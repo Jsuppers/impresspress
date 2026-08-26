@@ -32,7 +32,25 @@ So the schemas are a parallel, hand-maintained duplicate of types that already e
 
 `wafer-block` already ships the fix and it has never been used: `.input::<T>()`, `.output::<T>()`, `.path_params::<T>()`, and `.query_params::<T>()` derive schemas from Rust types via `schemars` (`wafer-run/crates/wafer-block/src/types/endpoint.rs:208-238`). The `json-schema` feature that gates them is enabled nowhere in impresspress, and `schemars` does not appear in `Cargo.lock`.
 
-This explains the coverage gap directly. Blocks with schemas: products, auth_ui, messages, files. Blocks with zero: admin, auth, vector, llm. `admin/users.rs` and `admin/settings.rs` contain no `pub struct` at all — their handlers were never typed. Nobody wanted to hand-write more JSON.
+This explains the coverage gap directly:
+
+| Block | Endpoints | Schema calls | Ships in Worker |
+|---|---:|---:|---|
+| products | 33 schema-carrying | ~30 schema vars | yes |
+| auth_ui | 18 | 8 | yes |
+| files | — | 4 | yes |
+| messages | — | 3-7 | yes |
+| admin | 17 | 0 | yes |
+| auth | 0 | 0 | yes |
+| vector | 11 | 0 | no |
+| llm | 18 | 0 | no |
+
+`admin/users.rs` and `admin/settings.rs` contain no `pub struct` at all — their handlers were never typed. Nobody wanted to hand-write more JSON.
+
+Two corrections to note, since both invert an obvious first reading:
+
+- **The auth HTTP surface is not in the `auth` block.** `auth/mod.rs` declares zero `BlockEndpoint`s — it is a service block. Login, `me`, and refresh are declared in `auth_ui/mod.rs` (e.g. `/b/auth/api/login` at `auth_ui/mod.rs:213`) and already carry schemas. There is nothing to type in `auth` itself.
+- **`admin` is the only Worker-shipping block that needs contracts written from scratch.**
 
 ### Verified feasibility
 
@@ -106,7 +124,7 @@ It must **inline `$defs`/`$ref`**. `schema_for!` emits ref-heavy schemas by defa
 **4. Enable `json-schema`; migrate the schemas.**
 Derive `JsonSchema` on existing contract types; replace every hand-written schema call site with `.input::<T>()` / `.output::<T>()` / `.path_params::<T>()` / `.query_params::<T>()`. This deletes duplication rather than adding any.
 
-**5. Type the untyped blocks.** admin and auth ship in the Worker and have no typed contracts. Writing them is a genuine improvement to those blocks independent of this feature.
+**5. Type the untyped block.** `admin` ships in the Worker and has no typed contracts — 17 endpoints, zero schemas, no request/response structs. Writing them is a genuine improvement to that block independent of this feature. (`auth` needs nothing: it declares no endpoints.)
 
 **6. Annotate the tool surface.** Mark tool-worthy endpoints with `agent_tool(...)`, with names and descriptions written for invocation rather than documentation.
 
@@ -147,7 +165,7 @@ Replacing curated hand-written schemas with derived ones can silently change the
 
 ## Scope
 
-**In, on the critical path** (Worker-shipping blocks): products, files, messages, auth_ui, auth, admin.
+**In, on the critical path** (Worker-shipping blocks): products, auth_ui, files, messages (migrate existing schemas), and admin (write contracts first, then migrate).
 
 **In, but not gating**: llm and vector. `impresspress-cloudflare/Cargo.toml:74` excludes `block-llm` and `block-vector` from the Worker build pending the LlmService refactor, so typing them is native-only work. It must not block the WebMCP-in-Worker milestone.
 
@@ -165,7 +183,7 @@ Replacing curated hand-written schemas with derived ones can silently change the
 1. wafer-run: `agent_tool` metadata + `generate_webmcp()` with ref inlining, with tests
 2. impresspress: enable `json-schema`, migrate products (largest, best-typed), snapshot-diff the result
 3. Migrate files, messages, auth_ui the same way
-4. Type admin + auth contracts, then migrate them
+4. Write admin's typed contracts, then migrate it
 5. Annotate the tool surface; implement render injection with auth filtering
 6. Inspector manifest view
 7. Deploy to Cloudflare; measure real wasm delta against the synthetic estimate
