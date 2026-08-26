@@ -1913,8 +1913,11 @@ crate::impresspress_feature_block! {
                     .agent_tool(
                         "start_checkout",
                         "Begin a purchase and return a Stripe checkout URL for the customer to \
-                         complete. This does NOT complete the payment — always give the returned \
-                         URL to the customer so they can confirm and pay themselves.",
+                         complete. Always send `presentation: \"hosted\"` — the `embedded` and \
+                         `payment_link` modes leave `checkout_url` null and return values only a \
+                         web page can use. This does NOT complete the payment: always give the \
+                         returned `checkout_url` to the customer so they can confirm and pay \
+                         themselves.",
                     ),
                 BlockEndpoint::get("/b/products/orders/{id}/status")
                     .summary("Guest checkout status")

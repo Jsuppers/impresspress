@@ -330,7 +330,11 @@ fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
     let named: HashMap<&str, &str> = info
         .endpoints
         .iter()
-        .filter_map(|ep| ep.agent_tool.as_ref().map(|t| (t.name.as_str(), ep.path.as_str())))
+        .filter_map(|ep| {
+            ep.agent_tool
+                .as_ref()
+                .map(|t| (t.name.as_str(), ep.path.as_str()))
+        })
         .collect();
 
     assert_eq!(
