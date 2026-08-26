@@ -375,28 +375,17 @@ Two edits in `crates/impresspress-core/src/blocks/system.rs`, and the second is 
 BlockEndpoint::get("/b/static/webmcp-{hash}.js").summary("Embedded WebMCP registration JS"),
 ```
 
-**Skipping 3b breaks the anonymous storefront demo.** `declared_access` (`routing.rs:346-353`) fails closed to `AuthLevel::Authenticated` for any path a block does not declare. htmx is publicly fetchable only because `system.rs:23` declares it. An undeclared `webmcp-{hash}.js` would return a login redirect to anonymous visitors, so the tools would silently never register for exactly the audience the storefront demo targets — and Step 5's unit test only checks that the tag is present in the HTML, so it would pass while the page is broken.
+**Correction — 3b is hygiene, not a load-bearing gate.** An earlier revision of this plan claimed that skipping 3b would break anonymous access, on the theory that `declared_access` fails closed to `Authenticated` for undeclared paths. That is true in general but **not** for this prefix: `routing.rs:194` mounts the whole of `/b/static/*` via `Route::router_declared_public`, which makes the route's own `Public` access final and means `declared_access` is never consulted there. The comment at `routing.rs:188-193` says so outright — that route exists precisely because the fail-closed default was 403-ing every anonymous asset request (code review 2026-07-16, C1: "the logged-out login/signup pages load with no CSS/JS/fonts/logo").
 
-- [ ] **Step 3c: Test that the asset is publicly reachable**
+So htmx is publicly fetchable because of the route, not because of its declaration. Still do 3b — it keeps the endpoint catalog accurate for the inspector and `/openapi.json`, and it costs one line — but do not expect it to change reachability.
 
-A tag-presence test cannot catch the above. Add a routing-level test asserting the URL resolves as `Public`:
+- [ ] **Step 3c: Test that the asset is publicly reachable — through the real router**
 
-```rust
-#[test]
-fn webmcp_script_asset_is_publicly_reachable() {
-    let infos = vec![SystemBlock::new().info()];
-    let access = crate::routing::declared_access(&infos, "GET", assets::webmcp_js_url());
-    assert_eq!(
-        access,
-        AuthLevel::Public,
-        "the WebMCP script must load for anonymous visitors — an undeclared \
-         static path fails closed to Authenticated and would silently disable \
-         tools on the public storefront"
-    );
-}
-```
+Do not test this via `declared_access`: it is private, and for this prefix it is not what decides the outcome. Test the thing that actually decides.
 
-Match `declared_access`'s real signature and the `SystemBlock` constructor to the code; read `routing.rs:346` and its existing tests first.
+Write an end-to-end dispatch test in `routing.rs` that drives a GET for `assets::webmcp_js_url()` through `route_to_block` with **no** authenticated session, and asserts it dispatches rather than redirecting. Follow the existing `/b/static/` dispatch test in that module — there is already one that passes zero `BlockInfo`s and still dispatches, which is itself the proof that declaration is not what gates this path.
+
+Optionally add a second check in `system.rs` asserting `effective_access` (the same resolver `pipeline.rs` passes to `generate_webmcp_with`) returns `Public` for the asset URL, so the manifest and the router agree about it.
 
 - [ ] **Step 4: Inject the tag on every page**
 
