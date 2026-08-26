@@ -16,11 +16,36 @@
 
 Plan 1's other four tasks are independent and may run in parallel with this one.
 
+**Plan 1 Task 5 has since landed** (wafer-run `983e7e7`), and it carries a limitation this plan must gate on.
+
+## Recursive contracts: the one shape that fails silently
+
+The typed builders now inline subschemas, so a normal contract derives to a fully self-contained schema. **A recursive type does not** — and it fails quietly rather than loudly. Verified empirically against schemars 1.2.1:
+
+| Shape | Emits | Embedded in `/openapi.json` |
+|---|---|---|
+| `Condition { all_of: Vec<Condition> }` (root-recursive) | `{"$ref": "#"}`, no `$defs` | `#` resolves to **the whole OpenAPI document** — a request body typed as all of `/openapi.json`, and an infinite loop for a dereferencing client |
+| `Rule { when: Condition }` (nested-recursive) | `#/$defs/Condition` + the table | The embedded schema has no `$id`, so the ref resolves at the document root, where no `$defs` exists — dangling |
+
+This is **not a regression** — before Plan 1 Task 5, *every* named type behaved this way; now only recursive ones do. But it is a real limitation and it will not announce itself: the snapshot diff shows a plausible-looking `$ref`, not an error.
+
+**`products/contracts.rs` has exactly this shape — `Condition`** (its `all_of` field holds child `Condition`s).
+
+**Required before migrating any block:**
+
+- [ ] Grep the block's contracts for recursive types — a type whose field, directly or through `Vec`/`Option`/`Box`, is itself.
+- [ ] For each hit, check whether it is reachable from an endpoint's `input`/`output`/`path_params`/`query_params` type.
+- [ ] If reachable: **do not migrate that call site.** Leave its hand-written schema and record why in the commit. A hand-written schema that is merely stale beats a derived one that types a request body as the entire API document.
+- [ ] Add the surviving `$ref` to the snapshot review checklist as a fifth diff category: *"a `$ref` appeared"* — always a defect here, never an accepted widening.
+
+The honest fix is to hoist `$defs` into `components/schemas` and rewrite `#` → `#/components/schemas/X` in `generate_openapi`. That is deliberately **not** in this plan: it changes a live public surface and needs its own task and its own snapshot review.
+
 ## Global Constraints
 
 - **schemars version is `1`**, matching `wafer-block`'s optional dep. Do not add a second schemars version to the tree.
 - **The snapshot gate is mandatory and per block.** Never migrate two blocks under one snapshot diff — a widening in one hides inside the other's churn.
 - **A widening is a decision, not noise.** If derive exposes a field the hand-written schema omitted, resolve it explicitly: `#[serde(skip)]`, a dedicated view type, or a recorded decision to accept. Never accept silently to make a diff pass.
+- **Recursive contracts are gated — see below.** They are the one shape the typed builders cannot render honestly, and they fail *silently*.
 - **Descriptions must survive.** Editorial text in a hand-written schema becomes a `///` doc comment on the corresponding field, which schemars emits as `description`.
 - **`/openapi.json` and `/.well-known/agent.json` must keep working throughout.** They are generated at runtime from these same schemas (`pipeline.rs:126`); this migration changes their input, so every step must leave both valid.
 - **Do not touch `vector` or `llm`.** They are excluded from the Worker build (`impresspress-cloudflare/Cargo.toml:74`) and are out of scope here. Do not touch `auth` either — it declares zero endpoints.
@@ -341,6 +366,7 @@ Read every changed line and classify it:
 - **`description` disappeared** → restore the hand-written text as a `///` doc comment on the corresponding field in `contracts.rs`.
 - **`required` list changed** → schemars marks non-`Option` fields required. If the hand-written schema disagreed, one of the two was wrong; decide which.
 - **Type narrowed or widened** (e.g. `string` became `string | null`) → an `Option<T>` in Rust that the hand-written schema treated as mandatory. Usually the Rust type is right.
+- **A `$ref` appeared** → the contract is recursive. **Always a defect, never an accepted widening.** Revert that call site to its hand-written schema per the recursive-contract gate above. `{"$ref": "#"}` in particular types the body as the entire OpenAPI document, which looks unremarkable in a diff and is catastrophic to a client.
 
 - [ ] **Step 7: Resolve every diff line, then accept the snapshot**
 
