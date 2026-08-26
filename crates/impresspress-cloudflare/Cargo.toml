@@ -31,6 +31,7 @@ default = []
 full = [
     "block-files",
     "block-legalpages",
+    "block-tickets",
     "block-messages",
     "block-products",
     "block-userportal",
@@ -42,6 +43,7 @@ full = [
 # `impresspress-web/Cargo.toml` block set.
 block-files = ["impresspress-core/block-files"]
 block-legalpages = ["impresspress-core/block-legalpages"]
+block-tickets = ["impresspress-core/block-tickets"]
 block-messages = ["impresspress-core/block-messages"]
 block-products = ["impresspress-core/block-products"]
 block-userportal = ["impresspress-core/block-userportal"]
@@ -106,6 +108,15 @@ tracing = { workspace = true }
 
 # Templating
 maud = { workspace = true }
+
+# This crate cannot compile for a native target at all — `JsFuture` holds an
+# `Rc<RefCell<_>>`, so it is `!Send` by construction and the `StorageService`
+# impl fails the trait's `Send` bound. Its tests therefore have to run ON
+# wasm32, under `wasm-bindgen-test-runner` (see `../../.cargo/config.toml`).
+# Before that was wired up, `#[test]` functions here were unreachable from every
+# command anyone ran, including whole-workspace runs used to gate merges.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [lints]
 workspace = true

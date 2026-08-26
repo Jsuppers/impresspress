@@ -130,8 +130,24 @@ async function getStorageRoot() {
     return root.getDirectoryHandle(STORAGE_DIR, { create: true });
 }
 
+function storageFolderSegments(folder) {
+    // StorageService folder names are logical paths. Native storage resolves
+    // `wafer-run/web/site` below its storage root, but OPFS rejects `/` in a
+    // single getDirectoryHandle() name. Walk each component so browser
+    // storage has the same nested-folder semantics as the other backends.
+    const segments = folder.split('/');
+    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+        throw new TypeError(`invalid storage folder: ${folder}`);
+    }
+    return segments;
+}
+
 async function getFolderHandle(storageRoot, folder, create = false) {
-    return storageRoot.getDirectoryHandle(folder, { create });
+    let handle = storageRoot;
+    for (const segment of storageFolderSegments(folder)) {
+        handle = await handle.getDirectoryHandle(segment, { create });
+    }
+    return handle;
 }
 
 /**
@@ -254,16 +270,22 @@ export async function storageList(folder, prefix, limit, offset) {
  */
 export async function storageCreateFolder(name) {
     const storageRoot = await getStorageRoot();
-    await storageRoot.getDirectoryHandle(name, { create: true });
+    await getFolderHandle(storageRoot, name, true);
 }
 
 /**
- * Remove OPFS directory recursively.
+ * Remove a nested OPFS directory recursively.
  * @param {string} name
  */
 export async function storageDeleteFolder(name) {
     const storageRoot = await getStorageRoot();
-    await storageRoot.removeEntry(name, { recursive: true });
+    const segments = storageFolderSegments(name);
+    const leaf = segments.pop();
+    let parent = storageRoot;
+    for (const segment of segments) {
+        parent = await parent.getDirectoryHandle(segment, { create: false });
+    }
+    await parent.removeEntry(leaf, { recursive: true });
 }
 
 /**

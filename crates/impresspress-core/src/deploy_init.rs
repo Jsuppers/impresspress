@@ -11,6 +11,16 @@ use crate::{
     builder::{post_start, BootHooks},
 };
 
+/// Request-current config flag set only while an authenticated deployment
+/// candidate is exporting a prepared runtime plan.
+///
+/// Consumer blocks whose `Init` lifecycle also publishes mutable derived
+/// output (for example a pre-rendered homepage) should still run migrations
+/// and seeds, but defer that publication while this value is `"1"`. This
+/// keeps the currently promoted Worker and its mutable objects unchanged
+/// until the prepared candidate has passed verification and promotion.
+pub const PREPARE_RUNTIME_PLAN_KEY: &str = "IMPRESSPRESS_PREPARE_RUNTIME_PLAN";
+
 #[derive(Debug, Serialize)]
 pub struct StepOutcome {
     pub ok: bool,

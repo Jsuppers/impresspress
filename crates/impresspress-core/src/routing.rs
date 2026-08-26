@@ -108,6 +108,14 @@ impl Route {
             router_final: true,
         }
     }
+
+    /// Whether the prefix declaration is the complete authorization decision.
+    ///
+    /// Exposed within the crate so deployment-plan export can preserve the
+    /// exact route policy without making this implementation detail public.
+    pub(crate) const fn is_router_final(&self) -> bool {
+        self.router_final
+    }
 }
 
 /// Access tier for a route.
@@ -239,6 +247,8 @@ pub const ROUTES: &[Route] = &[
     // Must precede the general `/b/products` entry below.
     Route::router_declared_public("/b/products/webhooks", "impresspress/products"),
     Route::new("/b/products", RouteAccess::Public, "impresspress/products"),
+    // Tickets — three declared public intake routes plus centrally gated admin UI/API.
+    Route::new("/b/tickets", RouteAccess::Public, "impresspress/tickets"),
     // Legalpages — public reads + admin writes/UI.
     // Admin and API prefixes must come BEFORE the bare `/b/legalpages` entry
     // because `route_to_block` matches on first-prefix-hit. Admin handlers
@@ -513,6 +523,7 @@ mod tests {
             ("/b/storage/buckets", "impresspress/files"),
             ("/b/cloudstorage/shares", "impresspress/files"),
             ("/b/products", "impresspress/products"),
+            ("/b/tickets/submit", "impresspress/tickets"),
             ("/b/legalpages", "impresspress/legalpages"),
             ("/b/userportal", "impresspress/userportal"),
         ];
@@ -579,6 +590,7 @@ mod tests {
             "/b/auth/",
             "/b/storage/",
             "/b/products",
+            "/b/tickets",
             "/b/userportal",
             "/b/cloudstorage/",
         ];
@@ -651,6 +663,7 @@ mod tests {
         "impresspress/admin",
         "impresspress/files",
         "impresspress/products",
+        "impresspress/tickets",
         "impresspress/legalpages",
         "impresspress/userportal",
     ];

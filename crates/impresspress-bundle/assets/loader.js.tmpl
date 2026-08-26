@@ -14,6 +14,9 @@ const RECOVERY_DONE_KEY = '__impresspress_recovery_done';
 // loop self-resolves; production apps whose OPFS holds user data leave
 // it false and surface the error instead.
 const OPFS_WIPE_ON_RECOVERY = __OPFS_WIPE_ON_RECOVERY__;
+// A pending Service Worker response has no useful browser-level deadline.
+// Recover explicitly instead of leaving the boot shell spinning forever.
+const BOOT_PROBE_TIMEOUT_MS = 60_000;
 
 // Unregister all SWs, drop Cache Storage, and (if asked) clear OPFS.
 // Used both by automatic recovery and by the manual reset button on the
@@ -66,6 +69,22 @@ function renderRecoveryStuckUI() {
     });
 }
 
+// Run one automatic reset in this tab. Both a Service Worker self-destruct and
+// a timed-out readiness probe use this path, so their loop guard and wipe
+// semantics cannot drift apart.
+async function recoverBrowserState(status) {
+    if (sessionStorage.getItem(RECOVERY_DONE_KEY)) {
+        renderRecoveryStuckUI();
+        return;
+    }
+    sessionStorage.setItem(RECOVERY_DONE_KEY, '1');
+    status.textContent = 'Recovering from stale cache...';
+    await wipeBrowserState({ wipeOpfs: OPFS_WIPE_ON_RECOVERY });
+    const url = new URL(window.location.href);
+    url.searchParams.set('_freshen', String(Date.now()));
+    window.location.replace(url.toString());
+}
+
 async function boot() {
     const status = document.getElementById('status');
     if (!('serviceWorker' in navigator)) {
@@ -87,21 +106,7 @@ async function boot() {
     // why self-destruct fires in the first place.
     if (sessionStorage.getItem(SW_RECOVER_KEY)) {
         sessionStorage.removeItem(SW_RECOVER_KEY);
-        // Loop guard: a recovery already ran in this tab. The wipe didn't
-        // resolve the boot failure, so retrying would just reload again
-        // with another `?_freshen` and crash the same way. Surface the
-        // error so the user can choose to wipe OPFS (production builds
-        // with OPFS_WIPE_ON_RECOVERY=false can't do it automatically).
-        if (sessionStorage.getItem(RECOVERY_DONE_KEY)) {
-            renderRecoveryStuckUI();
-            return;
-        }
-        sessionStorage.setItem(RECOVERY_DONE_KEY, '1');
-        status.textContent = 'Recovering from stale cache...';
-        await wipeBrowserState({ wipeOpfs: OPFS_WIPE_ON_RECOVERY });
-        const url = new URL(window.location.href);
-        url.searchParams.set('_freshen', String(Date.now()));
-        window.location.replace(url.toString());
+        await recoverBrowserState(status);
         return;
     }
 
@@ -140,8 +145,9 @@ async function boot() {
             });
         }
         // Auto-reload when a new SW takes control (subsequent updates).
-        // __impresspressReloading prevents a loop with the first-registration
-        // reload below (both fire window.location.reload()).
+        // __impresspressReloading is the shared breaker for every navigation
+        // below: this listener, the first-registration reload, and the boot
+        // redirect.
         if (!window.__impresspressReloading) {
             navigator.serviceWorker.addEventListener('controllerchange', () => {
                 if (window.__impresspressReloading) return;
@@ -156,7 +162,45 @@ async function boot() {
             return;
         }
         status.textContent = 'Loading __APP_NAME__...';
-        window.location.href = '__BOOT_REDIRECT__';
+        const target = new URL('__BOOT_REDIRECT__', window.location.href);
+        window.__impresspressReloading = true;
+        if (target.href === window.location.href) {
+            // A claimed worker initializes lazily on its first fetch. Probe
+            // the boot URL before reloading so a cold public origin does not
+            // race that initialization and render the static loader twice.
+            // Recovery remains owned by sw.js: a fatal probe self-destructs
+            // the worker and notifies/navigates this client.
+            const probeController = new AbortController();
+            const probeTimeout = setTimeout(
+                () => probeController.abort(),
+                BOOT_PROBE_TIMEOUT_MS,
+            );
+            try {
+                await fetch(target.href, {
+                    cache: 'no-store',
+                    credentials: 'same-origin',
+                    signal: probeController.signal,
+                });
+            } catch (error) {
+                if (probeController.signal.aborted) {
+                    console.warn('[__APP_NAME__] Boot probe timed out; recovering.');
+                    await recoverBrowserState(status);
+                    return;
+                }
+                console.warn('[__APP_NAME__] Boot probe failed:', error);
+            } finally {
+                clearTimeout(probeTimeout);
+            }
+            // A fatal probe self-destructs the worker, which sets the breaker
+            // and re-navigates this client itself. Reloading on top of that
+            // would be a second, uncoordinated navigation, so stand down and
+            // let the recovery path above run on the load sw.js is starting.
+            if (sessionStorage.getItem(SW_RECOVER_KEY)) return;
+            // Leave the current navigation task before requesting the reload.
+            setTimeout(() => window.location.reload(), 0);
+        } else {
+            window.location.replace(target.href);
+        }
     } catch (error) {
         status.textContent = 'Error: ' + error.message;
         console.error('[__APP_NAME__] Boot error:', error);

@@ -28,6 +28,7 @@ default = [
     "block-vector",
     "block-llm",
     "block-legalpages",
+    "block-tickets",
     "block-userportal",
     "block-products",
 ]
@@ -53,6 +54,7 @@ block-messages = ["impresspress-core/block-messages"]
 block-vector = ["impresspress-core/block-vector"]
 block-llm = ["impresspress-core/block-llm"]
 block-legalpages = ["impresspress-core/block-legalpages"]
+block-tickets = ["impresspress-core/block-tickets"]
 block-userportal = ["impresspress-core/block-userportal"]
 block-products = ["impresspress-core/block-products"]
 block-fastembed = ["impresspress-core/block-fastembed"]

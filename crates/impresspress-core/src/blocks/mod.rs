@@ -15,6 +15,8 @@ pub mod fastembed;
 pub mod files;
 #[cfg(feature = "block-legalpages")]
 pub mod legalpages;
+#[cfg(feature = "block-tickets")]
+pub mod tickets;
 // The LLM feature block compiles on every target that enables `block-llm`,
 // including wasm32. `LlmBlock` holds `Arc<dyn ProviderAdmin>` (the
 // provider-management seam), not the concrete reqwest/tokio
@@ -141,6 +143,8 @@ feature_block_manifest! {
     files::FilesBlock,
     #[cfg(feature = "block-legalpages")]
     legalpages::LegalPagesBlock,
+    #[cfg(feature = "block-tickets")]
+    tickets::TicketsBlock,
     #[cfg(feature = "block-messages")]
     messages::MessagesBlock,
     #[cfg(feature = "block-products")]

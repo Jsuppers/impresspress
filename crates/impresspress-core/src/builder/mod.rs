@@ -25,9 +25,11 @@ use wafer_run::Block;
 use crate::{features::BlockSettings, ExtraRoute, RouteAccess};
 
 mod boot;
+mod prepared;
 mod registration;
 
-pub use boot::{boot, post_start, BootHooks};
+pub use boot::{boot, post_start, strict_init_all_blocks, BootHooks};
+pub use prepared::PreparedPlanExporter;
 
 pub struct ImpresspressBuilder {
     database: Option<Arc<dyn DatabaseService>>,
@@ -45,6 +47,16 @@ pub struct ImpresspressBuilder {
     /// `WAFER_RUN__AUTH__JWT_SECRET`.
     jwt_secret: Arc<std::sync::RwLock<String>>,
     block_configs: Vec<(String, serde_json::Value)>,
+    /// Overrides applied after built-in flow registration. Needed when an
+    /// application intentionally replaces a config that `register_site_main`
+    /// installs near the end of `build()`.
+    final_block_configs: Vec<(String, serde_json::Value)>,
+    /// Deployment-owned external WRAP grants. Block-declared grants remain
+    /// sourced from `BlockInfo`; these are applied before `Wafer::seal()`.
+    wrap_grants: Vec<wafer_run::ResourceGrant>,
+    /// Deployment-owned grants imported from a prepared plan (for example
+    /// admin-created grants captured from D1 during candidate preparation).
+    deployment_wrap_grants: Vec<wafer_run::ResourceGrant>,
     extra_blocks: Vec<(String, Arc<dyn Block>)>,
     /// Additional LLM backends to register on the `MultiBackendLlmService`
     /// router backing `wafer-run/llm`. Each entry is `(label, service)` and
@@ -107,6 +119,9 @@ impl ImpresspressBuilder {
             ))),
             jwt_secret: Arc::new(std::sync::RwLock::new(String::new())),
             block_configs: Vec::new(),
+            final_block_configs: Vec::new(),
+            wrap_grants: Vec::new(),
+            deployment_wrap_grants: Vec::new(),
             extra_blocks: Vec::new(),
             extra_llm_services: Vec::new(),
             extra_image_services: Vec::new(),
@@ -267,6 +282,26 @@ impl ImpresspressBuilder {
 
     pub fn block_config(mut self, name: impl Into<String>, config: serde_json::Value) -> Self {
         self.block_configs.push((name.into(), config));
+        self
+    }
+
+    /// Apply a block config after built-in flow registration has completed.
+    ///
+    /// Use this for deliberate final overrides such as an application's
+    /// top-level router catch-all. Unlike post-build mutation, this declaration
+    /// is visible to prepared-plan export/import and target parity checks.
+    pub fn final_block_config(
+        mut self,
+        name: impl Into<String>,
+        config: serde_json::Value,
+    ) -> Self {
+        self.final_block_configs.push((name.into(), config));
+        self
+    }
+
+    /// Supply deployment-owned external WRAP grants without a runtime DB read.
+    pub fn wrap_grants(mut self, grants: Vec<wafer_run::ResourceGrant>) -> Self {
+        self.wrap_grants = grants;
         self
     }
 

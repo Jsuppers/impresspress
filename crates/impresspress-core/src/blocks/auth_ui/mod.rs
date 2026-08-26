@@ -37,9 +37,15 @@ pub const AUTH_UI_BLOCK_ID: &str = "impresspress/auth-ui";
 /// `(action, path)` match wins (see [`check_route_limits`]). IP-keyed rules
 /// guard unauthenticated endpoints; User-keyed rules guard authenticated ones.
 const RATE_LIMIT_ROUTES: &[RouteLimit] = &[
-    // Unauthenticated sensitive endpoints: login / signup — keyed by IP.
+    // Unauthenticated sensitive endpoints: login / signup / bootstrap — keyed by IP.
     RouteLimit {
-        matches: |a, p| a == "create" && matches!(p, "/auth/api/login" | "/auth/api/signup"),
+        matches: |a, p| {
+            a == "create"
+                && matches!(
+                    p,
+                    "/auth/api/login" | "/auth/api/signup" | "/auth/api/bootstrap"
+                )
+        },
         key: LimitKey::Ip,
         category: "auth",
         limit: RateLimit::AUTH,
@@ -449,4 +455,23 @@ crate::impresspress_feature_block! {
     // No `lifecycle`: auth-ui owns no schema (auth tables belong to the
     // framework `wafer-run/auth` block), so the `Block` no-op default
     // applies.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RATE_LIMIT_ROUTES;
+
+    #[test]
+    fn public_bootstrap_redemption_is_ip_rate_limited() {
+        assert!(RATE_LIMIT_ROUTES
+            .iter()
+            .any(|rule| (rule.matches)("create", "/auth/api/bootstrap")));
+    }
+
+    #[test]
+    fn bootstrap_form_get_does_not_spend_the_redemption_budget() {
+        assert!(!RATE_LIMIT_ROUTES
+            .iter()
+            .any(|rule| (rule.matches)("retrieve", "/auth/api/bootstrap")));
+    }
 }

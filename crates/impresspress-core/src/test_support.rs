@@ -225,6 +225,23 @@ impl TestContext {
         ctx
     }
 
+    /// Build a TestContext with admin, auth, and tickets migrations applied.
+    #[cfg(feature = "block-tickets")]
+    pub async fn with_tickets() -> Self {
+        let mut ctx = Self::with_auth().await;
+        ctx.apply_block_migrations(
+            "impresspress/tickets",
+            crate::blocks::tickets::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::tickets::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        ctx.register_block(
+            "impresspress/tickets",
+            Arc::new(crate::blocks::tickets::TicketsBlock::new()),
+        );
+        ctx
+    }
+
     /// Build a `TestContext` with admin + auth + vector migrations applied.
     #[cfg(feature = "block-vector")]
     pub async fn with_vector() -> Self {
