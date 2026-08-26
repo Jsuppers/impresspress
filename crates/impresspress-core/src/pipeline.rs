@@ -8,8 +8,8 @@ use std::cell::{Cell, RefCell};
 use wafer_block::http_codec;
 use wafer_core::clients::{config as config_client, database as db};
 use wafer_run::{
-    context::Context, streams::output::TerminalNotResponse, BlockInfo, ErrorCode, InputStream,
-    Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
+    context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockInfo, ErrorCode,
+    InputStream, Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
 };
 
 use crate::{
@@ -65,6 +65,34 @@ fn enqueue_request_log(
 /// after each dispatch and persists the rows off the response path.
 pub fn drain_queued_request_logs() -> Vec<QueuedRequestLog> {
     REQUEST_LOG_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+/// The `AuthLevel` ceiling for this request, used to filter the WebMCP tool
+/// manifest.
+///
+/// Reads the SAME source the router's admin gate enforces with:
+/// `crate::util::is_admin` (`util.rs:173`) inspects the `auth.user_roles`
+/// meta set from the verified JWT by `extract_auth_meta`, and
+/// `routing.rs:375` admits `RouteAccess::Admin` on exactly that basis.
+///
+/// It is tempting to query roles from the database instead. Do not — the
+/// manifest would then answer a different question than the gate. A user
+/// granted admin in the roles table after their token was minted would be
+/// advertised admin tools that the router then 403s (publishing tool names
+/// to someone who cannot invoke them, the precise SEC-073 problem this
+/// filtering exists to prevent), and a revoked admin whose JWT is still live
+/// would be under-reported while the router still admits their calls. Same
+/// source, no drift — and no DB round trip per page view.
+///
+/// Synchronous and infallible by construction: there is nothing to fail.
+fn caller_auth_level(msg: &Message) -> AuthLevel {
+    if msg.user_id().is_empty() {
+        return AuthLevel::Public;
+    }
+    if crate::util::is_admin(msg) {
+        return AuthLevel::Admin;
+    }
+    AuthLevel::Authenticated
 }
 
 /// Handle a impresspress request.
@@ -174,6 +202,33 @@ pub async fn handle_request(
     let client_ip = msg.remote_addr().to_string();
     let user_id = msg.user_id().to_string();
     let start_ms = crate::util::now_millis();
+
+    // WebMCP tool manifest. Placed after step 2 because it needs the resolved
+    // identity — the discovery documents at step 0 are anonymous by design,
+    // this one is not.
+    if path == "/b/webmcp/manifest.json" {
+        let caller = caller_auth_level(&msg);
+
+        // MUST be `generate_webmcp_with`, not `generate_webmcp`. The plain
+        // form filters on `ep.auth` alone, but this router admits on
+        // `max(prefix_tier, ep.auth)` (routing.rs:440). An endpoint declared
+        // Public under an Admin prefix would otherwise be advertised to
+        // anonymous callers — the router still 403s, so it is not a data
+        // leak, but it publishes a tool name the caller cannot use (the
+        // recon surface this filtering exists to prevent) and hands the
+        // agent a tool that always fails.
+        let body = wafer_core::discovery::generate_webmcp_with(
+            block_infos,
+            caller,
+            routing::effective_access,
+        );
+
+        // Per-session by construction: a shared cache serving one visitor's
+        // manifest to another would leak the privileged tool surface.
+        return ResponseBuilder::new()
+            .set_header("Cache-Control", "no-store")
+            .json(&body);
+    }
 
     // 2a. CSRF: cookie-authenticated unsafe-method requests must pass the
     // Fetch-Metadata/Origin/Referer policy before any block sees them. Bearer
@@ -877,6 +932,168 @@ mod discovery_tests {
                 "removed legacy builder path must not be documented: {path}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // WebMCP manifest — the third discovery document, but auth-filtered and
+    // per-session (unlike `/openapi.json` and the agent card, which are
+    // anonymous by design).
+    // -------------------------------------------------------------------
+
+    /// Like `discovery_json`, but returns the response headers instead of
+    /// parsing the body — used to assert on `Cache-Control`.
+    async fn discovery_headers(
+        ctx: &TestContext,
+        path: &str,
+        host: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut msg = anon_msg("retrieve", path);
+        msg.set_meta("http.header.host", host);
+        let out = handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            "test-jwt-secret",
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        buf.meta
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .key
+                    .strip_prefix("resp.header.")
+                    .map(|name| (name.to_string(), entry.value))
+            })
+            .collect()
+    }
+
+    /// Like `discovery_json`, but the request carries a real, signed
+    /// `Authorization: Bearer` access token for a non-admin user.
+    ///
+    /// Deliberately NOT `test_support::auth_msg`, which stamps
+    /// `auth.user_id` directly onto the `Message` before `handle_request`
+    /// ever runs. That would leave `msg.user_id()` non-empty even if the
+    /// WebMCP manifest branch were wrongly placed at step 0 — before
+    /// `extract_auth_meta` populates auth meta from the header — which
+    /// would defeat the one test that exists to catch that placement bug
+    /// (`webmcp_manifest_reflects_an_authenticated_caller`, below). Only a
+    /// Bearer header that step 2 must independently verify exercises the
+    /// ordering.
+    async fn discovery_json_as_user(
+        ctx: &TestContext,
+        path: &str,
+        host: &str,
+    ) -> serde_json::Value {
+        use std::{collections::HashMap, time::Duration};
+
+        use wafer_block_crypto::primitives;
+
+        let secret = "test-jwt-secret";
+        let derived = primitives::derive_block_key(
+            secret.as_bytes(),
+            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+        );
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), serde_json::json!("user-webmcp-1"));
+        claims.insert("type".to_string(), serde_json::json!("access"));
+        // Must match `expected_issuer`'s default
+        // (`crate::blocks::auth::helpers::expected_issuer`) — this test's
+        // `TestContext` has no `WAFER_RUN_SHARED__FRONTEND_URL` configured.
+        claims.insert(
+            "iss".to_string(),
+            serde_json::json!("http://localhost:5173"),
+        );
+        let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+            .expect("test jwt_sign");
+
+        let mut msg = anon_msg("retrieve", path);
+        msg.set_meta("http.header.host", host);
+        let auth_header = format!("Bearer {token}");
+        let out = handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            Some(&auth_header),
+            secret,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_is_served_and_versioned() {
+        let ctx = TestContext::new().await;
+        let body = discovery_json(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+
+        assert_eq!(body["schema_version"], serde_json::json!(1));
+        assert!(
+            body["tools"].is_array(),
+            "manifest must carry a tools array: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_for_anonymous_caller_contains_no_privileged_tools() {
+        let ctx = TestContext::new().await;
+        let body = discovery_json(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+
+        // An unauthenticated request must see Public tools only. Anything
+        // requiring a session is recon surface if its name is published here.
+        let rendered = body.to_string();
+        for forbidden in ["list_users", "list_my_purchases"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "anonymous manifest must not name the privileged tool {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_is_not_cacheable() {
+        let ctx = TestContext::new().await;
+        let headers = discovery_headers(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+
+        let cache_control = headers
+            .get("Cache-Control")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            cache_control.contains("no-store"),
+            "the manifest is per-session and must not be cached, got: {cache_control:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_reflects_an_authenticated_caller() {
+        let ctx = TestContext::with_auth().await;
+
+        // Build a request carrying a valid session for a non-admin user.
+        let body = discovery_json_as_user(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+
+        assert!(
+            names.contains(&"list_my_purchases"),
+            "an authenticated caller must receive Authenticated-level tools — if this \
+             fails with only Public tools present, the manifest branch is running \
+             before auth meta is set (step 0 instead of after step 2): {names:?}"
+        );
     }
 }
 

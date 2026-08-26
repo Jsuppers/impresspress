@@ -4,7 +4,9 @@
 //! All impresspress blocks are registered in the Wafer registry at boot; routing
 //! dispatches via `ctx.call_block` without any factory indirection.
 
-use wafer_run::{context::Context, AuthLevel, BlockInfo, InputStream, Message, OutputStream};
+use wafer_run::{
+    context::Context, AuthLevel, BlockEndpoint, BlockInfo, InputStream, Message, OutputStream,
+};
 
 use crate::{endpoint_match, features::FeatureConfig};
 
@@ -350,6 +352,58 @@ fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -
     endpoint_match::endpoint_auth(&info.endpoints, msg.action(), msg.path())
         .map(RouteAccess::from_auth_level)
         .unwrap_or(RouteAccess::Authenticated)
+}
+
+/// Resolve the [`AuthLevel`] a caller must actually have to invoke `ep`,
+/// mirroring exactly what [`route_to_block`] enforces for it (routing.rs
+/// :435-440): `route.access.max(declared_access(...))`, with the
+/// `router_final` escape hatch making the route's own declaration final.
+///
+/// Lives here (not in `pipeline.rs`, where the WebMCP manifest calls it)
+/// because `Route::router_final` is a private field — deliberately not
+/// exposed, so nothing outside this module can special-case it. This
+/// resolver is the one thing that legitimately needs to read it to answer
+/// "what would the router actually do here", so it is implemented beside
+/// [`ROUTES`], [`declared_access`], and [`check_access`] rather than poking
+/// a hole in the type for an outside caller.
+///
+/// Unlike [`declared_access`] — called by `route_to_block` with a live
+/// `Message` whose concrete path can match more than one declared endpoint
+/// in the same block, taking the strictest of all matches — this is asked
+/// about a single, already-known endpoint, so the "declared" half of the
+/// max is `ep.auth` directly rather than a fresh path lookup. The "prefix"
+/// half is whichever [`ROUTES`] entry, for this same block, this endpoint's
+/// path falls under — the same table and the same `starts_with` matching
+/// [`route_to_block`] uses, just walked against a declared template instead
+/// of a live request path.
+///
+/// Used by the WebMCP manifest (`pipeline.rs`) via
+/// `wafer_core::discovery::generate_webmcp_with`, whose plain
+/// `generate_webmcp` filters on `ep.auth` alone — which would advertise a
+/// tool the router still rejects whenever a block declares an endpoint
+/// looser than the prefix tier it is actually served under (recon surface:
+/// a tool name published to a caller who can never invoke it).
+pub fn effective_access(block: &BlockInfo, ep: &BlockEndpoint) -> AuthLevel {
+    let route = ROUTES.iter().find(|r| {
+        r.block == block.name && (ep.path == r.prefix || ep.path.starts_with(r.prefix))
+    });
+
+    let access = match route {
+        // The router's own declaration is the complete answer — the
+        // endpoint's declared level, looser or stricter, is never
+        // consulted. See `Route::router_declared_public`'s doc comment.
+        Some(r) if r.router_final => r.access,
+        Some(r) => r.access.max(RouteAccess::from_auth_level(ep.auth)),
+        // No `ROUTES` entry serves this block/path at all — mirrors
+        // `declared_access`'s fail-closed default.
+        None => RouteAccess::Authenticated,
+    };
+
+    match access {
+        RouteAccess::Public => AuthLevel::Public,
+        RouteAccess::Authenticated => AuthLevel::Authenticated,
+        RouteAccess::Admin => AuthLevel::Admin,
+    }
 }
 
 /// Enforce a route's [`RouteAccess`] tier against the request. Returns
@@ -903,6 +957,134 @@ mod tests {
             declared_access(&[], "test/block-not-registered", &msg),
             RouteAccess::Authenticated
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `effective_access` — the WebMCP manifest's resolver (pipeline.rs) must
+    // agree with what `route_to_block` actually admits (routing.rs:435-440),
+    // for each shape `Route::router_final` can produce. Each test asserts
+    // the resolver's verdict AND drives a real anonymous request through
+    // `route_to_block` to confirm the router itself behaves the same way —
+    // if the two disagree, the manifest is wrong by definition.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn effective_access_agrees_with_the_router_for_public_under_public() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        let ep_path = "/b/products/catalog";
+        let info =
+            BlockInfo::new("impresspress/products", "0.0.1", "http-handler@v1", "t").endpoints(
+                vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)],
+            );
+        let ep = info.endpoints[0].clone();
+
+        assert_eq!(
+            effective_access(&info, &ep),
+            AuthLevel::Public,
+            "a Public endpoint under the Public `/b/products` prefix stays Public"
+        );
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/products",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", ep_path),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &[],
+        )
+        .await;
+        let buf = out.collect_buffered().await.expect(
+            "router must actually admit an anonymous caller here, matching effective_access's Public verdict",
+        );
+        assert_eq!(buf.body, b"DISPATCHED");
+    }
+
+    #[tokio::test]
+    async fn effective_access_agrees_with_the_router_for_public_endpoint_under_admin_prefix() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        // The dangerous case this resolver exists for: a block endpoint
+        // declares itself `Public` even though it lives under the
+        // Admin-tier `/b/admin/` prefix. The router still enforces Admin
+        // via `RouteAccess::max` (routing.rs:435-440) — `effective_access`
+        // must agree, or the manifest would advertise this tool name to
+        // anonymous callers the router then silently 403s.
+        let ep_path = "/b/admin/misdeclared-report";
+        let info = BlockInfo::new("impresspress/admin", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
+        let ep = info.endpoints[0].clone();
+
+        assert_eq!(
+            effective_access(&info, &ep),
+            AuthLevel::Admin,
+            "the Admin prefix tier must win over a looser declared endpoint level"
+        );
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/admin",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", ep_path),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &[],
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "the router must reject the anonymous caller despite the endpoint's Public declaration"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_access_agrees_with_the_router_for_a_router_final_route() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        // `router_final` makes the route's own declaration complete in BOTH
+        // directions: here the endpoint declares itself Admin, but the
+        // static-asset prefix route is `router_declared_public`. The router
+        // must still admit an anonymous caller, and `effective_access` must
+        // say Public, not Admin — taking the max here would hide a tool
+        // that is genuinely publicly reachable.
+        let ep_path = "/b/static/secret-admin-only-thing";
+        let info = BlockInfo::new("impresspress/system", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Admin)]);
+        let ep = info.endpoints[0].clone();
+
+        assert_eq!(
+            effective_access(&info, &ep),
+            AuthLevel::Public,
+            "router_final routes make the router's own declaration final — the endpoint's stricter Admin declaration must not leak through"
+        );
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/system",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", ep_path),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &[],
+        )
+        .await;
+        let buf = out.collect_buffered().await.expect(
+            "router_final Public route must admit an anonymous caller regardless of the endpoint's declared level",
+        );
+        assert_eq!(buf.body, b"DISPATCHED");
     }
 
     #[tokio::test]
