@@ -128,7 +128,11 @@ Derive `JsonSchema` on existing contract types; replace every hand-written schem
 
 **6. Annotate the tool surface.** Mark tool-worthy endpoints with `agent_tool(...)`, with names and descriptions written for invocation rather than documentation.
 
-**7. Inject at the render chokepoints.** `ui/layout.rs:47` and `ui/templates.rs:449` both already iterate `config.embedded_scripts`. The session-filtered manifest is inlined into the page; the registration script itself stays a static asset. Inlining is preferred over fetching `/.well-known/webmcp.json` because per-session filtering makes such an endpoint uncacheable anyway, and 10-15 tools is roughly 3-6 KB gzipped.
+**7. Serve the manifest from an endpoint; inject only the script tag.** `ui/layout.rs` and `ui/templates.rs` are the two full-page render chokepoints and each gains one `<script src defer>` tag. The manifest itself is served from `GET /b/webmcp/manifest.json`, generated per request from the caller's effective auth level, with `Cache-Control: no-store`.
+
+> **Revised during implementation.** This section originally specified *inlining* the session-filtered manifest into the page and explicitly rejected an endpoint, on the grounds that per-session filtering makes such an endpoint uncacheable anyway. The reasoning about cacheability was right; the conclusion was not reachable. `block_infos` is a parameter of `pipeline::handle_request` and is **not** available inside a block's page render, so inlining would have meant threading it through `SiteConfig` and every page-rendering call site — a wide change to save one small same-origin request. Serving it mirrors `/openapi.json`, which already works exactly this way, and needs no change to `page()`'s signature. The endpoint is uncacheable and per-session either way, so nothing is lost but a round trip.
+>
+> Placement within the pipeline is load-bearing and easy to get wrong: the branch must run **after** step 2, where `extract_auth_meta` populates the auth metadata. At the step-0 discovery block, `msg.user_id()` is empty for every request, so every caller — including admins — silently receives the anonymous manifest. That failure is invisible in a smoke test, because an anonymous manifest is a perfectly valid document.
 
 **8. Inspector panel.** `wafer-block-inspector` already serves a static `inspector.html` at `/b/inspector`, and `routing.rs:304 routes_config()` already projects endpoint granularity from `BlockInfo::endpoints`. Add a view showing the live tool manifest as each auth level sees it.
 
@@ -197,6 +201,8 @@ Replacing curated hand-written schemas with derived ones can silently change the
 
 - `pipeline.rs:477-507` already asserts OpenAPI security/schema properties per auth level. Extend that harness to `generate_webmcp()`.
 - Snapshot tests for the generated manifest at each of `Public`, `Authenticated`, `Admin` — these encode the security property that privileged tool names never reach unprivileged pages.
+
+  **Status:** shipped in wafer-run (`generate_webmcp`, three full-document `assert_eq!` snapshots at each level). On the impresspress side the equivalent coverage is per-tool assertions against the served endpoint rather than whole-document snapshots, and the `Admin` case is thinner than the other two. Worth closing, since Admin is the level where a filtering mistake is most costly.
 - Per-block `/openapi.json` snapshot diffs as the migration fidelity gate above.
 - End-to-end: a real agent invoking the storefront chain against a deployed Worker.
 
