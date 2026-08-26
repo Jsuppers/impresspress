@@ -21,6 +21,7 @@ crate::impresspress_feature_block! {
             BlockEndpoint::get("/health").summary("Health check"),
             BlockEndpoint::get("/b/static/app-{hash}.css").summary("Embedded CSS"),
             BlockEndpoint::get("/b/static/htmx-{hash}.min.js").summary("Embedded htmx JS"),
+            BlockEndpoint::get("/b/static/webmcp-{hash}.js").summary("Embedded WebMCP registration JS"),
             BlockEndpoint::get("/b/static/itim-latin-{hash}.woff2").summary("Embedded Itim font (latin)"),
             BlockEndpoint::get("/b/static/itim-latin-ext-{hash}.woff2").summary("Embedded Itim font (latin-ext)"),
             BlockEndpoint::get("/b/static/impresspress-logo-{hash}.png").summary("Embedded Impresspress square logo"),
@@ -84,6 +85,12 @@ crate::impresspress_feature_block! {
                 ".min.js",
                 "application/javascript; charset=utf-8",
                 || ui::assets::htmx_js().as_bytes(),
+            ),
+            (
+                "/b/static/webmcp-",
+                ".js",
+                "application/javascript; charset=utf-8",
+                || ui::assets::webmcp_js().as_bytes(),
             ),
             // `latin-ext` must come before `latin` so the longer prefix
             // wins. The table is scanned in order.
@@ -172,7 +179,6 @@ mod tests {
     };
 
     use super::*;
-    #[cfg(any(feature = "block-llm", feature = "block-files"))]
     use crate::ui::assets;
 
     #[derive(Clone)]
@@ -307,6 +313,64 @@ mod tests {
         assert!(
             body.contains("DOMPurify"),
             "body should be the vendored DOMPurify build"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_handle_serves_webmcp_js() {
+        let block = SystemBlock::new();
+        let url = assets::webmcp_js_url();
+        let mut msg = Message::new(format!("retrieve:{url}"));
+        msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
+        msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
+
+        let out = block.handle(&NopCtx, msg, InputStream::empty()).await;
+        let buffered = out.collect_buffered().await.expect("response");
+        let content_type = buffered
+            .meta
+            .iter()
+            .find(|m| m.key == META_RESP_CONTENT_TYPE)
+            .map(|m| m.value.as_str());
+        assert_eq!(
+            content_type,
+            Some("application/javascript; charset=utf-8"),
+            "wrong content type"
+        );
+        let body = std::str::from_utf8(&buffered.body).unwrap();
+        assert!(
+            body.contains("registerTool"),
+            "body should be the WebMCP registration script"
+        );
+    }
+
+    /// `declared_access` (`routing.rs`) fails closed to `AuthLevel::
+    /// Authenticated` for any path a block does not declare as a
+    /// `BlockEndpoint` — this is the endpoint declaration this block adds
+    /// alongside htmx/CSS/fonts (`system.rs`'s `endpoints` list). Checked
+    /// via `effective_access`, not `declared_access` directly: `/b/static/`
+    /// is mounted as `Route::router_declared_public` (`router_final`), so
+    /// the router's own `Public` declaration is what actually admits an
+    /// anonymous request regardless of this endpoint entry (proved
+    /// end-to-end by `routing::tests::webmcp_script_asset_is_publicly_reachable`,
+    /// which registers no `BlockInfo` at all and still dispatches) —
+    /// `effective_access` is the resolver that mirrors exactly what the
+    /// router enforces (it's the same one `pipeline.rs` plugs into the
+    /// WebMCP manifest generator), so it's the correct thing to assert
+    /// against here.
+    #[test]
+    fn webmcp_script_asset_is_publicly_reachable() {
+        let info = SystemBlock::new().info();
+        let ep = info
+            .endpoints
+            .iter()
+            .find(|e| e.path == "/b/static/webmcp-{hash}.js")
+            .expect("webmcp asset endpoint not declared in SystemBlock::info()");
+        assert_eq!(
+            crate::routing::effective_access(&info, ep),
+            wafer_run::AuthLevel::Public,
+            "the WebMCP script must load for anonymous visitors — an \
+             effective auth level above Public would silently disable tools \
+             on the public storefront"
         );
     }
 }

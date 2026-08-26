@@ -1180,6 +1180,42 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
+    #[tokio::test]
+    async fn webmcp_script_asset_is_publicly_reachable() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        // The WebMCP registration script (`crates/impresspress-core/src/ui/
+        // assets/webmcp.js`, served under `/b/static/`) must load for
+        // anonymous visitors, or tools silently never register on the
+        // public storefront. Drive a real anonymous request through
+        // `route_to_block` against the actual URL the page embeds
+        // (`assets::webmcp_js_url()`), the same way
+        // `anonymous_static_asset_request_is_not_denied` proves this for the
+        // static prefix generally.
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/system",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", crate::ui::assets::webmcp_js_url()),
+            InputStream::empty(),
+            &AllEnabled,
+            &[],
+            &[],
+        )
+        .await;
+        let buf = out.collect_buffered().await.expect(
+            "an anonymous caller must reach dispatch for the WebMCP script — \
+             an undeclared or misrouted static path fails closed to \
+             Authenticated and would silently disable tools on the public \
+             storefront",
+        );
+        assert_eq!(buf.body, b"DISPATCHED");
+    }
+
     #[test]
     fn static_prefix_route_is_router_declared_public() {
         // Direct check on the ROUTES entry itself (companion to the dispatch

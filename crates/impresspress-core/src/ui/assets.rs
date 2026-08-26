@@ -139,6 +139,14 @@ pub fn htmx_js() -> &'static str {
     include_str!("assets/htmx.min.js")
 }
 
+/// WebMCP tool-registration script, served on every page. Fetches the
+/// auth-filtered manifest at `/b/webmcp/manifest.json` and registers each
+/// tool via `document.modelContext.registerTool` (no-ops on browsers
+/// without WebMCP support).
+pub fn webmcp_js() -> &'static str {
+    include_str!("assets/webmcp.js")
+}
+
 /// Short content hash (first 8 chars of hex SHA-256) for cache busting.
 fn short_hash(content: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -159,6 +167,17 @@ pub fn htmx_js_url() -> &'static str {
         format!(
             "{STATIC_PREFIX}htmx-{}.min.js",
             short_hash(htmx_js().as_bytes())
+        )
+    })
+}
+
+/// WebMCP script URL with content hash, e.g. `/b/static/webmcp-a1b2c3d4.js`
+pub fn webmcp_js_url() -> &'static str {
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| {
+        format!(
+            "{STATIC_PREFIX}webmcp-{}.js",
+            short_hash(webmcp_js().as_bytes())
         )
     })
 }
