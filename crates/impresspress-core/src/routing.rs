@@ -371,11 +371,36 @@ fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -
 /// `Message` whose concrete path can match more than one declared endpoint
 /// in the same block, taking the strictest of all matches — this is asked
 /// about a single, already-known endpoint, so the "declared" half of the
-/// max is `ep.auth` directly rather than a fresh path lookup. The "prefix"
-/// half is whichever [`ROUTES`] entry, for this same block, this endpoint's
-/// path falls under — the same table and the same `starts_with` matching
-/// [`route_to_block`] uses, just walked against a declared template instead
-/// of a live request path.
+/// max is `ep.auth` directly rather than a fresh path lookup.
+///
+/// # Route resolution mirrors the router, not the block name
+///
+/// The "prefix" half is resolved exactly the way [`route_to_block`] does:
+/// the FIRST entry — [`ROUTES`] in table order, then `extra_routes` — whose
+/// prefix matches `ep.path`. It is deliberately NOT "the first entry that
+/// happens to name this block", because the router never asks that
+/// question: it picks a route by path and then dispatches to
+/// `route.dispatch_to`, which can differ from `route.block`. Filtering the
+/// table by block name first made the inspector — `BlockInfo` name
+/// `wafer-run/inspector`, route `block` name `impresspress/inspector` —
+/// match no route at all and resolve to the fallback, while the router
+/// enforced `Admin`: the exact raising-direction leak this resolver exists
+/// to close.
+///
+/// A matched route is only accepted when it actually serves THIS block —
+/// `route.block == block.name` (feature-gate/display name) or
+/// `route.dispatch_to == block.name` (the `ctx.call_block` target). If the
+/// route that owns the path dispatches somewhere else, this endpoint is
+/// unreachable through it.
+///
+/// # Fails closed
+///
+/// Anything this function cannot positively resolve to a route serving
+/// `block` yields the STRICTEST level ([`AuthLevel::Admin`]) — no route
+/// matches the path, or the matching route belongs to another block. Such
+/// an endpoint is unreachable (the router 404s it), so publishing its tool
+/// name to anyone is pure recon surface; `Authenticated` would have
+/// published it to every logged-in visitor.
 ///
 /// Used by the WebMCP manifest (`pipeline.rs`) via
 /// `wafer_core::discovery::generate_webmcp_with`, whose plain
@@ -383,20 +408,37 @@ fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -
 /// tool the router still rejects whenever a block declares an endpoint
 /// looser than the prefix tier it is actually served under (recon surface:
 /// a tool name published to a caller who can never invoke it).
-pub fn effective_access(block: &BlockInfo, ep: &BlockEndpoint) -> AuthLevel {
-    let route = ROUTES.iter().find(|r| {
-        r.block == block.name && (ep.path == r.prefix || ep.path.starts_with(r.prefix))
-    });
+pub fn effective_access(
+    block: &BlockInfo,
+    ep: &BlockEndpoint,
+    extra_routes: &[ExtraRoute],
+) -> AuthLevel {
+    let prefix_matches = |prefix: &str| ep.path == prefix || ep.path.starts_with(prefix);
 
-    let access = match route {
+    // Built-in `ROUTES` win on prefix collision and are searched first —
+    // same order, same matching, as `route_to_block`.
+    let access = match ROUTES.iter().find(|r| prefix_matches(r.prefix)) {
+        Some(r) if r.block != block.name && r.dispatch_to != block.name => {
+            // The router serves this path from a different block, so this
+            // endpoint is dead. Fail closed.
+            RouteAccess::Admin
+        }
         // The router's own declaration is the complete answer — the
         // endpoint's declared level, looser or stricter, is never
         // consulted. See `Route::router_declared_public`'s doc comment.
         Some(r) if r.router_final => r.access,
         Some(r) => r.access.max(RouteAccess::from_auth_level(ep.auth)),
-        // No `ROUTES` entry serves this block/path at all — mirrors
-        // `declared_access`'s fail-closed default.
-        None => RouteAccess::Authenticated,
+        // No built-in route claims this path — fall through to the
+        // downstream-registered ones, exactly as `route_to_block` does.
+        None => match extra_routes.iter().find(|r| prefix_matches(&r.prefix)) {
+            // `route_to_block` enforces an extra route's `access` alone —
+            // it never refines it with `declared_access` — so neither does
+            // this. Taking a max with `ep.auth` here would HIDE a tool the
+            // router genuinely admits, the same mistake in the other
+            // direction.
+            Some(r) if r.block_name == block.name => r.access,
+            _ => RouteAccess::Admin,
+        },
     };
 
     match access {
@@ -404,6 +446,26 @@ pub fn effective_access(block: &BlockInfo, ep: &BlockEndpoint) -> AuthLevel {
         RouteAccess::Authenticated => AuthLevel::Authenticated,
         RouteAccess::Admin => AuthLevel::Admin,
     }
+}
+
+/// The block name [`route_to_block`]'s feature gate actually consults for
+/// a block whose [`BlockInfo`] is named `block_name`.
+///
+/// For every block but one these are the same string. The inspector is the
+/// exception: its `BlockInfo` is named `wafer-run/inspector` (it is the
+/// runtime's own block) while the router gates and displays it as
+/// `impresspress/inspector` (`Route::proxy`). Asking
+/// `FeatureConfig::is_block_enabled("wafer-run/inspector")` would therefore
+/// always answer "enabled" — unknown names default to enabled — even with
+/// the admin toggle off.
+///
+/// Used by the WebMCP manifest (`pipeline.rs`), which must not advertise
+/// tools from a block the router 404s.
+pub fn feature_gate_name(block_name: &str) -> &str {
+    ROUTES
+        .iter()
+        .find(|r| r.block == block_name || r.dispatch_to == block_name)
+        .map_or(block_name, |r| r.block)
 }
 
 /// Enforce a route's [`RouteAccess`] tier against the request. Returns
@@ -973,14 +1035,12 @@ mod tests {
         use crate::test_support::{anon_msg, TestContext};
 
         let ep_path = "/b/products/catalog";
-        let info =
-            BlockInfo::new("impresspress/products", "0.0.1", "http-handler@v1", "t").endpoints(
-                vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)],
-            );
+        let info = BlockInfo::new("impresspress/products", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
         let ep = info.endpoints[0].clone();
 
         assert_eq!(
-            effective_access(&info, &ep),
+            effective_access(&info, &ep, &[]),
             AuthLevel::Public,
             "a Public endpoint under the Public `/b/products` prefix stays Public"
         );
@@ -1021,7 +1081,7 @@ mod tests {
         let ep = info.endpoints[0].clone();
 
         assert_eq!(
-            effective_access(&info, &ep),
+            effective_access(&info, &ep, &[]),
             AuthLevel::Admin,
             "the Admin prefix tier must win over a looser declared endpoint level"
         );
@@ -1062,7 +1122,7 @@ mod tests {
         let ep = info.endpoints[0].clone();
 
         assert_eq!(
-            effective_access(&info, &ep),
+            effective_access(&info, &ep, &[]),
             AuthLevel::Public,
             "router_final routes make the router's own declaration final — the endpoint's stricter Admin declaration must not leak through"
         );
@@ -1085,6 +1145,178 @@ mod tests {
             "router_final Public route must admit an anonymous caller regardless of the endpoint's declared level",
         );
         assert_eq!(buf.body, b"DISPATCHED");
+    }
+
+    #[tokio::test]
+    async fn effective_access_resolves_a_proxy_route_by_its_dispatch_target() {
+        use crate::test_support::{auth_msg, TestContext};
+
+        // The inspector is the one `Route::proxy` in the table: gated and
+        // displayed as `impresspress/inspector`, but DISPATCHED to — and
+        // named in its own `BlockInfo` as — `wafer-run/inspector`. Matching
+        // the routing table on `route.block == block.name` therefore found
+        // NOTHING for this block, and the old `None` fallback answered
+        // `Authenticated` while the router enforces `Admin`: every
+        // logged-in non-admin would have been advertised the inspector's
+        // tools and 403d on every call.
+        let ep_path = "/b/inspector/blocks";
+        let info = BlockInfo::new("wafer-run/inspector", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
+        let ep = info.endpoints[0].clone();
+
+        assert_eq!(
+            effective_access(&info, &ep, &[]),
+            AuthLevel::Admin,
+            "the proxy route's Admin tier must be found via `dispatch_to`, not just `block`"
+        );
+
+        // And the router really does enforce Admin here — for a caller who
+        // IS logged in, which is the case the old `Authenticated` verdict
+        // wrongly advertised to.
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "wafer-run/inspector",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let out = route_to_block(
+            &ctx,
+            auth_msg("retrieve", ep_path, "user-1"),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &[],
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "the router must reject a logged-in non-admin on the inspector route"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_access_fails_closed_when_no_route_serves_the_path() {
+        use crate::test_support::{admin_msg, TestContext};
+
+        // No `ROUTES` prefix and no extra route covers `/x/...`, so
+        // `route_to_block` 404s it for EVERY caller. A tool name published
+        // for an unreachable endpoint is pure recon surface, so the
+        // strictest level is the only honest answer.
+        let ep_path = "/x/orphaned";
+        let info = BlockInfo::new("test/orphan", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
+        let ep = info.endpoints[0].clone();
+
+        assert_eq!(
+            effective_access(&info, &ep, &[]),
+            AuthLevel::Admin,
+            "an endpoint no route serves must fail closed, not fall back to Authenticated"
+        );
+
+        // Unreachable in fact, not just in the resolver's opinion — even an
+        // admin gets a 404.
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("test/orphan", std::sync::Arc::new(DispatchProbeBlock));
+        let out = route_to_block(
+            &ctx,
+            admin_msg("retrieve", ep_path),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &[],
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(out, "NotFound").await,
+            "no route serves this path — the router must 404 it, for an admin too"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_access_honors_a_stricter_extra_route() {
+        use crate::test_support::{auth_msg, TestContext};
+
+        // A downstream project's `ImpresspressBuilder::add_route` is
+        // enforced by `route_to_block`'s second loop exactly like a
+        // built-in. Before `extra_routes` was threaded through, this
+        // endpoint matched nothing and resolved to the fallback — again
+        // advertising an Admin-gated tool to every logged-in visitor.
+        let ep_path = "/x/reports/summary";
+        let info = BlockInfo::new("test/reports", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
+        let ep = info.endpoints[0].clone();
+        let extra = vec![ExtraRoute {
+            prefix: "/x/reports".to_string(),
+            access: RouteAccess::Admin,
+            block_name: "test/reports".to_string(),
+        }];
+
+        assert_eq!(
+            effective_access(&info, &ep, &extra),
+            AuthLevel::Admin,
+            "a downstream add_route(Admin) must win over the endpoint's Public declaration"
+        );
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("test/reports", std::sync::Arc::new(DispatchProbeBlock));
+        let out = route_to_block(
+            &ctx,
+            auth_msg("retrieve", ep_path, "user-1"),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &extra,
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "the router must reject a logged-in non-admin on an Admin extra route"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_access_mirrors_a_looser_extra_route_rather_than_hiding_the_tool() {
+        // The other direction, and the reason this does NOT max with
+        // `ep.auth`: `route_to_block`'s extra-route loop enforces
+        // `route.access` alone — it never consults `declared_access`. A
+        // resolver that took the max here would hide a tool the router
+        // genuinely admits anonymously.
+        let ep_path = "/x/public-thing";
+        let info = BlockInfo::new("test/pub", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Admin)]);
+        let ep = info.endpoints[0].clone();
+        let extra = vec![ExtraRoute {
+            prefix: "/x/public-thing".to_string(),
+            access: RouteAccess::Public,
+            block_name: "test/pub".to_string(),
+        }];
+
+        assert_eq!(
+            effective_access(&info, &ep, &extra),
+            AuthLevel::Public,
+            "extra routes are enforced on `route.access` alone, so the resolver must say Public"
+        );
+    }
+
+    #[test]
+    fn feature_gate_name_maps_the_proxy_block_to_its_gated_name() {
+        // The inspector is gated under its impresspress name even though its
+        // `BlockInfo` carries the runtime name — an unmapped lookup would
+        // hit `BlockSettings`' default-enabled branch and ignore the admin
+        // toggle entirely.
+        assert_eq!(
+            feature_gate_name("wafer-run/inspector"),
+            "impresspress/inspector"
+        );
+        assert_eq!(
+            feature_gate_name("impresspress/inspector"),
+            "impresspress/inspector"
+        );
+        assert_eq!(
+            feature_gate_name("impresspress/products"),
+            "impresspress/products"
+        );
+        // A block with no route at all is gated under its own name.
+        assert_eq!(feature_gate_name("test/unrouted"), "test/unrouted");
     }
 
     #[tokio::test]

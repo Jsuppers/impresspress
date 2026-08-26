@@ -209,6 +209,20 @@ pub async fn handle_request(
     if path == "/b/webmcp/manifest.json" {
         let caller = caller_auth_level(&msg);
 
+        // `block_infos` is every REGISTERED block, but `route_to_block`
+        // 404s any block the admin feature toggle has turned off
+        // (routing.rs's feature gate, backed by the live `block_settings`
+        // row). Advertising a disabled block's tools would hand the agent
+        // names that 404 on every call, so the manifest is generated from
+        // the enabled subset only — gated under the same name the router
+        // gates with (`feature_gate_name`; the inspector's `BlockInfo` name
+        // and its route's `block` name differ).
+        let enabled_infos: Vec<BlockInfo> = block_infos
+            .iter()
+            .filter(|b| features.is_block_enabled(routing::feature_gate_name(&b.name)))
+            .cloned()
+            .collect();
+
         // MUST be `generate_webmcp_with`, not `generate_webmcp`. The plain
         // form filters on `ep.auth` alone, but this router admits on
         // `max(prefix_tier, ep.auth)` (routing.rs:440). An endpoint declared
@@ -217,11 +231,13 @@ pub async fn handle_request(
         // leak, but it publishes a tool name the caller cannot use (the
         // recon surface this filtering exists to prevent) and hands the
         // agent a tool that always fails.
-        let body = wafer_core::discovery::generate_webmcp_with(
-            block_infos,
-            caller,
-            routing::effective_access,
-        );
+        //
+        // `extra_routes` is threaded in so a downstream `add_route` — which
+        // `route_to_block` enforces just like a built-in — is resolved too.
+        let body =
+            wafer_core::discovery::generate_webmcp_with(&enabled_infos, caller, |block, ep| {
+                routing::effective_access(block, ep, extra_routes)
+            });
 
         // Per-session by construction: a shared cache serving one visitor's
         // manifest to another would leak the privileged tool surface.
@@ -431,12 +447,12 @@ mod discovery_tests {
     //!     declare schemas, so `wafer_core::discovery::generate_openapi`
     //!     (which skips any endpoint failing `has_schema()`) includes them.
 
-    use wafer_run::{Block, BlockInfo, InputStream};
+    use wafer_run::{AuthLevel, Block, BlockEndpoint, BlockInfo, InputStream};
 
     use super::handle_request;
     use crate::{
         blocks::{auth_ui::AuthUiBlock, files::FilesBlock, products::ProductsBlock},
-        features::AllEnabled,
+        features::{AllEnabled, FeatureConfig},
         test_support::{anon_msg, collect_or_panic, TestContext},
     };
 
@@ -935,6 +951,7 @@ mod discovery_tests {
     }
 
     // -------------------------------------------------------------------
+    // -------------------------------------------------------------------
     // WebMCP manifest — the third discovery document, but auth-filtered and
     // per-session (unlike `/openapi.json` and the agent card, which are
     // anonymous by design).
@@ -973,68 +990,109 @@ mod discovery_tests {
             .collect()
     }
 
-    /// Like `discovery_json`, but the request carries a real, signed
-    /// `Authorization: Bearer` access token for a non-admin user.
+    /// Drive `GET /b/webmcp/manifest.json` through the whole pipeline and
+    /// return the parsed manifest.
     ///
-    /// Deliberately NOT `test_support::auth_msg`, which stamps
-    /// `auth.user_id` directly onto the `Message` before `handle_request`
-    /// ever runs. That would leave `msg.user_id()` non-empty even if the
-    /// WebMCP manifest branch were wrongly placed at step 0 — before
-    /// `extract_auth_meta` populates auth meta from the header — which
-    /// would defeat the one test that exists to catch that placement bug
-    /// (`webmcp_manifest_reflects_an_authenticated_caller`, below). Only a
-    /// Bearer header that step 2 must independently verify exercises the
-    /// ordering.
-    async fn discovery_json_as_user(
+    /// `roles: None` sends no `Authorization` header at all (an anonymous
+    /// visitor). `Some(roles)` mints a real, signed access token carrying
+    /// that `roles` claim — `Some(&[])` is a logged-in non-admin,
+    /// `Some(&["admin"])` an admin.
+    ///
+    /// Deliberately NOT `test_support::auth_msg` / `admin_msg`, which stamp
+    /// `auth.user_id` / `auth.user_roles` directly onto the `Message`
+    /// before `handle_request` ever runs. That would leave the identity
+    /// populated even if the WebMCP manifest branch were wrongly placed at
+    /// step 0 — before `extract_auth_meta` populates auth meta from the
+    /// header — which would defeat the tests that exist to catch that
+    /// placement bug. Only a Bearer header that step 2 must independently
+    /// verify exercises the ordering.
+    async fn webmcp_manifest(
         ctx: &TestContext,
-        path: &str,
-        host: &str,
+        roles: Option<&[&str]>,
+        infos: &[BlockInfo],
+        features: &dyn FeatureConfig,
     ) -> serde_json::Value {
         use std::{collections::HashMap, time::Duration};
 
         use wafer_block_crypto::primitives;
 
         let secret = "test-jwt-secret";
-        let derived = primitives::derive_block_key(
-            secret.as_bytes(),
-            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
-        );
-        let mut claims = HashMap::new();
-        claims.insert("sub".to_string(), serde_json::json!("user-webmcp-1"));
-        claims.insert("type".to_string(), serde_json::json!("access"));
-        // Must match `expected_issuer`'s default
-        // (`crate::blocks::auth::helpers::expected_issuer`) — this test's
-        // `TestContext` has no `WAFER_RUN_SHARED__FRONTEND_URL` configured.
-        claims.insert(
-            "iss".to_string(),
-            serde_json::json!("http://localhost:5173"),
-        );
-        let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
-            .expect("test jwt_sign");
+        let auth_header = roles.map(|roles| {
+            let derived = primitives::derive_block_key(
+                secret.as_bytes(),
+                crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+            );
+            let mut claims = HashMap::new();
+            claims.insert("sub".to_string(), serde_json::json!("user-webmcp-1"));
+            claims.insert("type".to_string(), serde_json::json!("access"));
+            // Must match `expected_issuer`'s default
+            // (`crate::blocks::auth::helpers::expected_issuer`) — this
+            // test's `TestContext` has no `WAFER_RUN_SHARED__FRONTEND_URL`
+            // configured.
+            claims.insert(
+                "iss".to_string(),
+                serde_json::json!("http://localhost:5173"),
+            );
+            claims.insert("roles".to_string(), serde_json::json!(roles));
+            let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+                .expect("test jwt_sign");
+            format!("Bearer {token}")
+        });
 
-        let mut msg = anon_msg("retrieve", path);
-        msg.set_meta("http.header.host", host);
-        let auth_header = format!("Bearer {token}");
+        let mut msg = anon_msg("retrieve", "/b/webmcp/manifest.json");
+        msg.set_meta("http.header.host", "impresspress.example.com");
         let out = handle_request(
             ctx,
             msg,
             InputStream::from_bytes(Vec::new()),
-            Some(&auth_header),
+            auth_header.as_deref(),
             secret,
             false,
-            &AllEnabled,
-            &real_block_infos(),
+            features,
+            infos,
             &[],
         )
         .await;
         let buf = collect_or_panic(out).await;
-        serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
+        serde_json::from_slice(&buf.body).expect("manifest response is valid JSON")
+    }
+
+    /// Every tool name in a manifest.
+    fn tool_names(manifest: &serde_json::Value) -> Vec<&str> {
+        manifest["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name"))
+            .collect()
+    }
+
+    /// A block declaring one Admin-tier agent tool.
+    ///
+    /// Nothing shipped declares one — every real tool today is Public or
+    /// Authenticated — so without this fixture no assertion could tell
+    /// `caller_auth_level`'s Admin branch apart from its Authenticated
+    /// branch: both would produce the same tool set, and an Admin test
+    /// would pass whether or not the branch worked. Mounted under
+    /// `/b/admin/`, so `routing::effective_access` resolves it to Admin the
+    /// same way the router would.
+    fn admin_tool_block() -> BlockInfo {
+        BlockInfo::new(
+            "impresspress/admin",
+            "0.0.1",
+            "http-handler@v1",
+            "admin tool probe",
+        )
+        .endpoints(vec![BlockEndpoint::get("/b/admin/api/tool-probe")
+            .summary("Admin-only probe")
+            .auth(AuthLevel::Admin)
+            .agent_tool("admin_only_probe", "An admin-only probe tool.")])
     }
 
     #[tokio::test]
     async fn webmcp_manifest_is_served_and_versioned() {
         let ctx = TestContext::new().await;
-        let body = discovery_json(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
 
         assert_eq!(body["schema_version"], serde_json::json!(1));
         assert!(
@@ -1046,15 +1104,21 @@ mod discovery_tests {
     #[tokio::test]
     async fn webmcp_manifest_for_anonymous_caller_contains_no_privileged_tools() {
         let ctx = TestContext::new().await;
-        let body = discovery_json(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
 
         // An unauthenticated request must see Public tools only. Anything
-        // requiring a session is recon surface if its name is published here.
-        let rendered = body.to_string();
-        for forbidden in ["list_users", "list_my_purchases"] {
+        // requiring a session is recon surface if its name is published
+        // here. `list_my_purchases` is the shipped Authenticated tool;
+        // `admin_only_probe` (fixture) covers the Admin tier, which nothing
+        // shipped declares.
+        let mut infos = real_block_infos();
+        infos.push(admin_tool_block());
+        let body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let names = tool_names(&body);
+
+        for forbidden in ["list_my_purchases", "admin_only_probe"] {
             assert!(
-                !rendered.contains(forbidden),
-                "anonymous manifest must not name the privileged tool {forbidden}: {rendered}"
+                !names.contains(&forbidden),
+                "anonymous manifest must not name the privileged tool {forbidden}: {names:?}"
             );
         }
     }
@@ -1062,16 +1126,16 @@ mod discovery_tests {
     #[tokio::test]
     async fn anonymous_manifest_exposes_the_storefront_purchase_path() {
         let ctx = TestContext::new().await;
-        let body = discovery_json(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+        let names = tool_names(&body);
 
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|t| t["name"].as_str().expect("name"))
-            .collect();
-
-        for expected in ["get_product", "preview_price", "start_checkout", "get_order_status"] {
+        for expected in [
+            "get_storefront_config",
+            "get_product",
+            "preview_price",
+            "start_checkout",
+            "get_order_status",
+        ] {
             assert!(
                 names.contains(&expected),
                 "anonymous visitors must get the public purchase path; missing {expected}: {names:?}"
@@ -1079,10 +1143,48 @@ mod discovery_tests {
         }
     }
 
+    /// Pins the producer-to-consumer contract for `invocation` — the object
+    /// `ui/assets/webmcp.js` reads to build every request it makes.
+    ///
+    /// `webmcp.js` has no test infrastructure of its own, and the wafer-run
+    /// rev this consumes is pinned to a branch that is still moving, so a
+    /// producer-side rename (`path_params` to `pathParams`, a dropped
+    /// `method`, a changed placeholder syntax) would otherwise land silently
+    /// green here and break every tool at runtime. Asserting the WHOLE
+    /// object — not a key at a time — is what makes a rename fail.
+    ///
+    /// `get_order_status` is the tool that exercises both a path param and
+    /// a query param, so it pins the most contract surface of the six.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_the_producer_invocation_contract() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "get_order_status")
+            .unwrap_or_else(|| panic!("get_order_status must be published: {body}"));
+
+        assert_eq!(
+            tool["invocation"],
+            serde_json::json!({
+                "method": "get",
+                "path": "/b/products/orders/{id}/status",
+                "path_params": ["id"],
+                "query_params": ["receipt_token"],
+                "body_params": [],
+            }),
+            "invocation shape drifted from what ui/assets/webmcp.js reads: {tool}"
+        );
+    }
+
     #[tokio::test]
     async fn webmcp_manifest_is_not_cacheable() {
         let ctx = TestContext::new().await;
-        let headers = discovery_headers(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+        let headers =
+            discovery_headers(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
 
         let cache_control = headers
             .get("Cache-Control")
@@ -1098,21 +1200,77 @@ mod discovery_tests {
     async fn webmcp_manifest_reflects_an_authenticated_caller() {
         let ctx = TestContext::with_auth().await;
 
-        // Build a request carrying a valid session for a non-admin user.
-        let body = discovery_json_as_user(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
-
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|t| t["name"].as_str().expect("name"))
-            .collect();
+        // A valid session for a non-admin user (empty `roles` claim).
+        let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
+        let names = tool_names(&body);
 
         assert!(
             names.contains(&"list_my_purchases"),
             "an authenticated caller must receive Authenticated-level tools — if this \
              fails with only Public tools present, the manifest branch is running \
              before auth meta is set (step 0 instead of after step 2): {names:?}"
+        );
+    }
+
+    /// `caller_auth_level`'s Admin branch: an `admin` role in the verified
+    /// JWT must raise the manifest's ceiling to Admin, not stop at
+    /// Authenticated.
+    #[tokio::test]
+    async fn webmcp_manifest_reflects_an_admin_caller() {
+        let ctx = TestContext::with_auth().await;
+        let mut infos = real_block_infos();
+        infos.push(admin_tool_block());
+
+        let as_admin = webmcp_manifest(&ctx, Some(&["admin"]), &infos, &AllEnabled).await;
+        let admin_names = tool_names(&as_admin);
+        assert!(
+            admin_names.contains(&"admin_only_probe"),
+            "an admin session must receive Admin-level tools: {admin_names:?}"
+        );
+        assert!(
+            admin_names.contains(&"list_my_purchases"),
+            "an admin is also authenticated — the lower tiers must still be there: {admin_names:?}"
+        );
+
+        // The discriminating half: the SAME blocks, for a logged-in caller
+        // without the role. If this passed too, the assertions above would
+        // prove nothing about the Admin branch specifically.
+        let as_user = webmcp_manifest(&ctx, Some(&[]), &infos, &AllEnabled).await;
+        let user_names = tool_names(&as_user);
+        assert!(
+            !user_names.contains(&"admin_only_probe"),
+            "a logged-in non-admin must NOT receive Admin-level tools: {user_names:?}"
+        );
+    }
+
+    /// The manifest must not advertise tools from a block the admin
+    /// disable toggle has turned off — `route_to_block` 404s every call to
+    /// such a block, so every advertised tool would fail.
+    #[tokio::test]
+    async fn disabled_block_contributes_no_tools() {
+        // Everything on except `impresspress/products` — the shape a live
+        // admin toggle produces.
+        struct ProductsDisabled;
+        impl FeatureConfig for ProductsDisabled {
+            fn is_block_enabled(&self, full_name: &str) -> bool {
+                full_name != "impresspress/products"
+            }
+        }
+
+        let ctx = TestContext::new().await;
+        let infos = real_block_infos();
+
+        let enabled = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        assert!(
+            tool_names(&enabled).contains(&"get_product"),
+            "precondition: the products block publishes tools while enabled: {enabled}"
+        );
+
+        let disabled = webmcp_manifest(&ctx, None, &infos, &ProductsDisabled).await;
+        assert_eq!(
+            tool_names(&disabled),
+            Vec::<&str>::new(),
+            "a disabled block must contribute no tools — every call to it 404s: {disabled}"
         );
     }
 }

@@ -366,7 +366,7 @@ mod tests {
             .find(|e| e.path == "/b/static/webmcp-{hash}.js")
             .expect("webmcp asset endpoint not declared in SystemBlock::info()");
         assert_eq!(
-            crate::routing::effective_access(&info, ep),
+            crate::routing::effective_access(&info, ep, &[]),
             wafer_run::AuthLevel::Public,
             "the WebMCP script must load for anonymous visitors — an \
              effective auth level above Public would silently disable tools \
