@@ -176,7 +176,10 @@ Expected: clean. The new field is additive with a serde default, so existing str
 - [ ] **Step 10: Commit**
 
 ```bash
-git add crates/wafer-block/src/types/endpoint.rs crates/wafer-block/src/lib.rs
+git add crates/wafer-block/src/types/endpoint.rs \
+        crates/wafer-block/src/types/mod.rs \
+        crates/wafer-block/src/lib.rs \
+        crates/wafer-run/src/lib.rs
 git commit -m "feat(wafer-block): add opt-in AgentTool metadata to BlockEndpoint
 
 Marks an endpoint as agent-callable with a curated name and description.
@@ -290,6 +293,35 @@ fn inline_refs_drops_unresolvable_ref_to_empty_schema() {
     let out = inline_refs(&schema);
     assert_eq!(out["properties"]["x"], json!({}));
 }
+
+#[test]
+fn inline_refs_preserves_keywords_sitting_beside_a_ref() {
+    // JSON Schema 2020-12 allows keywords alongside `$ref`, and schemars uses
+    // that for field-level docs on a named type. Returning only the target
+    // would delete every such description.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "description": "Current lifecycle status of the product.",
+                "$ref": "#/$defs/ProductStatus"
+            }
+        },
+        "$defs": {
+            "ProductStatus": { "type": "string", "enum": ["draft", "active"] }
+        }
+    });
+    let out = inline_refs(&schema);
+    let status = &out["properties"]["status"];
+
+    assert_eq!(
+        status["description"],
+        json!("Current lifecycle status of the product."),
+        "a description beside $ref must survive inlining: {status}"
+    );
+    assert_eq!(status["type"], json!("string"));
+    assert_eq!(status["enum"], json!(["draft", "active"]));
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -330,10 +362,27 @@ fn resolve_refs(node: &Value, defs: &Value, depth: u8) -> Value {
                 let target = reference
                     .strip_prefix("#/$defs/")
                     .and_then(|name| defs.get(name));
-                return match target {
+                let mut resolved = match target {
                     Some(found) => resolve_refs(found, defs, depth + 1),
                     None => json!({}),
                 };
+
+                // JSON Schema 2020-12 allows keywords ALONGSIDE `$ref`, and
+                // schemars uses that: a doc-commented field of a named type
+                // emits `{"description": "...", "$ref": "#/$defs/Status"}`.
+                // Returning only the target would silently delete every field
+                // description — the exact editorial text the migration works
+                // to preserve. Siblings win over the target's own keys, since
+                // they are the more specific annotation.
+                if let (Some(out), Some(src)) = (resolved.as_object_mut(), Some(map)) {
+                    for (key, value) in src {
+                        if key == "$ref" {
+                            continue;
+                        }
+                        out.insert(key.clone(), resolve_refs(value, defs, depth));
+                    }
+                }
+                return resolved;
             }
 
             let mut out = serde_json::Map::new();
@@ -392,6 +441,8 @@ terminate instead of recursing forever."
 - Produces: `fn agent_input_schema(ep: &BlockEndpoint) -> (Value, Vec<String>, Vec<String>, Vec<String>)` — returns `(merged_schema, path_param_names, query_param_names, body_param_names)`. An agent supplies one flat object; the returned name lists tell the client which properties belong in the URL path, the query string, and the request body.
 
 **Why flat:** WebMCP gives a tool exactly one `inputSchema`. An agent should not have to understand HTTP parameter placement. Provenance is recorded separately so the client can reassemble a correct request.
+
+**Import note:** `discovery.rs` currently imports `BlockEndpoint` only under `#[cfg(test)]` (lines 4-5). `agent_input_schema` takes `&BlockEndpoint` in non-test code, so promote that import to module level or the crate will not build.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -854,6 +905,206 @@ git commit -m "feat(wafer-core): add generate_webmcp auth-filtered tool manifest
 Third projection of BlockInfo::endpoints alongside generate_openapi and
 generate_agent_card. Opt-in via AgentTool metadata, and filtered to the
 caller's AuthLevel so unusable tool names never reach the client."
+```
+
+---
+
+### Task 5: Make the derived schemas self-contained at the source
+
+**This task blocks Plan 2.** Do not begin the derive migration until it has landed — every schema Plan 2 produces would otherwise be structurally broken inside `/openapi.json`, and Plan 2's snapshot reviewers would be rubber-stamping dangling references.
+
+**Files:**
+- Modify: `crates/wafer-block/src/types/endpoint.rs:208-238` (the four schemars builders)
+- Test: same file, `#[cfg(test)] mod block_endpoint_tests`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: `.input::<T>()`, `.output::<T>()`, `.path_params::<T>()`, `.query_params::<T>()` emitting schemas with no `$ref`, no `$defs`, no `$schema`, and no root `title`
+
+**The problem.** `schemars::schema_for!(T)` produces a *document*: a root schema plus a `$defs` table, with internal `#/$defs/X` references. `generate_openapi` embeds that value verbatim into `requestBody` and `responses` (`wafer-core/src/discovery.rs:94-133`). Inside an OpenAPI document, `#/$defs/X` resolves against the *document* root — where no `$defs` exists. Every reference dangles.
+
+It is worse for parameters: `extract_params` (`discovery.rs:23-48`) lifts each property subschema into a standalone parameter object and drops the root `$defs` entirely, so any enum-typed path or query field becomes a `$ref` with no referent anywhere in the document.
+
+This affects `/openapi.json` — a surface that works today — so it is a regression the migration would introduce, not a WebMCP concern. Fixing it in the builders fixes both consumers at once and makes `inline_refs` (Task 2) a defensive net rather than the only line of defence.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn derived_input_schema_is_self_contained() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    enum Status { Draft, Active }
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct CreateProduct {
+        /// Human-readable product name.
+        name: String,
+        /// Current lifecycle status.
+        status: Status,
+    }
+
+    let ep = BlockEndpoint::post("/b/products").input::<CreateProduct>();
+    let schema = ep.input_schema.expect("input schema set");
+    let rendered = schema.to_string();
+
+    assert!(
+        !rendered.contains("$ref"),
+        "derived schemas are embedded into OpenAPI documents where #/$defs \
+         does not resolve — no $ref may survive: {rendered}"
+    );
+    assert!(
+        !rendered.contains("$defs"),
+        "the $defs table must not travel with the schema: {rendered}"
+    );
+    assert!(
+        schema.get("$schema").is_none(),
+        "root $schema is meaningless inside an OpenAPI requestBody: {rendered}"
+    );
+}
+
+#[test]
+fn derived_schema_keeps_field_descriptions() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct WithDocs {
+        /// Human-readable product name.
+        name: String,
+    }
+
+    let ep = BlockEndpoint::post("/b/x").input::<WithDocs>();
+    let schema = ep.input_schema.expect("input schema set");
+    assert_eq!(
+        schema["properties"]["name"]["description"],
+        serde_json::json!("Human-readable product name."),
+        "doc comments must reach the schema — Plan 2 relies on this to \
+         preserve editorial text: {schema}"
+    );
+}
+
+#[test]
+fn derived_query_params_schema_inlines_enums() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    enum SortOrder { Asc, Desc }
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct ListQuery { sort: Option<SortOrder> }
+
+    let ep = BlockEndpoint::get("/b/x").query_params::<ListQuery>();
+    let schema = ep.query_params.expect("query params schema set");
+    assert!(
+        !schema.to_string().contains("$ref"),
+        "extract_params lifts each property out standalone and drops $defs, \
+         so an enum-typed query param must already be inlined: {schema}"
+    );
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test -p wafer-block --features json-schema derived_`
+Expected: FAIL — the current builders use `schema_for!` and emit `$defs`/`$ref`.
+
+- [ ] **Step 3: Switch the builders to an inlining generator**
+
+Replace `schemars::schema_for!(T)` in all four builders with a shared helper that configures the generator to inline subschemas and strips the document-level keys.
+
+In schemars v1 this is `SchemaSettings` with `inline_subschemas: true`, driven through a `SchemaGenerator`. **Verify the exact API against the vendored schemars 1.x source before writing it** — the module path moved between 0.8 and 1.0, and guessing it will cost more than reading it. Look for `SchemaSettings::default().with(|s| s.inline_subschemas = true)` and the generator's `into_root_schema_for::<T>()`.
+
+```rust
+/// Derive a self-contained JSON Schema for `T`.
+///
+/// `schema_for!` produces a *document* — a root schema plus a `$defs` table
+/// with internal `#/$defs/X` references. These schemas get embedded into
+/// OpenAPI documents (and lifted apart into individual parameter objects),
+/// where those references have no referent. So we inline everything and drop
+/// the document-level keys.
+///
+/// Recursive types are the reason `inline_subschemas` is not universally
+/// safe: a type that contains itself cannot be fully inlined. schemars
+/// breaks such cycles by keeping a `$ref`; if a contract ever does that, the
+/// self-contained tests above fail loudly rather than shipping a dangling
+/// reference.
+#[cfg(feature = "json-schema")]
+fn self_contained_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    // Construct the inlining generator here — exact API per the schemars 1.x
+    // source, see Step 3 note.
+    let schema = /* generator with inline_subschemas = true */;
+    let mut value = serde_json::to_value(schema).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("title");
+        obj.remove("$defs");
+    }
+    value
+}
+```
+
+Then each builder becomes, e.g.:
+
+```rust
+    #[cfg(feature = "json-schema")]
+    pub fn input<T: schemars::JsonSchema>(mut self) -> Self {
+        self.input_schema = Some(self_contained_schema::<T>());
+        self
+    }
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p wafer-block --features json-schema`
+Expected: PASS, all three new tests plus every existing one.
+
+- [ ] **Step 5: Confirm the recursion escape hatch behaves**
+
+Add a self-referential type and confirm the failure is loud rather than silent:
+
+```rust
+#[test]
+fn recursive_type_does_not_silently_emit_a_dangling_ref() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct Condition {
+        all_of: Vec<Condition>,
+    }
+
+    let ep = BlockEndpoint::post("/b/x").input::<Condition>();
+    let schema = ep.input_schema.expect("input schema set");
+    let rendered = schema.to_string();
+
+    // schemars must break the cycle somehow. Whatever it does, a `$ref`
+    // pointing at a `$defs` table we just deleted is the one unacceptable
+    // outcome — `inline_refs` in generate_webmcp would resolve it to `{}`,
+    // and generate_openapi would emit it dangling.
+    assert!(
+        !rendered.contains("\"$ref\""),
+        "recursive contract produced a dangling $ref after $defs removal — \
+         keep $defs for this case, or reject recursive contracts explicitly: \
+         {rendered}"
+    );
+}
+```
+
+If this test fails, **do not delete it and move on.** The correct response is to keep `$defs` when inlining could not fully resolve, and teach `generate_openapi` to hoist it into `components/schemas` — a larger change that must be made deliberately. `products/contracts.rs` has a `Condition` type with exactly this shape, so this is not hypothetical.
+
+- [ ] **Step 6: Verify existing discovery output**
+
+Run: `cargo test --workspace`
+Expected: PASS. No impresspress endpoint uses the typed builders yet, so `/openapi.json` output is unchanged.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/wafer-block/src/types/endpoint.rs
+git commit -m "fix(wafer-block): emit self-contained schemas from typed builders
+
+schema_for! produces a root schema plus a \$defs table with internal
+refs. These schemas are embedded into OpenAPI documents and lifted apart
+into parameter objects, where #/\$defs has no referent — every reference
+would dangle. Inline subschemas and drop the document-level keys."
 ```
 
 ---

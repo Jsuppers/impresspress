@@ -102,27 +102,29 @@ Add above `handle_request` in `pipeline.rs`:
 /// The `AuthLevel` ceiling for this request, used to filter the WebMCP tool
 /// manifest.
 ///
-/// Admin is decided by the SAME merged role resolution every other admin
-/// check uses — `get_user_roles` merges the inline `users.role` column with
-/// `USER_ROLES_TABLE` rows (see `blocks/auth/service.rs` around line 403).
-/// Introducing a second notion of "is this caller an admin" is how the two
-/// drift apart.
+/// Reads the SAME source the router's admin gate enforces with:
+/// `crate::util::is_admin` (`util.rs:173`) inspects the `auth.user_roles`
+/// meta set from the verified JWT by `extract_auth_meta`, and
+/// `routing.rs:375` admits `RouteAccess::Admin` on exactly that basis.
 ///
-/// Fails closed: any resolution error yields `Public`. Under-reporting hides
-/// tools a caller could have used, which is a UX problem; over-reporting
-/// publishes tool names to someone who cannot invoke them, which is the
-/// SEC-073 recon problem.
-async fn caller_auth_level(ctx: &dyn Context, msg: &Message) -> AuthLevel {
-    let user_id = msg.user_id();
-    if user_id.is_empty() {
+/// It is tempting to query roles from the database instead. Do not — the
+/// manifest would then answer a different question than the gate. A user
+/// granted admin in the roles table after their token was minted would be
+/// advertised admin tools that the router then 403s (publishing tool names
+/// to someone who cannot invoke them, the precise SEC-073 problem this
+/// filtering exists to prevent), and a revoked admin whose JWT is still live
+/// would be under-reported while the router still admits their calls. Same
+/// source, no drift — and no DB round trip per page view.
+///
+/// Synchronous and infallible by construction: there is nothing to fail.
+fn caller_auth_level(msg: &Message) -> AuthLevel {
+    if msg.user_id().is_empty() {
         return AuthLevel::Public;
     }
-
-    match crate::blocks::auth::helpers::get_user_roles(ctx, user_id).await {
-        Ok(roles) if roles.iter().any(|r| r == "admin") => AuthLevel::Admin,
-        Ok(_) => AuthLevel::Authenticated,
-        Err(_) => AuthLevel::Public,
+    if crate::util::is_admin(msg) {
+        return AuthLevel::Admin;
     }
+    AuthLevel::Authenticated
 }
 ```
 
@@ -137,7 +139,7 @@ Insert **after** the step-2 auth block (after line 170, where `let user_id = msg
     // identity — the discovery documents at step 0 are anonymous by design,
     // this one is not.
     if path == "/b/webmcp/manifest.json" {
-        let caller = caller_auth_level(ctx, &msg).await;
+        let caller = caller_auth_level(&msg);
         let body = wafer_core::discovery::generate_webmcp(block_infos, caller);
 
         // Per-session by construction: a shared cache serving one visitor's
@@ -183,7 +185,9 @@ async fn webmcp_manifest_reflects_an_authenticated_caller() {
 
 `discovery_json_as_user` needs adding to `test_support.rs` beside `discovery_json`, differing only in that it attaches a session for a seeded non-admin user. Follow how the existing authenticated tests in `pipeline.rs` construct one.
 
-This test depends on `list_my_purchases` existing, which Task 3 adds. Until then, assert against any `AuthLevel::Authenticated` tool the build actually has, or mark it `#[ignore]` with a note and enable it in Task 3.
+This test depends on the `list_my_purchases` tool, which **Task 3 Step 3b creates** by annotating the existing `GET /b/products/purchases` endpoint (`products/mod.rs:1930`, already `AuthLevel::Authenticated` and already schema'd). Write this test now and expect it red; it goes green in Task 3.
+
+Without at least one annotated Authenticated-level endpoint, the manifest's auth filtering — the core security property of this design — is never exercised above `Public` against real blocks, and the step-0 placement bug has no regression test. That is why Task 3 annotates a privileged endpoint rather than only public ones.
 
 - [ ] **Step 6: Run tests to verify they pass**
 
@@ -339,9 +343,40 @@ pub fn webmcp_js_url() -> &'static str {
 }
 ```
 
-- [ ] **Step 3: Serve it**
+- [ ] **Step 3: Serve it AND declare it — both, or anonymous visitors get a login redirect**
 
-`crates/impresspress-core/src/blocks/system.rs` serves everything under `STATIC_PREFIX`. Find where it matches the hashed htmx URL and add a matching arm for the webmcp script, returning `assets::webmcp_js()` with `Content-Type: application/javascript` and the same long-lived cache headers the other hashed assets use. The content hash in the URL makes immutable caching safe.
+Two edits in `crates/impresspress-core/src/blocks/system.rs`, and the second is easy to miss:
+
+**3a. Serve the bytes.** Find where the block matches the hashed htmx URL and add a matching arm returning `assets::webmcp_js()` with `Content-Type: application/javascript` and the same long-lived cache headers the other hashed assets use. The content hash in the URL makes immutable caching safe.
+
+**3b. Declare the endpoint.** Add to the `endpoints` list at `system.rs:21-38`, beside the other static assets:
+
+```rust
+BlockEndpoint::get("/b/static/webmcp-{hash}.js").summary("Embedded WebMCP registration JS"),
+```
+
+**Skipping 3b breaks the anonymous storefront demo.** `declared_access` (`routing.rs:346-353`) fails closed to `AuthLevel::Authenticated` for any path a block does not declare. htmx is publicly fetchable only because `system.rs:23` declares it. An undeclared `webmcp-{hash}.js` would return a login redirect to anonymous visitors, so the tools would silently never register for exactly the audience the storefront demo targets — and Step 5's unit test only checks that the tag is present in the HTML, so it would pass while the page is broken.
+
+- [ ] **Step 3c: Test that the asset is publicly reachable**
+
+A tag-presence test cannot catch the above. Add a routing-level test asserting the URL resolves as `Public`:
+
+```rust
+#[test]
+fn webmcp_script_asset_is_publicly_reachable() {
+    let infos = vec![SystemBlock::new().info()];
+    let access = crate::routing::declared_access(&infos, "GET", assets::webmcp_js_url());
+    assert_eq!(
+        access,
+        AuthLevel::Public,
+        "the WebMCP script must load for anonymous visitors — an undeclared \
+         static path fails closed to Authenticated and would silently disable \
+         tools on the public storefront"
+    );
+}
+```
+
+Match `declared_access`'s real signature and the `SystemBlock` constructor to the code; read `routing.rs:346` and its existing tests first.
 
 - [ ] **Step 4: Inject the tag on every page**
 
@@ -421,10 +456,19 @@ fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
         .filter_map(|ep| ep.agent_tool.as_ref().map(|t| (t.name.as_str(), ep.path.as_str())))
         .collect();
 
-    assert_eq!(named.get("search_products"), Some(&"/b/products/storefront"));
+    assert_eq!(
+        named.get("get_storefront_config"),
+        Some(&"/b/products/storefront/config")
+    );
     assert_eq!(
         named.get("get_product"),
         Some(&"/b/products/storefront/{product_id}")
+    );
+    assert_eq!(
+        named.get("list_my_purchases"),
+        Some(&"/b/products/purchases"),
+        "at least one Authenticated-level tool must exist, or the manifest's \
+         auth filtering is never exercised above Public"
     );
     assert_eq!(
         named.get("preview_price"),
@@ -506,7 +550,33 @@ BlockEndpoint::get("/b/products/orders/{id}/status")
     ),
 ```
 
-Add `search_products` to whichever endpoint lists storefront products. If no public list endpoint exists, **do not invent one in this plan** — drop `search_products` from the test in Step 1 and note the gap, since adding a new endpoint is a scope change rather than an annotation.
+```rust
+BlockEndpoint::get("/b/products/storefront/config")
+    // ...
+    .agent_tool(
+        "get_storefront_config",
+        "Get this store's checkout configuration, including whether embedded \
+         checkout is available. Call once before starting a checkout.",
+    ),
+```
+
+**There is no public product-list endpoint.** Only `storefront.js`, `storefront/config`, and `storefront/{product_id}` exist under `/b/products/storefront*`, so a `search_products` tool has nothing to call. Adding a list endpoint is a scope change, not an annotation — it is deliberately excluded. The agent reaches a product by id, typically from a link on the page it is already on.
+
+- [ ] **Step 3b: Annotate one Authenticated-level endpoint**
+
+`GET /b/products/purchases` (`products/mod.rs:1930`) is already `AuthLevel::Authenticated` and already carries `query_params_schema` and `output_schema`:
+
+```rust
+BlockEndpoint::get("/b/products/purchases")
+    // ... existing summary/auth/schemas unchanged ...
+    .agent_tool(
+        "list_my_purchases",
+        "List the signed-in customer's own past purchases. Requires a signed-in \
+         session; returns nothing useful for anonymous visitors.",
+    ),
+```
+
+This is not decoration. It is the only thing that makes the manifest's auth filtering testable against real blocks, and it is what turns Task 1 Step 5's regression test — the one that catches the step-0 placement bug — from unimplementable into green.
 
 - [ ] **Step 4: Run tests to verify they pass**
 

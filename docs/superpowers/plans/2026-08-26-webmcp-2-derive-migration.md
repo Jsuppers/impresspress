@@ -10,7 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-26-webmcp-design.md`
 
-**Repo:** All work is in `impresspress`. Plan 1's wafer-run changes are **not** required for this plan — `.input::<T>()` and friends already exist in the pinned wafer-block. Plans 1 and 2 can run in parallel.
+**Repo:** All work is in `impresspress`.
+
+**Blocked by Plan 1 Task 5.** The typed builders as they ship today emit `schema_for!` output — a root schema plus a `$defs` table with internal `#/$defs/X` refs. `generate_openapi` embeds that verbatim (`wafer-core/src/discovery.rs:94-133`) and `extract_params` lifts properties out while discarding `$defs`, so every migrated schema would put dangling references into `/openapi.json`. Plan 1 Task 5 fixes this in the builders. Starting here first means the snapshot reviews below would be approving structurally broken schemas.
+
+Plan 1's other four tasks are independent and may run in parallel with this one.
 
 ## Global Constraints
 
@@ -76,9 +80,23 @@ Create `crates/impresspress-core/tests/openapi_snapshot.rs`:
 
 use std::path::PathBuf;
 
-/// Blocks under migration. Add a block here *before* migrating it, so its
-/// pre-migration shape is committed and the diff is meaningful.
-const SNAPSHOTTED_BLOCKS: &[&str] = &["products", "auth_ui", "files", "messages", "admin"];
+/// Blocks under migration, mapped to the URL prefixes they actually serve.
+///
+/// **The prefix is NOT derivable from the block name**, and assuming it is
+/// makes this whole gate silently vacuous:
+///
+/// * `auth_ui` serves `/b/auth/*` — nothing is under `/b/auth_ui/`.
+/// * `files` serves TWO prefixes, `/b/storage/*` and `/b/cloudstorage/*`.
+///
+/// A name-derived prefix would produce a permanently empty snapshot for both,
+/// which passes forever and reviews nothing.
+const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
+    ("products", &["/b/products"]),
+    ("auth_ui", &["/b/auth"]),
+    ("files", &["/b/storage", "/b/cloudstorage"]),
+    ("messages", &["/b/messages"]),
+    ("admin", &["/b/admin"]),
+];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
@@ -86,15 +104,14 @@ fn snapshot_dir() -> PathBuf {
 
 /// Every path in the generated OpenAPI document belonging to `block`,
 /// pretty-printed with sorted keys so the output is diff-stable.
-fn block_openapi(doc: &serde_json::Value, block: &str) -> String {
-    let prefix = format!("/b/{block}");
+fn block_openapi(doc: &serde_json::Value, prefixes: &[&str]) -> String {
     let paths = doc["paths"].as_object().expect("openapi paths object");
 
     // BTreeMap gives deterministic key ordering regardless of how the
     // generator happened to insert them.
     let filtered: std::collections::BTreeMap<&String, &serde_json::Value> = paths
         .iter()
-        .filter(|(path, _)| path.starts_with(&prefix))
+        .filter(|(path, _)| prefixes.iter().any(|p| path.starts_with(p)))
         .collect();
 
     serde_json::to_string_pretty(&filtered).expect("serialize block paths")
@@ -110,9 +127,22 @@ async fn openapi_matches_committed_snapshots() {
 
     let mut failures = Vec::new();
 
-    for block in SNAPSHOTTED_BLOCKS {
-        let actual = block_openapi(&doc, block);
+    for (block, prefixes) in SNAPSHOTTED_BLOCKS {
+        let actual = block_openapi(&doc, prefixes);
         let path = snapshot_dir().join(format!("{block}.openapi.json"));
+
+        // An empty snapshot for a block that has schema-carrying endpoints
+        // means the prefix map is wrong and this block is being "guarded" by
+        // a diff that can never change. Only admin is legitimately empty
+        // before Task 5.
+        if *block != "admin" && actual.trim() == "{}" {
+            failures.push(format!(
+                "\n=== {block} ===\nEMPTY snapshot. This block's prefixes {prefixes:?} matched no \
+                 OpenAPI paths, so its gate is vacuous. Either the prefix map is wrong or the \
+                 block is missing from the document's block list."
+            ));
+            continue;
+        }
 
         if updating || !path.exists() {
             std::fs::write(&path, &actual).expect("write snapshot");
@@ -136,20 +166,47 @@ async fn openapi_matches_committed_snapshots() {
 }
 ```
 
-- [ ] **Step 4: Add the two test-support helpers the harness needs**
+- [ ] **Step 4: Add the test-support helpers — and widen the block list**
 
-The harness calls `test_support::openapi_document(&ctx)`. `TestContext` already exists in `crates/impresspress-core/src/test_support.rs`; the OpenAPI helper does not. Read `pipeline.rs`'s existing test module to find how its tests fetch `/openapi.json` — there is already a private `discovery_json(&ctx, path, host)` helper used at `pipeline.rs:441` and `pipeline.rs:459`.
+The harness calls `test_support::openapi_document(&ctx)`. `TestContext` already exists in `crates/impresspress-core/src/test_support.rs`; the OpenAPI helper does not. Read `pipeline.rs`'s existing test module: there is a private `discovery_json(&ctx, path, host)` helper, and it builds the document from `real_block_infos()` at `pipeline.rs:392-398`.
 
-Promote that logic into `test_support.rs` as:
+**`real_block_infos()` currently returns only three blocks:**
+
+```rust
+    fn real_block_infos() -> Vec<BlockInfo> {
+        vec![
+            AuthUiBlock::new().info(),
+            FilesBlock::new().info(),
+            ProductsBlock::new().info(),
+        ]
+    }
+```
+
+Admin and messages are absent, so they never appear in the generated document at all. Left unchanged, their snapshots are empty for a reason that has nothing to do with their schemas, and **Task 5's `admin_json_api_appears_in_openapi` test can never pass no matter how correct the migration is.**
+
+Extend it to every Worker-shipping block:
+
+```rust
+    fn real_block_infos() -> Vec<BlockInfo> {
+        vec![
+            AuthUiBlock::new().info(),
+            FilesBlock::new().info(),
+            ProductsBlock::new().info(),
+            AdminBlock::new().info(),
+            MessagesBlock::new().info(),
+        ]
+    }
+```
+
+Match the real constructor for each block — read how each is built elsewhere in the crate rather than assuming `::new()` for all of them. Update the stale doc comment above it, which still says "the three blocks this PR added schemas to".
+
+Then promote the helpers into `test_support.rs`:
 
 ```rust
 /// Fetch the generated `/openapi.json` document. Shared by pipeline tests
 /// and the per-block snapshot gate.
 #[cfg(feature = "test-support")]
 pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
-    // Mirror the existing `discovery_json` helper in pipeline.rs: build a GET
-    // for /openapi.json through `handle_request` with a fixed host, then
-    // parse the JSON body.
     discovery_json(ctx, "/openapi.json", "impresspress.example.com").await
 }
 ```
@@ -163,14 +220,20 @@ Expected: PASS, and `crates/impresspress-core/tests/snapshots/` now contains fiv
 
 Sanity-check them by eye: `products.openapi.json` should be substantial, `admin.openapi.json` should be nearly empty (admin has 17 endpoints and zero schemas, so `has_schema()` filters them all out — an empty snapshot here is correct, not a bug).
 
-- [ ] **Step 6: Verify the gate actually catches a change**
+- [ ] **Step 6: Verify the gate catches a change in EVERY block, not just products**
 
-Temporarily add a junk property to any hand-written schema in `products/mod.rs` — for example add `"zzz_probe": {"type": "string"}` to `product_schema`'s properties at line 308.
+This is the step that decides whether the rest of the plan is safe. Probing only products would confirm the one block whose prefix happens to match its name, and miss that auth_ui and files were silently unguarded.
 
-Run: `cargo test -p impresspress-core --test openapi_snapshot`
-Expected: FAIL, naming `products`. **If it passes, the gate is not wired correctly and the rest of this plan is unsafe** — fix it before continuing.
+For **each** of products, auth_ui, files, and messages in turn:
 
-Revert the junk property and re-run to confirm PASS.
+1. Add a junk property to one of that block's hand-written schemas — e.g. `"zzz_probe": {"type": "string"}` into a `properties` object.
+2. Run: `cargo test -p impresspress-core --test openapi_snapshot`
+3. Expected: FAIL, naming that specific block.
+4. Revert the junk property; re-run and confirm PASS.
+
+**If any block's probe does not produce a failure naming that block, its gate is vacuous.** The most likely cause is a wrong prefix in `SNAPSHOTTED_BLOCKS` or the block missing from `real_block_infos()`. Fix it before migrating anything — a green gate that cannot fail is worse than no gate, because it manufactures false confidence in every diff review downstream.
+
+Admin is exempt from this probe: it has no schemas until Task 5, so its snapshot is legitimately empty and the harness's empty-snapshot check allows only admin.
 
 - [ ] **Step 7: Commit**
 
@@ -189,8 +252,10 @@ drop descriptions silently; this makes both visible as a diff."
 
 **Files:**
 - Modify: `crates/impresspress-core/src/blocks/products/contracts.rs`
-- Modify: `crates/impresspress-core/src/blocks/products/mod.rs:308-800` (the ~30 `let *_schema = json!(...)` variables) and the endpoint declarations from line 1055 onward
+- Modify: `crates/impresspress-core/src/blocks/products/mod.rs` — **48** `let *_schema = json!(...)` bindings (lines 308-800) and **119** `BlockEndpoint::` declarations from line 1055 onward
 - Test: `crates/impresspress-core/tests/snapshots/products.openapi.json` (the gate)
+
+**Scale warning:** this is the largest task in the plan by a wide margin — 119 endpoint declarations, of which roughly 95 carry schemas, fed by 48 hand-written schema bindings. Budget accordingly; it is not a single sitting.
 
 **Interfaces:**
 - Consumes: the snapshot gate from Task 1
@@ -317,7 +382,9 @@ Match the field names to what `record_schema` / `record_list_schema` actually em
 
 - [ ] **Step 9: Migrate the remaining endpoints in batches**
 
-Work through the rest of the ~33 schema-carrying products endpoints in groups of roughly five, running the gate after each group. Small batches keep every diff attributable.
+Work through the remaining ~95 schema-carrying products endpoints in groups of roughly five, running the gate after each group and committing per group. Small batches keep every diff attributable; at this volume a large batch produces a diff nobody can meaningfully review, which defeats the gate.
+
+Expect this step to span many commits.
 
 For each: find the type the handler actually uses, swap the builder, read the diff, resolve it.
 
@@ -674,7 +741,7 @@ git commit -m "docs: record real wasm cost of the derive migration"
 - [ ] No `serde_json::json!` schema literal remains in any migrated block's endpoint declarations
 - [ ] Every snapshot change is either an intentional recorded decision or absent
 - [ ] `/openapi.json` and `/.well-known/agent.json` both still return valid documents
-- [ ] No secret, hash, or token appears in any snapshot — grep them for `secret`, `token`, `password`, `hash`
+- [ ] No secret, hash, or credential appears in any snapshot. Grep for `secret`, `password`, `hash`, `token` — then apply judgement: `access_token` and `refresh_token` in login responses and `receipt_token` in guest order status are **legitimate** parts of those contracts and already public. What must never appear is a password hash, a session-signing secret, or an unmasked `*_SECRET`/`*_KEY` config value. A blanket grep-must-be-empty criterion is unsatisfiable and would be waved through; review the hits instead.
 - [ ] Real wasm delta measured and recorded
 
 ## What this plan deliberately does not do

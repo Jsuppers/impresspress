@@ -36,8 +36,8 @@ This explains the coverage gap directly:
 
 | Block | Endpoints | Schema calls | Ships in Worker |
 |---|---:|---:|---|
-| products | 33 schema-carrying | ~30 schema vars | yes |
-| auth_ui | 18 | 8 | yes |
+| products | 119 (~95 schema-carrying) | 48 schema vars | yes |
+| auth_ui | 17 | 8 | yes |
 | files | — | 4 | yes |
 | messages | — | 3-7 | yes |
 | admin | 17 | 0 | yes |
@@ -152,6 +152,28 @@ The commerce path is already fully schema'd and `AuthLevel::Public`, and is the 
 
 **Payment stays human-in-the-loop by construction.** `checkout` returns a Stripe-hosted session URL; no tool completes a payment. The agent assembles the order, the human confirms it at Stripe. This is a property of the existing architecture, not a guard bolted on for the occasion.
 
+## Prompt injection and ambient authority
+
+A registered tool's `execute` runs in the visitor's page with their session cookie, and it is same-origin, so it passes the CSRF policy by construction (`csrf.rs:90-143` admits `Sec-Fetch-Site: same-origin`). The agent therefore acts with the user's full ambient authority.
+
+That is inherent to WebMCP and not a flaw in this design, but it sets a hard constraint: **page content can steer the agent.** Any text the agent reads — including user-generated content — is a potential instruction. On a marketplace where sellers control product descriptions, that is a live concern, not a theoretical one.
+
+Policy for this phase:
+
+- **No state-changing endpoint gets `agent_tool` without confirmation semantics stated in its description.** The single write tool in scope, `start_checkout`, satisfies this structurally: it returns a Stripe-hosted URL and cannot complete a payment.
+- **Admin tools are read-only.** The four admin JSON endpoints are `GET`. No agent-invocable admin write exists, which is why admin writes are out of scope rather than merely deferred.
+- **The manifest filter is an affordance, not the gate.** Every tool call traverses the same router authorization as any other request. A tool a caller should not invoke is refused at `routing.rs:375` regardless of what the manifest said.
+
+Revisit this before exposing any agent-invocable write beyond checkout.
+
+## Discovery-surface consistency
+
+The manifest withholds privileged tool names from callers who cannot invoke them. `/openapi.json` does not: it is anonymous and unauthenticated, and SEC-073 (`pipeline.rs:130-142`) withholds only the `Access-Control-Allow-Origin` header in production, not the content. Typing the admin block therefore publishes admin's paths and schemas to same-origin readers for the first time.
+
+These two surfaces now disagree about the same information. **This is a recorded, accepted decision, not an oversight:** `/openapi.json` is intentionally public API documentation, and its admin paths were always reachable — previously undocumented rather than protected. The manifest's filtering exists to avoid *handing an agent* names it cannot use, which is a different goal from concealing the API's shape.
+
+If that trade is ever judged wrong, the fix is to auth-filter `/openapi.json`'s paths the same way, not to loosen the manifest.
+
 ## Migration fidelity gate
 
 This is the highest risk in the plan, and it is not size.
@@ -193,7 +215,7 @@ Replacing curated hand-written schemas with derived ones can silently change the
 
 This work was scoped with [The WebMCP Challenge](https://webmcp.devpost.com/) in view (deadline 2026-09-03 13:00 PDT). The engineering decisions above stand on their own merits and are not contingent on entering; the following are submission-only requirements:
 
-- **`impresspress` has no `LICENSE` file.** The rules require an OSS license visible in the repository's About section. The repo is public and `wafer-run` already carries a license; impresspress does not. This is disqualifying if missed and takes minutes to fix.
+- **`LICENSE` (MIT) added** at the repo root in commit `ea46a30`, matching wafer-run's terms and copyright convention. It is on a feature branch — it must reach the default branch for GitHub's About section to display it.
 - A submission spans both repos, since `generate_webmcp()` lands in wafer-core. Both are public, so this is permitted, but the write-up should name both.
 - Also required: a live URL reachable from the ChatGPT browser, a demo video under 3 minutes, and the tool-registration code visible in-repo.
 
