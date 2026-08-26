@@ -34,7 +34,14 @@ pub const STATEMENT_COUNT: usize = 5;
 pub async fn prune(ctx: &dyn Context) -> MaintenanceResult {
     let now = chrono::Utc::now();
     let now_text = now.to_rfc3339();
-    let rate_cutoff = (now - chrono::Duration::hours(72)).to_rfc3339();
+    // `updated_at` on the auth rate-counter table is stamped by the windowed
+    // upsert with SQL `CURRENT_TIMESTAMP`, which SQLite stores as
+    // `YYYY-MM-DD HH:MM:SS` text (UTC, space separator). The cutoff must use
+    // the same shape: RFC3339's `T`/offset compares wrong lexicographically
+    // on SQLite and does not bind against Postgres's TIMESTAMPTZ column.
+    let rate_cutoff = (now - chrono::Duration::hours(72))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
     let mut result = MaintenanceResult {
         complete: true,
         analyses_deleted: 0,

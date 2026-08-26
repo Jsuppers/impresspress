@@ -3,9 +3,11 @@
 //! Consumed by the Cloudflare runtime; the byte contract is produced by
 //! the CLI's `ReleaseManifest::logical_keys_json()`.
 
-use std::{cell::RefCell, collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use wafer_core::interfaces::storage::service::{StorageError, StorageService};
+
+use crate::isolate_cell::IsolateCell;
 
 /// Checks if a logical key is normalized (no empty components, no `.` or `..`, no leading/trailing slash, no backslash).
 /// Shared by both CLI and runtime inventory validation.
@@ -79,9 +81,12 @@ impl ReleaseInventory {
 
 thread_local! {
     /// Digest-keyed parsed inventory; survives across requests in a wasm
-    /// isolate (thread-per-isolate) and per-thread in native tests.
-    static RELEASE_INVENTORY_CACHE: RefCell<Option<(String, Arc<ReleaseInventory>)>> =
-        const { RefCell::new(None) };
+    /// isolate (thread-per-isolate) and per-thread in native tests. An
+    /// `IsolateCell`, not a `RefCell`: a platform hard stop does not run
+    /// destructors, and dropping the previous inventory inside a held borrow
+    /// is exactly the wedge `isolate_cell` exists to prevent.
+    static RELEASE_INVENTORY_CACHE: IsolateCell<(String, Arc<ReleaseInventory>)> =
+        const { IsolateCell::new() };
 }
 
 /// Fetch the release key inventory object once per isolate and
@@ -93,13 +98,10 @@ pub async fn load_release_inventory(
     expected_sha256: &str,
     storage: &dyn StorageService,
 ) -> Result<Arc<ReleaseInventory>, StorageError> {
-    if let Some(inventory) = RELEASE_INVENTORY_CACHE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .filter(|(key, _)| key == expected_sha256)
-            .map(|(_, inventory)| inventory.clone())
-    }) {
-        return Ok(inventory);
+    if let Some((key, inventory)) = RELEASE_INVENTORY_CACHE.with(IsolateCell::get) {
+        if key == expected_sha256 {
+            return Ok(inventory);
+        }
     }
     let (bytes, _) = storage
         .get(keys_folder, keys_name)
@@ -110,7 +112,7 @@ pub async fn load_release_inventory(
             .map_err(StorageError::Internal)?,
     );
     RELEASE_INVENTORY_CACHE.with(|slot| {
-        *slot.borrow_mut() = Some((expected_sha256.to_string(), inventory.clone()));
+        slot.set((expected_sha256.to_string(), inventory.clone()));
     });
     Ok(inventory)
 }

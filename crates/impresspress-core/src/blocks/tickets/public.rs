@@ -178,6 +178,37 @@ pub async fn submit(
         return public_error(400, &error);
     }
 
+    let now = abuse::now_secs();
+    let identity = abuse::rotating_identity(&identity_secret, now, msg.remote_addr());
+    let identity_limit = abuse::limit(
+        config::u32_value(ctx, config::IDENTITY_MAX, 3).await,
+        config::u64_value(ctx, config::IDENTITY_WINDOW, 3_600).await,
+    );
+    let global_limit = abuse::limit(
+        config::u32_value(ctx, config::GLOBAL_MAX, 100).await,
+        config::u64_value(ctx, config::GLOBAL_WINDOW, 3_600).await,
+    );
+    let (Some(identity_limit), Some(global_limit)) = (identity_limit, global_limit) else {
+        return public_error(503, "Submission limits are unavailable");
+    };
+    // The per-identity limit runs BEFORE the outbound Turnstile Siteverify
+    // call so one client can trigger at most IDENTITY_MAX subrequests per
+    // window; otherwise a flood of schema-valid submissions with garbage
+    // tokens makes this handler an unbounded Siteverify amplifier (and, on
+    // Workers, burns the per-request subrequest budget). The global limit
+    // stays AFTER verification so unverified spam cannot consume the shared
+    // bucket and lock out legitimate reporters.
+    if let Some(response) = enforce_limit(
+        limiter,
+        ctx,
+        &format!("tickets:identity:{identity}"),
+        identity_limit,
+    )
+    .await
+    {
+        return response;
+    }
+
     if let Err(error) = turnstile::verify(
         ctx,
         &submission.turnstile_token,
@@ -194,29 +225,6 @@ pub async fn submit(
         };
     }
 
-    let now = abuse::now_secs();
-    let identity = abuse::rotating_identity(&identity_secret, now, msg.remote_addr());
-    let identity_limit = abuse::limit(
-        config::u32_value(ctx, config::IDENTITY_MAX, 3).await,
-        config::u64_value(ctx, config::IDENTITY_WINDOW, 3_600).await,
-    );
-    let global_limit = abuse::limit(
-        config::u32_value(ctx, config::GLOBAL_MAX, 100).await,
-        config::u64_value(ctx, config::GLOBAL_WINDOW, 3_600).await,
-    );
-    let (Some(identity_limit), Some(global_limit)) = (identity_limit, global_limit) else {
-        return public_error(503, "Submission limits are unavailable");
-    };
-    if let Some(response) = enforce_limit(
-        limiter,
-        ctx,
-        &format!("tickets:identity:{identity}"),
-        identity_limit,
-    )
-    .await
-    {
-        return response;
-    }
     if let Some(response) = enforce_limit(limiter, ctx, "tickets:global", global_limit).await {
         return response;
     }
