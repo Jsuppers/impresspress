@@ -452,7 +452,23 @@ terminate instead of recursing forever."
 
 **Interfaces:**
 - Consumes: `inline_refs` from Task 2
-- Produces: `fn agent_input_schema(ep: &BlockEndpoint) -> (Value, Vec<String>, Vec<String>, Vec<String>)` — returns `(merged_schema, path_param_names, query_param_names, body_param_names)`. An agent supplies one flat object; the returned name lists tell the client which properties belong in the URL path, the query string, and the request body.
+- Produces: `fn agent_input_schema(ep: &BlockEndpoint) -> AgentInputSchema`, where:
+
+```rust
+pub(crate) struct AgentInputSchema {
+    pub schema: Value,
+    pub path_params: Vec<String>,
+    pub query_params: Vec<String>,
+    pub body_params: Vec<String>,
+    /// Property names contributed by more than one of path/query/body.
+    /// Non-empty means the endpoint MUST NOT become a tool.
+    pub collisions: Vec<String>,
+}
+```
+
+An agent supplies one flat object; the name lists tell the client which properties belong in the URL path, the query string, and the request body.
+
+**Why `collisions` exists.** If the same property name arrives from two sources — a path param `id` and a body field `id`, a common REST shape — the merged schema can only describe one of them. Picking a winner produces a tool that misdescribes its own arguments, and the client would place one value in both the URL and the body. The spec's first principle forbids that outright: a tool that can lie about its arguments is worse than no tool. So the collision is reported, and `generate_webmcp` refuses to emit a tool for that endpoint. An absent tool is visible; a subtly wrong one is not.
 
 **Why flat:** WebMCP gives a tool exactly one `inputSchema`. An agent should not have to understand HTTP parameter placement. Provenance is recorded separately so the client can reassemble a correct request.
 
@@ -773,6 +789,35 @@ fn webmcp_excludes_endpoints_that_did_not_opt_in() {
 }
 
 #[test]
+fn webmcp_skips_an_endpoint_whose_parameter_names_collide() {
+    // `id` arrives from BOTH the path and the body. One flat schema cannot
+    // honestly describe both locations, so no tool may be emitted — an
+    // absent tool is visible, a lying one is not.
+    let block = BlockInfo::new("test/block", "1.0.0", "http-handler@v1", "Test").endpoints(vec![
+        BlockEndpoint::post("/b/x/{id}")
+            .summary("Collides")
+            .auth(AuthLevel::Public)
+            .path_params_schema(json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }))
+            .input_schema(json!({
+                "type": "object",
+                "properties": { "id": { "type": "integer" } }
+            }))
+            .agent_tool("colliding_tool", "Should never be emitted."),
+    ]);
+
+    let doc = generate_webmcp(&[block], AuthLevel::Admin);
+    assert_eq!(
+        doc["tools"],
+        json!([]),
+        "an endpoint with a cross-location name collision must produce no tool: {doc}"
+    );
+}
+
+#[test]
 fn webmcp_tool_carries_invocation_metadata() {
     let doc = generate_webmcp(&webmcp_fixture_blocks(), AuthLevel::Public);
     let tool = &doc["tools"][0];
@@ -869,18 +914,26 @@ pub fn generate_webmcp(blocks: &[BlockInfo], caller: AuthLevel) -> Value {
                 continue;
             }
 
-            let (input_schema, path_params, query_params, body_params) = agent_input_schema(ep);
+            let input = agent_input_schema(ep);
+
+            // A property name arriving from two of path/query/body cannot be
+            // honestly described by one flat schema, and the client would put
+            // the value in both places. Emitting no tool is the safe, visible
+            // failure; emitting a lying one is neither.
+            if !input.collisions.is_empty() {
+                continue;
+            }
 
             tools.push(json!({
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": input_schema,
+                "inputSchema": input.schema,
                 "invocation": {
                     "method": method_key(ep.method),
                     "path": ep.path,
-                    "path_params": path_params,
-                    "query_params": query_params,
-                    "body_params": body_params,
+                    "path_params": input.path_params,
+                    "query_params": input.query_params,
+                    "body_params": input.body_params,
                 },
             }));
         }
