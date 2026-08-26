@@ -285,6 +285,15 @@ fn inline_refs_terminates_on_self_referential_schema() {
         !rendered.contains("$ref"),
         "no unresolved $ref may survive: {rendered}"
     );
+    // Asserting only on `$ref` above is not enough, and missing this let a
+    // real bug through: with the `$ref` at the schema ROOT, the root's
+    // `$defs` table is a SIBLING of that `$ref`, so a sibling-merge that
+    // skips only `$ref` copies the whole reference table straight back into
+    // the output.
+    assert!(
+        !rendered.contains("$defs"),
+        "the reference table must not survive as a sibling of a root $ref: {rendered}"
+    );
 }
 
 #[test]
@@ -374,9 +383,14 @@ fn resolve_refs(node: &Value, defs: &Value, depth: u8) -> Value {
                 // description — the exact editorial text the migration works
                 // to preserve. Siblings win over the target's own keys, since
                 // they are the more specific annotation.
-                if let (Some(out), Some(src)) = (resolved.as_object_mut(), Some(map)) {
-                    for (key, value) in src {
-                        if key == "$ref" {
+                if let Some(out) = resolved.as_object_mut() {
+                    for (key, value) in map {
+                        // `$ref` is what we just resolved. `$defs` must be
+                        // skipped too: when the `$ref` sits at the schema
+                        // ROOT, the root's `$defs` table is a sibling of it,
+                        // and copying siblings blindly puts the whole
+                        // reference table back into the output.
+                        if key == "$ref" || key == "$defs" {
                             continue;
                         }
                         out.insert(key.clone(), resolve_refs(value, defs, depth));
