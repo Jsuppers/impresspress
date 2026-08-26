@@ -1060,6 +1060,26 @@ mod discovery_tests {
     }
 
     #[tokio::test]
+    async fn anonymous_manifest_exposes_the_storefront_purchase_path() {
+        let ctx = TestContext::new().await;
+        let body = discovery_json(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+
+        for expected in ["get_product", "preview_price", "start_checkout", "get_order_status"] {
+            assert!(
+                names.contains(&expected),
+                "anonymous visitors must get the public purchase path; missing {expected}: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn webmcp_manifest_is_not_cacheable() {
         let ctx = TestContext::new().await;
         let headers = discovery_headers(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;

@@ -323,3 +323,52 @@ async fn anonymous_commerce_routes_have_independent_ip_rate_limits() {
     })
     .await;
 }
+
+#[test]
+fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
+    let info = ProductsBlock::default().info();
+    let named: HashMap<&str, &str> = info
+        .endpoints
+        .iter()
+        .filter_map(|ep| ep.agent_tool.as_ref().map(|t| (t.name.as_str(), ep.path.as_str())))
+        .collect();
+
+    assert_eq!(
+        named.get("get_storefront_config"),
+        Some(&"/b/products/storefront/config")
+    );
+    assert_eq!(
+        named.get("get_product"),
+        Some(&"/b/products/storefront/{product_id}")
+    );
+    assert_eq!(
+        named.get("list_my_purchases"),
+        Some(&"/b/products/purchases"),
+        "at least one Authenticated-level tool must exist, or the manifest's \
+         auth filtering is never exercised above Public"
+    );
+    assert_eq!(
+        named.get("preview_price"),
+        Some(&"/b/products/pricing/preview")
+    );
+    assert_eq!(named.get("start_checkout"), Some(&"/b/products/checkout"));
+    assert_eq!(
+        named.get("get_order_status"),
+        Some(&"/b/products/orders/{id}/status")
+    );
+}
+
+#[test]
+fn stripe_webhook_is_never_an_agent_tool() {
+    let info = ProductsBlock::default().info();
+    let webhook = info
+        .endpoints
+        .iter()
+        .find(|ep| ep.path == "/b/products/webhooks")
+        .expect("webhook endpoint exists");
+    assert!(
+        !webhook.is_agent_tool(),
+        "the Stripe webhook is a machine-to-machine transport endpoint \
+         authenticated by HMAC — never an agent tool"
+    );
+}
