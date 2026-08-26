@@ -758,6 +758,25 @@ fn tool_names(doc: &Value) -> Vec<String> {
 fn webmcp_public_caller_sees_only_public_tools() {
     let doc = generate_webmcp(&webmcp_fixture_blocks(), AuthLevel::Public);
     assert_eq!(tool_names(&doc), vec!["get_product".to_string()]);
+
+    // Assert on the FULL rendered document, not just the name list. A tool
+    // could leak through a `description` or an `invocation.path` while its
+    // `name` stayed absent, and auth filtering is the security property this
+    // function exists for — a tool name an agent cannot invoke is
+    // reconnaissance surface.
+    let rendered = doc.to_string();
+    for leaked in [
+        "list_my_purchases",
+        "/b/products/purchases",
+        "list_users",
+        "/b/admin/api/users",
+    ] {
+        assert!(
+            !rendered.contains(leaked),
+            "privilege leak: `{leaked}` must not appear anywhere in an \
+             anonymous caller's manifest: {rendered}"
+        );
+    }
 }
 
 #[test]
@@ -766,10 +785,15 @@ fn webmcp_authenticated_caller_sees_public_and_authenticated() {
     let names = tool_names(&doc);
     assert!(names.contains(&"get_product".to_string()));
     assert!(names.contains(&"list_my_purchases".to_string()));
-    assert!(
-        !names.contains(&"list_users".to_string()),
-        "admin tool must not leak to an authenticated caller: {names:?}"
-    );
+
+    let rendered = doc.to_string();
+    for leaked in ["list_users", "/b/admin/api/users"] {
+        assert!(
+            !rendered.contains(leaked),
+            "privilege leak: `{leaked}` is admin-only and must not appear \
+             anywhere in an authenticated non-admin caller's manifest: {rendered}"
+        );
+    }
 }
 
 #[test]
