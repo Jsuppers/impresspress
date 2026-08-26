@@ -3,7 +3,7 @@
 //! Both Cloudflare and native adapters call `handle_request()` after
 //! converting their platform-specific HTTP types into a WAFER Message.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 use wafer_block::http_codec;
 use wafer_core::clients::{config as config_client, database as db};
@@ -40,7 +40,16 @@ pub struct QueuedRequestLog {
 
 thread_local! {
     static REQUEST_LOG_MODE: Cell<RequestLogMode> = const { Cell::new(RequestLogMode::Inline) };
-    static REQUEST_LOG_QUEUE: RefCell<Vec<QueuedRequestLog>> = const { RefCell::new(Vec::new()) };
+    /// Queued audit rows for this isolate.
+    ///
+    /// [`IsolateCell`](crate::IsolateCell) rather than `RefCell`: this is
+    /// isolate-lifetime state on the request path, and the push below can
+    /// reallocate the `Vec` — a wide enough window for a Cloudflare hard stop
+    /// to land in. A borrow flag stranded that way stays set for the life of
+    /// the isolate and traps every later request that logs. See
+    /// `crate::isolate_cell`.
+    static REQUEST_LOG_QUEUE: crate::IsolateCell<Vec<QueuedRequestLog>> =
+        const { crate::IsolateCell::new() };
 }
 
 /// Select the request-log persistence mode for this thread (isolate).
@@ -58,13 +67,17 @@ fn enqueue_request_log(
     table: &'static str,
     data: std::collections::HashMap<String, serde_json::Value>,
 ) {
-    REQUEST_LOG_QUEUE.with(|q| q.borrow_mut().push(QueuedRequestLog { table, data }));
+    REQUEST_LOG_QUEUE.with(|queue| {
+        let mut rows = queue.take().unwrap_or_default();
+        rows.push(QueuedRequestLog { table, data });
+        queue.set(rows);
+    });
 }
 
 /// Take every queued row, clearing the queue. The platform entry calls this
 /// after each dispatch and persists the rows off the response path.
 pub fn drain_queued_request_logs() -> Vec<QueuedRequestLog> {
-    REQUEST_LOG_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()))
+    REQUEST_LOG_QUEUE.with(|queue| queue.take().unwrap_or_default())
 }
 
 /// Handle a impresspress request.

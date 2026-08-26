@@ -2601,6 +2601,7 @@ dependencies = [
  "wafer-run",
  "wafer-sql-utils",
  "wasm-bindgen",
+ "wasm-bindgen-test",
  "worker",
 ]
 

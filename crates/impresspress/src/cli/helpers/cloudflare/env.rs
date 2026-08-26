@@ -21,6 +21,10 @@ use super::wrangler::{CloudflareConfig, D1Config, R2Config};
 /// previous hardcoded behavior for existing consumers.
 const DEFAULT_HEAD_SAMPLING_RATE: f64 = 1.0;
 
+/// Safe application-agnostic deploy smoke path for consumers that have not
+/// opted into representative dynamic routes.
+const DEFAULT_DEPLOY_SMOKE_PATH: &str = "/health";
+
 /// Toml-shaped, pre-resolution. Every field that can be supplied via env
 /// is `Option<String>`.
 #[derive(Debug, Deserialize)]
@@ -35,6 +39,9 @@ pub struct RawCloudflareConfig {
     /// defaults to [`DEFAULT_HEAD_SAMPLING_RATE`] when unset by both toml
     /// and env.
     pub head_sampling_rate: Option<f64>,
+    /// Ordinary application paths exercised before promotion. TOML-only;
+    /// defaults to `/health` for existing consumers.
+    pub deploy_smoke_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +55,11 @@ pub struct RawD1Config {
 pub struct RawR2Config {
     pub binding: String,
     pub bucket_name: Option<String>,
+    pub release_assets_dir: Option<PathBuf>,
+    pub release_assets_prefix: Option<PathBuf>,
+    /// Glob patterns, matched against staged logical keys, whose files are
+    /// kept out of the release asset set entirely.
+    pub release_assets_exclude: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,10 +128,37 @@ impl RawCloudflareConfig {
             "r2.bucket_name",
             "IMPRESSPRESS_CLOUDFLARE_R2_BUCKET_NAME",
         )?;
+        let release_assets_dir = self.r2.release_assets_dir;
+        let release_assets_prefix = self.r2.release_assets_prefix.unwrap_or_default();
+        if release_assets_dir.is_none() && !release_assets_prefix.as_os_str().is_empty() {
+            bail!("cloudflare.r2.release_assets_prefix requires cloudflare.r2.release_assets_dir");
+        }
+        if let Some(path) = &release_assets_dir {
+            validate_relative_path(path, "cloudflare.r2.release_assets_dir", false)?;
+        }
+        validate_relative_path(
+            &release_assets_prefix,
+            "cloudflare.r2.release_assets_prefix",
+            true,
+        )?;
+        // Compile the globs here so an unusable pattern is a config error at
+        // parse time, not a silently-ineffective filter at stage time.
+        let release_assets_exclude = self
+            .r2
+            .release_assets_exclude
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pattern| {
+                glob::Pattern::new(&pattern).with_context(|| {
+                    format!("cloudflare.r2.release_assets_exclude entry {pattern:?} is not a valid glob")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let head_sampling_rate = resolve_head_sampling_rate(
             env("IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE"),
             self.head_sampling_rate,
         )?;
+        let deploy_smoke_paths = resolve_deploy_smoke_paths(self.deploy_smoke_paths)?;
         Ok(CloudflareConfig {
             account_id,
             worker_name,
@@ -132,11 +171,31 @@ impl RawCloudflareConfig {
             r2: R2Config {
                 binding: self.r2.binding,
                 bucket_name: r2_bucket_name,
+                release_assets_dir,
+                release_assets_prefix,
+                release_assets_exclude,
             },
             wrangler_overrides_path: self.wrangler_overrides_path,
             head_sampling_rate,
+            deploy_smoke_paths,
         })
     }
+}
+
+fn validate_relative_path(path: &Path, key: &str, allow_empty: bool) -> Result<()> {
+    use std::path::Component;
+
+    if !allow_empty && path.as_os_str().is_empty() {
+        bail!("{key} must not be empty");
+    }
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        bail!("{key} must be a clean repository-relative path");
+    }
+    Ok(())
 }
 
 /// Resolve the Workers Observability head sampling rate: env > toml >
@@ -160,6 +219,35 @@ fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) ->
         );
     }
     Ok(rate)
+}
+
+fn resolve_deploy_smoke_paths(paths: Option<Vec<String>>) -> Result<Vec<String>> {
+    let paths = paths.unwrap_or_else(|| vec![DEFAULT_DEPLOY_SMOKE_PATH.to_string()]);
+    if paths.is_empty() {
+        bail!("cloudflare.deploy_smoke_paths must contain at least one path");
+    }
+    for (index, path) in paths.iter().enumerate() {
+        if !path.starts_with('/') || path.starts_with("//") {
+            bail!(
+                "cloudflare.deploy_smoke_paths[{index}] must start with exactly one '/': {path:?}"
+            );
+        }
+        if path.contains("://") {
+            bail!(
+                "cloudflare.deploy_smoke_paths[{index}] must be a path, not a scheme or host: \
+                 {path:?}"
+            );
+        }
+        if path.contains('?') {
+            bail!(
+                "cloudflare.deploy_smoke_paths[{index}] must not contain a query string: {path:?}"
+            );
+        }
+        if path.contains('#') {
+            bail!("cloudflare.deploy_smoke_paths[{index}] must not contain a fragment: {path:?}");
+        }
+    }
+    Ok(paths)
 }
 
 fn pick(
@@ -186,18 +274,4 @@ fn pick(
 pub fn load(repo_root: &Path) -> Result<CloudflareConfig> {
     let raw = parse(repo_root)?;
     raw.resolve(|name| std::env::var(name).ok())
-}
-
-/// Validate that `CLOUDFLARE_API_TOKEN` is set. Required for `deploy`,
-/// not for `build`/`serve`.
-///
-/// # Errors
-///
-/// Returns an error if the `CLOUDFLARE_API_TOKEN` env var is not set.
-pub fn require_api_token() -> Result<String> {
-    std::env::var("CLOUDFLARE_API_TOKEN").map_err(|_| {
-        anyhow!(
-            "missing env CLOUDFLARE_API_TOKEN — required for `impresspress deploy --target cloudflare`"
-        )
-    })
 }

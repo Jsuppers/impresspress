@@ -131,5 +131,17 @@ mod tests {
             "missing manual reset button label"
         );
         assert!(body.contains("const OPFS_WIPE_ON_RECOVERY = false;"));
+        assert!(
+            body.contains("const BOOT_PROBE_TIMEOUT_MS = 60_000;"),
+            "missing readiness-probe timeout"
+        );
+        assert!(
+            body.contains("signal: probeController.signal"),
+            "readiness fetch is not abortable"
+        );
+        assert!(
+            body.contains("await recoverBrowserState(status)"),
+            "timeout and self-destruct do not share recovery"
+        );
     }
 }

@@ -712,6 +712,63 @@ fn real_block_info(name: &str) -> BlockInfo {
         .unwrap_or_else(|| panic!("block {name} not in all_block_infos()"))
 }
 
+#[cfg(feature = "block-tickets")]
+#[tokio::test]
+async fn tickets_real_endpoint_contract_exposes_only_the_three_public_routes() {
+    let infos = vec![real_block_info("impresspress/tickets")];
+    let admin_cases = [
+        ("retrieve", "/b/tickets/admin"),
+        ("retrieve", "/b/tickets/admin/tickets"),
+        ("retrieve", "/b/tickets/admin/tickets/ticket-1"),
+        ("retrieve", "/b/tickets/admin/types"),
+        ("retrieve", "/b/tickets/admin/settings"),
+        ("retrieve", "/b/tickets/admin/endpoints"),
+        ("retrieve", "/b/tickets/api/admin/tickets"),
+        ("create", "/b/tickets/api/admin/tickets"),
+        ("retrieve", "/b/tickets/api/admin/tickets/ticket-1"),
+        ("update", "/b/tickets/api/admin/tickets/ticket-1"),
+        ("create", "/b/tickets/api/admin/tickets/ticket-1/notes"),
+        ("retrieve", "/b/tickets/api/admin/tickets/ticket-1/analyses"),
+        ("create", "/b/tickets/api/admin/tickets/ticket-1/analyses"),
+        ("retrieve", "/b/tickets/api/admin/types"),
+        ("create", "/b/tickets/api/admin/types"),
+        ("update", "/b/tickets/api/admin/types/type-1"),
+        ("retrieve", "/b/tickets/api/admin/status"),
+        ("create", "/b/tickets/api/admin/retention/prune"),
+    ];
+
+    for (action, path) in admin_cases {
+        for mut msg in [make_msg(path), make_msg_with_user(path, "user-1")] {
+            let ctx = RecordingContext::new();
+            msg.set_meta("req.action", action);
+            let stream =
+                routing::route_to_block(&ctx, msg, InputStream::empty(), &AllEnabled, &infos, &[])
+                    .await;
+            assert_eq!(
+                response_status(stream).await,
+                403,
+                "{action} {path} must reject callers without the admin role"
+            );
+            assert!(ctx.calls().is_empty(), "{path} must not dispatch");
+        }
+    }
+
+    for (action, path) in [
+        ("retrieve", "/b/tickets/submit"),
+        ("retrieve", "/b/tickets/submitted"),
+        ("create", "/b/tickets/api/submissions"),
+    ] {
+        let ctx = RecordingContext::new();
+        let mut msg = make_msg(path);
+        msg.set_meta("req.action", action);
+        let stream =
+            routing::route_to_block(&ctx, msg, InputStream::empty(), &AllEnabled, &infos, &[])
+                .await;
+        assert_eq!(response_status(stream).await, 200, "{action} {path}");
+        assert_eq!(ctx.calls(), vec!["impresspress/tickets".to_string()]);
+    }
+}
+
 #[cfg(feature = "block-products")]
 #[tokio::test]
 async fn products_owned_group_taxonomy_and_pricing_routes_enforce_real_declarations() {

@@ -37,6 +37,9 @@ const SQL_009_POSTGRES: &str = include_str!("009_auth_version.postgres.sql");
 const SQL_010_SQLITE: &str = include_str!("010_strict_schema_columns.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_010_POSTGRES: &str = include_str!("010_strict_schema_columns.postgres.sql");
+const SQL_011_SQLITE: &str = include_str!("011_rate_limit_retention.sqlite.sql");
+#[cfg(feature = "postgres")]
+const SQL_011_POSTGRES: &str = include_str!("011_rate_limit_retention.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle(Init)` apply path (auth's `init`).
@@ -52,6 +55,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("008_rate_limits", SQL_008_SQLITE),
     ("009_auth_version", SQL_009_SQLITE),
     ("010_strict_schema_columns", SQL_010_SQLITE),
+    ("011_rate_limit_retention", SQL_011_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`] one
@@ -70,6 +74,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_008_POSTGRES,
     SQL_009_POSTGRES,
     SQL_010_POSTGRES,
+    SQL_011_POSTGRES,
 ];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];

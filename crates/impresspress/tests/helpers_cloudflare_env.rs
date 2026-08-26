@@ -1,8 +1,6 @@
 use std::{collections::HashMap, fs};
 
-use impresspress::cli::helpers::cloudflare::env::{
-    load, parse, require_api_token, RawCloudflareConfig,
-};
+use impresspress::cli::helpers::cloudflare::env::{load, parse, RawCloudflareConfig};
 use tempfile::tempdir;
 
 const FULL_TOML: &str = r#"
@@ -19,6 +17,8 @@ database_id = "00000000-0000-0000-0000-000000000000"
 [cloudflare.r2]
 binding = "STORAGE"
 bucket_name = "x-bucket"
+release_assets_dir = "data/storage/site/media"
+release_assets_prefix = "site/media"
 "#;
 
 const BINDINGS_ONLY_TOML: &str = r#"
@@ -56,6 +56,9 @@ fn parse_returns_raw_with_optionals_when_only_bindings_present() {
     assert!(raw.d1.database_name.is_none());
     assert!(raw.d1.database_id.is_none());
     assert!(raw.r2.bucket_name.is_none());
+    assert!(raw.r2.release_assets_dir.is_none());
+    assert!(raw.r2.release_assets_prefix.is_none());
+    assert!(raw.deploy_smoke_paths.is_none());
 }
 
 #[test]
@@ -90,6 +93,14 @@ fn resolve_uses_toml_when_env_empty() {
     assert_eq!(cfg.d1.database_name, "x");
     assert_eq!(cfg.d1.database_id, "00000000-0000-0000-0000-000000000000");
     assert_eq!(cfg.r2.bucket_name, "x-bucket");
+    assert_eq!(
+        cfg.r2.release_assets_dir.as_deref(),
+        Some(std::path::Path::new("data/storage/site/media"))
+    );
+    assert_eq!(
+        cfg.r2.release_assets_prefix,
+        std::path::PathBuf::from("site/media")
+    );
 }
 
 #[test]
@@ -97,6 +108,63 @@ fn resolve_defaults_head_sampling_rate_to_one_when_unset() {
     let raw = parse_str(FULL_TOML);
     let cfg = raw.resolve(fake_env(&[])).unwrap();
     assert_eq!(cfg.head_sampling_rate, 1.0);
+}
+
+#[test]
+fn resolve_defaults_deploy_smoke_paths_to_health() {
+    let raw = parse_str(FULL_TOML);
+    let cfg = raw.resolve(fake_env(&[])).unwrap();
+    assert_eq!(cfg.deploy_smoke_paths, vec!["/health"]);
+}
+
+#[test]
+fn resolve_preserves_configured_deploy_smoke_paths_and_trailing_slashes() {
+    let configured = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"",
+        "compatibility_date = \"2026-05-01\"\n\
+         deploy_smoke_paths = [\"/catalog/\", \"/catalog/example\"]",
+    );
+    let cfg = parse_str(&configured).resolve(fake_env(&[])).unwrap();
+    assert_eq!(
+        cfg.deploy_smoke_paths,
+        vec!["/catalog/", "/catalog/example"]
+    );
+}
+
+#[test]
+fn resolve_rejects_empty_deploy_smoke_path_list() {
+    let configured = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"",
+        "compatibility_date = \"2026-05-01\"\ndeploy_smoke_paths = []",
+    );
+    let err = parse_str(&configured).resolve(fake_env(&[])).unwrap_err();
+    assert!(err.to_string().contains("at least one path"), "{err}");
+}
+
+#[test]
+fn resolve_rejects_invalid_deploy_smoke_paths() {
+    for invalid in [
+        "relative",
+        "//example.com/path",
+        "https://example.com/path",
+        "/proxy/https://example.com",
+        "/catalog?sort=new",
+        "/catalog#featured",
+    ] {
+        let configured = FULL_TOML.replace(
+            "compatibility_date = \"2026-05-01\"",
+            &format!(
+                "compatibility_date = \"2026-05-01\"\n\
+                 deploy_smoke_paths = [{}]",
+                serde_json::to_string(invalid).unwrap()
+            ),
+        );
+        let err = parse_str(&configured).resolve(fake_env(&[])).unwrap_err();
+        assert!(
+            err.to_string().contains("deploy_smoke_paths"),
+            "invalid {invalid:?} produced unexpected error: {err}"
+        );
+    }
 }
 
 #[test]
@@ -235,17 +303,38 @@ fn load_resolves_via_real_env() {
     assert_eq!(cfg.r2.bucket_name, "x-bucket");
 }
 
+/// A pattern that cannot compile must fail the deploy at config time. A glob
+/// that silently never matches would look identical to a working exclusion
+/// right up until the release key inventory blew its 4 KB budget again.
 #[test]
-fn require_api_token_errors_when_unset() {
-    // SAFETY: tests in this binary may be parallel; this could flake if
-    // another test sets CLOUDFLARE_API_TOKEN concurrently.
-    // SAFETY: env mutation is unsafe on Rust 2024 edition; test-only.
-    unsafe {
-        std::env::remove_var("CLOUDFLARE_API_TOKEN");
-    }
-    let err = require_api_token().unwrap_err();
-    assert!(
-        err.to_string().contains("CLOUDFLARE_API_TOKEN"),
-        "expected 'CLOUDFLARE_API_TOKEN' in: {err}"
+fn an_unparseable_release_assets_exclude_glob_is_a_config_error() {
+    let toml = FULL_TOML.replace(
+        r#"release_assets_prefix = "site/media""#,
+        "release_assets_prefix = \"site/media\"\nrelease_assets_exclude = [\"content/guides/[\"]",
     );
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("impresspress.toml"), &toml).unwrap();
+
+    let err = load(tmp.path()).unwrap_err();
+
+    assert!(
+        err.to_string().contains("release_assets_exclude"),
+        "expected the offending key to be named, got: {err}"
+    );
+}
+
+#[test]
+fn release_assets_exclude_globs_are_compiled_and_kept() {
+    let toml = FULL_TOML.replace(
+        r#"release_assets_prefix = "site/media""#,
+        "release_assets_prefix = \"site/media\"\nrelease_assets_exclude = [\"content/guides/**\"]",
+    );
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("impresspress.toml"), &toml).unwrap();
+
+    let cfg = load(tmp.path()).unwrap();
+
+    assert_eq!(cfg.r2.release_assets_exclude.len(), 1);
+    assert!(cfg.r2.release_assets_exclude[0].matches("content/guides/a.state.json"));
+    assert!(!cfg.r2.release_assets_exclude[0].matches("content/legal/terms.md"));
 }

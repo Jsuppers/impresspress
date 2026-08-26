@@ -39,7 +39,13 @@ pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
         profile_check::check_wasm_size(&wasm_path)?;
     }
 
-    let report = assets::stage(repo_root, &out_dir)?;
+    let report = assets::stage(
+        repo_root,
+        &out_dir,
+        cfg.r2.release_assets_dir.as_deref(),
+        &cfg.r2.release_assets_prefix,
+        &cfg.r2.release_assets_exclude,
+    )?;
     println!(
         "-> staged {} files ({:.1} KB) into {}/assets/",
         report.files_copied,
@@ -48,6 +54,13 @@ pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
     );
     if !report.dirs_skipped.is_empty() {
         println!("  (skipped missing dirs: {:?})", report.dirs_skipped);
+    }
+    if !report.files_excluded.is_empty() {
+        println!(
+            "  ({} files held out of the release set by \
+             cloudflare.r2.release_assets_exclude)",
+            report.files_excluded.len(),
+        );
     }
 
     println!();
@@ -197,7 +210,6 @@ async fn wait_and_run_local_init(
 
 pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     let cfg = env::load(repo_root)?;
-    let _ = env::require_api_token()?; // account_id already validated by load()
     let token_key = impresspress_core::config_vars::DEPLOY_TOKEN_KEY;
     let deploy_token = std::env::var(token_key).map_err(|_| {
         anyhow::anyhow!(
@@ -209,41 +221,164 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     build(repo_root, release).await?;
 
     let out_dir = repo_root.join("target/impresspress-cloudflare");
-    let wrangler_toml = out_dir.join("wrangler.toml");
-
-    // 1. Upload an unpromoted version (no traffic routed yet).
-    let upload = cf_deploy::wrangler_versions_upload(&wrangler_toml)?;
+    // `build()` emits a developer config with a Wrangler build hook for
+    // `wrangler dev`. A deploy consumes the artifact already produced by
+    // that build through a second, upload-only config. This prevents
+    // either `versions upload` from compiling the Rust worker a second time.
+    let assets_root = out_dir.join("assets");
+    let release_assets = assets::ReleaseManifest::from_staged_dir(&assets_root)?;
+    let wasm_path = repo_root.join("build/index_bg.wasm");
+    let wasm_sha256 = cf_deploy::artifact_sha256(&wasm_path)?;
+    let application_identity =
+        crate::cli::helpers::cloudflare::prepared::ApplicationArtifactIdentity::from_repo(
+            repo_root,
+            cfg.worker_name.clone(),
+            &wasm_path,
+        )?;
+    let mut deployment_gate =
+        crate::cli::helpers::cloudflare::prepared::TwoStageDeploymentGate::new();
+    let prepared_release_assets = release_assets.prepared_identity()?;
+    let candidate_toml = wrangler::generate_candidate_upload(
+        &cfg,
+        repo_root,
+        &out_dir,
+        &release_assets,
+        &application_identity,
+    )?;
     println!(
-        "-> uploaded version {} (preview {})",
-        upload.version_id, upload.preview_url
+        "-> upload artifact {} ({})",
+        wasm_path.display(),
+        application_identity.application_build_sha256
     );
+    println!(
+        "-> release assets {} files (sha256 {}, prefix {})",
+        release_assets.files.len(),
+        release_assets.asset_set_sha256,
+        release_assets.immutable_prefix
+    );
+
+    // 1. Upload the dynamic, unpromoted preparation candidate. It has no
+    //    packaged plan and is never eligible for promotion.
+    let candidate = cf_deploy::wrangler_versions_upload(&candidate_toml)?;
+    cf_deploy::verify_artifact_sha256(&wasm_path, &wasm_sha256)?;
+    application_identity.verify_repo(repo_root, &wasm_path)?;
+    deployment_gate.candidate_uploaded(&candidate.version_id, &wasm_sha256)?;
+    println!(
+        "-> uploaded preparation candidate {} (preview {})",
+        candidate.version_id, candidate.preview_url
+    );
+    cf_deploy::smoke_preview_lockdown(&candidate.preview_url).await?;
+    println!("-> preparation candidate preview lockdown verified");
     // Cloudflare's own reported size for the exact bundle it received —
     // prefer this over the pre-upload `.wasm` byte heuristic in
     // `profile_check` when deciding whether size is actually a problem.
-    profile_check::report_upload_size(upload.upload_size);
+    profile_check::report_upload_size(candidate.upload_size);
 
-    // 2. Run migrations + seeds through the new version's own code, against
-    //    the shared production D1 (additive migrations keep the still-live
-    //    old version safe). Abort pre-promote on failure.
-    let (ok, report) = cf_deploy::call_deploy_init(&upload.preview_url, &deploy_token).await?;
-    println!("{report}");
-    if !ok {
-        bail!(
-            "deploy init failed — version {} NOT promoted",
-            upload.version_id
-        );
-    }
-
-    // 3. Promote.
-    cf_deploy::wrangler_versions_promote(&upload.version_id, &wrangler_toml)?;
-    println!("-> promoted {}", upload.version_id);
-
-    let assets_root = out_dir.join("assets");
-    let n = cf_deploy::r2_upload_dir(&cfg.r2.bucket_name, &assets_root)?;
+    // 2. Populate and byte-verify immutable external R2 release assets before
+    //    candidate initialization. Manifests bind them to this Worker version.
+    //    Mutable logical keys are deliberately left untouched so the active
+    //    legacy Worker and legacy rollbacks continue to see their old assets.
+    let release_upload = cf_deploy::r2_upload_release(
+        &cfg.r2.bucket_name,
+        &assets_root,
+        &release_assets,
+        &candidate.version_id,
+        &wasm_sha256,
+    )?;
     println!(
-        "-> uploaded {} R2 objects to bucket {}",
-        n, cfg.r2.bucket_name
+        "-> uploaded {} immutable R2 files and {} metadata objects; \
+         verified {} objects (deployment record {})",
+        release_upload.immutable_files_uploaded,
+        release_upload.metadata_objects_uploaded,
+        release_upload.objects_verified,
+        release_upload.deployment_record_key,
     );
+    deployment_gate.assets_verified()?;
+
+    // 3. One authenticated request owns every mutation: migrate, seed, reload
+    //    final structural state, and export the strict immutable plan.
+    let prepared_response =
+        cf_deploy::call_deploy_prepare(&candidate.preview_url, &deploy_token).await?;
+    prepared_response
+        .plan
+        .verify_compatibility(
+            &application_identity.application_id,
+            &application_identity.application_build_sha256,
+            &application_identity.dependency_lock,
+            &prepared_release_assets,
+        )
+        .map_err(|error| anyhow::anyhow!("prepared candidate identity mismatch: {error}"))?;
+    deployment_gate.prepared()?;
+    println!(
+        "-> prepared plan {} ({} blocks, {} routes)",
+        prepared_response.plan.plan_hash,
+        prepared_response.plan.structure.application_blocks.len(),
+        prepared_response.plan.structure.routes.len()
+    );
+
+    // 4. Package deterministic JS/Text modules around the already-built Wasm
+    //    and upload the final candidate. No Rust/Wasm build occurs here.
+    let prepared_module = crate::cli::helpers::cloudflare::prepared::stage_prepared_module(
+        &out_dir,
+        &prepared_response.plan,
+    )?;
+    let final_toml = wrangler::generate_final_upload(
+        &cfg,
+        repo_root,
+        &out_dir,
+        &release_assets,
+        &application_identity,
+        &prepared_module,
+    )?;
+    let final_upload = cf_deploy::wrangler_versions_upload(&final_toml)?;
+    cf_deploy::verify_artifact_sha256(&wasm_path, &wasm_sha256)?;
+    application_identity.verify_repo(repo_root, &wasm_path)?;
+    crate::cli::helpers::cloudflare::prepared::verify_prepared_module(&prepared_module)?;
+    deployment_gate.final_uploaded(&final_upload.version_id, &wasm_sha256)?;
+    println!(
+        "-> uploaded final candidate {} (preview {}, same Wasm sha256 {})",
+        final_upload.version_id, final_upload.preview_url, wasm_sha256
+    );
+    profile_check::report_upload_size(final_upload.upload_size);
+
+    let final_record = cf_deploy::r2_upload_final_deployment_record(
+        &cfg.r2.bucket_name,
+        &release_assets,
+        &final_upload.version_id,
+        &wasm_sha256,
+        &prepared_response.plan.plan_hash,
+    )?;
+    println!("-> verified final deployment record {final_record}");
+
+    // 5. The final version must prove it parsed/applied the packaged plan and
+    //    can read an immutable representative asset, then serve a normal
+    //    route. Neither request reruns migrations or seeds.
+    cf_deploy::call_deploy_verify(
+        &final_upload.preview_url,
+        &deploy_token,
+        &prepared_response.plan,
+        &release_assets,
+    )
+    .await?;
+    cf_deploy::smoke_preview_lockdown(&final_upload.preview_url).await?;
+    cf_deploy::smoke_authenticated_get(&final_upload.preview_url, &deploy_token, "/health").await?;
+    cf_deploy::smoke_authenticated_concurrency(
+        &final_upload.preview_url,
+        &deploy_token,
+        &cfg.deploy_smoke_paths,
+        cf_deploy::KV_PROPAGATION_SETTLE,
+    )
+    .await?;
+    deployment_gate.final_verified()?;
+    println!(
+        "-> final candidate plan, release asset, preview lockdown, /health, and \
+         mixed 160-request P32 workload verified"
+    );
+
+    // 6. Only the prepared second upload is eligible for promotion.
+    deployment_gate.authorize_promotion()?;
+    cf_deploy::wrangler_versions_promote(&final_upload.version_id, &final_upload.wrangler_toml)?;
+    println!("-> promoted {}", final_upload.version_id);
 
     println!();
     println!("deploy complete");

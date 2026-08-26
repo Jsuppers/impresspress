@@ -50,11 +50,12 @@ pub enum Command {
     /// Build the app and deploy it to the target's hosting environment.
     /// (v1: only `--target cloudflare` is supported.)
     ///
-    /// Cloudflare deploys are atomic: an unpromoted version is uploaded,
-    /// migrations + seeds run against it via an authenticated
-    /// `/_deploy/init` call, and only on success is the version promoted
-    /// to 100% traffic. There is no `--run-migrations` flag here (unlike
-    /// `serve`) — every deploy always runs the init funnel.
+    /// Cloudflare deploys are atomic: a dynamic candidate runs the one
+    /// authenticated `/_deploy/prepare` mutation funnel, then its strict plan
+    /// is packaged with the exact same Wasm into a second candidate. Only the
+    /// second version is promoted after mutation-free plan/asset/health
+    /// verification. There is no `--run-migrations` flag here (unlike
+    /// `serve`) — every deploy always runs the prepare funnel.
     Deploy {
         #[arg(long)]
         target: Option<Target>,
