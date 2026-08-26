@@ -18,7 +18,13 @@
   function buildRequest(invocation, args) {
     var path = invocation.path;
     (invocation.path_params || []).forEach(function (name) {
-      path = path.replace('{' + name + '}', encodeURIComponent(args[name]));
+      // split/join, not String.replace: replace with a string pattern
+      // substitutes only the FIRST match, so a template repeating a
+      // placeholder (`/x/{id}/{id}`) would keep a literal `{id}` in the URL
+      // and 404 forever. The producer dedups placeholder names before
+      // comparing them against the declared path params, so such a template
+      // passes its eligibility check and reaches us intact.
+      path = path.split('{' + name + '}').join(encodeURIComponent(args[name]));
     });
 
     var query = new URLSearchParams();
@@ -65,7 +71,12 @@
         var text = await response.text();
 
         if (!response.ok) {
+          // `isError` is what tells the agent this is a failure. Without it
+          // the harness treats the body as a normal result, and a model can
+          // relay `Request failed (403): ...` to the customer as if it were
+          // product data.
           return {
+            isError: true,
             content: [{
               type: 'text',
               text: 'Request failed (' + response.status + '): ' + text
@@ -84,7 +95,16 @@
       if (!manifest || !Array.isArray(manifest.tools)) {
         return;
       }
-      manifest.tools.forEach(register);
+      // Per-tool try/catch: `registerTool` throwing on one malformed tool
+      // must not abort registration of every tool after it (the outer
+      // `.catch` would swallow it silently, leaving a half-registered page).
+      manifest.tools.forEach(function (tool) {
+        try {
+          register(tool);
+        } catch (e) {
+          // One tool the browser rejected is not a reason to lose the rest.
+        }
+      });
     })
     .catch(function () {
       // A failed manifest fetch means no tools. That is a degraded page,
