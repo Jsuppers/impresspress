@@ -745,8 +745,15 @@ pub fn r2_upload_release(
         release,
         worker_version_id,
         wasm_sha256,
+        OBJECT_RETRY_SECS,
     )
 }
+
+/// Backoff schedule for one release object's put+verify pair. Three retries
+/// is sized for the observed failure mode — a lone spurious `fetch failed`
+/// from one `wrangler` invocation among ~900 — not for an actual outage,
+/// which should still abort the deploy promptly.
+const OBJECT_RETRY_SECS: &[u64] = &[2, 5, 15];
 
 /// Write and verify the final Worker-version record after the second upload.
 /// This is separate from [`r2_upload_release`] so immutable files and their
@@ -759,13 +766,26 @@ pub fn r2_upload_final_deployment_record(
     prepared_plan_hash: &str,
 ) -> Result<String> {
     let mut client = WranglerR2Client { bucket };
-    upload_deployment_record_with_client(
+    // Retries matter most here: this record is written AFTER promotion, so a
+    // lone spurious wrangler failure would fail a deploy whose Worker is
+    // already live.
+    let mut record_key = None;
+    with_object_retries(
+        "final deployment record",
+        OBJECT_RETRY_SECS,
+        |client| {
+            record_key = Some(upload_deployment_record_with_client(
+                client,
+                release,
+                worker_version_id,
+                wasm_sha256,
+                Some(prepared_plan_hash),
+            )?);
+            Ok(())
+        },
         &mut client,
-        release,
-        worker_version_id,
-        wasm_sha256,
-        Some(prepared_plan_hash),
-    )
+    )?;
+    Ok(record_key.expect("with_object_retries returned Ok without running the record upload"))
 }
 
 trait R2ObjectClient {
@@ -849,12 +869,44 @@ impl R2ObjectClient for WranglerR2Client<'_> {
     }
 }
 
+/// Run one object's put+verify, retrying transient failures with backoff.
+///
+/// A release upload shells out to `wrangler` twice per object, hundreds of
+/// times back to back; at that volume the occasional spurious `fetch failed`
+/// from a single invocation is a certainty, not a possibility, and it aborted
+/// two otherwise-healthy production deploys before this existed. Re-running
+/// the WHOLE pair is deliberate: the verify may have failed because the put
+/// itself only half-happened, and both operations are idempotent
+/// (digest-pinned immutable keys). Persistent failures still abort — the
+/// budget is small and the last error is returned unchanged.
+fn with_object_retries<C: R2ObjectClient>(
+    key: &str,
+    retry_delays: &[u64],
+    mut op: impl FnMut(&mut C) -> Result<()>,
+    client: &mut C,
+) -> Result<()> {
+    for (attempt, delay) in retry_delays.iter().enumerate() {
+        match op(client) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "-> release object {key} attempt {} failed ({error:#}); retrying in {delay}s",
+                    attempt + 1,
+                );
+                std::thread::sleep(std::time::Duration::from_secs(*delay));
+            }
+        }
+    }
+    op(client)
+}
+
 fn r2_upload_release_with_client<C: R2ObjectClient>(
     client: &mut C,
     assets_root: &Path,
     release: &ReleaseManifest,
     worker_version_id: &str,
     wasm_sha256: &str,
+    retry_delays: &[u64],
 ) -> Result<R2ReleaseUploadReport> {
     validate_worker_version_id(worker_version_id)?;
     verify_local_release(assets_root, release)?;
@@ -863,34 +915,66 @@ fn r2_upload_release_with_client<C: R2ObjectClient>(
     for entry in &release.files {
         let path = assets_root.join(&entry.logical_key);
         let immutable_key = release.immutable_key(&entry.logical_key);
-        client.put_file(&immutable_key, &path, &entry.content_type)?;
-        verify_remote_sha256(client, &immutable_key, &entry.sha256)?;
+        with_object_retries(
+            &immutable_key,
+            retry_delays,
+            |client| {
+                client.put_file(&immutable_key, &path, &entry.content_type)?;
+                verify_remote_sha256(client, &immutable_key, &entry.sha256)
+            },
+            client,
+        )?;
         objects_verified += 1;
     }
 
     let manifest_bytes = release.to_pretty_json()?;
     let manifest_key = release.manifest_key();
-    client.put_bytes(
+    with_object_retries(
         &manifest_key,
-        &manifest_bytes,
-        "application/json; charset=utf-8",
+        retry_delays,
+        |client| {
+            client.put_bytes(
+                &manifest_key,
+                &manifest_bytes,
+                "application/json; charset=utf-8",
+            )?;
+            verify_remote_bytes(client, &manifest_key, &manifest_bytes)
+        },
+        client,
     )?;
-    verify_remote_bytes(client, &manifest_key, &manifest_bytes)?;
     objects_verified += 1;
 
     let keys_bytes = release.logical_keys_json()?.into_bytes();
     let keys_key = release.keys_key();
-    client.put_bytes(&keys_key, &keys_bytes, "application/json; charset=utf-8")?;
-    verify_remote_bytes(client, &keys_key, &keys_bytes)?;
+    with_object_retries(
+        &keys_key,
+        retry_delays,
+        |client| {
+            client.put_bytes(&keys_key, &keys_bytes, "application/json; charset=utf-8")?;
+            verify_remote_bytes(client, &keys_key, &keys_bytes)
+        },
+        client,
+    )?;
     objects_verified += 1;
 
-    let deployment_key = upload_deployment_record_with_client(
+    let mut deployment_key = None;
+    with_object_retries(
+        "deployment record",
+        retry_delays,
+        |client| {
+            deployment_key = Some(upload_deployment_record_with_client(
+                client,
+                release,
+                worker_version_id,
+                wasm_sha256,
+                None,
+            )?);
+            Ok(())
+        },
         client,
-        release,
-        worker_version_id,
-        wasm_sha256,
-        None,
     )?;
+    let deployment_key =
+        deployment_key.expect("with_object_retries returned Ok without running the record upload");
     objects_verified += 1;
 
     Ok(R2ReleaseUploadReport {
@@ -1387,9 +1471,15 @@ mod tests {
         r2.objects
             .insert("users/avatar.png".into(), b"business-data".to_vec());
 
-        let report =
-            r2_upload_release_with_client(&mut r2, staged.path(), &release, "abc-123", "wasm-sha")
-                .unwrap();
+        let report = r2_upload_release_with_client(
+            &mut r2,
+            staged.path(),
+            &release,
+            "abc-123",
+            "wasm-sha",
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(report.immutable_files_uploaded, 2);
         assert_eq!(report.metadata_objects_uploaded, 3);
@@ -1463,9 +1553,15 @@ mod tests {
         std::fs::write(staged.path().join("hero.webp"), b"v2").unwrap();
         let mut r2 = MemoryR2::default();
 
-        let err =
-            r2_upload_release_with_client(&mut r2, staged.path(), &release, "abc-123", "wasm-sha")
-                .unwrap_err();
+        let err = r2_upload_release_with_client(
+            &mut r2,
+            staged.path(),
+            &release,
+            "abc-123",
+            "wasm-sha",
+            &[],
+        )
+        .unwrap_err();
 
         assert!(err
             .to_string()
@@ -1484,11 +1580,78 @@ mod tests {
             ..Default::default()
         };
 
-        let err =
-            r2_upload_release_with_client(&mut r2, staged.path(), &release, "abc-123", "wasm-sha")
-                .unwrap_err();
+        let err = r2_upload_release_with_client(
+            &mut r2,
+            staged.path(),
+            &release,
+            "abc-123",
+            "wasm-sha",
+            &[],
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("verification failed"));
         assert!(!r2.objects.contains_key("hero.webp"));
+    }
+
+    /// One spurious get failure must not abort the release: the put+verify
+    /// pair re-runs and the second attempt succeeds. This is the exact shape
+    /// of the wrangler `fetch failed` that aborted two production deploys.
+    struct FlakyOnceR2 {
+        inner: MemoryR2,
+        fail_get_once_for: Option<String>,
+    }
+
+    impl R2ObjectClient for FlakyOnceR2 {
+        fn put_file(&mut self, key: &str, path: &Path, content_type: &str) -> Result<()> {
+            self.inner.put_file(key, path, content_type)
+        }
+
+        fn put_bytes(&mut self, key: &str, bytes: &[u8], content_type: &str) -> Result<()> {
+            self.inner.put_bytes(key, bytes, content_type)
+        }
+
+        fn get_bytes(&mut self, key: &str) -> Result<Vec<u8>> {
+            if self.fail_get_once_for.as_deref() == Some(key) {
+                self.fail_get_once_for = None;
+                anyhow::bail!("verify {key} failed (exit Some(1)): fetch failed");
+            }
+            self.inner.get_bytes(key)
+        }
+    }
+
+    #[test]
+    fn release_upload_retries_a_transient_verify_failure() {
+        let staged = tempfile::tempdir().unwrap();
+        std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
+        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let immutable_key = release.immutable_key("hero.webp");
+        let mut r2 = FlakyOnceR2 {
+            inner: MemoryR2::default(),
+            fail_get_once_for: Some(immutable_key.clone()),
+        };
+
+        let report = r2_upload_release_with_client(
+            &mut r2,
+            staged.path(),
+            &release,
+            "abc-123",
+            "wasm-sha",
+            &[0],
+        )
+        .unwrap();
+
+        // hero.webp, the release manifest, and the release-metadata objects
+        // the upload writes after it (keys inventory + latest pointer).
+        assert_eq!(report.objects_verified, 4);
+        // The pair re-ran in full: the object was PUT twice, then verified.
+        assert_eq!(
+            r2.inner
+                .put_keys
+                .iter()
+                .filter(|key| **key == immutable_key)
+                .count(),
+            2
+        );
     }
 }
