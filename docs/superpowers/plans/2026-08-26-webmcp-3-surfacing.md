@@ -140,7 +140,20 @@ Insert **after** the step-2 auth block (after line 170, where `let user_id = msg
     // this one is not.
     if path == "/b/webmcp/manifest.json" {
         let caller = caller_auth_level(&msg);
-        let body = wafer_core::discovery::generate_webmcp(block_infos, caller);
+
+        // MUST be `generate_webmcp_with`, not `generate_webmcp`. The plain
+        // form filters on `ep.auth` alone, but this router admits on
+        // `max(prefix_tier, ep.auth)` (routing.rs:440). An endpoint declared
+        // Public under an Admin prefix would otherwise be advertised to
+        // anonymous callers — the router still 403s, so it is not a data
+        // leak, but it publishes a tool name the caller cannot use (the
+        // recon surface this filtering exists to prevent) and hands the
+        // agent a tool that always fails.
+        let body = wafer_core::discovery::generate_webmcp_with(
+            block_infos,
+            caller,
+            |block, ep| effective_access(block, ep),
+        );
 
         // Per-session by construction: a shared cache serving one visitor's
         // manifest to another would leak the privileged tool surface.
@@ -151,6 +164,13 @@ Insert **after** the step-2 auth block (after line 170, where `let user_id = msg
 ```
 
 Note `path` is already bound at line 174 from `msg.path()`, so no extra binding is needed.
+
+**You must also write `effective_access(block, ep)`**, mirroring what `route_to_block` actually admits on. Read `routing.rs:435-440`: it computes `route.access.max(declared_access(block_infos, route.block, &msg))`. Your resolver must combine the same two inputs — the block's prefix tier from the `ROUTES` table and the endpoint's declared `auth` — and return the stronger. Two cases to get right:
+
+- A `router_final` route (`Route::router_declared_public`) makes the router's own declaration the complete answer, so the declared endpoint level is NOT consulted. A resolver that takes the max there would *hide* a tool that is genuinely publicly reachable.
+- A path with no matching route entry falls back to `declared_access`'s fail-closed default.
+
+Add a test asserting the resolver agrees with the router for at least one endpoint of each shape: Public-under-Public, Public-under-Admin (the dangerous one), and a `router_final` route. If the manifest and the router disagree, the manifest is wrong by definition — the router is what actually admits requests.
 
 This deliberately does **not** get the `Access-Control-Allow-Origin: *` treatment the step-0 discovery documents receive in development. The manifest is consumed same-origin by the page's own script; there is no reason to advertise it cross-origin.
 

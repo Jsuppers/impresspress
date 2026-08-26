@@ -31,6 +31,8 @@ This is **not a regression** — before Plan 1 Task 5, *every* named type behave
 
 **`products/contracts.rs` has exactly this shape — `Condition`** (its `all_of` field holds child `Condition`s).
 
+**Update after PR #323's review fixes (wafer-run `cffe15a`):** an unresolvable reference at *any* depth — including the recursion depth-cap bailout — now causes `generate_webmcp` to refuse the endpoint outright rather than ship `{}` at the leaf. So a recursive contract yields **no WebMCP tool at all**, which is the visible failure rather than a tool that silently claims a field accepts anything. The `/openapi.json` problem below is unchanged; only the agent-facing surface is now fail-safe.
+
 **Required before migrating any block:**
 
 - [ ] Grep the block's contracts for recursive types — a type whose field, directly or through `Vec`/`Option`/`Box`, is itself.
