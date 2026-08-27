@@ -706,8 +706,13 @@ impl TicketTypeListQuery {
 /// public form at `/b/tickets/submit`, which is where a browser obtains the
 /// two tokens below. Both are minted server-side; neither can be constructed
 /// by a caller.
+// No `deny_unknown_fields`, deliberately. The public form carries a honeypot
+// field that `public::parse_submission` reads from the raw body, and a
+// honeypot only works if a bot's extra keys are accepted rather than refused
+// before the trap can fire. Declaring the trap on this contract instead
+// published it: the schema told every caller "website — Must be left empty".
+// Unknown keys are ignored, not rejected.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct PublicSubmissionRequest {
     /// Id of an active, publicly visible ticket type.
     pub type_id: String,
@@ -740,14 +745,6 @@ pub struct PublicSubmissionRequest {
     pub form_token: String,
     /// Cloudflare Turnstile response token from the form's challenge widget.
     pub turnstile_token: String,
-    // Honeypot. The field is declared because the handler accepts it and
-    // `deny_unknown_fields` would otherwise make an honest form post fail; the
-    // doc comment deliberately states the requirement without explaining what
-    // a non-empty value does, since that text is published to anonymous
-    // callers.
-    /// Must be left empty.
-    #[serde(default)]
-    pub website: String,
 }
 
 /// Response body of `POST /b/tickets/api/submissions` when the caller asks for

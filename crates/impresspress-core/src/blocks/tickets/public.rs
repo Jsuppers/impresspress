@@ -454,8 +454,18 @@ fn parse_submission(content_type: &str, raw: &[u8]) -> Result<Submission, String
         .to_ascii_lowercase()
         .starts_with("application/json")
     {
-        let value: PublicSubmissionRequest =
+        let raw_value: serde_json::Value =
             serde_json::from_slice(raw).map_err(|_| "Invalid JSON submission".to_string())?;
+        // The honeypot is read from the raw body, not from the contract —
+        // see `PublicSubmissionRequest`'s derive comment for why it must not
+        // be declared there.
+        let website = raw_value
+            .get("website")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let value: PublicSubmissionRequest =
+            serde_json::from_value(raw_value).map_err(|_| "Invalid JSON submission".to_string())?;
         return Ok(Submission {
             ticket: CreateTicketInput {
                 type_id: value.type_id,
@@ -471,7 +481,7 @@ fn parse_submission(content_type: &str, raw: &[u8]) -> Result<Submission, String
             },
             form_token: value.form_token,
             turnstile_token: value.turnstile_token,
-            website: value.website,
+            website,
         });
     }
     let form = crate::util::parse_form_body(raw);
@@ -642,13 +652,36 @@ fn sanitize_reference(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The honeypot works because a bot that fills every field it can see
+    /// also fills `website`. That needs two things of the JSON path: unknown
+    /// keys are tolerated (a `deny_unknown_fields` contract would reject the
+    /// bot's post before the trap could fire), and the trap is read from the
+    /// raw body rather than declared on the contract — declaring it published
+    /// "website — Must be left empty" to every schema-reading caller.
     #[test]
-    fn json_parser_rejects_unknown_fields() {
+    fn json_parser_reads_the_honeypot_without_declaring_it() {
         let raw = br#"{
             "type_id":"type","subject":"valid subject","description":"a sufficiently long description",
-            "form_token":"token","turnstile_token":"challenge","unexpected":"value"
+            "form_token":"token","turnstile_token":"challenge",
+            "website":"http://spam.example","unexpected":"value"
         }"#;
-        assert!(parse_submission("application/json", raw).is_err());
+        let submission =
+            parse_submission("application/json", raw).expect("unknown keys are tolerated");
+        assert_eq!(submission.website, "http://spam.example");
+    }
+
+    #[test]
+    fn json_parser_treats_an_absent_honeypot_as_empty() {
+        let raw = br#"{
+            "type_id":"type","subject":"valid subject","description":"a sufficiently long description",
+            "form_token":"token","turnstile_token":"challenge"
+        }"#;
+        assert_eq!(
+            parse_submission("application/json", raw)
+                .expect("a body without the honeypot is a normal submission")
+                .website,
+            ""
+        );
     }
 
     #[test]
