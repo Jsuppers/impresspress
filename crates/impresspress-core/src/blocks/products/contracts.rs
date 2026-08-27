@@ -926,16 +926,19 @@ pub struct RefundRequest {
     /// Exact amount in the order currency's minor unit. Omit to refund the
     /// complete remaining refundable amount.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub amount_minor: Option<i64>,
     /// Stripe's constrained provider reason. Human context belongs in `note`.
     #[serde(default)]
     pub provider_reason: Option<RefundReason>,
     /// Private operator note retained in ImpressPress, never sent to Stripe.
     #[serde(default, alias = "reason")]
+    #[schemars(length(max = 500))]
     pub note: Option<String>,
     /// Stable client operation key. Supplying a fresh key allows a deliberate
     /// second partial refund of the same amount; retries must reuse the key.
     #[serde(default)]
+    #[schemars(length(max = 80))]
     pub idempotency_key: Option<String>,
 }
 
@@ -1017,22 +1020,30 @@ pub struct SellerFailureSummary {
 pub struct WebhookEventSummary {
     pub id: String,
     pub event_type: String,
+    /// One of `pending`, `processing`, `failed`, `processed`, `dead_letter`.
+    #[schemars(extend("enum" = ["pending", "processing", "failed", "processed", "dead_letter"]))]
     pub status: String,
     #[serde(default)]
     pub stripe_account_id: String,
     pub livemode: bool,
     pub attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub processing_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub next_retry_at: Option<String>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub processed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub terminal_at: Option<String>,
+    #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
+    #[schemars(extend("format" = "date-time"))]
     pub updated_at: String,
 }
 
@@ -1051,24 +1062,36 @@ pub struct WebhookEventList {
 #[serde(deny_unknown_fields)]
 pub struct ProviderOperationSummary {
     pub id: String,
+    /// Currently only `refund.reconcile`.
+    #[schemars(extend("enum" = ["refund.reconcile"]))]
     pub operation_type: String,
+    /// Currently only `refund`.
+    #[schemars(extend("enum" = ["refund"]))]
     pub aggregate_type: String,
     pub aggregate_id: String,
     #[serde(default)]
     pub stripe_account_id: String,
+    /// One of `pending`, `processing`, `failed`, `succeeded`, `dead_letter`.
+    #[schemars(extend("enum" = ["pending", "processing", "failed", "succeeded", "dead_letter"]))]
     pub status: String,
     pub attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub processing_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub next_attempt_at: Option<String>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub terminal_at: Option<String>,
+    #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
+    #[schemars(extend("format" = "date-time"))]
     pub updated_at: String,
 }
 

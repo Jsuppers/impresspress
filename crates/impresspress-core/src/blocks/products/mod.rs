@@ -648,33 +648,6 @@ crate::impresspress_feature_block! {
                 }
             }
         });
-        let refund_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "amount_minor": {"type": ["integer", "null"], "minimum": 1},
-                "provider_reason": {"type": ["string", "null"], "enum": ["duplicate", "fraudulent", "requested_by_customer", null]},
-                "note": {"type": ["string", "null"], "maxLength": 500},
-                "idempotency_key": {"type": ["string", "null"], "maxLength": 80}
-            }
-        });
-        let refund_output_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["purchase_id", "refund_id", "provider_refund_id", "status", "provider_status", "amount_minor", "refunded_total_minor", "order_total_minor", "currency", "livemode"],
-            "properties": {
-                "purchase_id": {"type": "string"},
-                "refund_id": {"type": "string"},
-                "provider_refund_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "succeeded", "failed"]},
-                "provider_status": {"type": "string"},
-                "amount_minor": {"type": "integer"},
-                "refunded_total_minor": {"type": "integer"},
-                "order_total_minor": {"type": "integer"},
-                "currency": {"type": "string"},
-                "livemode": {"type": "boolean"}
-            }
-        });
         let admin_stats_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -687,37 +660,6 @@ crate::impresspress_feature_block! {
                 "total_groups": {"type": "integer"}
             }
         });
-        let webhook_event_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "event_type", "status", "stripe_account_id", "livemode", "attempts", "last_error", "created_at", "updated_at"],
-            "properties": {
-                "id": {"type": "string"},
-                "event_type": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "processing", "failed", "processed", "dead_letter"]},
-                "stripe_account_id": {"type": "string"},
-                "livemode": {"type": "boolean"},
-                "attempts": {"type": "integer"},
-                "processing_started_at": {"type": "string", "format": "date-time"},
-                "next_retry_at": {"type": "string", "format": "date-time"},
-                "last_error": {"type": "string"},
-                "processed_at": {"type": "string", "format": "date-time"},
-                "terminal_at": {"type": "string", "format": "date-time"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let webhook_event_list_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["records", "total_count", "page", "page_size"],
-            "properties": {
-                "records": {"type": "array", "items": webhook_event_schema},
-                "total_count": {"type": "integer"},
-                "page": {"type": "integer"},
-                "page_size": {"type": "integer"}
-            }
-        });
         let webhook_ack_schema = serde_json::json!({
             "type": "object",
             "required": ["received"],
@@ -725,49 +667,6 @@ crate::impresspress_feature_block! {
                 "received": {"type": "boolean"},
                 "duplicate": {"type": "boolean"},
                 "dead_letter": {"type": "boolean"}
-            }
-        });
-        let provider_operation_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "operation_type", "aggregate_type", "aggregate_id", "stripe_account_id", "status", "attempts", "last_error", "created_at", "updated_at"],
-            "properties": {
-                "id": {"type": "string"},
-                "operation_type": {"type": "string", "enum": ["refund.reconcile"]},
-                "aggregate_type": {"type": "string", "enum": ["refund"]},
-                "aggregate_id": {"type": "string"},
-                "stripe_account_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "processing", "failed", "succeeded", "dead_letter"]},
-                "attempts": {"type": "integer"},
-                "processing_started_at": {"type": "string", "format": "date-time"},
-                "next_attempt_at": {"type": "string", "format": "date-time"},
-                "last_error": {"type": "string"},
-                "completed_at": {"type": "string", "format": "date-time"},
-                "terminal_at": {"type": "string", "format": "date-time"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let provider_operation_list_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["records", "total_count", "page", "page_size"],
-            "properties": {
-                "records": {"type": "array", "items": provider_operation_schema},
-                "total_count": {"type": "integer"},
-                "page": {"type": "integer"},
-                "page_size": {"type": "integer"}
-            }
-        });
-        let provider_reconcile_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["claimed", "succeeded", "retry_scheduled", "dead_letter"],
-            "properties": {
-                "claimed": {"type": "integer"},
-                "succeeded": {"type": "integer"},
-                "retry_scheduled": {"type": "integer"},
-                "dead_letter": {"type": "integer"}
             }
         });
         let deleted_schema = serde_json::json!({
@@ -1320,8 +1219,8 @@ crate::impresspress_feature_block! {
                     .summary("Create an idempotent full or partial refund")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(refund_input_schema.clone())
-                    .output_schema(refund_output_schema.clone())
+                    .input::<contracts::RefundRequest>()
+                    .output::<contracts::RefundResult>()
                     .tags(&["products", "admin", "refunds"]),
                 BlockEndpoint::get("/b/products/api/admin/stats")
                     .summary("Commerce analytics separated by currency")
@@ -1344,7 +1243,7 @@ crate::impresspress_feature_block! {
                             "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
                         }
                     }))
-                    .output_schema(webhook_event_list_schema)
+                    .output::<contracts::WebhookEventList>()
                     .tags(&["products", "admin", "stripe", "webhooks"]),
                 BlockEndpoint::post("/b/products/api/admin/webhook-events/{id}/replay")
                     .summary("Replay a failed or dead-letter Stripe webhook")
@@ -1363,7 +1262,7 @@ crate::impresspress_feature_block! {
                             "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
                         }
                     }))
-                    .output_schema(provider_operation_list_schema)
+                    .output::<contracts::ProviderOperationList>()
                     .tags(&["products", "admin", "stripe", "reconciliation"]),
                 BlockEndpoint::post("/b/products/api/admin/provider-operations/reconcile")
                     .summary("Claim and reconcile due Stripe provider operations")
@@ -1373,7 +1272,7 @@ crate::impresspress_feature_block! {
                         "type": "object",
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}
                     }))
-                    .output_schema(provider_reconcile_schema)
+                    .output::<contracts::ProviderReconcileResult>()
                     .tags(&["products", "admin", "stripe", "reconciliation"]),
                 BlockEndpoint::get("/b/products/api/admin/sellers")
                     .summary("List seller accounts and capability state")
@@ -1668,8 +1567,8 @@ crate::impresspress_feature_block! {
                     .summary("Refund a seller-owned order")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(refund_input_schema)
-                    .output_schema(refund_output_schema)
+                    .input::<contracts::RefundRequest>()
+                    .output::<contracts::RefundResult>()
                     .tags(&["products", "seller", "orders", "refunds"]),
                 BlockEndpoint::post("/b/products/api/seller/onboarding")
                     .summary("Create seller account and Stripe-hosted onboarding link")

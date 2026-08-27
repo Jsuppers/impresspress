@@ -4398,30 +4398,39 @@
                 "additionalProperties": false,
                 "properties": {
                   "page": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "page_size": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "records": {
                     "items": {
                       "additionalProperties": false,
+                      "description": "Safe administrator projection of a durable Stripe provider operation.\nRequest/response payloads, idempotency keys, and lease owners stay private.",
                       "properties": {
                         "aggregate_id": {
                           "type": "string"
                         },
                         "aggregate_type": {
+                          "description": "Currently only `refund`.",
                           "enum": [
                             "refund"
                           ],
                           "type": "string"
                         },
                         "attempts": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "completed_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "created_at": {
                           "format": "date-time",
@@ -4431,13 +4440,18 @@
                           "type": "string"
                         },
                         "last_error": {
+                          "default": "",
                           "type": "string"
                         },
                         "next_attempt_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "operation_type": {
+                          "description": "Currently only `refund.reconcile`.",
                           "enum": [
                             "refund.reconcile"
                           ],
@@ -4445,9 +4459,13 @@
                         },
                         "processing_started_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "status": {
+                          "description": "One of `pending`, `processing`, `failed`, `succeeded`, `dead_letter`.",
                           "enum": [
                             "pending",
                             "processing",
@@ -4458,11 +4476,15 @@
                           "type": "string"
                         },
                         "stripe_account_id": {
+                          "default": "",
                           "type": "string"
                         },
                         "terminal_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "updated_at": {
                           "format": "date-time",
@@ -4474,10 +4496,8 @@
                         "operation_type",
                         "aggregate_type",
                         "aggregate_id",
-                        "stripe_account_id",
                         "status",
                         "attempts",
-                        "last_error",
                         "created_at",
                         "updated_at"
                       ],
@@ -4486,6 +4506,7 @@
                     "type": "array"
                   },
                   "total_count": {
+                    "format": "int64",
                     "type": "integer"
                   }
                 },
@@ -4495,6 +4516,7 @@
                   "page",
                   "page_size"
                 ],
+                "title": "ProviderOperationList",
                 "type": "object"
               }
             }
@@ -4539,15 +4561,23 @@
                 "additionalProperties": false,
                 "properties": {
                   "claimed": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "dead_letter": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "retry_scheduled": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "succeeded": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   }
                 },
@@ -4557,6 +4587,7 @@
                   "retry_scheduled",
                   "dead_letter"
                 ],
+                "title": "ProviderReconcileResult",
                 "type": "object"
               }
             }
@@ -4922,6 +4953,9 @@
               "additionalProperties": false,
               "properties": {
                 "amount_minor": {
+                  "default": null,
+                  "description": "Exact amount in the order currency's minor unit. Omit to refund the\ncomplete remaining refundable amount.",
+                  "format": "int64",
                   "minimum": 1,
                   "type": [
                     "integer",
@@ -4929,6 +4963,8 @@
                   ]
                 },
                 "idempotency_key": {
+                  "default": null,
+                  "description": "Stable client operation key. Supplying a fresh key allows a deliberate\nsecond partial refund of the same amount; retries must reuse the key.",
                   "maxLength": 80,
                   "type": [
                     "string",
@@ -4936,6 +4972,8 @@
                   ]
                 },
                 "note": {
+                  "default": null,
+                  "description": "Private operator note retained in ImpressPress, never sent to Stripe.",
                   "maxLength": 500,
                   "type": [
                     "string",
@@ -4943,6 +4981,8 @@
                   ]
                 },
                 "provider_reason": {
+                  "default": null,
+                  "description": "Stripe's constrained provider reason. Human context belongs in `note`.",
                   "enum": [
                     "duplicate",
                     "fraudulent",
@@ -4955,6 +4995,7 @@
                   ]
                 }
               },
+              "title": "RefundRequest",
               "type": "object"
             }
           }
@@ -4969,6 +5010,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "amount_minor": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "currency": {
@@ -4978,21 +5020,26 @@
                     "type": "boolean"
                   },
                   "order_total_minor": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "provider_refund_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "provider_status": {
+                    "default": "",
                     "type": "string"
                   },
                   "purchase_id": {
                     "type": "string"
                   },
                   "refund_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "refunded_total_minor": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "status": {
@@ -5006,16 +5053,14 @@
                 },
                 "required": [
                   "purchase_id",
-                  "refund_id",
-                  "provider_refund_id",
                   "status",
-                  "provider_status",
                   "amount_minor",
                   "refunded_total_minor",
                   "order_total_minor",
                   "currency",
                   "livemode"
                 ],
+                "title": "RefundResult",
                 "type": "object"
               }
             }
@@ -6242,16 +6287,21 @@
                 "additionalProperties": false,
                 "properties": {
                   "page": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "page_size": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "records": {
                     "items": {
                       "additionalProperties": false,
+                      "description": "Safe operational projection of a Stripe event. The signed payload and\nprocessing owner are never serialized to the admin API.",
                       "properties": {
                         "attempts": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "created_at": {
@@ -6265,6 +6315,7 @@
                           "type": "string"
                         },
                         "last_error": {
+                          "default": "",
                           "type": "string"
                         },
                         "livemode": {
@@ -6272,17 +6323,27 @@
                         },
                         "next_retry_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "processed_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "processing_started_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "status": {
+                          "description": "One of `pending`, `processing`, `failed`, `processed`, `dead_letter`.",
                           "enum": [
                             "pending",
                             "processing",
@@ -6293,11 +6354,15 @@
                           "type": "string"
                         },
                         "stripe_account_id": {
+                          "default": "",
                           "type": "string"
                         },
                         "terminal_at": {
                           "format": "date-time",
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "updated_at": {
                           "format": "date-time",
@@ -6308,10 +6373,8 @@
                         "id",
                         "event_type",
                         "status",
-                        "stripe_account_id",
                         "livemode",
                         "attempts",
-                        "last_error",
                         "created_at",
                         "updated_at"
                       ],
@@ -6320,6 +6383,7 @@
                     "type": "array"
                   },
                   "total_count": {
+                    "format": "int64",
                     "type": "integer"
                   }
                 },
@@ -6329,6 +6393,7 @@
                   "page",
                   "page_size"
                 ],
+                "title": "WebhookEventList",
                 "type": "object"
               }
             }
@@ -10723,6 +10788,9 @@
               "additionalProperties": false,
               "properties": {
                 "amount_minor": {
+                  "default": null,
+                  "description": "Exact amount in the order currency's minor unit. Omit to refund the\ncomplete remaining refundable amount.",
+                  "format": "int64",
                   "minimum": 1,
                   "type": [
                     "integer",
@@ -10730,6 +10798,8 @@
                   ]
                 },
                 "idempotency_key": {
+                  "default": null,
+                  "description": "Stable client operation key. Supplying a fresh key allows a deliberate\nsecond partial refund of the same amount; retries must reuse the key.",
                   "maxLength": 80,
                   "type": [
                     "string",
@@ -10737,6 +10807,8 @@
                   ]
                 },
                 "note": {
+                  "default": null,
+                  "description": "Private operator note retained in ImpressPress, never sent to Stripe.",
                   "maxLength": 500,
                   "type": [
                     "string",
@@ -10744,6 +10816,8 @@
                   ]
                 },
                 "provider_reason": {
+                  "default": null,
+                  "description": "Stripe's constrained provider reason. Human context belongs in `note`.",
                   "enum": [
                     "duplicate",
                     "fraudulent",
@@ -10756,6 +10830,7 @@
                   ]
                 }
               },
+              "title": "RefundRequest",
               "type": "object"
             }
           }
@@ -10770,6 +10845,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "amount_minor": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "currency": {
@@ -10779,21 +10855,26 @@
                     "type": "boolean"
                   },
                   "order_total_minor": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "provider_refund_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "provider_status": {
+                    "default": "",
                     "type": "string"
                   },
                   "purchase_id": {
                     "type": "string"
                   },
                   "refund_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "refunded_total_minor": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "status": {
@@ -10807,16 +10888,14 @@
                 },
                 "required": [
                   "purchase_id",
-                  "refund_id",
-                  "provider_refund_id",
                   "status",
-                  "provider_status",
                   "amount_minor",
                   "refunded_total_minor",
                   "order_total_minor",
                   "currency",
                   "livemode"
                 ],
+                "title": "RefundResult",
                 "type": "object"
               }
             }
