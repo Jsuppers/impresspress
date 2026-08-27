@@ -1,6 +1,6 @@
 # WebMCP + derive-migration handoff
 
-**Date:** 2026-08-28
+**Date:** 2026-08-28 (updated end of day — see §1 for what moved)
 **Repos:** `wafer-run` (producer), `impresspress` (consumer)
 
 Goal: expose impresspress functionality as [WebMCP](https://github.com/webmachinelearning/webmcp)
@@ -15,27 +15,20 @@ its arguments is worse than no tool** — refuse rather than mislead.
 | Work | Where | State |
 |---|---|---|
 | WebMCP producer | wafer-run **#323** | **MERGED** (`ee103db`) |
-| Producer follow-ups | wafer-run **#324** | **OPEN** — `feat/webmcp-producer-followups` |
-| WebMCP consumer | impresspress **#72** | **OPEN** — `worktree-webmcp-feasibility` |
-| Derive migration | impresspress | **UNPUSHED** — `feat/derive-migration`, 22 commits |
+| Producer follow-ups | wafer-run **#324** | **MERGED** (`61e68a0`, squash). Review follow-ups filed: wafer-run **#325** (outputSchema wall lacks `required ⊆ properties`), **#326** (`RuntimeError` not `#[non_exhaustive]` + two weak tests) |
+| WebMCP consumer | impresspress **#72** | **MERGED** (`8b48bcd`) after the pin bump to `61e68a0` (`e204c98`); CI 13/13 |
+| Derive migration | impresspress **#74** | **OPEN** — `feat/derive-migration`; 22 migration commits + 4 follow-ups, `main` (post-#72) merged in as `e27895c` |
 
-### ⚠️ Merge order is load-bearing
+### Merge order — resolved
 
-**wafer-run #324 must merge before impresspress #72 and before the derive
-migration.** Two independent reasons:
-
-1. **#72 does not compile without it.** `builder/registration.rs:388` reads
-   `WebMcpRefusalReport::scope`, which only exists in #324. Its CI is red until
-   #324 lands and the rev pin is bumped a second time.
-2. **The migration's snapshots are only correct with it.** Every
-   `.output::<T>()` schema on `feat/derive-migration` was generated under
-   schemars' **serialize** contract, which #324 introduces. `wafer-block` at the
-   currently pinned `ee103db` still uses plain `schema_for!` for all four
-   builders. Merge the migration first and the output schemas silently revert to
-   deserialize semantics — **and the snapshot gate will not catch it**, because
-   the baseline would simply be regenerated to match.
-
-Sequence: **#324 → bump pin → #72 → migration.**
+The sequence **#324 → bump pin → #72 → migration** has been executed up to the
+migration PR. #324 merged as `61e68a0`; #72's pin was bumped to it (`e204c98`,
+`Cargo.lock` re-resolved against the git source, not the local patch); the
+migration branch merged the resulting `main` (`e27895c`; a rebase was abandoned after
+the first of 27 commits conflicted — merging is what #72 itself did), so its snapshots — all
+generated under schemars' **serialize** contract, which only exists from #324 —
+now sit on a pin that actually provides it. The one remaining rule: **never
+regenerate a snapshot to get green** (§5).
 
 ---
 
@@ -100,6 +93,16 @@ Per-block `/openapi.json` snapshot gate first, then block by block:
 | admin | 4 endpoints typed from scratch; off the empty-allowlist |
 | tickets | 13/13 JSON endpoints; off the empty-allowlist |
 
+Follow-ups landed on the same branch on 2026-08-28, each with its snapshot
+diff read line by line:
+
+| Commit | What |
+|---|---|
+| `fd3c57f` | Deleted `Product`, `ProductTemplate`, `Order`, `OrderLineItem`, `Subscription` (+ `TemplateKind`, `OwnerKind`, `ProductStatus`, which only they used) — produced by nothing, they were the "schema that lies" risk in its purest form |
+| `86c21b3` | `PATCH /b/auth/api/me` declared and typed; both handlers share one `me_response` projection, so the write now returns `{user: {…}}` like the read. SDK `updateUser` follows. |
+| `7d601c0` | `POST/PATCH/DELETE /b/admin/api/iam/roles*` declared and projected through `AdminRoleView`; the SDK's `IAMService` (wrong envelope, wrong `IAMRole` shape, keyed by name against id routes) now matches the wire |
+| `8c1e22d` | Plan 2 Task 6: real wasm cost recorded in `docs/2026-08-26-derive-migration-wasm-measurement.md` — lean +64 KB raw / +34 KB gz, full +157 KB / +67 KB; the estimate's gzip half did not hold; no action needed |
+
 ---
 
 ## 3. Security findings — the most valuable output
@@ -135,10 +138,8 @@ SQLite decodes. The admin response shape depended on the backend.
 ## 4. What still needs doing
 
 ### Blocking / sequencing
-1. **Merge wafer-run #324**, then bump the rev pin in `impresspress/Cargo.toml`
-   (18 entries) and `Cargo.lock` to the new merge commit.
-2. **Then** #72 goes green and can merge.
-3. **Then** push and PR `feat/derive-migration`.
+Done through the migration PR (#74). What is left is review and merge of
+that PR; nothing else is sequenced behind it.
 
 ### Decisions needed (deliberately not made)
 - **Honeypot is now self-defeating.** `deny_unknown_fields` forces the public
@@ -157,31 +158,33 @@ SQLite decodes. The admin response shape depended on the backend.
   `admin-leak-fix-report.md`: default `sensitive: true` on create.
 
 ### Work remaining
-- **Plan 2 Task 6 — measure the real wasm delta.** The spec's `+94 KB raw /
-  +21 KB gzip` is from a synthetic benchmark. Build the Cloudflare consumer at
-  the pre-migration commit and at HEAD with the same feature set (see
-  `cli/helpers/cloudflare/build.rs`) and record it. If it disappoints,
-  `worker-build` defaults to `wasm-opt -O` not `-Oz` (~−215 KB available).
 - **products' 69 unmigrated sites.** 22 need the `components/schemas` hoist; 47
   need typed handlers (currently generic CRUD over DB column maps).
 - **The `$defs` → `components/schemas` hoist.** Recursive contracts still
   produce dangling refs in `/openapi.json`. Not a regression — before #323 every
   named type did. The WebMCP side is fail-safe (refused, not published wrong).
-- **Plan 3 Task 4 — inspector panel** in impresspress (the wafer-run half landed
-  in #324).
+- **Plan 3 Task 4 — inspector panel.** The whole task was wafer-run work and
+  landed in #324 (`GET {mount}/webmcp` + the "Agent tools" tab). Not yet
+  verified: that impresspress's `/b/inspector` mount reaches the new sub-route
+  and that the tab renders against a real impresspress block set. Note its
+  columns are projected from `ep.auth`, not `routing::effective_access`, and
+  the page says so.
 - **Plan 3 Task 5 — end-to-end run.** Needs a human with a WebMCP-capable
   browser. **This is the only thing that tests whether the tool descriptions
   actually steer an agent**, which is the part most likely to be wrong and least
   covered by tests. Steps are in the plan.
-- **`PATCH /b/auth/api/me` is dispatched but never declared** in `.endpoints`,
-  so it is absent from `/openapi.json` and the access-tier table. It also
-  returns a flat user object where `GET` returns `{user:{…}}`.
-- **Five products contract types** (`Product`, `ProductTemplate`, `Order`,
-  `OrderLineItem`, `Subscription`) are referenced by **no handler or repo**.
-  They look canonical and are not. Either wire or delete them before someone
-  migrates against them.
-- **`impresspress-js` `IAMService` types are wrong** — declares `IAMRole[]`,
-  receives an envelope.
+- **Admin JSON writes still untyped:** `users` PUT is projected but
+  undeclared; `permissions` and `user-roles` GET/POST/DELETE echo raw
+  `RecordList`/`Record`. Same treatment as the role writes (`7d601c0`).
+- **`packages/impresspress-js/src/types/generated/database.ts`** is
+  hand-maintained despite its path, and its other interfaces are camelCase
+  (`userId`, `keyPrefix`, `createdAt`) against a snake_case wire. `IAMRole` was
+  fixed; the rest needs the same audit against the Rust views.
+- **wafer-run #325** — the outputSchema wall does not check
+  `required ⊆ properties` (input side does). Only reachable from hand-written
+  `.output_schema(...)`; none of #72's six tools trip it. Fix upstream.
+- **wafer-run #326** — `RuntimeError` should be `#[non_exhaustive]`; two
+  inspector/seal tests assert less than they appear to.
 
 ---
 
@@ -196,6 +199,14 @@ SQLite decodes. The admin response shape depended on the backend.
   `../wafer-run` tracks a main containing the merged work.
 - **Never bare `git stash` / `git stash pop`.** The stash stack is shared across
   worktrees and other sessions. Use a temporary WIP commit.
+- **`Cargo.lock` for a pin bump must be re-resolved from *outside* the
+  impresspress tree** (`cargo metadata --manifest-path … ` from the scratchpad):
+  cargo finds `.cargo/config.toml` by walking up from the *cwd*, so anywhere
+  under `impresspress/` inherits the repo-level `[patch]` and writes path
+  sources into the lock. `e204c98` on #72 was produced this way.
+- **`impresspress-cloudflare` is a library.** `worker-build` inside the crate
+  yields a 57 KB shell with nothing reachable. Measure through a consumer —
+  the exact one is in `docs/2026-08-26-derive-migration-wasm-measurement.md`.
 - **Never regenerate a snapshot to get green.** Every changed line is a
   decision. Regenerating without reading is the one way to fail the migration
   while appearing to pass it.
