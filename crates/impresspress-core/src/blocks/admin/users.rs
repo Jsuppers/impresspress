@@ -144,7 +144,20 @@ async fn handle_update(
     // The self-disable guard, safe-field whitelist, and audit-log write all
     // live in the shared ops layer so the SSR surface can't diverge.
     match ops::update_user_fields(ctx, msg, id, &body).await {
-        Ok(record) => ok_json(&record),
+        Ok(record) => {
+            // Same projection as GET (`get_user` / `handle_list`): the ops
+            // layer returns the raw `db::Record`, whose `password_hash.remove`
+            // is a no-op (no such column on this table — credentials live in
+            // `local_credentials`) and which otherwise still carries
+            // `verification_token` / `last_verification_sent` / `auth_version`.
+            // Echoing it here would leak the same columns the GET handlers
+            // used to, through a fourth response shape.
+            let roles = ops::fetch_roles(ctx, &[id])
+                .await
+                .remove(id)
+                .unwrap_or_default();
+            ok_json(&AdminUserView::from_record(&record, roles))
+        }
         Err(out) => out,
     }
 }
@@ -313,5 +326,38 @@ mod tests {
             !body.to_string().contains("verification_token"),
             "GET /b/admin/api/users/{{id}} leaked verification_token: {body}"
         );
+    }
+
+    /// `PUT /b/admin/api/users/{id}` used to `ok_json(&record)` the raw
+    /// `db::Record` returned by `ops::update_user_fields` — the same table,
+    /// same leak as the pre-fix `GET`, just a different handler. It must now
+    /// project through `AdminUserView` like the read paths, so the three
+    /// withheld columns can't reach the wire through this fourth shape.
+    #[tokio::test]
+    async fn update_uses_the_same_projection_as_get_and_list() {
+        let ctx = users_ctx().await;
+        let id = seed_user(&ctx).await;
+
+        let input = InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({"name": "Ada Updated"})).unwrap(),
+        );
+        let body = output_json(
+            handle_update(&ctx, &admin_msg("update", "/admin/users"), &id, input).await,
+        )
+        .await;
+
+        assert_eq!(body["id"], serde_json::json!(id));
+        assert_eq!(body["name"], serde_json::json!("Ada Updated"));
+        assert!(
+            body.get("data").is_none(),
+            "the record envelope must not survive the projection: {body}"
+        );
+        let raw = body.to_string();
+        for leaked in ["verification_token", "3d1f0ac0deadbeef", "password_hash"] {
+            assert!(
+                !raw.contains(leaked),
+                "PUT /b/admin/api/users/{{id}} leaked `{leaked}`: {raw}"
+            );
+        }
     }
 }
