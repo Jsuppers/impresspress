@@ -555,12 +555,6 @@ crate::impresspress_feature_block! {
                 }
             }
         });
-        let provider_redirect_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["url"],
-            "properties": {"url": {"type": "string", "format": "uri"}}
-        });
         let seller_account_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -691,28 +685,6 @@ crate::impresspress_feature_block! {
                 "total_purchases": {"type": "integer"},
                 "currency_analytics": {"type": "array", "items": commerce_analytics_schema},
                 "total_groups": {"type": "integer"}
-            }
-        });
-        let stripe_connection_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["state", "configured", "livemode", "account_id", "country", "default_currency", "business_name", "charges_enabled", "payouts_enabled", "details_submitted", "capabilities", "publishable_key_configured", "webhook_secret_configured", "api_version", "error"],
-            "properties": {
-                "state": {"type": "string", "enum": ["not_configured", "connected_test", "connected_live", "misconfigured"]},
-                "configured": {"type": "boolean"},
-                "livemode": {"type": "boolean"},
-                "account_id": {"type": "string"},
-                "country": {"type": "string"},
-                "default_currency": {"type": "string"},
-                "business_name": {"type": "string"},
-                "charges_enabled": {"type": "boolean"},
-                "payouts_enabled": {"type": "boolean"},
-                "details_submitted": {"type": "boolean"},
-                "capabilities": {"type": "object", "additionalProperties": {"type": "string"}},
-                "publishable_key_configured": {"type": "boolean"},
-                "webhook_secret_configured": {"type": "boolean"},
-                "api_version": {"type": "string"},
-                "error": {"type": "string"}
             }
         });
         let webhook_event_schema = serde_json::json!({
@@ -1359,7 +1331,7 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/api/admin/stripe/status")
                     .summary("Validate Stripe connection and account mode")
                     .auth(AuthLevel::Admin)
-                    .output_schema(stripe_connection_schema)
+                    .output::<contracts::StripeConnectionStatus>()
                     .tags(&["products", "admin", "stripe"]),
                 BlockEndpoint::get("/b/products/api/admin/webhook-events")
                     .summary("List safe Stripe webhook processing state")
@@ -1429,13 +1401,13 @@ crate::impresspress_feature_block! {
                     .summary("Suspend a seller after provider-safe offer archival")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(seller_account_schema.clone())
+                    .output::<contracts::SellerAccount>()
                     .tags(&["products", "admin", "seller", "stripe-connect"]),
                 BlockEndpoint::post("/b/products/api/admin/sellers/{id}/reactivate")
                     .summary("Reactivate a seller for onboarding or sales")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(seller_account_schema.clone())
+                    .output::<contracts::SellerAccount>()
                     .tags(&["products", "admin", "seller", "stripe-connect"]),
                 BlockEndpoint::get("/b/products/api/products")
                     .summary("List own products")
@@ -1666,7 +1638,7 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/api/seller/account")
                     .summary("Seller Stripe account status")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(seller_account_schema.clone())
+                    .output::<contracts::SellerAccount>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 BlockEndpoint::get("/b/products/api/seller/stats")
                     .summary("Seller analytics separated by currency")
@@ -1702,25 +1674,8 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::post("/b/products/api/seller/onboarding")
                     .summary("Create seller account and Stripe-hosted onboarding link")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["return_url", "refresh_url"],
-                        "properties": {
-                            "return_url": {"type": "string", "format": "uri"},
-                            "refresh_url": {"type": "string", "format": "uri"}
-                        }
-                    }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["account", "url", "expires_at"],
-                        "properties": {
-                            "account": seller_account_schema,
-                            "url": {"type": "string", "format": "uri"},
-                            "expires_at": {"type": "integer"}
-                        }
-                    }))
+                    .input::<contracts::SellerOnboardingRequest>()
+                    .output::<contracts::SellerOnboardingResponse>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 BlockEndpoint::post("/b/products/api/seller/dashboard")
                     .summary("Create Stripe Express dashboard login link")
@@ -1953,16 +1908,8 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::post("/b/products/billing-portal")
                     .summary("Create a Stripe Billing Portal session for an owned customer context")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["return_url"],
-                        "properties": {
-                            "return_url": {"type": "string", "format": "uri"},
-                            "order_id": {"type": ["string", "null"]}
-                        }
-                    }))
-                    .output_schema(provider_redirect_schema)
+                    .input::<contracts::BillingPortalRequest>()
+                    .output::<contracts::ProviderRedirect>()
                     .tags(&["products", "subscriptions", "stripe"]),
             ])
             .config_keys(config_vars())

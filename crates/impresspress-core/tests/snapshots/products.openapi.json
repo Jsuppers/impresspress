@@ -5497,6 +5497,7 @@
                         "type": "boolean"
                       },
                       "requirements_due": {
+                        "default": [],
                         "items": {
                           "type": "string"
                         },
@@ -5506,24 +5507,29 @@
                     "required": [
                       "details_submitted",
                       "charges_enabled",
-                      "payouts_enabled",
-                      "requirements_due"
+                      "payouts_enabled"
                     ],
                     "type": "object"
                   },
                   "country": {
+                    "default": "",
                     "type": "string"
                   },
                   "dashboard_type": {
+                    "default": "",
                     "type": "string"
                   },
                   "default_currency": {
+                    "default": "",
                     "type": "string"
                   },
                   "disabled_reason": {
+                    "default": "",
                     "type": "string"
                   },
                   "fee_basis_points": {
+                    "description": "Platform fee applied to this seller's sales, in basis points.",
+                    "format": "uint32",
                     "maximum": 10000,
                     "minimum": 0,
                     "type": "integer"
@@ -5532,18 +5538,22 @@
                     "type": "string"
                   },
                   "last_synced_at": {
+                    "default": "",
                     "type": "string"
                   },
                   "livemode": {
+                    "default": false,
                     "type": "boolean"
                   },
                   "status": {
                     "type": "string"
                   },
                   "stripe_account_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "user_id": {
@@ -5555,17 +5565,10 @@
                   "user_id",
                   "status",
                   "approval_status",
-                  "stripe_account_id",
                   "capabilities",
-                  "fee_basis_points",
-                  "livemode",
-                  "country",
-                  "default_currency",
-                  "dashboard_type",
-                  "disabled_reason",
-                  "sync_error",
-                  "last_synced_at"
+                  "fee_basis_points"
                 ],
+                "title": "SellerAccount",
                 "type": "object"
               }
             }
@@ -5629,6 +5632,7 @@
                         "type": "boolean"
                       },
                       "requirements_due": {
+                        "default": [],
                         "items": {
                           "type": "string"
                         },
@@ -5638,24 +5642,29 @@
                     "required": [
                       "details_submitted",
                       "charges_enabled",
-                      "payouts_enabled",
-                      "requirements_due"
+                      "payouts_enabled"
                     ],
                     "type": "object"
                   },
                   "country": {
+                    "default": "",
                     "type": "string"
                   },
                   "dashboard_type": {
+                    "default": "",
                     "type": "string"
                   },
                   "default_currency": {
+                    "default": "",
                     "type": "string"
                   },
                   "disabled_reason": {
+                    "default": "",
                     "type": "string"
                   },
                   "fee_basis_points": {
+                    "description": "Platform fee applied to this seller's sales, in basis points.",
+                    "format": "uint32",
                     "maximum": 10000,
                     "minimum": 0,
                     "type": "integer"
@@ -5664,18 +5673,22 @@
                     "type": "string"
                   },
                   "last_synced_at": {
+                    "default": "",
                     "type": "string"
                   },
                   "livemode": {
+                    "default": false,
                     "type": "boolean"
                   },
                   "status": {
                     "type": "string"
                   },
                   "stripe_account_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "user_id": {
@@ -5687,17 +5700,10 @@
                   "user_id",
                   "status",
                   "approval_status",
-                  "stripe_account_id",
                   "capabilities",
-                  "fee_basis_points",
-                  "livemode",
-                  "country",
-                  "default_currency",
-                  "dashboard_type",
-                  "disabled_reason",
-                  "sync_error",
-                  "last_synced_at"
+                  "fee_basis_points"
                 ],
+                "title": "SellerAccount",
                 "type": "object"
               }
             }
@@ -5884,18 +5890,21 @@
                 "additionalProperties": false,
                 "properties": {
                   "account_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "api_version": {
                     "type": "string"
                   },
                   "business_name": {
+                    "default": "",
                     "type": "string"
                   },
                   "capabilities": {
                     "additionalProperties": {
                       "type": "string"
                     },
+                    "default": {},
                     "type": "object"
                   },
                   "charges_enabled": {
@@ -5905,15 +5914,18 @@
                     "type": "boolean"
                   },
                   "country": {
+                    "default": "",
                     "type": "string"
                   },
                   "default_currency": {
+                    "default": "",
                     "type": "string"
                   },
                   "details_submitted": {
                     "type": "boolean"
                   },
                   "error": {
+                    "default": "",
                     "type": "string"
                   },
                   "livemode": {
@@ -5942,19 +5954,14 @@
                   "state",
                   "configured",
                   "livemode",
-                  "account_id",
-                  "country",
-                  "default_currency",
-                  "business_name",
                   "charges_enabled",
                   "payouts_enabled",
                   "details_submitted",
-                  "capabilities",
                   "publishable_key_configured",
                   "webhook_secret_configured",
-                  "api_version",
-                  "error"
+                  "api_version"
                 ],
+                "title": "StripeConnectionStatus",
                 "type": "object"
               }
             }
@@ -10077,6 +10084,7 @@
                         "type": "boolean"
                       },
                       "requirements_due": {
+                        "default": [],
                         "items": {
                           "type": "string"
                         },
@@ -10086,24 +10094,29 @@
                     "required": [
                       "details_submitted",
                       "charges_enabled",
-                      "payouts_enabled",
-                      "requirements_due"
+                      "payouts_enabled"
                     ],
                     "type": "object"
                   },
                   "country": {
+                    "default": "",
                     "type": "string"
                   },
                   "dashboard_type": {
+                    "default": "",
                     "type": "string"
                   },
                   "default_currency": {
+                    "default": "",
                     "type": "string"
                   },
                   "disabled_reason": {
+                    "default": "",
                     "type": "string"
                   },
                   "fee_basis_points": {
+                    "description": "Platform fee applied to this seller's sales, in basis points.",
+                    "format": "uint32",
                     "maximum": 10000,
                     "minimum": 0,
                     "type": "integer"
@@ -10112,18 +10125,22 @@
                     "type": "string"
                   },
                   "last_synced_at": {
+                    "default": "",
                     "type": "string"
                   },
                   "livemode": {
+                    "default": false,
                     "type": "boolean"
                   },
                   "status": {
                     "type": "string"
                   },
                   "stripe_account_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "user_id": {
@@ -10135,17 +10152,10 @@
                   "user_id",
                   "status",
                   "approval_status",
-                  "stripe_account_id",
                   "capabilities",
-                  "fee_basis_points",
-                  "livemode",
-                  "country",
-                  "default_currency",
-                  "dashboard_type",
-                  "disabled_reason",
-                  "sync_error",
-                  "last_synced_at"
+                  "fee_basis_points"
                 ],
+                "title": "SellerAccount",
                 "type": "object"
               }
             }
@@ -10214,10 +10224,12 @@
               "additionalProperties": false,
               "properties": {
                 "refresh_url": {
+                  "description": "Where Stripe returns the seller if the onboarding link expired.",
                   "format": "uri",
                   "type": "string"
                 },
                 "return_url": {
+                  "description": "Where Stripe returns the seller once onboarding is submitted.",
                   "format": "uri",
                   "type": "string"
                 }
@@ -10226,6 +10238,7 @@
                 "return_url",
                 "refresh_url"
               ],
+              "title": "SellerOnboardingRequest",
               "type": "object"
             }
           }
@@ -10265,6 +10278,7 @@
                             "type": "boolean"
                           },
                           "requirements_due": {
+                            "default": [],
                             "items": {
                               "type": "string"
                             },
@@ -10274,24 +10288,29 @@
                         "required": [
                           "details_submitted",
                           "charges_enabled",
-                          "payouts_enabled",
-                          "requirements_due"
+                          "payouts_enabled"
                         ],
                         "type": "object"
                       },
                       "country": {
+                        "default": "",
                         "type": "string"
                       },
                       "dashboard_type": {
+                        "default": "",
                         "type": "string"
                       },
                       "default_currency": {
+                        "default": "",
                         "type": "string"
                       },
                       "disabled_reason": {
+                        "default": "",
                         "type": "string"
                       },
                       "fee_basis_points": {
+                        "description": "Platform fee applied to this seller's sales, in basis points.",
+                        "format": "uint32",
                         "maximum": 10000,
                         "minimum": 0,
                         "type": "integer"
@@ -10300,18 +10319,22 @@
                         "type": "string"
                       },
                       "last_synced_at": {
+                        "default": "",
                         "type": "string"
                       },
                       "livemode": {
+                        "default": false,
                         "type": "boolean"
                       },
                       "status": {
                         "type": "string"
                       },
                       "stripe_account_id": {
+                        "default": "",
                         "type": "string"
                       },
                       "sync_error": {
+                        "default": "",
                         "type": "string"
                       },
                       "user_id": {
@@ -10323,23 +10346,17 @@
                       "user_id",
                       "status",
                       "approval_status",
-                      "stripe_account_id",
                       "capabilities",
-                      "fee_basis_points",
-                      "livemode",
-                      "country",
-                      "default_currency",
-                      "dashboard_type",
-                      "disabled_reason",
-                      "sync_error",
-                      "last_synced_at"
+                      "fee_basis_points"
                     ],
                     "type": "object"
                   },
                   "expires_at": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "url": {
+                    "description": "Single-use Stripe-hosted onboarding link.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -10349,6 +10366,7 @@
                   "url",
                   "expires_at"
                 ],
+                "title": "SellerOnboardingResponse",
                 "type": "object"
               }
             }
@@ -11009,12 +11027,14 @@
               "additionalProperties": false,
               "properties": {
                 "order_id": {
+                  "default": null,
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "return_url": {
+                  "description": "Where Stripe returns the customer when they leave the portal.",
                   "format": "uri",
                   "type": "string"
                 }
@@ -11022,6 +11042,7 @@
               "required": [
                 "return_url"
               ],
+              "title": "BillingPortalRequest",
               "type": "object"
             }
           }
@@ -11036,6 +11057,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "url": {
+                    "description": "Absolute provider-hosted URL the browser must be sent to.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -11043,6 +11065,7 @@
                 "required": [
                   "url"
                 ],
+                "title": "ProviderRedirect",
                 "type": "object"
               }
             }

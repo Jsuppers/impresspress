@@ -809,6 +809,8 @@ pub struct SellerAccount {
     #[serde(default)]
     pub stripe_account_id: String,
     pub capabilities: SellerCapabilities,
+    /// Platform fee applied to this seller's sales, in basis points.
+    #[schemars(range(max = 10000))]
     pub fee_basis_points: u32,
     #[serde(default)]
     pub livemode: bool,
@@ -864,7 +866,11 @@ pub struct StripeConnectionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SellerOnboardingRequest {
+    /// Where Stripe returns the seller once onboarding is submitted.
+    #[schemars(url)]
     pub return_url: String,
+    /// Where Stripe returns the seller if the onboarding link expired.
+    #[schemars(url)]
     pub refresh_url: String,
 }
 
@@ -872,6 +878,8 @@ pub struct SellerOnboardingRequest {
 #[serde(deny_unknown_fields)]
 pub struct SellerOnboardingResponse {
     pub account: SellerAccount,
+    /// Single-use Stripe-hosted onboarding link.
+    #[schemars(url)]
     pub url: String,
     pub expires_at: i64,
 }
@@ -880,13 +888,15 @@ pub struct SellerOnboardingResponse {
 #[serde(deny_unknown_fields)]
 pub struct ProviderRedirect {
     /// Absolute provider-hosted URL the browser must be sent to.
-    #[schemars(extend("format" = "uri"))]
+    #[schemars(url)]
     pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BillingPortalRequest {
+    /// Where Stripe returns the customer when they leave the portal.
+    #[schemars(url)]
     pub return_url: String,
     #[serde(default)]
     pub order_id: Option<String>,
