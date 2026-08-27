@@ -374,6 +374,17 @@ crate::impresspress_feature_block! {
                 "updated_at": {"type": "string", "format": "date-time"}
             }
         });
+        // NOT derivable, and deliberately so. `record_schema` /
+        // `record_list_schema` wrap `wafer_core::clients::database::Record`,
+        // whose `data` is the raw column map for a table with no contract
+        // type at all — `product_schema` above IS the row shape, hand-kept
+        // against the migration. There is no `T` to instantiate a generic
+        // `Record<T>` with, and `Record` itself lives in wafer-core. Every
+        // remaining `record_schema(...)` / `record_list_schema(...)` call
+        // site is a generic `crud::*` handler that reads and writes that map
+        // directly; typing them means typing the CRUD layer first, which is
+        // a behaviour change (unknown columns would start being rejected),
+        // not a schema migration.
         let record_schema = |data: serde_json::Value| serde_json::json!({
             "type": "object",
             "required": ["id", "data"],
@@ -395,6 +406,11 @@ crate::impresspress_feature_block! {
                 "page_size": {"type": "integer"}
             }
         });
+        // Path and query parameter schemas stay hand-written. They restate
+        // the route template, and no handler deserializes them — every one
+        // reads `msg.var(..)` / `msg.query(..)` by name. A struct declared
+        // only to feed `.path_params::<T>()` would have no runtime user and
+        // would generate a byte-identical parameter list.
         let id_path_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -566,6 +582,16 @@ crate::impresspress_feature_block! {
                 "link_id": {"type": "string"}
             }
         });
+        // NOT derivable: `Condition` is recursive (`All`/`Any` hold child
+        // `Condition`s), and it reaches these three schemas through
+        // `OfferComponent`/`OfferComponentDraft`. schemars cannot inline a
+        // cycle, so it closes it with `{"$ref": "#/$defs/Condition"}` plus a
+        // sibling `$defs`. Embedded in an OpenAPI document that pointer
+        // resolves against the *document* root, where no `$defs` exists — a
+        // dangling reference that reads as an ordinary `$ref` in a diff.
+        // Verified by swapping one call site and reading the output. These
+        // stay hand-written until `generate_openapi` hoists definitions into
+        // `components/schemas` and rewrites the pointers.
         let offer_definition_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
