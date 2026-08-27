@@ -235,7 +235,7 @@ pub fn endpoint_auth(
 /// this is the local ordering used by [`endpoint_auth`] to pick the strictest
 /// matching endpoint. The numbers are an internal detail — only their relative
 /// order matters.
-fn auth_rank(level: AuthLevel) -> u8 {
+pub(crate) fn auth_rank(level: AuthLevel) -> u8 {
     match level {
         AuthLevel::Public => 0,
         AuthLevel::Authenticated => 1,
