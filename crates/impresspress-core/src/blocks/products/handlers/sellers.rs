@@ -8,7 +8,10 @@ use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::products::{contracts::OfferStatus, repo, stripe, PRODUCTS_TABLE},
+    blocks::products::{
+        contracts::{OfferStatus, SellerAccountList},
+        repo, stripe, PRODUCTS_TABLE,
+    },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
     util::{stamp_updated, RecordExt},
 };
@@ -52,7 +55,7 @@ pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
         Ok(sellers) => sellers,
         Err(error) => return admin_error(error, "Seller not found"),
     };
-    ok_json(&serde_json::json!({"sellers": sellers}))
+    ok_json(&SellerAccountList { sellers })
 }
 
 pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {

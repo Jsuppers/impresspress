@@ -5142,6 +5142,8 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
+                "description": "Every seller account known to the platform, with its capability state.",
                 "properties": {
                   "sellers": {
                     "items": {
@@ -5170,6 +5172,7 @@
                               "type": "boolean"
                             },
                             "requirements_due": {
+                              "default": [],
                               "items": {
                                 "type": "string"
                               },
@@ -5179,24 +5182,29 @@
                           "required": [
                             "details_submitted",
                             "charges_enabled",
-                            "payouts_enabled",
-                            "requirements_due"
+                            "payouts_enabled"
                           ],
                           "type": "object"
                         },
                         "country": {
+                          "default": "",
                           "type": "string"
                         },
                         "dashboard_type": {
+                          "default": "",
                           "type": "string"
                         },
                         "default_currency": {
+                          "default": "",
                           "type": "string"
                         },
                         "disabled_reason": {
+                          "default": "",
                           "type": "string"
                         },
                         "fee_basis_points": {
+                          "description": "Platform fee applied to this seller's sales, in basis points.",
+                          "format": "uint32",
                           "maximum": 10000,
                           "minimum": 0,
                           "type": "integer"
@@ -5205,18 +5213,22 @@
                           "type": "string"
                         },
                         "last_synced_at": {
+                          "default": "",
                           "type": "string"
                         },
                         "livemode": {
+                          "default": false,
                           "type": "boolean"
                         },
                         "status": {
                           "type": "string"
                         },
                         "stripe_account_id": {
+                          "default": "",
                           "type": "string"
                         },
                         "sync_error": {
+                          "default": "",
                           "type": "string"
                         },
                         "user_id": {
@@ -5228,16 +5240,8 @@
                         "user_id",
                         "status",
                         "approval_status",
-                        "stripe_account_id",
                         "capabilities",
-                        "fee_basis_points",
-                        "livemode",
-                        "country",
-                        "default_currency",
-                        "dashboard_type",
-                        "disabled_reason",
-                        "sync_error",
-                        "last_synced_at"
+                        "fee_basis_points"
                       ],
                       "type": "object"
                     },
@@ -5247,6 +5251,7 @@
                 "required": [
                   "sellers"
                 ],
+                "title": "SellerAccountList",
                 "type": "object"
               }
             }
@@ -5832,64 +5837,92 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
+                "description": "Platform-wide commerce counters for the admin dashboard.",
                 "properties": {
                   "active_products": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "currency_analytics": {
+                    "description": "One entry per currency the platform has transacted in.",
                     "items": {
                       "additionalProperties": false,
                       "properties": {
                         "active_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "canceled_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "currency": {
                           "type": "string"
                         },
                         "failed_order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "gross_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "lost_dispute_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "lost_disputed_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "net_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "open_dispute_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "open_disputed_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "paid_order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "past_due_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "platform_fees_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "refunded_order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "refunded_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "top_products": {
                           "items": {
+                            "additionalProperties": false,
                             "properties": {
                               "name": {
                                 "type": "string"
@@ -5898,9 +5931,12 @@
                                 "type": "string"
                               },
                               "quantity": {
+                                "format": "uint64",
+                                "minimum": 0,
                                 "type": "integer"
                               },
                               "revenue_minor": {
+                                "format": "int64",
                                 "type": "integer"
                               }
                             },
@@ -5915,6 +5951,8 @@
                           "type": "array"
                         },
                         "trialing_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         }
                       },
@@ -5943,12 +5981,15 @@
                     "type": "array"
                   },
                   "total_groups": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "total_products": {
+                    "format": "int64",
                     "type": "integer"
                   },
                   "total_purchases": {
+                    "format": "int64",
                     "type": "integer"
                   }
                 },
@@ -5959,6 +6000,7 @@
                   "currency_analytics",
                   "total_groups"
                 ],
+                "title": "AdminStats",
                 "type": "object"
               }
             }
@@ -6486,11 +6528,14 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "Acknowledgement returned to Stripe for a delivered webhook event.",
                 "properties": {
                   "dead_letter": {
+                    "description": "Present only when the event exhausted its retry budget.",
                     "type": "boolean"
                   },
                   "duplicate": {
+                    "description": "Present only when the event id had already been recorded, in which\ncase no side effect ran.",
                     "type": "boolean"
                   },
                   "received": {
@@ -6500,6 +6545,7 @@
                 "required": [
                   "received"
                 ],
+                "title": "WebhookAck",
                 "type": "object"
               }
             }
@@ -11033,61 +11079,88 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
+                "description": "One seller's own commerce counters and recent operational failures.",
                 "properties": {
                   "currency_analytics": {
+                    "description": "One entry per currency this seller has transacted in.",
                     "items": {
                       "additionalProperties": false,
                       "properties": {
                         "active_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "canceled_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "currency": {
                           "type": "string"
                         },
                         "failed_order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "gross_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "lost_dispute_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "lost_disputed_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "net_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "open_dispute_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "open_disputed_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "paid_order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "past_due_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "platform_fees_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "refunded_order_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "refunded_volume_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "top_products": {
                           "items": {
+                            "additionalProperties": false,
                             "properties": {
                               "name": {
                                 "type": "string"
@@ -11096,9 +11169,12 @@
                                 "type": "string"
                               },
                               "quantity": {
+                                "format": "uint64",
+                                "minimum": 0,
                                 "type": "integer"
                               },
                               "revenue_minor": {
+                                "format": "int64",
                                 "type": "integer"
                               }
                             },
@@ -11113,6 +11189,8 @@
                           "type": "array"
                         },
                         "trialing_subscription_count": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         }
                       },
@@ -11143,6 +11221,7 @@
                   "recent_failures": {
                     "items": {
                       "additionalProperties": false,
+                      "description": "Ownership-safe failed-order projection for seller operational dashboards.",
                       "properties": {
                         "created_at": {
                           "format": "date-time",
@@ -11152,6 +11231,7 @@
                           "type": "string"
                         },
                         "error": {
+                          "default": "",
                           "type": "string"
                         },
                         "order_id": {
@@ -11161,6 +11241,7 @@
                           "type": "string"
                         },
                         "total_minor": {
+                          "format": "int64",
                           "type": "integer"
                         }
                       },
@@ -11169,7 +11250,6 @@
                         "status",
                         "currency",
                         "total_minor",
-                        "error",
                         "created_at"
                       ],
                       "type": "object"
@@ -11177,6 +11257,7 @@
                     "type": "array"
                   },
                   "seller_account_id": {
+                    "description": "Empty when the user has not started Stripe onboarding.",
                     "type": "string"
                   }
                 },
@@ -11185,6 +11266,7 @@
                   "currency_analytics",
                   "recent_failures"
                 ],
+                "title": "SellerStats",
                 "type": "object"
               }
             }
@@ -13947,11 +14029,14 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "Acknowledgement returned to Stripe for a delivered webhook event.",
                 "properties": {
                   "dead_letter": {
+                    "description": "Present only when the event exhausted its retry budget.",
                     "type": "boolean"
                   },
                   "duplicate": {
+                    "description": "Present only when the event id had already been recorded, in which\ncase no side effect ran.",
                     "type": "boolean"
                   },
                   "received": {
@@ -13961,6 +14046,7 @@
                 "required": [
                   "received"
                 ],
+                "title": "WebhookAck",
                 "type": "object"
               }
             }

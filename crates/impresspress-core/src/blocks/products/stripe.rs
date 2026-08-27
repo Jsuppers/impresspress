@@ -17,7 +17,7 @@ use super::{
     contracts::{
         AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, ManagedOffer,
         ManagedPaymentLink, Offer, OfferMode, OfferStatus, PaymentLinkCreateRequest,
-        PricingPreviewRequest, WebhookEventList, WebhookEventSummary,
+        PricingPreviewRequest, WebhookAck, WebhookEventList, WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
     PRODUCTS_TABLE,
@@ -3082,7 +3082,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     event_type = %event_type,
                     "duplicate Stripe webhook event — skipping side effects"
                 );
-                return ok_json(&serde_json::json!({"received": true, "duplicate": true}));
+                return ok_json(&WebhookAck::duplicate());
             }
             Ok(EventRecordState::DeadLetter) => {
                 tracing::error!(
@@ -3090,10 +3090,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     event_type = %event_type,
                     "Stripe webhook event exhausted its retry budget"
                 );
-                return ok_json(&serde_json::json!({
-                    "received": true,
-                    "dead_letter": true
-                }));
+                return ok_json(&WebhookAck::dead_letter());
             }
             Err(e) => return err_internal("Failed to record webhook event", e),
         }
@@ -3722,7 +3719,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                                 );
                             }
                         }
-                        return ok_json(&serde_json::json!({"received": true}));
+                        return ok_json(&WebhookAck::received());
                     }
                     Err(error) => fail_webhook!(
                         err_internal("Failed to load disputed purchase", error),
@@ -4100,7 +4097,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
         }
     }
 
-    ok_json(&serde_json::json!({"received": true}))
+    ok_json(&WebhookAck::received())
 }
 
 /// Fire a webhook for product/billing events.

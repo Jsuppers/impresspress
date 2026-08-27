@@ -873,6 +873,13 @@ pub struct SellerAccount {
     pub last_synced_at: String,
 }
 
+/// Every seller account known to the platform, with its capability state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SellerAccountList {
+    pub sellers: Vec<SellerAccount>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StripeConnectionState {
@@ -1055,7 +1062,77 @@ pub struct SellerFailureSummary {
     pub total_minor: i64,
     #[serde(default)]
     pub error: String,
+    #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
+}
+
+/// Platform-wide commerce counters for the admin dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdminStats {
+    pub total_products: i64,
+    pub active_products: i64,
+    pub total_purchases: i64,
+    /// One entry per currency the platform has transacted in.
+    pub currency_analytics: Vec<CommerceAnalytics>,
+    pub total_groups: i64,
+}
+
+/// One seller's own commerce counters and recent operational failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SellerStats {
+    /// Empty when the user has not started Stripe onboarding.
+    pub seller_account_id: String,
+    /// One entry per currency this seller has transacted in.
+    pub currency_analytics: Vec<CommerceAnalytics>,
+    pub recent_failures: Vec<SellerFailureSummary>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Acknowledgement returned to Stripe for a delivered webhook event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebhookAck {
+    pub received: bool,
+    /// Present only when the event id had already been recorded, in which
+    /// case no side effect ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub duplicate: bool,
+    /// Present only when the event exhausted its retry budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dead_letter: bool,
+}
+
+impl WebhookAck {
+    /// The event was accepted and processed.
+    pub fn received() -> Self {
+        Self {
+            received: true,
+            duplicate: false,
+            dead_letter: false,
+        }
+    }
+
+    /// The event id was already recorded, so no side effect ran.
+    pub fn duplicate() -> Self {
+        Self {
+            received: true,
+            duplicate: true,
+            dead_letter: false,
+        }
+    }
+
+    /// The event exhausted its retry budget.
+    pub fn dead_letter() -> Self {
+        Self {
+            received: true,
+            duplicate: false,
+            dead_letter: true,
+        }
+    }
 }
 
 /// Safe operational projection of a Stripe event. The signed payload and
