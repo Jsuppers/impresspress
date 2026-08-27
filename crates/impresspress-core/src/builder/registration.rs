@@ -327,15 +327,15 @@ impl ImpresspressBuilder {
         // two colliding endpoints still gets that name published normally,
         // even though it is contested at a higher tier (a low-privilege
         // endpoint can silently squat a name a high-privilege one also
-        // claims). Nothing about this being a "boot-time" pass changes that
-        // — on Cloudflare Workers in particular (see "Lifetime" below) it
-        // runs per isolate, not once at deploy time, so it is not a gate a
-        // bad deploy fails; it is a repeated warning a bad deploy will keep
-        // producing until someone reads it and renames one of the tools. A
-        // wafer-run fix that validates cross-block tool-name uniqueness at
-        // `seal()` — turning the collision into a deployment-time failure
-        // instead — was in flight upstream as of this writing; this repo
-        // does not have that protection yet.
+        // claims). What prevents it is `Wafer::seal()`: since wafer-run
+        // 61e68a0 (#324) it counts agent-tool names across every registered
+        // block and refuses boot with `RuntimeError::DuplicateToolNames`.
+        // Every impresspress runtime seals (native boot, the Cloudflare
+        // isolate cache, deploy init), so a colliding deploy never serves a
+        // request. This pass is the net behind that gate — it runs first,
+        // so the collision is logged alongside the boot error, and it still
+        // covers a caller that hands `generate_webmcp_report` declarations
+        // which never passed through `seal()`.
         //
         // The per-request manifest handler (`pipeline::handle_request`, `GET
         // /b/webmcp/manifest.json`) uses the silent `_report` form and
