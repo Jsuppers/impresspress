@@ -12,7 +12,10 @@ use crate::{
             repo::{local_credentials, users},
             USERS_TABLE,
         },
-        auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        auth_ui::{
+            contracts::{SignupRequest, SignupResponse, SignupUser, TokenType},
+            redirect::{default_post_login_redirect, is_safe_local_redirect},
+        },
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ResponseBuilder},
@@ -30,20 +33,37 @@ async fn user_exists(ctx: &dyn Context, email_lower: &str) -> Result<bool, Strin
     }
 }
 
+/// The no-auto-login signup response, shared by the two paths that must be
+/// byte-identical: verification-required, and [SEC-035]'s already-registered
+/// reply. Building both from one constructor is what keeps them
+/// indistinguishable — the whole point of SEC-035 is that a caller cannot tell
+/// which one they got, and two hand-built literals could drift apart.
+fn pending_verification(id: String, email: String) -> SignupResponse {
+    SignupResponse {
+        email_verified: false,
+        message: Some("Account created. Please verify your email before signing in.".to_string()),
+        access_token: None,
+        refresh_token: None,
+        token_type: None,
+        expires_in: None,
+        default_redirect: None,
+        user: SignupUser {
+            id,
+            email,
+            roles: None,
+            name: None,
+        },
+    }
+}
+
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // Enforce ALLOW_SIGNUP on the API (not just the page)
     if !signup_allowed(ctx).await {
         return error_response(ErrorCode::Forbidden, "Signups are currently disabled");
     }
 
-    #[derive(serde::Deserialize)]
-    struct SignupReq {
-        email: String,
-        password: String,
-        name: Option<String>,
-    }
     let raw = input.collect_to_bytes().await;
-    let body: SignupReq = match serde_json::from_slice(&raw) {
+    let body: SignupRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -99,14 +119,9 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Err(e) => return err_internal("User lookup failed", e),
     };
     if email_already_taken {
-        return ResponseBuilder::new().status(201).json(&serde_json::json!({
-            "email_verified": false,
-            "message": "Account created. Please verify your email before signing in.",
-            "user": {
-                "id": "",
-                "email": email_lower,
-            }
-        }));
+        return ResponseBuilder::new()
+            .status(201)
+            .json(&pending_verification(String::new(), email_lower));
     }
 
     // Hash password
@@ -180,14 +195,9 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     if require_verification {
         super::send_template_email(ctx, "verification", &email_lower, &verification_token).await;
         // Do NOT issue tokens before email is verified
-        return ResponseBuilder::new().status(201).json(&serde_json::json!({
-            "email_verified": false,
-            "message": "Account created. Please verify your email before signing in.",
-            "user": {
-                "id": user.id,
-                "email": email_lower,
-            }
-        }));
+        return ResponseBuilder::new()
+            .status(201)
+            .json(&pending_verification(user.id, email_lower));
     }
 
     // Mint tokens, persist the refresh + session rows, build the cookie
@@ -219,20 +229,21 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     ResponseBuilder::new()
         .status(201)
         .set_cookie(&issued.cookie)
-        .json(&serde_json::json!({
-            "access_token": issued.access_token,
-            "refresh_token": issued.refresh_token,
-            "token_type": "Bearer",
-            "expires_in": issued.access_lifetime,
-            "email_verified": true,
-            "default_redirect": default_redirect,
-            "user": {
-                "id": user.id,
-                "email": email_lower,
-                "roles": roles,
-                "name": user.display_name
-            }
-        }))
+        .json(&SignupResponse {
+            email_verified: true,
+            message: None,
+            access_token: Some(issued.access_token),
+            refresh_token: Some(issued.refresh_token),
+            token_type: Some(TokenType::Bearer),
+            expires_in: Some(issued.access_lifetime),
+            default_redirect: Some(default_redirect),
+            user: SignupUser {
+                id: user.id,
+                email: email_lower,
+                roles: Some(roles),
+                name: Some(user.display_name),
+            },
+        })
 }
 
 /// Signup UX (Fix 2) regression tests. Before this fix, a successful signup

@@ -7,6 +7,7 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use crate::{
     blocks::{
         auth::{helpers::get_user_roles, repo::users},
+        auth_ui::contracts::{MeResponse, MeUser},
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json},
@@ -24,16 +25,16 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(r) => r,
         Err(e) => return err_internal("Failed to resolve user roles", e),
     };
-    ok_json(&serde_json::json!({
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "name": user.display_name,
-            "roles": roles,
-            "created_at": user.created_at,
-            "avatar_url": user.avatar_url.unwrap_or_default()
-        }
-    }))
+    ok_json(&MeResponse {
+        user: MeUser {
+            id: user.id,
+            email: user.email,
+            name: user.display_name,
+            roles,
+            created_at: user.created_at,
+            avatar_url: user.avatar_url.unwrap_or_default(),
+        },
+    })
 }
 
 pub async fn handle_update(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
