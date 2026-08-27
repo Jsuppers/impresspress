@@ -1725,7 +1725,7 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::post("/b/products/api/seller/dashboard")
                     .summary("Create Stripe Express dashboard login link")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(provider_redirect_schema.clone())
+                    .output::<contracts::ProviderRedirect>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 // Public + authenticated user surface
                 // Public catalog — highest-value developer-facing surface of

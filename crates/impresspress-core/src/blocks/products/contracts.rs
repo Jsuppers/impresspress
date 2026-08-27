@@ -879,6 +879,8 @@ pub struct SellerOnboardingResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRedirect {
+    /// Absolute provider-hosted URL the browser must be sent to.
+    #[schemars(extend("format" = "uri"))]
     pub url: String,
 }
 

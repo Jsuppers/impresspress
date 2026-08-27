@@ -10176,6 +10176,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "url": {
+                    "description": "Absolute provider-hosted URL the browser must be sent to.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -10183,6 +10184,7 @@
                 "required": [
                   "url"
                 ],
+                "title": "ProviderRedirect",
                 "type": "object"
               }
             }
