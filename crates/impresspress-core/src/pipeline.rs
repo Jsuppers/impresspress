@@ -238,29 +238,37 @@ pub async fn handle_request(
 
         // MUST resolve the auth ceiling with `routing::effective_access`, not
         // the plain `ep.auth`. This router admits on `max(prefix_tier,
-        // ep.auth)` (routing.rs:440), so a `generate_webmcp`-style filter on
-        // `ep.auth` alone would advertise a Public-declared endpoint mounted
-        // under an Admin prefix to anonymous callers — the router still
-        // 403s, so it is not a data leak, but it publishes a tool name the
-        // caller cannot use (the recon surface this filtering exists to
-        // prevent) and hands the agent a tool that always fails.
+        // ep.auth)` (routing.rs:440), so a `generate_webmcp_declared_auth`-
+        // style filter on `ep.auth` alone would advertise a Public-declared
+        // endpoint mounted under an Admin prefix to anonymous callers — the
+        // router still 403s, so it is not a data leak, but it publishes a
+        // tool name the caller cannot use (the recon surface this filtering
+        // exists to prevent) and hands the agent a tool that always fails.
         //
         // `extra_routes` is threaded in so a downstream `add_route` — which
         // `route_to_block` enforces just like a built-in — is resolved too.
         //
-        // MUST be `generate_webmcp_report`, not `generate_webmcp_with`. This
+        // MUST be `generate_webmcp_report`, not `generate_webmcp`. This
         // route is unauthenticated and served with `Cache-Control: no-store`,
-        // so every anonymous GET re-runs generation; `_with`'s wrapper logs
-        // one `tracing::warn!` per refused endpoint on every call, which
-        // turns an unauthenticated endpoint into unbounded warn-level log
-        // volume for a caller in a loop. Refusals are static — a defect in
-        // a block's own declarations, identical for every call and every
-        // caller (see `generate_webmcp_report`'s doc comment) — so they are
-        // computed and logged exactly once, at runtime construction, in
-        // `builder::registration::build()`. The manifest content emitted
-        // here is unaffected either way: `_report` runs the identical
-        // generation and only changes where the refusal list goes.
-        // Refusals discarded on purpose — see the comment above.
+        // so every anonymous GET re-runs generation; `generate_webmcp`'s
+        // wrapper logs one `tracing::warn!` per refused endpoint on every
+        // call, which turns an unauthenticated endpoint into unbounded
+        // warn-level log volume for a caller in a loop. Refusals are mostly
+        // static — a defect in a block's own declarations, identical for
+        // every call and every caller — with one exception:
+        // `DuplicateToolName` is counted per-manifest against the
+        // auth-filtered set this same `caller`/effective-auth pair would
+        // produce (see `generate_webmcp_report`'s doc comment, "Refusals are
+        // the same for every caller — with one exception"), so it is not
+        // static across callers, only across repeated calls by the same
+        // caller. Either way they are computed and logged exactly once, at
+        // runtime construction, in `builder::registration::build()` (using
+        // an `AuthLevel::Admin` ceiling, which — because the auth filter is
+        // monotone — still sees every collision that exists anywhere,
+        // including ones invisible at this route's actual `caller`). The
+        // manifest content emitted here is unaffected either way: `_report`
+        // runs the identical generation and only changes where the refusal
+        // list goes. Refusals discarded on purpose — see the comment above.
         let (body, _refused) =
             wafer_core::discovery::generate_webmcp_report(&enabled_infos, caller, |block, ep| {
                 routing::effective_access(block, ep, extra_routes)
@@ -1207,6 +1215,67 @@ mod discovery_tests {
         );
     }
 
+    /// Pins the producer-to-consumer contract for `outputSchema` — the field
+    /// `ui/assets/webmcp.js` now reads to decide whether to pass a schema to
+    /// `registerTool` and to populate `structuredContent` from the parsed
+    /// response body.
+    ///
+    /// `get_order_status` declares a self-contained, object-shaped
+    /// `output_schema` with no `$ref`s, so the producer's projection
+    /// (`wafer_core::discovery::agent_output_schema`) has nothing to inline
+    /// and must publish it unchanged. Asserting the WHOLE object, the same
+    /// way `webmcp_manifest_pins_the_producer_invocation_contract` does for
+    /// `invocation`, is what makes a producer-side rename (`outputSchema` to
+    /// `output_schema`, or a dropped field) fail loudly here instead of
+    /// silently breaking `webmcp.js` at runtime.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_the_producer_output_schema_contract() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "get_order_status")
+            .unwrap_or_else(|| panic!("get_order_status must be published: {body}"));
+
+        assert_eq!(
+            tool["outputSchema"],
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["schema_version", "order_id", "status", "reconciliation_status", "amounts", "subscription_cancel_at_period_end"],
+                "properties": {
+                    "schema_version": {"type": "integer"},
+                    "order_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "reconciliation_status": {"type": "string"},
+                    "amounts": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["currency", "subtotal_minor", "discount_minor", "tax_minor", "shipping_minor", "platform_fee_minor", "total_minor"],
+                        "properties": {
+                            "currency": {"type": "string"},
+                            "subtotal_minor": {"type": "integer"},
+                            "discount_minor": {"type": "integer"},
+                            "tax_minor": {"type": "integer"},
+                            "shipping_minor": {"type": "integer"},
+                            "platform_fee_minor": {"type": "integer"},
+                            "total_minor": {"type": "integer"}
+                        }
+                    },
+                    "subscription_status": {"type": "string"},
+                    "subscription_current_period_end": {"type": "string", "format": "date-time"},
+                    "subscription_cancel_at_period_end": {"type": "boolean"},
+                    "paid_at": {"type": "string", "format": "date-time"},
+                    "refunded_at": {"type": "string", "format": "date-time"}
+                }
+            }),
+            "outputSchema shape drifted from what ui/assets/webmcp.js reads: {tool}"
+        );
+    }
+
     #[tokio::test]
     async fn webmcp_manifest_is_not_cacheable() {
         let ctx = TestContext::new().await;
@@ -1357,7 +1426,7 @@ mod discovery_tests {
         }
     }
 
-    /// The exact text `generate_webmcp_with`'s wrapper (and now
+    /// The exact text `generate_webmcp`'s wrapper (and now
     /// `builder::registration::build()`) attaches to the refusal warning —
     /// duplicated here rather than imported so this test does not depend on
     /// the message staying byte-for-byte in sync with production wording
@@ -1366,9 +1435,13 @@ mod discovery_tests {
         "webmcp: endpoint opted in to agent-tool exposure but was refused";
 
     /// A block declaring two endpoints that opt into the SAME tool name —
-    /// `WebMcpRefusal::DuplicateToolName`, a structural defect independent
-    /// of caller or auth tier. Used to prove the per-request manifest path
-    /// no longer logs about it.
+    /// `WebMcpRefusal::DuplicateToolName`. Unlike every other refusal
+    /// reason, this one is caller-dependent in general (its census is
+    /// counted per auth-filtered manifest — see
+    /// `generate_webmcp_report`'s doc comment), but both endpoints here
+    /// declare the same `Public` auth, so the collision is visible to every
+    /// caller and the distinction does not matter for this fixture. Used to
+    /// prove the per-request manifest path no longer logs about it.
     fn duplicate_tool_name_block() -> BlockInfo {
         BlockInfo::new(
             "test/webmcp-refusal-fixture",
@@ -1391,9 +1464,12 @@ mod discovery_tests {
     /// The bug this whole fix targets: N refused endpoints previously meant
     /// N `tracing::warn!` calls on EVERY GET of the unauthenticated,
     /// `no-store` manifest route — unbounded warn-level log volume for any
-    /// anonymous caller that loops the request. Refusals are static (same
-    /// for every call and caller), so the per-request path must log zero of
-    /// them; they are logged once elsewhere instead (see
+    /// anonymous caller that loops the request. Refusals are static across
+    /// repeated calls by the same caller (this fixture's `DuplicateToolName`
+    /// refusal happens to also be the same across callers, since both
+    /// endpoints share one auth tier — that is not true of the reason in
+    /// general), so the per-request path must log zero of them; they are
+    /// logged once elsewhere instead (see
     /// `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`).
     #[tokio::test]
     async fn webmcp_manifest_request_does_not_log_refusals() {
@@ -1426,7 +1502,7 @@ mod discovery_tests {
             capture.count_containing(REFUSAL_WARNING),
             0,
             "the per-request manifest path must not log per-refusal warnings — refusals \
-             are static (identical for every caller) and are logged once, at runtime \
+             are static across repeated calls and are logged once, at runtime \
              construction, not per anonymous request"
         );
     }

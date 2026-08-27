@@ -309,22 +309,45 @@ impl ImpresspressBuilder {
         let block_infos = wafer.block_infos();
         let routes_cfg = crate::routing::routes_config(&block_infos);
 
-        // WebMCP refusals are structural: a defect in a block's own
-        // AgentTool declarations (duplicate tool name, an unrepresentable
-        // schema, etc.), independent of caller and of `effective_auth` — see
+        // WebMCP refusals are *mostly* structural — a defect in a block's
+        // own AgentTool declarations (an unrepresentable schema, a malformed
+        // path template, etc.) that holds independent of caller and of
+        // `effective_auth` — with one exception: `DuplicateToolName`. Tool-
+        // name uniqueness is a property of the auth-filtered manifest a
+        // caller actually receives, not of the deployment as a whole, so
+        // that one reason is counted per-manifest against the callers who
+        // can see both colliding endpoints — see
         // `wafer_core::discovery::generate_webmcp_report`'s doc comment
-        // ("Refusals are the same for every caller"). The per-request
-        // manifest handler (`pipeline::handle_request`, `GET
+        // ("Refusals are the same for every caller — with one exception").
+        //
+        // This boot-time pass makes a `DuplicateToolName` collision
+        // *visible* — logged once, for an operator to find — it does not
+        // *prevent* it. The per-manifest census is fail-open at every tier
+        // below the collision: a caller whose manifest sees only one of the
+        // two colliding endpoints still gets that name published normally,
+        // even though it is contested at a higher tier (a low-privilege
+        // endpoint can silently squat a name a high-privilege one also
+        // claims). Nothing about this being a "boot-time" pass changes that
+        // — on Cloudflare Workers in particular (see "Lifetime" below) it
+        // runs per isolate, not once at deploy time, so it is not a gate a
+        // bad deploy fails; it is a repeated warning a bad deploy will keep
+        // producing until someone reads it and renames one of the tools. A
+        // wafer-run fix that validates cross-block tool-name uniqueness at
+        // `seal()` — turning the collision into a deployment-time failure
+        // instead — was in flight upstream as of this writing; this repo
+        // does not have that protection yet.
+        //
+        // The per-request manifest handler (`pipeline::handle_request`, `GET
         // /b/webmcp/manifest.json`) uses the silent `_report` form and
-        // discards the refusal list for exactly that reason: that route is
-        // unauthenticated and served with `Cache-Control: no-store`, so
-        // re-deriving and `tracing::warn!`-ing the same static facts on
-        // every anonymous GET is pure log amplification driven by whoever
-        // is looping requests. This is the one place refusals are computed
-        // and logged — once, here, from the same `block_infos` snapshot the
-        // router below is built from — so an operator who annotated an
-        // endpoint and is wondering why no tool appeared can still find out
-        // (the diagnostic moved, it was not dropped).
+        // discards the refusal list because re-deriving and
+        // `tracing::warn!`-ing the same facts on every anonymous GET of an
+        // unauthenticated, `no-store` route is pure log amplification driven
+        // by whoever is looping requests. This is the one place refusals are
+        // computed and logged — once, here, from the same `block_infos`
+        // snapshot the router below is built from — so an operator who
+        // annotated an endpoint and is wondering why no tool (or no
+        // `outputSchema`) appeared can still find out (the diagnostic moved,
+        // it was not dropped).
         //
         // Lifetime: `build()` runs once per `Wafer` construction. On
         // Cloudflare Workers that is once per isolate, not once globally —
@@ -334,10 +357,23 @@ impl ImpresspressBuilder {
         // config-version stamp moves. Still bounded, and a large reduction
         // from once per anonymous request.
         //
-        // `caller`/`effective_auth` below are arbitrary and do not affect
-        // `webmcp_refusals`: both only gate which already-admitted tools
-        // reach the *served* manifest (the `Value` half of the return,
-        // discarded here), never the refusal list itself.
+        // `caller` below is NOT arbitrary — it must be `AuthLevel::Admin`,
+        // the top of the auth hierarchy. Because the per-manifest
+        // `DuplicateToolName` census filters endpoints by
+        // `auth_rank(effective_auth) <= ceiling`, an `Admin` ceiling makes
+        // that filter true for every endpoint, so this one boot-time pass
+        // still sees every collision that exists anywhere (the auth filter
+        // is monotone in caller rank — see the doc comment cited above).
+        // Any lower placeholder would silently miss collisions that only
+        // become visible to a higher-privilege caller. `effective_auth`
+        // (`|_block, ep| ep.auth`) is genuinely arbitrary here, though,
+        // *because* `caller` is pinned to the ceiling: with the filter above
+        // trivially true for every endpoint regardless of which resolver
+        // computed it, using the router's real `routing::effective_access`
+        // instead would change nothing this pass reports. Both only gate
+        // which already-admitted tools reach the *served* manifest (the
+        // `Value` half of the return, discarded here), never the refusal
+        // list itself.
         let (_, webmcp_refusals) = wafer_core::discovery::generate_webmcp_report(
             &block_infos,
             wafer_run::AuthLevel::Admin,
@@ -349,8 +385,10 @@ impl ImpresspressBuilder {
                 method = %refusal.method,
                 path = %refusal.path,
                 tool = %refusal.tool_name,
+                scope = %refusal.scope,
                 reason = %refusal.reason,
-                "webmcp: endpoint opted in to agent-tool exposure but was refused"
+                "webmcp: endpoint opted in to agent-tool exposure but was refused — see \
+                 `scope` for whether the whole tool or just one field was dropped"
             );
         }
 

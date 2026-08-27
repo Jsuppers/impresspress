@@ -61,7 +61,13 @@
   }
 
   function register(tool) {
-    document.modelContext.registerTool({
+    // `outputSchema` is optional in the manifest — the producer only
+    // projects it when the endpoint's declared response schema is a
+    // self-contained JSON object it can vouch for (see wafer-core's
+    // `agent_output_schema`). A tool without one must still register
+    // cleanly, so the key is only set on `options` when present rather than
+    // passed through as `undefined`.
+    var options = {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
@@ -84,9 +90,35 @@
           };
         }
 
-        return { content: [{ type: 'text', text: text }] };
+        var result = { content: [{ type: 'text', text: text }] };
+
+        // When the tool declared an `outputSchema`, the response body IS
+        // the JSON value that schema describes (the endpoint's declared
+        // response schema and its actual response body are the same
+        // contract) — parse it into `structuredContent` so a client can
+        // validate/consume it as data instead of re-parsing the text block
+        // itself. `content` still carries the raw text unconditionally, both
+        // as the backward-compatible fallback for a client that ignores
+        // `structuredContent` and for a tool with no `outputSchema` at all.
+        // A body that fails to parse as JSON is a server-side schema/
+        // response mismatch, not something retrying fixes, so it just falls
+        // back to text-only rather than failing the call.
+        if (tool.outputSchema) {
+          try {
+            result.structuredContent = JSON.parse(text);
+          } catch (e) {
+            // Leave structuredContent unset; `content` above still carries
+            // the raw text.
+          }
+        }
+
+        return result;
       }
-    });
+    };
+    if (tool.outputSchema) {
+      options.outputSchema = tool.outputSchema;
+    }
+    document.modelContext.registerTool(options);
   }
 
   fetch('/b/webmcp/manifest.json', { credentials: 'same-origin' })

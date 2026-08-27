@@ -62,13 +62,15 @@ impl Block for WebmcpRefusalFixtureBlock {
     }
 }
 
-/// Minimal `tracing::Subscriber` that records the rendered `message` field
-/// of every event, so this test can assert on exactly what `build()` logged
+/// Minimal `tracing::Subscriber` that records every field of every event —
+/// not just the rendered `message` — so this test can assert on exactly
+/// what `build()` logged, including the `scope` field this fix adds,
 /// without pulling in `tracing-subscriber`. Mirrors
 /// `impresspress_core::pipeline::discovery_tests::MessageCapture` — kept
 /// local (integration test binaries can't share code across `tests/*.rs`
 /// files without a `tests/common/` module this crate doesn't otherwise
-/// have).
+/// have). That sibling copy only needs the `message` field (it counts
+/// occurrences, it does not inspect structured fields), so it is left as-is.
 #[derive(Clone, Default)]
 struct MessageCapture(Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -78,9 +80,12 @@ struct MessageVisitor<'a> {
 
 impl tracing::field::Visit for MessageVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            *self.out = format!("{value:?}");
-        }
+        use std::fmt::Write as _;
+        // Every field lands in the same string, space-separated, in
+        // whatever order `tracing` visits them — good enough for substring
+        // assertions like `scope=outputSchema` below, without committing to
+        // an exact rendering of the whole event.
+        let _ = write!(self.out, "{}={value:?} ", field.name());
     }
 }
 
@@ -123,13 +128,17 @@ const REFUSAL_WARNING: &str = "webmcp: endpoint opted in to agent-tool exposure 
 /// local storage root — the same construction native boot uses
 /// (`crates/impresspress/src/cli/server.rs::run`, minus the admin-table
 /// pre-seeding and HTTP-listener steps `build()` itself doesn't need: it is
-/// a synchronous, no-I/O block-registration method). `extra` is registered
-/// before `block_infos` is captured, so it participates in the same
-/// snapshot the router — and now the boot-time refusal log — is built from.
-async fn build_runtime_with_extra_block(
+/// a synchronous, no-I/O block-registration method). Every block in `extras`
+/// is registered before `block_infos` is captured, so all of them
+/// participate in the same snapshot the router — and now the boot-time
+/// refusal log — is built from. Takes a list (rather than one block) so a
+/// test can combine fixtures — e.g. a `DuplicateToolName` block alongside an
+/// `OutputSchemaNotAnObject` one — and see both kinds of refusal, with their
+/// different `scope`, in one boot pass.
+async fn build_runtime_with_extra_blocks(
     db_path: &Path,
     storage_root: &Path,
-    extra: Arc<dyn Block>,
+    extras: Vec<(&str, Arc<dyn Block>)>,
 ) -> wafer_run::Wafer {
     let db_path_str = db_path.to_str().expect("db path is valid utf-8");
     let database = impresspress_native::make_database_service("sqlite", db_path_str, None)
@@ -141,7 +150,7 @@ async fn build_runtime_with_extra_block(
         .await
         .expect("construct local storage service");
 
-    let (wafer, _storage_block) = ImpresspressBuilder::new()
+    let mut builder = ImpresspressBuilder::new()
         .database(database)
         .storage(storage)
         .config(Arc::new(
@@ -154,10 +163,12 @@ async fn build_runtime_with_extra_block(
             .expect("jwt crypto service"),
         )
         .network(impresspress_native::make_fetch_network_service().expect("network service"))
-        .logger(impresspress_native::make_tracing_logger())
-        .extra_block("test/webmcp-refusal-fixture", extra)
-        .build()
-        .expect("build impresspress runtime");
+        .logger(impresspress_native::make_tracing_logger());
+    for (name, block) in extras {
+        builder = builder.extra_block(name, block);
+    }
+
+    let (wafer, _storage_block) = builder.build().expect("build impresspress runtime");
 
     wafer
 }
@@ -174,10 +185,13 @@ async fn webmcp_refusals_are_logged_once_at_runtime_construction() {
 
     let capture = MessageCapture::default();
     let guard = tracing::subscriber::set_default(capture.clone());
-    let wafer = build_runtime_with_extra_block(
+    let wafer = build_runtime_with_extra_blocks(
         &db_path,
         &storage_root,
-        Arc::new(WebmcpRefusalFixtureBlock),
+        vec![(
+            "test/webmcp-refusal-fixture",
+            Arc::new(WebmcpRefusalFixtureBlock) as Arc<dyn Block>,
+        )],
     )
     .await;
     drop(guard);
@@ -189,5 +203,112 @@ async fn webmcp_refusals_are_logged_once_at_runtime_construction() {
         2,
         "build() must log exactly one warning per refused endpoint, once, at construction \
          (both fixture endpoints refused as DuplicateToolName): {refusal_logs:?}"
+    );
+}
+
+/// An endpoint that opts in to agent-tool exposure and declares a response
+/// schema that does not describe a JSON object —
+/// `WebMcpRefusal::OutputSchemaNotAnObject`. Unlike `DuplicateToolName`
+/// above, this refusal is scoped to `WebMcpRefusalScope::OutputSchema`, not
+/// `Scope::Tool`: the tool itself is still published, only its
+/// `outputSchema` field is dropped. Exercises the `scope` field this fix
+/// adds to the boot-time log — see
+/// `wafer_core::discovery::WebMcpRefusalScope`.
+struct WebmcpOutputSchemaRefusalFixtureBlock;
+
+#[wafer_block::wafer_async_trait]
+impl Block for WebmcpOutputSchemaRefusalFixtureBlock {
+    fn info(&self) -> BlockInfo {
+        BlockInfo::new(
+            "test/webmcp-output-schema-refusal-fixture",
+            "0.0.1",
+            "http-handler@v1",
+            "one endpoint whose declared output schema is not an object, on purpose",
+        )
+        .endpoints(vec![BlockEndpoint::get(
+            "/x/webmcp-output-schema-refusal-fixture/one",
+        )
+        .summary("array-shaped response")
+        .auth(AuthLevel::Public)
+        .output_schema(serde_json::json!({ "type": "array" }))
+        .agent_tool("webmcp_output_schema_refusal_fixture", "one")])
+    }
+
+    async fn lifecycle(
+        &self,
+        _ctx: &dyn Context,
+        _event: LifecycleEvent,
+    ) -> Result<(), WaferError> {
+        Ok(())
+    }
+
+    async fn handle(&self, _ctx: &dyn Context, _msg: Message, _input: InputStream) -> OutputStream {
+        OutputStream::respond(Vec::new())
+    }
+}
+
+/// Proves the `scope` field the boot-time log now carries distinguishes a
+/// whole-tool refusal (`DuplicateToolName`, scope `tool`) from a
+/// field-only refusal (`OutputSchemaNotAnObject`, scope `outputSchema`) —
+/// the distinction `registration.rs`'s corrected comment and log message
+/// describe. Combines both fixtures in one boot pass so both scopes are
+/// asserted from the same runtime construction.
+#[tokio::test]
+async fn webmcp_refusal_boot_log_includes_scope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp
+        .path()
+        .join("webmcp_refusal_boot_logging_scope_test.sqlite3");
+    let storage_root = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    let capture = MessageCapture::default();
+    let guard = tracing::subscriber::set_default(capture.clone());
+    let wafer = build_runtime_with_extra_blocks(
+        &db_path,
+        &storage_root,
+        vec![
+            (
+                "test/webmcp-refusal-fixture",
+                Arc::new(WebmcpRefusalFixtureBlock) as Arc<dyn Block>,
+            ),
+            (
+                "test/webmcp-output-schema-refusal-fixture",
+                Arc::new(WebmcpOutputSchemaRefusalFixtureBlock) as Arc<dyn Block>,
+            ),
+        ],
+    )
+    .await;
+    drop(guard);
+    drop(wafer);
+
+    let refusal_logs = capture.messages_containing(REFUSAL_WARNING);
+    assert_eq!(
+        refusal_logs.len(),
+        3,
+        "build() must log one warning per refusal: 2 DuplicateToolName (whole tool) + 1 \
+         OutputSchemaNotAnObject (field only): {refusal_logs:?}"
+    );
+
+    let tool_scoped: Vec<&String> = refusal_logs
+        .iter()
+        .filter(|m| m.contains("scope=tool "))
+        .collect();
+    assert_eq!(
+        tool_scoped.len(),
+        2,
+        "both DuplicateToolName refusals must be logged with scope=tool (the whole tool was \
+         refused): {refusal_logs:?}"
+    );
+
+    let output_schema_scoped: Vec<&String> = refusal_logs
+        .iter()
+        .filter(|m| m.contains("scope=outputSchema "))
+        .collect();
+    assert_eq!(
+        output_schema_scoped.len(),
+        1,
+        "the OutputSchemaNotAnObject refusal must be logged with scope=outputSchema (only the \
+         field was dropped, the tool was still published): {refusal_logs:?}"
     );
 }
