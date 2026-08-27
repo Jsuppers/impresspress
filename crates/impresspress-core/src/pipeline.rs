@@ -388,46 +388,13 @@ mod discovery_tests {
     //!  2. The core developer-facing auth/storage/products endpoints now
     //!     declare schemas, so `wafer_core::discovery::generate_openapi`
     //!     (which skips any endpoint failing `has_schema()`) includes them.
+    //!
+    //! `real_block_infos()` and `discovery_json()` live in
+    //! `test_support.rs` now — shared with the per-block openapi snapshot
+    //! gate (`tests/openapi_snapshot.rs`) so there is one implementation
+    //! rather than two.
 
-    use wafer_run::{Block, BlockInfo, InputStream};
-
-    use super::handle_request;
-    use crate::{
-        blocks::{auth_ui::AuthUiBlock, files::FilesBlock, products::ProductsBlock},
-        features::AllEnabled,
-        test_support::{anon_msg, collect_or_panic, TestContext},
-    };
-
-    /// `BlockInfo` for the three blocks this PR added schemas to, fetched
-    /// from the real block structs (not hand-rolled fixtures) so the test
-    /// exercises the actual declarations shipped in `blocks/{auth_ui,files,
-    /// products}/mod.rs`.
-    fn real_block_infos() -> Vec<BlockInfo> {
-        vec![
-            AuthUiBlock::new().info(),
-            FilesBlock::new().info(),
-            ProductsBlock::new().info(),
-        ]
-    }
-
-    async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
-        let mut msg = anon_msg("retrieve", path);
-        msg.set_meta("http.header.host", host);
-        let out = handle_request(
-            ctx,
-            msg,
-            InputStream::from_bytes(Vec::new()),
-            None,
-            "test-jwt-secret",
-            false,
-            &AllEnabled,
-            &real_block_infos(),
-            &[],
-        )
-        .await;
-        let buf = collect_or_panic(out).await;
-        serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
-    }
+    use crate::test_support::{discovery_json, TestContext};
 
     #[tokio::test]
     async fn openapi_title_falls_back_to_impresspress_not_host_derived_127() {

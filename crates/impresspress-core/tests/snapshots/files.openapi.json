@@ -1,0 +1,132 @@
+{
+  "/b/storage/api/buckets/{name}/objects": {
+    "get": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "Bucket name",
+            "type": "string"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page",
+          "required": false,
+          "schema": {
+            "default": 1,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page_size",
+          "required": false,
+          "schema": {
+            "default": 50,
+            "maximum": 100,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "prefix",
+          "required": false,
+          "schema": {
+            "description": "Key prefix filter",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "objects": {
+                    "items": {
+                      "properties": {
+                        "content_type": {
+                          "type": "string"
+                        },
+                        "key": {
+                          "type": "string"
+                        },
+                        "last_modified": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "size": {
+                          "description": "Size in bytes",
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "total_count": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List objects",
+      "tags": [
+        "storage"
+      ]
+    }
+  },
+  "/b/storage/api/buckets/{name}/objects/{key}": {
+    "get": {
+      "description": "Returns the raw object bytes with the stored Content-Type — not a JSON envelope.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "key",
+          "required": true,
+          "schema": {
+            "description": "Object key (may contain '/')",
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "Bucket name",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Download file",
+      "tags": [
+        "storage"
+      ]
+    }
+  }
+}

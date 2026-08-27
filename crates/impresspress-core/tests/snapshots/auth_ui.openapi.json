@@ -1,0 +1,316 @@
+{
+  "/b/auth/api/login": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "email": {
+                  "format": "email",
+                  "type": "string"
+                },
+                "password": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "email",
+                "password"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "access_token": {
+                    "type": "string"
+                  },
+                  "default_redirect": {
+                    "description": "Role-aware post-login redirect path",
+                    "type": "string"
+                  },
+                  "expires_in": {
+                    "description": "Access token lifetime in seconds",
+                    "type": "integer"
+                  },
+                  "refresh_token": {
+                    "type": "string"
+                  },
+                  "token_type": {
+                    "const": "Bearer",
+                    "type": "string"
+                  },
+                  "user": {
+                    "properties": {
+                      "email": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "roles": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Authenticate with email/password",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/api/logout": {
+    "post": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Sign out",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/api/me": {
+    "get": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "user": {
+                    "properties": {
+                      "avatar_url": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "email": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "roles": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Get current user",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/api/refresh": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "refresh_token": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "refresh_token"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "access_token": {
+                    "type": "string"
+                  },
+                  "expires_in": {
+                    "description": "Access token lifetime in seconds",
+                    "type": "integer"
+                  },
+                  "refresh_token": {
+                    "type": "string"
+                  },
+                  "token_type": {
+                    "const": "Bearer",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Rotate an access/refresh token pair",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/api/signup": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "email": {
+                  "format": "email",
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Optional display name",
+                  "type": "string"
+                },
+                "password": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "email",
+                "password"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Auto-logs in (issues tokens) unless email verification is required, in which case only email_verified/message/user are returned.",
+                "properties": {
+                  "access_token": {
+                    "type": "string"
+                  },
+                  "default_redirect": {
+                    "type": "string"
+                  },
+                  "email_verified": {
+                    "type": "boolean"
+                  },
+                  "expires_in": {
+                    "type": "integer"
+                  },
+                  "message": {
+                    "description": "Present when verification is required or the email is already registered",
+                    "type": "string"
+                  },
+                  "refresh_token": {
+                    "type": "string"
+                  },
+                  "token_type": {
+                    "const": "Bearer",
+                    "type": "string"
+                  },
+                  "user": {
+                    "properties": {
+                      "email": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "roles": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Create account",
+      "tags": [
+        "auth"
+      ]
+    }
+  }
+}

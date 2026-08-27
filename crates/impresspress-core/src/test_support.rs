@@ -16,7 +16,7 @@ use std::{
 use wafer_run::{
     context::Context,
     streams::output::{BufferedResponse, TerminalNotResponse},
-    Block, ErrorCode, InputStream, Message, OutputStream, ResourceGrant, WaferError,
+    Block, BlockInfo, ErrorCode, InputStream, Message, OutputStream, ResourceGrant, WaferError,
 };
 
 /// Minimal test context backed by a real in-memory SQLite database.
@@ -937,6 +937,75 @@ pub async fn output_is_error(out: OutputStream, code: &str) -> bool {
         out.collect_buffered().await,
         Err(TerminalNotResponse::Error(e)) if format!("{:?}", e.code) == code
     )
+}
+
+/// `BlockInfo` for every Worker-shipping block, fetched from the real block
+/// structs (not hand-rolled fixtures) so `discovery_json`/`openapi_document`
+/// exercise the actual declarations shipped in `blocks/*/mod.rs`.
+///
+/// This is the block list that backs the generated `/openapi.json` document
+/// in tests. A block absent from this list never appears in the document at
+/// all — regardless of how correct its own schema declarations are — so the
+/// per-block openapi snapshot gate (`tests/openapi_snapshot.rs`) depends on
+/// this staying in sync with every block that carries schema-bearing
+/// endpoints (or is expected to soon).
+#[cfg(all(
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets"
+))]
+fn real_block_infos() -> Vec<BlockInfo> {
+    vec![
+        crate::blocks::auth_ui::AuthUiBlock::new().info(),
+        crate::blocks::files::FilesBlock::new().info(),
+        crate::blocks::products::ProductsBlock::new().info(),
+        crate::blocks::admin::AdminBlock::new().info(),
+        crate::blocks::messages::MessagesBlock::new().info(),
+        crate::blocks::tickets::TicketsBlock::new().info(),
+    ]
+}
+
+/// Fetch a discovery document (`/openapi.json` or `/.well-known/agent.json`)
+/// generated from [`real_block_infos`]. Shared by `pipeline.rs`'s discovery
+/// tests and the per-block openapi snapshot gate, so there is one
+/// implementation rather than two.
+#[cfg(all(
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets"
+))]
+pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
+    let mut msg = anon_msg("retrieve", path);
+    msg.set_meta("http.header.host", host);
+    let out = crate::pipeline::handle_request(
+        ctx,
+        msg,
+        InputStream::from_bytes(Vec::new()),
+        None,
+        "test-jwt-secret",
+        false,
+        &crate::features::AllEnabled,
+        &real_block_infos(),
+        &[],
+    )
+    .await;
+    let buf = collect_or_panic(out).await;
+    serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
+}
+
+/// Fetch the generated `/openapi.json` document. Shared by pipeline tests
+/// and the per-block snapshot gate.
+#[cfg(feature = "test-support")]
+#[cfg(all(
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets"
+))]
+pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
+    discovery_json(ctx, "/openapi.json", "impresspress.example.com").await
 }
 
 #[cfg(test)]
