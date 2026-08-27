@@ -1,4 +1,25 @@
 //! Stable, provider-neutral JSON contracts for the commerce APIs.
+//!
+//! # `#[schemars(required)]` on `Option<T>` is not decoration
+//!
+//! `.output::<T>()` generates under schemars' **serialize** contract, so a
+//! response schema states what the server emits. That contract already gets
+//! `required` right for `#[serde(default)]` and for `skip_serializing_if`.
+//! What it does **not** fix is nullability: `Option<T>`'s `JsonSchema` impl
+//! calls `allow_null` unconditionally, without consulting the contract, so
+//! every `Option<String>` renders as `["string", "null"]` even when the
+//! server omits the key rather than writing `null`.
+//!
+//! `#[schemars(required)]` is the one lever that drops that `null` branch,
+//! under either contract. On a non-`Option` field it is genuinely a no-op —
+//! which is why it is easy to mistake for inert everywhere — but on an
+//! `Option<T>` it narrows `["T", "null"]` back to `"T"`. Paired with
+//! `skip_serializing_if = "Option::is_none"` under the serialize contract it
+//! does *not* also force the property into `required`, which is exactly the
+//! shape these fields have: optional, and never `null` when present.
+//!
+//! Removing one of these widens the published response contract. Do not strip
+//! them from an `Option<T>` field without changing what the handler emits.
 
 use std::collections::BTreeMap;
 
@@ -571,8 +592,10 @@ pub struct StorefrontConfig {
     pub schema_version: u32,
     pub embedded_checkout_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
     pub stripe_publishable_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
     pub stripe_mode: Option<StripeMode>,
 }
 
@@ -690,16 +713,20 @@ pub struct GuestOrderStatus {
     pub reconciliation_status: String,
     pub amounts: MoneyBreakdown,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
     pub subscription_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub subscription_current_period_end: Option<String>,
     pub subscription_cancel_at_period_end: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub paid_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub refunded_at: Option<String>,
 }
 
@@ -1151,17 +1178,21 @@ pub struct WebhookEventSummary {
     pub attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub processing_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub next_retry_at: Option<String>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub processed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub terminal_at: Option<String>,
     #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
@@ -1199,17 +1230,21 @@ pub struct ProviderOperationSummary {
     pub attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub processing_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub next_attempt_at: Option<String>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub terminal_at: Option<String>,
     #[schemars(extend("format" = "date-time"))]
     pub created_at: String,

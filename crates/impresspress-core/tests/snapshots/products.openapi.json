@@ -3141,10 +3141,12 @@
                       "required": [
                         "id",
                         "offer_id",
+                        "preset_id",
                         "url",
                         "active",
                         "configuration_hash",
-                        "sync_status"
+                        "sync_status",
+                        "sync_error"
                       ],
                       "type": "object"
                     },
@@ -3264,10 +3266,12 @@
                 "required": [
                   "id",
                   "offer_id",
+                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status"
+                  "sync_status",
+                  "sync_error"
                 ],
                 "title": "ManagedPaymentLink",
                 "type": "object"
@@ -3359,10 +3363,12 @@
                 "required": [
                   "id",
                   "offer_id",
+                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status"
+                  "sync_status",
+                  "sync_error"
                 ],
                 "title": "ManagedPaymentLink",
                 "type": "object"
@@ -3977,6 +3983,7 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
+                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -4481,10 +4488,7 @@
                         },
                         "completed_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "created_at": {
                           "format": "date-time",
@@ -4499,10 +4503,7 @@
                         },
                         "next_attempt_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "operation_type": {
                           "description": "Currently only `refund.reconcile`.",
@@ -4513,10 +4514,7 @@
                         },
                         "processing_started_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "status": {
                           "description": "One of `pending`, `processing`, `failed`, `succeeded`, `dead_letter`.",
@@ -4535,10 +4533,7 @@
                         },
                         "terminal_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "updated_at": {
                           "format": "date-time",
@@ -4550,8 +4545,10 @@
                         "operation_type",
                         "aggregate_type",
                         "aggregate_id",
+                        "stripe_account_id",
                         "status",
                         "attempts",
+                        "last_error",
                         "created_at",
                         "updated_at"
                       ],
@@ -5107,7 +5104,10 @@
                 },
                 "required": [
                   "purchase_id",
+                  "refund_id",
+                  "provider_refund_id",
                   "status",
+                  "provider_status",
                   "amount_minor",
                   "refunded_total_minor",
                   "order_total_minor",
@@ -5182,7 +5182,8 @@
                           "required": [
                             "details_submitted",
                             "charges_enabled",
-                            "payouts_enabled"
+                            "payouts_enabled",
+                            "requirements_due"
                           ],
                           "type": "object"
                         },
@@ -5240,8 +5241,16 @@
                         "user_id",
                         "status",
                         "approval_status",
+                        "stripe_account_id",
                         "capabilities",
-                        "fee_basis_points"
+                        "fee_basis_points",
+                        "livemode",
+                        "country",
+                        "default_currency",
+                        "dashboard_type",
+                        "disabled_reason",
+                        "sync_error",
+                        "last_synced_at"
                       ],
                       "type": "object"
                     },
@@ -5611,7 +5620,8 @@
                     "required": [
                       "details_submitted",
                       "charges_enabled",
-                      "payouts_enabled"
+                      "payouts_enabled",
+                      "requirements_due"
                     ],
                     "type": "object"
                   },
@@ -5669,8 +5679,16 @@
                   "user_id",
                   "status",
                   "approval_status",
+                  "stripe_account_id",
                   "capabilities",
-                  "fee_basis_points"
+                  "fee_basis_points",
+                  "livemode",
+                  "country",
+                  "default_currency",
+                  "dashboard_type",
+                  "disabled_reason",
+                  "sync_error",
+                  "last_synced_at"
                 ],
                 "title": "SellerAccount",
                 "type": "object"
@@ -5746,7 +5764,8 @@
                     "required": [
                       "details_submitted",
                       "charges_enabled",
-                      "payouts_enabled"
+                      "payouts_enabled",
+                      "requirements_due"
                     ],
                     "type": "object"
                   },
@@ -5804,8 +5823,16 @@
                   "user_id",
                   "status",
                   "approval_status",
+                  "stripe_account_id",
                   "capabilities",
-                  "fee_basis_points"
+                  "fee_basis_points",
+                  "livemode",
+                  "country",
+                  "default_currency",
+                  "dashboard_type",
+                  "disabled_reason",
+                  "sync_error",
+                  "last_synced_at"
                 ],
                 "title": "SellerAccount",
                 "type": "object"
@@ -6095,12 +6122,18 @@
                   "state",
                   "configured",
                   "livemode",
+                  "account_id",
+                  "country",
+                  "default_currency",
+                  "business_name",
                   "charges_enabled",
                   "payouts_enabled",
                   "details_submitted",
+                  "capabilities",
                   "publishable_key_configured",
                   "webhook_secret_configured",
-                  "api_version"
+                  "api_version",
+                  "error"
                 ],
                 "title": "StripeConnectionStatus",
                 "type": "object"
@@ -6419,24 +6452,15 @@
                         },
                         "next_retry_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "processed_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "processing_started_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "status": {
                           "description": "One of `pending`, `processing`, `failed`, `processed`, `dead_letter`.",
@@ -6455,10 +6479,7 @@
                         },
                         "terminal_at": {
                           "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                          "type": "string"
                         },
                         "updated_at": {
                           "format": "date-time",
@@ -6469,8 +6490,10 @@
                         "id",
                         "event_type",
                         "status",
+                        "stripe_account_id",
                         "livemode",
                         "attempts",
+                        "last_error",
                         "created_at",
                         "updated_at"
                       ],
@@ -9006,10 +9029,12 @@
                       "required": [
                         "id",
                         "offer_id",
+                        "preset_id",
                         "url",
                         "active",
                         "configuration_hash",
-                        "sync_status"
+                        "sync_status",
+                        "sync_error"
                       ],
                       "type": "object"
                     },
@@ -9129,10 +9154,12 @@
                 "required": [
                   "id",
                   "offer_id",
+                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status"
+                  "sync_status",
+                  "sync_error"
                 ],
                 "title": "ManagedPaymentLink",
                 "type": "object"
@@ -9224,10 +9251,12 @@
                 "required": [
                   "id",
                   "offer_id",
+                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status"
+                  "sync_status",
+                  "sync_error"
                 ],
                 "title": "ManagedPaymentLink",
                 "type": "object"
@@ -9842,6 +9871,7 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
+                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -10313,7 +10343,8 @@
                     "required": [
                       "details_submitted",
                       "charges_enabled",
-                      "payouts_enabled"
+                      "payouts_enabled",
+                      "requirements_due"
                     ],
                     "type": "object"
                   },
@@ -10371,8 +10402,16 @@
                   "user_id",
                   "status",
                   "approval_status",
+                  "stripe_account_id",
                   "capabilities",
-                  "fee_basis_points"
+                  "fee_basis_points",
+                  "livemode",
+                  "country",
+                  "default_currency",
+                  "dashboard_type",
+                  "disabled_reason",
+                  "sync_error",
+                  "last_synced_at"
                 ],
                 "title": "SellerAccount",
                 "type": "object"
@@ -10507,7 +10546,8 @@
                         "required": [
                           "details_submitted",
                           "charges_enabled",
-                          "payouts_enabled"
+                          "payouts_enabled",
+                          "requirements_due"
                         ],
                         "type": "object"
                       },
@@ -10565,8 +10605,16 @@
                       "user_id",
                       "status",
                       "approval_status",
+                      "stripe_account_id",
                       "capabilities",
-                      "fee_basis_points"
+                      "fee_basis_points",
+                      "livemode",
+                      "country",
+                      "default_currency",
+                      "dashboard_type",
+                      "disabled_reason",
+                      "sync_error",
+                      "last_synced_at"
                     ],
                     "type": "object"
                   },
@@ -11042,7 +11090,10 @@
                 },
                 "required": [
                   "purchase_id",
+                  "refund_id",
+                  "provider_refund_id",
                   "status",
+                  "provider_status",
                   "amount_minor",
                   "refunded_total_minor",
                   "order_total_minor",
@@ -11250,6 +11301,7 @@
                         "status",
                         "currency",
                         "total_minor",
+                        "error",
                         "created_at"
                       ],
                       "type": "object"
@@ -11832,6 +11884,7 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
+                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -11888,6 +11941,9 @@
                   "receipt_token",
                   "receipt_token_expires_at",
                   "presentation",
+                  "checkout_url",
+                  "client_secret",
+                  "payment_link_url",
                   "amounts"
                 ],
                 "title": "CheckoutResponse",
@@ -12667,6 +12723,7 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
+                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -12677,20 +12734,14 @@
                   },
                   "paid_at": {
                     "format": "date-time",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "reconciliation_status": {
                     "type": "string"
                   },
                   "refunded_at": {
                     "format": "date-time",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "schema_version": {
                     "format": "uint32",
@@ -12705,16 +12756,10 @@
                   },
                   "subscription_current_period_end": {
                     "format": "date-time",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "subscription_status": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -12818,6 +12863,7 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
+                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -13251,19 +13297,12 @@
                     "description": "Which Stripe environment a validated publishable key belongs to.",
                     "enum": [
                       "test",
-                      "live",
-                      null
+                      "live"
                     ],
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "stripe_publishable_key": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -13428,6 +13467,8 @@
                                       }
                                     },
                                     "required": [
+                                      "minimum",
+                                      "maximum",
                                       "unit"
                                     ],
                                     "type": [
@@ -13454,7 +13495,10 @@
                                 },
                                 "required": [
                                   "display_name",
-                                  "amount_minor"
+                                  "amount_minor",
+                                  "tax_behavior",
+                                  "delivery_estimate",
+                                  "stripe_shipping_rate_id"
                                 ],
                                 "type": "object"
                               },
@@ -13467,6 +13511,19 @@
                               "type": "integer"
                             }
                           },
+                          "required": [
+                            "minimum_total_minor",
+                            "maximum_total_minor",
+                            "allow_promotion_codes",
+                            "automatic_tax",
+                            "collect_billing_address",
+                            "collect_shipping_address",
+                            "allowed_shipping_countries",
+                            "shipping_options",
+                            "create_customer",
+                            "require_terms_consent",
+                            "trial_days"
+                          ],
                           "type": "object"
                         },
                         "currency": {
@@ -13543,6 +13600,7 @@
                                       "subtotal_minor",
                                       "discount_minor",
                                       "tax_minor",
+                                      "shipping_minor",
                                       "platform_fee_minor",
                                       "total_minor"
                                     ],
@@ -13639,6 +13697,7 @@
                             },
                             "required": [
                               "id",
+                              "preset_id",
                               "url",
                               "pricing"
                             ],
@@ -13756,7 +13815,17 @@
                             "required": [
                               "key",
                               "kind",
-                              "label"
+                              "label",
+                              "help_text",
+                              "required",
+                              "default_value",
+                              "allowed_values",
+                              "minimum",
+                              "maximum",
+                              "step",
+                              "maximum_length",
+                              "visibility",
+                              "sort_order"
                             ],
                             "type": "object"
                           },
@@ -13775,9 +13844,11 @@
                         "mode",
                         "currency",
                         "pricing_model",
+                        "recurring_interval",
                         "interval_count",
                         "variables",
-                        "checkout"
+                        "checkout",
+                        "payment_links"
                       ],
                       "type": "object"
                     },
@@ -13804,6 +13875,9 @@
                   "id",
                   "name",
                   "slug",
+                  "description",
+                  "image_url",
+                  "tags",
                   "fulfillment_kind",
                   "offers"
                 ],
