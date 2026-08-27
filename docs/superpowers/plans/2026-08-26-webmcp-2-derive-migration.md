@@ -51,6 +51,7 @@ The honest fix is to hoist `$defs` into `components/schemas` and rewrite `#` →
 - **Descriptions must survive.** Editorial text in a hand-written schema becomes a `///` doc comment on the corresponding field, which schemars emits as `description`.
 - **`/openapi.json` and `/.well-known/agent.json` must keep working throughout.** They are generated at runtime from these same schemas (`pipeline.rs:126`); this migration changes their input, so every step must leave both valid.
 - **Do not touch `vector` or `llm`.** They are excluded from the Worker build (`impresspress-cloudflare/Cargo.toml:74`) and are out of scope here. Do not touch `auth` either — it declares zero endpoints.
+- **`tickets` is in scope, and arrived after this plan was written** (in the `main` merge). It ships in the Worker — `block-tickets` is in `impresspress-cloudflare`'s `full` preset — and declares **21 endpoints with zero schemas**. Unlike admin it already has **7 typed structs in `models.rs`**, so it is a derive-and-wire block rather than a write-contracts-from-scratch one: closer to products than to admin. Give it its own task, after the blocks that establish the migration pattern, and its own snapshot diff like every other block.
 - Local `cargo test` failures in unrelated crates may be artifacts of the `[patch]` wiring in this workspace; check CI before treating them as caused by this work.
 
 ---
@@ -123,6 +124,7 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("files", &["/b/storage", "/b/cloudstorage"]),
     ("messages", &["/b/messages"]),
     ("admin", &["/b/admin"]),
+    ("tickets", &["/b/tickets"]),
 ];
 
 fn snapshot_dir() -> PathBuf {
