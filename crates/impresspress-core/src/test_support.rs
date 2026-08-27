@@ -955,7 +955,7 @@ pub async fn output_is_error(out: OutputStream, code: &str) -> bool {
     feature = "block-products",
     feature = "block-tickets"
 ))]
-fn real_block_infos() -> Vec<BlockInfo> {
+pub fn real_block_infos() -> Vec<BlockInfo> {
     vec![
         crate::blocks::auth_ui::AuthUiBlock::new().info(),
         crate::blocks::files::FilesBlock::new().info(),
