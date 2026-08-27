@@ -161,10 +161,20 @@ pub struct MeUser {
     pub avatar_url: String,
 }
 
-/// `GET /b/auth/api/me` response body.
+/// `GET /b/auth/api/me` and `PATCH /b/auth/api/me` response body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MeResponse {
     pub user: MeUser,
+}
+
+/// `PATCH /b/auth/api/me` request body. Every field is optional and only the
+/// ones present are applied. `name` and `avatar_url` are the only
+/// user-editable profile fields: email changes go through verification and
+/// roles through the admin API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateMeRequest {
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 /// `POST /b/auth/api/refresh` request body.

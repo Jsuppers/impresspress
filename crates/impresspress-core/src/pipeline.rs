@@ -471,6 +471,38 @@ mod discovery_tests {
             "me is AuthLevel::Authenticated — must carry bearerAuth security: {me}"
         );
 
+        // PATCH /b/auth/api/me was dispatched in handle() but undeclared, so
+        // it was absent here and from the access-tier table. It now shares
+        // GET's response type, so the two cannot drift.
+        let me_patch = &paths["/b/auth/api/me"]["patch"];
+        assert!(
+            !me_patch.is_null(),
+            "PATCH me must appear in /openapi.json now that it's declared: {body}"
+        );
+        let mut patch_fields: Vec<String> = me_patch["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]
+            .as_object()
+            .expect("PATCH me request schema has properties")
+            .keys()
+            .cloned()
+            .collect();
+        patch_fields.sort();
+        assert_eq!(
+            patch_fields,
+            vec!["avatar_url".to_string(), "name".to_string()],
+            "PATCH me request schema must expose exactly the two user-editable fields: {me_patch}"
+        );
+        assert_eq!(
+            me_patch["responses"]["200"]["content"]["application/json"]["schema"],
+            me["responses"]["200"]["content"]["application/json"]["schema"],
+            "PATCH me must publish the same response schema as GET me: {me_patch}"
+        );
+        assert_eq!(
+            me_patch["security"][0]["bearerAuth"],
+            serde_json::json!([]),
+            "PATCH me is AuthLevel::Authenticated — must carry bearerAuth security: {me_patch}"
+        );
+
         // /b/auth/api/refresh was previously entirely undeclared (dispatched
         // in handle() but absent from .endpoints) — now documented.
         let refresh = &paths["/b/auth/api/refresh"]["post"];

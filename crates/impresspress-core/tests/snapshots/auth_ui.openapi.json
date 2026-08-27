@@ -148,7 +148,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "`GET /b/auth/api/me` response body.",
+                "description": "`GET /b/auth/api/me` and `PATCH /b/auth/api/me` response body.",
                 "properties": {
                   "user": {
                     "description": "The caller's own profile.",
@@ -204,6 +204,98 @@
         }
       ],
       "summary": "Get current user",
+      "tags": [
+        "auth"
+      ]
+    },
+    "patch": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "`PATCH /b/auth/api/me` request body. Every field is optional and only the\nones present are applied. `name` and `avatar_url` are the only\nuser-editable profile fields: email changes go through verification and\nroles through the admin API.",
+              "properties": {
+                "avatar_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "title": "UpdateMeRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "`GET /b/auth/api/me` and `PATCH /b/auth/api/me` response body.",
+                "properties": {
+                  "user": {
+                    "description": "The caller's own profile.",
+                    "properties": {
+                      "avatar_url": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "email": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "roles": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "email",
+                      "name",
+                      "roles",
+                      "created_at",
+                      "avatar_url"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "user"
+                ],
+                "title": "MeResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Update current user profile",
       "tags": [
         "auth"
       ]

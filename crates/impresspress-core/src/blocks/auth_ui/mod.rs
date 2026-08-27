@@ -238,6 +238,17 @@ crate::impresspress_feature_block! {
                 .auth(AuthLevel::Authenticated)
                 .output::<contracts::MeResponse>()
                 .tags(&["auth"]),
+            // Was dispatched in `handle()` but absent from `.endpoints` — the
+            // same defect `refresh` had below — so it was missing from
+            // `/openapi.json` and from the per-endpoint access-tier table.
+            // `handle()` matches the `update` action, which both PUT and
+            // PATCH map to; PATCH is what the SDK sends and what is declared.
+            BlockEndpoint::patch("/b/auth/api/me")
+                .summary("Update current user profile")
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::UpdateMeRequest>()
+                .output::<contracts::MeResponse>()
+                .tags(&["auth"]),
             // Was previously undeclared entirely (dispatched in `handle()`
             // but absent from `.endpoints`), which meant it was excluded
             // from `/openapi.json` AND from the per-endpoint access-tier

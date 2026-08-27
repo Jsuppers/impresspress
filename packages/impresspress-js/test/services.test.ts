@@ -58,9 +58,11 @@ describe("AuthService", () => {
     expect(user?.id).toBe("u1");
   });
 
-  it("updateUser reads the update response directly (no {user} wrapper, unlike GET /me)", async () => {
+  it("updateUser unwraps the same {user} envelope as GET /me", async () => {
     fetchMock.mockResolvedValueOnce(
-      fakeJsonResponse({ id: "u1", email: "a@b.com", roles: ["user"], name: "New Name" }),
+      fakeJsonResponse({
+        user: { id: "u1", email: "a@b.com", roles: ["user"], name: "New Name" },
+      }),
     );
     const c = client();
     const user = await c.auth.updateUser({ name: "New Name" });
