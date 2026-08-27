@@ -94,6 +94,262 @@
         }
       ],
       "summary": "List roles API"
+    },
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "`POST /b/admin/api/iam/roles` request body.",
+              "properties": {
+                "description": {
+                  "description": "Human-readable description shown in the IAM UI. Empty when omitted.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "description": "Unique role name. This is the value stored in `user_roles.role` and\nchecked by the auth layer.",
+                  "type": "string"
+                },
+                "permissions": {
+                  "description": "Permission names to attach. Advisory metadata for the IAM UI — WRAP\ngrants, not this list, are what the runtime enforces. None when\nomitted.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "title": "CreateRoleRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "A role definition as published by the admin API.",
+                "properties": {
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "description": "Human-readable description shown in the IAM UI.",
+                    "type": "string"
+                  },
+                  "id": {
+                    "description": "Stable role identifier.",
+                    "type": "string"
+                  },
+                  "is_system": {
+                    "description": "Whether this is a built-in role. System roles cannot be renamed or\ndeleted.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "Unique role name (`\"admin\"`, `\"user\"`, …). This is the value stored in\n`user_roles.role` and checked by the auth layer.",
+                    "type": "string"
+                  },
+                  "permissions": {
+                    "description": "Permission names attached to the role. Advisory metadata for the IAM\nUI — WRAP grants, not this list, are what the runtime enforces.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "description",
+                  "permissions",
+                  "is_system",
+                  "created_at",
+                  "updated_at"
+                ],
+                "title": "AdminRoleView",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Create role API"
+    }
+  },
+  "/b/admin/api/iam/roles/{id}": {
+    "delete": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Role id, as returned by the list endpoint (not the role name).",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "`DELETE /b/admin/api/iam/roles/{id}` response body.",
+                "properties": {
+                  "deleted": {
+                    "description": "Always `true`: a delete that did not happen is an error response.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "deleted"
+                ],
+                "title": "AdminRoleDeleteResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Delete role API"
+    },
+    "patch": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Role id, as returned by the list endpoint (not the role name).",
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "`PATCH /b/admin/api/iam/roles/{id}` request body. Every field is optional\nand only the ones present are applied. `name` is refused on a system role:\nrenaming `admin` would break auth.",
+              "properties": {
+                "description": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "permissions": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                }
+              },
+              "title": "UpdateRoleRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "A role definition as published by the admin API.",
+                "properties": {
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "description": "Human-readable description shown in the IAM UI.",
+                    "type": "string"
+                  },
+                  "id": {
+                    "description": "Stable role identifier.",
+                    "type": "string"
+                  },
+                  "is_system": {
+                    "description": "Whether this is a built-in role. System roles cannot be renamed or\ndeleted.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "Unique role name (`\"admin\"`, `\"user\"`, …). This is the value stored in\n`user_roles.role` and checked by the auth layer.",
+                    "type": "string"
+                  },
+                  "permissions": {
+                    "description": "Permission names attached to the role. Advisory metadata for the IAM\nUI — WRAP grants, not this list, are what the runtime enforces.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "description",
+                  "permissions",
+                  "is_system",
+                  "created_at",
+                  "updated_at"
+                ],
+                "title": "AdminRoleView",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Update role API"
     }
   },
   "/b/admin/api/logs": {

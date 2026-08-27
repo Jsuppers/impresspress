@@ -4,7 +4,13 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::{contracts::AdminRoleListResponse, logs::audit_log};
+use super::{
+    contracts::{
+        AdminRoleDeleteResponse, AdminRoleListResponse, AdminRoleView, CreateRoleRequest,
+        UpdateRoleRequest,
+    },
+    logs::audit_log,
+};
 use crate::{
     blocks::auth::bump_auth_version,
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
@@ -77,14 +83,8 @@ async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
 }
 
 async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    #[derive(serde::Deserialize)]
-    struct Req {
-        name: String,
-        description: Option<String>,
-        permissions: Option<Vec<String>>,
-    }
     let raw = input.collect_to_bytes().await;
-    let body: Req = match serde_json::from_slice(&raw) {
+    let body: CreateRoleRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -98,7 +98,12 @@ async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream
     )
     .await
     {
-        Ok(record) => ok_json(&record),
+        // Same projection as the list: the ops layer returns the raw
+        // `db::Record`, whose `{id, data: {…}}` envelope and backend-dependent
+        // `permissions` encoding are exactly what `AdminRoleView` exists to
+        // normalize away. Echoing it here would publish a second shape for
+        // the same row.
+        Ok(record) => ok_json(&AdminRoleView::from_record(&record)),
         Err(out) => out,
     }
 }
@@ -110,7 +115,11 @@ async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -
     }
 
     let raw = input.collect_to_bytes().await;
-    let body_peek: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
+    // Typed rather than a `HashMap` peek plus a per-branch key whitelist: the
+    // published schema names exactly these three fields, and a `permissions`
+    // that is not an array of strings is refused here instead of being
+    // written to the column as whatever JSON arrived.
+    let body: UpdateRoleRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -127,32 +136,28 @@ async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -
         Err(e) => return err_internal("Database error", e),
     };
 
-    if existing.bool_field("is_system") {
-        if body_peek.contains_key("name") {
-            return err_forbidden("Cannot rename system roles");
-        }
-        let mut data = HashMap::new();
-        for key in &["description", "permissions"] {
-            if let Some(val) = body_peek.get(*key) {
-                data.insert(key.to_string(), val.clone());
-            }
-        }
-        crate::util::stamp_updated(&mut data);
-        return match db::update(ctx, ROLES_TABLE, id, data).await {
-            Ok(record) => ok_json(&record),
-            Err(e) => err_internal("Database error", e),
-        };
+    let is_system = existing.bool_field("is_system");
+    if is_system && body.name.is_some() {
+        return err_forbidden("Cannot rename system roles");
     }
 
     let mut data = HashMap::new();
-    for key in &["name", "description", "permissions"] {
-        if let Some(val) = body_peek.get(*key) {
-            data.insert(key.to_string(), val.clone());
-        }
+    if let Some(name) = body.name {
+        data.insert("name".to_string(), serde_json::Value::String(name));
+    }
+    if let Some(description) = body.description {
+        data.insert(
+            "description".to_string(),
+            serde_json::Value::String(description),
+        );
+    }
+    if let Some(permissions) = body.permissions {
+        data.insert("permissions".to_string(), serde_json::json!(permissions));
     }
     crate::util::stamp_updated(&mut data);
     match db::update(ctx, ROLES_TABLE, id, data).await {
-        Ok(record) => ok_json(&record),
+        // Same projection as list/create, for the same reason.
+        Ok(record) => ok_json(&AdminRoleView::from_record(&record)),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Role not found"),
         Err(e) => err_internal("Database error", e),
     }
@@ -163,7 +168,7 @@ async fn handle_delete_role(ctx: &dyn Context, msg: &Message, path: &str) -> Out
     // System-role guard, delete, and audit-log write live in the shared ops
     // layer (the JSON path previously logged nothing).
     match super::ops::delete_role(ctx, msg, id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Ok(()) => ok_json(&AdminRoleDeleteResponse { deleted: true }),
         Err(out) => out,
     }
 }
@@ -636,7 +641,122 @@ mod tests {
         )
         .await;
         let json = output_json(out).await;
-        assert_eq!(json["data"]["name"], "renamed-editor");
+        assert_eq!(json["name"], "renamed-editor");
+        assert!(
+            json.get("data").is_none(),
+            "the record envelope must not survive the projection: {json}"
+        );
+    }
+
+    /// Every field name a role write publishes, sorted — must equal what the
+    /// list publishes, since all three go through `AdminRoleView`.
+    fn role_fields(role: &serde_json::Value) -> Vec<&str> {
+        let mut got: Vec<&str> = role
+            .as_object()
+            .expect("role object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        got
+    }
+
+    const ROLE_VIEW_FIELDS: [&str; 7] = [
+        "created_at",
+        "description",
+        "id",
+        "is_system",
+        "name",
+        "permissions",
+        "updated_at",
+    ];
+
+    /// `POST` used to `ok_json` the raw `db::Record` from `ops::create_role`
+    /// — the `{id, data: {…}}` envelope with `permissions` in whatever
+    /// encoding the backend returned. It must publish the list's projection.
+    #[tokio::test]
+    async fn create_role_publishes_the_list_projection() {
+        let ctx = TestContext::with_admin().await;
+        let out = handle_create_role(
+            &ctx,
+            &admin_msg("create", "/admin/iam/roles"),
+            body_input(serde_json::json!({
+                "name": "editor",
+                "description": "Can edit content",
+                "permissions": ["posts.write"]
+            })),
+        )
+        .await;
+        let role = output_json(out).await;
+
+        assert_eq!(role_fields(&role), ROLE_VIEW_FIELDS);
+        assert_eq!(role["name"], serde_json::json!("editor"));
+        assert_eq!(role["permissions"], serde_json::json!(["posts.write"]));
+        assert_eq!(role["is_system"], serde_json::json!(false));
+    }
+
+    /// `PATCH` publishes the same projection, and a `permissions` value the
+    /// schema does not admit is refused rather than written.
+    #[tokio::test]
+    async fn update_role_publishes_the_list_projection_and_types_permissions() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        let path = format!("/admin/iam/roles/{}", created["id"].as_str().unwrap());
+
+        let updated = output_json(
+            handle_update_role(
+                &ctx,
+                &path,
+                body_input(serde_json::json!({"permissions": ["posts.read", "posts.write"]})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(role_fields(&updated), ROLE_VIEW_FIELDS);
+        assert_eq!(
+            updated["permissions"],
+            serde_json::json!(["posts.read", "posts.write"])
+        );
+
+        let out = handle_update_role(
+            &ctx,
+            &path,
+            body_input(serde_json::json!({"permissions": "posts.*"})),
+        )
+        .await;
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "a permissions value that is not an array of strings must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_role_reports_deleted() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        let path = format!("/admin/iam/roles/{}", created["id"].as_str().unwrap());
+
+        let body = output_json(
+            handle_delete_role(&ctx, &admin_msg("delete", "/admin/iam/roles"), &path).await,
+        )
+        .await;
+        assert_eq!(body, serde_json::json!({"deleted": true}));
     }
 
     /// P2c: assigning a role is a security-relevant grant — it must bump the

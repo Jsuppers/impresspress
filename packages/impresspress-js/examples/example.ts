@@ -78,12 +78,8 @@ async function main() {
     // Create a custom role
     const customRole = await impresspress.iam.createRole({
       name: 'editor',
-      display_name: 'Content Editor',
       description: 'Can edit content but not delete',
-      metadata: {
-        allowed_ips: ['192.168.1.0/24'],
-        disabled_features: ['delete', 'admin'],
-      },
+      permissions: ['posts.write'],
     });
     console.log('Custom role created:', customRole);
 

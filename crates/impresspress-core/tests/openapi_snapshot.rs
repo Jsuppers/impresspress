@@ -118,28 +118,51 @@ async fn openapi_matches_committed_snapshots() {
 /// `admin` shipped 17 endpoints and zero schemas: its handlers returned the
 /// database layer's untyped `RecordList` / `HashMap<String, Value>` directly,
 /// so `has_schema()` filtered every one of them out and the whole JSON API was
-/// absent from `/openapi.json`. These four reads are the ones that carry a
-/// contract; the other thirteen serve HTML and must stay absent.
+/// absent from `/openapi.json`. These four reads and three role writes are the
+/// ones that carry a contract; the HTML pages must stay absent.
 #[tokio::test]
 async fn admin_json_api_appears_in_openapi() {
     let ctx = impresspress_core::test_support::TestContext::new().await;
     let doc = impresspress_core::test_support::openapi_document(&ctx).await;
 
-    for path in [
-        "/b/admin/api/users",
-        "/b/admin/api/iam/roles",
-        "/b/admin/api/settings",
-        "/b/admin/api/logs",
+    for (path, method) in [
+        ("/b/admin/api/users", "get"),
+        ("/b/admin/api/iam/roles", "get"),
+        ("/b/admin/api/iam/roles", "post"),
+        ("/b/admin/api/iam/roles/{id}", "patch"),
+        ("/b/admin/api/iam/roles/{id}", "delete"),
+        ("/b/admin/api/settings", "get"),
+        ("/b/admin/api/logs", "get"),
     ] {
         assert!(
-            !doc["paths"][path]["get"].is_null(),
-            "{path} must carry a schema and appear in /openapi.json - admin's \
+            !doc["paths"][path][method].is_null(),
+            "{method} {path} must carry a schema and appear in /openapi.json - admin's \
              JSON API was previously invisible because its handlers were untyped"
         );
         assert_eq!(
-            doc["paths"][path]["get"]["security"],
+            doc["paths"][path][method]["security"],
             serde_json::json!([{ "bearerAuth": [] }]),
-            "{path} is AuthLevel::Admin and must carry a security requirement"
+            "{method} {path} is AuthLevel::Admin and must carry a security requirement"
+        );
+    }
+
+    // The three role writes publish the list's row projection, so a consumer
+    // reading one role from any of them can rely on one shape.
+    let list_row = &doc["paths"]["/b/admin/api/iam/roles"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["records"]["items"];
+    for (path, method) in [
+        ("/b/admin/api/iam/roles", "post"),
+        ("/b/admin/api/iam/roles/{id}", "patch"),
+    ] {
+        let written = &doc["paths"][path][method]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            written["properties"], list_row["properties"],
+            "{method} {path} must publish the same row projection as the list"
+        );
+        assert_eq!(
+            written["required"], list_row["required"],
+            "{method} {path} must publish the same row projection as the list"
         );
     }
 }

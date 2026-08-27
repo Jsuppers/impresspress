@@ -287,6 +287,37 @@ impl AdminRoleListResponse {
     }
 }
 
+/// `POST /b/admin/api/iam/roles` request body.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateRoleRequest {
+    /// Unique role name. This is the value stored in `user_roles.role` and
+    /// checked by the auth layer.
+    pub name: String,
+    /// Human-readable description shown in the IAM UI. Empty when omitted.
+    pub description: Option<String>,
+    /// Permission names to attach. Advisory metadata for the IAM UI — WRAP
+    /// grants, not this list, are what the runtime enforces. None when
+    /// omitted.
+    pub permissions: Option<Vec<String>>,
+}
+
+/// `PATCH /b/admin/api/iam/roles/{id}` request body. Every field is optional
+/// and only the ones present are applied. `name` is refused on a system role:
+/// renaming `admin` would break auth.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateRoleRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub permissions: Option<Vec<String>>,
+}
+
+/// `DELETE /b/admin/api/iam/roles/{id}` response body.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminRoleDeleteResponse {
+    /// Always `true`: a delete that did not happen is an error response.
+    pub deleted: bool,
+}
+
 // ---------------------------------------------------------------------------
 // GET /b/admin/api/settings
 // ---------------------------------------------------------------------------
