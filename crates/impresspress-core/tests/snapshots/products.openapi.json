@@ -11900,12 +11900,11 @@
                   },
                   "client_secret": {
                     "default": null,
-                    "description": "Stripe Embedded Checkout client secret. Present only for the embedded\npresentation, and `writeOnly` for the same reason as `receipt_token`.",
+                    "description": "Stripe Embedded Checkout client secret. Present only for the embedded\npresentation; it is how the browser opens the session, so it is\nreturned here and nowhere else. Same handling as `receipt_token`:\nnever log it.",
                     "type": [
                       "string",
                       "null"
-                    ],
-                    "writeOnly": true
+                    ]
                   },
                   "order_id": {
                     "type": "string"
@@ -11927,9 +11926,8 @@
                     "type": "string"
                   },
                   "receipt_token": {
-                    "description": "Returned once and never persisted in plaintext. Static storefronts use\nit to poll the minimal guest order-status endpoint after Stripe returns.\n\n`writeOnly` marks it as a secret capability that must not be logged or\nechoed. `pipeline.rs` asserts the flag, so it is carried on the\ncontract rather than left behind with the hand-written schema.",
-                    "type": "string",
-                    "writeOnly": true
+                    "description": "Returned once and never persisted in plaintext. Static storefronts use\nit to poll the minimal guest order-status endpoint after Stripe returns.\n\nA bearer capability: whoever holds it can read the order's status.\nTreat it like a session token — never log it, never put it in a URL\nthat gets shared. This response is its only delivery, which is why it\nis not `writeOnly`: that keyword claims a field is never present in a\nresponse, and this one is always present in this one.",
+                    "type": "string"
                   },
                   "receipt_token_expires_at": {
                     "format": "date-time",

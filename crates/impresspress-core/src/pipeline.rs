@@ -763,10 +763,28 @@ mod discovery_tests {
         let checkout_response =
             &checkout["responses"]["200"]["content"]["application/json"]["schema"];
         assert!(
-            checkout_response["properties"]["receipt_token"]["writeOnly"] == true
+            !checkout_response["properties"]["receipt_token"].is_null()
                 && !checkout_response["properties"]["amounts"].is_null(),
             "checkout must document the receipt token and minor-unit amounts: {checkout}"
         );
+        assert!(
+            checkout_response["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&serde_json::json!("receipt_token"))),
+            "the receipt token is what checkout returns, so it is always present: {checkout}"
+        );
+        // `writeOnly` asserts a field is never present in a response. Both of
+        // these are only ever present in a response — the receipt token is
+        // the product of checkout, the client secret is how an embedded
+        // checkout is opened — so the flag was a false statement that a
+        // strict OpenAPI 3.1 client would act on. Sensitivity is stated in
+        // the description instead.
+        for field in ["receipt_token", "client_secret"] {
+            assert!(
+                checkout_response["properties"][field]["writeOnly"].is_null(),
+                "{field} is returned in the response and must not be marked writeOnly: {checkout}"
+            );
+        }
 
         let guest_status = &paths["/b/products/orders/{id}/status"]["get"];
         let guest_props = &guest_status["responses"]["200"]["content"]["application/json"]
