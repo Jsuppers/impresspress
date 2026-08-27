@@ -3198,6 +3198,8 @@
               "additionalProperties": false,
               "properties": {
                 "after_completion_url": {
+                  "default": null,
+                  "description": "Where Stripe sends the buyer once the Payment Link is paid.",
                   "format": "uri",
                   "type": [
                     "string",
@@ -3205,12 +3207,14 @@
                   ]
                 },
                 "preset_id": {
+                  "default": null,
                   "type": [
                     "string",
                     "null"
                   ]
                 }
               },
+              "title": "PaymentLinkCreateRequest",
               "type": "object"
             }
           }
@@ -3237,15 +3241,18 @@
                     "type": "string"
                   },
                   "preset_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_status": {
                     "type": "string"
                   },
                   "url": {
+                    "description": "Stripe-hosted Payment Link the buyer opens.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -3253,13 +3260,12 @@
                 "required": [
                   "id",
                   "offer_id",
-                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status",
-                  "sync_error"
+                  "sync_status"
                 ],
+                "title": "ManagedPaymentLink",
                 "type": "object"
               }
             }
@@ -3330,15 +3336,18 @@
                     "type": "string"
                   },
                   "preset_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_status": {
                     "type": "string"
                   },
                   "url": {
+                    "description": "Stripe-hosted Payment Link the buyer opens.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -3346,13 +3355,12 @@
                 "required": [
                   "id",
                   "offer_id",
-                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status",
-                  "sync_error"
+                  "sync_status"
                 ],
+                "title": "ManagedPaymentLink",
                 "type": "object"
               }
             }
@@ -3490,18 +3498,22 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "name": {
                   "type": "string"
                 },
                 "slug": {
+                  "default": "",
                   "type": "string"
                 }
               },
               "required": [
                 "name"
               ],
+              "title": "CheckoutPresetRequest",
               "type": "object"
             }
           }
@@ -3525,6 +3537,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -3546,6 +3559,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -3612,6 +3626,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -3633,6 +3648,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -3697,6 +3713,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -3718,6 +3735,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -3772,18 +3790,22 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "name": {
                   "type": "string"
                 },
                 "slug": {
+                  "default": "",
                   "type": "string"
                 }
               },
               "required": [
                 "name"
               ],
+              "title": "CheckoutPresetRequest",
               "type": "object"
             }
           }
@@ -3807,6 +3829,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -3828,6 +3851,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -8963,6 +8987,8 @@
               "additionalProperties": false,
               "properties": {
                 "after_completion_url": {
+                  "default": null,
+                  "description": "Where Stripe sends the buyer once the Payment Link is paid.",
                   "format": "uri",
                   "type": [
                     "string",
@@ -8970,12 +8996,14 @@
                   ]
                 },
                 "preset_id": {
+                  "default": null,
                   "type": [
                     "string",
                     "null"
                   ]
                 }
               },
+              "title": "PaymentLinkCreateRequest",
               "type": "object"
             }
           }
@@ -9002,15 +9030,18 @@
                     "type": "string"
                   },
                   "preset_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_status": {
                     "type": "string"
                   },
                   "url": {
+                    "description": "Stripe-hosted Payment Link the buyer opens.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -9018,13 +9049,12 @@
                 "required": [
                   "id",
                   "offer_id",
-                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status",
-                  "sync_error"
+                  "sync_status"
                 ],
+                "title": "ManagedPaymentLink",
                 "type": "object"
               }
             }
@@ -9095,15 +9125,18 @@
                     "type": "string"
                   },
                   "preset_id": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_error": {
+                    "default": "",
                     "type": "string"
                   },
                   "sync_status": {
                     "type": "string"
                   },
                   "url": {
+                    "description": "Stripe-hosted Payment Link the buyer opens.",
                     "format": "uri",
                     "type": "string"
                   }
@@ -9111,13 +9144,12 @@
                 "required": [
                   "id",
                   "offer_id",
-                  "preset_id",
                   "url",
                   "active",
                   "configuration_hash",
-                  "sync_status",
-                  "sync_error"
+                  "sync_status"
                 ],
+                "title": "ManagedPaymentLink",
                 "type": "object"
               }
             }
@@ -9255,18 +9287,22 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "name": {
                   "type": "string"
                 },
                 "slug": {
+                  "default": "",
                   "type": "string"
                 }
               },
               "required": [
                 "name"
               ],
+              "title": "CheckoutPresetRequest",
               "type": "object"
             }
           }
@@ -9290,6 +9326,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -9311,6 +9348,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -9377,6 +9415,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -9398,6 +9437,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -9462,6 +9502,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -9483,6 +9524,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }
@@ -9537,18 +9579,22 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "name": {
                   "type": "string"
                 },
                 "slug": {
+                  "default": "",
                   "type": "string"
                 }
               },
               "required": [
                 "name"
               ],
+              "title": "CheckoutPresetRequest",
               "type": "object"
             }
           }
@@ -9572,6 +9618,7 @@
                     "type": "string"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "name": {
@@ -9593,6 +9640,7 @@
                   "active",
                   "configuration_hash"
                 ],
+                "title": "CheckoutPreset",
                 "type": "object"
               }
             }

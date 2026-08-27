@@ -800,16 +800,6 @@ crate::impresspress_feature_block! {
                 "offers": {"type": "array", "items": managed_offer_schema}
             }
         });
-        let checkout_preset_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "slug": {"type": "string"},
-                "inputs": {"type": "object"}
-            }
-        });
         let checkout_preset_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -828,14 +818,6 @@ crate::impresspress_feature_block! {
             "type": "object",
             "required": ["presets"],
             "properties": {"presets": {"type": "array", "items": checkout_preset_schema}}
-        });
-        let payment_link_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "preset_id": {"type": ["string", "null"]},
-                "after_completion_url": {"type": ["string", "null"], "format": "uri"}
-            }
         });
         let managed_payment_link_schema = serde_json::json!({
             "type": "object",
@@ -1110,27 +1092,27 @@ crate::impresspress_feature_block! {
                     .summary("Create checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Get checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(preset_path_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::patch("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Update checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(preset_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::delete("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Archive checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(preset_path_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("List Payment Links")
@@ -1142,14 +1124,14 @@ crate::impresspress_feature_block! {
                     .summary("Create or reuse Payment Link")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(payment_link_input_schema.clone())
-                    .output_schema(managed_payment_link_schema.clone())
+                    .input::<contracts::PaymentLinkCreateRequest>()
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "admin", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::delete("/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links/{link_id}")
                     .summary("Deactivate Payment Link")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(link_path_schema.clone())
-                    .output_schema(managed_payment_link_schema.clone())
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "admin", "offers", "payment-links", "stripe"]),
                 // JSON admin API — groups
                 BlockEndpoint::get("/b/products/api/admin/groups")
@@ -1422,27 +1404,27 @@ crate::impresspress_feature_block! {
                     .summary("Create own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Get own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(preset_path_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::patch("/b/products/api/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Update own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(preset_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema)
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::delete("/b/products/api/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Archive own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(preset_path_schema)
-                    .output_schema(checkout_preset_schema)
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("List own Payment Links")
@@ -1454,14 +1436,14 @@ crate::impresspress_feature_block! {
                     .summary("Create or reuse own Payment Link")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema)
-                    .input_schema(payment_link_input_schema)
-                    .output_schema(managed_payment_link_schema.clone())
+                    .input::<contracts::PaymentLinkCreateRequest>()
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "seller", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::delete("/b/products/api/products/{product_id}/offers/{offer_id}/payment-links/{link_id}")
                     .summary("Deactivate own Payment Link")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(link_path_schema)
-                    .output_schema(managed_payment_link_schema)
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "seller", "offers", "payment-links", "stripe"]),
                 // Authenticated user-owned groups and builder taxonomy. These
                 // routes used to rely on the products prefix's fail-closed

@@ -703,7 +703,9 @@ pub struct CheckoutPreset {
 pub struct PaymentLinkCreateRequest {
     #[serde(default)]
     pub preset_id: Option<String>,
+    /// Where Stripe sends the buyer once the Payment Link is paid.
     #[serde(default)]
+    #[schemars(url)]
     pub after_completion_url: Option<String>,
 }
 
@@ -714,6 +716,8 @@ pub struct ManagedPaymentLink {
     pub offer_id: String,
     #[serde(default)]
     pub preset_id: String,
+    /// Stripe-hosted Payment Link the buyer opens.
+    #[schemars(url)]
     pub url: String,
     pub active: bool,
     pub configuration_hash: String,
