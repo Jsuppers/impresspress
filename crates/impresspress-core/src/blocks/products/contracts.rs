@@ -573,6 +573,7 @@ pub struct StorefrontConfig {
 pub struct PricingPreviewRequest {
     pub offer_id: String,
     #[serde(default = "one_u64")]
+    #[schemars(range(min = 1))]
     pub quantity: u64,
     #[serde(default)]
     pub inputs: BTreeMap<String, Value>,

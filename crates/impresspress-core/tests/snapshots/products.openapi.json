@@ -3909,6 +3909,8 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "offer_id": {
@@ -3916,6 +3918,7 @@
                 },
                 "quantity": {
                   "default": 1,
+                  "format": "uint64",
                   "minimum": 1,
                   "type": "integer"
                 }
@@ -3923,6 +3926,7 @@
               "required": [
                 "offer_id"
               ],
+              "title": "PricingPreviewRequest",
               "type": "object"
             }
           }
@@ -3943,21 +3947,28 @@
                         "type": "string"
                       },
                       "discount_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "platform_fee_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "shipping_minor": {
+                        "default": 0,
+                        "format": "int64",
                         "type": "integer"
                       },
                       "subtotal_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "tax_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "total_minor": {
+                        "format": "int64",
                         "type": "integer"
                       }
                     },
@@ -3966,7 +3977,6 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
-                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -3989,6 +3999,8 @@
                           "type": "string"
                         },
                         "quantity": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "reason": {
@@ -3998,9 +4010,11 @@
                           "type": "boolean"
                         },
                         "total_amount_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "unit_amount_minor": {
+                          "format": "int64",
                           "type": "integer"
                         }
                       },
@@ -4020,18 +4034,25 @@
                     "type": "array"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "offer_id": {
                     "type": "string"
                   },
                   "offer_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "quantity": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "schema_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   }
                 },
@@ -4044,6 +4065,7 @@
                   "components",
                   "amounts"
                 ],
+                "title": "PricingPreview",
                 "type": "object"
               }
             }
@@ -9706,6 +9728,8 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "offer_id": {
@@ -9713,6 +9737,7 @@
                 },
                 "quantity": {
                   "default": 1,
+                  "format": "uint64",
                   "minimum": 1,
                   "type": "integer"
                 }
@@ -9720,6 +9745,7 @@
               "required": [
                 "offer_id"
               ],
+              "title": "PricingPreviewRequest",
               "type": "object"
             }
           }
@@ -9740,21 +9766,28 @@
                         "type": "string"
                       },
                       "discount_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "platform_fee_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "shipping_minor": {
+                        "default": 0,
+                        "format": "int64",
                         "type": "integer"
                       },
                       "subtotal_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "tax_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "total_minor": {
+                        "format": "int64",
                         "type": "integer"
                       }
                     },
@@ -9763,7 +9796,6 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
-                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -9786,6 +9818,8 @@
                           "type": "string"
                         },
                         "quantity": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "reason": {
@@ -9795,9 +9829,11 @@
                           "type": "boolean"
                         },
                         "total_amount_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "unit_amount_minor": {
+                          "format": "int64",
                           "type": "integer"
                         }
                       },
@@ -9817,18 +9853,25 @@
                     "type": "array"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "offer_id": {
                     "type": "string"
                   },
                   "offer_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "quantity": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "schema_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   }
                 },
@@ -9841,6 +9884,7 @@
                   "components",
                   "amounts"
                 ],
+                "title": "PricingPreview",
                 "type": "object"
               }
             }
@@ -12582,6 +12626,8 @@
               "additionalProperties": false,
               "properties": {
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "offer_id": {
@@ -12589,6 +12635,7 @@
                 },
                 "quantity": {
                   "default": 1,
+                  "format": "uint64",
                   "minimum": 1,
                   "type": "integer"
                 }
@@ -12596,6 +12643,7 @@
               "required": [
                 "offer_id"
               ],
+              "title": "PricingPreviewRequest",
               "type": "object"
             }
           }
@@ -12616,21 +12664,28 @@
                         "type": "string"
                       },
                       "discount_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "platform_fee_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "shipping_minor": {
+                        "default": 0,
+                        "format": "int64",
                         "type": "integer"
                       },
                       "subtotal_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "tax_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "total_minor": {
+                        "format": "int64",
                         "type": "integer"
                       }
                     },
@@ -12639,7 +12694,6 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
-                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -12662,6 +12716,8 @@
                           "type": "string"
                         },
                         "quantity": {
+                          "format": "uint64",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "reason": {
@@ -12671,9 +12727,11 @@
                           "type": "boolean"
                         },
                         "total_amount_minor": {
+                          "format": "int64",
                           "type": "integer"
                         },
                         "unit_amount_minor": {
+                          "format": "int64",
                           "type": "integer"
                         }
                       },
@@ -12693,18 +12751,25 @@
                     "type": "array"
                   },
                   "inputs": {
+                    "additionalProperties": true,
                     "type": "object"
                   },
                   "offer_id": {
                     "type": "string"
                   },
                   "offer_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "quantity": {
+                    "format": "uint64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "schema_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   }
                 },
@@ -12717,6 +12782,7 @@
                   "components",
                   "amounts"
                 ],
+                "title": "PricingPreview",
                 "type": "object"
               }
             }

@@ -415,48 +415,6 @@ crate::impresspress_feature_block! {
                 "total_minor": {"type": "integer"}
             }
         });
-        let pricing_preview_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["offer_id"],
-            "properties": {
-                "offer_id": {"type": "string"},
-                "quantity": {"type": "integer", "minimum": 1, "default": 1},
-                "inputs": {"type": "object"}
-            }
-        });
-        let pricing_preview_output_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["schema_version", "offer_id", "offer_version", "quantity", "inputs", "components", "amounts"],
-            "properties": {
-                "schema_version": {"type": "integer"},
-                "offer_id": {"type": "string"},
-                "offer_version": {"type": "integer"},
-                "quantity": {"type": "integer"},
-                "inputs": {"type": "object"},
-                "components": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["component_id", "key", "label", "included", "required", "unit_amount_minor", "quantity", "total_amount_minor", "reason"],
-                        "properties": {
-                            "component_id": {"type": "string"},
-                            "key": {"type": "string"},
-                            "label": {"type": "string"},
-                            "included": {"type": "boolean"},
-                            "required": {"type": "boolean"},
-                            "unit_amount_minor": {"type": "integer"},
-                            "quantity": {"type": "integer"},
-                            "total_amount_minor": {"type": "integer"},
-                            "reason": {"type": "string"}
-                        }
-                    }
-                },
-                "amounts": money_breakdown_schema
-            }
-        });
         let checkout_input_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -1009,8 +967,8 @@ crate::impresspress_feature_block! {
                     .description("Evaluate an owner-visible immutable or draft offer with the server pricing engine. Browser totals are never trusted.")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(pricing_preview_input_schema.clone())
-                    .output_schema(pricing_preview_output_schema.clone())
+                    .input::<contracts::PricingPreviewRequest>()
+                    .output::<contracts::PricingPreview>()
                     .tags(&["products", "admin", "offers", "pricing"]),
                 BlockEndpoint::patch("/b/products/api/admin/products/{product_id}/offers/{offer_id}")
                     .summary("Update draft offer")
@@ -1321,8 +1279,8 @@ crate::impresspress_feature_block! {
                     .description("Evaluate an owned immutable or draft offer with the server pricing engine. Browser totals are never trusted.")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(pricing_preview_input_schema.clone())
-                    .output_schema(pricing_preview_output_schema.clone())
+                    .input::<contracts::PricingPreviewRequest>()
+                    .output::<contracts::PricingPreview>()
                     .tags(&["products", "seller", "offers", "pricing"]),
                 BlockEndpoint::patch("/b/products/api/products/{product_id}/offers/{offer_id}")
                     .summary("Update own draft offer")
@@ -1680,8 +1638,8 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::post("/b/products/pricing/preview")
                     .summary("Preview configured offer")
                     .description("Evaluate a persisted active offer from validated customer inputs. Amounts are returned in integer minor units.")
-                    .input_schema(pricing_preview_input_schema)
-                    .output_schema(pricing_preview_output_schema)
+                    .input::<contracts::PricingPreviewRequest>()
+                    .output::<contracts::PricingPreview>()
                     .auth(AuthLevel::Public)
                     .tags(&["products", "pricing"]),
                 BlockEndpoint::post("/b/products/checkout")
