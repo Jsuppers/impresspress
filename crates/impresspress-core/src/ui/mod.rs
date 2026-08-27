@@ -40,12 +40,10 @@ impl SiteConfig {
         let scripts_raw = config::get_default(ctx, "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS", "").await;
         Self {
             app_name: config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await,
-            logo_url: config::get_default(
-                ctx,
-                "WAFER_RUN_SHARED__LOGO_URL",
-                assets::logo_long_url(),
-            )
-            .await,
+            // Blank = no wordmark image: templates render the app name as
+            // text next to the (pixel-art) icon. Set to white-label with a
+            // wordmark of your own.
+            logo_url: config::get_default(ctx, "WAFER_RUN_SHARED__LOGO_URL", "").await,
             logo_icon_url: config::get_default(
                 ctx,
                 "WAFER_RUN_SHARED__LOGO_ICON_URL",

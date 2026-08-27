@@ -98,8 +98,8 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Url),
         ConfigVar::new(
             "WAFER_RUN_SHARED__LOGO_URL",
-            "Logo shown in header and emails",
-            crate::ui::assets::logo_long_url(),
+            "Wordmark image shown in the header and on auth pages; blank shows the app name as text next to the icon",
+            "",
         )
         .name("Logo URL")
         .input_type(InputType::Url),

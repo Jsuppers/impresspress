@@ -311,6 +311,58 @@ pub fn account_card_page(opts: AccountCard<'_>, body: Markup) -> Markup {
     }
 }
 
+/// The brand icon. The built-in mark is pixel art (32- and 64-art-pixel
+/// renditions) and must only ever be drawn at a whole multiple of its size,
+/// so which file is used is decided here, deterministically:
+///
+/// - `size_px` ≥ 64: the 64-cell file as a plain `<img>` (1:1 on 1x screens,
+///   2:1 nearest-neighbour on 2x).
+/// - smaller: a `<picture>` — the 32-cell file by default, the 64-cell file
+///   from 1.5dppx up via a `min-resolution` media query. Not `srcset` width
+///   descriptors: browsers may pick an already-cached larger candidate for
+///   those, which then gets nearest-neighbour *down*scaled.
+///
+/// `.pixel-art` keeps the art-pixels square. A white-labelled icon URL is a
+/// smooth logo we know nothing about and is left untouched.
+pub fn brand_icon(logo_icon_url: &str, class: &str, size_px: u32) -> Markup {
+    let builtin = logo_icon_url == crate::ui::assets::logo_icon_url();
+    html! {
+        @if builtin && size_px >= 64 {
+            img class={ (class) " pixel-art" }
+                src=(crate::ui::assets::logo_icon_2x_url())
+                width=(size_px) height=(size_px) alt="";
+        } @else if builtin {
+            picture {
+                source media="(min-resolution: 1.5dppx)" srcset=(crate::ui::assets::logo_icon_2x_url());
+                img class={ (class) " pixel-art" }
+                    src=(logo_icon_url)
+                    width=(size_px) height=(size_px) alt="";
+            }
+        } @else {
+            img class=(class) src=(logo_icon_url) width=(size_px) height=(size_px) alt="";
+        }
+    }
+}
+
+/// The brand lockup on auth cards (login, signup, reset, verify, …): a
+/// configured wordmark image as before, otherwise the icon at 64px above the
+/// app name as text. Blank `logo_url` is the default — there is no built-in
+/// raster wordmark (brand text is text, only the art is pixel art).
+pub fn brand_lockup(logo_url: &str, logo_icon_url: &str, app_name: &str) -> Markup {
+    html! {
+        @if !logo_url.is_empty() {
+            img .logo-image src=(logo_url) alt=(app_name);
+        } @else {
+            div .login-brand {
+                @if !logo_icon_url.is_empty() {
+                    (brand_icon(logo_icon_url, "login-brand__icon", 64))
+                }
+                span .login-app-name { (app_name) }
+            }
+        }
+    }
+}
+
 pub struct BrandPanel<'a> {
     pub logo_html: Option<Markup>,
     pub headline: &'a str,
