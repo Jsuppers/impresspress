@@ -96,14 +96,15 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`POST /b/messages/api/contexts` request body.",
               "properties": {
-                "metadata": {
-                  "default": {},
-                  "type": "object"
-                },
+                "metadata": true,
                 "parent_id": {
-                  "description": "Parent context ID for sub-tasks/threads",
-                  "type": "string"
+                  "description": "Parent context ID for sub-tasks/threads.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "recipient_id": {
                   "default": "",
@@ -125,6 +126,7 @@
               "required": [
                 "type"
               ],
+              "title": "CreateContextRequest",
               "type": "object"
             }
           }
@@ -180,17 +182,23 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`PATCH /b/messages/api/contexts/{id}` request body. Every field is\noptional and only the ones present are applied — see the module doc for\nwhy this replaced a `HashMap<String, Value>` plus a runtime whitelist.",
               "properties": {
-                "metadata": {
-                  "type": "object"
-                },
+                "metadata": true,
                 "status": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "title": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
+              "title": "UpdateContextRequest",
               "type": "object"
             }
           }
@@ -273,6 +281,7 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`POST /b/messages/api/contexts/{id}/entries` request body.",
               "properties": {
                 "content": {
                   "default": "",
@@ -280,20 +289,21 @@
                 },
                 "content_type": {
                   "default": "text/plain",
-                  "type": "string"
+                  "description": "MIME type of `content`. Defaults to `text/plain` when omitted or\nexplicitly `null`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "kind": {
                   "default": "message",
-                  "description": "Entry kind: message, artifact, notification, status",
+                  "description": "Entry kind: message, artifact, notification, status.",
                   "type": "string"
                 },
-                "metadata": {
-                  "default": {},
-                  "type": "object"
-                },
+                "metadata": true,
                 "role": {
                   "default": "",
-                  "description": "Sender role: user, agent, system",
+                  "description": "Sender role: user, agent, system.",
                   "type": "string"
                 },
                 "sender_id": {
@@ -301,6 +311,7 @@
                   "type": "string"
                 }
               },
+              "title": "AddEntryRequest",
               "type": "object"
             }
           }
