@@ -308,6 +308,52 @@ impl ImpresspressBuilder {
         let feature_config: Arc<dyn FeatureConfig> = self.block_settings.clone();
         let block_infos = wafer.block_infos();
         let routes_cfg = crate::routing::routes_config(&block_infos);
+
+        // WebMCP refusals are structural: a defect in a block's own
+        // AgentTool declarations (duplicate tool name, an unrepresentable
+        // schema, etc.), independent of caller and of `effective_auth` — see
+        // `wafer_core::discovery::generate_webmcp_report`'s doc comment
+        // ("Refusals are the same for every caller"). The per-request
+        // manifest handler (`pipeline::handle_request`, `GET
+        // /b/webmcp/manifest.json`) uses the silent `_report` form and
+        // discards the refusal list for exactly that reason: that route is
+        // unauthenticated and served with `Cache-Control: no-store`, so
+        // re-deriving and `tracing::warn!`-ing the same static facts on
+        // every anonymous GET is pure log amplification driven by whoever
+        // is looping requests. This is the one place refusals are computed
+        // and logged — once, here, from the same `block_infos` snapshot the
+        // router below is built from — so an operator who annotated an
+        // endpoint and is wondering why no tool appeared can still find out
+        // (the diagnostic moved, it was not dropped).
+        //
+        // Lifetime: `build()` runs once per `Wafer` construction. On
+        // Cloudflare Workers that is once per isolate, not once globally —
+        // `impresspress-cloudflare/src/runtime_cache.rs` builds the Wafer
+        // once per isolate and caches it in a thread_local, reused across
+        // that isolate's requests and rebuilt only when the KV
+        // config-version stamp moves. Still bounded, and a large reduction
+        // from once per anonymous request.
+        //
+        // `caller`/`effective_auth` below are arbitrary and do not affect
+        // `webmcp_refusals`: both only gate which already-admitted tools
+        // reach the *served* manifest (the `Value` half of the return,
+        // discarded here), never the refusal list itself.
+        let (_, webmcp_refusals) = wafer_core::discovery::generate_webmcp_report(
+            &block_infos,
+            wafer_run::AuthLevel::Admin,
+            |_block, ep| ep.auth,
+        );
+        for refusal in &webmcp_refusals {
+            tracing::warn!(
+                block = %refusal.block,
+                method = %refusal.method,
+                path = %refusal.path,
+                tool = %refusal.tool_name,
+                reason = %refusal.reason,
+                "webmcp: endpoint opted in to agent-tool exposure but was refused"
+            );
+        }
+
         let router = ImpresspressRouterBlock::with_extra_routes(
             self.jwt_secret.clone(),
             feature_config,

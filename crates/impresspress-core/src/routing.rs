@@ -413,7 +413,7 @@ fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -
 /// published it to every logged-in visitor.
 ///
 /// Used by the WebMCP manifest (`pipeline.rs`) via
-/// `wafer_core::discovery::generate_webmcp_with`, whose plain
+/// `wafer_core::discovery::generate_webmcp_report`, whose plain
 /// `generate_webmcp` filters on `ep.auth` alone — which would advertise a
 /// tool the router still rejects whenever a block declares an endpoint
 /// looser than the prefix tier it is actually served under (recon surface:

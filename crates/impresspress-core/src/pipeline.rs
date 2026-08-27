@@ -236,19 +236,33 @@ pub async fn handle_request(
             .cloned()
             .collect();
 
-        // MUST be `generate_webmcp_with`, not `generate_webmcp`. The plain
-        // form filters on `ep.auth` alone, but this router admits on
-        // `max(prefix_tier, ep.auth)` (routing.rs:440). An endpoint declared
-        // Public under an Admin prefix would otherwise be advertised to
-        // anonymous callers — the router still 403s, so it is not a data
-        // leak, but it publishes a tool name the caller cannot use (the
-        // recon surface this filtering exists to prevent) and hands the
-        // agent a tool that always fails.
+        // MUST resolve the auth ceiling with `routing::effective_access`, not
+        // the plain `ep.auth`. This router admits on `max(prefix_tier,
+        // ep.auth)` (routing.rs:440), so a `generate_webmcp`-style filter on
+        // `ep.auth` alone would advertise a Public-declared endpoint mounted
+        // under an Admin prefix to anonymous callers — the router still
+        // 403s, so it is not a data leak, but it publishes a tool name the
+        // caller cannot use (the recon surface this filtering exists to
+        // prevent) and hands the agent a tool that always fails.
         //
         // `extra_routes` is threaded in so a downstream `add_route` — which
         // `route_to_block` enforces just like a built-in — is resolved too.
-        let body =
-            wafer_core::discovery::generate_webmcp_with(&enabled_infos, caller, |block, ep| {
+        //
+        // MUST be `generate_webmcp_report`, not `generate_webmcp_with`. This
+        // route is unauthenticated and served with `Cache-Control: no-store`,
+        // so every anonymous GET re-runs generation; `_with`'s wrapper logs
+        // one `tracing::warn!` per refused endpoint on every call, which
+        // turns an unauthenticated endpoint into unbounded warn-level log
+        // volume for a caller in a loop. Refusals are static — a defect in
+        // a block's own declarations, identical for every call and every
+        // caller (see `generate_webmcp_report`'s doc comment) — so they are
+        // computed and logged exactly once, at runtime construction, in
+        // `builder::registration::build()`. The manifest content emitted
+        // here is unaffected either way: `_report` runs the identical
+        // generation and only changes where the refusal list goes.
+        // Refusals discarded on purpose — see the comment above.
+        let (body, _refused) =
+            wafer_core::discovery::generate_webmcp_report(&enabled_infos, caller, |block, ep| {
                 routing::effective_access(block, ep, extra_routes)
             });
 
@@ -1284,6 +1298,136 @@ mod discovery_tests {
             tool_names(&disabled),
             Vec::<&str>::new(),
             "a disabled block must contribute no tools — every call to it 404s: {disabled}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Refusal-logging amplification (see also
+    // `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`
+    // for the "still reported somewhere" half of this fix).
+    // -------------------------------------------------------------------
+
+    /// Minimal `tracing::Subscriber` that records the rendered `message`
+    /// field of every event it sees, so a test can assert on what was (or
+    /// was not) logged without pulling in `tracing-subscriber`.
+    #[derive(Clone, Default)]
+    struct MessageCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MessageVisitor<'a> {
+        out: &'a mut String,
+    }
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.out = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for MessageCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MessageVisitor { out: &mut message });
+            self.0
+                .lock()
+                .expect("MessageCapture mutex poisoned")
+                .push(message);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    impl MessageCapture {
+        fn count_containing(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .expect("MessageCapture mutex poisoned")
+                .iter()
+                .filter(|m| m.contains(needle))
+                .count()
+        }
+    }
+
+    /// The exact text `generate_webmcp_with`'s wrapper (and now
+    /// `builder::registration::build()`) attaches to the refusal warning —
+    /// duplicated here rather than imported so this test does not depend on
+    /// the message staying byte-for-byte in sync with production wording
+    /// beyond this recognizable substring.
+    const REFUSAL_WARNING: &str =
+        "webmcp: endpoint opted in to agent-tool exposure but was refused";
+
+    /// A block declaring two endpoints that opt into the SAME tool name —
+    /// `WebMcpRefusal::DuplicateToolName`, a structural defect independent
+    /// of caller or auth tier. Used to prove the per-request manifest path
+    /// no longer logs about it.
+    fn duplicate_tool_name_block() -> BlockInfo {
+        BlockInfo::new(
+            "test/webmcp-refusal-fixture",
+            "0.0.1",
+            "http-handler@v1",
+            "two endpoints sharing one tool name, on purpose",
+        )
+        .endpoints(vec![
+            BlockEndpoint::get("/b/webmcp-refusal-fixture/one")
+                .summary("first")
+                .auth(AuthLevel::Public)
+                .agent_tool("webmcp_refusal_fixture_dup", "first"),
+            BlockEndpoint::get("/b/webmcp-refusal-fixture/two")
+                .summary("second")
+                .auth(AuthLevel::Public)
+                .agent_tool("webmcp_refusal_fixture_dup", "second"),
+        ])
+    }
+
+    /// The bug this whole fix targets: N refused endpoints previously meant
+    /// N `tracing::warn!` calls on EVERY GET of the unauthenticated,
+    /// `no-store` manifest route — unbounded warn-level log volume for any
+    /// anonymous caller that loops the request. Refusals are static (same
+    /// for every call and caller), so the per-request path must log zero of
+    /// them; they are logged once elsewhere instead (see
+    /// `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`).
+    #[tokio::test]
+    async fn webmcp_manifest_request_does_not_log_refusals() {
+        let ctx = TestContext::new().await;
+        let infos = vec![duplicate_tool_name_block()];
+
+        // Precondition: this fixture really does trigger a refusal — both
+        // endpoints sharing the name — so a silently-inert fixture couldn't
+        // make the assertion below pass vacuously.
+        let (_, refused) = wafer_core::discovery::generate_webmcp_report(
+            &infos,
+            AuthLevel::Admin,
+            |_block, ep| ep.auth,
+        );
+        assert_eq!(
+            refused.len(),
+            2,
+            "precondition: both endpoints sharing the tool name must be refused: {refused:?}"
+        );
+
+        let capture = MessageCapture::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        // Hit the manifest endpoint more than once — the bug is per-request
+        // amplification, so one call passing would be weak evidence.
+        let _first = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let _second = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        drop(guard);
+
+        assert_eq!(
+            capture.count_containing(REFUSAL_WARNING),
+            0,
+            "the per-request manifest path must not log per-refusal warnings — refusals \
+             are static (identical for every caller) and are logged once, at runtime \
+             construction, not per anonymous request"
         );
     }
 }
