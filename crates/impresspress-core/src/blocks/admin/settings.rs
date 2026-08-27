@@ -300,7 +300,11 @@ async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
         body.value.as_deref().unwrap_or(""),
         body.name.as_deref(),
         body.description.as_deref(),
-        body.sensitive.unwrap_or(false),
+        // Absent means sensitive. A caller that does not say is protected;
+        // one that wants a plain-text variable says `false`. The old `false`
+        // default published any key without a `_SECRET`/`_KEY` suffix in
+        // plain text unless the operator remembered the box.
+        body.sensitive.unwrap_or(true),
     )
     .await
     {
@@ -831,5 +835,77 @@ mod tests {
             Some(MASKED_VALUE),
             "a *_SECRET value must be masked even with the sensitive flag unset"
         );
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use wafer_block::db::{Filter, FilterOp};
+    use wafer_core::clients::database as db;
+    use wafer_run::InputStream;
+
+    use super::*;
+    use crate::test_support::{admin_msg, collect_or_panic, TestContext};
+
+    async fn admin_ctx() -> TestContext {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx
+    }
+
+    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> i64 {
+        let rows = db::list_all(
+            ctx,
+            VARIABLES_TABLE,
+            vec![Filter {
+                field: "key".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(key),
+            }],
+        )
+        .await
+        .expect("list variables");
+        rows.first()
+            .unwrap_or_else(|| panic!("{key} was not created"))
+            .i64_field("sensitive")
+    }
+
+    async fn create(ctx: &dyn Context, body: serde_json::Value) {
+        let out = handle_create(
+            ctx,
+            &admin_msg("create", "/admin/settings"),
+            InputStream::from_bytes(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        collect_or_panic(out).await;
+    }
+
+    /// An ad hoc variable created without saying whether it is sensitive is
+    /// stored as sensitive. Masking an innocuous value costs the operator one
+    /// click to undo; publishing a secret in plain text — which is what the
+    /// old `false` default did for any key without a `_SECRET`/`_KEY`
+    /// suffix — cannot be undone.
+    #[tokio::test]
+    async fn create_defaults_to_sensitive_when_the_flag_is_omitted() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "move fast"}),
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_honours_an_explicit_not_sensitive() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "move fast", "sensitive": false}),
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 0);
     }
 }
