@@ -38,19 +38,15 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// * `tickets` is a block that arrived recently and has no schemas yet —
-///   its endpoints exist (see `SNAPSHOTTED_BLOCKS`) but none of them call
-///   `.input_schema(...)` / `.output_schema(...)` today.
+/// The list is now empty. `admin` left it when its four JSON API reads were
+/// typed, and `tickets` left it when its thirteen JSON endpoints were: both
+/// blocks' handlers now build `contracts` types, so both have a non-empty
+/// snapshot to guard.
 ///
-/// `admin` left this list when its four JSON API reads were typed: its
-/// handlers now build `blocks::admin::contracts` types, so the block has a
-/// non-empty snapshot to guard.
-///
-/// Every other block in `SNAPSHOTTED_BLOCKS` already has schemas, so an
-/// empty snapshot for any of *them* means the gate is vacuous — wrong
-/// prefix, or the block missing from the document's block list — and must
-/// fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &["tickets"];
+/// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
+/// any of them means the gate is vacuous — wrong prefix, or the block missing
+/// from the document's block list — and must fail loudly.
+const LEGITIMATELY_EMPTY: &[&str] = &[];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
@@ -227,4 +223,184 @@ async fn admin_openapi_publishes_no_credential_field() {
             );
         }
     }
+}
+
+/// `tickets` declared 21 endpoints and zero schemas, so `has_schema()` filtered
+/// every one of them out and its JSON API was absent from `/openapi.json`. The
+/// thirteen JSON endpoints below are the ones that carry a contract; the eight
+/// that serve HTML (or redirect) must stay absent, because a schema is what
+/// turns an endpoint into a tool.
+#[tokio::test]
+async fn tickets_json_api_appears_in_openapi_and_its_pages_do_not() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    for (method, path) in [
+        ("post", "/b/tickets/api/submissions"),
+        ("get", "/b/tickets/api/admin/tickets"),
+        ("post", "/b/tickets/api/admin/tickets"),
+        ("get", "/b/tickets/api/admin/tickets/{id}"),
+        ("patch", "/b/tickets/api/admin/tickets/{id}"),
+        ("post", "/b/tickets/api/admin/tickets/{id}/notes"),
+        ("get", "/b/tickets/api/admin/tickets/{id}/analyses"),
+        ("post", "/b/tickets/api/admin/tickets/{id}/analyses"),
+        ("get", "/b/tickets/api/admin/types"),
+        ("post", "/b/tickets/api/admin/types"),
+        ("patch", "/b/tickets/api/admin/types/{id}"),
+        ("get", "/b/tickets/api/admin/status"),
+        ("post", "/b/tickets/api/admin/retention/prune"),
+    ] {
+        assert!(
+            !doc["paths"][path][method].is_null(),
+            "{method} {path} must carry a schema and appear in /openapi.json"
+        );
+    }
+
+    for path in [
+        "/b/tickets/submit",
+        "/b/tickets/submitted",
+        "/b/tickets/admin",
+        "/b/tickets/admin/tickets",
+        "/b/tickets/admin/tickets/{id}",
+        "/b/tickets/admin/types",
+        "/b/tickets/admin/settings",
+        "/b/tickets/admin/endpoints",
+    ] {
+        assert!(
+            doc["paths"][path].is_null(),
+            "{path} serves HTML and must carry no schema - a schema would make it \
+             a callable tool"
+        );
+    }
+}
+
+/// The ticket tables hold reporter-supplied text and one abuse digest, and the
+/// untyped handlers echoed whole rows. Two invariants the projection exists to
+/// hold, checked structurally rather than by reading the snapshot:
+///
+/// 1. No published field name matches the digest/credential pattern. That is
+///    what keeps `dedupe_hash` — an HMAC over the reporter's IP-derived
+///    rotating identity — out of every response.
+/// 2. Reporter-controlled text is reachable only inside an untrusted-report
+///    group, never flattened beside the workflow fields, so an agent client can
+///    always tell data from instruction.
+#[tokio::test]
+async fn tickets_openapi_withholds_the_abuse_digest_and_groups_reporter_text() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let fields = published_field_names(&doc, &["/b/tickets"]);
+
+    assert!(
+        !fields.is_empty(),
+        "no tickets fields found - the walk is looking in the wrong place and \
+         this test would pass forever"
+    );
+
+    // `…_secret_configured` on the readiness object is a boolean that reports
+    // whether a secret is set, never a secret; it is the only field allowed to
+    // match the pattern below.
+    const READINESS_FLAGS: &[&str] = &["turnstile_secret_configured", "identity_secret_configured"];
+
+    for field in &fields {
+        if READINESS_FLAGS.contains(&field.as_str()) {
+            continue;
+        }
+        let lower = field.to_lowercase();
+        for forbidden in ["dedupe", "hash", "secret", "password", "remote_addr"] {
+            assert!(
+                !lower.contains(forbidden),
+                "tickets publishes a field named `{field}`, which matches the \
+                 withheld pattern `{forbidden}`"
+            );
+        }
+    }
+
+    for flag in READINESS_FLAGS {
+        for props in objects_with_property(&doc, &["/b/tickets"], "responses", flag) {
+            assert_eq!(
+                props[*flag]["type"], "boolean",
+                "`{flag}` must stay a boolean readiness flag, never carry a value"
+            );
+        }
+    }
+
+    // `reporter_email` is the marker: it belongs to exactly one shape, the
+    // reporter-controlled group. Any other object carrying it would mean a raw
+    // ticket row had been echoed again.
+    let mut groups = 0;
+    for props in objects_with_property(&doc, &["/b/tickets"], "responses", "reporter_email") {
+        groups += 1;
+        let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "description",
+                "evidence_url",
+                "reporter_email",
+                "reporter_wants_reply",
+                "source_path",
+                "subject",
+                "subject_id",
+                "subject_type",
+            ],
+            "reporter text must appear only as the untrusted-report group, but it \
+             is flattened into an object with these keys: {keys:?}"
+        );
+    }
+    assert!(
+        groups > 0,
+        "no untrusted-report group found - the walk is looking in the wrong place \
+         and this test would pass forever"
+    );
+}
+
+/// Every `properties` map declaring `property` inside the `section` (e.g.
+/// `"responses"`) of an operation under `prefixes`.
+///
+/// The section matters: a *request* body legitimately carries reporter text
+/// flat - that is the reporter filling in the form - while a *response* that
+/// does so is an echoed row.
+fn objects_with_property<'a>(
+    doc: &'a serde_json::Value,
+    prefixes: &[&str],
+    section: &str,
+    property: &str,
+) -> Vec<&'a serde_json::Map<String, serde_json::Value>> {
+    fn walk<'a>(
+        node: &'a serde_json::Value,
+        property: &str,
+        out: &mut Vec<&'a serde_json::Map<String, serde_json::Value>>,
+    ) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                    if props.contains_key(property) {
+                        out.push(props);
+                    }
+                }
+                for value in map.values() {
+                    walk(value, property, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, property, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let paths = doc["paths"].as_object().expect("openapi paths object");
+    let mut out = Vec::new();
+    for (path, node) in paths {
+        if !prefixes.iter().any(|p| path.starts_with(p)) {
+            continue;
+        }
+        for operation in node.as_object().into_iter().flat_map(|ops| ops.values()) {
+            walk(&operation[section], property, &mut out);
+        }
+    }
+    out
 }
