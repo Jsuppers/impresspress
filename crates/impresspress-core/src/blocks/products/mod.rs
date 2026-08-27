@@ -1544,17 +1544,7 @@ crate::impresspress_feature_block! {
                     .summary("Browser-safe storefront configuration")
                     .description("Returns only a validated Stripe publishable key and mode. Secret keys, webhook secrets, provider ids, and API URLs are never exposed.")
                     .auth(AuthLevel::Public)
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["schema_version", "embedded_checkout_available"],
-                        "properties": {
-                            "schema_version": {"type": "integer"},
-                            "embedded_checkout_available": {"type": "boolean"},
-                            "stripe_publishable_key": {"type": "string"},
-                            "stripe_mode": {"type": "string", "enum": ["test", "live"]}
-                        }
-                    }))
+                    .output::<contracts::StorefrontConfig>()
                     .tags(&["products", "storefront"]),
                 BlockEndpoint::get("/b/products/storefront/{product_id}")
                     .summary("Storefront product and offers")
@@ -1567,42 +1557,7 @@ crate::impresspress_feature_block! {
                             "product_id": {"type": "string"}
                         }
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["schema_version", "id", "name", "offers"],
-                        "properties": {
-                            "schema_version": {"type": "integer"},
-                            "id": {"type": "string"},
-                            "name": {"type": "string"},
-                            "slug": {"type": "string"},
-                            "description": {"type": "string"},
-                            "image_url": {"type": "string"},
-                            "tags": {"type": "array", "items": {"type": "string"}},
-                            "fulfillment_kind": {"type": "string"},
-                            "offers": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["id", "version", "name", "mode", "currency", "variables"],
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "version": {"type": "integer"},
-                                        "name": {"type": "string"},
-                                        "mode": {"type": "string"},
-                                        "currency": {"type": "string"},
-                                        "pricing_model": {"type": "string"},
-                                        "recurring_interval": {"type": ["string", "null"]},
-                                        "interval_count": {"type": "integer"},
-                                        "variables": {"type": "array"},
-                                        "checkout": {"type": "object"},
-                                        "payment_links": {"type": "array"}
-                                    }
-                                }
-                            }
-                        }
-                    }))
+                    .output::<contracts::StorefrontProduct>()
                     .auth(AuthLevel::Public)
                     .tags(&["products", "storefront"]),
                 BlockEndpoint::post("/b/products/webhooks")

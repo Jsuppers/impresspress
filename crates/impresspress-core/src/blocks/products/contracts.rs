@@ -555,6 +555,14 @@ pub struct StorefrontProduct {
     pub offers: Vec<StorefrontOffer>,
 }
 
+/// Which Stripe environment a validated publishable key belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StripeMode {
+    Test,
+    Live,
+}
+
 /// Browser-safe deployment configuration. The Stripe secret key, webhook
 /// secret, account ids, and provider API URL are deliberately absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -565,7 +573,7 @@ pub struct StorefrontConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stripe_publishable_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stripe_mode: Option<String>,
+    pub stripe_mode: Option<StripeMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

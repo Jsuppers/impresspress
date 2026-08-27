@@ -13113,28 +13113,40 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
+                "description": "Browser-safe deployment configuration. The Stripe secret key, webhook\nsecret, account ids, and provider API URL are deliberately absent.",
                 "properties": {
                   "embedded_checkout_available": {
                     "type": "boolean"
                   },
                   "schema_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "stripe_mode": {
+                    "description": "Which Stripe environment a validated publishable key belongs to.",
                     "enum": [
                       "test",
-                      "live"
+                      "live",
+                      null
                     ],
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "stripe_publishable_key": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
                 "required": [
                   "schema_version",
                   "embedded_checkout_available"
                 ],
+                "title": "StorefrontConfig",
                 "type": "object"
               }
             }
@@ -13170,15 +13182,24 @@
                 "additionalProperties": false,
                 "properties": {
                   "description": {
+                    "default": "",
                     "type": "string"
                   },
                   "fulfillment_kind": {
+                    "enum": [
+                      "none",
+                      "manual",
+                      "download",
+                      "entitlement",
+                      "webhook"
+                    ],
                     "type": "string"
                   },
                   "id": {
                     "type": "string"
                   },
                   "image_url": {
+                    "default": "",
                     "type": "string"
                   },
                   "name": {
@@ -13189,6 +13210,139 @@
                       "additionalProperties": false,
                       "properties": {
                         "checkout": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "allow_promotion_codes": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "allowed_shipping_countries": {
+                              "default": [],
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "automatic_tax": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "collect_billing_address": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "collect_shipping_address": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "create_customer": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "maximum_total_minor": {
+                              "default": null,
+                              "description": "Maximum evaluated item total before provider discounts, tax, or shipping.",
+                              "format": "int64",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "minimum_total_minor": {
+                              "default": null,
+                              "description": "Minimum evaluated item total before provider discounts, tax, or shipping.",
+                              "format": "int64",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "require_terms_consent": {
+                              "default": false,
+                              "type": "boolean"
+                            },
+                            "shipping_options": {
+                              "default": [],
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "amount_minor": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  },
+                                  "delivery_estimate": {
+                                    "additionalProperties": false,
+                                    "default": null,
+                                    "properties": {
+                                      "maximum": {
+                                        "default": null,
+                                        "format": "uint32",
+                                        "minimum": 0,
+                                        "type": [
+                                          "integer",
+                                          "null"
+                                        ]
+                                      },
+                                      "minimum": {
+                                        "default": null,
+                                        "format": "uint32",
+                                        "minimum": 0,
+                                        "type": [
+                                          "integer",
+                                          "null"
+                                        ]
+                                      },
+                                      "unit": {
+                                        "enum": [
+                                          "hour",
+                                          "day",
+                                          "business_day",
+                                          "week",
+                                          "month"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "unit"
+                                    ],
+                                    "type": [
+                                      "object",
+                                      "null"
+                                    ]
+                                  },
+                                  "display_name": {
+                                    "type": "string"
+                                  },
+                                  "stripe_shipping_rate_id": {
+                                    "default": "",
+                                    "type": "string"
+                                  },
+                                  "tax_behavior": {
+                                    "default": "unspecified",
+                                    "enum": [
+                                      "unspecified",
+                                      "inclusive",
+                                      "exclusive"
+                                    ],
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "display_name",
+                                  "amount_minor"
+                                ],
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "trial_days": {
+                              "default": 0,
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
                           "type": "object"
                         },
                         "currency": {
@@ -13198,30 +13352,295 @@
                           "type": "string"
                         },
                         "interval_count": {
+                          "format": "uint32",
+                          "minimum": 0,
                           "type": "integer"
                         },
                         "mode": {
+                          "enum": [
+                            "payment",
+                            "subscription"
+                          ],
                           "type": "string"
                         },
                         "name": {
                           "type": "string"
                         },
                         "payment_links": {
+                          "default": [],
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "preset_id": {
+                                "default": "",
+                                "type": "string"
+                              },
+                              "pricing": {
+                                "additionalProperties": false,
+                                "description": "Immutable server-resolved pricing captured when the reusable link was\nsynchronized. This lets static pages display the link's actual price\nwithout issuing a runtime checkout or evaluating unrelated inputs.",
+                                "properties": {
+                                  "amounts": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "currency": {
+                                        "type": "string"
+                                      },
+                                      "discount_minor": {
+                                        "format": "int64",
+                                        "type": "integer"
+                                      },
+                                      "platform_fee_minor": {
+                                        "format": "int64",
+                                        "type": "integer"
+                                      },
+                                      "shipping_minor": {
+                                        "default": 0,
+                                        "format": "int64",
+                                        "type": "integer"
+                                      },
+                                      "subtotal_minor": {
+                                        "format": "int64",
+                                        "type": "integer"
+                                      },
+                                      "tax_minor": {
+                                        "format": "int64",
+                                        "type": "integer"
+                                      },
+                                      "total_minor": {
+                                        "format": "int64",
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "currency",
+                                      "subtotal_minor",
+                                      "discount_minor",
+                                      "tax_minor",
+                                      "platform_fee_minor",
+                                      "total_minor"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "components": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "component_id": {
+                                          "type": "string"
+                                        },
+                                        "included": {
+                                          "type": "boolean"
+                                        },
+                                        "key": {
+                                          "type": "string"
+                                        },
+                                        "label": {
+                                          "type": "string"
+                                        },
+                                        "quantity": {
+                                          "format": "uint64",
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "required": {
+                                          "type": "boolean"
+                                        },
+                                        "total_amount_minor": {
+                                          "format": "int64",
+                                          "type": "integer"
+                                        },
+                                        "unit_amount_minor": {
+                                          "format": "int64",
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "component_id",
+                                        "key",
+                                        "label",
+                                        "included",
+                                        "required",
+                                        "unit_amount_minor",
+                                        "quantity",
+                                        "total_amount_minor",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "inputs": {
+                                    "additionalProperties": true,
+                                    "type": "object"
+                                  },
+                                  "offer_id": {
+                                    "type": "string"
+                                  },
+                                  "offer_version": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "quantity": {
+                                    "format": "uint64",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "schema_version": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "schema_version",
+                                  "offer_id",
+                                  "offer_version",
+                                  "quantity",
+                                  "inputs",
+                                  "components",
+                                  "amounts"
+                                ],
+                                "type": "object"
+                              },
+                              "url": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "id",
+                              "url",
+                              "pricing"
+                            ],
+                            "type": "object"
+                          },
                           "type": "array"
                         },
                         "pricing_model": {
+                          "enum": [
+                            "fixed",
+                            "components"
+                          ],
                           "type": "string"
                         },
                         "recurring_interval": {
+                          "default": null,
+                          "enum": [
+                            "day",
+                            "week",
+                            "month",
+                            "year",
+                            null
+                          ],
                           "type": [
                             "string",
                             "null"
                           ]
                         },
                         "variables": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "allowed_values": {
+                                "default": [],
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "default_value": {
+                                "default": null
+                              },
+                              "help_text": {
+                                "default": "",
+                                "type": "string"
+                              },
+                              "key": {
+                                "type": "string"
+                              },
+                              "kind": {
+                                "enum": [
+                                  "number",
+                                  "integer",
+                                  "boolean",
+                                  "date",
+                                  "date_time",
+                                  "select",
+                                  "multi_select",
+                                  "text"
+                                ],
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "maximum": {
+                                "default": null,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "maximum_length": {
+                                "default": null,
+                                "format": "uint",
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "minimum": {
+                                "default": null,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "required": {
+                                "default": false,
+                                "type": "boolean"
+                              },
+                              "sort_order": {
+                                "default": 0,
+                                "format": "int32",
+                                "type": "integer"
+                              },
+                              "step": {
+                                "default": null,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "visibility": {
+                                "default": "public",
+                                "enum": [
+                                  "public",
+                                  "hidden",
+                                  "admin_only"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "kind",
+                              "label"
+                            ],
+                            "type": "object"
+                          },
                           "type": "array"
                         },
                         "version": {
+                          "format": "uint32",
+                          "minimum": 0,
                           "type": "integer"
                         }
                       },
@@ -13231,19 +13650,25 @@
                         "name",
                         "mode",
                         "currency",
-                        "variables"
+                        "pricing_model",
+                        "interval_count",
+                        "variables",
+                        "checkout"
                       ],
                       "type": "object"
                     },
                     "type": "array"
                   },
                   "schema_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "slug": {
                     "type": "string"
                   },
                   "tags": {
+                    "default": [],
                     "items": {
                       "type": "string"
                     },
@@ -13254,8 +13679,11 @@
                   "schema_version",
                   "id",
                   "name",
+                  "slug",
+                  "fulfillment_kind",
                   "offers"
                 ],
+                "title": "StorefrontProduct",
                 "type": "object"
               }
             }
