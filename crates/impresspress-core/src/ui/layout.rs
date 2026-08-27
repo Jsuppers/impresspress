@@ -44,10 +44,33 @@ pub fn page(title: &str, config: &SiteConfig, body: Markup) -> Markup {
                 div #toast-container .toast-container {}
                 script { (PreEscaped(assets::toast_js())) }
                 script { (PreEscaped(assets::modal_js())) }
+                script src=(assets::webmcp_js_url()) defer {}
                 @for src in &config.embedded_scripts {
                     script type="module" src=(src) {}
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_page_includes_the_webmcp_registration_script() {
+        let config = SiteConfig {
+            app_name: "Test".into(),
+            logo_url: String::new(),
+            logo_icon_url: String::new(),
+            favicon_url: String::new(),
+            primary_color: String::new(),
+            embedded_scripts: Vec::new(),
+        };
+        let rendered = page("Title", &config, maud::html! { p { "body" } }).into_string();
+        assert!(
+            rendered.contains(assets::webmcp_js_url()),
+            "the WebMCP script must be on every page: {rendered}"
+        );
     }
 }
