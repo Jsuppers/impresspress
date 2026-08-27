@@ -1,1 +1,457 @@
-{}
+{
+  "/b/admin/api/iam/roles": {
+    "get": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Response body of `GET /b/admin/api/iam/roles`.\n\nThe endpoint takes no query parameters: it returns every role, sorted by\nname, up to the handler's fixed 1000-row ceiling.",
+                "properties": {
+                  "page": {
+                    "description": "1-based index of this page. Always 1 — the handler does not paginate.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "page_size": {
+                    "description": "Rows per page. Always the handler's fixed 1000-row ceiling.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "records": {
+                    "description": "Roles, sorted by name ascending.",
+                    "items": {
+                      "description": "A role definition as published by the admin API.",
+                      "properties": {
+                        "created_at": {
+                          "description": "RFC 3339 creation timestamp.",
+                          "type": "string"
+                        },
+                        "description": {
+                          "description": "Human-readable description shown in the IAM UI.",
+                          "type": "string"
+                        },
+                        "id": {
+                          "description": "Stable role identifier.",
+                          "type": "string"
+                        },
+                        "is_system": {
+                          "description": "Whether this is a built-in role. System roles cannot be renamed or\ndeleted.",
+                          "type": "boolean"
+                        },
+                        "name": {
+                          "description": "Unique role name (`\"admin\"`, `\"user\"`, …). This is the value stored in\n`user_roles.role` and checked by the auth layer.",
+                          "type": "string"
+                        },
+                        "permissions": {
+                          "description": "Permission names attached to the role. Advisory metadata for the IAM\nUI — WRAP grants, not this list, are what the runtime enforces.",
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "updated_at": {
+                          "description": "RFC 3339 timestamp of the last modification.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "description",
+                        "permissions",
+                        "is_system",
+                        "created_at",
+                        "updated_at"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "total_count": {
+                    "description": "Total roles defined.",
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "records",
+                  "total_count",
+                  "page",
+                  "page_size"
+                ],
+                "title": "AdminRoleListResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List roles API"
+    }
+  },
+  "/b/admin/api/logs": {
+    "get": {
+      "parameters": [
+        {
+          "in": "query",
+          "name": "action",
+          "required": false,
+          "schema": {
+            "description": "Exact-match filter on the action name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "in": "query",
+          "name": "page",
+          "required": false,
+          "schema": {
+            "default": 1,
+            "description": "1-based page number. Values below 1 clamp to 1.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page_size",
+          "required": false,
+          "schema": {
+            "default": 50,
+            "description": "Rows per page, capped at 100.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "resource",
+          "required": false,
+          "schema": {
+            "description": "`LIKE '%…%'` filter on the affected resource.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "in": "query",
+          "name": "user_id",
+          "required": false,
+          "schema": {
+            "description": "Exact-match filter on the acting admin's user id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Response body of `GET /b/admin/api/logs`.",
+                "properties": {
+                  "page": {
+                    "description": "1-based index of this page.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "page_size": {
+                    "description": "Rows per page used to compute `page`.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "records": {
+                    "description": "Audit entries on this page, newest first.",
+                    "items": {
+                      "description": "One audit-log entry: an admin-initiated mutation, recorded whenever an\nadmin changes a user, a role, or a configuration variable.",
+                      "properties": {
+                        "action": {
+                          "description": "Action name (`\"user.delete\"`, `\"role.create\"`, …).",
+                          "type": "string"
+                        },
+                        "created_at": {
+                          "description": "RFC 3339 timestamp the action was recorded at.",
+                          "type": "string"
+                        },
+                        "id": {
+                          "description": "Stable entry identifier.",
+                          "type": "string"
+                        },
+                        "ip_address": {
+                          "description": "Client IP the action came from, as seen by the request pipeline. Empty\nwhen the pipeline could not determine one.",
+                          "type": "string"
+                        },
+                        "resource": {
+                          "description": "Target the action was applied to.",
+                          "type": "string"
+                        },
+                        "updated_at": {
+                          "description": "RFC 3339 write timestamp. Audit rows are never updated, so this always\nequals `created_at`.",
+                          "type": "string"
+                        },
+                        "user_id": {
+                          "description": "Id of the admin who performed the action. Empty when the action had no\nauthenticated actor.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "user_id",
+                        "action",
+                        "resource",
+                        "ip_address",
+                        "created_at",
+                        "updated_at"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "total_count": {
+                    "description": "Total entries matching the filters, across all pages.",
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "records",
+                  "total_count",
+                  "page",
+                  "page_size"
+                ],
+                "title": "AdminAuditLogListResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Audit logs API"
+    }
+  },
+  "/b/admin/api/settings": {
+    "get": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "description": "Response body of `GET /b/admin/api/settings`: every configuration variable\nas a flat `key → value` map.\n\n**Sensitive values are never present.** A variable is treated as sensitive\nwhen it is flagged sensitive in the database or its key ends in `_SECRET` or\n`_KEY`, and its value is replaced with `\"********\"` before the response is\nbuilt. Reading this endpoint cannot recover a secret, nor its length.\n\nValues are typed as `any` rather than `string` because the stored column is\ntext that the SQLite and D1 backends decode back into JSON when it looks\nlike an object or an array: a variable holding `[\"a\",\"b\"]` reads back as an\narray, one holding `on` reads back as a string.",
+                "title": "AdminSettingsResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List variables API"
+    }
+  },
+  "/b/admin/api/users": {
+    "get": {
+      "parameters": [
+        {
+          "in": "query",
+          "name": "page",
+          "required": false,
+          "schema": {
+            "default": 1,
+            "description": "1-based page number. Values below 1 clamp to 1.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page_size",
+          "required": false,
+          "schema": {
+            "default": 20,
+            "description": "Rows per page, capped at 100.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "search",
+          "required": false,
+          "schema": {
+            "description": "Case-insensitive `LIKE '%…%'` filter on the email address.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Response body of `GET /b/admin/api/users`.",
+                "properties": {
+                  "page": {
+                    "description": "1-based index of this page.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "page_size": {
+                    "description": "Rows per page used to compute `page`.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "records": {
+                    "description": "Users on this page, newest first.",
+                    "items": {
+                      "description": "A user account as published by the admin API.",
+                      "properties": {
+                        "avatar_url": {
+                          "description": "Avatar image URL, when set.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "created_at": {
+                          "description": "RFC 3339 creation timestamp.",
+                          "type": "string"
+                        },
+                        "deleted_at": {
+                          "description": "RFC 3339 soft-delete timestamp. Always `null` in the list response,\nwhich filters on `deleted_at IS NULL`.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "disabled": {
+                          "description": "Whether the account is disabled (blocked from signing in).",
+                          "type": "boolean"
+                        },
+                        "display_name": {
+                          "description": "Display name shown in the UI.",
+                          "type": "string"
+                        },
+                        "email": {
+                          "description": "Login email address.",
+                          "type": "string"
+                        },
+                        "email_verified": {
+                          "description": "Whether the email address has been verified.",
+                          "type": "boolean"
+                        },
+                        "id": {
+                          "description": "Stable user identifier.",
+                          "type": "string"
+                        },
+                        "last_login_at": {
+                          "description": "RFC 3339 timestamp of the last successful sign-in, if any.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "name": {
+                          "description": "Full name, when the user supplied one.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "role": {
+                          "description": "Legacy single-role column on the user row (`\"user\"` by default).\nAuthorization uses `roles`; this field is retained because the column is\nstill written by the signup path.",
+                          "type": "string"
+                        },
+                        "roles": {
+                          "description": "Role names assigned to this user in `impresspress__admin__user_roles`.",
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "updated_at": {
+                          "description": "RFC 3339 timestamp of the last modification.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "email",
+                        "display_name",
+                        "name",
+                        "avatar_url",
+                        "role",
+                        "roles",
+                        "email_verified",
+                        "disabled",
+                        "last_login_at",
+                        "created_at",
+                        "updated_at",
+                        "deleted_at"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "total_count": {
+                    "description": "Total users matching the filter, across all pages.",
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "records",
+                  "total_count",
+                  "page",
+                  "page_size"
+                ],
+                "title": "AdminUserListResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List users API"
+    }
+  }
+}

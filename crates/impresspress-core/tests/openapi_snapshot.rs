@@ -38,16 +38,19 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// * `admin` gets its schemas in Task 5.
-/// * `tickets` is a block that arrived recently and has no schemas yet
-///   either — its endpoints exist (see `SNAPSHOTTED_BLOCKS`) but none of
-///   them call `.input_schema(...)` / `.output_schema(...)` today.
+/// * `tickets` is a block that arrived recently and has no schemas yet —
+///   its endpoints exist (see `SNAPSHOTTED_BLOCKS`) but none of them call
+///   `.input_schema(...)` / `.output_schema(...)` today.
 ///
-/// Every other block in `SNAPSHOTTED_BLOCKS` already has hand-written
-/// schemas, so an empty snapshot for any of *them* means the gate is
-/// vacuous — wrong prefix, or the block missing from the document's block
-/// list — and must fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &["admin", "tickets"];
+/// `admin` left this list when its four JSON API reads were typed: its
+/// handlers now build `blocks::admin::contracts` types, so the block has a
+/// non-empty snapshot to guard.
+///
+/// Every other block in `SNAPSHOTTED_BLOCKS` already has schemas, so an
+/// empty snapshot for any of *them* means the gate is vacuous — wrong
+/// prefix, or the block missing from the document's block list — and must
+/// fail loudly.
+const LEGITIMATELY_EMPTY: &[&str] = &["tickets"];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
@@ -114,4 +117,114 @@ async fn openapi_matches_committed_snapshots() {
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `admin` shipped 17 endpoints and zero schemas: its handlers returned the
+/// database layer's untyped `RecordList` / `HashMap<String, Value>` directly,
+/// so `has_schema()` filtered every one of them out and the whole JSON API was
+/// absent from `/openapi.json`. These four reads are the ones that carry a
+/// contract; the other thirteen serve HTML and must stay absent.
+#[tokio::test]
+async fn admin_json_api_appears_in_openapi() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    for path in [
+        "/b/admin/api/users",
+        "/b/admin/api/iam/roles",
+        "/b/admin/api/settings",
+        "/b/admin/api/logs",
+    ] {
+        assert!(
+            !doc["paths"][path]["get"].is_null(),
+            "{path} must carry a schema and appear in /openapi.json - admin's \
+             JSON API was previously invisible because its handlers were untyped"
+        );
+        assert_eq!(
+            doc["paths"][path]["get"]["security"],
+            serde_json::json!([{ "bearerAuth": [] }]),
+            "{path} is AuthLevel::Admin and must carry a security requirement"
+        );
+    }
+}
+
+/// Every field name `block` publishes: the keys of every `properties` object
+/// anywhere in its schemas, plus the `name` of every declared parameter.
+///
+/// Names, not prose. A description that explains which column is deliberately
+/// withheld is documentation; a `properties` key with the same text is a
+/// published field. Only the second is a leak, so only the second is checked.
+fn published_field_names(doc: &serde_json::Value, prefixes: &[&str]) -> Vec<String> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                    out.extend(props.keys().cloned());
+                }
+                if let Some(serde_json::Value::Array(params)) = map.get("parameters") {
+                    out.extend(
+                        params
+                            .iter()
+                            .filter_map(|p| p.get("name")?.as_str().map(str::to_string)),
+                    );
+                }
+                for value in map.values() {
+                    walk(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let paths = doc["paths"].as_object().expect("openapi paths object");
+    let mut out = Vec::new();
+    for (path, node) in paths {
+        if prefixes.iter().any(|p| path.starts_with(p)) {
+            walk(node, &mut out);
+        }
+    }
+    out
+}
+
+/// The admin block is the most sensitive surface in the document, and this is
+/// the first release in which any of it is publicly described. Its handlers
+/// read `wafer_run__auth__users` and `impresspress__admin__variables`, tables
+/// that hold credential material, so every published field must be an explicit
+/// projection rather than an echoed row.
+#[tokio::test]
+async fn admin_openapi_publishes_no_credential_field() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let fields = published_field_names(&doc, &["/b/admin"]);
+
+    assert!(
+        !fields.is_empty(),
+        "no admin fields found - the walk is looking in the wrong place and this \
+         test would pass forever"
+    );
+
+    for field in &fields {
+        let lower = field.to_lowercase();
+        for forbidden in [
+            "password",
+            "verification_token",
+            "token_hash",
+            "access_token",
+            "refresh_token",
+            "session_token",
+            "secret",
+            "hash",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "admin publishes a field named `{field}`, which matches the \
+                 credential pattern `{forbidden}`"
+            );
+        }
+    }
 }

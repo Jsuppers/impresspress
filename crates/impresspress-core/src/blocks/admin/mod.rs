@@ -1,3 +1,4 @@
+mod contracts;
 mod database;
 mod iam;
 mod logs;
@@ -121,10 +122,27 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/admin/grants").summary("WRAP grants management").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/admin/database").summary("Database admin page").auth(AuthLevel::Admin),
                 BlockEndpoint::post("/b/admin/database/query").summary("Run read-only SQL (SSR)").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/users").summary("List users API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/iam/roles").summary("List roles API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/settings").summary("List variables API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/logs").summary("Audit logs API").auth(AuthLevel::Admin),
+                // The four JSON API reads. Every other endpoint above and below
+                // returns an SSR HTML page, so it carries no schema and never
+                // becomes a tool.
+                BlockEndpoint::get("/b/admin/api/users")
+                    .summary("List users API")
+                    .auth(AuthLevel::Admin)
+                    .query_params::<contracts::AdminUserListQuery>()
+                    .output::<contracts::AdminUserListResponse>(),
+                BlockEndpoint::get("/b/admin/api/iam/roles")
+                    .summary("List roles API")
+                    .auth(AuthLevel::Admin)
+                    .output::<contracts::AdminRoleListResponse>(),
+                BlockEndpoint::get("/b/admin/api/settings")
+                    .summary("List variables API")
+                    .auth(AuthLevel::Admin)
+                    .output::<contracts::AdminSettingsResponse>(),
+                BlockEndpoint::get("/b/admin/api/logs")
+                    .summary("Audit logs API")
+                    .auth(AuthLevel::Admin)
+                    .query_params::<contracts::AdminAuditLogListQuery>()
+                    .output::<contracts::AdminAuditLogListResponse>(),
             ])
     },
     handle: |_this, ctx, msg, input| {

@@ -4,7 +4,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::logs::audit_log;
+use super::{contracts::AdminRoleListResponse, logs::audit_log};
 use crate::{
     blocks::auth::bump_auth_version,
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
@@ -66,7 +66,12 @@ async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
         ..Default::default()
     };
     match db::list(ctx, ROLES_TABLE, &opts).await {
-        Ok(result) => ok_json(&result),
+        // Project onto the closed `AdminRoleView` field list. Besides pinning
+        // the published field set, this normalizes `permissions`: the column is
+        // JSON-encoded TEXT that the SQLite backend sniffs back into an array
+        // while Postgres/D1 return the raw string, so the untyped response had
+        // no single shape a schema could describe.
+        Ok(result) => ok_json(&AdminRoleListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -453,6 +458,65 @@ mod tests {
         fn clone_arc(&self) -> Arc<dyn Context> {
             Arc::new(self.clone())
         }
+    }
+
+    /// The roles list publishes exactly `AdminRoleView`'s fields, and
+    /// `permissions` arrives as an array of strings.
+    ///
+    /// The array is the part worth pinning: the column is JSON-encoded TEXT,
+    /// and only the SQLite backend decodes it on read. Echoing the row would
+    /// make the published `array of string` schema false on Postgres and D1,
+    /// where the same column comes back as a string.
+    #[tokio::test]
+    async fn list_roles_publishes_exactly_the_contract_fields() {
+        let ctx = TestContext::with_admin().await;
+        let msg = crate::test_support::admin_msg("create", "/admin/iam/roles");
+        let created = super::super::ops::create_role(
+            &ctx,
+            &msg,
+            "editor",
+            Some("Can edit content"),
+            Some(vec!["posts.write".to_string(), "posts.read".to_string()]),
+        )
+        .await;
+        assert!(created.is_ok(), "create role should succeed");
+
+        let body = crate::test_support::output_json(handle_list_roles(&ctx).await).await;
+
+        let editor = body["records"]
+            .as_array()
+            .expect("records array")
+            .iter()
+            .find(|r| r["name"] == serde_json::json!("editor"))
+            .expect("the created role is listed");
+
+        let mut got: Vec<&str> = editor
+            .as_object()
+            .expect("role object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "created_at",
+                "description",
+                "id",
+                "is_system",
+                "name",
+                "permissions",
+                "updated_at"
+            ],
+            "the wire field set must equal AdminRoleView's"
+        );
+
+        assert_eq!(
+            editor["permissions"],
+            serde_json::json!(["posts.write", "posts.read"]),
+            "permissions must be an array of strings on every backend"
+        );
+        assert_eq!(editor["is_system"], serde_json::json!(false));
     }
 
     /// Seed a real system role (`is_system: true`) via the shared
