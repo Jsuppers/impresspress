@@ -141,21 +141,25 @@ SQLite decodes. The admin response shape depended on the backend.
 Done through the migration PR (#74). What is left is review and merge of
 that PR; nothing else is sequenced behind it.
 
-### Decisions needed (deliberately not made)
-- **Honeypot is now self-defeating.** `deny_unknown_fields` forces the public
-  ticket input schema to name the honeypot field `website`, described "Must be
-  left empty." A honeypot works because bots fill it. Drop
-  `deny_unknown_fields` for that input, rotate the name, or accept it.
-- **`/openapi.json` is unauthenticated** (`pipeline.rs:121`), so the admin
-  schemas this migration created are anonymously readable. Recorded as an
-  accepted trade in the spec while it was theoretical; admin now has schemas.
-- **`CheckoutResponse.receipt_token` / `client_secret`** are both
-  `writeOnly: true` and in `required` of a response schema — contradictory under
-  OpenAPI 3.1. `pipeline.rs:635` asserts the flag, so it is load-bearing.
-- **Ad hoc config variables** created with the `sensitive` box clear and no
-  `_SECRET`/`_KEY` suffix are published in plain text. Masking works as
-  designed; the design leans on the operator. Recommended fix in
-  `admin-leak-fix-report.md`: default `sensitive: true` on create.
+### Decisions — made, implemented in #75
+All four were taken as recommended, each test-first, one commit apiece,
+stacked on #74:
+
+- **Honeypot** — out of the schema. `deny_unknown_fields` dropped on the
+  public submission request; `website` is read from the raw JSON body and
+  never declared. A gate test pins that the schema names no `website` and
+  carries no `additionalProperties: false`.
+- **`/openapi.json` and the agent card** — filtered by the caller's tier with
+  the same `routing::effective_access` the router and the manifest use;
+  rendered after step 2; `Cache-Control: no-store`. Placement pinned by a
+  test that sends a real bearer through step 2. Consumers generating clients
+  for Authenticated/Admin endpoints must now fetch with a bearer.
+- **`writeOnly` on `CheckoutResponse`** — removed (both fields are only
+  ever present in a response); sensitivity stated in the description; the
+  `pipeline.rs` assertion inverted.
+- **Ad hoc config variables** — absent `sensitive` means sensitive on the
+  JSON and form paths; the modal is checked by default and always posts an
+  explicit value.
 
 ### Work remaining
 - **products' 69 unmigrated sites.** 22 need the `components/schemas` hoist; 47
