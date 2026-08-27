@@ -12,8 +12,8 @@ use crate::{
     blocks::products::{
         contracts::{
             FulfillmentKind, GuestOrderStatus, MoneyBreakdown, PricingPreviewRequest,
-            StorefrontConfig, StorefrontOffer, StorefrontProduct, StripeMode,
-            VariableVisibility, COMMERCE_SCHEMA_VERSION,
+            StorefrontConfig, StorefrontOffer, StorefrontProduct, StripeMode, VariableVisibility,
+            COMMERCE_SCHEMA_VERSION,
         },
         offer_pricing,
         repo::{offers, payment_links, purchases},

@@ -118,7 +118,9 @@ pub enum BillingScheme {
     Tiered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TaxBehavior {
     #[default]
@@ -137,7 +139,9 @@ pub enum ShippingEstimateUnit {
     Month,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutPresentation {
     #[default]
@@ -159,7 +163,9 @@ pub enum VariableKind {
     Text,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum VariableVisibility {
     #[default]
@@ -258,7 +264,9 @@ pub struct PricingTier {
     pub flat_amount_minor: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageRounding {
     /// Charge one package for any partially used package.
