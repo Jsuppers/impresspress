@@ -401,50 +401,6 @@ crate::impresspress_feature_block! {
             "required": ["id"],
             "properties": {"id": {"type": "string"}}
         });
-        let money_breakdown_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["currency", "subtotal_minor", "discount_minor", "tax_minor", "shipping_minor", "platform_fee_minor", "total_minor"],
-            "properties": {
-                "currency": {"type": "string"},
-                "subtotal_minor": {"type": "integer"},
-                "discount_minor": {"type": "integer"},
-                "tax_minor": {"type": "integer"},
-                "shipping_minor": {"type": "integer"},
-                "platform_fee_minor": {"type": "integer"},
-                "total_minor": {"type": "integer"}
-            }
-        });
-        let checkout_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["offer_id"],
-            "properties": {
-                "offer_id": {"type": "string"},
-                "preset_id": {"type": ["string", "null"]},
-                "quantity": {"type": "integer", "minimum": 1, "default": 1},
-                "inputs": {"type": "object"},
-                "presentation": {"type": "string", "enum": ["hosted", "embedded", "payment_link"], "default": "hosted"},
-                "success_url": {"type": ["string", "null"], "format": "uri"},
-                "cancel_url": {"type": ["string", "null"], "format": "uri"},
-                "buyer_email": {"type": ["string", "null"], "format": "email"}
-            }
-        });
-        let checkout_output_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["order_id", "receipt_token", "receipt_token_expires_at", "presentation", "amounts"],
-            "properties": {
-                "order_id": {"type": "string"},
-                "receipt_token": {"type": "string", "writeOnly": true},
-                "receipt_token_expires_at": {"type": "string", "format": "date-time"},
-                "presentation": {"type": "string", "enum": ["hosted", "embedded", "payment_link"]},
-                "checkout_url": {"type": ["string", "null"], "format": "uri"},
-                "client_secret": {"type": ["string", "null"], "writeOnly": true},
-                "payment_link_url": {"type": ["string", "null"], "format": "uri"},
-                "amounts": money_breakdown_schema
-            }
-        });
         let purchase_list_schema = record_list_schema(serde_json::json!({"type": "object"}));
         let purchase_data_schema = serde_json::json!({
             "type": "object",
@@ -1600,8 +1556,8 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::post("/b/products/checkout")
                     .summary("Stripe checkout")
                     .description("Create a hosted or embedded Stripe Checkout Session from a public active offer. Guest checkout is supported and every amount is resolved from the immutable offer.")
-                    .input_schema(checkout_input_schema)
-                    .output_schema(checkout_output_schema)
+                    .input::<contracts::CheckoutRequest>()
+                    .output::<contracts::CheckoutResponse>()
                     .auth(AuthLevel::Public)
                     .tags(&["products", "checkout"]),
                 BlockEndpoint::get("/b/products/orders/{id}/status")
@@ -1619,23 +1575,7 @@ crate::impresspress_feature_block! {
                         "required": ["receipt_token"],
                         "properties": {"receipt_token": {"type": "string"}}
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["schema_version", "order_id", "status", "reconciliation_status", "amounts", "subscription_cancel_at_period_end"],
-                        "properties": {
-                            "schema_version": {"type": "integer"},
-                            "order_id": {"type": "string"},
-                            "status": {"type": "string"},
-                            "reconciliation_status": {"type": "string"},
-                            "amounts": money_breakdown_schema,
-                            "subscription_status": {"type": "string"},
-                            "subscription_current_period_end": {"type": "string", "format": "date-time"},
-                            "subscription_cancel_at_period_end": {"type": "boolean"},
-                            "paid_at": {"type": "string", "format": "date-time"},
-                            "refunded_at": {"type": "string", "format": "date-time"}
-                        }
-                    }))
+                    .output::<contracts::GuestOrderStatus>()
                     .tags(&["products", "storefront"]),
                 BlockEndpoint::get("/b/products/purchases")
                     .summary("List own purchases")

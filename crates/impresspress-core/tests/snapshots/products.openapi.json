@@ -11642,6 +11642,7 @@
               "additionalProperties": false,
               "properties": {
                 "buyer_email": {
+                  "default": null,
                   "format": "email",
                   "type": [
                     "string",
@@ -11649,6 +11650,7 @@
                   ]
                 },
                 "cancel_url": {
+                  "default": null,
                   "format": "uri",
                   "type": [
                     "string",
@@ -11656,6 +11658,8 @@
                   ]
                 },
                 "inputs": {
+                  "additionalProperties": true,
+                  "default": {},
                   "type": "object"
                 },
                 "offer_id": {
@@ -11671,6 +11675,7 @@
                   "type": "string"
                 },
                 "preset_id": {
+                  "default": null,
                   "type": [
                     "string",
                     "null"
@@ -11678,10 +11683,12 @@
                 },
                 "quantity": {
                   "default": 1,
+                  "format": "uint64",
                   "minimum": 1,
                   "type": "integer"
                 },
                 "success_url": {
+                  "default": null,
                   "format": "uri",
                   "type": [
                     "string",
@@ -11692,6 +11699,7 @@
               "required": [
                 "offer_id"
               ],
+              "title": "CheckoutRequest",
               "type": "object"
             }
           }
@@ -11712,21 +11720,28 @@
                         "type": "string"
                       },
                       "discount_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "platform_fee_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "shipping_minor": {
+                        "default": 0,
+                        "format": "int64",
                         "type": "integer"
                       },
                       "subtotal_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "tax_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "total_minor": {
+                        "format": "int64",
                         "type": "integer"
                       }
                     },
@@ -11735,13 +11750,13 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
-                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
                     "type": "object"
                   },
                   "checkout_url": {
+                    "default": null,
                     "format": "uri",
                     "type": [
                       "string",
@@ -11749,6 +11764,8 @@
                     ]
                   },
                   "client_secret": {
+                    "default": null,
+                    "description": "Stripe Embedded Checkout client secret. Present only for the embedded\npresentation, and `writeOnly` for the same reason as `receipt_token`.",
                     "type": [
                       "string",
                       "null"
@@ -11759,6 +11776,7 @@
                     "type": "string"
                   },
                   "payment_link_url": {
+                    "default": null,
                     "format": "uri",
                     "type": [
                       "string",
@@ -11774,6 +11792,7 @@
                     "type": "string"
                   },
                   "receipt_token": {
+                    "description": "Returned once and never persisted in plaintext. Static storefronts use\nit to poll the minimal guest order-status endpoint after Stripe returns.\n\n`writeOnly` marks it as a secret capability that must not be logged or\nechoed. `pipeline.rs` asserts the flag, so it is carried on the\ncontract rather than left behind with the hand-written schema.",
                     "type": "string",
                     "writeOnly": true
                   },
@@ -11789,6 +11808,7 @@
                   "presentation",
                   "amounts"
                 ],
+                "title": "CheckoutResponse",
                 "type": "object"
               }
             }
@@ -12526,6 +12546,7 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
+                "description": "Minimal order state exposed to a guest who presents the checkout receipt\ncapability. Buyer details and all Stripe resource ids remain private.",
                 "properties": {
                   "amounts": {
                     "additionalProperties": false,
@@ -12534,21 +12555,28 @@
                         "type": "string"
                       },
                       "discount_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "platform_fee_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "shipping_minor": {
+                        "default": 0,
+                        "format": "int64",
                         "type": "integer"
                       },
                       "subtotal_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "tax_minor": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "total_minor": {
+                        "format": "int64",
                         "type": "integer"
                       }
                     },
@@ -12557,7 +12585,6 @@
                       "subtotal_minor",
                       "discount_minor",
                       "tax_minor",
-                      "shipping_minor",
                       "platform_fee_minor",
                       "total_minor"
                     ],
@@ -12568,16 +12595,24 @@
                   },
                   "paid_at": {
                     "format": "date-time",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "reconciliation_status": {
                     "type": "string"
                   },
                   "refunded_at": {
                     "format": "date-time",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "schema_version": {
+                    "format": "uint32",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "status": {
@@ -12588,10 +12623,16 @@
                   },
                   "subscription_current_period_end": {
                     "format": "date-time",
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "subscription_status": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
                 "required": [
@@ -12602,6 +12643,7 @@
                   "amounts",
                   "subscription_cancel_at_period_end"
                 ],
+                "title": "GuestOrderStatus",
                 "type": "object"
               }
             }

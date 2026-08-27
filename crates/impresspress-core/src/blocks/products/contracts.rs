@@ -633,16 +633,20 @@ pub struct CheckoutRequest {
     #[serde(default)]
     pub preset_id: Option<String>,
     #[serde(default = "one_u64")]
+    #[schemars(range(min = 1))]
     pub quantity: u64,
     #[serde(default)]
     pub inputs: BTreeMap<String, Value>,
     #[serde(default)]
     pub presentation: CheckoutPresentation,
     #[serde(default)]
+    #[schemars(url)]
     pub success_url: Option<String>,
     #[serde(default)]
+    #[schemars(url)]
     pub cancel_url: Option<String>,
     #[serde(default)]
+    #[schemars(email)]
     pub buyer_email: Option<String>,
 }
 
@@ -652,14 +656,25 @@ pub struct CheckoutResponse {
     pub order_id: String,
     /// Returned once and never persisted in plaintext. Static storefronts use
     /// it to poll the minimal guest order-status endpoint after Stripe returns.
+    ///
+    /// `writeOnly` marks it as a secret capability that must not be logged or
+    /// echoed. `pipeline.rs` asserts the flag, so it is carried on the
+    /// contract rather than left behind with the hand-written schema.
+    #[schemars(extend("writeOnly" = true))]
     pub receipt_token: String,
+    #[schemars(extend("format" = "date-time"))]
     pub receipt_token_expires_at: String,
     pub presentation: CheckoutPresentation,
     #[serde(default)]
+    #[schemars(url)]
     pub checkout_url: Option<String>,
+    /// Stripe Embedded Checkout client secret. Present only for the embedded
+    /// presentation, and `writeOnly` for the same reason as `receipt_token`.
     #[serde(default)]
+    #[schemars(extend("writeOnly" = true))]
     pub client_secret: Option<String>,
     #[serde(default)]
+    #[schemars(url)]
     pub payment_link_url: Option<String>,
     pub amounts: MoneyBreakdown,
 }
@@ -677,11 +692,14 @@ pub struct GuestOrderStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub subscription_current_period_end: Option<String>,
     pub subscription_cancel_at_period_end: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub paid_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub refunded_at: Option<String>,
 }
 
