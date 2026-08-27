@@ -30,31 +30,6 @@ pub const COMMERCE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum TemplateKind {
-    SimpleProduct,
-    SimpleSubscription,
-    ConfigurableProduct,
-    ConfigurableSubscription,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum OwnerKind {
-    Platform,
-    User,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ProductStatus {
-    Draft,
-    PendingReview,
-    Active,
-    Archived,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum ApprovalStatus {
     Draft,
     Pending,
@@ -508,49 +483,6 @@ pub struct ManagedOffer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProductTemplate {
-    pub id: String,
-    pub name: String,
-    pub display_name: String,
-    pub kind: TemplateKind,
-    pub schema_version: u32,
-    #[serde(default)]
-    pub variables: Vec<VariableDefinition>,
-    #[serde(default)]
-    pub offer_defaults: Value,
-    pub is_system: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Product {
-    pub id: String,
-    pub name: String,
-    pub slug: String,
-    #[serde(default)]
-    pub description: String,
-    pub owner_kind: OwnerKind,
-    #[serde(default)]
-    pub owner_id: String,
-    #[serde(default)]
-    pub seller_account_id: String,
-    pub status: ProductStatus,
-    pub approval_status: ApprovalStatus,
-    pub fulfillment_kind: FulfillmentKind,
-    pub template_id: String,
-    pub current_version: u32,
-    #[serde(default)]
-    pub image_url: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub offers: Vec<Offer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct StorefrontOffer {
     pub id: String,
     pub version: u32,
@@ -813,60 +745,6 @@ pub struct StorefrontPaymentLink {
     /// synchronized. This lets static pages display the link's actual price
     /// without issuing a runtime checkout or evaluating unrelated inputs.
     pub pricing: PricingPreview,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct OrderLineItem {
-    pub product_id: String,
-    pub offer_id: String,
-    #[serde(default)]
-    pub component_id: String,
-    pub description: String,
-    pub unit_amount_minor: i64,
-    pub quantity: u64,
-    pub total_amount_minor: i64,
-    #[serde(default)]
-    pub inputs: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Order {
-    pub id: String,
-    pub status: String,
-    pub mode: OfferMode,
-    #[serde(default)]
-    pub buyer_user_id: String,
-    #[serde(default)]
-    pub buyer_email: String,
-    #[serde(default)]
-    pub seller_account_id: String,
-    pub amounts: MoneyBreakdown,
-    pub items: Vec<OrderLineItem>,
-    #[serde(default)]
-    pub stripe_session_id: String,
-    #[serde(default)]
-    pub stripe_payment_intent_id: String,
-    #[serde(default)]
-    pub stripe_subscription_id: String,
-    pub livemode: bool,
-    pub reconciliation_status: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Subscription {
-    pub id: String,
-    pub status: String,
-    pub product_id: String,
-    pub offer_id: String,
-    pub buyer_user_id: String,
-    pub buyer_email: String,
-    pub current_period_end: Option<String>,
-    pub cancel_at_period_end: bool,
-    pub items: Vec<OrderLineItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1280,13 +1158,13 @@ pub struct ProviderReconcileResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{Condition, PricingPreviewRequest, TemplateKind};
+    use super::{Condition, OfferMode, PricingPreviewRequest};
 
     #[test]
     fn enums_use_stable_snake_case_wire_names() {
         assert_eq!(
-            serde_json::to_string(&TemplateKind::ConfigurableSubscription).unwrap(),
-            "\"configurable_subscription\""
+            serde_json::to_string(&OfferMode::Subscription).unwrap(),
+            "\"subscription\""
         );
     }
 
