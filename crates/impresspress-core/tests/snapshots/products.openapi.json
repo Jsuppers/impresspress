@@ -3102,6 +3102,8 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
+                "description": "Every reusable Stripe Payment Link synchronized for one offer.",
                 "properties": {
                   "payment_links": {
                     "items": {
@@ -3120,15 +3122,18 @@
                           "type": "string"
                         },
                         "preset_id": {
+                          "default": "",
                           "type": "string"
                         },
                         "sync_error": {
+                          "default": "",
                           "type": "string"
                         },
                         "sync_status": {
                           "type": "string"
                         },
                         "url": {
+                          "description": "Stripe-hosted Payment Link the buyer opens.",
                           "format": "uri",
                           "type": "string"
                         }
@@ -3136,12 +3141,10 @@
                       "required": [
                         "id",
                         "offer_id",
-                        "preset_id",
                         "url",
                         "active",
                         "configuration_hash",
-                        "sync_status",
-                        "sync_error"
+                        "sync_status"
                       ],
                       "type": "object"
                     },
@@ -3151,6 +3154,7 @@
                 "required": [
                   "payment_links"
                 ],
+                "title": "PaymentLinkList",
                 "type": "object"
               }
             }
@@ -3408,6 +3412,8 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
+                "description": "Every checkout preset defined for one offer.",
                 "properties": {
                   "presets": {
                     "items": {
@@ -3423,6 +3429,7 @@
                           "type": "string"
                         },
                         "inputs": {
+                          "additionalProperties": true,
                           "type": "object"
                         },
                         "name": {
@@ -3452,6 +3459,7 @@
                 "required": [
                   "presets"
                 ],
+                "title": "CheckoutPresetList",
                 "type": "object"
               }
             }
@@ -8891,6 +8899,8 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
+                "description": "Every reusable Stripe Payment Link synchronized for one offer.",
                 "properties": {
                   "payment_links": {
                     "items": {
@@ -8909,15 +8919,18 @@
                           "type": "string"
                         },
                         "preset_id": {
+                          "default": "",
                           "type": "string"
                         },
                         "sync_error": {
+                          "default": "",
                           "type": "string"
                         },
                         "sync_status": {
                           "type": "string"
                         },
                         "url": {
+                          "description": "Stripe-hosted Payment Link the buyer opens.",
                           "format": "uri",
                           "type": "string"
                         }
@@ -8925,12 +8938,10 @@
                       "required": [
                         "id",
                         "offer_id",
-                        "preset_id",
                         "url",
                         "active",
                         "configuration_hash",
-                        "sync_status",
-                        "sync_error"
+                        "sync_status"
                       ],
                       "type": "object"
                     },
@@ -8940,6 +8951,7 @@
                 "required": [
                   "payment_links"
                 ],
+                "title": "PaymentLinkList",
                 "type": "object"
               }
             }
@@ -9197,6 +9209,8 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": false,
+                "description": "Every checkout preset defined for one offer.",
                 "properties": {
                   "presets": {
                     "items": {
@@ -9212,6 +9226,7 @@
                           "type": "string"
                         },
                         "inputs": {
+                          "additionalProperties": true,
                           "type": "object"
                         },
                         "name": {
@@ -9241,6 +9256,7 @@
                 "required": [
                   "presets"
                 ],
+                "title": "CheckoutPresetList",
                 "type": "object"
               }
             }

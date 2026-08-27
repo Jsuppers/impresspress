@@ -800,45 +800,6 @@ crate::impresspress_feature_block! {
                 "offers": {"type": "array", "items": managed_offer_schema}
             }
         });
-        let checkout_preset_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "offer_id", "name", "slug", "inputs", "active", "configuration_hash"],
-            "properties": {
-                "id": {"type": "string"},
-                "offer_id": {"type": "string"},
-                "name": {"type": "string"},
-                "slug": {"type": "string"},
-                "inputs": {"type": "object"},
-                "active": {"type": "boolean"},
-                "configuration_hash": {"type": "string"}
-            }
-        });
-        let checkout_preset_list_schema = serde_json::json!({
-            "type": "object",
-            "required": ["presets"],
-            "properties": {"presets": {"type": "array", "items": checkout_preset_schema}}
-        });
-        let managed_payment_link_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "offer_id", "preset_id", "url", "active", "configuration_hash", "sync_status", "sync_error"],
-            "properties": {
-                "id": {"type": "string"},
-                "offer_id": {"type": "string"},
-                "preset_id": {"type": "string"},
-                "url": {"type": "string", "format": "uri"},
-                "active": {"type": "boolean"},
-                "configuration_hash": {"type": "string"},
-                "sync_status": {"type": "string"},
-                "sync_error": {"type": "string"}
-            }
-        });
-        let payment_link_list_schema = serde_json::json!({
-            "type": "object",
-            "required": ["payment_links"],
-            "properties": {"payment_links": {"type": "array", "items": managed_payment_link_schema}}
-        });
         let group_write_schema = serde_json::json!({
             "type": "object",
             "required": ["name"],
@@ -1086,7 +1047,7 @@ crate::impresspress_feature_block! {
                     .summary("List checkout presets")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(checkout_preset_list_schema.clone())
+                    .output::<contracts::CheckoutPresetList>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::post("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets")
                     .summary("Create checkout preset")
@@ -1118,7 +1079,7 @@ crate::impresspress_feature_block! {
                     .summary("List Payment Links")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(payment_link_list_schema.clone())
+                    .output::<contracts::PaymentLinkList>()
                     .tags(&["products", "admin", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::post("/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("Create or reuse Payment Link")
@@ -1398,7 +1359,7 @@ crate::impresspress_feature_block! {
                     .summary("List own checkout presets")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(checkout_preset_list_schema)
+                    .output::<contracts::CheckoutPresetList>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::post("/b/products/api/products/{product_id}/offers/{offer_id}/presets")
                     .summary("Create own checkout preset")
@@ -1430,7 +1391,7 @@ crate::impresspress_feature_block! {
                     .summary("List own Payment Links")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(payment_link_list_schema)
+                    .output::<contracts::PaymentLinkList>()
                     .tags(&["products", "seller", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::post("/b/products/api/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("Create or reuse own Payment Link")

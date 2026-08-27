@@ -698,6 +698,13 @@ pub struct CheckoutPreset {
     pub configuration_hash: String,
 }
 
+/// Every checkout preset defined for one offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutPresetList {
+    pub presets: Vec<CheckoutPreset>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentLinkCreateRequest {
@@ -724,6 +731,13 @@ pub struct ManagedPaymentLink {
     pub sync_status: String,
     #[serde(default)]
     pub sync_error: String,
+}
+
+/// Every reusable Stripe Payment Link synchronized for one offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentLinkList {
+    pub payment_links: Vec<ManagedPaymentLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -6,7 +6,9 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use super::offers::{self, OfferAccess};
 use crate::{
     blocks::products::{
-        contracts::{CheckoutPresetRequest, PaymentLinkCreateRequest},
+        contracts::{
+            CheckoutPresetList, CheckoutPresetRequest, PaymentLinkCreateRequest, PaymentLinkList,
+        },
         repo::{checkout_presets, offers as offer_repo, payment_links},
         stripe,
     },
@@ -50,7 +52,7 @@ pub(super) async fn list_presets(
         return response;
     }
     match checkout_presets::list_for_offer(ctx, offers::offer_id(msg)).await {
-        Ok(presets) => ok_json(&serde_json::json!({"presets": presets})),
+        Ok(presets) => ok_json(&CheckoutPresetList { presets }),
         Err(error) => offers::domain_error(error),
     }
 }
@@ -139,7 +141,9 @@ pub(super) async fn list_links(
         return response;
     }
     match payment_links::list_for_offer(ctx, offers::offer_id(msg)).await {
-        Ok(links) => ok_json(&serde_json::json!({"payment_links": links})),
+        Ok(links) => ok_json(&PaymentLinkList {
+            payment_links: links,
+        }),
         Err(error) => offers::domain_error(error),
     }
 }
