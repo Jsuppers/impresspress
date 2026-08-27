@@ -232,8 +232,12 @@ thread_local! {
     /// Drained by [`take_pending_version_retry`] — `lib.rs::run()` calls it
     /// after dispatch and retries through `ctx.wait_until`, off the response
     /// path and comfortably past the throttle window.
-    static PENDING_VERSION_RETRY: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+    ///
+    /// `IsolateCell` rather than `RefCell` — a borrow flag stranded by a
+    /// Cloudflare hard-stop would trap every later request in the isolate.
+    /// See `impresspress_core::isolate_cell`.
+    static PENDING_VERSION_RETRY: impresspress_core::IsolateCell<String> =
+        const { impresspress_core::IsolateCell::new() };
 }
 
 /// Minimum spacing between config-version KV PUT *attempts* in one isolate.
@@ -242,25 +246,27 @@ thread_local! {
 const BUMP_COALESCE_WINDOW_MS: u64 = 1_000;
 
 fn note_pending_version_retry(stamp: String) {
-    PENDING_VERSION_RETRY.with(|p| *p.borrow_mut() = Some(stamp));
+    PENDING_VERSION_RETRY.with(|p| p.set(stamp));
 }
 
 /// Take (and clear) any version stamp still needing a delayed retry PUT. See
 /// the `PENDING_VERSION_RETRY` thread_local's doc.
 pub(crate) fn take_pending_version_retry() -> Option<String> {
-    PENDING_VERSION_RETRY.with(|p| p.borrow_mut().take())
+    PENDING_VERSION_RETRY.with(impresspress_core::IsolateCell::take)
 }
 
 /// Mint and persist a fresh config-version stamp unconditionally.
 /// Deploy-init calls this once after the funnel (per-write bumps are
 /// suppressed during it — see [`CacheMode::bump_on_write`]).
-pub(crate) async fn force_bump_config_version(kv: &dyn KvBackend) -> Result<(), String> {
+pub(crate) async fn force_bump_config_version(kv: &dyn KvBackend) -> Result<String, String> {
     // The isolate handling `/_deploy/init` may also hold a pre-deploy
     // cached runtime from earlier ordinary requests; mark it dirty so this
     // isolate rebuilds on its next ordinary request instead of serving
     // stale (pre-migration/pre-reseed) state for up to the probe window.
     crate::runtime_cache::mark_dirty();
-    put_version_stamp_with_retry(kv, &new_version_stamp()).await
+    let stamp = new_version_stamp();
+    put_version_stamp_with_retry(kv, &stamp).await?;
+    Ok(stamp)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -415,11 +421,36 @@ impl DatabaseService for KvCachedD1DatabaseService {
             return self.inner.list(collection, opts).await;
         };
 
-        // Try cache hit (skipped in read-through mode; the fall-through
-        // below still repopulates KV with the fresh D1 rows).
+        // ONE KV read serves both modes. In serve mode its value can answer
+        // the query outright. In read-through mode it is never *served* — it
+        // is read solely so the repopulating PUT below can be skipped when
+        // the rows did not actually move (`kv::needs_cache_write`).
+        //
+        // That read is not a new cost: read-through previously always PUT,
+        // so the common case (config unchanged across a rebuild) trades one
+        // write for one read — the same op count against the subrequest
+        // budget, against the far more generous side of KV's free-tier
+        // quotas. Only a genuine config change now costs both.
+        let mut cached_body = match self.kv.get(&key).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!(
+                    table = %collection,
+                    key = %key,
+                    error = %e,
+                    "kv get failed; falling through"
+                );
+                None
+            }
+        };
+
+        // Set when the serve path scrubbed a sensitive entry out of KV, so
+        // the write decision below sees KV's true (now empty) state.
+        let mut cache_scrubbed = false;
+
         if !self.mode.read_through {
-            match self.kv.get(&key).await {
-                Ok(Some(body)) => match serde_json::from_str::<Vec<Record>>(&body) {
+            match cached_body.as_deref() {
+                Some(body) => match serde_json::from_str::<Vec<Record>>(body) {
                     Ok(records) => {
                         // Defense in depth: a cached payload written before
                         // this check existed (or written by a future bug)
@@ -442,6 +473,10 @@ impl DatabaseService for KvCachedD1DatabaseService {
                                     error = %e,
                                     "stale sensitive cache-entry cleanup failed; relying on TTL"
                                 );
+                            } else {
+                                // KV no longer holds it, so the compare below
+                                // must not treat it as still cached.
+                                cache_scrubbed = true;
                             }
                         } else {
                             let page_size = opts.limit;
@@ -464,18 +499,13 @@ impl DatabaseService for KvCachedD1DatabaseService {
                         );
                     }
                 },
-                Ok(None) => {
+                None => {
                     tracing::debug!(table = %collection, key = %key, "cache_miss");
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        table = %collection,
-                        key = %key,
-                        error = %e,
-                        "kv get failed; falling through"
-                    );
-                }
             }
+        }
+        if cache_scrubbed {
+            cached_body = None;
         }
 
         // Fall through to D1 and populate cache.
@@ -506,6 +536,21 @@ impl DatabaseService for KvCachedD1DatabaseService {
                 return Ok(result);
             }
         };
+        // Only write when KV does not already say this. A read-through
+        // rebuild touches every cached key, and config almost never moves
+        // across one, so an unconditional PUT here is what made a single
+        // deploy cost (isolates x keys) writes against a 1k/day budget.
+        //
+        // Skipping the PUT also stops refreshing `CACHE_TTL_SECS`, so an
+        // unchanging key now genuinely expires 24h after it last changed
+        // rather than being kept alive by deploy churn. That is the TTL
+        // working as intended: the next build misses, reads D1, and
+        // repopulates through this same path.
+        if !impresspress_core::kv::needs_cache_write(cached_body.as_deref(), &payload) {
+            tracing::debug!(table = %collection, key = %key, "cache_current; skipping put");
+            return Ok(result);
+        }
+
         if let Err(e) = self.kv.put_with_ttl(&key, &payload, CACHE_TTL_SECS).await {
             tracing::warn!(
                 table = %collection,

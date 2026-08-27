@@ -49,6 +49,7 @@ wafer-block = { workspace = true }
 impresspress-core = { path = "../impresspress-core", default-features = false, features = [
     "block-files",
     "block-legalpages",
+    "block-tickets",
     # `block-llm` (NOT `llm`): registers the `impresspress/llm` feature block —
     # chat UI + thread persistence — on wasm32. It holds a `NoopProviderAdmin`
     # (no native HTTP `ProviderLlmService`); chat routes through the

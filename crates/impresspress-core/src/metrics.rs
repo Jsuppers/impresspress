@@ -49,14 +49,21 @@ pub enum CacheOutcome {
     /// stamp still matched — one KV read, no rebuild.
     ProbedFresh,
     /// Version stamp moved, or a local write is pending: full rebuild.
-    /// `build_ordinal` is this isolate's cumulative build count (1-based).
-    Rebuilt { build_ordinal: u32 },
+    /// `build_ordinal` is this isolate's cumulative build count (1-based);
+    /// `duration_ms` covers cache resolution through the completed build.
+    Rebuilt {
+        build_ordinal: u32,
+        duration_ms: u64,
+    },
     /// Nothing cached yet in this isolate: cold build. `build_ordinal` is
-    /// this isolate's cumulative build count (1-based; always 1 the first
-    /// time, but a prior rebuild that raced and lost — see
-    /// `runtime_cache`'s module doc on concurrent-first-request races —
-    /// could make a later cold path start higher).
-    ColdBuilt { build_ordinal: u32 },
+    /// this isolate's cumulative build count (1-based; always 1 on the first
+    /// successful build because runtime construction is single-flight).
+    /// `duration_ms` covers the initial version probe through the completed
+    /// build.
+    ColdBuilt {
+        build_ordinal: u32,
+        duration_ms: u64,
+    },
 }
 
 impl CacheOutcome {
@@ -75,8 +82,18 @@ impl CacheOutcome {
     pub fn build_ordinal(self) -> Option<u32> {
         match self {
             Self::Hit | Self::ProbedFresh => None,
-            Self::Rebuilt { build_ordinal } | Self::ColdBuilt { build_ordinal } => {
+            Self::Rebuilt { build_ordinal, .. } | Self::ColdBuilt { build_ordinal, .. } => {
                 Some(build_ordinal)
+            }
+        }
+    }
+
+    /// Runtime-cache resolution duration when this request built a Wafer.
+    pub fn build_duration_ms(self) -> Option<u64> {
+        match self {
+            Self::Hit | Self::ProbedFresh => None,
+            Self::Rebuilt { duration_ms, .. } | Self::ColdBuilt { duration_ms, .. } => {
+                Some(duration_ms)
             }
         }
     }
@@ -91,12 +108,16 @@ impl CacheOutcome {
 /// build-ordinal counter (an integer count, not a time) must never be
 /// passed as `dur`; that would render e.g. a 3rd rebuild as "3ms", which is
 /// actively misleading. When this request paid for a build, the ordinal is
-/// folded into the `desc` text instead (`"rebuilt (build 3)"`); a
-/// Server-Timing entry is valid with just name+desc and no `dur`.
+/// folded into the `desc` text instead (`"rebuilt (build 3)"`), while the
+/// separately measured elapsed milliseconds are emitted as
+/// `runtime-build;dur=<ms>`.
 pub fn server_timing_header(outcome: CacheOutcome) -> String {
-    match outcome.build_ordinal() {
-        Some(n) => format!("cache;desc=\"{} (build {n})\"", outcome.as_str()),
-        None => format!("cache;desc=\"{}\"", outcome.as_str()),
+    match (outcome.build_ordinal(), outcome.build_duration_ms()) {
+        (Some(n), Some(duration_ms)) => format!(
+            "cache;desc=\"{} (build {n})\", runtime-build;dur={duration_ms}",
+            outcome.as_str()
+        ),
+        _ => format!("cache;desc=\"{}\"", outcome.as_str()),
     }
 }
 
@@ -138,13 +159,21 @@ mod tests {
         // `dur` is milliseconds per the Server-Timing spec — the build
         // ordinal is a count, not a duration, so it must never land there
         // (DevTools/RUM would render e.g. "rtbuild;dur=3" as a 3ms bar).
-        let with_build = server_timing_header(CacheOutcome::Rebuilt { build_ordinal: 3 });
-        assert_eq!(with_build, r#"cache;desc="rebuilt (build 3)""#);
-        assert!(!with_build.contains("dur="));
+        let with_build = server_timing_header(CacheOutcome::Rebuilt {
+            build_ordinal: 3,
+            duration_ms: 147,
+        });
+        assert_eq!(
+            with_build,
+            r#"cache;desc="rebuilt (build 3)", runtime-build;dur=147"#
+        );
 
         assert_eq!(
-            server_timing_header(CacheOutcome::ColdBuilt { build_ordinal: 1 }),
-            r#"cache;desc="cold-built (build 1)""#
+            server_timing_header(CacheOutcome::ColdBuilt {
+                build_ordinal: 1,
+                duration_ms: 82,
+            }),
+            r#"cache;desc="cold-built (build 1)", runtime-build;dur=82"#
         );
     }
 
@@ -153,8 +182,20 @@ mod tests {
         assert_eq!(CacheOutcome::Hit.build_ordinal(), None);
         assert_eq!(CacheOutcome::ProbedFresh.build_ordinal(), None);
         assert_eq!(
-            CacheOutcome::Rebuilt { build_ordinal: 7 }.build_ordinal(),
+            CacheOutcome::Rebuilt {
+                build_ordinal: 7,
+                duration_ms: 10,
+            }
+            .build_ordinal(),
             Some(7)
+        );
+        assert_eq!(
+            CacheOutcome::ColdBuilt {
+                build_ordinal: 1,
+                duration_ms: 42,
+            }
+            .build_duration_ms(),
+            Some(42)
         );
     }
 

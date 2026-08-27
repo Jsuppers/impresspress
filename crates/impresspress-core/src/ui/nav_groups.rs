@@ -70,6 +70,12 @@ pub fn admin() -> Vec<NavGroup> {
                     icons::file_text,
                     "impresspress/messages",
                 ),
+                block_item(
+                    "Tickets",
+                    "/b/tickets/admin/tickets",
+                    icons::file_text,
+                    "impresspress/tickets",
+                ),
                 block_item("LLM", "/b/llm/", icons::robot, "impresspress/llm"),
             ],
         },
@@ -315,6 +321,7 @@ mod tests {
             "impresspress/messages",
             "impresspress/llm",
             "impresspress/products",
+            "impresspress/tickets",
         ]
         .into();
         let before: usize = groups.iter().map(|g| g.items.len()).sum();

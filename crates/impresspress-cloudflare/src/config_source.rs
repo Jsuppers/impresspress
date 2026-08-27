@@ -166,9 +166,11 @@ impl ConfigSource for D1ConfigSource {
 
 #[cfg(test)]
 mod tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
     use super::*;
 
-    #[test]
+    #[wasm_bindgen_test]
     fn screaming_block_handles_two_segments() {
         assert_eq!(
             D1ConfigSource::screaming_block("wafer-run/auth"),
@@ -180,7 +182,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn screaming_block_handles_org_only() {
         assert_eq!(
             D1ConfigSource::screaming_block("impresspress"),
@@ -188,7 +190,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_returns_db_value_when_present() {
         let mut rows = HashMap::new();
         rows.insert("KEY".to_string(), "from-db".to_string());
@@ -198,7 +200,7 @@ mod tests {
         assert_eq!(cfg.get("KEY"), Some("from-db"));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_falls_back_to_default_when_db_missing() {
         let rows = HashMap::new();
         let overlay = HashMap::new();
@@ -207,7 +209,7 @@ mod tests {
         assert_eq!(cfg.get("KEY"), Some("fallback"));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_falls_back_to_default_when_db_value_empty() {
         let mut rows = HashMap::new();
         rows.insert("KEY".to_string(), "".to_string());
@@ -217,7 +219,7 @@ mod tests {
         assert_eq!(cfg.get("KEY"), Some("fallback"));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_required_missing_returns_error() {
         let rows = HashMap::new();
         let overlay = HashMap::new();
@@ -226,7 +228,7 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::MissingRequired { .. })));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_optional_missing_is_skipped() {
         let rows = HashMap::new();
         let overlay = HashMap::new();
@@ -235,7 +237,7 @@ mod tests {
         assert_eq!(cfg.get("KEY"), None);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_overlay_wins_over_db() {
         let mut rows = HashMap::new();
         rows.insert("KEY".to_string(), "from-db".to_string());
@@ -246,7 +248,7 @@ mod tests {
         assert_eq!(cfg.get("KEY"), Some("from-overlay"));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn resolve_overlay_supplies_required_value_when_db_empty() {
         let rows = HashMap::new();
         let mut overlay = HashMap::new();

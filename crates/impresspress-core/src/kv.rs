@@ -56,6 +56,38 @@ pub async fn put_version_stamp_with_retry(kv: &dyn KvBackend, stamp: &str) -> Re
     }
 }
 
+/// True when `fresh` must be written to KV because what is cached there
+/// (`cached`, `None` for a miss) does not already say the same thing.
+///
+/// Exists because a read-through row-cache rebuild re-PUTs every key it
+/// touches whether or not the contents moved. Config almost never changes
+/// across a rebuild, so those PUTs are near-100% redundant — and on
+/// Cloudflare's KV free tier writes are the scarce resource (1k/day, versus
+/// 100k reads), so a fleet-wide rebuild after a deploy could exhaust the
+/// daily write budget rewriting bytes KV already held.
+///
+/// The compare is SEMANTIC, not textual: `Record::data` is a `HashMap`, so
+/// the same rows serialise with different key order in different isolates
+/// and a byte compare would report a change every time, restoring the exact
+/// amplification this removes. JSON arrays still compare order-sensitively —
+/// row order is part of the cached value.
+///
+/// Fails open: an absent, corrupt, or unparseable entry returns `true` so a
+/// broken compare can never suppress a needed write and strand every isolate
+/// on stale config.
+pub fn needs_cache_write(cached: Option<&str>, fresh: &str) -> bool {
+    let Some(cached) = cached else {
+        return true;
+    };
+    match (
+        serde_json::from_str::<serde_json::Value>(cached),
+        serde_json::from_str::<serde_json::Value>(fresh),
+    ) {
+        (Ok(cached), Ok(fresh)) => cached != fresh,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -174,6 +206,73 @@ mod tests {
             kv.put_count(),
             1,
             "a successful first put must not trigger the retry"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // needs_cache_write
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn identical_payload_needs_no_write() {
+        let payload = r#"[{"block":"WAFER_RUN__WEB","key":"PORT","value":"8080"}]"#;
+        assert!(
+            !needs_cache_write(Some(payload), payload),
+            "re-PUTting a payload KV already holds is the write amplification \
+             this function exists to stop"
+        );
+    }
+
+    #[test]
+    fn absent_cache_entry_needs_a_write() {
+        let payload = r#"[{"block":"WAFER_RUN__WEB","key":"PORT","value":"8080"}]"#;
+        assert!(
+            needs_cache_write(None, payload),
+            "a cold/expired key must still be populated"
+        );
+    }
+
+    #[test]
+    fn changed_payload_needs_a_write() {
+        let cached = r#"[{"block":"WAFER_RUN__WEB","key":"PORT","value":"8080"}]"#;
+        let fresh = r#"[{"block":"WAFER_RUN__WEB","key":"PORT","value":"9090"}]"#;
+        assert!(
+            needs_cache_write(Some(cached), fresh),
+            "a real config change must reach KV or every isolate serves stale config"
+        );
+    }
+
+    #[test]
+    fn unparseable_cache_entry_needs_a_write() {
+        assert!(
+            needs_cache_write(Some("{not json"), "[]"),
+            "a corrupt entry must be overwritten, not preserved by a failed compare"
+        );
+    }
+
+    /// `Record::data` is a `HashMap`, so two isolates serialising the same
+    /// rows can emit the same object with different key order. A byte compare
+    /// would call that a change and re-PUT on every rebuild — exactly the
+    /// amplification this is meant to remove — so the compare is semantic.
+    #[test]
+    fn key_order_difference_alone_needs_no_write() {
+        let cached = r#"[{"block":"WAFER_RUN__WEB","key":"PORT","value":"8080"}]"#;
+        let fresh = r#"[{"value":"8080","key":"PORT","block":"WAFER_RUN__WEB"}]"#;
+        assert!(
+            !needs_cache_write(Some(cached), fresh),
+            "map key order is not a config change"
+        );
+    }
+
+    /// Row order, unlike key order, IS meaningful — the cached payload is a
+    /// JSON array and callers hand it back as an ordered `Vec<Record>`.
+    #[test]
+    fn row_order_difference_needs_a_write() {
+        let cached = r#"[{"key":"A"},{"key":"B"}]"#;
+        let fresh = r#"[{"key":"B"},{"key":"A"}]"#;
+        assert!(
+            needs_cache_write(Some(cached), fresh),
+            "array order is part of the value; reordered rows must be rewritten"
         );
     }
 }

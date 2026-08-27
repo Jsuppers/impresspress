@@ -212,6 +212,12 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
             "wafer_run__auth__rate_limits",
         ),
         wafer_run::ResourceGrant::read_write("impresspress/files", "wafer_run__auth__rate_limits"),
+        // Public ticket submissions fail closed around this durable counter;
+        // maintenance also prunes rows older than the bounded retention window.
+        wafer_run::ResourceGrant::read_write(
+            "impresspress/tickets",
+            "wafer_run__auth__rate_limits",
+        ),
         // auth-ui's login / signup / refresh handlers read the auth-policy
         // config vars declared by `auth::config` (owned by this block). These
         // are CONFIG resources (uppercase `WAFER_RUN__AUTH__*`), a different

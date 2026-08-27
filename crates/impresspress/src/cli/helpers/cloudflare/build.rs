@@ -11,9 +11,10 @@ use tokio::process::Command;
 /// can skip `cargo install` outright once the right binary is already on
 /// `PATH`, and so every build path installs the identical toolchain: this
 /// helper (used by `impresspress build --target cloudflare` locally) and the
-/// `[build] command` embedded in generated `wrangler.toml` by
-/// [`super::wrangler::base_toml`] (run by Cloudflare's own build step during
-/// `wrangler deploy`/`versions upload`).
+/// `[build] command` embedded in the developer `wrangler.toml` by
+/// [`super::wrangler::base_toml`]. Production deploys use a separate
+/// upload-only config with that hook removed, so the artifact produced here
+/// is not rebuilt by `wrangler versions upload`.
 ///
 /// Pin reason: worker-build 0.8.x rejects `worker < 0.8` (hard version
 /// check) and changed its output layout from `build/worker/shim.mjs` to
@@ -88,15 +89,12 @@ async fn installed_version_matches(expected: &str) -> bool {
 ///
 /// Returns an error if `worker-build` cannot be installed, fails to spawn,
 /// or exits non-zero.
-pub async fn run(repo_root: &Path, release: bool) -> Result<()> {
+pub async fn run(repo_root: &Path, _release: bool) -> Result<()> {
     ensure_worker_build_installed().await?;
 
     let mut cmd = Command::new("worker-build");
     cmd.current_dir(repo_root)
         .args(["--no-default-features", "--features", "target-cloudflare"]);
-    if release {
-        cmd.arg("--release");
-    }
     let status = cmd.status().await.context("run worker-build")?;
     if !status.success() {
         bail!("worker-build failed (exit {:?})", status.code());

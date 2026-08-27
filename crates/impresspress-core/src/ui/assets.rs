@@ -300,8 +300,18 @@ document.body.addEventListener("showToast", function(e) {
     var c = document.getElementById("toast-container");
     if (!c) return;
     var t = document.createElement("div");
-    t.className = "toast toast-" + (d.type || "info");
-    t.innerHTML = '<span>' + (d.message || '') + '</span><button class="toast-dismiss" onclick="this.parentElement.remove()">&times;</button>';
+    var kind = ["success", "error", "warning", "info"].indexOf(d.type) >= 0 ? d.type : "info";
+    t.className = "toast toast-" + kind;
+    var message = document.createElement("span");
+    message.textContent = String(d.message || "");
+    var dismiss = document.createElement("button");
+    dismiss.className = "toast-dismiss";
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", function() { t.remove(); });
+    t.appendChild(message);
+    t.appendChild(dismiss);
     c.appendChild(t);
     setTimeout(function() { t.remove(); }, 4000);
 });
@@ -509,6 +519,18 @@ pub fn drawer_js() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn toast_messages_are_rendered_as_text_not_html() {
+        let js = super::toast_js();
+        assert!(
+            !js.contains("innerHTML"),
+            "toast content must not use an HTML sink"
+        );
+        assert!(js.contains("message.textContent"));
+        assert!(js.contains("createElement(\"button\")"));
+        assert!(js.contains("addEventListener(\"click\""));
+    }
+
     #[test]
     fn css_bundle_includes_all_layers() {
         let s = super::css_bundle();

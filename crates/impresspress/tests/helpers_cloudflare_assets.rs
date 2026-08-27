@@ -34,7 +34,7 @@ fn stage_copies_dist_and_content_skips_missing_public() {
     let out = root.join("target/impresspress-cloudflare");
     fs::create_dir_all(&out).unwrap();
 
-    let report = stage(root, &out).unwrap();
+    let report = stage(root, &out, None, Path::new(""), &[]).unwrap();
     assert_eq!(report.files_copied, 3);
     assert!(
         report.dirs_skipped.contains(&"public"),
@@ -52,7 +52,7 @@ fn stage_returns_zero_files_when_no_dirs_present() {
     let tmp = tempdir().unwrap();
     let out = tmp.path().join("target/impresspress-cloudflare");
     fs::create_dir_all(&out).unwrap();
-    let report = stage(tmp.path(), &out).unwrap();
+    let report = stage(tmp.path(), &out, None, Path::new(""), &[]).unwrap();
     assert_eq!(report.files_copied, 0);
     assert_eq!(report.dirs_skipped.len(), 3);
 }
