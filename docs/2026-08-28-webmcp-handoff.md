@@ -167,16 +167,21 @@ stacked on #74:
 - **The `$defs` → `components/schemas` hoist.** Recursive contracts still
   produce dangling refs in `/openapi.json`. Not a regression — before #323 every
   named type did. The WebMCP side is fail-safe (refused, not published wrong).
-- **Plan 3 Task 4 — inspector panel.** The whole task was wafer-run work and
-  landed in #324 (`GET {mount}/webmcp` + the "Agent tools" tab). Not yet
-  verified: that impresspress's `/b/inspector` mount reaches the new sub-route
-  and that the tab renders against a real impresspress block set. Note its
-  columns are projected from `ep.auth`, not `routing::effective_access`, and
-  the page says so.
-- **Plan 3 Task 5 — end-to-end run.** Needs a human with a WebMCP-capable
-  browser. **This is the only thing that tests whether the tool descriptions
-  actually steer an agent**, which is the part most likely to be wrong and least
-  covered by tests. Steps are in the plan.
+- **Plan 3 Task 4 — inspector panel.** Landed in wafer-run #324; the
+  impresspress half is now **verified** by `webmcp.spec.ts` (#76):
+  `/b/inspector/webmcp` through impresspress's mount answers with all three
+  levels, monotone, zero refusals, tool count = `opted_in`. Its columns are
+  projected from `ep.auth`, not `routing::effective_access`, and the page
+  says so.
+- **Plan 3 Task 2 + the mechanics of Task 5 — verified in CI** by
+  `crates/impresspress-web/tests/e2e/webmcp.spec.ts` (#76): a real native
+  server, `webmcp.js` registering against a polyfilled `document.modelContext`,
+  every tool invoked against live endpoints (seeded product, exact price,
+  `isError` on a bad receipt and on checkout without a provider).
+- **Plan 3 Task 5 — the human half.** Whether an agent *chooses* the right
+  tool from its description: browse → price → checkout in a WebMCP-capable
+  browser with a Stripe test key, payment confirmed by a person. **The one
+  thing no test covers.** Steps are in the plan.
 - **Admin JSON writes still untyped:** `users` PUT is projected but
   undeclared; `permissions` and `user-roles` GET/POST/DELETE echo raw
   `RecordList`/`Record`. Same treatment as the role writes (`7d601c0`).
@@ -191,6 +196,22 @@ stacked on #74:
   inspector/seal tests assert less than they appear to.
 
 ---
+
+### Submission checklist — The WebMCP Challenge (deadline 2026-09-03 13:00 PDT)
+The spec's §Submission context, as of 2026-08-28 end of day:
+
+| Requirement | State |
+|---|---|
+| MIT `LICENSE` on the default branch | ✅ on `main` since #72 |
+| Tool-registration code visible in-repo | ✅ `crates/impresspress-core/src/ui/assets/webmcp.js` on `main` |
+| Both repos public, write-up names both | ✅ public; ❌ write-up not started |
+| Live URL reachable from the ChatGPT browser | ❌ not deployed. `wrangler` is logged in; the deployable is a *consumer* crate (`impresspress-cloudflare` is a library — see the wasm measurement doc), so the target is wafer-site's Cloudflare build or a minimal consumer. Outward-facing: needs a go. |
+| Demo video < 3 minutes | ❌ human |
+| Agent-driven browse → price → checkout | ❌ human, plan 3 task 5 |
+
+Engineering that does **not** gate the submission but is still open: products'
+69 unmigrated sites; `llm` (18 endpoints) and `vector` (11) declare no schemas
+at all (spec step 8, native-only, non-gating); the `$defs` hoist (wafer-run).
 
 ## 5. Traps for whoever picks this up
 
