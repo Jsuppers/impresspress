@@ -87,16 +87,35 @@ fn number(key: &str, name: &str, default: &str) -> ConfigVar {
         .input_type(InputType::Number)
 }
 
-#[derive(Debug, Clone, Serialize)]
+// Every field is a boolean "is this configured", never a configured value:
+// the two secrets behind `turnstile_secret_configured` and
+// `identity_secret_configured` are only ever tested for emptiness here, so
+// this shape cannot carry one. Reaching it needs admin auth in any case — the
+// public form renders `reasons` only under `debug_assertions`.
+/// Whether protected public reporting can currently accept a submission.
+///
+/// Public reporting fails closed: every check below must pass, and `reasons`
+/// names the ones that did not.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SecurityReadiness {
+    /// Whether all of the checks below passed.
     pub ready: bool,
+    /// Whether the tickets block itself is enabled.
     pub block_enabled: bool,
+    /// Whether the operator has turned public submissions on.
     pub public_enabled: bool,
+    /// Whether a Turnstile widget site key is configured.
     pub site_key_configured: bool,
+    /// Whether a Turnstile Siteverify secret is configured.
     pub turnstile_secret_configured: bool,
+    /// Whether the abuse-digest identity secret is configured.
     pub identity_secret_configured: bool,
+    /// Whether both submission rate limits have a positive cap and window.
     pub positive_limits: bool,
+    /// Whether at least one active, publicly visible ticket type exists.
     pub has_public_type: bool,
+    /// Human-readable reason for each failed check, in check order. Empty when
+    /// `ready`.
     pub reasons: Vec<String>,
 }
 

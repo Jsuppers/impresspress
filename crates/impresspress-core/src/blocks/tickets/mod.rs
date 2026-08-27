@@ -2,6 +2,7 @@
 
 pub mod abuse;
 pub mod config;
+pub mod contracts;
 pub mod maintenance;
 pub mod migrations;
 pub mod models;
