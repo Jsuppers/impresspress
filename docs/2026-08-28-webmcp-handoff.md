@@ -190,8 +190,12 @@ that PR; nothing else is sequenced behind it.
 
 ## 5. Traps for whoever picks this up
 
-- **`Cargo.lock` is rewritten by the local `[patch]`.** It is an artifact —
-  `git checkout Cargo.lock` before committing, never include it. Do not pass
+- **`Cargo.lock` is rewritten by the local `[patch]`.** That rewrite is an
+  artifact — `git checkout Cargo.lock` before committing — but the rule is
+  *not* "never commit the lock". When a `Cargo.toml` changes (this branch
+  added `schemars` and wafer-block's `json-schema` feature), CI's `--locked`
+  jobs need the matching lock; #74 sat red on exactly that until the lock was
+  re-resolved from outside the tree (next bullet) and committed. Do not pass
   `--locked` locally.
 - **A worktree-local `.cargo/config.toml`** (gitignored) patches the wafer
   crates at a wafer-run worktree. The repo-level one points at `../wafer-run`,
