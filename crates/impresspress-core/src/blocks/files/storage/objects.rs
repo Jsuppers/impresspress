@@ -11,7 +11,10 @@ use super::{
     validation::{is_valid_bucket_name, is_valid_storage_key},
 };
 use crate::{
-    blocks::files::repo,
+    blocks::files::{
+        contracts::{ObjectInfoResponse, ObjectListResponse},
+        repo,
+    },
     http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
 };
 
@@ -64,7 +67,24 @@ pub(super) async fn handle_list_objects(ctx: &dyn Context, msg: &Message) -> Out
     };
 
     match store::list(ctx, bucket, &opts).await {
-        Ok(list) => ok_json(&list),
+        // `store::list` returns `wafer_core::clients::storage::ObjectList`,
+        // a wafer-run wire type that doesn't derive `schemars::JsonSchema`.
+        // Rebuild it as the local `ObjectListResponse` (see
+        // `blocks::files::contracts` for why) so the type the OpenAPI schema
+        // is derived from is the same type that gets serialized.
+        Ok(list) => ok_json(&ObjectListResponse {
+            objects: list
+                .objects
+                .into_iter()
+                .map(|o| ObjectInfoResponse {
+                    key: o.key,
+                    size: o.size,
+                    content_type: o.content_type,
+                    last_modified: o.last_modified,
+                })
+                .collect(),
+            total_count: list.total_count,
+        }),
         Err(e) => err_internal("Storage error", e),
     }
 }

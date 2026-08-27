@@ -128,7 +128,11 @@ wafer-core = { workspace = true }
 # snapshot gate (tests/openapi_snapshot.rs) and, later, by the derive
 # migration itself.
 wafer-block = { workspace = true, features = ["json-schema"] }
-schemars = "1"
+# `chrono04` turns on schemars' impl for `chrono::DateTime<Tz>` (renders as
+# `{"type": "string", "format": "date-time"}`), needed by
+# `blocks::files::contracts::ObjectInfoResponse::last_modified` — a real
+# `chrono::DateTime<Utc>` field, not a pre-formatted `String`.
+schemars = { version = "1", features = ["chrono04"] }
 # SQL utilities (query builders, value conversion). sea-query is reached
 # transitively through this crate — impresspress-core builds no queries with the
 # raw sea-query API itself, so it declares no direct sea-query dependency. A

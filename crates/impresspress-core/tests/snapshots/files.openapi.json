@@ -45,14 +45,18 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "`GET /b/storage/api/buckets/{name}/objects` response body. Mirrors\n`wafer_core::clients::storage::ObjectList` minus `next_cursor`:\n[`super::storage::objects::handle_list_objects`] always calls\n`store::list` with `cursor: None` (offset-only paging), and every\nbackend (S3, local-storage, Cloudflare R2) returns `next_cursor: None`\nin offset mode unconditionally — so on this endpoint the field can never\nbe anything but absent. Carrying it here would describe a cursor-paging\ncapability this endpoint does not actually expose.",
                 "properties": {
                   "objects": {
+                    "description": "Objects in this page.",
                     "items": {
+                      "description": "Mirrors `wafer_core::clients::storage::ObjectInfo`.",
                       "properties": {
                         "content_type": {
                           "type": "string"
                         },
                         "key": {
+                          "description": "Object key.",
                           "type": "string"
                         },
                         "last_modified": {
@@ -60,18 +64,32 @@
                           "type": "string"
                         },
                         "size": {
-                          "description": "Size in bytes",
+                          "description": "Size in bytes.",
+                          "format": "int64",
                           "type": "integer"
                         }
                       },
+                      "required": [
+                        "key",
+                        "size",
+                        "content_type",
+                        "last_modified"
+                      ],
                       "type": "object"
                     },
                     "type": "array"
                   },
                   "total_count": {
+                    "description": "Total number of objects matching the filter (across all pages). See\n`ObjectList::total_count` for the lower-bound caveat on some backends.",
+                    "format": "int64",
                     "type": "integer"
                   }
                 },
+                "required": [
+                  "objects",
+                  "total_count"
+                ],
+                "title": "ObjectListResponse",
                 "type": "object"
               }
             }
