@@ -109,19 +109,19 @@ async fn admin_moderation_approves_rejects_and_resubmits_only_ready_sellers() {
 
     let approved_id = create_seller_product(&test_ctx, "maker_ready", "Approved print").await;
     let pending = submit_product(&test_ctx, "maker_ready", &approved_id).await;
-    assert_eq!(pending["data"]["status"], "pending_review");
-    assert_eq!(pending["data"]["approval_status"], "pending");
+    assert_eq!(pending["status"], "pending_review");
+    assert_eq!(pending["approval_status"], "pending");
 
     let path = format!("/admin/b/products/products/{approved_id}/approve");
     let (msg, input) = admin_create_msg(&path, json!({}));
     let approved = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(approved["data"]["status"], "active");
-    assert_eq!(approved["data"]["approval_status"], "approved");
-    assert!(approved["data"]["published_at"].as_str().is_some());
+    assert_eq!(approved["status"], "active");
+    assert_eq!(approved["approval_status"], "approved");
+    assert!(approved["published_at"].as_str().is_some());
 
     let (msg, input) = admin_create_msg(&path, json!({}));
     let repeated = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(repeated["data"]["status"], "active");
+    assert_eq!(repeated["status"], "active");
 
     let rejected_id = create_seller_product(&test_ctx, "maker_ready", "Needs changes").await;
     submit_product(&test_ctx, "maker_ready", &rejected_id).await;
@@ -130,11 +130,11 @@ async fn admin_moderation_approves_rejects_and_resubmits_only_ready_sellers() {
         json!({}),
     );
     let rejected = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(rejected["data"]["status"], "draft");
-    assert_eq!(rejected["data"]["approval_status"], "rejected");
+    assert_eq!(rejected["status"], "draft");
+    assert_eq!(rejected["approval_status"], "rejected");
     let resubmitted = submit_product(&test_ctx, "maker_ready", &rejected_id).await;
-    assert_eq!(resubmitted["data"]["status"], "pending_review");
-    assert_eq!(resubmitted["data"]["approval_status"], "pending");
+    assert_eq!(resubmitted["status"], "pending_review");
+    assert_eq!(resubmitted["approval_status"], "pending");
 
     seed_seller(&test_ctx, "seller_not_ready", "maker_not_ready", false).await;
     let blocked_id = create_seller_product(&test_ctx, "maker_not_ready", "Blocked print").await;
@@ -169,7 +169,7 @@ async fn suspension_archives_catalog_blocks_mutations_and_reactivation_stays_dra
     seed_seller(&test_ctx, "seller_governed", "maker_governed", true).await;
     let product_id = create_seller_product(&test_ctx, "maker_governed", "Governed print").await;
     let published = submit_product(&test_ctx, "maker_governed", &product_id).await;
-    assert_eq!(published["data"]["status"], "active");
+    assert_eq!(published["status"], "active");
 
     let offers_path = format!("/b/products/products/{product_id}/offers");
     let (msg, input) = create_msg(&offers_path, "maker_governed", fixed_offer());
@@ -406,8 +406,8 @@ async fn activation_validates_merged_values_not_stale_record() {
         json!({"currency": "NZD", "status": "active"}),
     );
     let body = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(body["data"]["currency"], "NZD");
-    assert_eq!(body["data"]["status"], "active");
+    assert_eq!(body["currency"], "NZD");
+    assert_eq!(body["status"], "active");
 
     // Activating while leaving the stale value untouched must still fail.
     let mut pd = HashMap::new();

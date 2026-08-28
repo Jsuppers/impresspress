@@ -11,7 +11,10 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{default_template_id, GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCTS_TABLE};
 use crate::{
-    blocks::crud,
+    blocks::{
+        crud,
+        products::contracts::{PageQuery, ProductListResponse},
+    },
     http::{err_bad_request, err_internal, err_unauthorized, ok_json},
     util::stamp_created,
 };
@@ -177,12 +180,25 @@ pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message)
         return resp;
     }
 
+    let query = PageQuery::from_message(msg);
     let filters = vec![Filter {
         field: "group_id".to_string(),
         operator: FilterOp::Equal,
         value: serde_json::Value::String(group_id.to_string()),
     }];
-    crud::crud_list(ctx, msg, PRODUCTS_TABLE, filters, None).await
+    match crud::list_page(
+        ctx,
+        PRODUCTS_TABLE,
+        i64::from(query.page),
+        i64::from(query.page_size),
+        filters,
+        None,
+    )
+    .await
+    {
+        Ok(list) => ok_json(&ProductListResponse::from_record_list(&list)),
+        Err(response) => response,
+    }
 }
 
 // User-accessible group templates (read-only)

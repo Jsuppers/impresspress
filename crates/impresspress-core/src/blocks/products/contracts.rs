@@ -21,10 +21,14 @@
 //! Removing one of these widens the published response contract. Do not strip
 //! them from an `Option<T>` field without changing what the handler emits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wafer_core::clients::database::{Record, RecordList};
+use wafer_run::Message;
+
+use crate::util::{json_map, RecordExt};
 
 pub const COMMERCE_SCHEMA_VERSION: u32 = 1;
 
@@ -1156,6 +1160,406 @@ pub struct ProviderReconcileResult {
     pub succeeded: u64,
     pub retry_scheduled: u64,
     pub dead_letter: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Catalog rows — typed views of the block's own tables
+// ---------------------------------------------------------------------------
+//
+// Until these existed the product, group, type and purchase endpoints echoed
+// the database layer's `Record` / `RecordList` (`{id, data: {column → value}}`)
+// straight to the wire, so a response was whatever the row held and its JSON
+// types depended on the backend (`tags` / `metadata` are JSON-encoded `TEXT`
+// that only SQLite decodes; `is_system` / `livemode` are `INTEGER`). Each view
+// below is a closed field list built column by column, normalized through
+// `RecordExt`, so a column added by a migration is never published by
+// accident and one schema is true on SQLite, D1 and Postgres.
+//
+// The `{records, total_count, page, page_size}` list envelope is unchanged;
+// only the row moves from `{id, data: {…}}` to the flat view.
+
+/// A nullable timestamp column as `Option<String>`.
+///
+/// The moderation path writes `published_at = ""` when it returns a product to
+/// draft, so the column holds `NULL`, the empty string, or an RFC 3339
+/// timestamp. The empty string is not a `date-time`; it reads as `None` so the
+/// declared format is true.
+fn timestamp_field(record: &Record, key: &str) -> Option<String> {
+    record.opt_str_field(key).filter(|value| !value.is_empty())
+}
+
+/// An absent query parameter and an empty one mean the same thing to every
+/// filter here (`msg.query` returns `""` for both), so collapse them onto
+/// `None` rather than letting `Some("")` reach a `LIKE '%%'`.
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Default page size for every paginated list in this block.
+const DEFAULT_PAGE_SIZE: u32 = 20;
+
+/// `?page` default.
+fn default_page() -> u32 {
+    1
+}
+
+fn default_page_size() -> u32 {
+    DEFAULT_PAGE_SIZE
+}
+
+/// Turn a request struct into the column map the database client writes.
+///
+/// Every optional field carries `skip_serializing_if = "Option::is_none"`, so
+/// a key the client did not send is not written — an update touches only what
+/// arrived, and an explicit `null` is treated the same as an absent key rather
+/// than becoming a `NULL` write against a `NOT NULL` column.
+fn columns<T: Serialize>(request: &T) -> HashMap<String, Value> {
+    json_map(serde_json::to_value(request).expect("request structs serialize"))
+}
+
+/// Publication state of a product row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductStatus {
+    Draft,
+    PendingReview,
+    Active,
+    Archived,
+}
+
+/// A product row as published to its owner and to administrators: every
+/// column of `impresspress__products__products`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProductView {
+    /// Stable product identifier.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// URL slug, unique per owner among non-deleted products. Empty when the
+    /// product has none.
+    pub slug: String,
+    /// ISO 4217 presentment currency.
+    pub currency: String,
+    /// Publication state: `draft`, `pending_review` (seller product awaiting
+    /// moderation), `active` (in the public catalog) or `archived`.
+    #[schemars(extend("enum" = ["draft", "pending_review", "active", "archived"]))]
+    pub status: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    /// Free-form key/value metadata attached by the product builder.
+    pub metadata: serde_json::Map<String, Value>,
+    pub image_url: String,
+    /// Units in stock; `0` when inventory is not tracked.
+    pub stock: i64,
+    /// Group the product is listed under, or empty.
+    pub group_id: String,
+    /// Product type (taxonomy) id, or empty.
+    pub type_id: String,
+    pub group_template_id: String,
+    /// Product builder template this product was created from.
+    pub product_template_id: String,
+    /// Id of a product the buyer must already own before checkout, or empty.
+    pub requires: String,
+    /// Id of the user who created the row.
+    pub created_by: String,
+    /// `platform` for an administrator-owned product, `user` for a seller's.
+    #[schemars(extend("enum" = ["platform", "user"]))]
+    pub owner_kind: String,
+    /// Owning seller's user id; empty for platform products.
+    pub owner_id: String,
+    /// Seller account the product sells through; empty for platform products.
+    pub seller_account_id: String,
+    /// Moderation state: `draft`, `pending` (submitted for review), `approved`,
+    /// `rejected` or `suspended`.
+    #[schemars(extend("enum" = ["draft", "pending", "approved", "rejected", "suspended"]))]
+    pub approval_status: String,
+    /// How a purchase is fulfilled.
+    #[schemars(extend("enum" = ["none", "manual", "download", "entitlement", "webhook"]))]
+    pub fulfillment_kind: String,
+    /// Stripe Product id once the catalog has been synchronized, or empty.
+    pub stripe_product_id: String,
+    /// Version counter of the product's immutable offer definitions.
+    #[schemars(range(min = 1))]
+    pub current_version: i64,
+    /// RFC 3339 timestamp the seller last submitted the product for
+    /// moderation, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub submitted_at: Option<String>,
+    /// RFC 3339 timestamp the product last became active, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub published_at: Option<String>,
+    /// RFC 3339 soft-delete timestamp, or `null` unless the product has been
+    /// soft-deleted.
+    #[schemars(extend("format" = "date-time"))]
+    pub deleted_at: Option<String>,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl ProductView {
+    /// Project an `impresspress__products__products` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.str_field("name").to_string(),
+            description: record.str_field("description").to_string(),
+            slug: record.str_field("slug").to_string(),
+            currency: record.str_field("currency").to_string(),
+            status: record.str_field("status").to_string(),
+            category: record.str_field("category").to_string(),
+            tags: record.string_list_field("tags"),
+            metadata: record.json_object_field("metadata"),
+            image_url: record.str_field("image_url").to_string(),
+            stock: record.i64_field("stock"),
+            group_id: record.str_field("group_id").to_string(),
+            type_id: record.str_field("type_id").to_string(),
+            group_template_id: record.str_field("group_template_id").to_string(),
+            product_template_id: record.str_field("product_template_id").to_string(),
+            requires: record.str_field("requires").to_string(),
+            created_by: record.str_field("created_by").to_string(),
+            owner_kind: record.str_field("owner_kind").to_string(),
+            owner_id: record.str_field("owner_id").to_string(),
+            seller_account_id: record.str_field("seller_account_id").to_string(),
+            approval_status: record.str_field("approval_status").to_string(),
+            fulfillment_kind: record.str_field("fulfillment_kind").to_string(),
+            stripe_product_id: record.str_field("stripe_product_id").to_string(),
+            current_version: record.i64_field("current_version"),
+            submitted_at: timestamp_field(record, "submitted_at"),
+            published_at: timestamp_field(record, "published_at"),
+            deleted_at: timestamp_field(record, "deleted_at"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// One page of product rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProductListResponse {
+    /// Products on this page, newest first.
+    pub records: Vec<ProductView>,
+    /// Total products matching the filters, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl ProductListResponse {
+    /// Project a `RecordList` of product rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list.records.iter().map(ProductView::from_record).collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// Query parameters accepted by the list endpoints that paginate and do
+/// nothing else.
+///
+/// Built by [`Self::from_message`], which is the handler's only source for
+/// these values — the type is the parser, not a parallel description of one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+pub struct PageQuery {
+    /// 1-based page number. Values below 1 clamp to 1.
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// Rows per page, capped at 100.
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+}
+
+impl PageQuery {
+    /// Resolve the query string on `msg`, applying the same defaults and
+    /// clamps the handler applied inline before this type existed.
+    pub fn from_message(msg: &Message) -> Self {
+        let (page, page_size, _) = msg.pagination_params(DEFAULT_PAGE_SIZE as usize);
+        Self {
+            page: page as u32,
+            page_size: page_size as u32,
+        }
+    }
+}
+
+/// Query parameters accepted by the product list endpoints.
+///
+/// Built by [`Self::from_message`], which is the handler's only source for
+/// these values — the type is the parser, not a parallel description of one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+pub struct ProductListQuery {
+    /// 1-based page number. Values below 1 clamp to 1.
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// Rows per page, capped at 100.
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+    /// Exact-match filter on the product's group.
+    pub group_id: Option<String>,
+    /// Exact-match filter on the publication state.
+    pub status: Option<String>,
+    /// `LIKE '%…%'` filter on the product name.
+    pub search: Option<String>,
+}
+
+impl ProductListQuery {
+    /// Resolve the query string on `msg`, applying the same defaults and
+    /// clamps the handler applied inline before this type existed.
+    pub fn from_message(msg: &Message) -> Self {
+        let (page, page_size, _) = msg.pagination_params(DEFAULT_PAGE_SIZE as usize);
+        Self {
+            page: page as u32,
+            page_size: page_size as u32,
+            group_id: non_empty(msg.query("group_id")),
+            status: non_empty(msg.query("status")),
+            search: non_empty(msg.query("search")),
+        }
+    }
+}
+
+// The write requests are closed field lists too, and that is the point: the
+// column-map path they replace wrote every key it was sent. On the seller
+// create path that included `seller_account_id`, `stripe_product_id`,
+// `current_version`, `published_at`, `submitted_at` and `deleted_at` — the
+// update path stripped them, the create path did not. A field that is not
+// declared here cannot reach the row from any tier. Unknown keys are ignored
+// rather than refused so that a client sending one of those protected columns
+// gets the same answer it always did on update: the row, unchanged in that
+// column.
+/// `POST /b/products/api/admin/products` and `POST /b/products/api/products`
+/// request body. Ownership, moderation and provider columns are set by the
+/// server and cannot be supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateProductRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// ISO 4217 currency. A seller product defaults to the platform default
+    /// currency when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Initial publication state. Defaults to `draft`; a seller product is
+    /// always created as `draft` regardless of this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ProductStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// Free-form key/value metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stock: Option<i64>,
+    /// Group to list the product under. A seller may only use a group they
+    /// own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_template_id: Option<String>,
+    /// Product builder template. A seller product defaults to the seeded
+    /// `default` template when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_template_id: Option<String>,
+    /// Id of a product the buyer must already own before checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfillment_kind: Option<FulfillmentKind>,
+}
+
+impl CreateProductRequest {
+    /// The columns this request writes: only the fields that were sent.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        columns(&self)
+    }
+}
+
+/// `PATCH /b/products/api/admin/products/{id}` and
+/// `PATCH /b/products/api/products/{id}` request body. Every field is
+/// optional and only the ones present are applied. Ownership, moderation and
+/// provider columns are set by the server and cannot be supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateProductRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// ISO 4217 currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Publication state. A seller may set `draft`, `active` or `archived`;
+    /// `active` on a moderated product submits it for review instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ProductStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// Free-form key/value metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stock: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_template_id: Option<String>,
+    /// Product builder template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_template_id: Option<String>,
+    /// Id of a product the buyer must already own before checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfillment_kind: Option<FulfillmentKind>,
+}
+
+impl UpdateProductRequest {
+    /// The columns this request writes: only the fields that were sent.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        columns(&self)
+    }
+}
+
+// Not declared through `.output::<T>()`: `ManagedOffer` reaches the recursive
+// `Condition`, so the endpoint schema for this response stays hand-written in
+// `mod.rs` (`product_duplicate_schema`), with the `product` half derived from
+// `ProductView`. The handler still builds this type, so the wire shape has one
+// source.
+/// Response body of the product duplication endpoints: the new draft product
+/// and its copied, editable offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProductDuplicateResponse {
+    pub product: ProductView,
+    pub offers: Vec<ManagedOffer>,
+}
+
+/// Response body of `GET /b/products/api/admin/sellers/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminSellerDetail {
+    pub seller: SellerAccount,
+    /// Every product owned by the seller's user, in any publication state.
+    pub products: Vec<ProductView>,
 }
 
 #[cfg(test)]

@@ -24,9 +24,9 @@ async fn admin_create_product() {
     let out = dispatch_admin(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     assert!(body["id"].as_str().is_some());
-    assert_eq!(body["data"]["name"], "Cloud Hosting");
-    assert_eq!(body["data"]["status"], "draft");
-    assert_eq!(body["data"]["created_by"], "admin_1");
+    assert_eq!(body["name"], "Cloud Hosting");
+    assert_eq!(body["status"], "draft");
+    assert_eq!(body["created_by"], "admin_1");
 }
 
 #[tokio::test]
@@ -74,7 +74,7 @@ async fn admin_get_product() {
     let (get_msg_data, get_input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
     let out = dispatch_admin(&ctx, get_msg_data, get_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "Widget");
+    assert_eq!(body["name"], "Widget");
 }
 
 #[tokio::test]
@@ -104,7 +104,7 @@ async fn admin_update_product() {
     update.set_meta("auth.user_roles", "admin");
     let out = dispatch_admin(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "New Name");
+    assert_eq!(body["name"], "New Name");
 }
 
 #[tokio::test]
@@ -593,8 +593,8 @@ async fn user_create_product_in_own_group() {
     );
     let out = dispatch_user(&ctx, create_prod, cp_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "Widget");
-    assert_eq!(body["data"]["created_by"], "user_1");
+    assert_eq!(body["name"], "Widget");
+    assert_eq!(body["created_by"], "user_1");
 }
 
 #[tokio::test]
@@ -728,7 +728,7 @@ async fn user_list_only_own_products() {
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["data"]["name"], "U1 Product");
+    assert_eq!(records[0]["name"], "U1 Product");
 }
 
 #[tokio::test]
@@ -757,7 +757,7 @@ async fn user_update_prevents_ownership_change() {
     );
     let out = dispatch_user(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["created_by"], "user_1");
+    assert_eq!(body["created_by"], "user_1");
 }
 
 // ============================================================
@@ -1420,15 +1420,15 @@ async fn admin_product_duplicate_copies_safe_metadata_and_non_archived_offers_as
     let duplicated = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
     let copy = &duplicated["product"];
     assert_ne!(copy["id"], source["id"]);
-    assert_eq!(copy["data"]["name"], "Original product copy");
-    assert!(copy["data"]["slug"]
+    assert_eq!(copy["name"], "Original product copy");
+    assert!(copy["slug"]
         .as_str()
         .unwrap()
         .starts_with("original-product-copy-"));
-    assert_eq!(copy["data"]["description"], "Keep this description");
-    assert_eq!(copy["data"]["status"], "draft");
-    assert_eq!(copy["data"]["owner_kind"], "platform");
-    assert_eq!(copy["data"]["approval_status"], "approved");
+    assert_eq!(copy["description"], "Keep this description");
+    assert_eq!(copy["status"], "draft");
+    assert_eq!(copy["owner_kind"], "platform");
+    assert_eq!(copy["approval_status"], "approved");
     let offers = duplicated["offers"].as_array().unwrap();
     assert_eq!(offers.len(), 1, "archived offers must not be copied");
     assert_eq!(offers[0]["status"], "draft");
@@ -1469,11 +1469,11 @@ async fn seller_product_duplicate_preserves_owner_moderation_and_rejects_other_s
 
     let (msg, input) = create_msg(&path, "seller_a", serde_json::json!({}));
     let duplicated = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(duplicated["product"]["data"]["owner_kind"], "user");
-    assert_eq!(duplicated["product"]["data"]["owner_id"], "seller_a");
-    assert_eq!(duplicated["product"]["data"]["created_by"], "seller_a");
-    assert_eq!(duplicated["product"]["data"]["status"], "draft");
-    assert_eq!(duplicated["product"]["data"]["approval_status"], "draft");
+    assert_eq!(duplicated["product"]["owner_kind"], "user");
+    assert_eq!(duplicated["product"]["owner_id"], "seller_a");
+    assert_eq!(duplicated["product"]["created_by"], "seller_a");
+    assert_eq!(duplicated["product"]["status"], "draft");
+    assert_eq!(duplicated["product"]["approval_status"], "draft");
 }
 
 #[tokio::test]
@@ -1492,7 +1492,7 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
     );
     let product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
-    assert_eq!(product["data"]["status"], "draft");
+    assert_eq!(product["status"], "draft");
 
     let offer_collection = format!("/admin/b/products/products/{product_id}/offers");
     let (msg, input) = admin_create_msg(
@@ -1546,7 +1546,7 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
         serde_json::json!({"status": "active"}),
     );
     let active_product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(active_product["data"]["status"], "active");
+    assert_eq!(active_product["status"], "active");
 
     let (msg, input) = get_msg(&format!("/b/products/storefront/{product_id}"), "");
     let storefront = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
@@ -1574,8 +1574,8 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
     );
     let product = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
-    assert_eq!(product["data"]["owner_id"], "seller_wizard");
-    assert_eq!(product["data"]["approval_status"], "draft");
+    assert_eq!(product["owner_id"], "seller_wizard");
+    assert_eq!(product["approval_status"], "draft");
 
     let offer_collection = format!("/b/products/products/{product_id}/offers");
     let (msg, input) = create_msg(
@@ -1641,8 +1641,8 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
         serde_json::json!({"status": "active"}),
     );
     let pending = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(pending["data"]["status"], "pending_review");
-    assert_eq!(pending["data"]["approval_status"], "pending");
+    assert_eq!(pending["status"], "pending_review");
+    assert_eq!(pending["approval_status"], "pending");
 
     let (msg, input) = get_msg(&format!("/b/products/storefront/{product_id}"), "");
     assert!(
@@ -2344,4 +2344,186 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
             route.template,
         );
     }
+}
+
+// ============================================================
+// Typed row projection
+// ============================================================
+
+/// Every product endpoint publishes `contracts::ProductView`, flat, with the
+/// exact field set the type declares — not the database layer's
+/// `{id, data: {column → value}}` record, and not whatever else the row holds.
+#[tokio::test]
+async fn product_endpoints_publish_the_flat_product_view() {
+    use crate::blocks::products::contracts::ProductView;
+
+    let ctx = ctx().await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({
+            "name": "Flat",
+            "tags": ["a", "b"],
+            "metadata": {"k": 1},
+            "stock": 3,
+            "fulfillment_kind": "download"
+        }),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(
+        created.get("data").is_none(),
+        "rows are flat views, not {{id, data}} records: {created}"
+    );
+    let view: ProductView =
+        serde_json::from_value(created.clone()).expect("create response is a ProductView");
+    assert_eq!(view.name, "Flat");
+    assert_eq!(view.tags, vec!["a", "b"]);
+    assert_eq!(view.metadata.get("k"), Some(&serde_json::json!(1)));
+    assert_eq!(view.stock, 3);
+    assert_eq!(view.status, "draft");
+    assert_eq!(view.owner_kind, "platform");
+    assert_eq!(view.approval_status, "approved");
+    assert_eq!(view.created_by, "admin_1");
+    assert_eq!(view.fulfillment_kind, "download");
+    assert_eq!(view.current_version, 1);
+    assert_eq!(view.published_at, None);
+    // The response carries exactly the view's keys: nothing the row holds
+    // reaches the wire unless the type names it.
+    assert_eq!(serde_json::to_value(&view).unwrap(), created);
+
+    let id = view.id.clone();
+    let (msg, input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
+    let fetched = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(fetched, created);
+
+    let (msg, input) = admin_get_msg("/admin/b/products/products");
+    let list = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(list["total_count"], 1);
+    assert_eq!(list["page"], 1);
+    assert_eq!(list["page_size"], 20);
+    assert_eq!(list["records"][0], created);
+
+    let (mut msg, input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({"description": "Renamed", "tags": ["c"]}),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    let updated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let updated_view: ProductView =
+        serde_json::from_value(updated.clone()).expect("update response is a ProductView");
+    assert_eq!(updated_view.description, "Renamed");
+    assert_eq!(updated_view.tags, vec!["c"]);
+    assert_eq!(
+        updated_view.name, "Flat",
+        "untouched columns survive a PATCH"
+    );
+    assert_eq!(serde_json::to_value(&updated_view).unwrap(), updated);
+}
+
+/// The seller create path used to hand every key of the body to the
+/// database. The update path stripped the ownership, moderation and provider
+/// columns; the create path did not, so a seller could create a product
+/// already published, already synchronized to a Stripe product they did not
+/// own, or attached to another seller's account. The typed request has no
+/// such fields, so nothing a client sends can reach them on either path.
+#[tokio::test]
+async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
+    use crate::{blocks::products::PRODUCTS_TABLE, util::RecordExt};
+
+    let ctx = user_products_ctx().await;
+    let smuggled = serde_json::json!({
+        "seller_account_id": "acct_other",
+        "stripe_product_id": "prod_hijacked",
+        "current_version": 9,
+        "published_at": "2026-01-01T00:00:00Z",
+        "submitted_at": "2026-01-01T00:00:00Z",
+        "deleted_at": "2026-01-01T00:00:00Z",
+        "owner_kind": "platform",
+        "owner_id": "attacker",
+        "created_by": "attacker",
+        "approval_status": "approved"
+    });
+    let mut body = smuggled.clone();
+    body["name"] = serde_json::json!("Sneaky");
+    let (msg, input) = create_msg("/b/products/products", "seller_a", body);
+    let created = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let assert_untouched = |row: &wafer_core::clients::database::Record| {
+        assert_eq!(row.str_field("seller_account_id"), "");
+        assert_eq!(row.str_field("stripe_product_id"), "");
+        assert_eq!(row.i64_field("current_version"), 1);
+        assert_eq!(row.str_field("published_at"), "");
+        assert_eq!(row.str_field("submitted_at"), "");
+        assert_eq!(row.str_field("deleted_at"), "");
+        assert_eq!(row.str_field("owner_kind"), "user");
+        assert_eq!(row.str_field("owner_id"), "seller_a");
+        assert_eq!(row.str_field("created_by"), "seller_a");
+        assert_eq!(row.str_field("approval_status"), "draft");
+    };
+    let row = wafer_core::clients::database::get(&ctx, PRODUCTS_TABLE, &id)
+        .await
+        .expect("created row");
+    assert_untouched(&row);
+
+    let (msg, input) = update_msg(&format!("/b/products/products/{id}"), "seller_a", smuggled);
+    let updated = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(updated["id"], id, "protected keys are ignored, not refused");
+    let row = wafer_core::clients::database::get(&ctx, PRODUCTS_TABLE, &id)
+        .await
+        .expect("updated row");
+    assert_untouched(&row);
+}
+
+/// A typed request refuses a value outside its contract instead of writing
+/// it to the column as whatever JSON arrived.
+#[tokio::test]
+async fn typed_product_writes_reject_values_outside_the_contract() {
+    let ctx = ctx().await;
+    for body in [
+        serde_json::json!({"status": "draft"}),
+        serde_json::json!({"name": "x", "status": "published"}),
+        serde_json::json!({"name": "x", "fulfillment_kind": "teleport"}),
+        serde_json::json!({"name": "x", "stock": "many"}),
+        serde_json::json!({"name": "x", "tags": "not-a-list"}),
+    ] {
+        let (msg, input) = admin_create_msg("/admin/b/products/products", body.clone());
+        assert!(
+            output_is_error(
+                dispatch_admin(&ctx, msg, input).await,
+                ErrorCode::InvalidArgument
+            )
+            .await,
+            "{body} must be refused"
+        );
+    }
+}
+
+/// Moderation writes `published_at = ""` when it returns a product to draft.
+/// The view declares that column as a nullable `date-time`, so the empty
+/// string must read as `null` rather than as a string that is not a date.
+#[tokio::test]
+async fn empty_timestamp_columns_read_as_null() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "p_blank_ts",
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Blank")),
+            ("status".to_string(), serde_json::json!("draft")),
+            ("published_at".to_string(), serde_json::json!("")),
+            (
+                "submitted_at".to_string(),
+                serde_json::json!("2026-07-01T00:00:00Z"),
+            ),
+        ]),
+    )
+    .await;
+    let (msg, input) = admin_get_msg("/admin/b/products/products/p_blank_ts");
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(body["published_at"].is_null(), "{body}");
+    assert_eq!(body["submitted_at"], "2026-07-01T00:00:00Z");
+    assert!(body["deleted_at"].is_null());
 }

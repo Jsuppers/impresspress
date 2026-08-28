@@ -990,12 +990,17 @@ mod discovery_tests {
                 serde_json::json!(["name"]),
                 "product creation must document its required name: {collection}"
             );
+            // The row is `contracts::ProductView`, flat: the `{id, data}`
+            // record envelope the untyped handlers echoed is gone.
+            let row = &collection["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["records"]["items"];
             assert_eq!(
-                collection["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-                    ["properties"]["records"]["items"]["properties"]["data"]["properties"]
-                    ["approval_status"]["type"],
-                "string",
+                row["properties"]["approval_status"]["type"], "string",
                 "builder product lists must use the commerce-v2 row contract: {collection}"
+            );
+            assert!(
+                row["properties"]["data"].is_null(),
+                "builder product rows are flat views, not {{id, data}} records: {collection}"
             );
 
             let duplicate = &paths[&format!("{prefix}/{{id}}/duplicate")]["post"];

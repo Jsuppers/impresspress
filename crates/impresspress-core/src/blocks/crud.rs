@@ -1,7 +1,18 @@
 //! Generic CRUD helpers for block handlers.
 //!
-//! These encapsulate the repeated list/get/create/update/delete patterns
-//! so each handler reduces to a one-liner for pure-CRUD operations.
+//! Two layers:
+//!
+//! * The `Result`-returning primitives (`read_json_body`, `list_page`,
+//!   `get_record`, `create_record`, `update_record`, `delete_record` and the
+//!   `*_owned` variants) do one database step each and hand back either the
+//!   row or a ready-to-send error response. A handler that publishes a typed
+//!   view composes them: parse a typed request, turn it into the column map,
+//!   run the step, project the row through `View::from_record`.
+//! * The `crud_*` functions are the untyped one-liners built on top of them:
+//!   the request body is whatever JSON object arrived, written as a column
+//!   map, and the response is the database layer's own `Record` /
+//!   `RecordList` envelope. They remain for the blocks that still speak that
+//!   shape; a block whose JSON API is typed uses the primitives directly.
 //!
 // audit-allow-file: pure pass-through helpers — every db::* call here takes
 // the table name as a `collection: &str` parameter from the caller. WRAP
@@ -10,14 +21,29 @@
 
 use std::collections::HashMap;
 
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wafer_block::db::{Filter, SortField};
-use wafer_core::clients::database::{self as db, Record};
+use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use crate::{
     http::{err_bad_request, err_internal, err_not_found, err_unauthorized, ok_json},
     util::{field_as_string, stamp_created, stamp_updated},
 };
+
+/// Response body of every CRUD delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Deleted {
+    /// Always `true`: a delete that did not happen is an error response.
+    pub deleted: bool,
+}
+
+impl Deleted {
+    /// The one value this type ever carries.
+    pub const fn done() -> Self {
+        Self { deleted: true }
+    }
+}
 
 /// Extract the record id that follows `path_prefix` in the request path.
 /// Returns `""` when the prefix doesn't match or nothing follows it.
@@ -35,8 +61,136 @@ fn id_from_path<'m>(msg: &'m Message, path_prefix: &str) -> &'m str {
     msg.path().strip_prefix(path_prefix).unwrap_or("")
 }
 
+/// The record id for a CRUD route, or the 400 a missing id turns into.
+pub fn path_id<'m>(
+    msg: &'m Message,
+    path_prefix: &str,
+    not_found_label: &str,
+) -> Result<&'m str, OutputStream> {
+    let id = id_from_path(msg, path_prefix);
+    if id.is_empty() {
+        return Err(err_bad_request(&format!(
+            "Missing {} ID",
+            not_found_label.to_lowercase()
+        )));
+    }
+    Ok(id)
+}
+
 // ---------------------------------------------------------------------------
-// CRUD helpers
+// Typed primitives
+// ---------------------------------------------------------------------------
+
+/// Deserialize the request body into `T`, or the 400 a malformed body turns
+/// into. The error text names the serde failure so a client learns which
+/// field was wrong.
+pub async fn read_json_body<T: DeserializeOwned>(input: InputStream) -> Result<T, OutputStream> {
+    let raw = input.collect_to_bytes().await;
+    serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))
+}
+
+/// One page of `collection`, with caller-supplied filters and sort (`None` =
+/// newest first by `created_at`).
+pub async fn list_page(
+    ctx: &dyn Context,
+    collection: &str,
+    page: i64,
+    page_size: i64,
+    filters: Vec<Filter>,
+    sort: Option<Vec<SortField>>,
+) -> Result<RecordList, OutputStream> {
+    let sort = sort.unwrap_or_else(|| {
+        vec![SortField {
+            field: "created_at".to_string(),
+            desc: true,
+        }]
+    });
+    db::paginated_list(ctx, collection, page, page_size, filters, sort)
+        .await
+        .map_err(|e| err_internal("Database error", e))
+}
+
+/// Fetch `id` from `collection`, mapping a missing row to a 404 labelled
+/// `not_found_label`.
+pub async fn get_record(
+    ctx: &dyn Context,
+    collection: &str,
+    id: &str,
+    not_found_label: &str,
+) -> Result<Record, OutputStream> {
+    db::get(ctx, collection, id).await.map_err(|e| {
+        if e.code == ErrorCode::NotFound {
+            err_not_found(&format!("{not_found_label} not found"))
+        } else {
+            err_internal("Database error", e)
+        }
+    })
+}
+
+/// Insert `data` into `collection`, stamping `created_at` / `updated_at`
+/// when the caller did not, and return the row as stored.
+///
+/// `db::create` hands back the map it was given plus the id — not the row.
+/// Every column the caller omitted and the table defaulted (`currency`,
+/// `current_version`, `metadata`, …) is absent from that map, so a view
+/// projected from it would report the zero value where the database holds
+/// the default. `db::update` already re-fetches by id; this does the same so
+/// a create response and a subsequent read describe the same row.
+pub async fn create_record(
+    ctx: &dyn Context,
+    collection: &str,
+    mut data: HashMap<String, serde_json::Value>,
+) -> Result<Record, OutputStream> {
+    stamp_created(&mut data);
+    let created = db::create(ctx, collection, data)
+        .await
+        .map_err(|e| err_internal("Database error", e))?;
+    db::get(ctx, collection, &created.id)
+        .await
+        .map_err(|e| err_internal("Database error", e))
+}
+
+/// Apply `data` to `id` in `collection`, stamping `updated_at`; a missing
+/// row is a 404 labelled `not_found_label`.
+pub async fn update_record(
+    ctx: &dyn Context,
+    collection: &str,
+    id: &str,
+    mut data: HashMap<String, serde_json::Value>,
+    not_found_label: &str,
+) -> Result<Record, OutputStream> {
+    stamp_updated(&mut data);
+    db::update(ctx, collection, id, data).await.map_err(|e| {
+        if e.code == ErrorCode::NotFound {
+            err_not_found(&format!("{not_found_label} not found"))
+        } else {
+            err_internal("Database error", e)
+        }
+    })
+}
+
+/// Delete `id` from `collection`; a missing row is a 404 labelled
+/// `not_found_label`.
+pub async fn delete_record(
+    ctx: &dyn Context,
+    collection: &str,
+    id: &str,
+    not_found_label: &str,
+) -> Result<Deleted, OutputStream> {
+    db::delete(ctx, collection, id)
+        .await
+        .map(|()| Deleted::done())
+        .map_err(|e| {
+            if e.code == ErrorCode::NotFound {
+                err_not_found(&format!("{not_found_label} not found"))
+            } else {
+                err_internal("Database error", e)
+            }
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Untyped one-liners over the primitives
 // ---------------------------------------------------------------------------
 
 /// List records with pagination, optional extra filters, and optional sort
@@ -49,13 +203,7 @@ pub async fn crud_list(
     sort: Option<Vec<SortField>>,
 ) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
-    let sort = sort.unwrap_or_else(|| {
-        vec![SortField {
-            field: "created_at".to_string(),
-            desc: true,
-        }]
-    });
-    match db::paginated_list(
+    match list_page(
         ctx,
         collection,
         page as i64,
@@ -66,7 +214,7 @@ pub async fn crud_list(
     .await
     {
         Ok(result) => ok_json(&result),
-        Err(e) => err_internal("Database error", e),
+        Err(response) => response,
     }
 }
 
@@ -78,16 +226,13 @@ pub async fn crud_get(
     path_prefix: &str,
     not_found_label: &str,
 ) -> OutputStream {
-    let id = id_from_path(msg, path_prefix);
-    if id.is_empty() {
-        return err_bad_request(&format!("Missing {} ID", not_found_label.to_lowercase()));
-    }
-    match db::get(ctx, collection, id).await {
+    let id = match path_id(msg, path_prefix, not_found_label) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match get_record(ctx, collection, id, not_found_label).await {
         Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("{not_found_label} not found"))
-        }
-        Err(e) => err_internal("Database error", e),
+        Err(response) => response,
     }
 }
 
@@ -99,22 +244,16 @@ pub async fn crud_create(
     collection: &str,
     defaults: HashMap<String, serde_json::Value>,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
-    let body: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
-        Ok(b) => b,
-        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    let mut data: HashMap<String, serde_json::Value> = match read_json_body(input).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
-
-    let mut data = body;
-    stamp_created(&mut data);
-
     for (key, val) in defaults {
         data.entry(key).or_insert(val);
     }
-
-    match db::create(ctx, collection, data).await {
+    match create_record(ctx, collection, data).await {
         Ok(record) => ok_json(&record),
-        Err(e) => err_internal("Database error", e),
+        Err(response) => response,
     }
 }
 
@@ -127,24 +266,17 @@ pub async fn crud_update(
     path_prefix: &str,
     not_found_label: &str,
 ) -> OutputStream {
-    let id = id_from_path(msg, path_prefix);
-    if id.is_empty() {
-        return err_bad_request(&format!("Missing {} ID", not_found_label.to_lowercase()));
-    }
-
-    let raw = input.collect_to_bytes().await;
-    let mut body: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
-        Ok(b) => b,
-        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    let id = match path_id(msg, path_prefix, not_found_label) {
+        Ok(id) => id,
+        Err(response) => return response,
     };
-    stamp_updated(&mut body);
-
-    match db::update(ctx, collection, id, body).await {
+    let body: HashMap<String, serde_json::Value> = match read_json_body(input).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    match update_record(ctx, collection, id, body, not_found_label).await {
         Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("{not_found_label} not found"))
-        }
-        Err(e) => err_internal("Database error", e),
+        Err(response) => response,
     }
 }
 
@@ -156,16 +288,13 @@ pub async fn crud_delete(
     path_prefix: &str,
     not_found_label: &str,
 ) -> OutputStream {
-    let id = id_from_path(msg, path_prefix);
-    if id.is_empty() {
-        return err_bad_request(&format!("Missing {} ID", not_found_label.to_lowercase()));
-    }
-    match db::delete(ctx, collection, id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("{not_found_label} not found"))
-        }
-        Err(e) => err_internal("Database error", e),
+    let id = match path_id(msg, path_prefix, not_found_label) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match delete_record(ctx, collection, id, not_found_label).await {
+        Ok(deleted) => ok_json(&deleted),
+        Err(response) => response,
     }
 }
 
@@ -220,17 +349,14 @@ pub async fn verify_owner(
     }
 }
 
-/// Get a single owner-scoped record by ID extracted from the path.
-pub async fn crud_get_owned(
+/// The owner-scoped record named by the path, after the ownership check.
+pub async fn get_owned(
     ctx: &dyn Context,
     msg: &Message,
     res: &OwnedResource<'_>,
-) -> OutputStream {
-    let id = id_from_path(msg, res.path_prefix);
-    if id.is_empty() {
-        return err_bad_request(&format!("Missing {} ID", res.label.to_lowercase()));
-    }
-    match verify_owner(
+) -> Result<Record, OutputStream> {
+    let id = path_id(msg, res.path_prefix, res.label)?;
+    verify_owner(
         ctx,
         res.collection,
         id,
@@ -239,7 +365,56 @@ pub async fn crud_get_owned(
         res.label,
     )
     .await
-    {
+}
+
+/// Apply `data` to the owner-scoped record named by the path, after the
+/// ownership check, stamping `updated_at`.
+pub async fn update_owned(
+    ctx: &dyn Context,
+    msg: &Message,
+    res: &OwnedResource<'_>,
+    data: HashMap<String, serde_json::Value>,
+) -> Result<Record, OutputStream> {
+    let id = path_id(msg, res.path_prefix, res.label)?.to_string();
+    verify_owner(
+        ctx,
+        res.collection,
+        &id,
+        res.owner_field,
+        msg.user_id(),
+        res.label,
+    )
+    .await?;
+    update_record(ctx, res.collection, &id, data, res.label).await
+}
+
+/// Delete the owner-scoped record named by the path, after the ownership
+/// check.
+pub async fn delete_owned(
+    ctx: &dyn Context,
+    msg: &Message,
+    res: &OwnedResource<'_>,
+) -> Result<Deleted, OutputStream> {
+    let id = path_id(msg, res.path_prefix, res.label)?.to_string();
+    verify_owner(
+        ctx,
+        res.collection,
+        &id,
+        res.owner_field,
+        msg.user_id(),
+        res.label,
+    )
+    .await?;
+    delete_record(ctx, res.collection, &id, res.label).await
+}
+
+/// Get a single owner-scoped record by ID extracted from the path.
+pub async fn crud_get_owned(
+    ctx: &dyn Context,
+    msg: &Message,
+    res: &OwnedResource<'_>,
+) -> OutputStream {
+    match get_owned(ctx, msg, res).await {
         Ok(record) => ok_json(&record),
         Err(resp) => resp,
     }
@@ -255,39 +430,16 @@ pub async fn crud_update_owned(
     res: &OwnedResource<'_>,
     strip_fields: &[&str],
 ) -> OutputStream {
-    let id = id_from_path(msg, res.path_prefix).to_string();
-    if id.is_empty() {
-        return err_bad_request(&format!("Missing {} ID", res.label.to_lowercase()));
-    }
-    if let Err(resp) = verify_owner(
-        ctx,
-        res.collection,
-        &id,
-        res.owner_field,
-        msg.user_id(),
-        res.label,
-    )
-    .await
-    {
-        return resp;
-    }
-
-    let raw = input.collect_to_bytes().await;
-    let mut body: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
-        Ok(b) => b,
-        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    let mut body: HashMap<String, serde_json::Value> = match read_json_body(input).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
     for field in strip_fields {
         body.remove(*field);
     }
-    stamp_updated(&mut body);
-
-    match db::update(ctx, res.collection, &id, body).await {
+    match update_owned(ctx, msg, res, body).await {
         Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("{} not found", res.label))
-        }
-        Err(e) => err_internal("Database error", e),
+        Err(resp) => resp,
     }
 }
 
@@ -297,27 +449,8 @@ pub async fn crud_delete_owned(
     msg: &Message,
     res: &OwnedResource<'_>,
 ) -> OutputStream {
-    let id = id_from_path(msg, res.path_prefix).to_string();
-    if id.is_empty() {
-        return err_bad_request(&format!("Missing {} ID", res.label.to_lowercase()));
-    }
-    if let Err(resp) = verify_owner(
-        ctx,
-        res.collection,
-        &id,
-        res.owner_field,
-        msg.user_id(),
-        res.label,
-    )
-    .await
-    {
-        return resp;
-    }
-    match db::delete(ctx, res.collection, &id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("{} not found", res.label))
-        }
-        Err(e) => err_internal("Database error", e),
+    match delete_owned(ctx, msg, res).await {
+        Ok(deleted) => ok_json(&deleted),
+        Err(resp) => resp,
     }
 }

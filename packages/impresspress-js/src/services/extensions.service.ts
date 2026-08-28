@@ -291,8 +291,54 @@ export interface ManagedOffer {
   offer: OfferDefinition & { id: string; product_id: string; version: number };
 }
 
+/**
+ * A product row as the owner and administrator endpoints publish it:
+ * `contracts::ProductView` — every column of the products table, flat.
+ * The `{id, data}` record envelope those endpoints used to echo is gone.
+ */
+export interface Product {
+  id: string;
+  name: string;
+  description: string;
+  slug: string;
+  currency: string;
+  status: "draft" | "pending_review" | "active" | "archived";
+  category: string;
+  tags: string[];
+  metadata: Record<string, unknown>;
+  image_url: string;
+  stock: number;
+  group_id: string;
+  type_id: string;
+  group_template_id: string;
+  product_template_id: string;
+  /** Id of a product the buyer must already own before checkout, or empty. */
+  requires: string;
+  created_by: string;
+  owner_kind: "platform" | "user";
+  owner_id: string;
+  seller_account_id: string;
+  approval_status: "draft" | "pending" | "approved" | "rejected" | "suspended";
+  fulfillment_kind: "none" | "manual" | "download" | "entitlement" | "webhook";
+  stripe_product_id: string;
+  current_version: number;
+  submitted_at: string | null;
+  published_at: string | null;
+  deleted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `{records, total_count, page, page_size}` over `Product` rows. */
+export interface ProductList {
+  records: Product[];
+  total_count: number;
+  page: number;
+  page_size: number;
+}
+
 export interface ProductDuplicateResult {
-  product: WireRecord;
+  product: Product;
   offers: ManagedOffer[];
 }
 
@@ -447,18 +493,30 @@ export interface RefundResult {
   livemode: boolean;
 }
 
+/**
+ * `contracts::CreateProductRequest` / `UpdateProductRequest`. Ownership,
+ * moderation and provider columns (`owner_id`, `approval_status`,
+ * `stripe_product_id`, …) are set by the server; a key that is not listed
+ * here is ignored, not written.
+ */
 export interface ProductDraft {
   name: string;
   slug?: string;
   description?: string;
-  image_url?: string;
-  tags?: string[];
-  group_id?: string;
-  product_template_id?: string;
-  fulfillment_kind?: "none" | "manual" | "download" | "entitlement" | "webhook";
+  currency?: string;
   status?: "draft" | "pending_review" | "active" | "archived";
+  category?: string;
+  tags?: string[];
   metadata?: Record<string, unknown>;
-  [key: string]: unknown;
+  image_url?: string;
+  stock?: number;
+  group_id?: string;
+  type_id?: string;
+  group_template_id?: string;
+  product_template_id?: string;
+  /** Id of a product the buyer must already own before checkout. */
+  requires?: string;
+  fulfillment_kind?: "none" | "manual" | "download" | "entitlement" | "webhook";
 }
 
 export interface CheckoutPreset {
@@ -631,7 +689,7 @@ export interface SellerAccount {
 
 export interface AdminSellerDetail {
   seller: SellerAccount;
-  products: WireRecord[];
+  products: Product[];
 }
 
 /** Typed client for public, buyer, seller, and admin products APIs. */
@@ -664,18 +722,18 @@ export class ProductsExtension extends ExtensionsService {
   }
 
   /** Create a product (admin). `POST /b/products/api/admin/products`. */
-  async createProduct(data: ProductDraft): Promise<WireRecord> {
+  async createProduct(data: ProductDraft): Promise<Product> {
     return this.call("products", "api/admin/products", {
       method: "POST",
       data,
     });
   }
 
-  async getProduct(productId: string): Promise<WireRecord> {
+  async getProduct(productId: string): Promise<Product> {
     return this.call("products", `api/admin/products/${encodeURIComponent(productId)}`);
   }
 
-  async updateProduct(productId: string, data: Partial<ProductDraft>): Promise<WireRecord> {
+  async updateProduct(productId: string, data: Partial<ProductDraft>): Promise<Product> {
     return this.call("products", `api/admin/products/${encodeURIComponent(productId)}`, {
       method: "PATCH",
       data,
@@ -690,19 +748,19 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", `api/admin/products/${encodeURIComponent(productId)}/duplicate`, { method: "POST" });
   }
 
-  async listSellerProducts(options?: { page?: number; page_size?: number; status?: string; search?: string }): Promise<WireRecordList> {
+  async listSellerProducts(options?: { page?: number; page_size?: number; group_id?: string; status?: string; search?: string }): Promise<ProductList> {
     return this.call("products", "api/products", { params: options });
   }
 
-  async createSellerProduct(data: ProductDraft): Promise<WireRecord> {
+  async createSellerProduct(data: ProductDraft): Promise<Product> {
     return this.call("products", "api/products", { method: "POST", data });
   }
 
-  async getSellerProduct(productId: string): Promise<WireRecord> {
+  async getSellerProduct(productId: string): Promise<Product> {
     return this.call("products", `api/products/${encodeURIComponent(productId)}`);
   }
 
-  async updateSellerProduct(productId: string, data: Partial<ProductDraft>): Promise<WireRecord> {
+  async updateSellerProduct(productId: string, data: Partial<ProductDraft>): Promise<Product> {
     return this.call("products", `api/products/${encodeURIComponent(productId)}`, {
       method: "PATCH",
       data,
@@ -811,11 +869,11 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", `api/admin/sellers/${encodeURIComponent(sellerId)}/reactivate`, { method: "POST" });
   }
 
-  async approveSellerProduct(productId: string): Promise<WireRecord> {
+  async approveSellerProduct(productId: string): Promise<Product> {
     return this.call("products", `api/admin/products/${encodeURIComponent(productId)}/approve`, { method: "POST" });
   }
 
-  async rejectSellerProduct(productId: string): Promise<WireRecord> {
+  async rejectSellerProduct(productId: string): Promise<Product> {
     return this.call("products", `api/admin/products/${encodeURIComponent(productId)}/reject`, { method: "POST" });
   }
 
