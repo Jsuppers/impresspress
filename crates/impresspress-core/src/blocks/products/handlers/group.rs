@@ -65,6 +65,12 @@ pub(super) async fn handle_create_group(
     let mut data = request.into_columns();
     data.entry("user_id".to_string())
         .or_insert_with(|| serde_json::Value::String(msg.user_id().to_string()));
+    // The creator is the caller, as for products: the administrator here even
+    // when the body assigns the group to someone else as its owner.
+    data.insert(
+        "created_by".to_string(),
+        serde_json::Value::String(msg.user_id().to_string()),
+    );
     match crud::create_record(ctx, GROUPS_TABLE, data).await {
         Ok(record) => ok_json(&GroupView::from_record(&record)),
         Err(response) => response,
@@ -143,7 +149,11 @@ pub(super) async fn handle_user_create_group(
         Err(response) => return response,
     };
     let mut body = request.into_columns();
-    body.insert("user_id".to_string(), serde_json::Value::String(user_id));
+    body.insert(
+        "user_id".to_string(),
+        serde_json::Value::String(user_id.clone()),
+    );
+    body.insert("created_by".to_string(), serde_json::Value::String(user_id));
     // Default group_template_id to the seeded "default" template's real
     // (UUIDv7) id — same reasoning as for product_template_id in
     // `product::handle_user_create_product`.

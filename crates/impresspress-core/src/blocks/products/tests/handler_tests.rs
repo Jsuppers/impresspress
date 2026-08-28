@@ -2567,6 +2567,39 @@ async fn group_endpoints_publish_the_flat_group_view() {
     assert_eq!(deleted, serde_json::json!({"deleted": true}));
 }
 
+/// A group records who created it the way a product does: the caller, on
+/// both tiers. On the admin tier that is the administrator even when the
+/// body assigns the group to someone else as `user_id`; on the owner tier it
+/// is the owner. `created_by` is not a request field, so a body naming
+/// someone else is ignored rather than honoured.
+#[tokio::test]
+async fn group_creates_record_the_caller_as_created_by() {
+    let ctx = user_products_ctx().await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/groups",
+        serde_json::json!({"name": "Assigned", "user_id": "someone", "created_by": "attacker"}),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(created["user_id"], "someone");
+    assert_eq!(
+        created["created_by"], "admin_1",
+        "the admin tier records the administrator: {created}"
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "Mine", "created_by": "attacker"}),
+    );
+    let own = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(own["user_id"], "user_1");
+    assert_eq!(
+        own["created_by"], "user_1",
+        "the owner tier records the owner: {own}"
+    );
+}
+
 /// The type endpoints publish `contracts::ProductTypeView`, flat, with
 /// `is_system` normalized to a boolean whichever way the backend stores it.
 #[tokio::test]

@@ -1810,8 +1810,8 @@ pub struct GroupView {
     pub user_id: String,
     /// `active` unless the group has been retired.
     pub status: String,
-    /// Id of the user who created the row; empty when the row was created
-    /// through the admin API, which records the owner in `user_id` instead.
+    /// Id of the user who created the row: the administrator on the admin
+    /// tier (the owner is `user_id`), the owner on the owner tier.
     pub created_by: String,
     /// RFC 3339 creation timestamp.
     #[schemars(extend("format" = "date-time"))]

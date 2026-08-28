@@ -56,7 +56,7 @@
                           "type": "string"
                         },
                         "created_by": {
-                          "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                          "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                           "type": "string"
                         },
                         "description": {
@@ -193,7 +193,7 @@
                     "type": "string"
                   },
                   "created_by": {
-                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                     "type": "string"
                   },
                   "description": {
@@ -372,7 +372,7 @@
                     "type": "string"
                   },
                   "created_by": {
-                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                     "type": "string"
                   },
                   "description": {
@@ -14664,7 +14664,7 @@
                           "type": "string"
                         },
                         "created_by": {
-                          "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                          "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                           "type": "string"
                         },
                         "description": {
@@ -14794,7 +14794,7 @@
                     "type": "string"
                   },
                   "created_by": {
-                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                     "type": "string"
                   },
                   "description": {
@@ -14926,7 +14926,7 @@
                     "type": "string"
                   },
                   "created_by": {
-                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                     "type": "string"
                   },
                   "description": {
@@ -15049,7 +15049,7 @@
                     "type": "string"
                   },
                   "created_by": {
-                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
                     "type": "string"
                   },
                   "description": {
