@@ -2,7 +2,11 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use super::{
-    contracts::{RefundRequest, RefundResult, RefundResultStatus},
+    contracts::{
+        AdminPurchaseListQuery, DisputeView, LineItemView, PageQuery, PurchaseDetailResponse,
+        PurchaseListResponse, PurchaseView, RefundRequest, RefundResult, RefundResultStatus,
+        RefundView, SellerOrderListQuery,
+    },
     repo, stripe_provider,
 };
 use crate::{
@@ -10,47 +14,51 @@ use crate::{
     util::RecordExt,
 };
 
+/// One page of order rows, newest first, projected as a list response.
+async fn list_orders(
+    ctx: &dyn Context,
+    filters: Vec<Filter>,
+    page: u32,
+    page_size: u32,
+) -> OutputStream {
+    match repo::purchases::list_paginated(ctx, filters, i64::from(page), i64::from(page_size)).await
+    {
+        Ok(result) => ok_json(&PurchaseListResponse::from_record_list(&result)),
+        Err(e) => err_internal("Database error", e),
+    }
+}
+
 pub async fn handle_list_user(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
-    let (page, page_size, _) = msg.pagination_params(20);
+    let query = PageQuery::from_message(msg);
 
     let filters = vec![Filter {
         field: "user_id".to_string(),
         operator: FilterOp::Equal,
         value: serde_json::Value::String(user_id),
     }];
-
-    match repo::purchases::list_paginated(ctx, filters, page as i64, page_size as i64).await {
-        Ok(result) => ok_json(&result),
-        Err(e) => err_internal("Database error", e),
-    }
+    list_orders(ctx, filters, query.page, query.page_size).await
 }
 
 pub async fn handle_list_admin(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let (page, page_size, _) = msg.pagination_params(20);
+    let query = AdminPurchaseListQuery::from_message(msg);
 
     let mut filters = Vec::new();
-    let status = msg.query("status").to_string();
-    if !status.is_empty() {
+    if let Some(status) = &query.status {
         filters.push(Filter {
             field: "status".to_string(),
             operator: FilterOp::Equal,
-            value: serde_json::Value::String(status),
+            value: serde_json::Value::String(status.clone()),
         });
     }
-    let user_id = msg.query("user_id").to_string();
-    if !user_id.is_empty() {
+    if let Some(user_id) = &query.user_id {
         filters.push(Filter {
             field: "user_id".to_string(),
             operator: FilterOp::Equal,
-            value: serde_json::Value::String(user_id),
+            value: serde_json::Value::String(user_id.clone()),
         });
     }
-
-    match repo::purchases::list_paginated(ctx, filters, page as i64, page_size as i64).await {
-        Ok(result) => ok_json(&result),
-        Err(e) => err_internal("Database error", e),
-    }
+    list_orders(ctx, filters, query.page, query.page_size).await
 }
 
 pub async fn handle_list_seller(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -59,24 +67,20 @@ pub async fn handle_list_seller(ctx: &dyn Context, msg: &Message) -> OutputStrea
         Ok(None) => return err_forbidden("Complete seller setup before viewing seller orders"),
         Err(error) => return err_internal("Database error", error),
     };
-    let (page, page_size, _) = msg.pagination_params(20);
+    let query = SellerOrderListQuery::from_message(msg);
     let mut filters = vec![Filter {
         field: "seller_account_id".to_string(),
         operator: FilterOp::Equal,
         value: serde_json::json!(account.id),
     }];
-    let status = msg.query("status").to_string();
-    if !status.is_empty() && status != "all" {
+    if let Some(status) = &query.status {
         filters.push(Filter {
             field: "status".to_string(),
             operator: FilterOp::Equal,
             value: serde_json::json!(status),
         });
     }
-    match repo::purchases::list_paginated(ctx, filters, page as i64, page_size as i64).await {
-        Ok(result) => ok_json(&result),
-        Err(error) => err_internal("Database error", error),
-    }
+    list_orders(ctx, filters, query.page, query.page_size).await
 }
 
 async fn purchase_response(
@@ -95,12 +99,12 @@ async fn purchase_response(
         Ok(disputes) => disputes,
         Err(error) => return err_internal("Could not load purchase disputes", error),
     };
-    ok_json(&serde_json::json!({
-        "purchase": purchase,
-        "line_items": line_items,
-        "refunds": refunds,
-        "disputes": disputes
-    }))
+    ok_json(&PurchaseDetailResponse {
+        purchase: PurchaseView::from_record(&purchase),
+        line_items: line_items.iter().map(LineItemView::from_record).collect(),
+        refunds: refunds.iter().map(RefundView::from_record).collect(),
+        disputes: disputes.iter().map(DisputeView::from_record).collect(),
+    })
 }
 
 pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {

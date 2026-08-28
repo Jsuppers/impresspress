@@ -70,9 +70,192 @@ async fn get_purchase_own() {
     let body = output_to_json(out).await;
     assert_eq!(body["purchase"]["id"], "pur_own");
     assert_eq!(
-        body["disputes"][0]["data"]["provider_dispute_id"],
+        body["disputes"][0]["provider_dispute_id"],
         "dp_provider_own"
     );
+}
+
+/// The order list and detail endpoints publish `contracts::PurchaseView`
+/// rows (and `LineItemView` / `RefundView` / `DisputeView` under the detail),
+/// flat, with exactly the types' field sets. Two columns the raw echo used
+/// to hand out are withheld everywhere: `receipt_token_hash`, the sha256 of
+/// the guest receipt capability, together with its expiry, and on refund
+/// rows `idempotency_key` and `response_json`, which the block's own
+/// provider-operation projection already keeps private.
+#[tokio::test]
+async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
+    use crate::blocks::products::contracts::{PurchaseDetailResponse, PurchaseListResponse};
+
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_typed",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("buyer_user_id".to_string(), serde_json::json!("user_1")),
+            (
+                "buyer_email".to_string(),
+                serde_json::json!("buyer@example.com"),
+            ),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(5000)),
+            ("livemode".to_string(), serde_json::json!(1)),
+            (
+                "subscription_cancel_at_period_end".to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                "metadata".to_string(),
+                serde_json::json!({"offer_id": "offer_1", "offer_version": 2}),
+            ),
+            (
+                "receipt_token_hash".to_string(),
+                serde_json::json!("deadbeef-digest"),
+            ),
+            (
+                "receipt_token_expires_at".to_string(),
+                serde_json::json!("2026-08-01T00:00:00Z"),
+            ),
+            (
+                "payment_at".to_string(),
+                serde_json::json!("2026-07-19T01:02:03Z"),
+            ),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        "impresspress__products__line_items",
+        "li_typed",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("pur_typed")),
+            ("product_id".to_string(), serde_json::json!("prod_1")),
+            ("product_name".to_string(), serde_json::json!("Widget")),
+            ("quantity".to_string(), serde_json::json!(2)),
+            ("total_minor".to_string(), serde_json::json!(5000)),
+            (
+                "input_snapshot".to_string(),
+                serde_json::json!({"size": "large"}),
+            ),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        super::super::repo::refunds::TABLE,
+        "rf_typed",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("pur_typed")),
+            (
+                "payment_intent_id".to_string(),
+                serde_json::json!("pi_typed"),
+            ),
+            (
+                "idempotency_key".to_string(),
+                serde_json::json!("impresspress_refund_pur_typed_full"),
+            ),
+            ("amount_minor".to_string(), serde_json::json!(1000)),
+            (
+                "target_refunded_total_minor".to_string(),
+                serde_json::json!(1000),
+            ),
+            ("currency".to_string(), serde_json::json!("USD")),
+            ("status".to_string(), serde_json::json!("succeeded")),
+            ("note".to_string(), serde_json::json!("goodwill")),
+            (
+                "response_json".to_string(),
+                serde_json::json!("{\"id\":\"re_secret\"}"),
+            ),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        super::super::repo::disputes::TABLE,
+        "dp_typed",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("pur_typed")),
+            (
+                "provider_dispute_id".to_string(),
+                serde_json::json!("dp_provider_typed"),
+            ),
+            (
+                "payment_intent_id".to_string(),
+                serde_json::json!("pi_typed"),
+            ),
+            ("status".to_string(), serde_json::json!("needs_response")),
+            ("amount_minor".to_string(), serde_json::json!(1000)),
+            ("currency".to_string(), serde_json::json!("USD")),
+            ("livemode".to_string(), serde_json::json!(1)),
+        ]),
+    )
+    .await;
+
+    let (msg, _input) = get_msg("/b/products/purchases/pur_typed", "user_1");
+    let body = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    let detail: PurchaseDetailResponse =
+        serde_json::from_value(body.clone()).expect("PurchaseDetailResponse");
+    assert_eq!(serde_json::to_value(&detail).unwrap(), body);
+    assert_eq!(detail.purchase.id, "pur_typed");
+    assert_eq!(detail.purchase.total_cents, 5000);
+    assert!(
+        detail.purchase.livemode,
+        "INTEGER column reads as a boolean"
+    );
+    assert!(!detail.purchase.subscription_cancel_at_period_end);
+    assert_eq!(
+        detail.purchase.metadata.get("offer_id"),
+        Some(&serde_json::json!("offer_1"))
+    );
+    assert_eq!(
+        detail.purchase.payment_at.as_deref(),
+        Some("2026-07-19T01:02:03Z")
+    );
+    assert_eq!(detail.line_items[0].product_name, "Widget");
+    assert_eq!(detail.line_items[0].quantity, 2);
+    assert_eq!(
+        serde_json::Value::Object(detail.line_items[0].input_snapshot.clone()),
+        serde_json::json!({"size": "large"})
+    );
+    assert_eq!(detail.refunds[0].note, "goodwill");
+    assert_eq!(detail.refunds[0].amount_minor, 1000);
+    assert_eq!(detail.disputes[0].provider_dispute_id, "dp_provider_typed");
+    assert!(detail.disputes[0].livemode);
+
+    let encoded = body.to_string();
+    for withheld in [
+        "receipt_token_hash",
+        "receipt_token_expires_at",
+        "deadbeef-digest",
+        "idempotency_key",
+        "impresspress_refund_pur_typed_full",
+        "response_json",
+        "re_secret",
+    ] {
+        assert!(
+            !encoded.contains(withheld),
+            "detail leaked {withheld}: {body}"
+        );
+    }
+
+    let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    let list = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
+    let typed: PurchaseListResponse =
+        serde_json::from_value(list.clone()).expect("PurchaseListResponse");
+    assert_eq!(serde_json::to_value(&typed).unwrap(), list);
+    assert_eq!(typed.records[0].id, "pur_typed");
+    assert_eq!(typed.page_size, 20);
+    let encoded = list.to_string();
+    assert!(
+        !encoded.contains("receipt_token"),
+        "list leaked the digest: {list}"
+    );
+
+    let (mut msg, _input) = get_msg("/admin/b/products/purchases", "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let admin_list = output_to_json(purchase::handle_list_admin(&ctx, &msg).await).await;
+    assert_eq!(admin_list["records"][0], list["records"][0]);
 }
 
 #[tokio::test]

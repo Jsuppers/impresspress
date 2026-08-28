@@ -946,9 +946,11 @@ mod discovery_tests {
                 && stripe_status["publishable_key"].is_null(),
             "Stripe health discovery must never expose credential values: {stripe_status}"
         );
+        // Order rows are flat `contracts::*View`s; the `{id, data}` record
+        // envelope is gone from the detail's `purchase` and `disputes`.
         let order_dispute = &paths["/b/products/api/admin/purchases/{id}"]["get"]["responses"]
             ["200"]["content"]["application/json"]["schema"]["properties"]["disputes"]["items"]
-            ["properties"]["data"]["properties"];
+            ["properties"];
         assert_eq!(order_dispute["amount_minor"]["type"], "integer");
         assert!(
             order_dispute["status"]["enum"]
@@ -958,7 +960,12 @@ mod discovery_tests {
         );
         let order_payment = &paths["/b/products/api/admin/purchases/{id}"]["get"]["responses"]
             ["200"]["content"]["application/json"]["schema"]["properties"]["purchase"]
-            ["properties"]["data"]["properties"];
+            ["properties"];
+        assert!(
+            order_payment["receipt_token_hash"].is_null()
+                && order_payment["receipt_token_expires_at"].is_null(),
+            "the guest receipt digest is never published on an order row: {order_payment}"
+        );
         assert_eq!(
             order_payment["payment_intent_event_created"]["type"],
             "integer"

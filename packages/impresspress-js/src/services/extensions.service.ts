@@ -663,7 +663,9 @@ export type DisputeStatus =
   | "lost"
   | "prevented";
 
-export interface DisputeSummary {
+/** `contracts::DisputeView`: the durable projection of a provider dispute. */
+export interface Dispute {
+  id: string;
   purchase_id: string;
   seller_account_id: string;
   stripe_account_id: string;
@@ -674,26 +676,127 @@ export interface DisputeSummary {
   amount_minor: number;
   currency: string;
   reason: string;
-  evidence_due_by?: string;
+  evidence_due_by: string | null;
   livemode: boolean;
   event_created: number;
-  closed_at?: string;
+  closed_at: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export type PurchaseRecordData = Record<string, unknown> & {
+/**
+ * `contracts::PurchaseView`: an order row, flat. The guest receipt digest
+ * (`receipt_token_hash`, `receipt_token_expires_at`) is never published.
+ */
+export interface Purchase {
+  id: string;
+  user_id: string;
+  buyer_user_id: string;
+  buyer_email: string;
+  seller_account_id: string;
+  stripe_account_id: string;
+  stripe_customer_id: string;
+  stripe_subscription_id: string;
+  status: string;
+  checkout_mode: "hosted" | "embedded" | "payment_link";
+  provider: string;
+  livemode: boolean;
+  currency: string;
+  amount_cents: number;
+  subtotal_cents: number;
+  discount_cents: number;
+  tax_cents: number;
+  shipping_cents: number;
+  platform_fee_cents: number;
+  total_cents: number;
+  refunded_total_cents: number;
+  metadata: Record<string, unknown>;
+  stripe_payment_intent_id: string;
+  provider_payment_intent_id: string;
+  provider_session_id: string;
   provider_payment_status: "" | "succeeded" | "payment_failed" | "processing" | "requires_action" | "canceled";
   provider_payment_error_code: string;
   provider_payment_error_message: string;
   payment_intent_event_created: number;
-};
+  reconciliation_status: string;
+  reconciliation_error: string;
+  subscription_status: string;
+  subscription_current_period_end: string | null;
+  subscription_cancel_at_period_end: boolean;
+  subscription_canceled_at: string | null;
+  subscription_last_synced_at: string | null;
+  subscription_event_created: number;
+  approved_at: string | null;
+  payment_at: string | null;
+  refunded_at: string | null;
+  refunded_by: string;
+  refund_reason: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `{records, total_count, page, page_size}` over `Purchase` rows. */
+export interface PurchaseList {
+  records: Purchase[];
+  total_count: number;
+  page: number;
+  page_size: number;
+}
+
+/** `contracts::LineItemView`: one line of an order. */
+export interface LineItem {
+  id: string;
+  purchase_id: string;
+  product_id: string;
+  product_name: string;
+  quantity: number;
+  offer_id: string;
+  offer_version: number;
+  component_id: string;
+  seller_account_id: string;
+  stripe_price_id: string;
+  unit_amount_minor: number;
+  subtotal_minor: number;
+  discount_minor: number;
+  tax_minor: number;
+  total_minor: number;
+  input_snapshot: Record<string, unknown>;
+  condition_snapshot: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * `contracts::RefundView`: one refund on an order. The Stripe idempotency
+ * key and raw provider response are never published.
+ */
+export interface Refund {
+  id: string;
+  purchase_id: string;
+  provider_refund_id: string;
+  payment_intent_id: string;
+  stripe_account_id: string;
+  amount_minor: number;
+  target_refunded_total_minor: number;
+  currency: string;
+  status: string;
+  provider_status: string;
+  provider_reason: string;
+  note: string;
+  refunded_by: string;
+  livemode: boolean;
+  last_error: string;
+  completed_at: string | null;
+  stripe_event_created: number;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface PurchaseDetail {
-  purchase: WireRecord<PurchaseRecordData>;
-  line_items: WireRecord[];
-  refunds: WireRecord[];
-  disputes: Array<WireRecord<DisputeSummary>>;
+  purchase: Purchase;
+  line_items: LineItem[];
+  refunds: Refund[];
+  disputes: Dispute[];
 }
 
 export interface SellerAccount {
@@ -943,7 +1046,7 @@ export class ProductsExtension extends ExtensionsService {
     });
   }
 
-  async listAdminOrders(options?: { page?: number; page_size?: number; status?: string }): Promise<WireRecordList> {
+  async listAdminOrders(options?: { page?: number; page_size?: number; status?: string; user_id?: string }): Promise<PurchaseList> {
     return this.call("products", "api/admin/purchases", { params: options });
   }
 
@@ -955,7 +1058,7 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", `api/admin/purchases/${encodeURIComponent(orderId)}/refund`, { method: "POST", data: request });
   }
 
-  async listPurchases(options?: { page?: number; page_size?: number }): Promise<WireRecordList> {
+  async listPurchases(options?: { page?: number; page_size?: number }): Promise<PurchaseList> {
     return this.call("products", "purchases", { params: options });
   }
 
@@ -993,7 +1096,7 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", "api/seller/stats");
   }
 
-  async listSellerOrders(options?: { page?: number; page_size?: number; status?: string }): Promise<WireRecordList> {
+  async listSellerOrders(options?: { page?: number; page_size?: number; status?: string }): Promise<PurchaseList> {
     return this.call("products", "api/seller/orders", { params: options });
   }
 

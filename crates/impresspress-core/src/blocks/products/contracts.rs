@@ -1863,6 +1863,489 @@ impl GroupTemplateListResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+// Two columns of `impresspress__products__purchases` are deliberately NOT
+// published, on any tier (buyer, seller, admin). The reasons live in this
+// plain comment rather than the doc comment: a `///` line is published as the
+// schema's `description`.
+//
+// * `receipt_token_hash` — the sha256 of the guest receipt capability issued
+//   at checkout (`CheckoutResponse::receipt_token`). Whoever holds the raw
+//   token can read the order's status without a session; the digest is what
+//   the server compares it against. Credential material of the same class as
+//   the admin block's withheld `verification_token`; it has no use on any
+//   order page, and the untyped handler only ever emitted it because it
+//   echoed the whole row.
+// * `receipt_token_expires_at` — the capability's expiry, meaningful only
+//   beside the digest.
+/// An order row: `impresspress__products__purchases`, as published to the
+/// buyer, the seller and administrators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PurchaseView {
+    /// Stable order identifier.
+    pub id: String,
+    /// Legacy owner column; equals `buyer_user_id` for orders placed while
+    /// signed in and is empty for guest orders.
+    pub user_id: String,
+    /// Signed-in buyer's user id, or empty for a guest order.
+    pub buyer_user_id: String,
+    /// Buyer's email address as captured at checkout, or empty.
+    pub buyer_email: String,
+    /// Seller account the order was placed against; empty for platform
+    /// products.
+    pub seller_account_id: String,
+    /// Stripe connected account the order was charged through; empty for
+    /// platform products.
+    pub stripe_account_id: String,
+    /// Stripe Customer id, or empty.
+    pub stripe_customer_id: String,
+    /// Stripe Subscription id for subscription orders, or empty.
+    pub stripe_subscription_id: String,
+    /// Order state: `pending`, `completed`, `partially_refunded`,
+    /// `refunded` or `failed`.
+    pub status: String,
+    /// Checkout presentation the order was started with.
+    #[schemars(extend("enum" = ["hosted", "embedded", "payment_link"]))]
+    pub checkout_mode: String,
+    /// Payment provider: `stripe`, or `manual` for orders recorded outside a
+    /// provider.
+    pub provider: String,
+    /// Whether the order was placed against the live Stripe environment.
+    pub livemode: bool,
+    /// ISO 4217 currency of every amount on the order.
+    pub currency: String,
+    /// Legacy amount column, in minor units. Prefer `total_cents`.
+    pub amount_cents: i64,
+    pub subtotal_cents: i64,
+    pub discount_cents: i64,
+    pub tax_cents: i64,
+    pub shipping_cents: i64,
+    pub platform_fee_cents: i64,
+    /// Final charged amount in minor units.
+    pub total_cents: i64,
+    /// Sum of succeeded refunds in minor units.
+    pub refunded_total_cents: i64,
+    /// Immutable checkout snapshot: the offer id and version the order was
+    /// priced against and the shipping amounts allowed at checkout.
+    pub metadata: serde_json::Map<String, Value>,
+    /// Stripe PaymentIntent id, or empty.
+    pub stripe_payment_intent_id: String,
+    /// PaymentIntent id as recorded from the provider event stream, or empty.
+    pub provider_payment_intent_id: String,
+    /// Stripe Checkout Session id, or empty.
+    pub provider_session_id: String,
+    /// Latest PaymentIntent state received from the provider.
+    #[schemars(extend("enum" = ["", "succeeded", "payment_failed", "processing", "requires_action", "canceled"]))]
+    pub provider_payment_status: String,
+    pub provider_payment_error_code: String,
+    pub provider_payment_error_message: String,
+    /// Provider timestamp (Unix seconds) of the PaymentIntent event that
+    /// last updated the payment state; `0` until one arrives.
+    pub payment_intent_event_created: i64,
+    /// Whether the provider's view of the order has been reconciled with the
+    /// local snapshot: `pending`, `reconciled` or `failed`.
+    pub reconciliation_status: String,
+    pub reconciliation_error: String,
+    /// Stripe subscription lifecycle state for subscription orders, or
+    /// empty.
+    pub subscription_status: String,
+    /// RFC 3339 end of the current billing period, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub subscription_current_period_end: Option<String>,
+    pub subscription_cancel_at_period_end: bool,
+    /// RFC 3339 timestamp the subscription was canceled, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub subscription_canceled_at: Option<String>,
+    /// RFC 3339 timestamp the subscription state was last synchronized from
+    /// the provider, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub subscription_last_synced_at: Option<String>,
+    /// Provider timestamp (Unix seconds) of the subscription event that last
+    /// updated the subscription state; `0` until one arrives.
+    pub subscription_event_created: i64,
+    /// RFC 3339 timestamp the order was approved, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub approved_at: Option<String>,
+    /// RFC 3339 timestamp payment was recorded, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub payment_at: Option<String>,
+    /// RFC 3339 timestamp of the last refund applied, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub refunded_at: Option<String>,
+    /// User id of the operator who issued the last refund, or empty.
+    pub refunded_by: String,
+    /// Operator note attached to the last refund, or empty.
+    pub refund_reason: String,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl PurchaseView {
+    /// Project an `impresspress__products__purchases` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            user_id: record.str_field("user_id").to_string(),
+            buyer_user_id: record.str_field("buyer_user_id").to_string(),
+            buyer_email: record.str_field("buyer_email").to_string(),
+            seller_account_id: record.str_field("seller_account_id").to_string(),
+            stripe_account_id: record.str_field("stripe_account_id").to_string(),
+            stripe_customer_id: record.str_field("stripe_customer_id").to_string(),
+            stripe_subscription_id: record.str_field("stripe_subscription_id").to_string(),
+            status: record.str_field("status").to_string(),
+            checkout_mode: record.str_field("checkout_mode").to_string(),
+            provider: record.str_field("provider").to_string(),
+            livemode: record.bool_field("livemode"),
+            currency: record.str_field("currency").to_string(),
+            amount_cents: record.i64_field("amount_cents"),
+            subtotal_cents: record.i64_field("subtotal_cents"),
+            discount_cents: record.i64_field("discount_cents"),
+            tax_cents: record.i64_field("tax_cents"),
+            shipping_cents: record.i64_field("shipping_cents"),
+            platform_fee_cents: record.i64_field("platform_fee_cents"),
+            total_cents: record.i64_field("total_cents"),
+            refunded_total_cents: record.i64_field("refunded_total_cents"),
+            metadata: record.json_object_field("metadata"),
+            stripe_payment_intent_id: record.str_field("stripe_payment_intent_id").to_string(),
+            provider_payment_intent_id: record.str_field("provider_payment_intent_id").to_string(),
+            provider_session_id: record.str_field("provider_session_id").to_string(),
+            provider_payment_status: record.str_field("provider_payment_status").to_string(),
+            provider_payment_error_code: record
+                .str_field("provider_payment_error_code")
+                .to_string(),
+            provider_payment_error_message: record
+                .str_field("provider_payment_error_message")
+                .to_string(),
+            payment_intent_event_created: record.i64_field("payment_intent_event_created"),
+            reconciliation_status: record.str_field("reconciliation_status").to_string(),
+            reconciliation_error: record.str_field("reconciliation_error").to_string(),
+            subscription_status: record.str_field("subscription_status").to_string(),
+            subscription_current_period_end: timestamp_field(
+                record,
+                "subscription_current_period_end",
+            ),
+            subscription_cancel_at_period_end: record
+                .bool_field("subscription_cancel_at_period_end"),
+            subscription_canceled_at: timestamp_field(record, "subscription_canceled_at"),
+            subscription_last_synced_at: timestamp_field(record, "subscription_last_synced_at"),
+            subscription_event_created: record.i64_field("subscription_event_created"),
+            approved_at: timestamp_field(record, "approved_at"),
+            payment_at: timestamp_field(record, "payment_at"),
+            refunded_at: timestamp_field(record, "refunded_at"),
+            refunded_by: record.str_field("refunded_by").to_string(),
+            refund_reason: record.str_field("refund_reason").to_string(),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// One page of order rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PurchaseListResponse {
+    /// Orders on this page, newest first.
+    pub records: Vec<PurchaseView>,
+    /// Total orders matching the filters, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl PurchaseListResponse {
+    /// Project a `RecordList` of order rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list.records.iter().map(PurchaseView::from_record).collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// Query parameters accepted by `GET /b/products/api/admin/purchases`.
+///
+/// Built by [`Self::from_message`], which is the handler's only source for
+/// these values.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+pub struct AdminPurchaseListQuery {
+    /// 1-based page number. Values below 1 clamp to 1.
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// Rows per page, capped at 100.
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+    /// Exact-match filter on the order state.
+    pub status: Option<String>,
+    /// Exact-match filter on the legacy owner column `user_id`.
+    pub user_id: Option<String>,
+}
+
+impl AdminPurchaseListQuery {
+    /// Resolve the query string on `msg`.
+    pub fn from_message(msg: &Message) -> Self {
+        let (page, page_size, _) = msg.pagination_params(DEFAULT_PAGE_SIZE as usize);
+        Self {
+            page: page as u32,
+            page_size: page_size as u32,
+            status: non_empty(msg.query("status")),
+            user_id: non_empty(msg.query("user_id")),
+        }
+    }
+}
+
+/// Query parameters accepted by `GET /b/products/api/seller/orders`.
+///
+/// Built by [`Self::from_message`], which is the handler's only source for
+/// these values.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+pub struct SellerOrderListQuery {
+    /// 1-based page number. Values below 1 clamp to 1.
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// Rows per page, capped at 100.
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+    /// Exact-match filter on the order state. `all` (or omitting the
+    /// parameter) returns every state.
+    pub status: Option<String>,
+}
+
+impl SellerOrderListQuery {
+    /// Resolve the query string on `msg`. `status=all` reads as no filter.
+    pub fn from_message(msg: &Message) -> Self {
+        let (page, page_size, _) = msg.pagination_params(DEFAULT_PAGE_SIZE as usize);
+        Self {
+            page: page as u32,
+            page_size: page_size as u32,
+            status: non_empty(msg.query("status")).filter(|status| status != "all"),
+        }
+    }
+}
+
+/// One line of an order: `impresspress__products__line_items`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LineItemView {
+    /// Stable line identifier.
+    pub id: String,
+    pub purchase_id: String,
+    pub product_id: String,
+    /// Product name as it was at checkout.
+    pub product_name: String,
+    pub quantity: i64,
+    /// Offer the line was priced from, or empty for legacy lines.
+    pub offer_id: String,
+    /// Version of that offer at checkout.
+    pub offer_version: i64,
+    /// Offer component the line resolved, or empty for a whole-offer line.
+    pub component_id: String,
+    pub seller_account_id: String,
+    /// Stripe Price id the line was charged through, or empty.
+    pub stripe_price_id: String,
+    pub unit_amount_minor: i64,
+    pub subtotal_minor: i64,
+    pub discount_minor: i64,
+    pub tax_minor: i64,
+    pub total_minor: i64,
+    /// Customer inputs the line was priced with, as submitted at checkout.
+    pub input_snapshot: serde_json::Map<String, Value>,
+    /// The component condition as it was evaluated at checkout.
+    pub condition_snapshot: serde_json::Map<String, Value>,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl LineItemView {
+    /// Project an `impresspress__products__line_items` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            purchase_id: record.str_field("purchase_id").to_string(),
+            product_id: record.str_field("product_id").to_string(),
+            product_name: record.str_field("product_name").to_string(),
+            quantity: record.i64_field("quantity"),
+            offer_id: record.str_field("offer_id").to_string(),
+            offer_version: record.i64_field("offer_version"),
+            component_id: record.str_field("component_id").to_string(),
+            seller_account_id: record.str_field("seller_account_id").to_string(),
+            stripe_price_id: record.str_field("stripe_price_id").to_string(),
+            unit_amount_minor: record.i64_field("unit_amount_minor"),
+            subtotal_minor: record.i64_field("subtotal_minor"),
+            discount_minor: record.i64_field("discount_minor"),
+            tax_minor: record.i64_field("tax_minor"),
+            total_minor: record.i64_field("total_minor"),
+            input_snapshot: record.json_object_field("input_snapshot"),
+            condition_snapshot: record.json_object_field("condition_snapshot"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+// Two columns of `impresspress__products__refunds` are NOT published, under
+// the rule `ProviderOperationSummary` already states for the block's
+// provider operations ("request/response payloads, idempotency keys ... stay
+// private"): `idempotency_key`, the Stripe idempotency key the refund was
+// claimed under, and `response_json`, the raw provider response.
+/// One refund on an order: `impresspress__products__refunds`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RefundView {
+    /// Stable refund identifier.
+    pub id: String,
+    pub purchase_id: String,
+    /// Stripe Refund id once the provider accepted it, or empty.
+    pub provider_refund_id: String,
+    /// PaymentIntent the refund was issued against; empty for manual
+    /// refunds.
+    pub payment_intent_id: String,
+    /// Stripe connected account the refund was issued through, or empty.
+    pub stripe_account_id: String,
+    pub amount_minor: i64,
+    /// The order's `refunded_total_cents` once this refund succeeds.
+    pub target_refunded_total_minor: i64,
+    pub currency: String,
+    /// Ledger state: `pending`, `provider_succeeded`, `succeeded` or
+    /// `failed`.
+    pub status: String,
+    /// Provider's own refund state, or `manual`.
+    pub provider_status: String,
+    /// Reason sent to the provider, or empty.
+    pub provider_reason: String,
+    /// Operator note kept on the platform, never sent to the provider.
+    pub note: String,
+    /// User id of the operator who issued the refund.
+    pub refunded_by: String,
+    pub livemode: bool,
+    pub last_error: String,
+    /// RFC 3339 timestamp the refund reached a terminal state, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub completed_at: Option<String>,
+    /// Provider timestamp (Unix seconds) of the event that last updated the
+    /// refund; `0` until one arrives.
+    pub stripe_event_created: i64,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl RefundView {
+    /// Project an `impresspress__products__refunds` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            purchase_id: record.str_field("purchase_id").to_string(),
+            provider_refund_id: record.str_field("provider_refund_id").to_string(),
+            payment_intent_id: record.str_field("payment_intent_id").to_string(),
+            stripe_account_id: record.str_field("stripe_account_id").to_string(),
+            amount_minor: record.i64_field("amount_minor"),
+            target_refunded_total_minor: record.i64_field("target_refunded_total_minor"),
+            currency: record.str_field("currency").to_string(),
+            status: record.str_field("status").to_string(),
+            provider_status: record.str_field("provider_status").to_string(),
+            provider_reason: record.str_field("provider_reason").to_string(),
+            note: record.str_field("note").to_string(),
+            refunded_by: record.str_field("refunded_by").to_string(),
+            livemode: record.bool_field("livemode"),
+            last_error: record.str_field("last_error").to_string(),
+            completed_at: timestamp_field(record, "completed_at"),
+            stripe_event_created: record.i64_field("stripe_event_created"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// One payment dispute on an order: `impresspress__products__disputes`, the
+/// durable projection of the provider's dispute events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DisputeView {
+    /// Stable dispute identifier.
+    pub id: String,
+    pub purchase_id: String,
+    pub seller_account_id: String,
+    pub stripe_account_id: String,
+    /// Stripe Dispute id.
+    pub provider_dispute_id: String,
+    /// Stripe Charge id the dispute was raised against, or empty.
+    pub provider_charge_id: String,
+    pub payment_intent_id: String,
+    #[schemars(extend("enum" = ["warning_needs_response", "warning_under_review", "warning_closed", "needs_response", "under_review", "won", "lost", "prevented"]))]
+    pub status: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    /// Provider's dispute reason, or empty.
+    pub reason: String,
+    /// RFC 3339 evidence deadline, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub evidence_due_by: Option<String>,
+    pub livemode: bool,
+    /// Provider timestamp (Unix seconds) of the event that last updated the
+    /// dispute.
+    pub event_created: i64,
+    /// RFC 3339 timestamp the dispute closed, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub closed_at: Option<String>,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl DisputeView {
+    /// Project an `impresspress__products__disputes` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            purchase_id: record.str_field("purchase_id").to_string(),
+            seller_account_id: record.str_field("seller_account_id").to_string(),
+            stripe_account_id: record.str_field("stripe_account_id").to_string(),
+            provider_dispute_id: record.str_field("provider_dispute_id").to_string(),
+            provider_charge_id: record.str_field("provider_charge_id").to_string(),
+            payment_intent_id: record.str_field("payment_intent_id").to_string(),
+            status: record.str_field("status").to_string(),
+            amount_minor: record.i64_field("amount_minor"),
+            currency: record.str_field("currency").to_string(),
+            reason: record.str_field("reason").to_string(),
+            evidence_due_by: timestamp_field(record, "evidence_due_by"),
+            livemode: record.bool_field("livemode"),
+            event_created: record.i64_field("event_created"),
+            closed_at: timestamp_field(record, "closed_at"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// Response body of the order detail endpoints: the order with its lines,
+/// refunds and disputes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PurchaseDetailResponse {
+    pub purchase: PurchaseView,
+    pub line_items: Vec<LineItemView>,
+    /// Refunds, newest first.
+    pub refunds: Vec<RefundView>,
+    /// Disputes, newest first.
+    pub disputes: Vec<DisputeView>,
+}
+
 /// Response body of `GET /b/products/api/admin/sellers/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminSellerDetail {
