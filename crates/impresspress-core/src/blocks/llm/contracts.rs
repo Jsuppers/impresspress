@@ -140,8 +140,15 @@ pub struct ProviderListResponse {
     pub providers: Vec<ProviderView>,
 }
 
+// `deny_unknown_fields` is a deliberate exception to this repo's habit of
+// tolerating unknown keys (only `prepared_plan.rs` uses it otherwise), for a
+// credential-adjacent admin input: `ProviderConfig` has an inline `api_key`
+// that this contract does not expose, so an admin who sends one must be told
+// so by name. Silently dropping it would answer 200 with a provider that runs
+// unauthenticated — after the secret transited the request body.
 /// `POST /b/llm/api/providers` request body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProviderRequest {
     /// Unique provider name. Becomes the `backend_id` chat requests route on.
     pub name: String,
@@ -159,10 +166,14 @@ pub struct CreateProviderRequest {
     pub enabled: Option<bool>,
 }
 
+// Same deliberate `deny_unknown_fields` exception as `CreateProviderRequest`,
+// for the same reason: an inline `api_key` on the patch must be refused by
+// name, not dropped.
 /// `PATCH /b/llm/api/providers/{id}` request body. Every field is optional
 /// and only the ones present are applied. An empty `key_var` clears the
 /// variable; an empty `name` or `endpoint` is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
     pub protocol: Option<ProviderProtocol>,

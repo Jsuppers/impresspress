@@ -460,6 +460,56 @@ mod tests {
         }
     }
 
+    /// The API key is referenced by variable name (`key_var`), never sent
+    /// inline. A body carrying `api_key` must be refused by name, not
+    /// silently dropped after the secret transited the request — the admin
+    /// would otherwise get a 200 and a provider that runs unauthenticated.
+    #[tokio::test]
+    async fn create_provider_refuses_an_inline_api_key() {
+        let block = stub_block();
+        let ctx = PanicCtx;
+        let msg = admin_msg("create", "/b/llm/api/providers");
+        let input = InputStream::from_bytes(
+            br#"{"name":"x","protocol":"open_ai","endpoint":"https://api.openai.com/v1","api_key":"sk-inline"}"#
+                .to_vec(),
+        );
+
+        let out = create_provider(&block, &ctx, &msg, input).await;
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument);
+                assert!(
+                    e.message.contains("api_key"),
+                    "the refusal must name the unknown field, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// Same on the patch body.
+    #[tokio::test]
+    async fn update_provider_refuses_an_inline_api_key() {
+        let block = stub_block();
+        let ctx = PanicCtx;
+        let msg = admin_msg("update", "/b/llm/api/providers/row-1");
+        let input = InputStream::from_bytes(br#"{"api_key":"sk-inline"}"#.to_vec());
+
+        let out = update_provider(&block, &ctx, &msg, input).await;
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument);
+                assert!(
+                    e.message.contains("api_key"),
+                    "the refusal must name the unknown field, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn update_provider_requires_id() {
         let block = stub_block();

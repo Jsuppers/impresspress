@@ -690,6 +690,7 @@
         "content": {
           "application/json": {
             "schema": {
+              "additionalProperties": false,
               "description": "`POST /b/llm/api/providers` request body.",
               "properties": {
                 "enabled": {
@@ -877,6 +878,7 @@
         "content": {
           "application/json": {
             "schema": {
+              "additionalProperties": false,
               "description": "`PATCH /b/llm/api/providers/{id}` request body. Every field is optional\nand only the ones present are applied. An empty `key_var` clears the\nvariable; an empty `name` or `endpoint` is ignored.",
               "properties": {
                 "enabled": {
