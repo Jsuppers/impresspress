@@ -249,6 +249,45 @@ async fn products_public_catalog_withholds_the_internal_columns() {
     }
 }
 
+/// The order state columns are published on seven surfaces: the buyer,
+/// seller and admin lists and details, and the guest status endpoint. Their
+/// value sets are defined once, by `contracts::ReconciliationStatus` and
+/// `contracts::OrderStatus`, and every surface must carry that set as an
+/// `enum`. Prose that named three of nine values is how the published
+/// description drifted from the code in the first place.
+#[tokio::test]
+async fn products_order_surfaces_publish_the_state_enums() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    let surfaces =
+        objects_with_property(&doc, &["/b/products"], "responses", "reconciliation_status");
+    assert!(
+        surfaces.len() >= 7,
+        "expected the buyer, seller and admin list/detail rows plus the guest status \
+         endpoint, found {} schemas carrying `reconciliation_status`",
+        surfaces.len()
+    );
+    for props in &surfaces {
+        assert_eq!(
+            props["reconciliation_status"]["enum"],
+            serde_json::json!([
+                "pending",
+                "awaiting_payment",
+                "reconciled",
+                "provider_error",
+                "payment_succeeded_awaiting_checkout",
+                "payment_failed",
+                "payment_processing",
+                "payment_requires_action",
+                "payment_canceled"
+            ]),
+            "every value `repo::purchases` and `stripe` store must be published: {:?}",
+            props["reconciliation_status"]
+        );
+    }
+}
+
 /// Every field name `block` publishes: the keys of every `properties` object
 /// anywhere in its schemas, plus the `name` of every declared parameter.
 ///

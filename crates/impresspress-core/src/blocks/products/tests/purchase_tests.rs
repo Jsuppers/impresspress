@@ -606,3 +606,41 @@ async fn purchase_list_via_user_handler() {
     let body = output_to_json(out).await;
     assert_eq!(body["records"].as_array().unwrap().len(), 1);
 }
+
+/// A stored order state outside the contract is a data-integrity error. The
+/// projection reports it as an internal error naming the row, never as a
+/// `200` carrying a value the schema does not define, and never as a default.
+#[tokio::test]
+async fn order_rows_outside_the_state_contract_are_an_internal_error() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_bad_reconciliation",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(1000)),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("half_done"),
+            ),
+        ]),
+    )
+    .await;
+
+    let (msg, _input) = get_msg("/b/products/purchases/pur_bad_reconciliation", "user_1");
+    assert!(
+        output_is_error(purchase::handle_get(&ctx, &msg).await, ErrorCode::Internal).await,
+        "a 200 would publish `half_done`, which the contract does not define"
+    );
+    let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    assert!(
+        output_is_error(
+            purchase::handle_list_user(&ctx, &msg).await,
+            ErrorCode::Internal
+        )
+        .await,
+        "the list must not publish the row either"
+    );
+}

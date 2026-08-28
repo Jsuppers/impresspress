@@ -10,7 +10,7 @@ use crate::{
     blocks::products::{
         contracts::{
             AnalyticsProduct, CheckoutPresentation, CommerceAnalytics, MoneyBreakdown, OfferMode,
-            SellerFailureSummary,
+            ReconciliationStatus, SellerFailureSummary,
         },
         money,
     },
@@ -300,7 +300,7 @@ pub(crate) async fn create_checkout_order(
         ("metadata".to_string(), serde_json::json!(metadata)),
         (
             "reconciliation_status".to_string(),
-            serde_json::json!("pending"),
+            serde_json::json!(ReconciliationStatus::Pending),
         ),
         (
             "receipt_token_hash".to_string(),
@@ -403,7 +403,7 @@ pub(crate) async fn mark_checkout_failed(
             ("status".to_string(), serde_json::json!("failed")),
             (
                 "reconciliation_status".to_string(),
-                serde_json::json!("provider_error"),
+                serde_json::json!(ReconciliationStatus::ProviderError),
             ),
             (
                 "reconciliation_error".to_string(),
@@ -652,7 +652,7 @@ pub(crate) async fn complete_checkout_atomic(
     data.insert("livemode".into(), serde_json::json!(livemode));
     data.insert(
         "reconciliation_status".into(),
-        serde_json::json!("reconciled"),
+        serde_json::json!(ReconciliationStatus::Reconciled),
     );
     data.insert("approved_at".into(), serde_json::json!(&now));
     data.insert("payment_at".into(), serde_json::json!(&now));
@@ -839,7 +839,7 @@ pub(crate) async fn reconcile_checkout_session(
         ),
         (
             "reconciliation_status".to_string(),
-            serde_json::json!("reconciled"),
+            serde_json::json!(ReconciliationStatus::Reconciled),
         ),
         ("reconciliation_error".to_string(), serde_json::json!("")),
         ("approved_at".to_string(), serde_json::json!(&now)),
@@ -986,7 +986,7 @@ pub(crate) async fn reconcile_checkout_failure(
             ("status".to_string(), serde_json::json!("failed")),
             (
                 "reconciliation_status".to_string(),
-                serde_json::json!("provider_error"),
+                serde_json::json!(ReconciliationStatus::ProviderError),
             ),
             (
                 "reconciliation_error".to_string(),
@@ -1137,11 +1137,11 @@ pub(crate) async fn sync_payment_intent(
     ]);
     if !paid {
         let reconciliation_status = match snapshot.status.as_str() {
-            "succeeded" => "payment_succeeded_awaiting_checkout",
-            "payment_failed" => "payment_failed",
-            "processing" => "payment_processing",
-            "requires_action" => "payment_requires_action",
-            "canceled" => "payment_canceled",
+            "succeeded" => ReconciliationStatus::PaymentSucceededAwaitingCheckout,
+            "payment_failed" => ReconciliationStatus::PaymentFailed,
+            "processing" => ReconciliationStatus::PaymentProcessing,
+            "requires_action" => ReconciliationStatus::PaymentRequiresAction,
+            "canceled" => ReconciliationStatus::PaymentCanceled,
             _ => unreachable!("validated PaymentIntent status"),
         };
         data.insert(

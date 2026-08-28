@@ -17,7 +17,8 @@ use super::{
     contracts::{
         AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, ManagedOffer,
         ManagedPaymentLink, Offer, OfferMode, OfferStatus, PaymentLinkCreateRequest,
-        PricingPreviewRequest, WebhookAck, WebhookEventList, WebhookEventSummary,
+        PricingPreviewRequest, ReconciliationStatus, WebhookAck, WebhookEventList,
+        WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
     PRODUCTS_TABLE,
@@ -1268,7 +1269,7 @@ async fn handle_offer_checkout(
         ),
         (
             "reconciliation_status".to_string(),
-            serde_json::json!("awaiting_payment"),
+            serde_json::json!(ReconciliationStatus::AwaitingPayment),
         ),
         (
             "updated_at".to_string(),

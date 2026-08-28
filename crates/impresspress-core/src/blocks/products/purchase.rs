@@ -23,7 +23,10 @@ async fn list_orders(
 ) -> OutputStream {
     match repo::purchases::list_paginated(ctx, filters, i64::from(page), i64::from(page_size)).await
     {
-        Ok(result) => ok_json(&PurchaseListResponse::from_record_list(&result)),
+        Ok(result) => match PurchaseListResponse::from_record_list(&result) {
+            Ok(response) => ok_json(&response),
+            Err(error) => err_internal("Order row is outside the contract", error),
+        },
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -99,8 +102,12 @@ async fn purchase_response(
         Ok(disputes) => disputes,
         Err(error) => return err_internal("Could not load purchase disputes", error),
     };
+    let view = match PurchaseView::from_record(&purchase) {
+        Ok(view) => view,
+        Err(error) => return err_internal("Order row is outside the contract", error),
+    };
     ok_json(&PurchaseDetailResponse {
-        purchase: PurchaseView::from_record(&purchase),
+        purchase: view,
         line_items: line_items.iter().map(LineItemView::from_record).collect(),
         refunds: refunds.iter().map(RefundView::from_record).collect(),
         disputes: disputes.iter().map(DisputeView::from_record).collect(),

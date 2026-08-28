@@ -23,10 +23,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use wafer_core::clients::database::{Record, RecordList};
-use wafer_run::Message;
+use wafer_run::{ErrorCode, Message, WaferError};
 
 use crate::util::{json_map, RecordExt};
 
@@ -648,6 +648,41 @@ pub struct CheckoutResponse {
     pub amounts: MoneyBreakdown,
 }
 
+/// Where an order stands against the payment provider's view of it: the
+/// `reconciliation_status` column of `impresspress__products__purchases`.
+///
+/// This is the one definition of the column's value set. `repo::purchases`
+/// and `stripe` store these variants, and the order views parse the column
+/// back through [`Self::from_record`], so a stored value outside the set is
+/// reported as a data-integrity error rather than published or defaulted.
+///
+/// `pending`: row created, no provider session yet. `awaiting_payment`: a
+/// Checkout Session exists and the customer has not paid. `reconciled`: the
+/// completed session matched the local snapshot. `provider_error`: the
+/// provider's answer was unusable or contradicted the snapshot;
+/// `reconciliation_error` says why. The `payment_*` values mirror the last
+/// PaymentIntent event received before Checkout completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationStatus {
+    Pending,
+    AwaitingPayment,
+    Reconciled,
+    ProviderError,
+    PaymentSucceededAwaitingCheckout,
+    PaymentFailed,
+    PaymentProcessing,
+    PaymentRequiresAction,
+    PaymentCanceled,
+}
+
+impl ReconciliationStatus {
+    /// Parse the `reconciliation_status` column of an order row.
+    pub fn from_record(record: &Record) -> Result<Self, WaferError> {
+        enum_column(record, "reconciliation_status")
+    }
+}
+
 /// Minimal order state exposed to a guest who presents the checkout receipt
 /// capability. Buyer details and all Stripe resource ids remain private.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -656,7 +691,8 @@ pub struct GuestOrderStatus {
     pub schema_version: u32,
     pub order_id: String,
     pub status: String,
-    pub reconciliation_status: String,
+    /// Where the order stands against the provider's view of it.
+    pub reconciliation_status: ReconciliationStatus,
     pub amounts: MoneyBreakdown,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(required)]
@@ -1177,6 +1213,24 @@ pub struct ProviderReconcileResult {
 //
 // The `{records, total_count, page, page_size}` list envelope is unchanged;
 // only the row moves from `{id, data: {…}}` to the flat view.
+
+/// Parse `column` of `record` into the enum that defines its value set.
+///
+/// A stored value outside the set is a data-integrity error: it is reported
+/// as `Internal`, naming the row and the value, and never mapped to a
+/// default. The handler turns that into the 500-with-reference response.
+fn enum_column<T: DeserializeOwned>(record: &Record, column: &str) -> Result<T, WaferError> {
+    let value = record.str_field(column);
+    serde_json::from_value(Value::String(value.to_string())).map_err(|_| {
+        WaferError::new(
+            ErrorCode::Internal,
+            format!(
+                "row {} holds {column} {value:?}, which the contract does not define",
+                record.id
+            ),
+        )
+    })
+}
 
 /// A nullable timestamp column as `Option<String>`.
 ///
@@ -2079,9 +2133,13 @@ pub struct PurchaseView {
     /// Provider timestamp (Unix seconds) of the PaymentIntent event that
     /// last updated the payment state; `0` until one arrives.
     pub payment_intent_event_created: i64,
-    /// Whether the provider's view of the order has been reconciled with the
-    /// local snapshot: `pending`, `reconciled` or `failed`.
-    pub reconciliation_status: String,
+    /// Where the order stands against the provider's view of it. `pending`:
+    /// no provider session yet; `awaiting_payment`: a Checkout Session exists;
+    /// `reconciled`: the completed session matched the local snapshot;
+    /// `provider_error`: the provider's answer was unusable or contradicted
+    /// it (`reconciliation_error` says why); the `payment_*` values mirror
+    /// the last PaymentIntent event received before Checkout completion.
+    pub reconciliation_status: ReconciliationStatus,
     pub reconciliation_error: String,
     /// Stripe subscription lifecycle state for subscription orders, or
     /// empty.
@@ -2122,9 +2180,10 @@ pub struct PurchaseView {
 }
 
 impl PurchaseView {
-    /// Project an `impresspress__products__purchases` row.
-    pub fn from_record(record: &Record) -> Self {
-        Self {
+    /// Project an `impresspress__products__purchases` row. Fails when a state
+    /// column holds a value outside its contract.
+    pub fn from_record(record: &Record) -> Result<Self, WaferError> {
+        Ok(Self {
             id: record.id.clone(),
             user_id: record.str_field("user_id").to_string(),
             buyer_user_id: record.str_field("buyer_user_id").to_string(),
@@ -2158,7 +2217,7 @@ impl PurchaseView {
                 .str_field("provider_payment_error_message")
                 .to_string(),
             payment_intent_event_created: record.i64_field("payment_intent_event_created"),
-            reconciliation_status: record.str_field("reconciliation_status").to_string(),
+            reconciliation_status: ReconciliationStatus::from_record(record)?,
             reconciliation_error: record.str_field("reconciliation_error").to_string(),
             subscription_status: record.str_field("subscription_status").to_string(),
             subscription_current_period_end: timestamp_field(
@@ -2177,7 +2236,7 @@ impl PurchaseView {
             refund_reason: record.str_field("refund_reason").to_string(),
             created_at: record.str_field("created_at").to_string(),
             updated_at: record.str_field("updated_at").to_string(),
-        }
+        })
     }
 }
 
@@ -2195,14 +2254,19 @@ pub struct PurchaseListResponse {
 }
 
 impl PurchaseListResponse {
-    /// Project a `RecordList` of order rows.
-    pub fn from_record_list(list: &RecordList) -> Self {
-        Self {
-            records: list.records.iter().map(PurchaseView::from_record).collect(),
+    /// Project a `RecordList` of order rows. Fails when any row holds a
+    /// state column outside its contract.
+    pub fn from_record_list(list: &RecordList) -> Result<Self, WaferError> {
+        Ok(Self {
+            records: list
+                .records
+                .iter()
+                .map(PurchaseView::from_record)
+                .collect::<Result<_, _>>()?,
             total_count: list.total_count,
             page: list.page,
             page_size: list.page_size,
-        }
+        })
     }
 }
 
@@ -2549,13 +2613,70 @@ pub struct AdminSellerDetail {
 
 #[cfg(test)]
 mod tests {
-    use super::{Condition, OfferMode, PricingPreviewRequest};
+    use std::collections::HashMap;
+
+    use wafer_core::clients::database::Record;
+    use wafer_run::ErrorCode;
+
+    use super::{Condition, OfferMode, PricingPreviewRequest, ReconciliationStatus};
 
     #[test]
     fn enums_use_stable_snake_case_wire_names() {
         assert_eq!(
             serde_json::to_string(&OfferMode::Subscription).unwrap(),
             "\"subscription\""
+        );
+    }
+
+    /// The enum's wire form is the stored column value: the writers store
+    /// `json!(variant)` and the views parse the column back, so a rename here
+    /// would be a migration, not a refactor.
+    #[test]
+    fn reconciliation_status_wire_form_is_the_stored_column_value() {
+        use ReconciliationStatus::*;
+        for (variant, stored) in [
+            (Pending, "pending"),
+            (AwaitingPayment, "awaiting_payment"),
+            (Reconciled, "reconciled"),
+            (ProviderError, "provider_error"),
+            (
+                PaymentSucceededAwaitingCheckout,
+                "payment_succeeded_awaiting_checkout",
+            ),
+            (PaymentFailed, "payment_failed"),
+            (PaymentProcessing, "payment_processing"),
+            (PaymentRequiresAction, "payment_requires_action"),
+            (PaymentCanceled, "payment_canceled"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), stored);
+            let record = Record {
+                id: "pur_1".to_string(),
+                data: HashMap::from([(
+                    "reconciliation_status".to_string(),
+                    serde_json::json!(stored),
+                )]),
+            };
+            assert_eq!(ReconciliationStatus::from_record(&record).unwrap(), variant);
+        }
+    }
+
+    #[test]
+    fn a_state_column_outside_the_contract_is_an_internal_error_naming_the_row() {
+        let record = Record {
+            id: "pur_1".to_string(),
+            data: HashMap::from([(
+                "reconciliation_status".to_string(),
+                serde_json::json!("half_done"),
+            )]),
+        };
+        let error = ReconciliationStatus::from_record(&record).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            error.message.contains("pur_1")
+                && error.message.contains("reconciliation_status")
+                && error.message.contains("half_done"),
+            "{}",
+            error.message
         );
     }
 
