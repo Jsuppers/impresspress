@@ -319,10 +319,11 @@ impl LlmBlock {
     }
 
     /// `POST /b/llm/api/config`. Three outcomes, two of them successful:
-    /// a `thread_id` creates or updates that thread's override and returns
-    /// the row as [`contracts::ThreadOverrideView`]; a body naming a global
-    /// default is refused (those come from the environment); anything else
-    /// is acknowledged without a write.
+    /// a body naming a global default is refused first (those come from
+    /// the environment); otherwise a `thread_id` creates or updates that
+    /// thread's override and returns the row as
+    /// [`contracts::ThreadOverrideView`]; anything else is acknowledged
+    /// without a write.
     async fn handle_post_config(&self, ctx: &dyn Context, input: InputStream) -> OutputStream {
         use contracts::{ConfigAcknowledgement, ConfigUpdateResponse, ThreadOverrideView};
 
@@ -331,6 +332,17 @@ impl LlmBlock {
             Ok(b) => b,
             Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
         };
+
+        // The global defaults come from the environment, never from this
+        // endpoint, and the published contract says sending one is refused.
+        // Checked before the thread branch: a request carrying both a
+        // `thread_id` and a default is refused whole, not stripped of the
+        // default and written as an override.
+        if body.default_provider.is_some() || body.default_model.is_some() {
+            return err_bad_request(
+                "Global default provider/model must be set via environment variables: IMPRESSPRESS__LLM__DEFAULT_PROVIDER and IMPRESSPRESS__LLM__DEFAULT_MODEL",
+            );
+        }
 
         // Per-thread override update
         if let Some(thread_id) = body.thread_id {
@@ -372,14 +384,6 @@ impl LlmBlock {
                     Err(e) => return err_internal("Database error", e),
                 }
             }
-        }
-
-        // Global default update would go via the config system (admin only),
-        // but here we just acknowledge since config writes go through wafer-run/config.
-        if body.default_provider.is_some() || body.default_model.is_some() {
-            return err_bad_request(
-                "Global default provider/model must be set via environment variables: IMPRESSPRESS__LLM__DEFAULT_PROVIDER and IMPRESSPRESS__LLM__DEFAULT_MODEL",
-            );
         }
 
         ok_json(&ConfigUpdateResponse::Acknowledged(ConfigAcknowledgement {
@@ -811,6 +815,42 @@ mod config_tests {
                 );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// The published description says sending a global default is refused.
+    /// That must hold on the thread branch too: an override request that
+    /// also carries a default is refused whole, not silently stripped of the
+    /// default and written.
+    #[tokio::test]
+    async fn post_config_refuses_global_defaults_even_with_a_thread() {
+        for value in [
+            serde_json::json!({ "thread_id": "t1", "default_model": "gpt-4o" }),
+            serde_json::json!({ "thread_id": "t1", "default_provider": "openai-main" }),
+        ] {
+            let ctx = TestContext::with_llm().await;
+
+            let out = block().handle_post_config(&ctx, body(value.clone())).await;
+
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::InvalidArgument, "{value}");
+                    assert!(
+                        e.message.contains(DEFAULT_PROVIDER_VAR)
+                            && e.message.contains(DEFAULT_MODEL_VAR),
+                        "{value}: the refusal must point at the variables to set instead, got: {}",
+                        e.message
+                    );
+                }
+                other => panic!("{value}: expected InvalidArgument, got {other:?}"),
+            }
+            let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+                .await
+                .expect("list overrides");
+            assert!(
+                rows.is_empty(),
+                "{value}: a refused request must not have written an override"
+            );
         }
     }
 
