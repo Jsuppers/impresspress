@@ -205,7 +205,7 @@ The spec's §Submission context, as of 2026-08-28 end of day:
 | MIT `LICENSE` on the default branch | ✅ on `main` since #72 |
 | Tool-registration code visible in-repo | ✅ `crates/impresspress-core/src/ui/assets/webmcp.js` on `main` |
 | Both repos public, write-up names both | ✅ public; ❌ write-up not started |
-| Live URL reachable from the ChatGPT browser | ✅ **https://impresspress-webmcp-demo.jorissuppers.workers.dev** — `examples/webmcp-demo` (its own D1/R2/KV on the account), admin `admin@example.com` (password in the session scratchpad), one seeded product with a published per-page offer; anonymous manifest serves the five tools. No Stripe key yet, so `start_checkout` returns an error result until one is entered in `/b/admin/variables`. |
+| Live URL reachable from the ChatGPT browser | ✅ **https://impresspress-webmcp-demo.jorissuppers.workers.dev** — `examples/webmcp-demo` (its own D1/R2/KV on the account), admin `admin@example.com` (password in the session scratchpad), one seeded product with a published per-page offer; anonymous manifest serves the five tools. No Stripe key yet, so `start_checkout` returns an error result until one is entered in `/b/admin/variables` — and note **impresspress#78**: on Workers, config edits are currently invisible to the runtime (shared vars have no read path; nothing sets `variables.block`), so the demo runs on defaults and the Stripe key will need that fix or the workaround in the README. |
 | Demo video < 3 minutes | ❌ human |
 | Agent-driven browse → price → checkout | ❌ human, plan 3 task 5 |
 
@@ -216,12 +216,16 @@ deploy needs one plain `wrangler deploy`; `impresspress deploy secret` needs
 `CONFIG_CACHE` that the generator does not emit (`/_deploy/prepare` fails with
 `invalid kv store` without it) — supplied via `wrangler.overrides.toml`; the
 first admin is whoever signs up with the email in the D1 `variables` row
-`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`, so that row is upserted with
-`wrangler d1 execute` after prepare — and a running isolate only sees that row once
-the KV config-version stamp (`cfg:v1:config_version`) moves, which a raw D1
-write does not do. The Worker now live was built from this branch plus #77's
-files (adapter fix + `examples/webmcp-demo`); once #74, #75 and #77 are on
-`main`, redeploy from `main`.
+`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` — except that on Workers that
+row is never read: **impresspress#78** — shared `WAFER_RUN_SHARED__*` variables
+have no read path on Cloudflare, and `seed_defaults`/admin writes never set
+`variables.block`, which the lazy per-block loader filters on, so block-scoped
+edits are invisible too. The demo's admin was promoted with a direct
+`UPDATE wafer_run__auth__users SET role='admin'`; its `ENVIRONMENT`,
+`FRONTEND_URL` and `APP_NAME` edits sit in D1 unread. `wrangler kv key`
+commands default to the LOCAL store — pass `--remote`. The Worker now live was
+built from this branch plus #77's files (adapter fix + `examples/webmcp-demo`);
+once #74, #75 and #77 are on `main`, redeploy from `main`.
 
 Engineering that does **not** gate the submission but is still open: products'
 remaining CRUD row schemas and `llm`/`vector` typing (both in flight as
