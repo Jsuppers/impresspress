@@ -40,19 +40,6 @@ use crate::util::RecordExt;
 // Record → view helpers
 // ---------------------------------------------------------------------------
 
-/// A nullable `TEXT` column as `Option<String>`: a SQL `NULL` (JSON `null`), an
-/// absent key and a non-string value all read as `None`.
-///
-/// [`RecordExt::str_field`] collapses all three onto `""`, which would make a
-/// non-nullable `"string"` schema look correct while erasing the difference
-/// between "not a duplicate" and "duplicate of the empty id".
-fn opt_str_field(record: &Record, key: &str) -> Option<String> {
-    match record.data.get(key) {
-        Some(serde_json::Value::String(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
 /// A `REAL` column as `f64`. D1 and Postgres hand back a JSON number; a
 /// backend that stringifies it is decoded rather than silently read as `0`.
 fn f64_field(record: &Record, key: &str) -> f64 {
@@ -61,38 +48,6 @@ fn f64_field(record: &Record, key: &str) -> f64 {
         Some(serde_json::Value::String(value)) => value.parse().unwrap_or_default(),
         _ => 0.0,
     }
-}
-
-/// A JSON-encoded `TEXT` column as the value it encodes, whichever way the
-/// backend returned it.
-///
-/// `events.metadata_json` and `analyses.suggested_actions_json` are written by
-/// [`serde_json::to_string`] and read back as a real value by the SQLite
-/// backend (`row_to_record` sniffs JSON-shaped text) but as the literal string
-/// by Postgres and D1. Normalizing here is what lets the schema declare
-/// `object` / `array` truthfully on all three: a value that does not decode to
-/// the declared kind reads as empty rather than widening the schema to "any".
-/// These columns are advisory context, not an authorization input.
-fn decoded_json(record: &Record, key: &str) -> Option<serde_json::Value> {
-    match record.data.get(key) {
-        Some(serde_json::Value::String(raw)) => serde_json::from_str(raw).ok(),
-        Some(value) => Some(value.clone()),
-        None => None,
-    }
-}
-
-/// A JSON-encoded `TEXT` column that holds an object, or `{}`.
-fn json_object_field(record: &Record, key: &str) -> serde_json::Value {
-    decoded_json(record, key)
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// A JSON-encoded `TEXT` column that holds an array, or `[]`.
-fn json_array_field(record: &Record, key: &str) -> serde_json::Value {
-    decoded_json(record, key)
-        .filter(serde_json::Value::is_array)
-        .unwrap_or_else(|| serde_json::json!([]))
 }
 
 /// An absent-or-empty query parameter as `None`.
@@ -387,10 +342,10 @@ impl TicketView {
             status: record.str_field("status").to_string(),
             priority: record.str_field("priority").to_string(),
             assignee_id: record.str_field("assignee_id").to_string(),
-            duplicate_of: opt_str_field(record, "duplicate_of"),
+            duplicate_of: record.opt_str_field("duplicate_of"),
             legal_hold: record.bool_field("legal_hold"),
-            resolved_at: opt_str_field(record, "resolved_at"),
-            expires_at: opt_str_field(record, "expires_at"),
+            resolved_at: record.opt_str_field("resolved_at"),
+            expires_at: record.opt_str_field("expires_at"),
             created_at: record.str_field("created_at").to_string(),
             updated_at: record.str_field("updated_at").to_string(),
             untrusted_report,
@@ -442,8 +397,8 @@ impl TicketEventView {
             actor_type: record.str_field("actor_type").to_string(),
             actor_id: record.str_field("actor_id").to_string(),
             body: record.str_field("body").to_string(),
-            metadata: json_object_field(record, "metadata_json"),
-            expires_at: opt_str_field(record, "expires_at"),
+            metadata: serde_json::Value::Object(record.json_object_field("metadata_json")),
+            expires_at: record.opt_str_field("expires_at"),
             created_at: record.str_field("created_at").to_string(),
         }
     }
@@ -492,14 +447,16 @@ impl TicketAnalysisView {
             id: record.id.clone(),
             ticket_id: record.str_field("ticket_id").to_string(),
             source: record.str_field("source").to_string(),
-            model: opt_str_field(record, "model"),
+            model: record.opt_str_field("model"),
             prompt_version: record.str_field("prompt_version").to_string(),
             summary: record.str_field("summary").to_string(),
-            suggested_type_id: opt_str_field(record, "suggested_type_id"),
-            suggested_priority: opt_str_field(record, "suggested_priority"),
+            suggested_type_id: record.opt_str_field("suggested_type_id"),
+            suggested_priority: record.opt_str_field("suggested_priority"),
             confidence: f64_field(record, "confidence"),
-            suggested_actions: json_array_field(record, "suggested_actions_json"),
-            expires_at: opt_str_field(record, "expires_at"),
+            suggested_actions: serde_json::Value::Array(
+                record.json_array_field("suggested_actions_json"),
+            ),
+            expires_at: record.opt_str_field("expires_at"),
             created_at: record.str_field("created_at").to_string(),
         }
     }

@@ -84,6 +84,38 @@ pub trait RecordExt {
     /// Field as `u64`, defaulting to `0` when missing/non-numeric/negative.
     fn u64_field(&self, key: &str) -> u64;
     fn bool_field(&self, key: &str) -> bool;
+
+    /// A nullable `TEXT` column as `Option<String>`: a SQL `NULL` (JSON
+    /// `null`), an absent key and a non-string value all read as `None`.
+    ///
+    /// [`Self::str_field`] collapses all three onto `""`, which would make a
+    /// non-nullable `"string"` schema look correct while erasing the
+    /// difference between "never set" and "set to the empty string".
+    fn opt_str_field(&self, key: &str) -> Option<String>;
+
+    /// A JSON-encoded `TEXT` column as the value it encodes, whichever way
+    /// the backend returned it.
+    ///
+    /// Such columns are written by [`serde_json::to_string`] and read back as
+    /// a real value by the SQLite backend (`row_to_record` sniffs JSON-shaped
+    /// text) but as the literal string by Postgres and D1. Normalizing here is
+    /// what lets a view declare `object` / `array` truthfully on all three.
+    /// `Null` when the column is absent or does not decode.
+    fn json_value_field(&self, key: &str) -> serde_json::Value;
+
+    /// A JSON-encoded `TEXT` column that holds an object, or an empty map
+    /// when it holds anything else.
+    fn json_object_field(&self, key: &str) -> serde_json::Map<String, serde_json::Value>;
+
+    /// A JSON-encoded `TEXT` column that holds an array, or empty when it
+    /// holds anything else.
+    fn json_array_field(&self, key: &str) -> Vec<serde_json::Value>;
+
+    /// A JSON-encoded `TEXT` column that holds an array of strings. Elements
+    /// that are not strings are dropped; a column holding anything but an
+    /// array reads as empty. These columns are advisory metadata, not an
+    /// authorization input, so an unexpected shape degrades rather than errs.
+    fn string_list_field(&self, key: &str) -> Vec<String>;
 }
 
 impl RecordExt for Record {
@@ -110,6 +142,47 @@ impl RecordExt for Record {
             Some(serde_json::Value::String(s)) => s == "true" || s == "1",
             _ => false,
         }
+    }
+
+    fn opt_str_field(&self, key: &str) -> Option<String> {
+        match self.data.get(key) {
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn json_value_field(&self, key: &str) -> serde_json::Value {
+        match self.data.get(key) {
+            Some(serde_json::Value::String(raw)) => {
+                serde_json::from_str(raw).unwrap_or(serde_json::Value::Null)
+            }
+            Some(value) => value.clone(),
+            None => serde_json::Value::Null,
+        }
+    }
+
+    fn json_object_field(&self, key: &str) -> serde_json::Map<String, serde_json::Value> {
+        match self.json_value_field(key) {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        }
+    }
+
+    fn json_array_field(&self, key: &str) -> Vec<serde_json::Value> {
+        match self.json_value_field(key) {
+            serde_json::Value::Array(items) => items,
+            _ => Vec::new(),
+        }
+    }
+
+    fn string_list_field(&self, key: &str) -> Vec<String> {
+        self.json_array_field(key)
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(value) => Some(value),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -467,6 +540,58 @@ mod tests {
     #[test]
     fn urlencode_space_becomes_plus() {
         assert_eq!(urlencode("a b"), "a+b");
+    }
+
+    fn record(data: serde_json::Value) -> Record {
+        Record {
+            id: "r1".to_string(),
+            data: json_map(data),
+        }
+    }
+
+    #[test]
+    fn opt_str_field_distinguishes_null_and_absent_from_a_string() {
+        let r = record(serde_json::json!({"present": "x", "empty": "", "null": null, "num": 3}));
+        assert_eq!(r.opt_str_field("present").as_deref(), Some("x"));
+        assert_eq!(r.opt_str_field("empty").as_deref(), Some(""));
+        assert_eq!(r.opt_str_field("null"), None);
+        assert_eq!(r.opt_str_field("absent"), None);
+        assert_eq!(r.opt_str_field("num"), None);
+    }
+
+    #[test]
+    fn json_fields_decode_text_and_pass_through_decoded_values() {
+        // SQLite hands JSON-shaped TEXT back decoded; Postgres/D1 hand back
+        // the literal string. Both must read the same.
+        let decoded = record(serde_json::json!({
+            "tags": ["a", "b", 3],
+            "meta": {"k": 1},
+            "snap": {"x": [1]}
+        }));
+        let literal = record(serde_json::json!({
+            "tags": "[\"a\",\"b\",3]",
+            "meta": "{\"k\":1}",
+            "snap": "{\"x\":[1]}"
+        }));
+        for r in [&decoded, &literal] {
+            assert_eq!(r.string_list_field("tags"), vec!["a", "b"]);
+            assert_eq!(
+                serde_json::Value::Object(r.json_object_field("meta")),
+                serde_json::json!({"k": 1})
+            );
+            assert_eq!(r.json_value_field("snap"), serde_json::json!({"x": [1]}));
+        }
+    }
+
+    #[test]
+    fn json_fields_read_as_empty_when_the_column_does_not_hold_the_declared_kind() {
+        let r =
+            record(serde_json::json!({"tags": "{\"not\":\"a list\"}", "meta": "[1]", "bad": "{"}));
+        assert!(r.string_list_field("tags").is_empty());
+        assert!(r.json_object_field("meta").is_empty());
+        assert!(r.json_object_field("absent").is_empty());
+        assert_eq!(r.json_value_field("bad"), serde_json::Value::Null);
+        assert_eq!(r.json_value_field("absent"), serde_json::Value::Null);
     }
 
     #[test]
