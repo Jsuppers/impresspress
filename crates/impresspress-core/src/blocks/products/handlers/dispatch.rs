@@ -773,7 +773,7 @@ pub async fn handle_admin(
         AdminRoute::DeleteType => types::handle_delete_type(ctx, msg).await,
         AdminRoute::ListPurchases => purchase::handle_list_admin(ctx, msg).await,
         AdminRoute::RefundPurchase => purchase::handle_refund(ctx, msg, input).await,
-        AdminRoute::GetPurchase => purchase::handle_get(ctx, msg).await,
+        AdminRoute::GetPurchase => purchase::handle_get_admin(ctx, msg).await,
         AdminRoute::Stats => stats::handle_stats(ctx, msg).await,
         AdminRoute::StripeStatus => provider::connection_status(ctx).await,
         AdminRoute::WebhookEvents => provider::webhook_events(ctx, msg).await,

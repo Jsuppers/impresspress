@@ -334,21 +334,48 @@ async fn products_refund_rows_describe_provider_status_truthfully() {
     let ctx = impresspress_core::test_support::TestContext::new().await;
     let doc = impresspress_core::test_support::openapi_document(&ctx).await;
 
-    let rows = objects_with_property(
+    // `target_refunded_total_minor` is on the full `RefundView`, which the
+    // seller and admin details embed. The buyer's detail embeds
+    // `BuyerRefundView`, which withholds the provider handles and the
+    // operator fields but keeps `provider_status` — so it is collected by
+    // that name instead, and held to the same description.
+    let mut rows = objects_with_property(
         &doc,
         &["/b/products"],
         "responses",
         "target_refunded_total_minor",
     );
     assert!(
-        rows.len() >= 3,
-        "the buyer, seller and admin order details embed refund rows; found {}",
+        rows.len() >= 2,
+        "the seller and admin order details embed full refund rows; found {}",
         rows.len()
     );
+    let buyer_rows: Vec<_> =
+        objects_with_property(&doc, &["/b/products"], "responses", "provider_status")
+            .into_iter()
+            .filter(|props| {
+                // `completed_at` is what distinguishes the buyer's refund ROW from
+                // `RefundResult`, the ephemeral body a refund CALL returns —
+                // which also carries `amount_minor` and `provider_status`.
+                props.get("target_refunded_total_minor").is_none()
+                    && props.get("amount_minor").is_some()
+                    && props.get("completed_at").is_some()
+            })
+            .collect();
+    assert!(
+        !buyer_rows.is_empty(),
+        "the buyer's order detail must embed its own refund row"
+    );
+    rows.extend(buyer_rows);
     for props in &rows {
-        let description = props["provider_status"]["description"]
+        // Collapse whitespace before matching: rustdoc wraps these sentences,
+        // so a phrase can land with a newline in the middle of it and a
+        // literal `contains` would fail on prose that is perfectly correct.
+        let raw = props["provider_status"]["description"]
             .as_str()
             .unwrap_or_default();
+        let description = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let description = description.as_str();
         assert!(
             !description.contains("`manual`"),
             "no refund row ever holds `manual`: {description}"
