@@ -543,6 +543,7 @@ mod discovery_tests {
     use super::handle_request;
     use crate::{
         features::{AllEnabled, FeatureConfig},
+        routing,
         test_support::{
             anon_msg, bearer_for_roles, collect_or_panic, discovery_json, discovery_json_as,
             real_block_infos, TestContext, TEST_JWT_SECRET,
@@ -1574,6 +1575,11 @@ mod discovery_tests {
             published.contains(&"name".to_string()) && published.contains(&"slug".to_string()),
             "the walk must reach the catalog row's properties: {published:?}"
         );
+        assert!(
+            published.contains(&"id".to_string()),
+            "the tool's own description calls it the only way to discover a \
+             product id, so the id must be published: {published:?}"
+        );
         for withheld in [
             "owner_id",
             "created_by",
@@ -1680,6 +1686,35 @@ mod discovery_tests {
             !user_names.contains(&"admin_only_probe"),
             "a logged-in non-admin must NOT receive Admin-level tools: {user_names:?}"
         );
+    }
+
+    /// No Admin-tier tool anywhere is a write.
+    ///
+    /// `admin/mod.rs` has its own copy of this over `AdminBlock`, which is
+    /// where an author annotating an admin endpoint will trip it. This one is
+    /// the backstop: the policy is about the Admin tier, not about one block,
+    /// so a POST tool declared under an admin-access route in any other block
+    /// has to fail somewhere too.
+    #[test]
+    fn no_admin_tier_tool_is_a_write() {
+        for block in real_block_infos() {
+            for ep in &block.endpoints {
+                if !ep.is_agent_tool() {
+                    continue;
+                }
+                if routing::effective_access(&block, ep, &[]) != AuthLevel::Admin {
+                    continue;
+                }
+                assert_eq!(
+                    ep.method,
+                    wafer_run::HttpMethod::Get,
+                    "{} {} is an Admin-tier agent tool and must be a read: a tool's \
+                     execute runs with the visitor's full ambient authority",
+                    block.name,
+                    ep.path
+                );
+            }
+        }
     }
 
     /// The same three-tier property as above, but against the tools the

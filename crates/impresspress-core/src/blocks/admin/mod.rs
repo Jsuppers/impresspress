@@ -201,11 +201,15 @@ crate::impresspress_feature_block! {
                     .output::<contracts::AdminSettingsResponse>()
                     .agent_tool(
                         "get_site_settings",
-                        "Read this site's configuration variables as a \
-                         key-to-value map. Values of variables marked \
-                         sensitive come back masked, never in the clear, so \
-                         this cannot be used to retrieve a secret. \
-                         Read-only: it cannot change a setting.",
+                        "Read this site's configuration variables as a list of \
+                         entries, each with its key, its value, and whether \
+                         that value is masked. A variable is masked when it \
+                         carries the sensitive flag or its key ends in \
+                         `_SECRET` or `_KEY`; a masked value reads \
+                         `********` and is never the real one. Treat an \
+                         unmasked value as readable configuration, not as \
+                         proof it holds no secret. Read-only: it cannot \
+                         change a setting.",
                     ),
                 BlockEndpoint::get("/b/admin/api/logs")
                     .summary("Audit logs API")
@@ -217,7 +221,8 @@ crate::impresspress_feature_block! {
                         "List recorded admin actions, newest first: which \
                          admin changed which user, role or setting, when, \
                          and from which client IP. Use it to answer what \
-                         changed on this site and who changed it.",
+                         changed on this site and who changed it. Read-only: \
+                         it cannot alter or remove an entry.",
                     ),
             ])
     },

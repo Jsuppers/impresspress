@@ -363,6 +363,13 @@ fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
     );
     assert_eq!(named.get("start_checkout"), Some(&"/b/products/checkout"));
     assert_eq!(
+        named.len(),
+        7,
+        "the products block's agent surface is exactly the six storefront \
+         tools plus list_products — an extra annotation here is reachable \
+         from any visitor's page: {named:?}"
+    );
+    assert_eq!(
         named.get("get_order_status"),
         Some(&"/b/products/orders/{id}/status")
     );
