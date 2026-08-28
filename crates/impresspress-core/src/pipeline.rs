@@ -1354,14 +1354,22 @@ mod discovery_tests {
         // An unauthenticated request must see Public tools only. Anything
         // requiring a session is recon surface if its name is published
         // here. `list_my_purchases` is the shipped Authenticated tool;
-        // `admin_only_probe` (fixture) covers the Admin tier, which nothing
-        // shipped declares.
+        // `admin_only_probe` (fixture) is kept alongside the shipped admin
+        // tools so this still covers the Admin tier if admin's own surface
+        // ever goes away.
         let mut infos = real_block_infos();
         infos.push(admin_tool_block());
         let body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
         let names = tool_names(&body);
 
-        for forbidden in ["list_my_purchases", "admin_only_probe"] {
+        for forbidden in [
+            "list_my_purchases",
+            "admin_only_probe",
+            "list_users",
+            "list_roles",
+            "get_site_settings",
+            "list_audit_log",
+        ] {
             assert!(
                 !names.contains(&forbidden),
                 "anonymous manifest must not name the privileged tool {forbidden}: {names:?}"
@@ -1623,6 +1631,57 @@ mod discovery_tests {
             !user_names.contains(&"admin_only_probe"),
             "a logged-in non-admin must NOT receive Admin-level tools: {user_names:?}"
         );
+    }
+
+    /// The same three-tier property as above, but against the tools the
+    /// admin block actually ships rather than the `admin_only_probe`
+    /// fixture.
+    ///
+    /// The design spec calls the Admin tier the thinnest coverage on the
+    /// impresspress side and the level where a filtering mistake is most
+    /// costly: these four tools read the site's user list, its roles, its
+    /// configuration and its audit trail. A fixture cannot catch an admin
+    /// endpoint that was mis-tiered in `admin/mod.rs` — only the real
+    /// `BlockInfo` can.
+    #[tokio::test]
+    async fn shipped_admin_tools_reach_only_admin_callers() {
+        const ADMIN_TOOLS: [&str; 4] = [
+            "list_users",
+            "list_roles",
+            "get_site_settings",
+            "list_audit_log",
+        ];
+
+        let ctx = TestContext::with_auth().await;
+        let infos = real_block_infos();
+
+        let admin_body = webmcp_manifest(&ctx, Some(&["admin"]), &infos, &AllEnabled).await;
+        let as_admin = tool_names(&admin_body);
+        for tool in ADMIN_TOOLS {
+            assert!(
+                as_admin.contains(&tool),
+                "an admin session must receive the shipped admin tool {tool}: {as_admin:?}"
+            );
+        }
+
+        // The two discriminating halves. A logged-in non-admin and an
+        // anonymous visitor must both be told nothing about these names:
+        // publishing them is recon surface, and the manifest is the only
+        // place tool names are handed out.
+        let user_body = webmcp_manifest(&ctx, Some(&[]), &infos, &AllEnabled).await;
+        let anon_body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let as_user = tool_names(&user_body);
+        let as_anon = tool_names(&anon_body);
+        for tool in ADMIN_TOOLS {
+            assert!(
+                !as_user.contains(&tool),
+                "a logged-in non-admin must NOT receive the admin tool {tool}: {as_user:?}"
+            );
+            assert!(
+                !as_anon.contains(&tool),
+                "an anonymous visitor must NOT receive the admin tool {tool}: {as_anon:?}"
+            );
+        }
     }
 
     /// The manifest must not advertise tools from a block the admin
