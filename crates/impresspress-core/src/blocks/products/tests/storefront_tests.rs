@@ -346,6 +346,12 @@ fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
         Some(&"/b/products/storefront/{product_id}")
     );
     assert_eq!(
+        named.get("list_products"),
+        Some(&"/b/products/catalog"),
+        "an agent that cannot list products cannot reach get_product: it has \
+         no other way to learn a product id"
+    );
+    assert_eq!(
         named.get("list_my_purchases"),
         Some(&"/b/products/purchases"),
         "at least one Authenticated-level tool must exist, or the manifest's \

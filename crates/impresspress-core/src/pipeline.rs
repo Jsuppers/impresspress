@@ -1385,6 +1385,7 @@ mod discovery_tests {
 
         for expected in [
             "get_storefront_config",
+            "list_products",
             "get_product",
             "preview_price",
             "start_checkout",
@@ -1542,6 +1543,54 @@ mod discovery_tests {
                 .any(|name| name.starts_with("receipt_token")),
             "the guest receipt digest must not be published to an agent: {published:?}"
         );
+    }
+
+    /// `list_products` is the agent's entry point and the only anonymous
+    /// tool that returns a list of rows, so it is the one place an internal
+    /// products column would reach an unauthenticated agent in bulk.
+    ///
+    /// Before the catalog was projected through `CatalogProductView` this
+    /// endpoint echoed the stored row: `owner_id`, `created_by`,
+    /// `seller_account_id`, `owner_kind`, `stripe_product_id`,
+    /// `approval_status`, `submitted_at`, `current_version` and
+    /// `deleted_at` were all public. Annotating it as a tool is only safe
+    /// on top of that projection, and this pins the two together.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_list_products_to_the_public_catalog_view() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "list_products")
+            .unwrap_or_else(|| {
+                panic!("list_products must be published to an anonymous caller: {body}")
+            });
+
+        let published = property_names(&tool["outputSchema"]);
+        assert!(
+            published.contains(&"name".to_string()) && published.contains(&"slug".to_string()),
+            "the walk must reach the catalog row's properties: {published:?}"
+        );
+        for withheld in [
+            "owner_id",
+            "created_by",
+            "seller_account_id",
+            "owner_kind",
+            "stripe_product_id",
+            "approval_status",
+            "submitted_at",
+            "current_version",
+            "deleted_at",
+        ] {
+            assert!(
+                !published.contains(&withheld.to_string()),
+                "the public catalog tool must not publish the internal column \
+                 {withheld}: {published:?}"
+            );
+        }
     }
 
     /// Every `properties` key anywhere under `schema`: the names a consumer
