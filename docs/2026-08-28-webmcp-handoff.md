@@ -21,6 +21,7 @@ its arguments is worse than no tool** — refuse rather than mislead.
 | Four schema decisions | impresspress **#75** | **OPEN** — `feat/schema-decisions`, stacked on #74 (no CI until it retargets `main`; suite run locally) |
 | Real-server WebMCP e2e | impresspress **#76** | **OPEN** — `test/webmcp-e2e`, base `main`; CI 13/13 |
 | llm + vector typed (spec step 8) | impresspress **#79** | **OPEN** — `feat/type-llm-vector`, stacked on #75; 13 llm + 9 vector JSON endpoints typed, both blocks under the snapshot gate; independently reviewed pre-push (three confirmed findings fixed on the branch); native-only, non-gating for the submission |
+| products' CRUD rows typed | impresspress **#80** | **OPEN** — `feat/type-products-rows`, stacked on #75; all 47 row endpoints projected through `contracts::*View` / `*Request`, three security holes closed (§3), order `status` + `reconciliation_status` published as enums; independently reviewed pre-push (DO-NOT-PUSH verdict on four false descriptions — all fixed on the branch) |
 | Demo consumer + preview-host fix | impresspress **#77** | **OPEN** — `feat/webmcp-demo-consumer`, base `main`; CI 13/13 (one rerun: the runner's apt mirror answered 403 during `playwright install --with-deps`, not the PR) |
 
 ### Merge order — resolved
@@ -166,8 +167,10 @@ stacked on #74:
   explicit value.
 
 ### Work remaining
-- **products' 69 unmigrated sites.** 22 need the `components/schemas` hoist; 47
-  need typed handlers (currently generic CRUD over DB column maps).
+- **products' 22 offer sites.** `ManagedOffer` / `OfferDefinitionRequest` and
+  the offer list / product-duplicate outputs that embed them reach the
+  recursive `Condition` and need the `components/schemas` hoist. The other 47
+  (every row endpoint) are typed in **#80**.
 - **The `$defs` → `components/schemas` hoist.** Recursive contracts still
   produce dangling refs in `/openapi.json`. Not a regression — before #323 every
   named type did. The WebMCP side is fail-safe (refused, not published wrong).
@@ -232,8 +235,9 @@ built from this branch plus #77's files (adapter fix + `examples/webmcp-demo`);
 once #74, #75 and #77 are on `main`, redeploy from `main`.
 
 Engineering that does **not** gate the submission but is still open: products'
-remaining CRUD row schemas and `llm`/`vector` typing (both in flight as
-stacked PRs on 2026-08-28); the `$defs` hoist (wafer-run).
+22 offer sites (recursive `Condition`); the `$defs` hoist (wafer-run). The
+`llm`/`vector` typing (**#79**) and products' row endpoints (**#80**) landed as
+stacked PRs on 2026-08-28.
 
 ## 5. Traps for whoever picks this up
 
