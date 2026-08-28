@@ -86,7 +86,7 @@ Per-block `/openapi.json` snapshot gate first, then block by block:
 | Block | Result |
 |---|---|
 | gate | built; probed per block — each fails naming itself |
-| products | 54/123 sites; 69 blocked (22 recursive `Condition`, 47 handlers with no contract type) |
+| products | 54/123 sites in the first pass; the 47 row endpoints (products, groups, types, group templates, orders, subscription, public catalog) then typed through `contracts::*View` / `*Request` in 7 commits — three of them security fixes (§3); 22 offer sites still blocked by the recursive `Condition` |
 | auth_ui | 8/8; 9 types written; `pipeline.rs` auth assertions passed unmodified |
 | files | 4 sites; local mirror of the wafer wire type, handler serializes it |
 | messages | 7 sites, 3 migrated; `UpdateContextRequest` replaced a `HashMap` + runtime whitelist |
@@ -129,6 +129,26 @@ tool instructions". POST/PATCH returned `subject`/`description`/`evidence_url`/
 `reporter_email` **ungrouped**, and the inbox listed `subject` flat. Now
 structural across every ticket shape.
 
+**Live leak, fixed.** The public catalog (`GET /b/products/catalog`,
+`/catalog/{id}`, `AuthLevel::Public`) echoed the products row, so an
+anonymous request got every listing's `owner_id`, `created_by`,
+`seller_account_id`, `owner_kind`, `stripe_product_id`, `approval_status`,
+`submitted_at`, `current_version` and `deleted_at`. `pipeline.rs` asserted the
+schema carried all of them. Fixed by projection (`CatalogProductView`); the
+gate walks every published field name under the public paths.
+
+**Live leak, fixed.** Every order endpoint — buyer, seller and admin — echoed
+`receipt_token_hash`, the sha256 of the guest receipt capability
+(`CheckoutResponse::receipt_token`), plus its expiry; refund rows under the
+order detail echoed the Stripe `idempotency_key` and raw `response_json`,
+which `ProviderOperationSummary` already kept private for provider operations.
+Fixed by projection (`PurchaseView`, `RefundView`).
+
+**Write-side hole, fixed.** The seller product *create* path wrote every key
+of the body; only the update path stripped `seller_account_id`,
+`stripe_product_id`, `published_at`, `current_version`, `submitted_at`,
+`deleted_at`. `CreateProductRequest` has no such fields on either tier.
+
 **No schema could have been true before.** `email_verified`/`disabled` are
 INTEGER on SQLite/D1 and BOOLEAN on Postgres; `permissions` is JSON TEXT only
 SQLite decodes. The admin response shape depended on the backend.
@@ -162,8 +182,14 @@ stacked on #74:
   explicit value.
 
 ### Work remaining
-- **products' 69 unmigrated sites.** 22 need the `components/schemas` hoist; 47
-  need typed handlers (currently generic CRUD over DB column maps).
+- **products' 22 offer sites.** `ManagedOffer` / `OfferDefinitionRequest` and
+  the offer list / product-duplicate outputs that embed them reach the
+  recursive `Condition` and need the `components/schemas` hoist. The other
+  47 (every row endpoint) are typed: the rows are flat `contracts::*View`s,
+  the writes are `Create*` / `Update*` requests, and the `{id, data}` record
+  envelope is gone from the block. Consumers of the products JSON API — the
+  SDK's `ProductsExtension` was updated in step — now read `body.name`, not
+  `body.data.name`.
 - **The `$defs` → `components/schemas` hoist.** Recursive contracts still
   produce dangling refs in `/openapi.json`. Not a regression — before #323 every
   named type did. The WebMCP side is fail-safe (refused, not published wrong).
@@ -210,8 +236,9 @@ The spec's §Submission context, as of 2026-08-28 end of day:
 | Agent-driven browse → price → checkout | ❌ human, plan 3 task 5 |
 
 Engineering that does **not** gate the submission but is still open: products'
-69 unmigrated sites; `llm` (18 endpoints) and `vector` (11) declare no schemas
-at all (spec step 8, native-only, non-gating); the `$defs` hoist (wafer-run).
+22 offer sites (recursive `Condition`); `llm` (18 endpoints) and `vector` (11)
+declare no schemas at all (spec step 8, native-only, non-gating); the `$defs`
+hoist (wafer-run).
 
 ## 5. Traps for whoever picks this up
 

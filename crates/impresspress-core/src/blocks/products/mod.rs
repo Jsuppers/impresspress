@@ -322,11 +322,15 @@ crate::impresspress_feature_block! {
     info: |_this| {
         use wafer_run::{AuthLevel, CollectionSchema};
 
-        // Path and query parameter schemas stay hand-written. They restate
-        // the route template, and no handler deserializes them — every one
-        // reads `msg.var(..)` / `msg.query(..)` by name. A struct declared
-        // only to feed `.path_params::<T>()` would have no runtime user and
-        // would generate a byte-identical parameter list.
+        // Path parameter schemas stay hand-written. They restate the route
+        // template, and no handler deserializes them — every one reads
+        // `msg.var(..)` by name. A struct declared only to feed
+        // `.path_params::<T>()` would have no runtime user and would
+        // generate a byte-identical parameter list. Query parameters are
+        // typed wherever a handler reads more than one (`contracts::
+        // PageQuery`, `ProductListQuery`, …: `from_message` is the handler's
+        // only reader); the few endpoints that read a single `msg.query(..)`
+        // keep the hand-written form beside that call.
         let id_path_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
