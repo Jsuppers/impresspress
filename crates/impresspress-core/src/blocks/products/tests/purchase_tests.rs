@@ -643,4 +643,25 @@ async fn order_rows_outside_the_state_contract_are_an_internal_error() {
         .await,
         "the list must not publish the row either"
     );
+
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_bad_status",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_2")),
+            ("status".to_string(), serde_json::json!("shipped")),
+            ("total_cents".to_string(), serde_json::json!(1000)),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+        ]),
+    )
+    .await;
+    let (msg, _input) = get_msg("/b/products/purchases/pur_bad_status", "user_2");
+    assert!(
+        output_is_error(purchase::handle_get(&ctx, &msg).await, ErrorCode::Internal).await,
+        "a 200 would publish `shipped`, which is not an order state"
+    );
 }

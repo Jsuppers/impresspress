@@ -10,7 +10,7 @@ use crate::{
     blocks::products::{
         contracts::{
             AnalyticsProduct, CheckoutPresentation, CommerceAnalytics, MoneyBreakdown, OfferMode,
-            ReconciliationStatus, SellerFailureSummary,
+            OrderStatus, ReconciliationStatus, SellerFailureSummary,
         },
         money,
     },
@@ -42,7 +42,7 @@ pub(crate) async fn recent_seller_failures(
                 Filter {
                     field: "status".to_string(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!("failed"),
+                    value: serde_json::json!(OrderStatus::Failed),
                 },
             ],
             sort: vec![SortField {
@@ -92,13 +92,13 @@ pub(crate) async fn recent_seller_failures(
             .then_with(|| left.id.cmp(&right.id))
     });
     records.truncate(limit as usize);
-    Ok(records
+    records
         .into_iter()
         .map(|record| {
             let reconciliation_error = record.str_field("reconciliation_error");
-            SellerFailureSummary {
+            Ok(SellerFailureSummary {
                 order_id: record.id.clone(),
-                status: record.str_field("status").to_string(),
+                status: OrderStatus::from_record(&record)?,
                 currency: record.str_field("currency").to_string(),
                 total_minor: record.i64_field("total_cents"),
                 error: if reconciliation_error.is_empty() {
@@ -108,9 +108,9 @@ pub(crate) async fn recent_seller_failures(
                 }
                 .to_string(),
                 created_at: record.str_field("created_at").to_string(),
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Immutable server-resolved line item written before a provider checkout is
@@ -258,7 +258,10 @@ pub(crate) async fn create_checkout_order(
             "stripe_account_id".to_string(),
             serde_json::json!(&snapshot.stripe_account_id),
         ),
-        ("status".to_string(), serde_json::json!("pending")),
+        (
+            "status".to_string(),
+            serde_json::json!(OrderStatus::Pending),
+        ),
         (
             "total_cents".to_string(),
             serde_json::json!(snapshot.amounts.total_minor),
@@ -400,7 +403,7 @@ pub(crate) async fn mark_checkout_failed(
         ctx,
         purchase_id,
         HashMap::from([
-            ("status".to_string(), serde_json::json!("failed")),
+            ("status".to_string(), serde_json::json!(OrderStatus::Failed)),
             (
                 "reconciliation_status".to_string(),
                 serde_json::json!(ReconciliationStatus::ProviderError),
@@ -614,7 +617,7 @@ pub(crate) async fn complete_checkout_atomic(
 ) -> Result<i64, WaferError> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-    data.insert("status".into(), serde_json::json!("completed"));
+    data.insert("status".into(), serde_json::json!(OrderStatus::Completed));
     data.insert(
         "provider_payment_intent_id".into(),
         serde_json::json!(payment_intent),
@@ -669,7 +672,7 @@ pub(crate) async fn complete_checkout_atomic(
             Filter {
                 field: "status".into(),
                 operator: FilterOp::In,
-                value: serde_json::json!(["checkout_started", "pending"]),
+                value: serde_json::json!([OrderStatus::CheckoutStarted, OrderStatus::Pending]),
             },
         ],
         data,
@@ -800,7 +803,10 @@ pub(crate) async fn reconcile_checkout_session(
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut data = HashMap::from([
-        ("status".to_string(), serde_json::json!("completed")),
+        (
+            "status".to_string(),
+            serde_json::json!(OrderStatus::Completed),
+        ),
         (
             "provider_payment_intent_id".to_string(),
             serde_json::json!(&completion.payment_intent_id),
@@ -888,7 +894,7 @@ pub(crate) async fn reconcile_checkout_session(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::In,
-                value: serde_json::json!(["checkout_started", "pending"]),
+                value: serde_json::json!([OrderStatus::CheckoutStarted, OrderStatus::Pending]),
             },
             Filter {
                 field: "provider_session_id".to_string(),
@@ -974,7 +980,7 @@ pub(crate) async fn reconcile_checkout_failure(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::In,
-                value: serde_json::json!(["checkout_started", "pending"]),
+                value: serde_json::json!([OrderStatus::CheckoutStarted, OrderStatus::Pending]),
             },
             Filter {
                 field: "provider_session_id".to_string(),
@@ -983,7 +989,7 @@ pub(crate) async fn reconcile_checkout_failure(
             },
         ],
         HashMap::from([
-            ("status".to_string(), serde_json::json!("failed")),
+            ("status".to_string(), serde_json::json!(OrderStatus::Failed)),
             (
                 "reconciliation_status".to_string(),
                 serde_json::json!(ReconciliationStatus::ProviderError),
@@ -1085,11 +1091,8 @@ pub(crate) async fn sync_payment_intent(
         return Ok(Some(purchase));
     }
 
-    let order_status = purchase.str_field("status");
-    let paid = matches!(
-        order_status,
-        "completed" | "partially_refunded" | "refunded"
-    );
+    let order_status = OrderStatus::from_record(&purchase)?;
+    let paid = order_status.is_paid();
     if paid {
         if snapshot.status != "succeeded" {
             // Checkout is the fulfillment authority. A late, non-success
@@ -1101,7 +1104,7 @@ pub(crate) async fn sync_payment_intent(
         if purchase.i64_field("total_cents") != snapshot.amount_minor {
             return Err(invalid("amount does not match the completed order"));
         }
-    } else if order_status == "failed" && snapshot.status == "succeeded" {
+    } else if order_status == OrderStatus::Failed && snapshot.status == "succeeded" {
         return Err(invalid(
             "a succeeded PaymentIntent conflicts with a terminal failed order",
         ));
@@ -1331,7 +1334,10 @@ pub(crate) async fn claim_for_checkout(
     purchase_id: &str,
 ) -> Result<i64, WaferError> {
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-    data.insert("status".into(), serde_json::json!("checkout_started"));
+    data.insert(
+        "status".into(),
+        serde_json::json!(OrderStatus::CheckoutStarted),
+    );
     data.insert(
         "updated_at".into(),
         serde_json::json!(chrono::Utc::now().to_rfc3339()),
@@ -1348,7 +1354,7 @@ pub(crate) async fn claim_for_checkout(
             Filter {
                 field: "status".into(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!("pending"),
+                value: serde_json::json!(OrderStatus::Pending),
             },
         ],
         data,
@@ -1369,7 +1375,7 @@ pub(crate) async fn refund_atomic(
     let total = purchase.i64_field("total_cents");
     let now = chrono::Utc::now().to_rfc3339();
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-    data.insert("status".into(), serde_json::json!("refunded"));
+    data.insert("status".into(), serde_json::json!(OrderStatus::Refunded));
     data.insert("refunded_at".into(), serde_json::json!(&now));
     data.insert("refunded_by".into(), serde_json::json!(refunded_by));
     data.insert("refund_reason".into(), serde_json::json!(reason));
@@ -1387,7 +1393,7 @@ pub(crate) async fn refund_atomic(
             Filter {
                 field: "status".into(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!("completed"),
+                value: serde_json::json!(OrderStatus::Completed),
             },
         ],
         data,
@@ -1417,10 +1423,7 @@ pub(crate) async fn reconcile_refund_total(
     if current >= target_refunded_total {
         return Ok(purchase);
     }
-    if !matches!(
-        purchase.str_field("status"),
-        "completed" | "partially_refunded"
-    ) {
+    if !OrderStatus::from_record(&purchase)?.is_refundable() {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "purchase is not in a refundable state",
@@ -1431,9 +1434,9 @@ pub(crate) async fn reconcile_refund_total(
         (
             "status".to_string(),
             serde_json::json!(if target_refunded_total == total {
-                "refunded"
+                OrderStatus::Refunded
             } else {
-                "partially_refunded"
+                OrderStatus::PartiallyRefunded
             }),
         ),
         (
@@ -1466,7 +1469,7 @@ pub(crate) async fn reconcile_refund_total(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::In,
-                value: serde_json::json!(["completed", "partially_refunded"]),
+                value: serde_json::json!([OrderStatus::Completed, OrderStatus::PartiallyRefunded]),
             },
         ],
         data,
@@ -1590,8 +1593,8 @@ pub(crate) async fn commerce_analytics(
             })?;
         let aggregate = by_currency.entry(currency.clone()).or_default();
         aggregate.order_count += 1;
-        let status = order.str_field("status");
-        let paid = matches!(status, "completed" | "partially_refunded" | "refunded");
+        let status = OrderStatus::from_record(&order)?;
+        let paid = status.is_paid();
         if paid {
             let total = order.i64_field("total_cents");
             let refunded = order.i64_field("refunded_total_cents");
@@ -1610,7 +1613,7 @@ pub(crate) async fn commerce_analytics(
                 aggregate.refunded_order_count += 1;
             }
             paid_order_currencies.insert(order.id.clone(), currency);
-        } else if status == "failed" {
+        } else if status == OrderStatus::Failed {
             aggregate.failed_order_count += 1;
         }
 

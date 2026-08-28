@@ -286,6 +286,40 @@ async fn products_order_surfaces_publish_the_state_enums() {
             props["reconciliation_status"]
         );
     }
+
+    let order_states = serde_json::json!([
+        "pending",
+        "checkout_started",
+        "completed",
+        "partially_refunded",
+        "refunded",
+        "failed"
+    ]);
+    for props in &surfaces {
+        assert_eq!(
+            props["status"]["enum"], order_states,
+            "`claim_for_checkout` writes `checkout_started`; every stored order state must \
+             be published: {:?}",
+            props["status"]
+        );
+    }
+    let failures = objects_with_property(
+        &doc,
+        &["/b/products/api/seller/stats"],
+        "responses",
+        "order_id",
+    );
+    assert!(
+        !failures.is_empty(),
+        "the seller stats publish failed-order summaries; the walk found none"
+    );
+    for props in &failures {
+        assert_eq!(
+            props["status"]["enum"], order_states,
+            "the seller failure summary is an order surface too: {:?}",
+            props["status"]
+        );
+    }
 }
 
 /// Every field name `block` publishes: the keys of every `properties` object

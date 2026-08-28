@@ -11,7 +11,7 @@ use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream,
 use crate::{
     blocks::products::{
         contracts::{
-            FulfillmentKind, GuestOrderStatus, MoneyBreakdown, PricingPreviewRequest,
+            FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus, PricingPreviewRequest,
             ReconciliationStatus, StorefrontConfig, StorefrontOffer, StorefrontProduct, StripeMode,
             VariableVisibility, COMMERCE_SCHEMA_VERSION,
         },
@@ -115,14 +115,16 @@ pub(crate) async fn handle_guest_order_status(ctx: &dyn Context, msg: &Message) 
             Err(error) => return err_internal("Order has invalid currency", error),
         };
     let subscription_status = optional_nonempty(&order, "subscription_status");
-    let reconciliation_status = match ReconciliationStatus::from_record(&order) {
-        Ok(status) => status,
+    let state = OrderStatus::from_record(&order)
+        .and_then(|status| Ok((status, ReconciliationStatus::from_record(&order)?)));
+    let (status, reconciliation_status) = match state {
+        Ok(state) => state,
         Err(error) => return err_internal("Order row is outside the contract", error),
     };
     let response = GuestOrderStatus {
         schema_version: COMMERCE_SCHEMA_VERSION,
         order_id: order.id.clone(),
-        status: order.str_field("status").to_string(),
+        status,
         reconciliation_status,
         amounts: MoneyBreakdown {
             currency,

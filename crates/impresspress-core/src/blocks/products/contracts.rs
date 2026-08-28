@@ -648,6 +648,57 @@ pub struct CheckoutResponse {
     pub amounts: MoneyBreakdown,
 }
 
+/// Lifecycle state of an order: the `status` column of
+/// `impresspress__products__purchases`.
+///
+/// This is the one definition of the column's value set. `repo::purchases`
+/// stores these variants and filters on them, and the order views parse the
+/// column back through [`Self::from_record`], so a stored value outside the
+/// set is reported as a data-integrity error rather than published or
+/// defaulted.
+///
+/// `pending`: created, checkout not yet claimed. `checkout_started`: a
+/// provider Checkout Session was claimed for the order. `completed`: paid.
+/// `partially_refunded` / `refunded`: paid, then refunded in part or in
+/// full. `failed`: checkout or reconciliation failed; `reconciliation_error`
+/// says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    Pending,
+    CheckoutStarted,
+    Completed,
+    PartiallyRefunded,
+    Refunded,
+    Failed,
+}
+
+impl OrderStatus {
+    /// Parse the `status` column of an order row.
+    pub fn from_record(record: &Record) -> Result<Self, WaferError> {
+        enum_column(record, "status")
+    }
+
+    /// Whether the order was paid: `completed`, or paid and then refunded.
+    pub const fn is_paid(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::PartiallyRefunded | Self::Refunded
+        )
+    }
+
+    /// Whether a further refund may be issued against the order.
+    pub const fn is_refundable(self) -> bool {
+        matches!(self, Self::Completed | Self::PartiallyRefunded)
+    }
+
+    /// Whether checkout has not completed yet: `pending` or
+    /// `checkout_started`.
+    pub const fn awaits_completion(self) -> bool {
+        matches!(self, Self::Pending | Self::CheckoutStarted)
+    }
+}
+
 /// Where an order stands against the payment provider's view of it: the
 /// `reconciliation_status` column of `impresspress__products__purchases`.
 ///
@@ -690,7 +741,8 @@ impl ReconciliationStatus {
 pub struct GuestOrderStatus {
     pub schema_version: u32,
     pub order_id: String,
-    pub status: String,
+    /// Lifecycle state of the order.
+    pub status: OrderStatus,
     /// Where the order stands against the provider's view of it.
     pub reconciliation_status: ReconciliationStatus,
     pub amounts: MoneyBreakdown,
@@ -1012,7 +1064,9 @@ pub struct AnalyticsProduct {
 #[serde(deny_unknown_fields)]
 pub struct SellerFailureSummary {
     pub order_id: String,
-    pub status: String,
+    /// `failed` for a terminal failure; otherwise the state of an order whose
+    /// last PaymentIntent event needs the seller's attention.
+    pub status: OrderStatus,
     pub currency: String,
     pub total_minor: i64,
     #[serde(default)]
@@ -2092,9 +2146,12 @@ pub struct PurchaseView {
     pub stripe_customer_id: String,
     /// Stripe Subscription id for subscription orders, or empty.
     pub stripe_subscription_id: String,
-    /// Order state: `pending`, `completed`, `partially_refunded`,
-    /// `refunded` or `failed`.
-    pub status: String,
+    /// Lifecycle state of the order. `pending`: created, checkout not yet
+    /// claimed; `checkout_started`: a provider Checkout Session was claimed;
+    /// `completed`: paid; `partially_refunded` / `refunded`: paid, then
+    /// refunded in part or in full; `failed`: checkout or reconciliation
+    /// failed (`reconciliation_error` says why).
+    pub status: OrderStatus,
     /// Checkout presentation the order was started with.
     #[schemars(extend("enum" = ["hosted", "embedded", "payment_link"]))]
     pub checkout_mode: String,
@@ -2192,7 +2249,7 @@ impl PurchaseView {
             stripe_account_id: record.str_field("stripe_account_id").to_string(),
             stripe_customer_id: record.str_field("stripe_customer_id").to_string(),
             stripe_subscription_id: record.str_field("stripe_subscription_id").to_string(),
-            status: record.str_field("status").to_string(),
+            status: OrderStatus::from_record(record)?,
             checkout_mode: record.str_field("checkout_mode").to_string(),
             provider: record.str_field("provider").to_string(),
             livemode: record.bool_field("livemode"),
@@ -2618,7 +2675,40 @@ mod tests {
     use wafer_core::clients::database::Record;
     use wafer_run::ErrorCode;
 
-    use super::{Condition, OfferMode, PricingPreviewRequest, ReconciliationStatus};
+    use super::{Condition, OfferMode, OrderStatus, PricingPreviewRequest, ReconciliationStatus};
+
+    /// Same contract as for `ReconciliationStatus`: the wire form is the
+    /// stored column value, and the predicates the repo filters on are the
+    /// documented groupings.
+    #[test]
+    fn order_status_wire_form_is_the_stored_column_value() {
+        use OrderStatus::*;
+        for (variant, stored, paid, refundable, awaiting) in [
+            (Pending, "pending", false, false, true),
+            (CheckoutStarted, "checkout_started", false, false, true),
+            (Completed, "completed", true, true, false),
+            (PartiallyRefunded, "partially_refunded", true, true, false),
+            (Refunded, "refunded", true, false, false),
+            (Failed, "failed", false, false, false),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), stored);
+            let record = Record {
+                id: "pur_1".to_string(),
+                data: HashMap::from([("status".to_string(), serde_json::json!(stored))]),
+            };
+            assert_eq!(OrderStatus::from_record(&record).unwrap(), variant);
+            assert_eq!(variant.is_paid(), paid, "{stored}");
+            assert_eq!(variant.is_refundable(), refundable, "{stored}");
+            assert_eq!(variant.awaits_completion(), awaiting, "{stored}");
+        }
+        let record = Record {
+            id: "pur_1".to_string(),
+            data: HashMap::from([("status".to_string(), serde_json::json!("shipped"))]),
+        };
+        let error = OrderStatus::from_record(&record).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("shipped"), "{}", error.message);
+    }
 
     #[test]
     fn enums_use_stable_snake_case_wire_names() {

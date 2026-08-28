@@ -3,9 +3,9 @@ use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream}
 
 use super::{
     contracts::{
-        AdminPurchaseListQuery, DisputeView, LineItemView, PageQuery, PurchaseDetailResponse,
-        PurchaseListResponse, PurchaseView, RefundRequest, RefundResult, RefundResultStatus,
-        RefundView, SellerOrderListQuery,
+        AdminPurchaseListQuery, DisputeView, LineItemView, OrderStatus, PageQuery,
+        PurchaseDetailResponse, PurchaseListResponse, PurchaseView, RefundRequest, RefundResult,
+        RefundResultStatus, RefundView, SellerOrderListQuery,
     },
     repo, stripe_provider,
 };
@@ -327,14 +327,15 @@ async fn refund_purchase(
         }
         Err(error) => return err_internal("Database error", error),
     };
+    let order_status = match OrderStatus::from_record(&purchase) {
+        Ok(status) => status,
+        Err(error) => return err_internal("Order row is outside the contract", error),
+    };
     let has_payment_intent = !purchase.str_field("stripe_payment_intent_id").is_empty()
         || !purchase.str_field("provider_payment_intent_id").is_empty();
     if purchase.str_field("provider") != "stripe"
         && !has_payment_intent
-        && !matches!(
-            purchase.str_field("status"),
-            "completed" | "partially_refunded"
-        )
+        && !order_status.is_refundable()
     {
         return err_bad_request("Purchase is not in a refundable state");
     }
@@ -406,10 +407,7 @@ async fn refund_purchase(
                 livemode: existing.bool_field("livemode"),
             }
         } else {
-            if !matches!(
-                purchase.str_field("status"),
-                "completed" | "partially_refunded"
-            ) {
+            if !order_status.is_refundable() {
                 return err_bad_request("Purchase is not in a refundable state");
             }
             let remaining = total - refunded_total;
@@ -512,10 +510,7 @@ async fn refund_purchase(
             livemode: existing.bool_field("livemode"),
         }
     } else {
-        if !matches!(
-            purchase.str_field("status"),
-            "completed" | "partially_refunded"
-        ) {
+        if !order_status.is_refundable() {
             return err_bad_request("Purchase is not in a refundable state");
         }
         let remaining = total - refunded_total;

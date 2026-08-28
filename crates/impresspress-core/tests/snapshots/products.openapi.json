@@ -5482,7 +5482,15 @@
                           "type": "integer"
                         },
                         "status": {
-                          "description": "Order state: `pending`, `completed`, `partially_refunded`,\n`refunded` or `failed`.",
+                          "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                          "enum": [
+                            "pending",
+                            "checkout_started",
+                            "completed",
+                            "partially_refunded",
+                            "refunded",
+                            "failed"
+                          ],
                           "type": "string"
                         },
                         "stripe_account_id": {
@@ -6035,7 +6043,15 @@
                         "type": "integer"
                       },
                       "status": {
-                        "description": "Order state: `pending`, `completed`, `partially_refunded`,\n`refunded` or `failed`.",
+                        "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                        "enum": [
+                          "pending",
+                          "checkout_started",
+                          "completed",
+                          "partially_refunded",
+                          "refunded",
+                          "failed"
+                        ],
                         "type": "string"
                       },
                       "stripe_account_id": {
@@ -12705,7 +12721,15 @@
                           "type": "integer"
                         },
                         "status": {
-                          "description": "Order state: `pending`, `completed`, `partially_refunded`,\n`refunded` or `failed`.",
+                          "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                          "enum": [
+                            "pending",
+                            "checkout_started",
+                            "completed",
+                            "partially_refunded",
+                            "refunded",
+                            "failed"
+                          ],
                           "type": "string"
                         },
                         "stripe_account_id": {
@@ -13258,7 +13282,15 @@
                         "type": "integer"
                       },
                       "status": {
-                        "description": "Order state: `pending`, `completed`, `partially_refunded`,\n`refunded` or `failed`.",
+                        "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                        "enum": [
+                          "pending",
+                          "checkout_started",
+                          "completed",
+                          "partially_refunded",
+                          "refunded",
+                          "failed"
+                        ],
                         "type": "string"
                       },
                       "stripe_account_id": {
@@ -13841,6 +13873,15 @@
                           "type": "string"
                         },
                         "status": {
+                          "description": "`failed` for a terminal failure; otherwise the state of an order whose\nlast PaymentIntent event needs the seller's attention.",
+                          "enum": [
+                            "pending",
+                            "checkout_started",
+                            "completed",
+                            "partially_refunded",
+                            "refunded",
+                            "failed"
+                          ],
                           "type": "string"
                         },
                         "total_minor": {
@@ -15456,6 +15497,15 @@
                     "type": "integer"
                   },
                   "status": {
+                    "description": "Lifecycle state of the order.",
+                    "enum": [
+                      "pending",
+                      "checkout_started",
+                      "completed",
+                      "partially_refunded",
+                      "refunded",
+                      "failed"
+                    ],
                     "type": "string"
                   },
                   "subscription_cancel_at_period_end": {
@@ -15876,7 +15926,15 @@
                           "type": "integer"
                         },
                         "status": {
-                          "description": "Order state: `pending`, `completed`, `partially_refunded`,\n`refunded` or `failed`.",
+                          "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                          "enum": [
+                            "pending",
+                            "checkout_started",
+                            "completed",
+                            "partially_refunded",
+                            "refunded",
+                            "failed"
+                          ],
                           "type": "string"
                         },
                         "stripe_account_id": {
@@ -16428,7 +16486,15 @@
                         "type": "integer"
                       },
                       "status": {
-                        "description": "Order state: `pending`, `completed`, `partially_refunded`,\n`refunded` or `failed`.",
+                        "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                        "enum": [
+                          "pending",
+                          "checkout_started",
+                          "completed",
+                          "partially_refunded",
+                          "refunded",
+                          "failed"
+                        ],
                         "type": "string"
                       },
                       "stripe_account_id": {

@@ -16,7 +16,7 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError
 use super::{
     contracts::{
         AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, ManagedOffer,
-        ManagedPaymentLink, Offer, OfferMode, OfferStatus, PaymentLinkCreateRequest,
+        ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus, PaymentLinkCreateRequest,
         PricingPreviewRequest, ReconciliationStatus, WebhookAck, WebhookEventList,
         WebhookEventSummary,
     },
@@ -2500,7 +2500,8 @@ async fn reconcile_payment_link_session(
     // identity/amount cross-check still runs; only creation is skipped).
     let mut resumed_order = None;
     if let Some(existing) = repo::purchases::find_by_session(ctx, session_id).await? {
-        if matches!(existing.str_field("status"), "pending" | "checkout_started") {
+        let status = OrderStatus::from_record(&existing)?;
+        if status.awaits_completion() {
             resumed_order = Some(existing);
         } else {
             // The order already completed. Backfill the idempotent
@@ -2510,7 +2511,7 @@ async fn reconcile_payment_link_session(
                 .get("subscription")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            if !subscription.is_empty() && existing.str_field("status") == "completed" {
+            if !subscription.is_empty() && status == OrderStatus::Completed {
                 repo::subscription_items::snapshot_from_purchase(ctx, &existing.id, subscription)
                     .await?;
             }
@@ -3199,7 +3200,13 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     // subscription without its item snapshot forever.
                     let snapshot_due = rows == 1
                         || match repo::purchases::get(ctx, purchase_id).await {
-                            Ok(purchase) => purchase.str_field("status") == "completed",
+                            Ok(purchase) => match OrderStatus::from_record(&purchase) {
+                                Ok(status) => status == OrderStatus::Completed,
+                                Err(error) => fail_webhook!(
+                                    err_internal("Purchase row is outside the contract", error),
+                                    "subscription snapshot purchase state is outside the contract"
+                                ),
+                            },
                             Err(error) => fail_webhook!(
                                 err_internal(
                                     "Failed to load purchase for subscription snapshot",
