@@ -1593,7 +1593,21 @@ pub(crate) async fn commerce_analytics(
             })?;
         let aggregate = by_currency.entry(currency.clone()).or_default();
         aggregate.order_count += 1;
-        let status = OrderStatus::from_record(&order)?;
+        // Same reasoning as `PurchaseListResponse::from_record_list`: one row
+        // whose state column is outside the contract must not take down the
+        // whole stats endpoint. It is counted in `order_count` (it is a real
+        // order) but contributes no money, and is logged for the operator.
+        let status = match OrderStatus::from_record(&order) {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::error!(
+                    order_id = %order.id,
+                    error = %e,
+                    "order row is outside the published contract and was omitted from analytics"
+                );
+                continue;
+            }
+        };
         let paid = status.is_paid();
         if paid {
             let total = order.i64_field("total_cents");

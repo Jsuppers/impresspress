@@ -23,10 +23,7 @@ async fn list_orders(
 ) -> OutputStream {
     match repo::purchases::list_paginated(ctx, filters, i64::from(page), i64::from(page_size)).await
     {
-        Ok(result) => match PurchaseListResponse::from_record_list(&result) {
-            Ok(response) => ok_json(&response),
-            Err(error) => err_internal("Order row is outside the contract", error),
-        },
+        Ok(result) => ok_json(&PurchaseListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
 }

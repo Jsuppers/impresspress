@@ -2311,19 +2311,36 @@ pub struct PurchaseListResponse {
 }
 
 impl PurchaseListResponse {
-    /// Project a `RecordList` of order rows. Fails when any row holds a
-    /// state column outside its contract.
-    pub fn from_record_list(list: &RecordList) -> Result<Self, WaferError> {
-        Ok(Self {
+    /// Project a `RecordList` of order rows.
+    ///
+    /// A row holding a state column outside its contract is a data-integrity
+    /// problem, and it costs that row rather than the page: the alternative —
+    /// collecting into a `Result` — meant one legacy, imported or hand-edited
+    /// order denied the caller every order they had. It is logged at ERROR
+    /// with the row id so the operator sees what the caller cannot. The
+    /// single-order paths keep failing loudly, because there the row *is* the
+    /// response.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
             records: list
                 .records
                 .iter()
-                .map(PurchaseView::from_record)
-                .collect::<Result<_, _>>()?,
+                .filter_map(|record| match PurchaseView::from_record(record) {
+                    Ok(view) => Some(view),
+                    Err(e) => {
+                        tracing::error!(
+                            order_id = %record.id,
+                            error = %e,
+                            "order row is outside the published contract and was omitted from the page"
+                        );
+                        None
+                    }
+                })
+                .collect(),
             total_count: list.total_count,
             page: list.page,
             page_size: list.page_size,
-        })
+        }
     }
 }
 
@@ -2679,6 +2696,52 @@ mod tests {
     use wafer_run::ErrorCode;
 
     use super::{Condition, OfferMode, OrderStatus, PricingPreviewRequest, ReconciliationStatus};
+
+    /// One row whose state column is outside the contract must cost that
+    /// row, not the page.
+    ///
+    /// `PurchaseView::from_record` is fallible, so collecting the page into a
+    /// `Result` meant a single legacy, imported or hand-edited row took down
+    /// the caller's whole order list — a buyer could see none of their orders
+    /// because of one they could not see anyway.
+    #[test]
+    fn a_row_outside_the_contract_is_dropped_not_fatal_for_the_page() {
+        fn order(id: &str, status: &str) -> Record {
+            Record {
+                id: id.to_string(),
+                data: HashMap::from([
+                    ("status".to_string(), serde_json::json!(status)),
+                    (
+                        "reconciliation_status".to_string(),
+                        serde_json::json!("pending"),
+                    ),
+                ]),
+            }
+        }
+
+        let list = wafer_core::clients::database::RecordList {
+            records: vec![
+                order("pur_ok", "completed"),
+                order("pur_bad", "shipped"),
+                order("pur_ok2", "pending"),
+            ],
+            total_count: 3,
+            page: 1,
+            page_size: 20,
+        };
+
+        let projected = super::PurchaseListResponse::from_record_list(&list);
+        let ids: Vec<&str> = projected.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pur_ok", "pur_ok2"],
+            "the conforming rows must still reach the caller"
+        );
+        assert_eq!(
+            projected.total_count, 3,
+            "total_count is the database's count and is not rewritten by the projection"
+        );
+    }
 
     /// Same contract as for `ReconciliationStatus`: the wire form is the
     /// stored column value, and the predicates the repo filters on are the

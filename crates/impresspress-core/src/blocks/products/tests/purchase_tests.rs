@@ -619,11 +619,16 @@ async fn purchase_list_via_user_handler() {
     assert_eq!(body["records"].as_array().unwrap().len(), 1);
 }
 
-/// A stored order state outside the contract is a data-integrity error. The
-/// projection reports it as an internal error naming the row, never as a
-/// `200` carrying a value the schema does not define, and never as a default.
+/// A stored order state outside the contract is a data-integrity error, and
+/// it is never published as a `200` carrying a value the schema does not
+/// define, nor silently defaulted.
+///
+/// The two surfaces answer differently, on purpose. On a single-order GET the
+/// row *is* the response, so it fails loudly. On a list the row is one of
+/// many, so it is omitted and logged: failing the page meant one legacy,
+/// imported or hand-edited order denied the buyer every order they had.
 #[tokio::test]
-async fn order_rows_outside_the_state_contract_are_an_internal_error() {
+async fn order_rows_outside_the_state_contract_never_reach_the_wire() {
     let ctx = ctx().await;
     seed(
         &ctx,
@@ -646,14 +651,41 @@ async fn order_rows_outside_the_state_contract_are_an_internal_error() {
         output_is_error(purchase::handle_get(&ctx, &msg).await, ErrorCode::Internal).await,
         "a 200 would publish `half_done`, which the contract does not define"
     );
+    // A conforming order for the same buyer: without one, "the list is not
+    // empty" would pass vacuously and prove nothing about the skip.
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_good",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(2500)),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+        ]),
+    )
+    .await;
+
+    // The list omits the offending row and still serves the caller's other
+    // orders.
     let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    let body = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
+    let ids: Vec<&str> = body["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|r| r["id"].as_str().expect("row id"))
+        .collect();
     assert!(
-        output_is_error(
-            purchase::handle_list_user(&ctx, &msg).await,
-            ErrorCode::Internal
-        )
-        .await,
-        "the list must not publish the row either"
+        !ids.contains(&"pur_bad_reconciliation"),
+        "the list must not publish a row the contract cannot describe: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"pur_good"),
+        "one unprojectable row must not cost the caller their other orders: {ids:?}"
     );
 
     seed(

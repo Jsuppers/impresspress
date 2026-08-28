@@ -321,12 +321,19 @@ pub(super) async fn delete_role(
     }
     let admin_id = msg.user_id().to_string();
 
-    // Protect system roles. A missing row falls through to db::delete, which
-    // returns NotFound below.
-    if let Ok(role) = db::get(ctx, ROLES_TABLE, role_id).await {
-        if role.bool_field("is_system") {
-            return Err(err_forbidden("Cannot delete system role"));
+    // Protect system roles. The guard read must fail closed, for the same
+    // reason `handle_update_role`'s does: the old `if let Ok(role)` swallowed
+    // every non-success result — including a transient infra error — as "not
+    // a system role" and fell through to the unprotected delete below, which
+    // would drop the `admin` role and break auth. Not-found still falls
+    // through, so `db::delete` reports it.
+    match db::get(ctx, ROLES_TABLE, role_id).await {
+        Ok(role) if role.bool_field("is_system") => {
+            return Err(err_forbidden("Cannot delete system role"))
         }
+        Ok(_) => {}
+        Err(e) if e.code == ErrorCode::NotFound => {}
+        Err(e) => return Err(err_internal("Database error", e)),
     }
 
     match db::delete(ctx, ROLES_TABLE, role_id).await {
