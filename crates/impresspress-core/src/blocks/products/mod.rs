@@ -361,38 +361,11 @@ crate::impresspress_feature_block! {
                 "updated_at": {"type": "string", "format": "date-time"}
             }
         });
-        let product_type_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "is_system": {"type": "integer"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let group_template_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "display_name": {"type": "string"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        // NOT derivable, and deliberately so. `record_schema` /
-        // `record_list_schema` wrap `wafer_core::clients::database::Record`,
-        // whose `data` is the raw column map for a table with no contract
-        // type at all — `product_schema` above IS the row shape, hand-kept
-        // against the migration. There is no `T` to instantiate a generic
-        // `Record<T>` with, and `Record` itself lives in wafer-core. Every
-        // remaining `record_schema(...)` / `record_list_schema(...)` call
-        // site is a generic `crud::*` handler that reads and writes that map
-        // directly; typing them means typing the CRUD layer first, which is
-        // a behaviour change (unknown columns would start being rejected),
-        // not a schema migration.
+        // `record_schema` / `record_list_schema` wrap
+        // `wafer_core::clients::database::Record`, whose `data` is the raw
+        // column map. The remaining callers are the public catalog (still
+        // echoing `product_schema` above) and the purchase list/detail
+        // endpoints; every other row in this block is a `contracts::*View`.
         let record_schema = |data: serde_json::Value| serde_json::json!({
             "type": "object",
             "required": ["id", "data"],
@@ -492,11 +465,6 @@ crate::impresspress_feature_block! {
                     }
                 }
             }
-        });
-        let deleted_schema = serde_json::json!({
-            "type": "object",
-            "required": ["deleted"],
-            "properties": {"deleted": {"type": "boolean"}}
         });
         let product_id_path_schema = serde_json::json!({
             "type": "object",
@@ -610,16 +578,6 @@ crate::impresspress_feature_block! {
                 "offers": {"type": "array", "items": managed_offer_schema}
             }
         });
-        let product_type_write_schema = serde_json::json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "is_system": {"type": "integer", "enum": [0, 1]}
-            }
-        });
-
         BlockInfo::new("impresspress/products", "0.0.1", "http-handler@v1", "Products, pricing, purchases, and payment integration")
             .instance_mode(InstanceMode::Singleton)
             .requires(vec!["wafer-run/database".into(), "wafer-run/config".into(), "wafer-run/network".into()])
@@ -909,19 +867,20 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/api/admin/types")
                     .summary("List types")
                     .auth(AuthLevel::Admin)
-                    .output_schema(record_list_schema(product_type_schema.clone()))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::ProductTypeListResponse>()
                     .tags(&["products", "admin", "types"]),
                 BlockEndpoint::post("/b/products/api/admin/types")
                     .summary("Create type")
                     .auth(AuthLevel::Admin)
-                    .input_schema(product_type_write_schema)
-                    .output_schema(record_schema(product_type_schema.clone()))
+                    .input::<contracts::CreateProductTypeRequest>()
+                    .output::<contracts::ProductTypeView>()
                     .tags(&["products", "admin", "types"]),
                 BlockEndpoint::delete("/b/products/api/admin/types/{id}")
                     .summary("Delete type")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(deleted_schema)
+                    .output::<crud::Deleted>()
                     .tags(&["products", "admin", "types"]),
                 // JSON admin API — purchases + stats
                 BlockEndpoint::get("/b/products/api/admin/purchases")
@@ -1216,12 +1175,13 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/types")
                     .summary("List product types for the authenticated builder")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(record_list_schema(product_type_schema))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::ProductTypeListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/group-templates")
                     .summary("List group templates for the authenticated builder")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(record_list_schema(group_template_schema))
+                    .output::<contracts::GroupTemplateListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/api/seller/account")
                     .summary("Seller Stripe account status")

@@ -1709,6 +1709,160 @@ impl UpdateOwnGroupRequest {
     }
 }
 
+/// A product type (taxonomy) row: every column of
+/// `impresspress__products__types`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProductTypeView {
+    /// Stable type identifier.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Whether the type is built in. System types are seeded by the block
+    /// rather than created through the API.
+    pub is_system: bool,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl ProductTypeView {
+    /// Project an `impresspress__products__types` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.str_field("name").to_string(),
+            description: record.str_field("description").to_string(),
+            is_system: record.bool_field("is_system"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// One page of product type rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProductTypeListResponse {
+    /// Types on this page, newest first.
+    pub records: Vec<ProductTypeView>,
+    /// Total types, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl ProductTypeListResponse {
+    /// Project a `RecordList` of type rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .map(ProductTypeView::from_record)
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// `POST /b/products/api/admin/types` request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateProductTypeRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether the type is built in. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_system: Option<bool>,
+}
+
+impl CreateProductTypeRequest {
+    /// The columns this request writes: only the fields that were sent.
+    ///
+    /// `is_system` is an `INTEGER` column on every backend (the Postgres
+    /// migration mirrors SQLite's `INTEGER NOT NULL DEFAULT 0` deliberately),
+    /// so the boolean is written as `0` / `1` rather than bound as a boolean
+    /// Postgres would refuse.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        let is_system = self.is_system;
+        let mut data = columns(&self);
+        if let Some(is_system) = is_system {
+            data.insert(
+                "is_system".to_string(),
+                Value::from(if is_system { 1 } else { 0 }),
+            );
+        }
+        data
+    }
+}
+
+/// A group template row: every column of
+/// `impresspress__products__group_templates`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GroupTemplateView {
+    /// Stable template identifier.
+    pub id: String,
+    /// Machine name (`default`, …).
+    pub name: String,
+    /// Human-readable name shown in the product builder.
+    pub display_name: String,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl GroupTemplateView {
+    /// Project an `impresspress__products__group_templates` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.str_field("name").to_string(),
+            display_name: record.str_field("display_name").to_string(),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// Every group template, as one page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GroupTemplateListResponse {
+    /// Templates, sorted by name.
+    pub records: Vec<GroupTemplateView>,
+    /// Total templates. Always equal to the number of records: the endpoint
+    /// does not paginate.
+    pub total_count: i64,
+    /// Always `1`.
+    pub page: i64,
+    /// The fixed ceiling on rows returned.
+    pub page_size: i64,
+}
+
+impl GroupTemplateListResponse {
+    /// Project a `RecordList` of template rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .map(GroupTemplateView::from_record)
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
 /// Response body of `GET /b/products/api/admin/sellers/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminSellerDetail {

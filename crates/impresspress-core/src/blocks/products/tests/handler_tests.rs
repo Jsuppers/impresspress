@@ -2567,6 +2567,105 @@ async fn group_endpoints_publish_the_flat_group_view() {
     assert_eq!(deleted, serde_json::json!({"deleted": true}));
 }
 
+/// The type endpoints publish `contracts::ProductTypeView`, flat, with
+/// `is_system` normalized to a boolean whichever way the backend stores it.
+#[tokio::test]
+async fn type_endpoints_publish_the_flat_type_view() {
+    use crate::{blocks::products::contracts::ProductTypeView, util::RecordExt};
+
+    let ctx = ctx().await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/types",
+        serde_json::json!({"name": "subscription", "description": "Recurring", "is_system": true}),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(created.get("data").is_none(), "{created}");
+    let view: ProductTypeView = serde_json::from_value(created.clone()).expect("ProductTypeView");
+    assert_eq!(view.name, "subscription");
+    assert_eq!(view.description, "Recurring");
+    assert!(view.is_system);
+    assert_eq!(serde_json::to_value(&view).unwrap(), created);
+    let row = wafer_core::clients::database::get(&ctx, "impresspress__products__types", &view.id)
+        .await
+        .expect("type row");
+    assert_eq!(
+        row.i64_field("is_system"),
+        1,
+        "the INTEGER column is written as 0/1, which Postgres requires"
+    );
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/types",
+        serde_json::json!({"name": "plain"}),
+    );
+    let plain = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(plain["is_system"], false, "the table default is reported");
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/types",
+        serde_json::json!({"name": "bad", "is_system": 1}),
+    );
+    assert!(
+        output_is_error(
+            dispatch_admin(&ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await,
+        "is_system is a boolean on the wire"
+    );
+
+    for (msg, input) in [
+        admin_get_msg("/admin/b/products/types"),
+        get_msg("/b/products/types", "user_1"),
+    ] {
+        let out = if msg.path().starts_with("/admin/") {
+            dispatch_admin(&ctx, msg, input).await
+        } else {
+            dispatch_user(&ctx, msg, input).await
+        };
+        let list = output_to_json(out).await;
+        assert_eq!(list["total_count"], 2, "{list}");
+        assert_eq!(list["page_size"], 20);
+        let names: Vec<&str> = list["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"subscription") && names.contains(&"plain"));
+    }
+
+    let (mut msg, input) = delete_msg(&format!("/admin/b/products/types/{}", view.id), "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let deleted = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(deleted, serde_json::json!({"deleted": true}));
+}
+
+/// `GET /b/products/group-templates` was documented as the
+/// `{records, total_count, page, page_size}` envelope every other list uses
+/// but answered with a bare JSON array of raw records. It now publishes the
+/// documented envelope over `contracts::GroupTemplateView` rows.
+#[tokio::test]
+async fn group_templates_publish_the_documented_list_envelope() {
+    use crate::blocks::products::contracts::GroupTemplateView;
+
+    let ctx = ctx().await;
+    let (msg, input) = get_msg("/b/products/group-templates", "user_1");
+    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(list.is_object(), "an envelope, not a bare array: {list}");
+    let records = list["records"].as_array().expect("records");
+    assert_eq!(list["total_count"], records.len());
+    assert!(
+        records.iter().any(|r| r["name"] == "default"),
+        "the seeded default template is listed: {list}"
+    );
+    for record in records {
+        let view: GroupTemplateView =
+            serde_json::from_value(record.clone()).expect("GroupTemplateView");
+        assert_eq!(&serde_json::to_value(&view).unwrap(), record);
+    }
+}
+
 /// Moderation writes `published_at = ""` when it returns a product to draft.
 /// The view declares that column as a nullable `date-time`, so the empty
 /// string must read as `null` rather than as a string that is not a date.

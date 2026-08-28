@@ -1,25 +1,56 @@
 //! Product-type taxonomy CRUD (admin `/admin/b/products/types`; read-only
 //! list also served to regular users at `/b/products/types`).
-
-use std::collections::HashMap;
+//!
+//! Every response is a `contracts::ProductTypeView` (or a list of them)
+//! built from the row; the create body is a typed request.
 
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::TYPES_TABLE;
-use crate::blocks::crud;
+use crate::{
+    blocks::{
+        crud,
+        products::contracts::{
+            CreateProductTypeRequest, PageQuery, ProductTypeListResponse, ProductTypeView,
+        },
+    },
+    http::ok_json,
+};
+
+const ADMIN_TYPE_PREFIX: &str = "/admin/b/products/types/";
 
 pub(super) async fn handle_list_types(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_list(ctx, msg, TYPES_TABLE, vec![], None).await
+    let query = PageQuery::from_message(msg);
+    match crud::list_page(
+        ctx,
+        TYPES_TABLE,
+        i64::from(query.page),
+        i64::from(query.page_size),
+        vec![],
+        None,
+    )
+    .await
+    {
+        Ok(list) => ok_json(&ProductTypeListResponse::from_record_list(&list)),
+        Err(response) => response,
+    }
 }
 
 pub(super) async fn handle_create_type(
     ctx: &dyn Context,
-    msg: &Message,
+    _msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    crud::crud_create(ctx, msg, input, TYPES_TABLE, HashMap::new()).await
+    let request: CreateProductTypeRequest = match crud::read_json_body(input).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match crud::create_record(ctx, TYPES_TABLE, request.into_columns()).await {
+        Ok(record) => ok_json(&ProductTypeView::from_record(&record)),
+        Err(response) => response,
+    }
 }
 
 pub(super) async fn handle_delete_type(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete(ctx, msg, TYPES_TABLE, "/admin/b/products/types/", "Type").await
+    crud::crud_delete(ctx, msg, TYPES_TABLE, ADMIN_TYPE_PREFIX, "Type").await
 }

@@ -16,8 +16,9 @@ use crate::{
     blocks::{
         crud,
         products::contracts::{
-            CreateGroupRequest, CreateOwnGroupRequest, GroupListResponse, GroupView, PageQuery,
-            ProductListResponse, UpdateGroupRequest, UpdateOwnGroupRequest,
+            CreateGroupRequest, CreateOwnGroupRequest, GroupListResponse,
+            GroupTemplateListResponse, GroupView, PageQuery, ProductListResponse,
+            UpdateGroupRequest, UpdateOwnGroupRequest,
         },
     },
     http::{err_bad_request, err_internal, err_unauthorized, ok_json},
@@ -237,13 +238,24 @@ pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message)
     }
 }
 
-// User-accessible group templates (read-only)
+// User-accessible group templates (read-only). Answers with the same
+// `{records, total_count, page, page_size}` envelope as every other list in
+// the block — the shape its schema always documented — over the whole
+// table, sorted by name, the way the owner group list does.
 pub(super) async fn handle_user_list_group_templates(
     ctx: &dyn Context,
     _msg: &Message,
 ) -> OutputStream {
-    match db::list_all(ctx, GROUP_TEMPLATES_TABLE, vec![]).await {
-        Ok(records) => ok_json(&records),
+    let opts = ListOptions {
+        sort: vec![SortField {
+            field: "name".to_string(),
+            desc: false,
+        }],
+        limit: 1000,
+        ..Default::default()
+    };
+    match db::list(ctx, GROUP_TEMPLATES_TABLE, &opts).await {
+        Ok(result) => ok_json(&GroupTemplateListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
 }
