@@ -22,6 +22,7 @@ its arguments is worse than no tool** — refuse rather than mislead.
 | Real-server WebMCP e2e | impresspress **#76** | **OPEN** — `test/webmcp-e2e`, base `main`; CI 13/13 |
 | llm + vector typed (spec step 8) | impresspress **#79** | **OPEN** — `feat/type-llm-vector`, stacked on #75; 13 llm + 9 vector JSON endpoints typed, both blocks under the snapshot gate; independently reviewed pre-push (three confirmed findings fixed on the branch); native-only, non-gating for the submission |
 | products' CRUD rows typed | impresspress **#80** | **OPEN** — `feat/type-products-rows`, stacked on #75; all 47 row endpoints projected through `contracts::*View` / `*Request`, three security holes closed (§3), order `status` + `reconciliation_status` published as enums; independently reviewed pre-push (DO-NOT-PUSH verdict on four false descriptions — all fixed on the branch) |
+| Admin read tools + product discovery | impresspress **#81** | **OPEN** — `feat/agent-read-tools`, stacked on #80; the four admin JSON reads become `list_users` / `list_roles` / `get_site_settings` / `list_audit_log` (the spec's scoped read tools, never written), and `GET /b/products/catalog` becomes `list_products`, the agent's only way to discover a product id. `AdminSettingsResponse` reshaped so it can carry an `outputSchema` at all |
 | Demo consumer + preview-host fix | impresspress **#77** | **OPEN** — `feat/webmcp-demo-consumer`, base `main`; CI 13/13 (one rerun: the runner's apt mirror answered 403 during `playwright install --with-deps`, not the PR) |
 
 ### Merge order — resolved
@@ -236,8 +237,14 @@ once #74, #75 and #77 are on `main`, redeploy from `main`.
 
 Engineering that does **not** gate the submission but is still open: products'
 22 offer sites (recursive `Condition`); the `$defs` hoist (wafer-run). The
-`llm`/`vector` typing (**#79**) and products' row endpoints (**#80**) landed as
-stacked PRs on 2026-08-28.
+`llm`/`vector` typing (**#79**), products' row endpoints (**#80**) and the
+admin read tools + `list_products` (**#81**) landed as stacked PRs on
+2026-08-28.
+
+**Merge-order debt between #81 and #76.** `webmcp.spec.ts` (#76, on `main`)
+asserts exact tool sets at `:198`, `:304` and `:329`; #81 adds `list_products`
+to the Public set and four tools to the Admin set. Neither is red today — the
+branches have not met. Whichever merges second carries the spec update.
 
 ## 5. Traps for whoever picks this up
 
