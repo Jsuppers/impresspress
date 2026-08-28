@@ -2346,6 +2346,63 @@ pub struct PurchaseDetailResponse {
     pub disputes: Vec<DisputeView>,
 }
 
+// Two columns of `impresspress__products__subscriptions` are NOT published:
+// `user_id` (the caller already is that user) and `stripe_customer_id`,
+// the provider Customer id, which the hand-curated projection this type
+// replaces had always kept out of the response.
+/// The caller's platform subscription: `impresspress__products__subscriptions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionView {
+    /// Stable subscription identifier.
+    pub id: String,
+    /// Plan name.
+    pub plan: String,
+    /// Stripe subscription lifecycle state.
+    pub status: String,
+    /// Stripe Subscription id, or empty.
+    pub stripe_subscription_id: String,
+    /// RFC 3339 end of the grace period after a failed payment, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub grace_period_end: Option<String>,
+    /// Purchased add-on quantities; `0` when none.
+    pub addon_projects: i64,
+    pub addon_requests: i64,
+    pub addon_r2_bytes: i64,
+    pub addon_d1_bytes: i64,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl SubscriptionView {
+    /// Project an `impresspress__products__subscriptions` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            plan: record.str_field("plan").to_string(),
+            status: record.str_field("status").to_string(),
+            stripe_subscription_id: record.str_field("stripe_subscription_id").to_string(),
+            grace_period_end: timestamp_field(record, "grace_period_end"),
+            addon_projects: record.i64_field("addon_projects"),
+            addon_requests: record.i64_field("addon_requests"),
+            addon_r2_bytes: record.i64_field("addon_r2_bytes"),
+            addon_d1_bytes: record.i64_field("addon_d1_bytes"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// Response body of `GET /b/products/subscription`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionStatusResponse {
+    /// The caller's subscription, or `null` when they have none.
+    pub subscription: Option<SubscriptionView>,
+}
+
 /// Response body of `GET /b/products/api/admin/sellers/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminSellerDetail {

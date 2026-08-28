@@ -372,28 +372,6 @@ crate::impresspress_feature_block! {
             "required": ["id"],
             "properties": {"id": {"type": "string"}}
         });
-        let subscription_status_schema = serde_json::json!({
-            "type": "object",
-            "required": ["subscription"],
-            "properties": {
-                "subscription": {
-                    "type": ["object", "null"],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "plan": {"type": "string"},
-                        "status": {"type": "string"},
-                        "stripe_subscription_id": {"type": "string"},
-                        "grace_period_end": {"type": ["string", "null"], "format": "date-time"},
-                        "addon_projects": {"type": "integer"},
-                        "addon_requests": {"type": "integer"},
-                        "addon_r2_bytes": {"type": "integer"},
-                        "addon_d1_bytes": {"type": "integer"},
-                        "created_at": {"type": "string", "format": "date-time"},
-                        "updated_at": {"type": "string", "format": "date-time"}
-                    }
-                }
-            }
-        });
         let product_id_path_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -1324,7 +1302,7 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/subscription")
                     .summary("Platform subscription status")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(subscription_status_schema)
+                    .output::<contracts::SubscriptionStatusResponse>()
                     .tags(&["products", "subscriptions"]),
                 BlockEndpoint::post("/b/products/billing-portal")
                     .summary("Create a Stripe Billing Portal session for an owned customer context")

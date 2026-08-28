@@ -167,6 +167,42 @@ async fn admin_json_api_appears_in_openapi() {
     }
 }
 
+/// The products block's row endpoints used to echo database records, and the
+/// hand-written schemas beside them documented a row the handler never
+/// consulted. Each is now a `contracts::*View` the handler builds, and the
+/// schema is derived from it. A derived row schema always carries a complete
+/// `required` list — the view has no optional fields — so `required` is how
+/// this test tells a derived schema from a hand-written one that happened to
+/// list the same properties.
+#[tokio::test]
+async fn products_row_schemas_are_derived_from_the_views() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let paths = &doc["paths"];
+
+    let subscription = &paths["/b/products/subscription"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["subscription"];
+    assert_eq!(
+        subscription["type"],
+        serde_json::json!(["object", "null"]),
+        "the subscription stays nullable: {subscription}"
+    );
+    let required = subscription["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a derived row lists its fields as required: {subscription}"));
+    for field in ["id", "plan", "status", "addon_projects", "addon_d1_bytes"] {
+        assert!(
+            required.contains(&serde_json::json!(field)),
+            "`{field}` is always emitted: {subscription}"
+        );
+    }
+    assert!(
+        subscription["properties"]["user_id"].is_null()
+            && subscription["properties"]["stripe_customer_id"].is_null(),
+        "the projection withholds the owner and provider customer: {subscription}"
+    );
+}
+
 /// Every field name `block` publishes: the keys of every `properties` object
 /// anywhere in its schemas, plus the `name` of every declared parameter.
 ///

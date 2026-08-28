@@ -2666,6 +2666,57 @@ async fn group_templates_publish_the_documented_list_envelope() {
     }
 }
 
+/// `GET /b/products/subscription` publishes `contracts::SubscriptionView`
+/// under `subscription`, or `null` when the user has none. The row's
+/// `user_id` and `stripe_customer_id` are never part of it.
+#[tokio::test]
+async fn subscription_status_publishes_the_typed_projection() {
+    use crate::blocks::products::contracts::SubscriptionStatusResponse;
+
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        super::super::repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_row",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            (
+                "stripe_customer_id".to_string(),
+                serde_json::json!("cus_private"),
+            ),
+            (
+                "stripe_subscription_id".to_string(),
+                serde_json::json!("sub_stripe_1"),
+            ),
+            ("plan".to_string(), serde_json::json!("pro")),
+            ("status".to_string(), serde_json::json!("active")),
+            ("addon_projects".to_string(), serde_json::json!(2)),
+        ]),
+    )
+    .await;
+
+    let (msg, input) = get_msg("/b/products/subscription", "user_1");
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let typed: SubscriptionStatusResponse =
+        serde_json::from_value(body.clone()).expect("SubscriptionStatusResponse");
+    assert_eq!(serde_json::to_value(&typed).unwrap(), body);
+    let subscription = typed.subscription.expect("a subscription");
+    assert_eq!(subscription.id, "sub_row");
+    assert_eq!(subscription.plan, "pro");
+    assert_eq!(subscription.status, "active");
+    assert_eq!(subscription.stripe_subscription_id, "sub_stripe_1");
+    assert_eq!(subscription.addon_projects, 2);
+    assert_eq!(subscription.addon_requests, 0, "table default, not absent");
+    assert_eq!(subscription.grace_period_end, None);
+    let encoded = body.to_string();
+    assert!(!encoded.contains("cus_private"), "{body}");
+    assert!(!encoded.contains("user_id"), "{body}");
+
+    let (msg, input) = get_msg("/b/products/subscription", "user_2");
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(body, serde_json::json!({"subscription": null}));
+}
+
 /// Moderation writes `published_at = ""` when it returns a product to draft.
 /// The view declares that column as a nullable `date-time`, so the empty
 /// string must read as `null` rather than as a string that is not a date.

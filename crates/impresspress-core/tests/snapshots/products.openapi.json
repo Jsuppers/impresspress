@@ -17243,26 +17243,35 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "Response body of `GET /b/products/subscription`.",
                 "properties": {
                   "subscription": {
+                    "description": "The caller's subscription, or `null` when they have none.",
                     "properties": {
                       "addon_d1_bytes": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "addon_projects": {
+                        "description": "Purchased add-on quantities; `0` when none.",
+                        "format": "int64",
                         "type": "integer"
                       },
                       "addon_r2_bytes": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "addon_requests": {
+                        "format": "int64",
                         "type": "integer"
                       },
                       "created_at": {
+                        "description": "RFC 3339 creation timestamp.",
                         "format": "date-time",
                         "type": "string"
                       },
                       "grace_period_end": {
+                        "description": "RFC 3339 end of the grace period after a failed payment, or `null`.",
                         "format": "date-time",
                         "type": [
                           "string",
@@ -17270,22 +17279,40 @@
                         ]
                       },
                       "id": {
+                        "description": "Stable subscription identifier.",
                         "type": "string"
                       },
                       "plan": {
+                        "description": "Plan name.",
                         "type": "string"
                       },
                       "status": {
+                        "description": "Stripe subscription lifecycle state.",
                         "type": "string"
                       },
                       "stripe_subscription_id": {
+                        "description": "Stripe Subscription id, or empty.",
                         "type": "string"
                       },
                       "updated_at": {
+                        "description": "RFC 3339 timestamp of the last modification.",
                         "format": "date-time",
                         "type": "string"
                       }
                     },
+                    "required": [
+                      "id",
+                      "plan",
+                      "status",
+                      "stripe_subscription_id",
+                      "grace_period_end",
+                      "addon_projects",
+                      "addon_requests",
+                      "addon_r2_bytes",
+                      "addon_d1_bytes",
+                      "created_at",
+                      "updated_at"
+                    ],
                     "type": [
                       "object",
                       "null"
@@ -17295,6 +17322,7 @@
                 "required": [
                   "subscription"
                 ],
+                "title": "SubscriptionStatusResponse",
                 "type": "object"
               }
             }
