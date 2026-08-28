@@ -12553,7 +12553,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "One page of order rows.",
+                "description": "One page of the seller's own orders, newest first.",
                 "properties": {
                   "page": {
                     "description": "1-based index of this page.",
@@ -12566,38 +12566,15 @@
                     "type": "integer"
                   },
                   "records": {
-                    "description": "Orders on this page, newest first.",
                     "items": {
-                      "description": "An order row: `impresspress__products__purchases`, as published to the\nbuyer, the seller and administrators.",
+                      "description": "One order as the **seller** who fulfils it may read it.\n\nWider than the buyer's: a seller needs the fee that was taken, their own\nconnected account, the provider handles for their own charge, and the\nbuyer's email in order to fulfil. It still withholds the buyer's platform\nidentity (`user_id` / `buyer_user_id`) and their Stripe customer id, none\nof which a seller needs to ship an order.",
                       "properties": {
-                        "amount_cents": {
-                          "description": "Legacy amount column, in minor units. Prefer `total_cents`.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "approved_at": {
-                          "description": "RFC 3339 timestamp the order was approved, or `null`.",
-                          "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        },
                         "buyer_email": {
                           "description": "Buyer's email address as captured at checkout, or empty.",
                           "type": "string"
                         },
-                        "buyer_user_id": {
-                          "description": "Signed-in buyer's user id, or empty for a guest order.",
-                          "type": "string"
-                        },
                         "checkout_mode": {
                           "description": "Checkout presentation the order was started with.",
-                          "enum": [
-                            "hosted",
-                            "embedded",
-                            "payment_link"
-                          ],
                           "type": "string"
                         },
                         "created_at": {
@@ -12623,7 +12600,7 @@
                         },
                         "metadata": {
                           "additionalProperties": true,
-                          "description": "Immutable checkout snapshot: the offer id and version the order was\npriced against and the shipping amounts allowed at checkout.",
+                          "description": "Immutable checkout snapshot.",
                           "type": "object"
                         },
                         "payment_at": {
@@ -12634,17 +12611,13 @@
                             "null"
                           ]
                         },
-                        "payment_intent_event_created": {
-                          "description": "Provider timestamp (Unix seconds) of the PaymentIntent event that\nlast updated the payment state; `0` until one arrives.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
                         "platform_fee_cents": {
+                          "description": "Platform fee taken from this order, in minor units.",
                           "format": "int64",
                           "type": "integer"
                         },
                         "provider": {
-                          "description": "Payment provider: `stripe`, or `manual` for orders recorded outside a\nprovider.",
+                          "description": "Payment provider: `stripe`, or `manual`.",
                           "type": "string"
                         },
                         "provider_payment_error_code": {
@@ -12653,20 +12626,8 @@
                         "provider_payment_error_message": {
                           "type": "string"
                         },
-                        "provider_payment_intent_id": {
-                          "description": "PaymentIntent id as recorded from the provider event stream, or empty.",
-                          "type": "string"
-                        },
                         "provider_payment_status": {
                           "description": "Latest PaymentIntent state received from the provider.",
-                          "enum": [
-                            "",
-                            "succeeded",
-                            "payment_failed",
-                            "processing",
-                            "requires_action",
-                            "canceled"
-                          ],
                           "type": "string"
                         },
                         "provider_session_id": {
@@ -12677,7 +12638,7 @@
                           "type": "string"
                         },
                         "reconciliation_status": {
-                          "description": "Where the order stands against the provider's view of it. `pending`:\nno provider session yet; `awaiting_payment`: a Checkout Session exists;\n`reconciled`: the completed session matched the local snapshot;\n`provider_error`: the provider's answer was unusable or contradicted\nit (`reconciliation_error` says why); the `payment_*` values mirror\nthe last PaymentIntent event received before Checkout completion.",
+                          "description": "Where the order stands against the provider's view of it.",
                           "enum": [
                             "pending",
                             "awaiting_payment",
@@ -12713,7 +12674,7 @@
                           "type": "integer"
                         },
                         "seller_account_id": {
-                          "description": "Seller account the order was placed against; empty for platform\nproducts.",
+                          "description": "Seller account the order was placed against.",
                           "type": "string"
                         },
                         "shipping_cents": {
@@ -12721,7 +12682,7 @@
                           "type": "integer"
                         },
                         "status": {
-                          "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                          "description": "Lifecycle state of the order.",
                           "enum": [
                             "pending",
                             "checkout_started",
@@ -12733,31 +12694,15 @@
                           "type": "string"
                         },
                         "stripe_account_id": {
-                          "description": "Stripe connected account the order was charged through; empty for\nplatform products.",
-                          "type": "string"
-                        },
-                        "stripe_customer_id": {
-                          "description": "Stripe Customer id, or empty.",
+                          "description": "Stripe connected account the order was charged through, or empty.",
                           "type": "string"
                         },
                         "stripe_payment_intent_id": {
                           "description": "Stripe PaymentIntent id, or empty.",
                           "type": "string"
                         },
-                        "stripe_subscription_id": {
-                          "description": "Stripe Subscription id for subscription orders, or empty.",
-                          "type": "string"
-                        },
                         "subscription_cancel_at_period_end": {
                           "type": "boolean"
-                        },
-                        "subscription_canceled_at": {
-                          "description": "RFC 3339 timestamp the subscription was canceled, or `null`.",
-                          "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
                         },
                         "subscription_current_period_end": {
                           "description": "RFC 3339 end of the current billing period, or `null`.",
@@ -12767,21 +12712,8 @@
                             "null"
                           ]
                         },
-                        "subscription_event_created": {
-                          "description": "Provider timestamp (Unix seconds) of the subscription event that last\nupdated the subscription state; `0` until one arrives.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "subscription_last_synced_at": {
-                          "description": "RFC 3339 timestamp the subscription state was last synchronized from\nthe provider, or `null`.",
-                          "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        },
                         "subscription_status": {
-                          "description": "Stripe subscription lifecycle state for subscription orders, or\nempty.",
+                          "description": "Stripe subscription lifecycle state, or empty.",
                           "type": "string"
                         },
                         "subtotal_cents": {
@@ -12801,27 +12733,18 @@
                           "description": "RFC 3339 timestamp of the last modification.",
                           "format": "date-time",
                           "type": "string"
-                        },
-                        "user_id": {
-                          "description": "Legacy owner column; equals `buyer_user_id` for orders placed while\nsigned in and is empty for guest orders.",
-                          "type": "string"
                         }
                       },
                       "required": [
                         "id",
-                        "user_id",
-                        "buyer_user_id",
                         "buyer_email",
                         "seller_account_id",
                         "stripe_account_id",
-                        "stripe_customer_id",
-                        "stripe_subscription_id",
                         "status",
                         "checkout_mode",
                         "provider",
                         "livemode",
                         "currency",
-                        "amount_cents",
                         "subtotal_cents",
                         "discount_cents",
                         "tax_cents",
@@ -12831,21 +12754,15 @@
                         "refunded_total_cents",
                         "metadata",
                         "stripe_payment_intent_id",
-                        "provider_payment_intent_id",
                         "provider_session_id",
                         "provider_payment_status",
                         "provider_payment_error_code",
                         "provider_payment_error_message",
-                        "payment_intent_event_created",
                         "reconciliation_status",
                         "reconciliation_error",
                         "subscription_status",
                         "subscription_current_period_end",
                         "subscription_cancel_at_period_end",
-                        "subscription_canceled_at",
-                        "subscription_last_synced_at",
-                        "subscription_event_created",
-                        "approved_at",
                         "payment_at",
                         "refunded_at",
                         "refunded_by",
@@ -12858,7 +12775,7 @@
                     "type": "array"
                   },
                   "total_count": {
-                    "description": "Total orders matching the filters, across all pages.",
+                    "description": "Total orders matching the query, across all pages.",
                     "format": "int64",
                     "type": "integer"
                   }
@@ -12869,7 +12786,7 @@
                   "page",
                   "page_size"
                 ],
-                "title": "PurchaseListResponse",
+                "title": "SellerOrderListResponse",
                 "type": "object"
               }
             }
@@ -12907,10 +12824,9 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "Response body of the order detail endpoints: the order with its lines,\nrefunds and disputes.",
+                "description": "One seller-owned order with its lines, refunds and disputes.",
                 "properties": {
                   "disputes": {
-                    "description": "Disputes, newest first.",
                     "items": {
                       "description": "One payment dispute on an order: `impresspress__products__disputes`, the\ndurable projection of the provider's dispute events.",
                       "properties": {
@@ -13129,36 +13045,14 @@
                     "type": "array"
                   },
                   "purchase": {
-                    "description": "An order row: `impresspress__products__purchases`, as published to the\nbuyer, the seller and administrators.",
+                    "description": "One order as the **seller** who fulfils it may read it.\n\nWider than the buyer's: a seller needs the fee that was taken, their own\nconnected account, the provider handles for their own charge, and the\nbuyer's email in order to fulfil. It still withholds the buyer's platform\nidentity (`user_id` / `buyer_user_id`) and their Stripe customer id, none\nof which a seller needs to ship an order.",
                     "properties": {
-                      "amount_cents": {
-                        "description": "Legacy amount column, in minor units. Prefer `total_cents`.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "approved_at": {
-                        "description": "RFC 3339 timestamp the order was approved, or `null`.",
-                        "format": "date-time",
-                        "type": [
-                          "string",
-                          "null"
-                        ]
-                      },
                       "buyer_email": {
                         "description": "Buyer's email address as captured at checkout, or empty.",
                         "type": "string"
                       },
-                      "buyer_user_id": {
-                        "description": "Signed-in buyer's user id, or empty for a guest order.",
-                        "type": "string"
-                      },
                       "checkout_mode": {
                         "description": "Checkout presentation the order was started with.",
-                        "enum": [
-                          "hosted",
-                          "embedded",
-                          "payment_link"
-                        ],
                         "type": "string"
                       },
                       "created_at": {
@@ -13184,7 +13078,7 @@
                       },
                       "metadata": {
                         "additionalProperties": true,
-                        "description": "Immutable checkout snapshot: the offer id and version the order was\npriced against and the shipping amounts allowed at checkout.",
+                        "description": "Immutable checkout snapshot.",
                         "type": "object"
                       },
                       "payment_at": {
@@ -13195,17 +13089,13 @@
                           "null"
                         ]
                       },
-                      "payment_intent_event_created": {
-                        "description": "Provider timestamp (Unix seconds) of the PaymentIntent event that\nlast updated the payment state; `0` until one arrives.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
                       "platform_fee_cents": {
+                        "description": "Platform fee taken from this order, in minor units.",
                         "format": "int64",
                         "type": "integer"
                       },
                       "provider": {
-                        "description": "Payment provider: `stripe`, or `manual` for orders recorded outside a\nprovider.",
+                        "description": "Payment provider: `stripe`, or `manual`.",
                         "type": "string"
                       },
                       "provider_payment_error_code": {
@@ -13214,20 +13104,8 @@
                       "provider_payment_error_message": {
                         "type": "string"
                       },
-                      "provider_payment_intent_id": {
-                        "description": "PaymentIntent id as recorded from the provider event stream, or empty.",
-                        "type": "string"
-                      },
                       "provider_payment_status": {
                         "description": "Latest PaymentIntent state received from the provider.",
-                        "enum": [
-                          "",
-                          "succeeded",
-                          "payment_failed",
-                          "processing",
-                          "requires_action",
-                          "canceled"
-                        ],
                         "type": "string"
                       },
                       "provider_session_id": {
@@ -13238,7 +13116,7 @@
                         "type": "string"
                       },
                       "reconciliation_status": {
-                        "description": "Where the order stands against the provider's view of it. `pending`:\nno provider session yet; `awaiting_payment`: a Checkout Session exists;\n`reconciled`: the completed session matched the local snapshot;\n`provider_error`: the provider's answer was unusable or contradicted\nit (`reconciliation_error` says why); the `payment_*` values mirror\nthe last PaymentIntent event received before Checkout completion.",
+                        "description": "Where the order stands against the provider's view of it.",
                         "enum": [
                           "pending",
                           "awaiting_payment",
@@ -13274,7 +13152,7 @@
                         "type": "integer"
                       },
                       "seller_account_id": {
-                        "description": "Seller account the order was placed against; empty for platform\nproducts.",
+                        "description": "Seller account the order was placed against.",
                         "type": "string"
                       },
                       "shipping_cents": {
@@ -13282,7 +13160,7 @@
                         "type": "integer"
                       },
                       "status": {
-                        "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                        "description": "Lifecycle state of the order.",
                         "enum": [
                           "pending",
                           "checkout_started",
@@ -13294,31 +13172,15 @@
                         "type": "string"
                       },
                       "stripe_account_id": {
-                        "description": "Stripe connected account the order was charged through; empty for\nplatform products.",
-                        "type": "string"
-                      },
-                      "stripe_customer_id": {
-                        "description": "Stripe Customer id, or empty.",
+                        "description": "Stripe connected account the order was charged through, or empty.",
                         "type": "string"
                       },
                       "stripe_payment_intent_id": {
                         "description": "Stripe PaymentIntent id, or empty.",
                         "type": "string"
                       },
-                      "stripe_subscription_id": {
-                        "description": "Stripe Subscription id for subscription orders, or empty.",
-                        "type": "string"
-                      },
                       "subscription_cancel_at_period_end": {
                         "type": "boolean"
-                      },
-                      "subscription_canceled_at": {
-                        "description": "RFC 3339 timestamp the subscription was canceled, or `null`.",
-                        "format": "date-time",
-                        "type": [
-                          "string",
-                          "null"
-                        ]
                       },
                       "subscription_current_period_end": {
                         "description": "RFC 3339 end of the current billing period, or `null`.",
@@ -13328,21 +13190,8 @@
                           "null"
                         ]
                       },
-                      "subscription_event_created": {
-                        "description": "Provider timestamp (Unix seconds) of the subscription event that last\nupdated the subscription state; `0` until one arrives.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "subscription_last_synced_at": {
-                        "description": "RFC 3339 timestamp the subscription state was last synchronized from\nthe provider, or `null`.",
-                        "format": "date-time",
-                        "type": [
-                          "string",
-                          "null"
-                        ]
-                      },
                       "subscription_status": {
-                        "description": "Stripe subscription lifecycle state for subscription orders, or\nempty.",
+                        "description": "Stripe subscription lifecycle state, or empty.",
                         "type": "string"
                       },
                       "subtotal_cents": {
@@ -13362,27 +13211,18 @@
                         "description": "RFC 3339 timestamp of the last modification.",
                         "format": "date-time",
                         "type": "string"
-                      },
-                      "user_id": {
-                        "description": "Legacy owner column; equals `buyer_user_id` for orders placed while\nsigned in and is empty for guest orders.",
-                        "type": "string"
                       }
                     },
                     "required": [
                       "id",
-                      "user_id",
-                      "buyer_user_id",
                       "buyer_email",
                       "seller_account_id",
                       "stripe_account_id",
-                      "stripe_customer_id",
-                      "stripe_subscription_id",
                       "status",
                       "checkout_mode",
                       "provider",
                       "livemode",
                       "currency",
-                      "amount_cents",
                       "subtotal_cents",
                       "discount_cents",
                       "tax_cents",
@@ -13392,21 +13232,15 @@
                       "refunded_total_cents",
                       "metadata",
                       "stripe_payment_intent_id",
-                      "provider_payment_intent_id",
                       "provider_session_id",
                       "provider_payment_status",
                       "provider_payment_error_code",
                       "provider_payment_error_message",
-                      "payment_intent_event_created",
                       "reconciliation_status",
                       "reconciliation_error",
                       "subscription_status",
                       "subscription_current_period_end",
                       "subscription_cancel_at_period_end",
-                      "subscription_canceled_at",
-                      "subscription_last_synced_at",
-                      "subscription_event_created",
-                      "approved_at",
                       "payment_at",
                       "refunded_at",
                       "refunded_by",
@@ -13417,7 +13251,6 @@
                     "type": "object"
                   },
                   "refunds": {
-                    "description": "Refunds, newest first.",
                     "items": {
                       "description": "One refund on an order: `impresspress__products__refunds`.",
                       "properties": {
@@ -13534,7 +13367,7 @@
                   "refunds",
                   "disputes"
                 ],
-                "title": "PurchaseDetailResponse",
+                "title": "SellerOrderDetailResponse",
                 "type": "object"
               }
             }
@@ -15758,7 +15591,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "One page of order rows.",
+                "description": "One page of the caller's own orders, newest first.",
                 "properties": {
                   "page": {
                     "description": "1-based index of this page.",
@@ -15771,38 +15604,15 @@
                     "type": "integer"
                   },
                   "records": {
-                    "description": "Orders on this page, newest first.",
                     "items": {
-                      "description": "An order row: `impresspress__products__purchases`, as published to the\nbuyer, the seller and administrators.",
+                      "description": "One order as its **buyer** may read it.\n\nThe narrowest of the three order projections, and the one that matters\nmost: `GET /b/products/purchases` is opted in as the `list_my_purchases`\nWebMCP tool, so every field here is handed to whatever agent runs in the\nbuyer's page.\n\nWithheld, deliberately: the platform's economics (`platform_fee_cents`),\nthe seller's identity and Stripe account, the buyer's own provider handles\n(`stripe_customer_id`, the PaymentIntent and Checkout Session ids — a\nbuyer never needs to quote one, and they are the provider's namespace, not\nours), and the reconciliation and payment-error diagnostics, which describe\nour integration rather than their purchase.",
                       "properties": {
-                        "amount_cents": {
-                          "description": "Legacy amount column, in minor units. Prefer `total_cents`.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "approved_at": {
-                          "description": "RFC 3339 timestamp the order was approved, or `null`.",
-                          "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        },
                         "buyer_email": {
-                          "description": "Buyer's email address as captured at checkout, or empty.",
-                          "type": "string"
-                        },
-                        "buyer_user_id": {
-                          "description": "Signed-in buyer's user id, or empty for a guest order.",
+                          "description": "Email captured at checkout, or empty.",
                           "type": "string"
                         },
                         "checkout_mode": {
                           "description": "Checkout presentation the order was started with.",
-                          "enum": [
-                            "hosted",
-                            "embedded",
-                            "payment_link"
-                          ],
                           "type": "string"
                         },
                         "created_at": {
@@ -15822,10 +15632,6 @@
                           "description": "Stable order identifier.",
                           "type": "string"
                         },
-                        "livemode": {
-                          "description": "Whether the order was placed against the live Stripe environment.",
-                          "type": "boolean"
-                        },
                         "metadata": {
                           "additionalProperties": true,
                           "description": "Immutable checkout snapshot: the offer id and version the order was\npriced against and the shipping amounts allowed at checkout.",
@@ -15839,50 +15645,16 @@
                             "null"
                           ]
                         },
-                        "payment_intent_event_created": {
-                          "description": "Provider timestamp (Unix seconds) of the PaymentIntent event that\nlast updated the payment state; `0` until one arrives.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "platform_fee_cents": {
-                          "format": "int64",
-                          "type": "integer"
-                        },
                         "provider": {
                           "description": "Payment provider: `stripe`, or `manual` for orders recorded outside a\nprovider.",
                           "type": "string"
                         },
-                        "provider_payment_error_code": {
-                          "type": "string"
-                        },
-                        "provider_payment_error_message": {
-                          "type": "string"
-                        },
-                        "provider_payment_intent_id": {
-                          "description": "PaymentIntent id as recorded from the provider event stream, or empty.",
-                          "type": "string"
-                        },
                         "provider_payment_status": {
-                          "description": "Latest PaymentIntent state received from the provider.",
-                          "enum": [
-                            "",
-                            "succeeded",
-                            "payment_failed",
-                            "processing",
-                            "requires_action",
-                            "canceled"
-                          ],
-                          "type": "string"
-                        },
-                        "provider_session_id": {
-                          "description": "Stripe Checkout Session id, or empty.",
-                          "type": "string"
-                        },
-                        "reconciliation_error": {
+                          "description": "Latest payment state received from the provider.",
                           "type": "string"
                         },
                         "reconciliation_status": {
-                          "description": "Where the order stands against the provider's view of it. `pending`:\nno provider session yet; `awaiting_payment`: a Checkout Session exists;\n`reconciled`: the completed session matched the local snapshot;\n`provider_error`: the provider's answer was unusable or contradicted\nit (`reconciliation_error` says why); the `payment_*` values mirror\nthe last PaymentIntent event received before Checkout completion.",
+                          "description": "Where the order stands against the provider's view of it.",
                           "enum": [
                             "pending",
                             "awaiting_payment",
@@ -15897,7 +15669,7 @@
                           "type": "string"
                         },
                         "refund_reason": {
-                          "description": "Operator note attached to the last refund, or empty.",
+                          "description": "Reason given for the last refund, or empty.",
                           "type": "string"
                         },
                         "refunded_at": {
@@ -15908,25 +15680,17 @@
                             "null"
                           ]
                         },
-                        "refunded_by": {
-                          "description": "User id of the operator who issued the last refund, or empty.",
-                          "type": "string"
-                        },
                         "refunded_total_cents": {
                           "description": "Sum of succeeded refunds in minor units.",
                           "format": "int64",
                           "type": "integer"
-                        },
-                        "seller_account_id": {
-                          "description": "Seller account the order was placed against; empty for platform\nproducts.",
-                          "type": "string"
                         },
                         "shipping_cents": {
                           "format": "int64",
                           "type": "integer"
                         },
                         "status": {
-                          "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                          "description": "Lifecycle state of the order.",
                           "enum": [
                             "pending",
                             "checkout_started",
@@ -15935,22 +15699,6 @@
                             "refunded",
                             "failed"
                           ],
-                          "type": "string"
-                        },
-                        "stripe_account_id": {
-                          "description": "Stripe connected account the order was charged through; empty for\nplatform products.",
-                          "type": "string"
-                        },
-                        "stripe_customer_id": {
-                          "description": "Stripe Customer id, or empty.",
-                          "type": "string"
-                        },
-                        "stripe_payment_intent_id": {
-                          "description": "Stripe PaymentIntent id, or empty.",
-                          "type": "string"
-                        },
-                        "stripe_subscription_id": {
-                          "description": "Stripe Subscription id for subscription orders, or empty.",
                           "type": "string"
                         },
                         "subscription_cancel_at_period_end": {
@@ -15972,21 +15720,8 @@
                             "null"
                           ]
                         },
-                        "subscription_event_created": {
-                          "description": "Provider timestamp (Unix seconds) of the subscription event that last\nupdated the subscription state; `0` until one arrives.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "subscription_last_synced_at": {
-                          "description": "RFC 3339 timestamp the subscription state was last synchronized from\nthe provider, or `null`.",
-                          "format": "date-time",
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        },
                         "subscription_status": {
-                          "description": "Stripe subscription lifecycle state for subscription orders, or\nempty.",
+                          "description": "Stripe subscription lifecycle state for subscription orders, or empty.",
                           "type": "string"
                         },
                         "subtotal_cents": {
@@ -16006,54 +15741,30 @@
                           "description": "RFC 3339 timestamp of the last modification.",
                           "format": "date-time",
                           "type": "string"
-                        },
-                        "user_id": {
-                          "description": "Legacy owner column; equals `buyer_user_id` for orders placed while\nsigned in and is empty for guest orders.",
-                          "type": "string"
                         }
                       },
                       "required": [
                         "id",
-                        "user_id",
-                        "buyer_user_id",
                         "buyer_email",
-                        "seller_account_id",
-                        "stripe_account_id",
-                        "stripe_customer_id",
-                        "stripe_subscription_id",
                         "status",
                         "checkout_mode",
                         "provider",
-                        "livemode",
                         "currency",
-                        "amount_cents",
                         "subtotal_cents",
                         "discount_cents",
                         "tax_cents",
                         "shipping_cents",
-                        "platform_fee_cents",
                         "total_cents",
                         "refunded_total_cents",
                         "metadata",
-                        "stripe_payment_intent_id",
-                        "provider_payment_intent_id",
-                        "provider_session_id",
                         "provider_payment_status",
-                        "provider_payment_error_code",
-                        "provider_payment_error_message",
-                        "payment_intent_event_created",
                         "reconciliation_status",
-                        "reconciliation_error",
                         "subscription_status",
                         "subscription_current_period_end",
                         "subscription_cancel_at_period_end",
                         "subscription_canceled_at",
-                        "subscription_last_synced_at",
-                        "subscription_event_created",
-                        "approved_at",
                         "payment_at",
                         "refunded_at",
-                        "refunded_by",
                         "refund_reason",
                         "created_at",
                         "updated_at"
@@ -16063,7 +15774,7 @@
                     "type": "array"
                   },
                   "total_count": {
-                    "description": "Total orders matching the filters, across all pages.",
+                    "description": "Total orders matching the query, across all pages.",
                     "format": "int64",
                     "type": "integer"
                   }
@@ -16074,7 +15785,7 @@
                   "page",
                   "page_size"
                 ],
-                "title": "PurchaseListResponse",
+                "title": "BuyerOrderListResponse",
                 "type": "object"
               }
             }
@@ -16111,10 +15822,10 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "Response body of the order detail endpoints: the order with its lines,\nrefunds and disputes.",
+                "description": "One of the caller's own orders with the lines it was made of and the\nrefunds against it.",
                 "properties": {
                   "disputes": {
-                    "description": "Disputes, newest first.",
+                    "description": "Disputes raised against this order. Kept because the SSR order page\nalready shows a buyer their own disputes, and this endpoint is not\nopted into the WebMCP manifest — only the list above is, and it\ncarries no nested rows.",
                     "items": {
                       "description": "One payment dispute on an order: `impresspress__products__disputes`, the\ndurable projection of the provider's dispute events.",
                       "properties": {
@@ -16333,36 +16044,14 @@
                     "type": "array"
                   },
                   "purchase": {
-                    "description": "An order row: `impresspress__products__purchases`, as published to the\nbuyer, the seller and administrators.",
+                    "description": "One order as its **buyer** may read it.\n\nThe narrowest of the three order projections, and the one that matters\nmost: `GET /b/products/purchases` is opted in as the `list_my_purchases`\nWebMCP tool, so every field here is handed to whatever agent runs in the\nbuyer's page.\n\nWithheld, deliberately: the platform's economics (`platform_fee_cents`),\nthe seller's identity and Stripe account, the buyer's own provider handles\n(`stripe_customer_id`, the PaymentIntent and Checkout Session ids — a\nbuyer never needs to quote one, and they are the provider's namespace, not\nours), and the reconciliation and payment-error diagnostics, which describe\nour integration rather than their purchase.",
                     "properties": {
-                      "amount_cents": {
-                        "description": "Legacy amount column, in minor units. Prefer `total_cents`.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "approved_at": {
-                        "description": "RFC 3339 timestamp the order was approved, or `null`.",
-                        "format": "date-time",
-                        "type": [
-                          "string",
-                          "null"
-                        ]
-                      },
                       "buyer_email": {
-                        "description": "Buyer's email address as captured at checkout, or empty.",
-                        "type": "string"
-                      },
-                      "buyer_user_id": {
-                        "description": "Signed-in buyer's user id, or empty for a guest order.",
+                        "description": "Email captured at checkout, or empty.",
                         "type": "string"
                       },
                       "checkout_mode": {
                         "description": "Checkout presentation the order was started with.",
-                        "enum": [
-                          "hosted",
-                          "embedded",
-                          "payment_link"
-                        ],
                         "type": "string"
                       },
                       "created_at": {
@@ -16382,10 +16071,6 @@
                         "description": "Stable order identifier.",
                         "type": "string"
                       },
-                      "livemode": {
-                        "description": "Whether the order was placed against the live Stripe environment.",
-                        "type": "boolean"
-                      },
                       "metadata": {
                         "additionalProperties": true,
                         "description": "Immutable checkout snapshot: the offer id and version the order was\npriced against and the shipping amounts allowed at checkout.",
@@ -16399,50 +16084,16 @@
                           "null"
                         ]
                       },
-                      "payment_intent_event_created": {
-                        "description": "Provider timestamp (Unix seconds) of the PaymentIntent event that\nlast updated the payment state; `0` until one arrives.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "platform_fee_cents": {
-                        "format": "int64",
-                        "type": "integer"
-                      },
                       "provider": {
                         "description": "Payment provider: `stripe`, or `manual` for orders recorded outside a\nprovider.",
                         "type": "string"
                       },
-                      "provider_payment_error_code": {
-                        "type": "string"
-                      },
-                      "provider_payment_error_message": {
-                        "type": "string"
-                      },
-                      "provider_payment_intent_id": {
-                        "description": "PaymentIntent id as recorded from the provider event stream, or empty.",
-                        "type": "string"
-                      },
                       "provider_payment_status": {
-                        "description": "Latest PaymentIntent state received from the provider.",
-                        "enum": [
-                          "",
-                          "succeeded",
-                          "payment_failed",
-                          "processing",
-                          "requires_action",
-                          "canceled"
-                        ],
-                        "type": "string"
-                      },
-                      "provider_session_id": {
-                        "description": "Stripe Checkout Session id, or empty.",
-                        "type": "string"
-                      },
-                      "reconciliation_error": {
+                        "description": "Latest payment state received from the provider.",
                         "type": "string"
                       },
                       "reconciliation_status": {
-                        "description": "Where the order stands against the provider's view of it. `pending`:\nno provider session yet; `awaiting_payment`: a Checkout Session exists;\n`reconciled`: the completed session matched the local snapshot;\n`provider_error`: the provider's answer was unusable or contradicted\nit (`reconciliation_error` says why); the `payment_*` values mirror\nthe last PaymentIntent event received before Checkout completion.",
+                        "description": "Where the order stands against the provider's view of it.",
                         "enum": [
                           "pending",
                           "awaiting_payment",
@@ -16457,7 +16108,7 @@
                         "type": "string"
                       },
                       "refund_reason": {
-                        "description": "Operator note attached to the last refund, or empty.",
+                        "description": "Reason given for the last refund, or empty.",
                         "type": "string"
                       },
                       "refunded_at": {
@@ -16468,25 +16119,17 @@
                           "null"
                         ]
                       },
-                      "refunded_by": {
-                        "description": "User id of the operator who issued the last refund, or empty.",
-                        "type": "string"
-                      },
                       "refunded_total_cents": {
                         "description": "Sum of succeeded refunds in minor units.",
                         "format": "int64",
                         "type": "integer"
-                      },
-                      "seller_account_id": {
-                        "description": "Seller account the order was placed against; empty for platform\nproducts.",
-                        "type": "string"
                       },
                       "shipping_cents": {
                         "format": "int64",
                         "type": "integer"
                       },
                       "status": {
-                        "description": "Lifecycle state of the order. `pending`: created, checkout not yet\nclaimed; `checkout_started`: a provider Checkout Session was claimed;\n`completed`: paid; `partially_refunded` / `refunded`: paid, then\nrefunded in part or in full; `failed`: checkout or reconciliation\nfailed (`reconciliation_error` says why).",
+                        "description": "Lifecycle state of the order.",
                         "enum": [
                           "pending",
                           "checkout_started",
@@ -16495,22 +16138,6 @@
                           "refunded",
                           "failed"
                         ],
-                        "type": "string"
-                      },
-                      "stripe_account_id": {
-                        "description": "Stripe connected account the order was charged through; empty for\nplatform products.",
-                        "type": "string"
-                      },
-                      "stripe_customer_id": {
-                        "description": "Stripe Customer id, or empty.",
-                        "type": "string"
-                      },
-                      "stripe_payment_intent_id": {
-                        "description": "Stripe PaymentIntent id, or empty.",
-                        "type": "string"
-                      },
-                      "stripe_subscription_id": {
-                        "description": "Stripe Subscription id for subscription orders, or empty.",
                         "type": "string"
                       },
                       "subscription_cancel_at_period_end": {
@@ -16532,21 +16159,8 @@
                           "null"
                         ]
                       },
-                      "subscription_event_created": {
-                        "description": "Provider timestamp (Unix seconds) of the subscription event that last\nupdated the subscription state; `0` until one arrives.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "subscription_last_synced_at": {
-                        "description": "RFC 3339 timestamp the subscription state was last synchronized from\nthe provider, or `null`.",
-                        "format": "date-time",
-                        "type": [
-                          "string",
-                          "null"
-                        ]
-                      },
                       "subscription_status": {
-                        "description": "Stripe subscription lifecycle state for subscription orders, or\nempty.",
+                        "description": "Stripe subscription lifecycle state for subscription orders, or empty.",
                         "type": "string"
                       },
                       "subtotal_cents": {
@@ -16566,54 +16180,30 @@
                         "description": "RFC 3339 timestamp of the last modification.",
                         "format": "date-time",
                         "type": "string"
-                      },
-                      "user_id": {
-                        "description": "Legacy owner column; equals `buyer_user_id` for orders placed while\nsigned in and is empty for guest orders.",
-                        "type": "string"
                       }
                     },
                     "required": [
                       "id",
-                      "user_id",
-                      "buyer_user_id",
                       "buyer_email",
-                      "seller_account_id",
-                      "stripe_account_id",
-                      "stripe_customer_id",
-                      "stripe_subscription_id",
                       "status",
                       "checkout_mode",
                       "provider",
-                      "livemode",
                       "currency",
-                      "amount_cents",
                       "subtotal_cents",
                       "discount_cents",
                       "tax_cents",
                       "shipping_cents",
-                      "platform_fee_cents",
                       "total_cents",
                       "refunded_total_cents",
                       "metadata",
-                      "stripe_payment_intent_id",
-                      "provider_payment_intent_id",
-                      "provider_session_id",
                       "provider_payment_status",
-                      "provider_payment_error_code",
-                      "provider_payment_error_message",
-                      "payment_intent_event_created",
                       "reconciliation_status",
-                      "reconciliation_error",
                       "subscription_status",
                       "subscription_current_period_end",
                       "subscription_cancel_at_period_end",
                       "subscription_canceled_at",
-                      "subscription_last_synced_at",
-                      "subscription_event_created",
-                      "approved_at",
                       "payment_at",
                       "refunded_at",
-                      "refunded_by",
                       "refund_reason",
                       "created_at",
                       "updated_at"
@@ -16621,9 +16211,8 @@
                     "type": "object"
                   },
                   "refunds": {
-                    "description": "Refunds, newest first.",
                     "items": {
-                      "description": "One refund on an order: `impresspress__products__refunds`.",
+                      "description": "One refund as its **buyer** may read it: how much came back, in what\ncurrency, and whether it has landed.\n\nThe provider handles (`provider_refund_id`, `payment_intent_id`,\n`stripe_account_id`), the operator fields (`refunded_by`, `note`,\n`provider_reason`) and the failure diagnostics (`last_error`) belong to\nwhoever issued the refund, not to whoever received it.",
                       "properties": {
                         "amount_minor": {
                           "format": "int64",
@@ -16649,83 +16238,27 @@
                           "description": "Stable refund identifier.",
                           "type": "string"
                         },
-                        "last_error": {
-                          "type": "string"
-                        },
-                        "livemode": {
-                          "type": "boolean"
-                        },
-                        "note": {
-                          "description": "Operator note kept on the platform, never sent to the provider.",
-                          "type": "string"
-                        },
-                        "payment_intent_id": {
-                          "description": "PaymentIntent the refund was issued against; empty for manual\nrefunds.",
-                          "type": "string"
-                        },
-                        "provider_reason": {
-                          "description": "Reason sent to the provider, or empty.",
-                          "type": "string"
-                        },
-                        "provider_refund_id": {
-                          "description": "Stripe Refund id once the provider accepted it, or empty.",
-                          "type": "string"
-                        },
                         "provider_status": {
-                          "description": "The provider's own state for the refund (`pending`, `requires_action`,\n`succeeded`, `failed` or `canceled`). Empty until the provider answers;\n`succeeded` for a refund recorded without a provider, which the ledger\ncompletes itself.",
+                          "description": "The provider's own state for the refund. Empty until the provider\nanswers; `succeeded` for a refund recorded without a provider. Kept\nfor the buyer because \"has my money actually gone back\" is the\nquestion this endpoint exists to answer — it is a state, not a handle.",
                           "type": "string"
                         },
                         "purchase_id": {
                           "type": "string"
                         },
-                        "refunded_by": {
-                          "description": "User id of the operator who issued the refund.",
-                          "type": "string"
-                        },
                         "status": {
-                          "description": "Ledger state: `pending`, `provider_succeeded`, `succeeded` or\n`failed`.",
-                          "type": "string"
-                        },
-                        "stripe_account_id": {
-                          "description": "Stripe connected account the refund was issued through, or empty.",
-                          "type": "string"
-                        },
-                        "stripe_event_created": {
-                          "description": "Provider timestamp (Unix seconds) of the event that last updated the\nrefund; `0` until one arrives.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "target_refunded_total_minor": {
-                          "description": "The order's `refunded_total_cents` once this refund succeeds.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
-                        "updated_at": {
-                          "description": "RFC 3339 timestamp of the last modification.",
-                          "format": "date-time",
+                          "description": "Ledger state: `pending`, `provider_succeeded`, `succeeded` or `failed`.",
                           "type": "string"
                         }
                       },
                       "required": [
                         "id",
                         "purchase_id",
-                        "provider_refund_id",
-                        "payment_intent_id",
-                        "stripe_account_id",
                         "amount_minor",
-                        "target_refunded_total_minor",
                         "currency",
                         "status",
                         "provider_status",
-                        "provider_reason",
-                        "note",
-                        "refunded_by",
-                        "livemode",
-                        "last_error",
                         "completed_at",
-                        "stripe_event_created",
-                        "created_at",
-                        "updated_at"
+                        "created_at"
                       ],
                       "type": "object"
                     },
@@ -16738,7 +16271,7 @@
                   "refunds",
                   "disputes"
                 ],
-                "title": "PurchaseDetailResponse",
+                "title": "BuyerOrderDetailResponse",
                 "type": "object"
               }
             }

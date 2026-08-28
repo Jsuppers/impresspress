@@ -75,6 +75,117 @@ async fn get_purchase_own() {
     );
 }
 
+/// Each tier sees only what belongs to it.
+///
+/// One `PurchaseView` used to serve buyer, seller and admin alike, so the
+/// buyer's own order list — and `list_my_purchases`, the WebMCP tool built on
+/// it — published the platform's economics (`platform_fee_cents`), the
+/// seller's Stripe account, the provider's internal handles and the
+/// reconciliation diagnostics. The same row handed the seller the buyer's
+/// platform user id and Stripe customer id. Products got
+/// `ProductView`/`CatalogProductView` for exactly this reason; orders did not.
+#[tokio::test]
+async fn each_order_tier_publishes_only_its_own_fields() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_tiers",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("buyer_user_id".to_string(), serde_json::json!("user_1")),
+            (
+                "buyer_email".to_string(),
+                serde_json::json!("buyer@example.com"),
+            ),
+            (
+                "seller_account_id".to_string(),
+                serde_json::json!("acct_seller_1"),
+            ),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stripe_1"),
+            ),
+            (
+                "stripe_customer_id".to_string(),
+                serde_json::json!("cus_buyer_1"),
+            ),
+            (
+                "provider_session_id".to_string(),
+                serde_json::json!("cs_test_1"),
+            ),
+            ("platform_fee_cents".to_string(), serde_json::json!(250)),
+            (
+                "reconciliation_error".to_string(),
+                serde_json::json!("internal diagnostic"),
+            ),
+            ("status".to_string(), serde_json::json!("completed")),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+            ("total_cents".to_string(), serde_json::json!(5000)),
+        ]),
+    )
+    .await;
+
+    // Fields the platform and the provider own. A buyer has no use for any of
+    // them, and `list_my_purchases` feeds whatever is here to a page agent.
+    const PLATFORM_ONLY: [&str; 8] = [
+        "platform_fee_cents",
+        "seller_account_id",
+        "stripe_account_id",
+        "stripe_customer_id",
+        "provider_session_id",
+        "stripe_payment_intent_id",
+        "provider_payment_intent_id",
+        "reconciliation_error",
+    ];
+
+    let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    let list = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
+    let row = list["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .find(|r| r["id"] == "pur_tiers")
+        .expect("the seeded order is the caller's own")
+        .clone();
+    for field in PLATFORM_ONLY {
+        assert!(
+            row.get(field).is_none(),
+            "buyer order list must not publish {field}: {:?}",
+            row.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+    }
+    // What the buyer legitimately needs is still there.
+    for field in ["id", "status", "currency", "total_cents", "created_at"] {
+        assert!(
+            row.get(field).is_some(),
+            "buyer order list must still publish {field}"
+        );
+    }
+
+    let (msg, _input) = get_msg("/b/products/purchases/pur_tiers", "user_1");
+    let detail = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    for field in PLATFORM_ONLY {
+        assert!(
+            detail["purchase"].get(field).is_none(),
+            "buyer order detail must not publish {field}"
+        );
+    }
+
+    // The admin tier is the one that legitimately sees the whole row.
+    let (msg, _input) = get_msg("/b/products/api/admin/purchases/pur_tiers", "admin_1");
+    let admin = output_to_json(purchase::handle_get_admin(&ctx, &msg).await).await;
+    for field in PLATFORM_ONLY {
+        assert!(
+            admin["purchase"].get(field).is_some(),
+            "admin order detail must still publish {field}"
+        );
+    }
+}
+
 /// The order list and detail endpoints publish `contracts::PurchaseView`
 /// rows (and `LineItemView` / `RefundView` / `DisputeView` under the detail),
 /// flat, with exactly the types' field sets. Two columns the raw echo used
@@ -84,7 +195,7 @@ async fn get_purchase_own() {
 /// provider-operation projection already keeps private.
 #[tokio::test]
 async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
-    use crate::blocks::products::contracts::{PurchaseDetailResponse, PurchaseListResponse};
+    use crate::blocks::products::contracts::{BuyerOrderDetailResponse, BuyerOrderListResponse};
 
     let ctx = ctx().await;
     seed(
@@ -194,15 +305,14 @@ async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
 
     let (msg, _input) = get_msg("/b/products/purchases/pur_typed", "user_1");
     let body = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
-    let detail: PurchaseDetailResponse =
-        serde_json::from_value(body.clone()).expect("PurchaseDetailResponse");
+    let detail: BuyerOrderDetailResponse =
+        serde_json::from_value(body.clone()).expect("BuyerOrderDetailResponse");
     assert_eq!(serde_json::to_value(&detail).unwrap(), body);
     assert_eq!(detail.purchase.id, "pur_typed");
     assert_eq!(detail.purchase.total_cents, 5000);
-    assert!(
-        detail.purchase.livemode,
-        "INTEGER column reads as a boolean"
-    );
+    // `livemode` is withheld from the buyer (see `BuyerOrderView`), so the
+    // INTEGER-reads-as-a-boolean property is pinned on the boolean the buyer
+    // does keep. The seller and admin views still carry `livemode`.
     assert!(!detail.purchase.subscription_cancel_at_period_end);
     assert_eq!(
         detail.purchase.metadata.get("offer_id"),
@@ -218,8 +328,11 @@ async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
         serde_json::Value::Object(detail.line_items[0].input_snapshot.clone()),
         serde_json::json!({"size": "large"})
     );
-    assert_eq!(detail.refunds[0].note, "goodwill");
     assert_eq!(detail.refunds[0].amount_minor, 1000);
+    assert_eq!(
+        detail.refunds[0].status, "succeeded",
+        "the buyer sees whether their refund landed"
+    );
     assert_eq!(detail.disputes[0].provider_dispute_id, "dp_provider_typed");
     assert!(detail.disputes[0].livemode);
 
@@ -241,8 +354,8 @@ async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
 
     let (msg, _input) = get_msg("/b/products/purchases", "user_1");
     let list = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
-    let typed: PurchaseListResponse =
-        serde_json::from_value(list.clone()).expect("PurchaseListResponse");
+    let typed: BuyerOrderListResponse =
+        serde_json::from_value(list.clone()).expect("BuyerOrderListResponse");
     assert_eq!(serde_json::to_value(&typed).unwrap(), list);
     assert_eq!(typed.records[0].id, "pur_typed");
     assert_eq!(typed.page_size, 20);
@@ -252,10 +365,28 @@ async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
         "list leaked the digest: {list}"
     );
 
+    // The admin list is deliberately NOT the same row any more: it is the
+    // whole record, where the buyer's is a projection of it. What must hold
+    // is that they describe the same order and that everything the buyer sees
+    // the admin also sees.
     let (mut msg, _input) = get_msg("/admin/b/products/purchases", "admin_1");
     msg.set_meta("auth.user_roles", "admin");
     let admin_list = output_to_json(purchase::handle_list_admin(&ctx, &msg).await).await;
-    assert_eq!(admin_list["records"][0], list["records"][0]);
+    let admin_row = &admin_list["records"][0];
+    let buyer_row = &list["records"][0];
+    assert_eq!(admin_row["id"], buyer_row["id"]);
+    for (key, value) in buyer_row.as_object().expect("buyer row is an object") {
+        assert_eq!(
+            admin_row.get(key),
+            Some(value),
+            "the admin row must agree with the buyer's on {key}"
+        );
+    }
+    assert!(
+        admin_row.get("platform_fee_cents").is_some()
+            && buyer_row.get("platform_fee_cents").is_none(),
+        "and must carry what the buyer's withholds"
+    );
 }
 
 #[tokio::test]
