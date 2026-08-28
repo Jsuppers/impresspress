@@ -40,17 +40,15 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// `vector` (11 endpoints) declares no schemas at all: its handlers
-/// deserialize into private in-function structs and answer with
-/// `serde_json::json!` literals, so `has_schema()` filters every one of them
-/// out. It is listed here so the committed baseline is the pre-typing state;
-/// it leaves the list as its handlers gain `contracts` types, exactly as
-/// `admin`, `tickets` and `llm` did.
+/// The list is now empty. `admin` left it when its four JSON API reads were
+/// typed, `tickets` when its thirteen JSON endpoints were, and `llm` /
+/// `vector` when their thirteen and nine were: every block's handlers now
+/// build `contracts` types, so every block has a non-empty snapshot to guard.
 ///
-/// Every other block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty
-/// snapshot for any of them means the gate is vacuous — wrong prefix, or the
-/// block missing from the document's block list — and must fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &["vector"];
+/// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
+/// any of them means the gate is vacuous — wrong prefix, or the block missing
+/// from the document's block list — and must fail loudly.
+const LEGITIMATELY_EMPTY: &[&str] = &[];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
@@ -423,6 +421,148 @@ async fn llm_openapi_publishes_no_credential_field() {
     }
 }
 
+/// `vector` declared 11 endpoints and zero schemas: every handler
+/// deserialized into a private in-function struct and answered with a
+/// `serde_json::json!` literal, so `has_schema()` filtered all of them out.
+/// The nine JSON endpoints below are the ones that carry a contract; the two
+/// HTML pages must stay absent, because a schema is what turns an endpoint
+/// into a tool.
+#[tokio::test]
+async fn vector_json_api_appears_in_openapi_and_its_pages_do_not() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    for (method, path) in [
+        ("post", "/b/vector/api/indexes"),
+        ("get", "/b/vector/api/indexes"),
+        ("delete", "/b/vector/api/indexes/{name}"),
+        ("post", "/b/vector/api/upsert"),
+        ("post", "/b/vector/api/query"),
+        ("post", "/b/vector/api/ingest"),
+        ("post", "/b/vector/api/embed"),
+        ("delete", "/b/vector/api/{index}/{id}"),
+        ("get", "/b/vector/api/stats"),
+    ] {
+        assert!(
+            !doc["paths"][path][method].is_null(),
+            "{method} {path} must carry a schema and appear in /openapi.json"
+        );
+        assert_eq!(
+            doc["paths"][path][method]["security"],
+            serde_json::json!([{ "bearerAuth": [] }]),
+            "{method} {path} is Authenticated and must carry a security requirement"
+        );
+    }
+
+    for path in ["/b/vector/", "/b/vector/{name}/"] {
+        assert!(
+            doc["paths"][path].is_null(),
+            "{path} serves HTML and must carry no schema - a schema would make it \
+             a callable tool"
+        );
+    }
+
+    // The create request is the one the admin modal also posts as a form,
+    // where the checkbox arrives as the string `on`. The JSON contract must
+    // type it as the boolean the handler stores, and require nothing but the
+    // name.
+    let create = &doc["paths"]["/b/vector/api/indexes"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(create["properties"]["keyword_search"]["type"], "boolean");
+    assert_eq!(create["required"], serde_json::json!(["name"]));
+    // The metric variants carry doc comments, so schemars publishes them as
+    // documented `const` alternatives rather than a bare `enum` list; the
+    // tokens must still be exactly the backend's.
+    let mut metric_tokens = const_strings(&create["properties"]["metric"]);
+    metric_tokens.sort_unstable();
+    assert_eq!(
+        metric_tokens,
+        ["cosine", "dotproduct", "euclidean"],
+        "metric must publish the backend's exact tokens: {}",
+        create["properties"]["metric"]
+    );
+
+    // A query is by text or by vector; the schema requires neither and the
+    // handler refuses a body carrying neither.
+    let query = &doc["paths"]["/b/vector/api/query"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(query["required"], serde_json::json!(["index"]));
+    for optional in ["text", "vector"] {
+        assert!(
+            query["properties"][optional]["type"]
+                .as_array()
+                .is_some_and(|t| t.contains(&serde_json::json!("null"))),
+            "`{optional}` must be optional on the query request: {}",
+            query["properties"][optional]
+        );
+    }
+
+    // A hit carries exactly id, score and the stored metadata.
+    let hit = &doc["paths"]["/b/vector/api/query"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["matches"]["items"];
+    let mut hit_keys: Vec<&str> = hit["properties"]
+        .as_object()
+        .expect("match properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    hit_keys.sort_unstable();
+    assert_eq!(hit_keys, ["id", "metadata", "score"]);
+
+    // Both delete routes read their ids from the path and must say so.
+    let param_names = |path: &str| -> Vec<String> {
+        let mut names: Vec<String> = doc["paths"][path]["delete"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("delete {path} must declare path parameters"))
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(param_names("/b/vector/api/indexes/{name}"), ["name"]);
+    assert_eq!(param_names("/b/vector/api/{index}/{id}"), ["id", "index"]);
+}
+
+/// The vector API publishes index names, counts, caller-supplied metadata
+/// and raw embeddings — none of it credential material — but every field
+/// is still an explicit projection, and this pins that no name matching a
+/// credential pattern ever enters it. `keyword_search` / `keyword_query`
+/// are the reason the bare `key` pattern is not on the list.
+#[tokio::test]
+async fn vector_openapi_publishes_no_credential_field() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let fields = published_field_names(&doc, &["/b/vector"]);
+
+    assert!(
+        !fields.is_empty(),
+        "no vector fields found - the walk is looking in the wrong place and \
+         this test would pass forever"
+    );
+
+    for field in &fields {
+        let lower = field.to_lowercase();
+        for forbidden in [
+            "api_key",
+            "apikey",
+            "key_var",
+            "secret",
+            "password",
+            "hash",
+            "token",
+            "bearer",
+            "credential",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "vector publishes a field named `{field}`, which matches the \
+                 credential pattern `{forbidden}`"
+            );
+        }
+    }
+}
+
 /// `tickets` declared 21 endpoints and zero schemas, so `has_schema()` filtered
 /// every one of them out and its JSON API was absent from `/openapi.json`. The
 /// thirteen JSON endpoints below are the ones that carry a contract; the eight
@@ -551,6 +691,32 @@ async fn tickets_openapi_withholds_the_abuse_digest_and_groups_reporter_text() {
         "no untrusted-report group found - the walk is looking in the wrong place \
          and this test would pass forever"
     );
+}
+
+/// Every string `const` anywhere under `node` — the tokens a documented enum
+/// publishes, whichever `oneOf` / `anyOf` nesting schemars wrapped them in.
+fn const_strings(node: &serde_json::Value) -> Vec<String> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(token)) = map.get("const") {
+                    out.push(token.clone());
+                }
+                for value in map.values() {
+                    walk(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, &mut out);
+    out
 }
 
 /// Every `properties` map declaring `property` inside the `section` (e.g.

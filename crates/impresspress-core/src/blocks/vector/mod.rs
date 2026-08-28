@@ -1,8 +1,11 @@
+pub mod contracts;
 pub mod ingestion;
 pub(crate) mod migrations;
 pub mod pages;
 pub mod pages_ui;
 pub mod service;
+#[cfg(test)]
+mod test_support;
 
 use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, HttpMethod, InstanceMode};
 
@@ -60,6 +63,47 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     ),
 ];
 
+/// Path-parameter schema for `DELETE /b/vector/api/indexes/{name}`.
+///
+/// Hand-written rather than derived: the handler reads the name with
+/// `path_param(msg, "name", ..)` by name, so a struct declared only to feed
+/// `.path_params::<T>()` would have no runtime user (the `tickets` /
+/// `messages` precedent).
+fn index_name_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Index name, as returned by `GET /b/vector/api/indexes`."
+            }
+        }
+    })
+}
+
+/// Path-parameter schema for `DELETE /b/vector/api/{index}/{id}`. Hand-written
+/// for the same reason as [`index_name_path_schema`]: `pages::extract_index_and_id`
+/// reads both by name.
+fn vector_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "id"],
+        "properties": {
+            "index": {
+                "type": "string",
+                "description": "Index name, as returned by `GET /b/vector/api/indexes`."
+            },
+            "id": {
+                "type": "string",
+                "description": "Row id, as supplied on upsert (or `{document_id}:{n}` for an ingested chunk)."
+            }
+        }
+    })
+}
+
 crate::impresspress_feature_block! {
     /// Vector search, RAG ingestion, and embedding generation (`impresspress/vector`).
     pub struct VectorBlock;
@@ -93,33 +137,54 @@ crate::impresspress_feature_block! {
             BlockEndpoint::get("/b/vector/{name}/")
                 .summary("Vector index detail")
                 .auth(AuthLevel::Admin),
+            // The admin modal posts this same endpoint as a URL-encoded form
+            // with an `HX-Request` header and gets the index list back as
+            // HTML. The schemas describe the programmatic JSON path; the
+            // form path builds the same request type through
+            // `contracts::CreateIndexRequest::from_form`.
             BlockEndpoint::post("/b/vector/api/indexes")
                 .summary("Create a vector index")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::CreateIndexRequest>()
+                .output::<contracts::CreateIndexResponse>(),
             BlockEndpoint::get("/b/vector/api/indexes")
                 .summary("List indexes")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .output::<contracts::IndexListResponse>(),
             BlockEndpoint::delete("/b/vector/api/indexes/{name}")
                 .summary("Delete an index")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .path_params_schema(index_name_path_schema())
+                .output::<contracts::AckResponse>(),
             BlockEndpoint::post("/b/vector/api/upsert")
                 .summary("Upsert pre-computed vectors")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::UpsertRequest>()
+                .output::<contracts::AckResponse>(),
             BlockEndpoint::post("/b/vector/api/query")
                 .summary("Search vectors")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::QueryRequest>()
+                .output::<contracts::QueryResponse>(),
             BlockEndpoint::post("/b/vector/api/ingest")
                 .summary("Chunk + embed + upsert a document")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::IngestRequest>()
+                .output::<contracts::IngestResponse>(),
             BlockEndpoint::post("/b/vector/api/embed")
                 .summary("Generate embeddings for raw text")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::EmbedRequest>()
+                .output::<contracts::EmbedResponse>(),
             BlockEndpoint::delete("/b/vector/api/{index}/{id}")
                 .summary("Delete a single vector")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .path_params_schema(vector_id_path_schema())
+                .output::<contracts::AckResponse>(),
             BlockEndpoint::get("/b/vector/api/stats")
                 .summary("Index stats and usage")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .output::<contracts::IndexStatsResponse>(),
         ])
         .can_disable(true)
         .default_enabled(true)
