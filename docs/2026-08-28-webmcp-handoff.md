@@ -18,6 +18,10 @@ its arguments is worse than no tool** — refuse rather than mislead.
 | Producer follow-ups | wafer-run **#324** | **MERGED** (`61e68a0`, squash). Review follow-ups filed: wafer-run **#325** (outputSchema wall lacks `required ⊆ properties`), **#326** (`RuntimeError` not `#[non_exhaustive]` + two weak tests) |
 | WebMCP consumer | impresspress **#72** | **MERGED** (`8b48bcd`) after the pin bump to `61e68a0` (`e204c98`); CI 13/13 |
 | Derive migration | impresspress **#74** | **OPEN** — `feat/derive-migration`; 22 migration commits + 4 follow-ups, `main` (post-#72) merged in as `e27895c` |
+| Four schema decisions | impresspress **#75** | **OPEN** — `feat/schema-decisions`, stacked on #74 (no CI until it retargets `main`; suite run locally) |
+| Real-server WebMCP e2e | impresspress **#76** | **OPEN** — `test/webmcp-e2e`, base `main`; CI 13/13 |
+| llm + vector typed (spec step 8) | impresspress **#79** | **OPEN** — `feat/type-llm-vector`, stacked on #75; 13 llm + 9 vector JSON endpoints typed, both blocks under the snapshot gate; independently reviewed pre-push (three confirmed findings fixed on the branch); native-only, non-gating for the submission |
+| Demo consumer + preview-host fix | impresspress **#77** | **OPEN** — `feat/webmcp-demo-consumer`, base `main`; CI 13/13 (one rerun: the runner's apt mirror answered 403 during `playwright install --with-deps`, not the PR) |
 
 ### Merge order — resolved
 
