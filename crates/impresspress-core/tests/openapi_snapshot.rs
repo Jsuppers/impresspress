@@ -203,6 +203,52 @@ async fn products_row_schemas_are_derived_from_the_views() {
     );
 }
 
+/// The public catalog (`/b/products/catalog`, `/b/products/catalog/{id}`) is
+/// the block's `AuthLevel::Public` row surface, and it used to publish
+/// whatever the products row held. `CatalogProductView` withholds the
+/// ownership, moderation and provider columns; this walks every published
+/// field name under the public paths and pins that. The admin list is
+/// checked to carry the same names so the walk is known not to be vacuous.
+#[tokio::test]
+async fn products_public_catalog_withholds_the_internal_columns() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    const WITHHELD: &[&str] = &[
+        "created_by",
+        "owner_kind",
+        "owner_id",
+        "seller_account_id",
+        "approval_status",
+        "stripe_product_id",
+        "current_version",
+        "submitted_at",
+        "deleted_at",
+    ];
+
+    let public = published_field_names(&doc, &["/b/products/catalog"]);
+    assert!(
+        public.contains(&"stock".to_string()),
+        "no catalog fields found - the walk is looking in the wrong place and \
+         this test would pass forever: {public:?}"
+    );
+    for field in WITHHELD {
+        assert!(
+            !public.contains(&field.to_string()),
+            "the public catalog publishes `{field}`: {public:?}"
+        );
+    }
+
+    let admin = published_field_names(&doc, &["/b/products/api/admin/products"]);
+    for field in WITHHELD {
+        assert!(
+            admin.contains(&field.to_string()),
+            "the admin product list is expected to carry `{field}`, so its absence \
+             from the catalog is a projection and not a missing column: {admin:?}"
+        );
+    }
+}
+
 /// Every field name `block` publishes: the keys of every `properties` object
 /// anywhere in its schemas, plus the `name` of every declared parameter.
 ///

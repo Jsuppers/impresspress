@@ -1337,6 +1337,138 @@ impl ProductView {
     }
 }
 
+// The public catalog row. Nine columns of `impresspress__products__products`
+// that `ProductView` publishes to owners and administrators are deliberately
+// NOT published here, on the `AuthLevel::Public` catalog. The reasons live
+// in this plain comment rather than the doc comment: a `///` line is
+// published as the schema's `description`, and the public contract has no
+// reason to name the columns it withholds. The untyped handler only ever
+// emitted them because it echoed the whole row; `StorefrontProduct`, the
+// block's other public product projection, has never carried any of them
+// ("internal ownership, provider, and pricing-rule fields are omitted").
+//
+// * `owner_id`, `created_by` — user ids. A guest has no business learning
+//   which account owns or created a listing.
+// * `seller_account_id` — the seller's account row id; an internal handle
+//   that pairs with the two above.
+// * `owner_kind` — `platform` / `user`; the ownership flag the storefront
+//   projection also omits.
+// * `stripe_product_id` — a provider resource id. Never on a public surface.
+// * `approval_status`, `submitted_at` — moderation state and timestamp.
+//   Every catalog row is `active`, which is the only moderation fact a
+//   buyer needs.
+// * `current_version` — the counter behind the immutable offer definitions;
+//   an internal handle the storefront projection also omits.
+// * `deleted_at` — soft-delete bookkeeping.
+//
+// Kept, as the row has always published them and nothing about them is
+// internal: the catalog content (`name`, `slug`, `description`, `image_url`,
+// `tags`, `category`, `currency`, `stock`, `fulfillment_kind`), the taxonomy
+// ids a storefront filters by (`group_id`, `type_id`), the builder template
+// ids, `requires` (a product id, and the checkout error names it anyway),
+// `metadata`, `status` (always `active` here) and the public timestamps.
+/// A product as the public catalog publishes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CatalogProductView {
+    /// Stable product identifier.
+    pub id: String,
+    pub name: String,
+    /// URL slug, or empty.
+    pub slug: String,
+    pub description: String,
+    pub image_url: String,
+    pub tags: Vec<String>,
+    pub category: String,
+    /// ISO 4217 presentment currency.
+    pub currency: String,
+    /// Always `active`: the catalog lists active products only.
+    #[schemars(extend("enum" = ["active"]))]
+    pub status: String,
+    /// Units in stock; `0` when inventory is not tracked.
+    pub stock: i64,
+    /// Group the product is listed under, or empty.
+    pub group_id: String,
+    /// Product type (taxonomy) id, or empty.
+    pub type_id: String,
+    pub group_template_id: String,
+    /// Product builder template this product was created from.
+    pub product_template_id: String,
+    /// Id of a product the buyer must already own before checkout, or empty.
+    pub requires: String,
+    /// Free-form key/value metadata attached by the product builder.
+    pub metadata: serde_json::Map<String, Value>,
+    /// How a purchase is fulfilled.
+    #[schemars(extend("enum" = ["none", "manual", "download", "entitlement", "webhook"]))]
+    pub fulfillment_kind: String,
+    /// RFC 3339 timestamp the product last became active, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub published_at: Option<String>,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl CatalogProductView {
+    /// Project an `impresspress__products__products` row for the public
+    /// catalog.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.str_field("name").to_string(),
+            slug: record.str_field("slug").to_string(),
+            description: record.str_field("description").to_string(),
+            image_url: record.str_field("image_url").to_string(),
+            tags: record.string_list_field("tags"),
+            category: record.str_field("category").to_string(),
+            currency: record.str_field("currency").to_string(),
+            status: record.str_field("status").to_string(),
+            stock: record.i64_field("stock"),
+            group_id: record.str_field("group_id").to_string(),
+            type_id: record.str_field("type_id").to_string(),
+            group_template_id: record.str_field("group_template_id").to_string(),
+            product_template_id: record.str_field("product_template_id").to_string(),
+            requires: record.str_field("requires").to_string(),
+            metadata: record.json_object_field("metadata"),
+            fulfillment_kind: record.str_field("fulfillment_kind").to_string(),
+            published_at: timestamp_field(record, "published_at"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// One page of the public catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CatalogProductListResponse {
+    /// Active products on this page, sorted by name.
+    pub records: Vec<CatalogProductView>,
+    /// Total active products, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl CatalogProductListResponse {
+    /// Project a `RecordList` of active product rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .map(CatalogProductView::from_record)
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
 /// One page of product rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProductListResponse {
@@ -1374,6 +1506,7 @@ pub struct PageQuery {
     pub page: u32,
     /// Rows per page, capped at 100.
     #[serde(default = "default_page_size")]
+    #[schemars(range(max = 100))]
     pub page_size: u32,
 }
 
@@ -1400,6 +1533,7 @@ pub struct ProductListQuery {
     pub page: u32,
     /// Rows per page, capped at 100.
     #[serde(default = "default_page_size")]
+    #[schemars(range(max = 100))]
     pub page_size: u32,
     /// Exact-match filter on the product's group.
     pub group_id: Option<String>,
@@ -2083,6 +2217,7 @@ pub struct AdminPurchaseListQuery {
     pub page: u32,
     /// Rows per page, capped at 100.
     #[serde(default = "default_page_size")]
+    #[schemars(range(max = 100))]
     pub page_size: u32,
     /// Exact-match filter on the order state.
     pub status: Option<String>,
@@ -2114,6 +2249,7 @@ pub struct SellerOrderListQuery {
     pub page: u32,
     /// Rows per page, capped at 100.
     #[serde(default = "default_page_size")]
+    #[schemars(range(max = 100))]
     pub page_size: u32,
     /// Exact-match filter on the order state. `all` (or omitting the
     /// parameter) returns every state.

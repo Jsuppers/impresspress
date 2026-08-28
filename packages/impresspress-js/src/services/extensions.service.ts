@@ -360,6 +360,41 @@ export interface GroupDraft {
   status?: string;
 }
 
+/**
+ * A product as the public catalog publishes it: `contracts::CatalogProductView`.
+ * Ownership, moderation and provider columns are not part of it.
+ */
+export interface CatalogProduct {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  image_url: string;
+  tags: string[];
+  category: string;
+  currency: string;
+  status: "active";
+  stock: number;
+  group_id: string;
+  type_id: string;
+  group_template_id: string;
+  product_template_id: string;
+  requires: string;
+  metadata: Record<string, unknown>;
+  fulfillment_kind: "none" | "manual" | "download" | "entitlement" | "webhook";
+  published_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `{records, total_count, page, page_size}` over `CatalogProduct` rows. */
+export interface CatalogProductList {
+  records: CatalogProduct[];
+  total_count: number;
+  page: number;
+  page_size: number;
+}
+
 /** `{records, total_count, page, page_size}` over `Product` rows. */
 export interface ProductList {
   records: Product[];
@@ -829,7 +864,7 @@ export interface AdminSellerDetail {
 /** Typed client for public, buyer, seller, and admin products APIs. */
 export class ProductsExtension extends ExtensionsService {
   /** Browse the public product catalog. `GET /b/products/catalog`. */
-  async listProducts(options?: { page?: number; page_size?: number }): Promise<WireRecordList> {
+  async listProducts(options?: { page?: number; page_size?: number }): Promise<CatalogProductList> {
     return this.call("products", "catalog", { params: options });
   }
 

@@ -322,45 +322,6 @@ crate::impresspress_feature_block! {
     info: |_this| {
         use wafer_run::{AuthLevel, CollectionSchema};
 
-        // Product row shape (see `migrations/001_products_schema.sqlite.sql`)
-        // as the public catalog list/detail endpoints still echo it —
-        // `db::get`/`db::paginated_list` return a `Record { id, data }` where
-        // `data` is the full column map (`id` included). Every other product
-        // endpoint publishes `contracts::ProductView`.
-        let product_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "slug": {"type": "string"},
-                "currency": {"type": "string"},
-                "status": {"type": "string", "description": "draft | active"},
-                "category": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "metadata": {"type": "object"},
-                "image_url": {"type": "string"},
-                "stock": {"type": "integer"},
-                "group_id": {"type": "string"},
-                "type_id": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "product_template_id": {"type": "string"},
-                "requires": {"type": "string"},
-                "created_by": {"type": "string"},
-                "owner_kind": {"type": "string", "enum": ["platform", "user"]},
-                "owner_id": {"type": "string"},
-                "seller_account_id": {"type": "string"},
-                "approval_status": {"type": "string", "enum": ["draft", "pending_review", "approved", "rejected", "suspended"]},
-                "fulfillment_kind": {"type": "string", "enum": ["none", "manual", "download", "entitlement", "webhook"]},
-                "stripe_product_id": {"type": "string"},
-                "current_version": {"type": "integer", "minimum": 1},
-                "submitted_at": {"type": ["string", "null"], "format": "date-time"},
-                "published_at": {"type": ["string", "null"], "format": "date-time"},
-                "deleted_at": {"type": ["string", "null"], "format": "date-time", "description": "Null unless the product has been soft-deleted."},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
         // Path and query parameter schemas stay hand-written. They restate
         // the route template, and no handler deserializes them — every one
         // reads `msg.var(..)` / `msg.query(..)` by name. A struct declared
@@ -1122,40 +1083,14 @@ crate::impresspress_feature_block! {
                     .output::<contracts::ProviderRedirect>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 // Public + authenticated user surface
-                // Public catalog — highest-value developer-facing surface of
-                // this block; accurate shapes read from `handlers.rs`
-                // (`handle_catalog` → `crud::crud_list` → `RecordList`,
-                // `handle_get_product_public` → `db::get` → `Record`). Full
-                // schema coverage of the admin/purchase/checkout API is a
-                // follow-up.
+                // Public catalog — the anonymous surface of this block. Both
+                // endpoints publish `contracts::CatalogProductView`, whose
+                // field list (not the row) decides what a guest may read.
                 BlockEndpoint::get("/b/products/catalog")
                     .summary("Browse catalog")
                     .description("Public list of active products, sorted by name.")
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "default": 1},
-                            "page_size": {"type": "integer", "default": 20, "maximum": 100}
-                        }
-                    }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "records": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "data": product_schema
-                                    }
-                                }
-                            },
-                            "total_count": {"type": "integer"},
-                            "page": {"type": "integer"},
-                            "page_size": {"type": "integer"}
-                        }
-                    }))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::CatalogProductListResponse>()
                     .tags(&["products"]),
                 BlockEndpoint::get("/b/products/catalog/{id}")
                     .summary("Product detail")
@@ -1166,13 +1101,7 @@ crate::impresspress_feature_block! {
                             "id": {"type": "string"}
                         }
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "data": product_schema
-                        }
-                    }))
+                    .output::<contracts::CatalogProductView>()
                     .tags(&["products"]),
                 BlockEndpoint::get("/b/products/storefront.js")
                     .summary("Framework-free product storefront widget")

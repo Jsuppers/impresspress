@@ -867,7 +867,7 @@ async fn catalog_only_shows_active_products() {
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["data"]["name"], "Active");
+    assert_eq!(records[0]["name"], "Active");
 }
 
 #[tokio::test]
@@ -2715,6 +2715,95 @@ async fn subscription_status_publishes_the_typed_projection() {
     let (msg, input) = get_msg("/b/products/subscription", "user_2");
     let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
     assert_eq!(body, serde_json::json!({"subscription": null}));
+}
+
+/// The public catalog publishes `contracts::CatalogProductView`: a closed
+/// projection that carries none of the ownership, moderation or provider
+/// columns the row holds. Checked on the wire, with every withheld column
+/// populated on the seeded row so an echo would be visible.
+#[tokio::test]
+async fn public_catalog_withholds_ownership_moderation_and_provider_columns() {
+    use crate::blocks::products::contracts::{CatalogProductListResponse, CatalogProductView};
+
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "p_public",
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Public")),
+            ("status".to_string(), serde_json::json!("active")),
+            ("tags".to_string(), serde_json::json!(["a"])),
+            ("metadata".to_string(), serde_json::json!({"k": "v"})),
+            (
+                "created_by".to_string(),
+                serde_json::json!("creator_secret"),
+            ),
+            ("owner_kind".to_string(), serde_json::json!("user")),
+            ("owner_id".to_string(), serde_json::json!("owner_secret")),
+            (
+                "seller_account_id".to_string(),
+                serde_json::json!("acct_secret"),
+            ),
+            ("approval_status".to_string(), serde_json::json!("approved")),
+            (
+                "stripe_product_id".to_string(),
+                serde_json::json!("prod_secret"),
+            ),
+            ("current_version".to_string(), serde_json::json!(7)),
+            (
+                "submitted_at".to_string(),
+                serde_json::json!("2026-07-01T00:00:00Z"),
+            ),
+            (
+                "published_at".to_string(),
+                serde_json::json!("2026-07-02T00:00:00Z"),
+            ),
+        ]),
+    )
+    .await;
+
+    let (msg, input) = get_msg("/b/products/catalog/p_public", "");
+    let detail = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(detail.get("data").is_none(), "{detail}");
+    let view: CatalogProductView =
+        serde_json::from_value(detail.clone()).expect("CatalogProductView");
+    assert_eq!(serde_json::to_value(&view).unwrap(), detail);
+    assert_eq!(view.name, "Public");
+    assert_eq!(view.tags, vec!["a"]);
+    assert_eq!(view.published_at.as_deref(), Some("2026-07-02T00:00:00Z"));
+
+    let (msg, input) = get_msg("/b/products/catalog", "");
+    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let typed: CatalogProductListResponse =
+        serde_json::from_value(list.clone()).expect("CatalogProductListResponse");
+    assert_eq!(serde_json::to_value(&typed).unwrap(), list);
+    assert_eq!(list["records"][0], detail);
+    assert_eq!(list["total_count"], 1);
+
+    for body in [&detail, &list] {
+        let encoded = body.to_string();
+        for withheld in [
+            "created_by",
+            "creator_secret",
+            "owner_kind",
+            "owner_id",
+            "owner_secret",
+            "seller_account_id",
+            "acct_secret",
+            "approval_status",
+            "stripe_product_id",
+            "prod_secret",
+            "current_version",
+            "submitted_at",
+            "deleted_at",
+        ] {
+            assert!(
+                !encoded.contains(withheld),
+                "public catalog leaked {withheld}: {body}"
+            );
+        }
+    }
 }
 
 /// Moderation writes `published_at = ""` when it returns a product to draft.

@@ -723,17 +723,19 @@ mod discovery_tests {
             !catalog.is_null(),
             "catalog list must appear in /openapi.json: {body}"
         );
+        let catalog_props = &catalog["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["records"]["items"]["properties"];
         assert_eq!(
-            catalog["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
-                ["records"]["items"]["properties"]["data"]["properties"]["stock"]["type"],
-            "integer",
-            "catalog response schema must match the real products row shape: {catalog}"
+            catalog_props["stock"]["type"], "integer",
+            "catalog rows are flat `CatalogProductView`s: {catalog}"
         );
-        // The product object schema must cover the original row plus every
-        // commerce-v2 column — `SELECT *` means all of them land in real
-        // catalog and builder responses.
-        let product_props = &catalog["responses"]["200"]["content"]["application/json"]["schema"]
-            ["properties"]["records"]["items"]["properties"]["data"]["properties"];
+        // The admin row is every column of the products table; the public
+        // catalog row is the same table minus the ownership, moderation and
+        // provider columns, which `CatalogProductView` withholds by not
+        // naming them.
+        let product_props = &paths["/b/products/api/admin/products"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["records"]["items"]
+            ["properties"];
         for field in [
             "group_template_id",
             "product_template_id",
@@ -753,6 +755,22 @@ mod discovery_tests {
             assert!(
                 !product_props[field].is_null(),
                 "product schema is missing real column `{field}`: {product_props}"
+            );
+        }
+        for field in [
+            "created_by",
+            "owner_kind",
+            "owner_id",
+            "seller_account_id",
+            "approval_status",
+            "stripe_product_id",
+            "current_version",
+            "submitted_at",
+            "deleted_at",
+        ] {
+            assert!(
+                catalog_props[field].is_null(),
+                "the public catalog must not publish `{field}`: {catalog_props}"
             );
         }
 
