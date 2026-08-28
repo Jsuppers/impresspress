@@ -362,6 +362,18 @@ async fn manual_partial_refund_retry_is_idempotent() {
     assert_eq!(body["status"], "succeeded");
     assert_eq!(body["amount_minor"], 2000);
     assert_eq!(body["refunded_total_minor"], 2000);
+    // `manual` is the ephemeral result's word for "no provider was asked";
+    // the ledger row itself records the refund as `succeeded` on both state
+    // columns, which is what `RefundView.provider_status` documents.
+    assert_eq!(body["provider_status"], "manual");
+    let (msg, _input) = admin_get_msg("/admin/b/products/purchases/pur_manual_retry");
+    let detail = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    assert_eq!(detail["refunds"].as_array().map(Vec::len), Some(1));
+    assert_eq!(detail["refunds"][0]["status"], "succeeded");
+    assert_eq!(
+        detail["refunds"][0]["provider_status"], "succeeded",
+        "a refund recorded without a provider is `succeeded`, never `manual`: {detail}"
+    );
 
     // A retried delivery of the same request (same idempotency key, e.g.
     // after a timeout) must return the recorded outcome, not deduct again.

@@ -2477,7 +2477,10 @@ pub struct RefundView {
     /// Ledger state: `pending`, `provider_succeeded`, `succeeded` or
     /// `failed`.
     pub status: String,
-    /// Provider's own refund state, or `manual`.
+    /// The provider's own state for the refund (`pending`, `requires_action`,
+    /// `succeeded`, `failed` or `canceled`). Empty until the provider answers;
+    /// `succeeded` for a refund recorded without a provider, which the ledger
+    /// completes itself.
     pub provider_status: String,
     /// Reason sent to the provider, or empty.
     pub provider_reason: String,

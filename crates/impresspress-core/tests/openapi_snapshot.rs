@@ -322,6 +322,46 @@ async fn products_order_surfaces_publish_the_state_enums() {
     }
 }
 
+/// `RefundView.provider_status` used to say "or `manual`". No refund row
+/// ever holds that: a refund recorded without a provider goes through the
+/// ledger, and `mark_succeeded` writes `succeeded` to both state columns;
+/// `manual` exists only on the ephemeral `RefundResult` a refund call
+/// returns. The column defaults to the empty string, so a row is empty until
+/// the provider answers. Refund rows are the schemas carrying
+/// `target_refunded_total_minor`, which `RefundResult` does not.
+#[tokio::test]
+async fn products_refund_rows_describe_provider_status_truthfully() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    let rows = objects_with_property(
+        &doc,
+        &["/b/products"],
+        "responses",
+        "target_refunded_total_minor",
+    );
+    assert!(
+        rows.len() >= 3,
+        "the buyer, seller and admin order details embed refund rows; found {}",
+        rows.len()
+    );
+    for props in &rows {
+        let description = props["provider_status"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !description.contains("`manual`"),
+            "no refund row ever holds `manual`: {description}"
+        );
+        assert!(
+            description.contains("until the provider answers")
+                && description.contains("`succeeded`"),
+            "the description must say what the column holds before the provider answers \
+             and for a refund recorded without one: {description}"
+        );
+    }
+}
+
 /// Every field name `block` publishes: the keys of every `properties` object
 /// anywhere in its schemas, plus the `name` of every declared parameter.
 ///

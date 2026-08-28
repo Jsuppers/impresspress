@@ -6229,7 +6229,7 @@
                           "type": "string"
                         },
                         "provider_status": {
-                          "description": "Provider's own refund state, or `manual`.",
+                          "description": "The provider's own state for the refund (`pending`, `requires_action`,\n`succeeded`, `failed` or `canceled`). Empty until the provider answers;\n`succeeded` for a refund recorded without a provider, which the ledger\ncompletes itself.",
                           "type": "string"
                         },
                         "purchase_id": {
@@ -13468,7 +13468,7 @@
                           "type": "string"
                         },
                         "provider_status": {
-                          "description": "Provider's own refund state, or `manual`.",
+                          "description": "The provider's own state for the refund (`pending`, `requires_action`,\n`succeeded`, `failed` or `canceled`). Empty until the provider answers;\n`succeeded` for a refund recorded without a provider, which the ledger\ncompletes itself.",
                           "type": "string"
                         },
                         "purchase_id": {
@@ -16672,7 +16672,7 @@
                           "type": "string"
                         },
                         "provider_status": {
-                          "description": "Provider's own refund state, or `manual`.",
+                          "description": "The provider's own state for the refund (`pending`, `requires_action`,\n`succeeded`, `failed` or `canceled`). Empty until the provider answers;\n`succeeded` for a refund recorded without a provider, which the ledger\ncompletes itself.",
                           "type": "string"
                         },
                         "purchase_id": {
