@@ -496,6 +496,25 @@ async fn vector_json_api_appears_in_openapi_and_its_pages_do_not() {
             query["properties"][optional]
         );
     }
+    // The handler accepts both — `vector` is then the query vector and
+    // `text` only the keyword-query fallback — and refuses only neither.
+    // The description must say that, not claim exclusivity.
+    // Doc comments wrap at 80 columns, so compare with line breaks
+    // collapsed to single spaces.
+    let query_doc = query["description"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        query_doc.contains("At least one of `text` and `vector` is required"),
+        "the query description must state the real contract: {query_doc}"
+    );
+    assert!(
+        !query_doc.contains("Exactly one"),
+        "the query description must not claim exclusivity: {query_doc}"
+    );
 
     // A hit carries exactly id, score and the stored metadata.
     let hit = &doc["paths"]["/b/vector/api/query"]["post"]["responses"]["200"]["content"]

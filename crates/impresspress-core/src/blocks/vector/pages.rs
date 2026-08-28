@@ -1161,6 +1161,43 @@ mod contract_tests {
         );
     }
 
+    /// Both `vector` and `text` is a legitimate call — in hybrid mode `text`
+    /// feeds the keyword half — and in vector mode the vector is used as is.
+    /// No embedding block is registered here, so had the handler tried to
+    /// embed `text` the call would have failed with a 500 ("embed failed");
+    /// the 200 is the proof that it did not.
+    #[tokio::test]
+    async fn query_with_both_vector_and_text_uses_the_vector_without_embedding() {
+        let ctx = ctx_with(StubVectorBlock {
+            matches: vec![VectorMatch {
+                id: "a".into(),
+                score: 0.75,
+                metadata: None,
+            }],
+            ..Default::default()
+        })
+        .await;
+        seed_registry_row(&ctx, &service::prefixed_index_name("docs")).await;
+
+        let body = output_json(
+            query(
+                &ctx,
+                json_input(serde_json::json!({
+                    "index": "docs",
+                    "vector": [0.1, 0.2, 0.3],
+                    "text": "hello",
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({ "matches": [{ "id": "a", "score": 0.75 }] })
+        );
+    }
+
     #[tokio::test]
     async fn upsert_and_deletes_acknowledge() {
         let ctx = ctx_with(StubVectorBlock::default()).await;

@@ -381,7 +381,7 @@
         "content": {
           "application/json": {
             "schema": {
-              "description": "`POST /b/vector/api/query` request body. Exactly one of `text` and\n`vector` must be present: `text` is embedded with the index's own model,\n`vector` is used as is.",
+              "description": "`POST /b/vector/api/query` request body. At least one of `text` and\n`vector` is required. With `vector` alone it is the query vector as is;\nwith `text` alone the text is embedded with the index's own model. When\nboth are present `vector` is used as is and `text` is not embedded — it\nthen serves only as the keyword-query fallback in keyword and hybrid\nmode.",
               "properties": {
                 "filter": {
                   "description": "Restrict hits to rows whose metadata matches.",
@@ -438,7 +438,7 @@
                   "description": "Search modality. Omitted means `hybrid` for an index created with\n`keyword_search`, `vector` otherwise."
                 },
                 "text": {
-                  "description": "Query text, embedded with the model the index was created with. In\nkeyword and hybrid mode it is also the keyword query unless\n`keyword_query` is given.",
+                  "description": "Query text. Embedded with the model the index was created with when\n`vector` is absent; never embedded when `vector` is present. In\nkeyword and hybrid mode it is also the keyword query unless\n`keyword_query` is given.",
                   "type": [
                     "string",
                     "null"
@@ -454,7 +454,7 @@
                   ]
                 },
                 "vector": {
-                  "description": "Pre-computed query vector; its length must match the index's\n`dimensions`. Takes precedence over `text` when both are present.",
+                  "description": "Pre-computed query vector, used as is; its length must match the\nindex's `dimensions`. When present, `text` is not embedded.",
                   "items": {
                     "format": "float",
                     "type": "number"

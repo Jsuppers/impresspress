@@ -286,19 +286,23 @@ pub struct UpsertRequest {
 // POST /b/vector/api/query
 // ---------------------------------------------------------------------------
 
-/// `POST /b/vector/api/query` request body. Exactly one of `text` and
-/// `vector` must be present: `text` is embedded with the index's own model,
-/// `vector` is used as is.
+/// `POST /b/vector/api/query` request body. At least one of `text` and
+/// `vector` is required. With `vector` alone it is the query vector as is;
+/// with `text` alone the text is embedded with the index's own model. When
+/// both are present `vector` is used as is and `text` is not embedded — it
+/// then serves only as the keyword-query fallback in keyword and hybrid
+/// mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
     /// Index name.
     pub index: String,
-    /// Query text, embedded with the model the index was created with. In
+    /// Query text. Embedded with the model the index was created with when
+    /// `vector` is absent; never embedded when `vector` is present. In
     /// keyword and hybrid mode it is also the keyword query unless
     /// `keyword_query` is given.
     pub text: Option<String>,
-    /// Pre-computed query vector; its length must match the index's
-    /// `dimensions`. Takes precedence over `text` when both are present.
+    /// Pre-computed query vector, used as is; its length must match the
+    /// index's `dimensions`. When present, `text` is not embedded.
     pub vector: Option<Vec<f32>>,
     /// Maximum number of hits. Omitted means 10.
     pub top_k: Option<usize>,
