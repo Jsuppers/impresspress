@@ -2236,6 +2236,380 @@ pub struct PurchaseView {
     pub updated_at: String,
 }
 
+/// One order as its **buyer** may read it.
+///
+/// The narrowest of the three order projections, and the one that matters
+/// most: `GET /b/products/purchases` is opted in as the `list_my_purchases`
+/// WebMCP tool, so every field here is handed to whatever agent runs in the
+/// buyer's page.
+///
+/// Withheld, deliberately: the platform's economics (`platform_fee_cents`),
+/// the seller's identity and Stripe account, the buyer's own provider handles
+/// (`stripe_customer_id`, the PaymentIntent and Checkout Session ids — a
+/// buyer never needs to quote one, and they are the provider's namespace, not
+/// ours), and the reconciliation and payment-error diagnostics, which describe
+/// our integration rather than their purchase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BuyerOrderView {
+    /// Stable order identifier.
+    pub id: String,
+    /// Email captured at checkout, or empty.
+    pub buyer_email: String,
+    /// Lifecycle state of the order.
+    pub status: OrderStatus,
+    /// Checkout presentation the order was started with.
+    pub checkout_mode: String,
+    /// Payment provider: `stripe`, or `manual` for orders recorded outside a
+    /// provider.
+    pub provider: String,
+    /// ISO 4217 currency of every amount on the order.
+    pub currency: String,
+    pub subtotal_cents: i64,
+    pub discount_cents: i64,
+    pub tax_cents: i64,
+    pub shipping_cents: i64,
+    /// Final charged amount in minor units.
+    pub total_cents: i64,
+    /// Sum of succeeded refunds in minor units.
+    pub refunded_total_cents: i64,
+    /// Immutable checkout snapshot: the offer id and version the order was
+    /// priced against and the shipping amounts allowed at checkout.
+    pub metadata: serde_json::Map<String, Value>,
+    /// Latest payment state received from the provider.
+    pub provider_payment_status: String,
+    /// Where the order stands against the provider's view of it.
+    pub reconciliation_status: ReconciliationStatus,
+    /// Stripe subscription lifecycle state for subscription orders, or empty.
+    pub subscription_status: String,
+    /// RFC 3339 end of the current billing period, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub subscription_current_period_end: Option<String>,
+    pub subscription_cancel_at_period_end: bool,
+    /// RFC 3339 timestamp the subscription was canceled, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub subscription_canceled_at: Option<String>,
+    /// RFC 3339 timestamp payment was recorded, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub payment_at: Option<String>,
+    /// RFC 3339 timestamp of the last refund applied, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub refunded_at: Option<String>,
+    /// Reason given for the last refund, or empty.
+    pub refund_reason: String,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl BuyerOrderView {
+    /// Project an `impresspress__products__purchases` row for its buyer.
+    pub fn from_record(record: &Record) -> Result<Self, WaferError> {
+        Ok(Self {
+            id: record.id.clone(),
+            buyer_email: record.str_field("buyer_email").to_string(),
+            status: OrderStatus::from_record(record)?,
+            checkout_mode: record.str_field("checkout_mode").to_string(),
+            provider: record.str_field("provider").to_string(),
+            currency: record.str_field("currency").to_string(),
+            subtotal_cents: record.i64_field("subtotal_cents"),
+            discount_cents: record.i64_field("discount_cents"),
+            tax_cents: record.i64_field("tax_cents"),
+            shipping_cents: record.i64_field("shipping_cents"),
+            total_cents: record.i64_field("total_cents"),
+            refunded_total_cents: record.i64_field("refunded_total_cents"),
+            metadata: record.json_object_field("metadata"),
+            provider_payment_status: record.str_field("provider_payment_status").to_string(),
+            reconciliation_status: ReconciliationStatus::from_record(record)?,
+            subscription_status: record.str_field("subscription_status").to_string(),
+            subscription_current_period_end: timestamp_field(
+                record,
+                "subscription_current_period_end",
+            ),
+            subscription_cancel_at_period_end: record
+                .bool_field("subscription_cancel_at_period_end"),
+            subscription_canceled_at: timestamp_field(record, "subscription_canceled_at"),
+            payment_at: timestamp_field(record, "payment_at"),
+            refunded_at: timestamp_field(record, "refunded_at"),
+            refund_reason: record.str_field("refund_reason").to_string(),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        })
+    }
+}
+
+/// One refund as its **buyer** may read it: how much came back, in what
+/// currency, and whether it has landed.
+///
+/// The provider handles (`provider_refund_id`, `payment_intent_id`,
+/// `stripe_account_id`), the operator fields (`refunded_by`, `note`,
+/// `provider_reason`) and the failure diagnostics (`last_error`) belong to
+/// whoever issued the refund, not to whoever received it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BuyerRefundView {
+    /// Stable refund identifier.
+    pub id: String,
+    pub purchase_id: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    /// Ledger state: `pending`, `provider_succeeded`, `succeeded` or `failed`.
+    pub status: String,
+    /// The provider's own state for the refund. Empty until the provider
+    /// answers; `succeeded` for a refund recorded without a provider. Kept
+    /// for the buyer because "has my money actually gone back" is the
+    /// question this endpoint exists to answer — it is a state, not a handle.
+    pub provider_status: String,
+    /// RFC 3339 timestamp the refund reached a terminal state, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub completed_at: Option<String>,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+}
+
+impl BuyerRefundView {
+    /// Project an `impresspress__products__refunds` row for the buyer.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            purchase_id: record.str_field("purchase_id").to_string(),
+            amount_minor: record.i64_field("amount_minor"),
+            currency: record.str_field("currency").to_string(),
+            status: record.str_field("status").to_string(),
+            provider_status: record.str_field("provider_status").to_string(),
+            completed_at: timestamp_field(record, "completed_at"),
+            created_at: record.str_field("created_at").to_string(),
+        }
+    }
+}
+
+/// One page of the caller's own orders, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BuyerOrderListResponse {
+    pub records: Vec<BuyerOrderView>,
+    /// Total orders matching the query, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl BuyerOrderListResponse {
+    /// Project a `RecordList` of the caller's order rows. A row outside the
+    /// contract costs that row, not the page — see
+    /// [`PurchaseListResponse::from_record_list`].
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .filter_map(|record| match BuyerOrderView::from_record(record) {
+                    Ok(view) => Some(view),
+                    Err(e) => {
+                        tracing::error!(
+                            order_id = %record.id,
+                            error = %e,
+                            "order row is outside the published contract and was omitted from the page"
+                        );
+                        None
+                    }
+                })
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// One of the caller's own orders with the lines it was made of and the
+/// refunds against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BuyerOrderDetailResponse {
+    pub purchase: BuyerOrderView,
+    pub line_items: Vec<LineItemView>,
+    pub refunds: Vec<BuyerRefundView>,
+    /// Disputes raised against this order. Kept because the SSR order page
+    /// already shows a buyer their own disputes, and this endpoint is not
+    /// opted into the WebMCP manifest — only the list above is, and it
+    /// carries no nested rows.
+    pub disputes: Vec<DisputeView>,
+}
+
+/// One order as the **seller** who fulfils it may read it.
+///
+/// Wider than the buyer's: a seller needs the fee that was taken, their own
+/// connected account, the provider handles for their own charge, and the
+/// buyer's email in order to fulfil. It still withholds the buyer's platform
+/// identity (`user_id` / `buyer_user_id`) and their Stripe customer id, none
+/// of which a seller needs to ship an order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SellerOrderView {
+    /// Stable order identifier.
+    pub id: String,
+    /// Buyer's email address as captured at checkout, or empty.
+    pub buyer_email: String,
+    /// Seller account the order was placed against.
+    pub seller_account_id: String,
+    /// Stripe connected account the order was charged through, or empty.
+    pub stripe_account_id: String,
+    /// Lifecycle state of the order.
+    pub status: OrderStatus,
+    /// Checkout presentation the order was started with.
+    pub checkout_mode: String,
+    /// Payment provider: `stripe`, or `manual`.
+    pub provider: String,
+    /// Whether the order was placed against the live Stripe environment.
+    pub livemode: bool,
+    /// ISO 4217 currency of every amount on the order.
+    pub currency: String,
+    pub subtotal_cents: i64,
+    pub discount_cents: i64,
+    pub tax_cents: i64,
+    pub shipping_cents: i64,
+    /// Platform fee taken from this order, in minor units.
+    pub platform_fee_cents: i64,
+    /// Final charged amount in minor units.
+    pub total_cents: i64,
+    /// Sum of succeeded refunds in minor units.
+    pub refunded_total_cents: i64,
+    /// Immutable checkout snapshot.
+    pub metadata: serde_json::Map<String, Value>,
+    /// Stripe PaymentIntent id, or empty.
+    pub stripe_payment_intent_id: String,
+    /// Stripe Checkout Session id, or empty.
+    pub provider_session_id: String,
+    /// Latest PaymentIntent state received from the provider.
+    pub provider_payment_status: String,
+    pub provider_payment_error_code: String,
+    pub provider_payment_error_message: String,
+    /// Where the order stands against the provider's view of it.
+    pub reconciliation_status: ReconciliationStatus,
+    pub reconciliation_error: String,
+    /// Stripe subscription lifecycle state, or empty.
+    pub subscription_status: String,
+    /// RFC 3339 end of the current billing period, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub subscription_current_period_end: Option<String>,
+    pub subscription_cancel_at_period_end: bool,
+    /// RFC 3339 timestamp payment was recorded, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub payment_at: Option<String>,
+    /// RFC 3339 timestamp of the last refund applied, or `null`.
+    #[schemars(extend("format" = "date-time"))]
+    pub refunded_at: Option<String>,
+    /// User id of the operator who issued the last refund, or empty.
+    pub refunded_by: String,
+    /// Operator note attached to the last refund, or empty.
+    pub refund_reason: String,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl SellerOrderView {
+    /// Project an `impresspress__products__purchases` row for its seller.
+    pub fn from_record(record: &Record) -> Result<Self, WaferError> {
+        Ok(Self {
+            id: record.id.clone(),
+            buyer_email: record.str_field("buyer_email").to_string(),
+            seller_account_id: record.str_field("seller_account_id").to_string(),
+            stripe_account_id: record.str_field("stripe_account_id").to_string(),
+            status: OrderStatus::from_record(record)?,
+            checkout_mode: record.str_field("checkout_mode").to_string(),
+            provider: record.str_field("provider").to_string(),
+            livemode: record.bool_field("livemode"),
+            currency: record.str_field("currency").to_string(),
+            subtotal_cents: record.i64_field("subtotal_cents"),
+            discount_cents: record.i64_field("discount_cents"),
+            tax_cents: record.i64_field("tax_cents"),
+            shipping_cents: record.i64_field("shipping_cents"),
+            platform_fee_cents: record.i64_field("platform_fee_cents"),
+            total_cents: record.i64_field("total_cents"),
+            refunded_total_cents: record.i64_field("refunded_total_cents"),
+            metadata: record.json_object_field("metadata"),
+            stripe_payment_intent_id: record.str_field("stripe_payment_intent_id").to_string(),
+            provider_session_id: record.str_field("provider_session_id").to_string(),
+            provider_payment_status: record.str_field("provider_payment_status").to_string(),
+            provider_payment_error_code: record
+                .str_field("provider_payment_error_code")
+                .to_string(),
+            provider_payment_error_message: record
+                .str_field("provider_payment_error_message")
+                .to_string(),
+            reconciliation_status: ReconciliationStatus::from_record(record)?,
+            reconciliation_error: record.str_field("reconciliation_error").to_string(),
+            subscription_status: record.str_field("subscription_status").to_string(),
+            subscription_current_period_end: timestamp_field(
+                record,
+                "subscription_current_period_end",
+            ),
+            subscription_cancel_at_period_end: record
+                .bool_field("subscription_cancel_at_period_end"),
+            payment_at: timestamp_field(record, "payment_at"),
+            refunded_at: timestamp_field(record, "refunded_at"),
+            refunded_by: record.str_field("refunded_by").to_string(),
+            refund_reason: record.str_field("refund_reason").to_string(),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        })
+    }
+}
+
+/// One page of the seller's own orders, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SellerOrderListResponse {
+    pub records: Vec<SellerOrderView>,
+    /// Total orders matching the query, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl SellerOrderListResponse {
+    /// Project a `RecordList` of the seller's order rows. Same row-not-page
+    /// degradation as [`PurchaseListResponse::from_record_list`].
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .filter_map(|record| match SellerOrderView::from_record(record) {
+                    Ok(view) => Some(view),
+                    Err(e) => {
+                        tracing::error!(
+                            order_id = %record.id,
+                            error = %e,
+                            "order row is outside the published contract and was omitted from the page"
+                        );
+                        None
+                    }
+                })
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// One seller-owned order with its lines, refunds and disputes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SellerOrderDetailResponse {
+    pub purchase: SellerOrderView,
+    pub line_items: Vec<LineItemView>,
+    pub refunds: Vec<RefundView>,
+    pub disputes: Vec<DisputeView>,
+}
+
 impl PurchaseView {
     /// Project an `impresspress__products__purchases` row. Fails when a state
     /// column holds a value outside its contract.

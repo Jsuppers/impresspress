@@ -3,9 +3,11 @@ use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream}
 
 use super::{
     contracts::{
-        AdminPurchaseListQuery, DisputeView, LineItemView, OrderStatus, PageQuery,
-        PurchaseDetailResponse, PurchaseListResponse, PurchaseView, RefundRequest, RefundResult,
-        RefundResultStatus, RefundView, SellerOrderListQuery,
+        AdminPurchaseListQuery, BuyerOrderDetailResponse, BuyerOrderListResponse, BuyerOrderView,
+        BuyerRefundView, DisputeView, LineItemView, OrderStatus, PageQuery, PurchaseDetailResponse,
+        PurchaseListResponse, PurchaseView, RefundRequest, RefundResult, RefundResultStatus,
+        RefundView, SellerOrderDetailResponse, SellerOrderListQuery, SellerOrderListResponse,
+        SellerOrderView,
     },
     repo, stripe_provider,
 };
@@ -14,18 +16,22 @@ use crate::{
     util::RecordExt,
 };
 
-/// One page of order rows, newest first, projected as a list response.
-async fn list_orders(
+/// One page of order rows, newest first.
+///
+/// Every tier reads the same table through the same query; what differs is
+/// the projection, so each caller below names the view its own tier is
+/// allowed to see. That is the whole point of having three: the row is not
+/// filtered at runtime, it is described by a different type, and the type is
+/// what `/openapi.json` and the WebMCP manifest publish.
+async fn order_page(
     ctx: &dyn Context,
     filters: Vec<Filter>,
     page: u32,
     page_size: u32,
-) -> OutputStream {
-    match repo::purchases::list_paginated(ctx, filters, i64::from(page), i64::from(page_size)).await
-    {
-        Ok(result) => ok_json(&PurchaseListResponse::from_record_list(&result)),
-        Err(e) => err_internal("Database error", e),
-    }
+) -> Result<wafer_core::clients::database::RecordList, OutputStream> {
+    repo::purchases::list_paginated(ctx, filters, i64::from(page), i64::from(page_size))
+        .await
+        .map_err(|e| err_internal("Database error", e))
 }
 
 pub async fn handle_list_user(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -37,7 +43,10 @@ pub async fn handle_list_user(ctx: &dyn Context, msg: &Message) -> OutputStream 
         operator: FilterOp::Equal,
         value: serde_json::Value::String(user_id),
     }];
-    list_orders(ctx, filters, query.page, query.page_size).await
+    match order_page(ctx, filters, query.page, query.page_size).await {
+        Ok(result) => ok_json(&BuyerOrderListResponse::from_record_list(&result)),
+        Err(out) => out,
+    }
 }
 
 pub async fn handle_list_admin(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -58,7 +67,10 @@ pub async fn handle_list_admin(ctx: &dyn Context, msg: &Message) -> OutputStream
             value: serde_json::Value::String(user_id.clone()),
         });
     }
-    list_orders(ctx, filters, query.page, query.page_size).await
+    match order_page(ctx, filters, query.page, query.page_size).await {
+        Ok(result) => ok_json(&PurchaseListResponse::from_record_list(&result)),
+        Err(out) => out,
+    }
 }
 
 pub async fn handle_list_seller(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -80,24 +92,112 @@ pub async fn handle_list_seller(ctx: &dyn Context, msg: &Message) -> OutputStrea
             value: serde_json::json!(status),
         });
     }
-    list_orders(ctx, filters, query.page, query.page_size).await
+    match order_page(ctx, filters, query.page, query.page_size).await {
+        Ok(result) => ok_json(&SellerOrderListResponse::from_record_list(&result)),
+        Err(out) => out,
+    }
 }
 
+/// The rows that hang off one order. Shared by all three detail tiers; the
+/// projection applied to them is not.
+struct OrderRelations {
+    line_items: Vec<wafer_core::clients::database::Record>,
+    refunds: Vec<wafer_core::clients::database::Record>,
+    disputes: Vec<wafer_core::clients::database::Record>,
+}
+
+async fn order_relations(
+    ctx: &dyn Context,
+    purchase_id: &str,
+) -> Result<OrderRelations, OutputStream> {
+    Ok(OrderRelations {
+        line_items: repo::purchases::list_line_items(ctx, purchase_id)
+            .await
+            .map_err(|e| err_internal("Could not load purchase line items", e))?,
+        refunds: repo::refunds::list_for_purchase(ctx, purchase_id)
+            .await
+            .map_err(|e| err_internal("Could not load purchase refunds", e))?,
+        disputes: repo::disputes::list_for_purchase(ctx, purchase_id)
+            .await
+            .map_err(|e| err_internal("Could not load purchase disputes", e))?,
+    })
+}
+
+/// The caller's own order. Disputes are not included: a dispute is a matter
+/// between the seller, the platform and the provider.
+async fn buyer_order_response(
+    ctx: &dyn Context,
+    purchase: wafer_core::clients::database::Record,
+) -> OutputStream {
+    let relations = match order_relations(ctx, &purchase.id).await {
+        Ok(relations) => relations,
+        Err(out) => return out,
+    };
+    let view = match BuyerOrderView::from_record(&purchase) {
+        Ok(view) => view,
+        Err(error) => return err_internal("Order row is outside the contract", error),
+    };
+    ok_json(&BuyerOrderDetailResponse {
+        purchase: view,
+        line_items: relations
+            .line_items
+            .iter()
+            .map(LineItemView::from_record)
+            .collect(),
+        refunds: relations
+            .refunds
+            .iter()
+            .map(BuyerRefundView::from_record)
+            .collect(),
+        disputes: relations
+            .disputes
+            .iter()
+            .map(DisputeView::from_record)
+            .collect(),
+    })
+}
+
+/// A seller-owned order, as the seller fulfilling it may read it.
+async fn seller_order_response(
+    ctx: &dyn Context,
+    purchase: wafer_core::clients::database::Record,
+) -> OutputStream {
+    let relations = match order_relations(ctx, &purchase.id).await {
+        Ok(relations) => relations,
+        Err(out) => return out,
+    };
+    let view = match SellerOrderView::from_record(&purchase) {
+        Ok(view) => view,
+        Err(error) => return err_internal("Order row is outside the contract", error),
+    };
+    ok_json(&SellerOrderDetailResponse {
+        purchase: view,
+        line_items: relations
+            .line_items
+            .iter()
+            .map(LineItemView::from_record)
+            .collect(),
+        refunds: relations
+            .refunds
+            .iter()
+            .map(RefundView::from_record)
+            .collect(),
+        disputes: relations
+            .disputes
+            .iter()
+            .map(DisputeView::from_record)
+            .collect(),
+    })
+}
+
+/// The whole row. Admin is the one tier that legitimately reads every column.
 async fn purchase_response(
     ctx: &dyn Context,
     purchase: wafer_core::clients::database::Record,
 ) -> OutputStream {
-    let line_items = match repo::purchases::list_line_items(ctx, &purchase.id).await {
-        Ok(line_items) => line_items,
-        Err(error) => return err_internal("Could not load purchase line items", error),
-    };
-    let refunds = match repo::refunds::list_for_purchase(ctx, &purchase.id).await {
-        Ok(refunds) => refunds,
-        Err(error) => return err_internal("Could not load purchase refunds", error),
-    };
-    let disputes = match repo::disputes::list_for_purchase(ctx, &purchase.id).await {
-        Ok(disputes) => disputes,
-        Err(error) => return err_internal("Could not load purchase disputes", error),
+    let relations = match order_relations(ctx, &purchase.id).await {
+        Ok(relations) => relations,
+        Err(out) => return out,
     };
     let view = match PurchaseView::from_record(&purchase) {
         Ok(view) => view,
@@ -105,9 +205,21 @@ async fn purchase_response(
     };
     ok_json(&PurchaseDetailResponse {
         purchase: view,
-        line_items: line_items.iter().map(LineItemView::from_record).collect(),
-        refunds: refunds.iter().map(RefundView::from_record).collect(),
-        disputes: disputes.iter().map(DisputeView::from_record).collect(),
+        line_items: relations
+            .line_items
+            .iter()
+            .map(LineItemView::from_record)
+            .collect(),
+        refunds: relations
+            .refunds
+            .iter()
+            .map(RefundView::from_record)
+            .collect(),
+        disputes: relations
+            .disputes
+            .iter()
+            .map(DisputeView::from_record)
+            .collect(),
     })
 }
 
@@ -137,7 +249,10 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Err(e) => return err_internal("Database error", e),
     };
 
-    // Verify access: a buyer can only view their own order; admin can view all.
+    // A buyer may read only their own order. An admin reading this same path
+    // gets the buyer projection, which is the honest answer for an endpoint
+    // that declares `BuyerOrderDetailResponse`; the admin surface is
+    // `/b/products/api/admin/purchases/{id}`, which declares the full row.
     let purchase_user = if purchase.str_field("buyer_user_id").is_empty() {
         purchase.str_field("user_id")
     } else {
@@ -147,6 +262,35 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return err_forbidden("Access denied");
     }
 
+    buyer_order_response(ctx, purchase).await
+}
+
+/// `GET /b/products/api/admin/purchases/{id}` — the full row.
+///
+/// Split from [`handle_get`] because the two endpoints declare different
+/// output types: routing already gates this one at `AuthLevel::Admin`, so
+/// there is no ownership check to make here.
+pub async fn handle_get_admin(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = {
+        let var = msg.var("id");
+        if !var.is_empty() {
+            var
+        } else {
+            msg.path()
+                .strip_prefix("/admin/b/products/api/admin/purchases/")
+                .or_else(|| msg.path().strip_prefix("/b/products/api/admin/purchases/"))
+                .unwrap_or("")
+                .trim_matches('/')
+        }
+    };
+    if id.is_empty() {
+        return err_bad_request("Missing purchase ID");
+    }
+    let purchase = match repo::purchases::get(ctx, id).await {
+        Ok(p) => p,
+        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Purchase not found"),
+        Err(e) => return err_internal("Database error", e),
+    };
     purchase_response(ctx, purchase).await
 }
 
@@ -170,7 +314,7 @@ pub async fn handle_get_seller(ctx: &dyn Context, msg: &Message) -> OutputStream
     if purchase.str_field("seller_account_id") != account.id {
         return err_forbidden("Access denied");
     }
-    purchase_response(ctx, purchase).await
+    seller_order_response(ctx, purchase).await
 }
 
 fn refund_result(

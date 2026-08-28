@@ -1060,13 +1060,13 @@ crate::impresspress_feature_block! {
                     .summary("List seller-owned orders")
                     .auth(AuthLevel::Authenticated)
                     .query_params::<contracts::SellerOrderListQuery>()
-                    .output::<contracts::PurchaseListResponse>()
+                    .output::<contracts::SellerOrderListResponse>()
                     .tags(&["products", "seller", "orders"]),
                 BlockEndpoint::get("/b/products/api/seller/orders/{id}")
                     .summary("Get seller-owned order")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output::<contracts::PurchaseDetailResponse>()
+                    .output::<contracts::SellerOrderDetailResponse>()
                     .tags(&["products", "seller", "orders"]),
                 BlockEndpoint::post("/b/products/api/seller/orders/{id}/refund")
                     .summary("Refund a seller-owned order")
@@ -1228,7 +1228,7 @@ crate::impresspress_feature_block! {
                     .summary("List own purchases")
                     .auth(AuthLevel::Authenticated)
                     .query_params::<contracts::PageQuery>()
-                    .output::<contracts::PurchaseListResponse>()
+                    .output::<contracts::BuyerOrderListResponse>()
                     .tags(&["products", "orders"])
                     .agent_tool(
                         "list_my_purchases",
@@ -1239,7 +1239,7 @@ crate::impresspress_feature_block! {
                     .summary("Get own purchase")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema)
-                    .output::<contracts::PurchaseDetailResponse>()
+                    .output::<contracts::BuyerOrderDetailResponse>()
                     .tags(&["products", "orders"]),
                 BlockEndpoint::get("/b/products/subscription")
                     .summary("Platform subscription status")

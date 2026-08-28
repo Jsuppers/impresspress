@@ -723,6 +723,11 @@ export interface Dispute {
  * `contracts::PurchaseView`: an order row, flat. The guest receipt digest
  * (`receipt_token_hash`, `receipt_token_expires_at`) is never published.
  */
+/**
+ * The whole order row — the ADMIN projection
+ * (`GET /b/products/api/admin/purchases`). Buyers get `BuyerOrder` and
+ * sellers get `SellerOrder`; those endpoints no longer return this shape.
+ */
 export interface Purchase {
   id: string;
   user_id: string;
@@ -770,7 +775,124 @@ export interface Purchase {
   updated_at: string;
 }
 
-/** `{records, total_count, page, page_size}` over `Purchase` rows. */
+/**
+ * One order as its buyer may read it — the projection behind
+ * `GET /b/products/purchases`, which is also the `list_my_purchases` WebMCP
+ * tool. Narrower than `Purchase` on purpose: the platform fee, the seller's
+ * identity and Stripe account, the provider handles and the reconciliation
+ * diagnostics are not the buyer's to read.
+ */
+export interface BuyerOrder {
+  id: string;
+  buyer_email: string;
+  status: string;
+  checkout_mode: "hosted" | "embedded" | "payment_link";
+  provider: string;
+  currency: string;
+  subtotal_cents: number;
+  discount_cents: number;
+  tax_cents: number;
+  shipping_cents: number;
+  total_cents: number;
+  refunded_total_cents: number;
+  metadata: Record<string, unknown>;
+  provider_payment_status: "" | "succeeded" | "payment_failed" | "processing" | "requires_action" | "canceled";
+  reconciliation_status: string;
+  subscription_status: string;
+  subscription_current_period_end: string | null;
+  subscription_cancel_at_period_end: boolean;
+  subscription_canceled_at: string | null;
+  payment_at: string | null;
+  refunded_at: string | null;
+  refund_reason: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One refund as its buyer may read it: how much, in what currency, and whether it landed. */
+export interface BuyerRefund {
+  id: string;
+  purchase_id: string;
+  amount_minor: number;
+  currency: string;
+  status: string;
+  provider_status: string;
+  completed_at: string | null;
+  created_at: string;
+}
+
+/** `{records, total_count, page, page_size}` over `BuyerOrder` rows. */
+export interface BuyerOrderList {
+  records: BuyerOrder[];
+  total_count: number;
+  page: number;
+  page_size: number;
+}
+
+export interface BuyerOrderDetail {
+  purchase: BuyerOrder;
+  line_items: LineItem[];
+  refunds: BuyerRefund[];
+  disputes: Dispute[];
+}
+
+/**
+ * One order as the seller fulfilling it may read it. Wider than `BuyerOrder`
+ * — the fee, the connected account and the provider handles for their own
+ * charge — but without the buyer's platform identity or Stripe customer id.
+ */
+export interface SellerOrder {
+  id: string;
+  buyer_email: string;
+  seller_account_id: string;
+  stripe_account_id: string;
+  status: string;
+  checkout_mode: "hosted" | "embedded" | "payment_link";
+  provider: string;
+  livemode: boolean;
+  currency: string;
+  subtotal_cents: number;
+  discount_cents: number;
+  tax_cents: number;
+  shipping_cents: number;
+  platform_fee_cents: number;
+  total_cents: number;
+  refunded_total_cents: number;
+  metadata: Record<string, unknown>;
+  stripe_payment_intent_id: string;
+  provider_session_id: string;
+  provider_payment_status: "" | "succeeded" | "payment_failed" | "processing" | "requires_action" | "canceled";
+  provider_payment_error_code: string;
+  provider_payment_error_message: string;
+  reconciliation_status: string;
+  reconciliation_error: string;
+  subscription_status: string;
+  subscription_current_period_end: string | null;
+  subscription_cancel_at_period_end: boolean;
+  payment_at: string | null;
+  refunded_at: string | null;
+  refunded_by: string;
+  refund_reason: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `{records, total_count, page, page_size}` over `SellerOrder` rows. */
+export interface SellerOrderList {
+  records: SellerOrder[];
+  total_count: number;
+  page: number;
+  page_size: number;
+}
+
+export interface SellerOrderDetail {
+  purchase: SellerOrder;
+  line_items: LineItem[];
+  refunds: Refund[];
+  disputes: Dispute[];
+}
+
+/** `{records, total_count, page, page_size}` over `Purchase` rows (admin). */
 export interface PurchaseList {
   records: Purchase[];
   total_count: number;
@@ -1093,11 +1215,11 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", `api/admin/purchases/${encodeURIComponent(orderId)}/refund`, { method: "POST", data: request });
   }
 
-  async listPurchases(options?: { page?: number; page_size?: number }): Promise<PurchaseList> {
+  async listPurchases(options?: { page?: number; page_size?: number }): Promise<BuyerOrderList> {
     return this.call("products", "purchases", { params: options });
   }
 
-  async getPurchase(orderId: string): Promise<PurchaseDetail> {
+  async getPurchase(orderId: string): Promise<BuyerOrderDetail> {
     return this.call("products", `purchases/${encodeURIComponent(orderId)}`);
   }
 
@@ -1131,11 +1253,11 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", "api/seller/stats");
   }
 
-  async listSellerOrders(options?: { page?: number; page_size?: number; status?: string }): Promise<PurchaseList> {
+  async listSellerOrders(options?: { page?: number; page_size?: number; status?: string }): Promise<SellerOrderList> {
     return this.call("products", "api/seller/orders", { params: options });
   }
 
-  async getSellerOrder(orderId: string): Promise<PurchaseDetail> {
+  async getSellerOrder(orderId: string): Promise<SellerOrderDetail> {
     return this.call("products", `api/seller/orders/${encodeURIComponent(orderId)}`);
   }
 
