@@ -943,6 +943,7 @@ mod contract_tests {
     use std::{collections::HashMap, sync::Arc};
 
     use wafer_block::wire::vector::VectorMatch;
+    use wafer_run::streams::output::TerminalNotResponse;
 
     use super::*;
     use crate::{
@@ -995,20 +996,38 @@ mod contract_tests {
     /// number and a checkbox string is not a boolean. The untyped handler
     /// coerced both, so a client that had drifted onto form-shaped JSON was
     /// silently accepted.
+    ///
+    /// The message is asserted, not just the code: `"1024"` happens to be
+    /// the catalog default's dimensionality, so a coercing handler would
+    /// still 400 on a later check for any other number, and the test would
+    /// pass for the wrong reason.
     #[tokio::test]
     async fn create_index_json_refuses_string_typed_fields() {
-        for body in [
-            serde_json::json!({ "name": "docs", "dimensions": "1024" }),
-            serde_json::json!({ "name": "docs", "keyword_search": "on" }),
+        for (body, expected) in [
+            (
+                serde_json::json!({ "name": "docs", "dimensions": "1024" }),
+                r#"invalid type: string "1024", expected u32"#,
+            ),
+            (
+                serde_json::json!({ "name": "docs", "keyword_search": "on" }),
+                r#"invalid type: string "on", expected a boolean"#,
+            ),
         ] {
             let ctx = ctx_with(StubVectorBlock::default()).await;
 
             let out = create_index(&ctx, &create_msg(), json_input(body.clone())).await;
 
-            assert!(
-                output_is_error(out, "InvalidArgument").await,
-                "{body} must be refused by the typed contract"
-            );
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::InvalidArgument, "{body}");
+                    assert!(
+                        e.message.starts_with("Invalid body: ") && e.message.contains(expected),
+                        "{body}: the refusal must come from the typed contract, got: {}",
+                        e.message
+                    );
+                }
+                other => panic!("{body}: expected InvalidArgument, got {other:?}"),
+            }
         }
     }
 

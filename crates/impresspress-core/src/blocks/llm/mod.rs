@@ -732,6 +732,15 @@ mod config_tests {
             out["id"].as_str().is_some_and(|id| !id.is_empty()),
             "the row id must be published so the settings page can address it"
         );
+        for field in ["created_at", "updated_at"] {
+            let value = out[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be a string, got {}", out[field]));
+            assert!(!value.is_empty(), "{field} must be set");
+            chrono::DateTime::parse_from_rfc3339(value).unwrap_or_else(|e| {
+                panic!("{field} must be RFC 3339 as the schema promises, got {value:?}: {e}")
+            });
+        }
     }
 
     #[tokio::test]
