@@ -62,21 +62,24 @@ impresspress deploy --target cloudflare secret   # IMPRESSPRESS_DEPLOY_TOKEN + J
 impresspress deploy --target cloudflare          # atomic versioned deploy, runs /_deploy/prepare
 ```
 
-The first admin: on Workers, config lives in the D1 `variables` table, and
-the auth block grants the `admin` role to whoever signs up with the email in
-`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` (`blocks/auth/mod.rs`,
-`initial_role_for`). After the first deploy has run `/_deploy/prepare` (which
-creates the table), upsert that row, then sign up with that email:
+The first admin. The auth block grants the `admin` role to whoever signs up
+with the email in `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`
+(`blocks/auth/mod.rs`, `initial_role_for`) — but on Workers that shared
+variable, like every `WAFER_RUN_SHARED__*` variable, currently has no read
+path (impresspress#78), so setting it in D1 does nothing. Until #78 is fixed:
+sign up, then promote the row directly and log in again:
 
 ```sh
-wrangler d1 execute impresspress-webmcp-demo --remote --command \
-  "INSERT INTO impresspress__admin__variables (id, key, name, value, created_at, updated_at) \
-   VALUES ('<uuid>', 'WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL', \
-           'WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL', '<you@example.com>', '<now>', '<now>') \
-   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;"
 curl -X POST https://<worker>.workers.dev/b/auth/api/signup -H 'Content-Type: application/json' \
   -d '{"email":"<you@example.com>","password":"<password>","name":"Admin"}'
+wrangler d1 execute impresspress-webmcp-demo --remote --command \
+  "UPDATE wafer_run__auth__users SET role = 'admin' WHERE email = '<you@example.com>';"
 ```
+
+For the same reason `WAFER_RUN_SHARED__ENVIRONMENT`, `FRONTEND_URL` and
+`APP_NAME` edits made in the admin UI do not reach the Worker yet; the demo
+runs on their defaults (`development`: discovery documents carry
+`Access-Control-Allow-Origin: *`, cookies are not `Secure`).
 
 Stripe keys are entered afterwards in the admin UI (`/b/admin/variables`).
 Without a Stripe key the `start_checkout` tool returns an error result rather
