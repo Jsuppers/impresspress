@@ -73,7 +73,15 @@ export default async function globalSetup(config: FullConfig): Promise<void> {
   // requests are exempt (not CSRF-able — a cross-site page has no ambient
   // credential to attach a bearer token with), so seed via the `access_token`
   // from the login response instead. Same pattern as `vector.spec.ts`.
-  await seedStoragePhotos(requestContext, accessToken);
+  // Seeding writes to whatever target `baseURL` points at — it creates a
+  // `photos` bucket and uploads two objects. That is right for the throwaway
+  // local database the visual baselines run against, and wrong for anything
+  // else, so a live run opts out. `playwright.live.config.ts` sets this.
+  if (process.env.IMPRESSPRESS_E2E_NO_SEED === '1') {
+    console.log('globalSetup: IMPRESSPRESS_E2E_NO_SEED=1 — skipping storage seed');
+  } else {
+    await seedStoragePhotos(requestContext, accessToken);
+  }
 
   await requestContext.storageState({ path: ADMIN_STATE_PATH });
   await requestContext.dispose();
