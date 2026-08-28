@@ -2476,6 +2476,51 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
     assert_untouched(&row);
 }
 
+/// A `PATCH` field sent as an explicit `null` is treated as absent: the
+/// column keeps its value rather than becoming a `NULL` write against a
+/// `NOT NULL` column, and the other fields in the same body still apply.
+#[tokio::test]
+async fn seller_patch_treats_explicit_null_fields_as_absent() {
+    use crate::{blocks::products::PRODUCTS_TABLE, util::RecordExt};
+
+    let ctx = user_products_ctx().await;
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "seller_a",
+        serde_json::json!({
+            "name": "Kept",
+            "description": "Original",
+            "category": "tools",
+            "stock": 7
+        }),
+    );
+    let created = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let id = created["id"].as_str().expect("created id").to_string();
+    assert_eq!(created["stock"], 7, "{created}");
+
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{id}"),
+        "seller_a",
+        serde_json::json!({
+            "name": "Renamed",
+            "description": null,
+            "category": null,
+            "stock": null
+        }),
+    );
+    let updated = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(updated["name"], "Renamed", "{updated}");
+    assert_eq!(updated["description"], "Original", "{updated}");
+    assert_eq!(updated["category"], "tools", "{updated}");
+    assert_eq!(updated["stock"], 7, "{updated}");
+    let row = wafer_core::clients::database::get(&ctx, PRODUCTS_TABLE, &id)
+        .await
+        .expect("updated row");
+    assert_eq!(row.str_field("description"), "Original");
+    assert_eq!(row.str_field("category"), "tools");
+    assert_eq!(row.i64_field("stock"), 7);
+}
+
 /// A typed request refuses a value outside its contract instead of writing
 /// it to the column as whatever JSON arrived.
 #[tokio::test]
@@ -2604,7 +2649,7 @@ async fn group_creates_record_the_caller_as_created_by() {
 /// `is_system` normalized to a boolean whichever way the backend stores it.
 #[tokio::test]
 async fn type_endpoints_publish_the_flat_type_view() {
-    use crate::{blocks::products::contracts::ProductTypeView, util::RecordExt};
+    use crate::blocks::products::contracts::{CreateProductTypeRequest, ProductTypeView};
 
     let ctx = ctx().await;
     let (msg, input) = admin_create_msg(
@@ -2618,14 +2663,19 @@ async fn type_endpoints_publish_the_flat_type_view() {
     assert_eq!(view.description, "Recurring");
     assert!(view.is_system);
     assert_eq!(serde_json::to_value(&view).unwrap(), created);
-    let row = wafer_core::clients::database::get(&ctx, "impresspress__products__types", &view.id)
-        .await
-        .expect("type row");
-    assert_eq!(
-        row.i64_field("is_system"),
-        1,
-        "the INTEGER column is written as 0/1, which Postgres requires"
-    );
+    // The INTEGER column is written as `0` / `1`, which Postgres requires.
+    // Reading the SQLite row back cannot show that (a bound `true` reads back
+    // as `1` there too), so the assertion is on the column map the request
+    // encodes, which is what reaches either backend.
+    for (is_system, stored) in [(true, 1), (false, 0)] {
+        let columns = CreateProductTypeRequest {
+            name: "subscription".to_string(),
+            description: None,
+            is_system: Some(is_system),
+        }
+        .into_columns();
+        assert_eq!(columns["is_system"], serde_json::json!(stored));
+    }
 
     let (msg, input) = admin_create_msg(
         "/admin/b/products/types",
@@ -2688,6 +2738,11 @@ async fn group_templates_publish_the_documented_list_envelope() {
     assert!(list.is_object(), "an envelope, not a bare array: {list}");
     let records = list["records"].as_array().expect("records");
     assert_eq!(list["total_count"], records.len());
+    // The descriptions commit to these: `page` is "Always `1`" and
+    // `page_size` is "the fixed ceiling on rows returned", the handler's
+    // `limit: 1000`.
+    assert_eq!(list["page"], 1, "{list}");
+    assert_eq!(list["page_size"], 1000, "{list}");
     assert!(
         records.iter().any(|r| r["name"] == "default"),
         "the seeded default template is listed: {list}"
