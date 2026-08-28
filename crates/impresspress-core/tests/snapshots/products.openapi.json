@@ -1,79 +1,119 @@
 {
   "/b/products/api/admin/groups": {
     "get": {
+      "parameters": [
+        {
+          "in": "query",
+          "name": "page",
+          "required": false,
+          "schema": {
+            "default": 1,
+            "description": "1-based page number. Values below 1 clamp to 1.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page_size",
+          "required": false,
+          "schema": {
+            "default": 20,
+            "description": "Rows per page, capped at 100.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
       "responses": {
         "200": {
           "content": {
             "application/json": {
               "schema": {
+                "description": "One page of group rows.",
                 "properties": {
                   "page": {
+                    "description": "1-based index of this page.",
+                    "format": "int64",
                     "type": "integer"
                   },
                   "page_size": {
+                    "description": "Rows per page used to compute `page`.",
+                    "format": "int64",
                     "type": "integer"
                   },
                   "records": {
+                    "description": "Groups on this page.",
                     "items": {
+                      "description": "A product group row: every column of `impresspress__products__groups`.",
                       "properties": {
-                        "data": {
-                          "properties": {
-                            "created_at": {
-                              "format": "date-time",
-                              "readOnly": true,
-                              "type": "string"
-                            },
-                            "created_by": {
-                              "readOnly": true,
-                              "type": "string"
-                            },
-                            "description": {
-                              "type": "string"
-                            },
-                            "group_template_id": {
-                              "type": "string"
-                            },
-                            "id": {
-                              "type": "string"
-                            },
-                            "name": {
-                              "type": "string"
-                            },
-                            "status": {
-                              "type": "string"
-                            },
-                            "updated_at": {
-                              "format": "date-time",
-                              "readOnly": true,
-                              "type": "string"
-                            },
-                            "user_id": {
-                              "readOnly": true,
-                              "type": "string"
-                            }
-                          },
-                          "type": "object"
+                        "created_at": {
+                          "description": "RFC 3339 creation timestamp.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "created_by": {
+                          "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "group_template_id": {
+                          "description": "Group template the group was created from.",
+                          "type": "string"
                         },
                         "id": {
+                          "description": "Stable group identifier.",
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`active` unless the group has been retired.",
+                          "type": "string"
+                        },
+                        "updated_at": {
+                          "description": "RFC 3339 timestamp of the last modification.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "user_id": {
+                          "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                           "type": "string"
                         }
                       },
                       "required": [
                         "id",
-                        "data"
+                        "name",
+                        "description",
+                        "group_template_id",
+                        "user_id",
+                        "status",
+                        "created_by",
+                        "created_at",
+                        "updated_at"
                       ],
                       "type": "object"
                     },
                     "type": "array"
                   },
                   "total_count": {
+                    "description": "Total groups matching the filters, across all pages.",
+                    "format": "int64",
                     "type": "integer"
                   }
                 },
                 "required": [
                   "records",
-                  "total_count"
+                  "total_count",
+                  "page",
+                  "page_size"
                 ],
+                "title": "GroupListResponse",
                 "type": "object"
               }
             }
@@ -98,26 +138,41 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`POST /b/products/api/admin/groups` request body.",
               "properties": {
                 "description": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "group_template_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "name": {
                   "type": "string"
                 },
                 "status": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "user_id": {
-                  "type": "string"
+                  "description": "Owner of the group. Defaults to the administrator creating it.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
                 "name"
               ],
+              "title": "CreateGroupRequest",
               "type": "object"
             }
           }
@@ -129,53 +184,57 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "A product group row: every column of `impresspress__products__groups`.",
                 "properties": {
-                  "data": {
-                    "properties": {
-                      "created_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "created_by": {
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "group_template_id": {
-                        "type": "string"
-                      },
-                      "id": {
-                        "type": "string"
-                      },
-                      "name": {
-                        "type": "string"
-                      },
-                      "status": {
-                        "type": "string"
-                      },
-                      "updated_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "user_id": {
-                        "readOnly": true,
-                        "type": "string"
-                      }
-                    },
-                    "type": "object"
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "created_by": {
+                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "group_template_id": {
+                    "description": "Group template the group was created from.",
+                    "type": "string"
                   },
                   "id": {
+                    "description": "Stable group identifier.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "`active` unless the group has been retired.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "user_id": {
+                    "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                     "type": "string"
                   }
                 },
                 "required": [
                   "id",
-                  "data"
+                  "name",
+                  "description",
+                  "group_template_id",
+                  "user_id",
+                  "status",
+                  "created_by",
+                  "created_at",
+                  "updated_at"
                 ],
+                "title": "GroupView",
                 "type": "object"
               }
             }
@@ -213,14 +272,17 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "Response body of every CRUD delete.",
                 "properties": {
                   "deleted": {
+                    "description": "Always `true`: a delete that did not happen is an error response.",
                     "type": "boolean"
                   }
                 },
                 "required": [
                   "deleted"
                 ],
+                "title": "Deleted",
                 "type": "object"
               }
             }
@@ -255,23 +317,41 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`PATCH /b/products/api/admin/groups/{id}` request body. Every field is\noptional and only the ones present are applied.",
               "properties": {
                 "description": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "group_template_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "name": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "status": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "user_id": {
-                  "type": "string"
+                  "description": "Owner of the group.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
+              "title": "UpdateGroupRequest",
               "type": "object"
             }
           }
@@ -283,53 +363,57 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "A product group row: every column of `impresspress__products__groups`.",
                 "properties": {
-                  "data": {
-                    "properties": {
-                      "created_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "created_by": {
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "group_template_id": {
-                        "type": "string"
-                      },
-                      "id": {
-                        "type": "string"
-                      },
-                      "name": {
-                        "type": "string"
-                      },
-                      "status": {
-                        "type": "string"
-                      },
-                      "updated_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "user_id": {
-                        "readOnly": true,
-                        "type": "string"
-                      }
-                    },
-                    "type": "object"
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "created_by": {
+                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "group_template_id": {
+                    "description": "Group template the group was created from.",
+                    "type": "string"
                   },
                   "id": {
+                    "description": "Stable group identifier.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "`active` unless the group has been retired.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "user_id": {
+                    "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                     "type": "string"
                   }
                 },
                 "required": [
                   "id",
-                  "data"
+                  "name",
+                  "description",
+                  "group_template_id",
+                  "user_id",
+                  "status",
+                  "created_by",
+                  "created_at",
+                  "updated_at"
                 ],
+                "title": "GroupView",
                 "type": "object"
               }
             }
@@ -13026,74 +13110,88 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "One page of group rows.",
                 "properties": {
                   "page": {
+                    "description": "1-based index of this page.",
+                    "format": "int64",
                     "type": "integer"
                   },
                   "page_size": {
+                    "description": "Rows per page used to compute `page`.",
+                    "format": "int64",
                     "type": "integer"
                   },
                   "records": {
+                    "description": "Groups on this page.",
                     "items": {
+                      "description": "A product group row: every column of `impresspress__products__groups`.",
                       "properties": {
-                        "data": {
-                          "properties": {
-                            "created_at": {
-                              "format": "date-time",
-                              "readOnly": true,
-                              "type": "string"
-                            },
-                            "created_by": {
-                              "readOnly": true,
-                              "type": "string"
-                            },
-                            "description": {
-                              "type": "string"
-                            },
-                            "group_template_id": {
-                              "type": "string"
-                            },
-                            "id": {
-                              "type": "string"
-                            },
-                            "name": {
-                              "type": "string"
-                            },
-                            "status": {
-                              "type": "string"
-                            },
-                            "updated_at": {
-                              "format": "date-time",
-                              "readOnly": true,
-                              "type": "string"
-                            },
-                            "user_id": {
-                              "readOnly": true,
-                              "type": "string"
-                            }
-                          },
-                          "type": "object"
+                        "created_at": {
+                          "description": "RFC 3339 creation timestamp.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "created_by": {
+                          "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "group_template_id": {
+                          "description": "Group template the group was created from.",
+                          "type": "string"
                         },
                         "id": {
+                          "description": "Stable group identifier.",
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`active` unless the group has been retired.",
+                          "type": "string"
+                        },
+                        "updated_at": {
+                          "description": "RFC 3339 timestamp of the last modification.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "user_id": {
+                          "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                           "type": "string"
                         }
                       },
                       "required": [
                         "id",
-                        "data"
+                        "name",
+                        "description",
+                        "group_template_id",
+                        "user_id",
+                        "status",
+                        "created_by",
+                        "created_at",
+                        "updated_at"
                       ],
                       "type": "object"
                     },
                     "type": "array"
                   },
                   "total_count": {
+                    "description": "Total groups matching the filters, across all pages.",
+                    "format": "int64",
                     "type": "integer"
                   }
                 },
                 "required": [
                   "records",
-                  "total_count"
+                  "total_count",
+                  "page",
+                  "page_size"
                 ],
+                "title": "GroupListResponse",
                 "type": "object"
               }
             }
@@ -13117,23 +13215,35 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`POST /b/products/groups` request body. The owner is always the caller.",
               "properties": {
                 "description": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "group_template_id": {
-                  "type": "string"
+                  "description": "Group template. Defaults to the seeded `default` template when\nomitted.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "name": {
                   "type": "string"
                 },
                 "status": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
                 "name"
               ],
+              "title": "CreateOwnGroupRequest",
               "type": "object"
             }
           }
@@ -13145,53 +13255,57 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "A product group row: every column of `impresspress__products__groups`.",
                 "properties": {
-                  "data": {
-                    "properties": {
-                      "created_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "created_by": {
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "group_template_id": {
-                        "type": "string"
-                      },
-                      "id": {
-                        "type": "string"
-                      },
-                      "name": {
-                        "type": "string"
-                      },
-                      "status": {
-                        "type": "string"
-                      },
-                      "updated_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "user_id": {
-                        "readOnly": true,
-                        "type": "string"
-                      }
-                    },
-                    "type": "object"
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "created_by": {
+                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "group_template_id": {
+                    "description": "Group template the group was created from.",
+                    "type": "string"
                   },
                   "id": {
+                    "description": "Stable group identifier.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "`active` unless the group has been retired.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "user_id": {
+                    "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                     "type": "string"
                   }
                 },
                 "required": [
                   "id",
-                  "data"
+                  "name",
+                  "description",
+                  "group_template_id",
+                  "user_id",
+                  "status",
+                  "created_by",
+                  "created_at",
+                  "updated_at"
                 ],
+                "title": "GroupView",
                 "type": "object"
               }
             }
@@ -13228,14 +13342,17 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "Response body of every CRUD delete.",
                 "properties": {
                   "deleted": {
+                    "description": "Always `true`: a delete that did not happen is an error response.",
                     "type": "boolean"
                   }
                 },
                 "required": [
                   "deleted"
                 ],
+                "title": "Deleted",
                 "type": "object"
               }
             }
@@ -13270,53 +13387,57 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "A product group row: every column of `impresspress__products__groups`.",
                 "properties": {
-                  "data": {
-                    "properties": {
-                      "created_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "created_by": {
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "group_template_id": {
-                        "type": "string"
-                      },
-                      "id": {
-                        "type": "string"
-                      },
-                      "name": {
-                        "type": "string"
-                      },
-                      "status": {
-                        "type": "string"
-                      },
-                      "updated_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "user_id": {
-                        "readOnly": true,
-                        "type": "string"
-                      }
-                    },
-                    "type": "object"
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "created_by": {
+                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "group_template_id": {
+                    "description": "Group template the group was created from.",
+                    "type": "string"
                   },
                   "id": {
+                    "description": "Stable group identifier.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "`active` unless the group has been retired.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "user_id": {
+                    "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                     "type": "string"
                   }
                 },
                 "required": [
                   "id",
-                  "data"
+                  "name",
+                  "description",
+                  "group_template_id",
+                  "user_id",
+                  "status",
+                  "created_by",
+                  "created_at",
+                  "updated_at"
                 ],
+                "title": "GroupView",
                 "type": "object"
               }
             }
@@ -13350,20 +13471,34 @@
         "content": {
           "application/json": {
             "schema": {
+              "description": "`PATCH /b/products/groups/{id}` request body. Every field is optional\nand only the ones present are applied; the owner cannot be changed.",
               "properties": {
                 "description": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "group_template_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "name": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "status": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
+              "title": "UpdateOwnGroupRequest",
               "type": "object"
             }
           }
@@ -13375,53 +13510,57 @@
           "content": {
             "application/json": {
               "schema": {
+                "description": "A product group row: every column of `impresspress__products__groups`.",
                 "properties": {
-                  "data": {
-                    "properties": {
-                      "created_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "created_by": {
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "group_template_id": {
-                        "type": "string"
-                      },
-                      "id": {
-                        "type": "string"
-                      },
-                      "name": {
-                        "type": "string"
-                      },
-                      "status": {
-                        "type": "string"
-                      },
-                      "updated_at": {
-                        "format": "date-time",
-                        "readOnly": true,
-                        "type": "string"
-                      },
-                      "user_id": {
-                        "readOnly": true,
-                        "type": "string"
-                      }
-                    },
-                    "type": "object"
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "created_by": {
+                    "description": "Id of the user who created the row; empty when the row was created\nthrough the admin API, which records the owner in `user_id` instead.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "group_template_id": {
+                    "description": "Group template the group was created from.",
+                    "type": "string"
                   },
                   "id": {
+                    "description": "Stable group identifier.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "`active` unless the group has been retired.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "user_id": {
+                    "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
                     "type": "string"
                   }
                 },
                 "required": [
                   "id",
-                  "data"
+                  "name",
+                  "description",
+                  "group_template_id",
+                  "user_id",
+                  "status",
+                  "created_by",
+                  "created_at",
+                  "updated_at"
                 ],
+                "title": "GroupView",
                 "type": "object"
               }
             }

@@ -1042,18 +1042,23 @@ mod discovery_tests {
             );
         }
 
-        for path in [
-            "/b/products/api/admin/groups",
-            "/b/products/api/admin/types",
-        ] {
-            assert_eq!(
-                paths[path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-                    ["required"],
-                serde_json::json!(["records", "total_count"]),
-                "admin builder list must document RecordList: {}",
-                paths[path]["get"]
-            );
-        }
+        // The envelope is `{records, total_count, page, page_size}` and the
+        // handler always emits all four; the hand-written schema understated
+        // `required`.
+        assert_eq!(
+            paths["/b/products/api/admin/groups"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["required"],
+            serde_json::json!(["records", "total_count", "page", "page_size"]),
+            "admin group list must document its envelope: {}",
+            paths["/b/products/api/admin/groups"]["get"]
+        );
+        assert_eq!(
+            paths["/b/products/api/admin/types"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["required"],
+            serde_json::json!(["records", "total_count"]),
+            "admin builder list must document RecordList: {}",
+            paths["/b/products/api/admin/types"]["get"]
+        );
         // The legacy pricing-template/formula-variable builders were removed
         // with the typed-offer redesign and must stay out of discovery.
         for path in [

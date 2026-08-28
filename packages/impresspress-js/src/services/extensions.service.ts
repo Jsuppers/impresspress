@@ -329,6 +329,37 @@ export interface Product {
   updated_at: string;
 }
 
+/** A product group row: `contracts::GroupView`. */
+export interface Group {
+  id: string;
+  name: string;
+  description: string;
+  group_template_id: string;
+  user_id: string;
+  status: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `{records, total_count, page, page_size}` over `Group` rows. */
+export interface GroupList {
+  records: Group[];
+  total_count: number;
+  page: number;
+  page_size: number;
+}
+
+/** `contracts::CreateGroupRequest`; a key not listed here is ignored. */
+export interface GroupDraft {
+  name: string;
+  description?: string;
+  group_template_id?: string;
+  /** Admin only: the owner. Defaults to the creating administrator. */
+  user_id?: string;
+  status?: string;
+}
+
 /** `{records, total_count, page, page_size}` over `Product` rows. */
 export interface ProductList {
   records: Product[];
@@ -975,16 +1006,12 @@ export class ProductsExtension extends ExtensionsService {
   }
 
   /** List product groups (admin). `GET /b/products/api/admin/groups`. */
-  async listGroups(): Promise<WireRecordList> {
-    return this.call("products", "api/admin/groups");
+  async listGroups(options?: { page?: number; page_size?: number }): Promise<GroupList> {
+    return this.call("products", "api/admin/groups", { params: options });
   }
 
   /** Create a product group (admin). `POST /b/products/api/admin/groups`. */
-  async createGroup(data: {
-    name: string;
-    group_template_id?: string;
-    [key: string]: unknown;
-  }): Promise<WireRecord> {
+  async createGroup(data: GroupDraft): Promise<Group> {
     return this.call("products", "api/admin/groups", {
       method: "POST",
       data,

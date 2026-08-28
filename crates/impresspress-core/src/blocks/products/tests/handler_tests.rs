@@ -151,8 +151,8 @@ async fn admin_create_and_list_groups() {
     );
     let out = dispatch_admin(&ctx, create, create_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "Electronics");
-    assert_eq!(body["data"]["user_id"], "admin_1");
+    assert_eq!(body["name"], "Electronics");
+    assert_eq!(body["user_id"], "admin_1");
 
     let (list, list_input) = admin_get_msg("/admin/b/products/groups");
     let list_out = dispatch_admin(&ctx, list, list_input).await;
@@ -787,7 +787,7 @@ async fn user_list_only_own_groups() {
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["data"]["name"], "U1 Group");
+    assert_eq!(records[0]["name"], "U1 Group");
 }
 
 #[tokio::test]
@@ -841,7 +841,7 @@ async fn user_group_update_prevents_ownership_change() {
     );
     let out = dispatch_user(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["user_id"], "user_1");
+    assert_eq!(body["user_id"], "user_1");
 }
 
 // ============================================================
@@ -2498,6 +2498,73 @@ async fn typed_product_writes_reject_values_outside_the_contract() {
             "{body} must be refused"
         );
     }
+}
+
+/// Every group endpoint publishes `contracts::GroupView`, flat, with exactly
+/// the type's field set, on both the admin and the owner tier.
+#[tokio::test]
+async fn group_endpoints_publish_the_flat_group_view() {
+    use crate::blocks::products::contracts::GroupView;
+
+    let ctx = user_products_ctx().await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/groups",
+        serde_json::json!({"name": "Admin group", "description": "d", "user_id": "someone"}),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(created.get("data").is_none(), "{created}");
+    let view: GroupView = serde_json::from_value(created.clone()).expect("GroupView");
+    assert_eq!(view.name, "Admin group");
+    assert_eq!(view.user_id, "someone", "an admin may assign the owner");
+    assert_eq!(view.status, "active", "the table default is reported");
+    assert_eq!(serde_json::to_value(&view).unwrap(), created);
+
+    let (mut msg, input) = request_msg(
+        "update",
+        &format!("/admin/b/products/groups/{}", view.id),
+        "admin_1",
+        serde_json::json!({"description": "changed"}),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    let updated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let updated_view: GroupView = serde_json::from_value(updated.clone()).expect("GroupView");
+    assert_eq!(updated_view.description, "changed");
+    assert_eq!(updated_view.name, "Admin group");
+
+    let (msg, input) = admin_get_msg("/admin/b/products/groups");
+    let list = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(list["total_count"], 1);
+    assert_eq!(list["page_size"], 20);
+    assert_eq!(list["records"][0], updated);
+
+    // Owner tier: `user_id` is not a field of the request, so the row keeps
+    // the caller as owner however the body tries to name someone else.
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "Mine", "user_id": "attacker"}),
+    );
+    let own = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let own_view: GroupView = serde_json::from_value(own.clone()).expect("GroupView");
+    assert_eq!(own_view.user_id, "user_1");
+    assert!(
+        !own_view.group_template_id.is_empty(),
+        "the seeded default template is applied"
+    );
+    assert_eq!(serde_json::to_value(&own_view).unwrap(), own);
+
+    let (msg, input) = get_msg(&format!("/b/products/groups/{}", own_view.id), "user_1");
+    let fetched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(fetched, own);
+
+    let (msg, input) = get_msg("/b/products/groups", "user_1");
+    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(list["records"][0], own);
+    assert_eq!(list["total_count"], 1);
+
+    let (msg, input) = delete_msg(&format!("/b/products/groups/{}", own_view.id), "user_1");
+    let deleted = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(deleted, serde_json::json!({"deleted": true}));
 }
 
 /// Moderation writes `published_at = ""` when it returns a product to draft.

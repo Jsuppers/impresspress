@@ -1554,6 +1554,161 @@ pub struct ProductDuplicateResponse {
     pub offers: Vec<ManagedOffer>,
 }
 
+/// A product group row: every column of `impresspress__products__groups`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GroupView {
+    /// Stable group identifier.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Group template the group was created from.
+    pub group_template_id: String,
+    /// Id of the user who owns the group. The owner tier lists and edits
+    /// only groups whose `user_id` is the caller.
+    pub user_id: String,
+    /// `active` unless the group has been retired.
+    pub status: String,
+    /// Id of the user who created the row; empty when the row was created
+    /// through the admin API, which records the owner in `user_id` instead.
+    pub created_by: String,
+    /// RFC 3339 creation timestamp.
+    #[schemars(extend("format" = "date-time"))]
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    #[schemars(extend("format" = "date-time"))]
+    pub updated_at: String,
+}
+
+impl GroupView {
+    /// Project an `impresspress__products__groups` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.str_field("name").to_string(),
+            description: record.str_field("description").to_string(),
+            group_template_id: record.str_field("group_template_id").to_string(),
+            user_id: record.str_field("user_id").to_string(),
+            status: record.str_field("status").to_string(),
+            created_by: record.str_field("created_by").to_string(),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// One page of group rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GroupListResponse {
+    /// Groups on this page.
+    pub records: Vec<GroupView>,
+    /// Total groups matching the filters, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl GroupListResponse {
+    /// Project a `RecordList` of group rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list.records.iter().map(GroupView::from_record).collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// `POST /b/products/api/admin/groups` request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateGroupRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_template_id: Option<String>,
+    /// Owner of the group. Defaults to the administrator creating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl CreateGroupRequest {
+    /// The columns this request writes: only the fields that were sent.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        columns(&self)
+    }
+}
+
+/// `PATCH /b/products/api/admin/groups/{id}` request body. Every field is
+/// optional and only the ones present are applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateGroupRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_template_id: Option<String>,
+    /// Owner of the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl UpdateGroupRequest {
+    /// The columns this request writes: only the fields that were sent.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        columns(&self)
+    }
+}
+
+/// `POST /b/products/groups` request body. The owner is always the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateOwnGroupRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Group template. Defaults to the seeded `default` template when
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl CreateOwnGroupRequest {
+    /// The columns this request writes: only the fields that were sent.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        columns(&self)
+    }
+}
+
+/// `PATCH /b/products/groups/{id}` request body. Every field is optional
+/// and only the ones present are applied; the owner cannot be changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateOwnGroupRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl UpdateOwnGroupRequest {
+    /// The columns this request writes: only the fields that were sent.
+    pub fn into_columns(self) -> HashMap<String, Value> {
+        columns(&self)
+    }
+}
+
 /// Response body of `GET /b/products/api/admin/sellers/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminSellerDetail {

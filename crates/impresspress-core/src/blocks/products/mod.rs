@@ -361,20 +361,6 @@ crate::impresspress_feature_block! {
                 "updated_at": {"type": "string", "format": "date-time"}
             }
         });
-        let group_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "user_id": {"type": "string", "readOnly": true},
-                "status": {"type": "string"},
-                "created_by": {"type": "string", "readOnly": true},
-                "created_at": {"type": "string", "format": "date-time", "readOnly": true},
-                "updated_at": {"type": "string", "format": "date-time", "readOnly": true}
-            }
-        });
         let product_type_schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -624,22 +610,6 @@ crate::impresspress_feature_block! {
                 "offers": {"type": "array", "items": managed_offer_schema}
             }
         });
-        let group_write_schema = serde_json::json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "user_id": {"type": "string"},
-                "status": {"type": "string"}
-            }
-        });
-        let mut group_update_schema = group_write_schema.clone();
-        group_update_schema
-            .as_object_mut()
-            .expect("group schema is an object")
-            .remove("required");
         let product_type_write_schema = serde_json::json!({
             "type": "object",
             "required": ["name"],
@@ -913,26 +883,27 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/api/admin/groups")
                     .summary("List groups")
                     .auth(AuthLevel::Admin)
-                    .output_schema(record_list_schema(group_schema.clone()))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::GroupListResponse>()
                     .tags(&["products", "admin", "groups"]),
                 BlockEndpoint::post("/b/products/api/admin/groups")
                     .summary("Create group")
                     .auth(AuthLevel::Admin)
-                    .input_schema(group_write_schema)
-                    .output_schema(record_schema(group_schema.clone()))
+                    .input::<contracts::CreateGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "admin", "groups"]),
                 BlockEndpoint::patch("/b/products/api/admin/groups/{id}")
                     .summary("Update group")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(group_update_schema.clone())
-                    .output_schema(record_schema(group_schema.clone()))
+                    .input::<contracts::UpdateGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "admin", "groups"]),
                 BlockEndpoint::delete("/b/products/api/admin/groups/{id}")
                     .summary("Delete group")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(deleted_schema.clone())
+                    .output::<crud::Deleted>()
                     .tags(&["products", "admin", "groups"]),
                 // JSON admin API — types
                 BlockEndpoint::get("/b/products/api/admin/types")
@@ -1208,53 +1179,32 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/groups")
                     .summary("List own product groups")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(record_list_schema(group_schema.clone()))
+                    .output::<contracts::GroupListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::post("/b/products/groups")
                     .summary("Create own product group")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["name"],
-                        "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
-                                        "group_template_id": {"type": "string"},
-                            "status": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(record_schema(group_schema.clone()))
+                    .input::<contracts::CreateOwnGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/groups/{id}")
                     .summary("Get own product group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(group_schema.clone()))
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::patch("/b/products/groups/{id}")
                     .summary("Update own product group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
-                                        "group_template_id": {"type": "string"},
-                            "status": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(record_schema(group_schema))
+                    .input::<contracts::UpdateOwnGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::delete("/b/products/groups/{id}")
                     .summary("Delete own product group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["deleted"],
-                        "properties": {"deleted": {"type": "boolean"}}
-                    }))
+                    .output::<crud::Deleted>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/groups/{id}/products")
                     .summary("List products in own group")
