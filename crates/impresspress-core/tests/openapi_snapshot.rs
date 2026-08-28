@@ -32,21 +32,25 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("messages", &["/b/messages"]),
     ("admin", &["/b/admin"]),
     ("tickets", &["/b/tickets"]),
+    ("llm", &["/b/llm"]),
+    ("vector", &["/b/vector"]),
 ];
 
 /// Blocks that legitimately have no schema-carrying endpoints yet, so an
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// The list is now empty. `admin` left it when its four JSON API reads were
-/// typed, and `tickets` left it when its thirteen JSON endpoints were: both
-/// blocks' handlers now build `contracts` types, so both have a non-empty
-/// snapshot to guard.
+/// `llm` (18 endpoints) and `vector` (11) declare no schemas at all: their
+/// handlers deserialize into private in-function structs and answer with
+/// `serde_json::json!` literals, so `has_schema()` filters every one of them
+/// out. They are listed here so the committed baseline is the pre-typing
+/// state; each leaves the list as its handlers gain `contracts` types,
+/// exactly as `admin` and `tickets` did.
 ///
-/// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
-/// any of them means the gate is vacuous — wrong prefix, or the block missing
-/// from the document's block list — and must fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &[];
+/// Every other block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty
+/// snapshot for any of them means the gate is vacuous — wrong prefix, or the
+/// block missing from the document's block list — and must fail loudly.
+const LEGITIMATELY_EMPTY: &[&str] = &["llm", "vector"];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
