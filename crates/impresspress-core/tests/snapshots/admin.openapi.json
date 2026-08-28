@@ -515,8 +515,38 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": true,
-                "description": "Response body of `GET /b/admin/api/settings`: every configuration variable\nas a flat `key → value` map.\n\n**Sensitive values are never present.** A variable is treated as sensitive\nwhen it is flagged sensitive in the database or its key ends in `_SECRET` or\n`_KEY`, and its value is replaced with `\"********\"` before the response is\nbuilt. Reading this endpoint cannot recover a secret, nor its length.\n\nValues are typed as `any` rather than `string` because the stored column is\ntext that the SQLite and D1 backends decode back into JSON when it looks\nlike an object or an array: a variable holding `[\"a\",\"b\"]` reads back as an\narray, one holding `on` reads back as a string.",
+                "additionalProperties": false,
+                "description": "Response body of `GET /b/admin/api/settings`: every configuration\nvariable, sorted by key.\n\n**Sensitive values are never present.** A variable is treated as sensitive\nwhen it is flagged sensitive in the database or its key ends in `_SECRET` or\n`_KEY`, and its value is replaced with `\"********\"` before the response is\nbuilt. Reading this endpoint cannot recover a secret, nor its length.",
+                "properties": {
+                  "settings": {
+                    "items": {
+                      "description": "One configuration variable, as published by `GET /b/admin/api/settings`.\n\n`sensitive` is what makes the masking legible to a reader that is not a\nperson: a bare `\"********\"` is indistinguishable from a variable whose\nvalue really is that string, and a caller cannot tell it must not treat\nthe value as usable.",
+                      "properties": {
+                        "key": {
+                          "description": "Variable name, e.g. `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`.",
+                          "type": "string"
+                        },
+                        "sensitive": {
+                          "description": "Whether `value` is masked. True when the row carries the sensitive\nflag or the key ends in `_SECRET` or `_KEY`.",
+                          "type": "boolean"
+                        },
+                        "value": {
+                          "description": "The stored value, or `\"********\"` when `sensitive` is true.\n\nTyped as `any` rather than `string` because the stored column is text\nthat the SQLite and D1 backends decode back into JSON when it looks\nlike an object or an array: a variable holding `[\"a\",\"b\"]` reads back\nas an array, one holding `on` reads back as a string."
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "value",
+                        "sensitive"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "settings"
+                ],
                 "title": "AdminSettingsResponse",
                 "type": "object"
               }

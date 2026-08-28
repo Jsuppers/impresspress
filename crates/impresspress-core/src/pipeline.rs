@@ -1711,6 +1711,24 @@ mod discovery_tests {
                 as_admin.contains(&tool),
                 "an admin session must receive the shipped admin tool {tool}: {as_admin:?}"
             );
+
+            // Presence of the name is not enough. The producer drops an
+            // `outputSchema` it cannot vouch for and still publishes the
+            // tool, so a refused schema is invisible to a name check: an
+            // agent gets a tool whose result it cannot interpret.
+            // `AdminSettingsResponse` was exactly this — a free-form map
+            // (`additionalProperties: true`) that the wall refused.
+            let published = admin_body["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .find(|t| t["name"] == tool)
+                .expect("just asserted present");
+            assert_eq!(
+                published["outputSchema"]["type"], "object",
+                "{tool} must publish an object outputSchema, not a dropped or \
+                 non-object one: {published}"
+            );
         }
 
         // The two discriminating halves. A logged-in non-admin and an

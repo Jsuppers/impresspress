@@ -23,7 +23,7 @@
 //! The `{records, total_count, page, page_size}` envelope is preserved exactly:
 //! only the per-row shape changes, from `{id, data: {…}}` to the flat view.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use wafer_core::clients::database::{Record, RecordList};
@@ -297,21 +297,40 @@ pub struct AdminRoleDeleteResponse {
 // a secret-ish name and the `sensitive` checkbox left clear: it matches neither
 // half of the rule and its value is published. That is a property of the
 // create form, not of this endpoint, and is unchanged by typing the response.
-/// Response body of `GET /b/admin/api/settings`: every configuration variable
-/// as a flat `key → value` map.
+/// One configuration variable, as published by `GET /b/admin/api/settings`.
+///
+/// `sensitive` is what makes the masking legible to a reader that is not a
+/// person: a bare `"********"` is indistinguishable from a variable whose
+/// value really is that string, and a caller cannot tell it must not treat
+/// the value as usable.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminSettingView {
+    /// Variable name, e.g. `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`.
+    pub key: String,
+    /// The stored value, or `"********"` when `sensitive` is true.
+    ///
+    /// Typed as `any` rather than `string` because the stored column is text
+    /// that the SQLite and D1 backends decode back into JSON when it looks
+    /// like an object or an array: a variable holding `["a","b"]` reads back
+    /// as an array, one holding `on` reads back as a string.
+    pub value: serde_json::Value,
+    /// Whether `value` is masked. True when the row carries the sensitive
+    /// flag or the key ends in `_SECRET` or `_KEY`.
+    pub sensitive: bool,
+}
+
+/// Response body of `GET /b/admin/api/settings`: every configuration
+/// variable, sorted by key.
 ///
 /// **Sensitive values are never present.** A variable is treated as sensitive
 /// when it is flagged sensitive in the database or its key ends in `_SECRET` or
 /// `_KEY`, and its value is replaced with `"********"` before the response is
 /// built. Reading this endpoint cannot recover a secret, nor its length.
-///
-/// Values are typed as `any` rather than `string` because the stored column is
-/// text that the SQLite and D1 backends decode back into JSON when it looks
-/// like an object or an array: a variable holding `["a","b"]` reads back as an
-/// array, one holding `on` reads back as a string.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(transparent)]
-pub struct AdminSettingsResponse(pub BTreeMap<String, serde_json::Value>);
+#[serde(deny_unknown_fields)]
+pub struct AdminSettingsResponse {
+    pub settings: Vec<AdminSettingView>,
+}
 
 // ---------------------------------------------------------------------------
 // GET /b/admin/api/logs
