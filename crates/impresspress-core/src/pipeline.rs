@@ -1486,6 +1486,82 @@ mod discovery_tests {
         );
     }
 
+    /// `list_my_purchases` is the other WebMCP tool whose output is a products
+    /// contract, and the one whose shape changed when the order rows were
+    /// typed: flat `PurchaseView` rows under `records`, with the guest receipt
+    /// digest (`receipt_token_hash`, `receipt_token_expires_at`) withheld.
+    /// Same pin as for `get_order_status`: the manifest's `outputSchema` is
+    /// the `/openapi.json` projection of `GET /b/products/purchases` minus the
+    /// root `title`, and no property name published under it starts with
+    /// `receipt_token`.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_list_my_purchases_to_the_typed_order_rows() {
+        let ctx = TestContext::with_auth().await;
+        let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "list_my_purchases")
+            .unwrap_or_else(|| {
+                panic!("list_my_purchases must be published to an authenticated caller: {body}")
+            });
+
+        let openapi = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
+        let mut expected = openapi["paths"]["/b/products/purchases"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]
+            .clone();
+        let expected_obj = expected
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("the endpoint's response schema must be in /openapi.json"));
+        expected_obj.remove("title");
+
+        assert_eq!(
+            tool["outputSchema"], expected,
+            "outputSchema must be the /openapi.json projection of the same declaration, \
+             minus the root title: {tool}"
+        );
+
+        let published = property_names(&tool["outputSchema"]);
+        assert!(
+            published.contains(&"refunded_total_cents".to_string()),
+            "the walk must reach the order row's properties: {published:?}"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|name| name.starts_with("receipt_token")),
+            "the guest receipt digest must not be published to an agent: {published:?}"
+        );
+    }
+
+    /// Every `properties` key anywhere under `schema`: the names a consumer
+    /// of the schema can read, at any depth.
+    fn property_names(schema: &serde_json::Value) -> Vec<String> {
+        fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                        out.extend(props.keys().cloned());
+                    }
+                    for value in map.values() {
+                        walk(value, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(schema, &mut out);
+        out
+    }
+
     #[tokio::test]
     async fn webmcp_manifest_is_not_cacheable() {
         let ctx = TestContext::new().await;
