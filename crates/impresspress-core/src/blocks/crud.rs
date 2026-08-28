@@ -10,9 +10,10 @@
 //!   run the step, project the row through `View::from_record`.
 //! * The `crud_*` functions are the untyped one-liners built on top of them:
 //!   the request body is whatever JSON object arrived, written as a column
-//!   map, and the response is the database layer's own `Record` /
-//!   `RecordList` envelope. They remain for the blocks that still speak that
-//!   shape; a block whose JSON API is typed uses the primitives directly.
+//!   map, and the response is the database layer's own `Record` envelope or
+//!   [`Deleted`]. Only the five with callers remain: `crud_get` and
+//!   `crud_update` (legalpages), `crud_get_owned` (messages) and the two
+//!   deletes. A block whose JSON API is typed uses the primitives directly.
 //!
 // audit-allow-file: pure pass-through helpers — every db::* call here takes
 // the table name as a `collection: &str` parameter from the caller. WRAP
@@ -193,31 +194,6 @@ pub async fn delete_record(
 // Untyped one-liners over the primitives
 // ---------------------------------------------------------------------------
 
-/// List records with pagination, optional extra filters, and optional sort
-/// (`None` = newest first by `created_at`).
-pub async fn crud_list(
-    ctx: &dyn Context,
-    msg: &Message,
-    collection: &str,
-    extra_filters: Vec<Filter>,
-    sort: Option<Vec<SortField>>,
-) -> OutputStream {
-    let (page, page_size, _) = msg.pagination_params(20);
-    match list_page(
-        ctx,
-        collection,
-        page as i64,
-        page_size as i64,
-        extra_filters,
-        sort,
-    )
-    .await
-    {
-        Ok(result) => ok_json(&result),
-        Err(response) => response,
-    }
-}
-
 /// Get a single record by ID extracted from the path.
 pub async fn crud_get(
     ctx: &dyn Context,
@@ -231,27 +207,6 @@ pub async fn crud_get(
         Err(response) => return response,
     };
     match get_record(ctx, collection, id, not_found_label).await {
-        Ok(record) => ok_json(&record),
-        Err(response) => response,
-    }
-}
-
-/// Create a record from the request body, with auto-timestamps and optional defaults.
-pub async fn crud_create(
-    ctx: &dyn Context,
-    _msg: &Message,
-    input: InputStream,
-    collection: &str,
-    defaults: HashMap<String, serde_json::Value>,
-) -> OutputStream {
-    let mut data: HashMap<String, serde_json::Value> = match read_json_body(input).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    for (key, val) in defaults {
-        data.entry(key).or_insert(val);
-    }
-    match create_record(ctx, collection, data).await {
         Ok(record) => ok_json(&record),
         Err(response) => response,
     }
@@ -415,29 +370,6 @@ pub async fn crud_get_owned(
     res: &OwnedResource<'_>,
 ) -> OutputStream {
     match get_owned(ctx, msg, res).await {
-        Ok(record) => ok_json(&record),
-        Err(resp) => resp,
-    }
-}
-
-/// Update an owner-scoped record by ID extracted from the path, with
-/// auto-`updated_at`. `strip_fields` are removed from the request body
-/// before the write (e.g. the owner column, to prevent ownership changes).
-pub async fn crud_update_owned(
-    ctx: &dyn Context,
-    msg: &Message,
-    input: InputStream,
-    res: &OwnedResource<'_>,
-    strip_fields: &[&str],
-) -> OutputStream {
-    let mut body: HashMap<String, serde_json::Value> = match read_json_body(input).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    for field in strip_fields {
-        body.remove(*field);
-    }
-    match update_owned(ctx, msg, res, body).await {
         Ok(record) => ok_json(&record),
         Err(resp) => resp,
     }
