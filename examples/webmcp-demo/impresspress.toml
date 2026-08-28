@@ -1,0 +1,24 @@
+# WebMCP demo — `impresspress build/deploy --target cloudflare` config.
+#
+# Deployer identifiers come from env (see `README.md`):
+#   CLOUDFLARE_ACCOUNT_ID, IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID,
+#   IMPRESSPRESS_DEPLOY_TOKEN.
+
+[cloudflare]
+worker_name        = "impresspress-webmcp-demo"
+compatibility_date = "2026-05-01"
+# Deep-merged into the generated wrangler.toml: the `CONFIG_CACHE` KV binding
+# the D1 config cache needs, which the generator does not emit.
+wrangler_overrides_path = "wrangler.overrides.toml"
+
+[cloudflare.d1]
+# Binding is a code contract — the adapter reads `env.DB`.
+binding       = "DB"
+database_name = "impresspress-webmcp-demo"
+# database_id comes from IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID
+# (`wrangler d1 create impresspress-webmcp-demo`).
+
+[cloudflare.r2]
+# Binding is a code contract — the adapter reads `env.STORAGE`.
+binding     = "STORAGE"
+bucket_name = "impresspress-webmcp-demo"
