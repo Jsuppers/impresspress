@@ -40,17 +40,17 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// `llm` (18 endpoints) and `vector` (11) declare no schemas at all: their
-/// handlers deserialize into private in-function structs and answer with
+/// `vector` (11 endpoints) declares no schemas at all: its handlers
+/// deserialize into private in-function structs and answer with
 /// `serde_json::json!` literals, so `has_schema()` filters every one of them
-/// out. They are listed here so the committed baseline is the pre-typing
-/// state; each leaves the list as its handlers gain `contracts` types,
-/// exactly as `admin` and `tickets` did.
+/// out. It is listed here so the committed baseline is the pre-typing state;
+/// it leaves the list as its handlers gain `contracts` types, exactly as
+/// `admin`, `tickets` and `llm` did.
 ///
 /// Every other block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty
 /// snapshot for any of them means the gate is vacuous — wrong prefix, or the
 /// block missing from the document's block list — and must fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &["llm", "vector"];
+const LEGITIMATELY_EMPTY: &[&str] = &["vector"];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
@@ -249,6 +249,177 @@ async fn admin_openapi_publishes_no_credential_field() {
                  credential pattern `{forbidden}`"
             );
         }
+    }
+}
+
+/// `llm` declared 18 endpoints and zero schemas: every handler deserialized
+/// into a private in-function struct and answered with a `serde_json::json!`
+/// literal, so `has_schema()` filtered all of them out. The thirteen JSON
+/// endpoints below are the ones that carry a contract; the five HTML pages
+/// must stay absent, because a schema is what turns an endpoint into a tool.
+#[tokio::test]
+async fn llm_json_api_appears_in_openapi_and_its_pages_do_not() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    for (method, path) in [
+        ("post", "/b/llm/api/chat"),
+        ("post", "/b/llm/api/chat/stream"),
+        ("get", "/b/llm/api/providers"),
+        ("post", "/b/llm/api/providers"),
+        ("patch", "/b/llm/api/providers/{id}"),
+        ("delete", "/b/llm/api/providers/{id}"),
+        ("post", "/b/llm/api/providers/{id}/discover-models"),
+        ("get", "/b/llm/api/models"),
+        ("get", "/b/llm/api/models/{backend_id}/{model_id}/status"),
+        ("post", "/b/llm/api/models/{backend_id}/{model_id}/load"),
+        ("post", "/b/llm/api/models/{backend_id}/{model_id}/unload"),
+        ("get", "/b/llm/api/config"),
+        ("post", "/b/llm/api/config"),
+    ] {
+        assert!(
+            !doc["paths"][path][method].is_null(),
+            "{method} {path} must carry a schema and appear in /openapi.json"
+        );
+        assert_eq!(
+            doc["paths"][path][method]["security"],
+            serde_json::json!([{ "bearerAuth": [] }]),
+            "{method} {path} is Authenticated or Admin and must carry a security requirement"
+        );
+    }
+
+    for path in [
+        "/b/llm/",
+        "/b/llm/threads/{id}",
+        "/b/llm/settings",
+        "/b/llm/providers",
+        "/b/llm/models",
+    ] {
+        assert!(
+            doc["paths"][path].is_null(),
+            "{path} serves HTML and must carry no schema - a schema would make it \
+             a callable tool"
+        );
+    }
+
+    // The two SSE endpoints answer with `text/event-stream`, one frame per
+    // `ChatChunk` / `LoadProgress`. An `application/json` response schema
+    // there would describe a body that is never sent, so they carry their
+    // request/path contract only.
+    for (method, path) in [
+        ("post", "/b/llm/api/chat/stream"),
+        ("post", "/b/llm/api/models/{backend_id}/{model_id}/load"),
+    ] {
+        assert!(
+            doc["paths"][path][method]["responses"]["200"]["content"].is_null(),
+            "{method} {path} streams SSE and must not publish a JSON response schema"
+        );
+    }
+    assert!(
+        !doc["paths"]["/b/llm/api/chat/stream"]["post"]["requestBody"].is_null(),
+        "the streaming chat endpoint takes the same body as the buffered one and must say so"
+    );
+
+    // Both chat endpoints deserialize the same struct, so they must publish
+    // the same request schema; a divergence would mean one of them stopped
+    // going through the shared prelude.
+    assert_eq!(
+        doc["paths"]["/b/llm/api/chat"]["post"]["requestBody"],
+        doc["paths"]["/b/llm/api/chat/stream"]["post"]["requestBody"],
+        "chat and chat/stream must publish one request contract"
+    );
+
+    // The three provider writes publish the list's row projection, so a
+    // consumer reading one provider from any of them can rely on one shape.
+    let list_row = &doc["paths"]["/b/llm/api/providers"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["providers"]["items"];
+    assert!(
+        !list_row["properties"].is_null(),
+        "the provider list must publish a row projection: {doc}"
+    );
+    for (method, path) in [
+        ("post", "/b/llm/api/providers"),
+        ("patch", "/b/llm/api/providers/{id}"),
+    ] {
+        let written = &doc["paths"][path][method]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            written["properties"], list_row["properties"],
+            "{method} {path} must publish the same row projection as the list"
+        );
+        assert_eq!(
+            written["required"], list_row["required"],
+            "{method} {path} must publish the same row projection as the list"
+        );
+    }
+}
+
+/// Provider rows reference an API key by the *name* of the admin variable
+/// that holds it (`key_var`); the key itself is resolved into the in-memory
+/// router at reload time and lives on the very `ProviderConfig` the handlers
+/// hold. Every published field must therefore be an explicit projection, and
+/// this pins two things structurally:
+///
+/// 1. No published field name matches a credential pattern. `api_key` is the
+///    one this block could leak; the rest are the shared list.
+/// 2. `key_var` is the only `key`-bearing name, and it is a plain string (a
+///    variable *name*), never an object that could carry a value.
+#[tokio::test]
+async fn llm_openapi_publishes_no_credential_field() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let fields = published_field_names(&doc, &["/b/llm"]);
+
+    assert!(
+        !fields.is_empty(),
+        "no llm fields found - the walk is looking in the wrong place and this \
+         test would pass forever"
+    );
+
+    let mut saw_key_var = false;
+    for field in &fields {
+        let lower = field.to_lowercase();
+        for forbidden in [
+            "api_key",
+            "apikey",
+            "secret",
+            "password",
+            "hash",
+            "access_token",
+            "refresh_token",
+            "session_token",
+            "bearer",
+            "credential",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "llm publishes a field named `{field}`, which matches the \
+                 credential pattern `{forbidden}`"
+            );
+        }
+        if lower.contains("key") {
+            assert_eq!(
+                field, "key_var",
+                "the only key-bearing name llm may publish is `key_var`, the \
+                 admin variable *name*; got `{field}`"
+            );
+            saw_key_var = true;
+        }
+    }
+    assert!(
+        saw_key_var,
+        "`key_var` must be published (it is how an admin sees which variable a \
+         provider reads) - its absence means the walk missed the provider view"
+    );
+
+    for props in objects_with_property(&doc, &["/b/llm"], "responses", "key_var") {
+        assert_eq!(
+            props["key_var"]["type"],
+            serde_json::json!(["string", "null"]),
+            "`key_var` must stay a nullable string naming a variable, never a \
+             value-carrying object: {}",
+            props["key_var"]
+        );
     }
 }
 

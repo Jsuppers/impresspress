@@ -255,6 +255,24 @@ impl TestContext {
         ctx
     }
 
+    /// Build a `TestContext` with admin + llm migrations applied.
+    ///
+    /// Admin first so the `impresspress__admin__block_settings` tracking
+    /// table exists before llm's `apply_if_blessed` upserts its row (the
+    /// production ordering). llm's schema does not depend on auth, so auth
+    /// migrations are skipped.
+    #[cfg(feature = "block-llm")]
+    pub async fn with_llm() -> Self {
+        let ctx = Self::with_admin().await;
+        ctx.apply_block_migrations(
+            "impresspress/llm",
+            crate::blocks::llm::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::llm::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        ctx
+    }
+
     /// Build a `TestContext` with admin + products migrations applied.
     ///
     /// Admin migrations run first so the `impresspress__admin__block_settings`

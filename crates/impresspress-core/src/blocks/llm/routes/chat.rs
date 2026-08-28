@@ -20,7 +20,7 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::streaming::sse_chat_response;
 use crate::{
-    blocks::llm::{messages_create, messages_list, LlmBlock, DEFAULT_PROVIDER},
+    blocks::llm::{contracts, messages_create, messages_list, LlmBlock, DEFAULT_PROVIDER},
     http::{err_bad_request, err_internal, ok_json},
 };
 
@@ -28,14 +28,6 @@ use crate::{
 /// enabled provider from `impresspress__llm__providers` before the request
 /// reaches the `wafer-run/llm` service.
 const LEGACY_PROVIDER_BLOCK: &str = DEFAULT_PROVIDER;
-
-#[derive(serde::Deserialize)]
-struct ChatRequestBody {
-    thread_id: String,
-    message: String,
-    provider: Option<String>,
-    model: Option<String>,
-}
 
 /// Map a stored message-role string to a [`ChatRole`].
 ///
@@ -126,7 +118,7 @@ async fn dispatch_chat(
     input: InputStream,
 ) -> Result<DispatchOutcome, OutputStream> {
     let raw = input.collect_to_bytes().await;
-    let ChatRequestBody {
+    let contracts::ChatRequest {
         thread_id,
         message,
         provider,
@@ -257,12 +249,12 @@ pub(in crate::blocks::llm) async fn handle_chat(
         .unwrap_or("")
         .to_string();
 
-    ok_json(&serde_json::json!({
-        "content": content,
-        "message_id": message_id,
-        "model": model_used,
-        "truncated": truncated,
-    }))
+    ok_json(&contracts::ChatResponse {
+        content,
+        message_id,
+        model: model_used,
+        truncated,
+    })
 }
 
 /// SSE streaming chat handler: forwards each `ChatChunk` (as its JSON
@@ -300,6 +292,67 @@ mod tests {
 
     use super::*;
     use crate::blocks::llm::routes::test_support::{stub_block, PanicCtx};
+
+    /// The buffered reply is the contract's four fields and nothing else.
+    /// `message_id` stays present (empty) when persistence is skipped — here
+    /// no messages block is registered — because the schema says it is
+    /// always there.
+    #[tokio::test]
+    async fn handle_chat_publishes_exactly_the_contract_fields() {
+        use std::sync::Arc;
+
+        use wafer_core::clients::llm::FinishReason;
+
+        use crate::{
+            blocks::llm::{
+                routes::test_support::StubLlmServiceBlock, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
+            },
+            test_support::{output_json, TestContext},
+        };
+
+        let mut ctx = TestContext::with_llm().await;
+        ctx.set_config(DEFAULT_PROVIDER_VAR, "stub-backend");
+        ctx.set_config(DEFAULT_MODEL_VAR, "stub-model");
+        ctx.register_block(
+            "wafer-run/llm",
+            Arc::new(StubLlmServiceBlock {
+                chat_chunks: vec![
+                    ChatChunk::text("Hel"),
+                    ChatChunk::text("lo"),
+                    ChatChunk::finish(FinishReason::Stop, None),
+                ],
+                ..Default::default()
+            }),
+        );
+
+        let body = output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &Message::new("create:/b/llm/api/chat"),
+                InputStream::from_bytes(br#"{"thread_id":"t1","message":"hi"}"#.to_vec()),
+            )
+            .await,
+        )
+        .await;
+
+        let mut got: Vec<&str> = body
+            .as_object()
+            .expect("chat response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            ["content", "message_id", "model", "truncated"],
+            "the wire field set must equal ChatResponse's"
+        );
+        assert_eq!(body["content"], "Hello");
+        assert_eq!(body["model"], "stub-model");
+        assert_eq!(body["truncated"], false);
+        assert_eq!(body["message_id"], "");
+    }
 
     #[tokio::test]
     async fn handle_chat_returns_bad_request_on_invalid_json() {

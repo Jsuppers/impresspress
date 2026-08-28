@@ -9,8 +9,12 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
     blocks::llm::{
+        contracts::{
+            CreateProviderRequest, DiscoveredModelsResponse, ProviderDeleteResponse,
+            ProviderListResponse, ProviderView, UpdateProviderRequest,
+        },
         provider_admin::ProviderAdmin,
-        providers::config::{ProviderConfig, ProviderProtocol},
+        providers::config::ProviderConfig,
         schema::{config_to_row, row_to_config, TABLE as PROVIDERS_TABLE},
         LlmBlock,
     },
@@ -18,35 +22,8 @@ use crate::{
     util::path_param,
 };
 
-/// Body shape for `POST /b/llm/api/providers` and `PATCH /b/llm/api/providers/:id`.
-///
-/// Every field is optional so the same struct can serve both create (which
-/// validates required fields after parsing) and patch.
-#[derive(serde::Deserialize, Default)]
-struct ProviderBody {
-    name: Option<String>,
-    protocol: Option<String>,
-    endpoint: Option<String>,
-    key_var: Option<String>,
-    models: Option<Vec<String>>,
-    enabled: Option<bool>,
-}
-
 /// Path prefix preceding the provider id in the JSON API routes.
 const PROVIDERS_PREFIX: &str = "/b/llm/api/providers/";
-
-/// Render a `ProviderConfig` as the JSON shape returned by list/create/update.
-fn provider_to_json(id: &str, cfg: &ProviderConfig) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "name": cfg.name,
-        "protocol": cfg.protocol.as_str(),
-        "endpoint": cfg.endpoint,
-        "key_var": cfg.key_var,
-        "models": cfg.models,
-        "enabled": cfg.enabled,
-    })
-}
 
 /// Reload all enabled providers from the DB and push the snapshot into the
 /// in-memory provider router via [`ProviderAdmin::configure`].
@@ -127,19 +104,20 @@ pub(in crate::blocks::llm) async fn list_providers(
         Ok(r) => r,
         Err(e) => return err_internal("Database error", e),
     };
-    let providers: Vec<serde_json::Value> = records
+    let providers: Vec<ProviderView> = records
         .iter()
         .filter_map(|rec| {
             row_to_config(rec)
                 .ok()
-                .map(|cfg| provider_to_json(&rec.id, &cfg))
+                .map(|cfg| ProviderView::from_config(&rec.id, &cfg))
         })
         .collect();
-    ok_json(&serde_json::json!({ "providers": providers }))
+    ok_json(&ProviderListResponse { providers })
 }
 
-/// `POST /b/llm/api/providers` — create. Body must include `name`,
-/// `protocol`, `endpoint`. `key_var`, `models`, `enabled` optional. Admin-only.
+/// `POST /b/llm/api/providers` — create. The typed body requires `name`,
+/// `protocol` (one of the `ProviderProtocol` tokens) and `endpoint`;
+/// `key_var`, `models`, `enabled` are optional. Admin-only.
 pub(in crate::blocks::llm) async fn create_provider(
     block: &LlmBlock,
     ctx: &dyn Context,
@@ -147,43 +125,27 @@ pub(in crate::blocks::llm) async fn create_provider(
     input: InputStream,
 ) -> OutputStream {
     let raw = input.collect_to_bytes().await;
-    let body: ProviderBody = match serde_json::from_slice(&raw) {
+    let body: CreateProviderRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
-    let Some(name) = body
-        .name
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-    else {
+    // Presence is enforced by the type; emptiness still has to be, because
+    // `""` is a valid JSON string and neither a usable name nor a URL.
+    if body.name.is_empty() {
         return err_bad_request("`name` is required");
-    };
-    let Some(protocol_str) = body.protocol.as_deref().filter(|s| !s.is_empty()) else {
-        return err_bad_request("`protocol` is required");
-    };
-    let Some(protocol) = ProviderProtocol::parse(protocol_str) else {
-        return err_bad_request(&format!(
-            "invalid `protocol` `{protocol_str}` — expected `open_ai`, `anthropic`, or `open_ai_compatible`"
-        ));
-    };
-    let Some(endpoint) = body
-        .endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-    else {
+    }
+    if body.endpoint.is_empty() {
         return err_bad_request("`endpoint` is required");
-    };
+    }
     // SSRF: an admin must not be able to point a provider at internal infra.
     // Same gate the config `_URL` write surfaces use; the outbound client
     // re-checks at call time (resolve-before-connect), this fails fast on save.
-    if let Err(e) = crate::util::validate_url_value(&endpoint) {
+    if let Err(e) = crate::util::validate_url_value(&body.endpoint) {
         return err_bad_request(&format!("invalid `endpoint`: {e}"));
     }
 
-    let mut cfg = ProviderConfig::new(name, protocol, endpoint);
+    let mut cfg = ProviderConfig::new(body.name, body.protocol, body.endpoint);
     if let Some(k) = body.key_var.filter(|s| !s.is_empty()) {
         cfg.key_var = Some(k);
     }
@@ -206,7 +168,7 @@ pub(in crate::blocks::llm) async fn create_provider(
         return err_internal("reload_provider_service failed", e);
     }
 
-    ok_json(&provider_to_json(&record.id, &cfg))
+    ok_json(&ProviderView::from_config(&record.id, &cfg))
 }
 
 /// `PATCH /b/llm/api/providers/:id` — partial update. Admin-only.
@@ -222,7 +184,7 @@ pub(in crate::blocks::llm) async fn update_provider(
     }
 
     let raw = input.collect_to_bytes().await;
-    let body: ProviderBody = match serde_json::from_slice(&raw) {
+    let body: UpdateProviderRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -243,15 +205,8 @@ pub(in crate::blocks::llm) async fn update_provider(
     if let Some(n) = body.name.filter(|s| !s.is_empty()) {
         cfg.name = n;
     }
-    if let Some(p) = body.protocol.as_deref().filter(|s| !s.is_empty()) {
-        match ProviderProtocol::parse(p) {
-            Some(parsed) => cfg.protocol = parsed,
-            None => {
-                return err_bad_request(&format!(
-                    "invalid `protocol` `{p}` — expected `open_ai`, `anthropic`, or `open_ai_compatible`"
-                ))
-            }
-        }
+    if let Some(p) = body.protocol {
+        cfg.protocol = p;
     }
     if let Some(e) = body.endpoint.filter(|s| !s.is_empty()) {
         // SSRF: re-validate on edit (see create_provider) so an update can't
@@ -286,7 +241,7 @@ pub(in crate::blocks::llm) async fn update_provider(
         return err_internal("reload_provider_service failed", e);
     }
 
-    ok_json(&provider_to_json(&record.id, &cfg))
+    ok_json(&ProviderView::from_config(&record.id, &cfg))
 }
 
 /// `DELETE /b/llm/api/providers/:id` — remove. Admin-only.
@@ -311,7 +266,7 @@ pub(in crate::blocks::llm) async fn delete_provider(
         return err_internal("reload_provider_service failed", e);
     }
 
-    ok_json(&serde_json::json!({ "deleted": true }))
+    ok_json(&ProviderDeleteResponse { deleted: true })
 }
 
 /// `POST /b/llm/api/providers/:id/discover-models` — call the provider's
@@ -365,7 +320,7 @@ pub(in crate::blocks::llm) async fn discover_models(
         return err_internal("reload_provider_service failed", e);
     }
 
-    ok_json(&serde_json::json!({ "models": cfg.models }))
+    ok_json(&DiscoveredModelsResponse { models: cfg.models })
 }
 
 #[cfg(test)]
@@ -375,7 +330,13 @@ mod tests {
     use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
 
     use super::*;
-    use crate::blocks::llm::routes::test_support::{admin_msg, stub_block, PanicCtx};
+    use crate::{
+        blocks::llm::{
+            providers::config::ProviderProtocol,
+            routes::test_support::{admin_msg, stub_block, PanicCtx, RecordingProviderAdmin},
+        },
+        test_support::{output_json, TestContext},
+    };
 
     #[tokio::test]
     async fn create_provider_returns_bad_request_on_invalid_json() {
@@ -416,6 +377,9 @@ mod tests {
         }
     }
 
+    /// `protocol` is typed as the `ProviderProtocol` enum on the way in, so an
+    /// alias is refused by deserialization and the refusal names the accepted
+    /// values — which is what a caller who sent `openai` needs to see.
     #[tokio::test]
     async fn create_provider_rejects_unknown_protocol() {
         let block = stub_block();
@@ -429,7 +393,35 @@ mod tests {
         match out.collect_buffered().await {
             Err(TerminalNotResponse::Error(e)) => {
                 assert_eq!(e.code, ErrorCode::InvalidArgument);
-                assert!(e.message.contains("protocol"), "got: {}", e.message);
+                assert!(
+                    e.message.contains("open_ai_compatible"),
+                    "the refusal must name the accepted values, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// Same enum on the patch body: `""` is outside it and is refused before
+    /// any row is read. The untyped body used to treat an empty `protocol` as
+    /// "not provided" and silently apply the rest of the patch.
+    #[tokio::test]
+    async fn update_provider_rejects_an_empty_protocol() {
+        let block = stub_block();
+        let ctx = PanicCtx;
+        let msg = admin_msg("update", "/b/llm/api/providers/row-1");
+        let input = InputStream::from_bytes(br#"{"protocol":""}"#.to_vec());
+
+        let out = update_provider(&block, &ctx, &msg, input).await;
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument);
+                assert!(
+                    e.message.contains("open_ai_compatible"),
+                    "the refusal must name the accepted values, got: {}",
+                    e.message
+                );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
@@ -534,27 +526,221 @@ mod tests {
         assert_eq!(path_param(&m4, "id", PROVIDERS_PREFIX), "from-var");
     }
 
-    #[test]
-    fn provider_to_json_shape() {
-        let cfg = ProviderConfig::new(
-            "openai-main",
-            ProviderProtocol::OpenAi,
-            "https://api.openai.com/v1",
-        )
-        .with_key_var("IMPRESSPRESS__LLM__OPENAI_KEY")
-        .with_models(vec!["gpt-4o".into()]);
-        let v = provider_to_json("row-1", &cfg);
-        assert_eq!(v["id"], "row-1");
-        assert_eq!(v["name"], "openai-main");
-        assert_eq!(v["protocol"], "open_ai");
-        assert_eq!(v["endpoint"], "https://api.openai.com/v1");
-        assert_eq!(v["key_var"], "IMPRESSPRESS__LLM__OPENAI_KEY");
-        assert_eq!(v["models"], serde_json::json!(["gpt-4o"]));
-        assert_eq!(v["enabled"], true);
-        assert!(
-            v.get("api_key").is_none(),
-            "api_key must never appear in API output"
+    // -----------------------------------------------------------------
+    // Wire shape — what the published schema is derived from
+    // -----------------------------------------------------------------
+
+    const KEY_VAR: &str = "IMPRESSPRESS__LLM__TEST_OPENAI_KEY";
+
+    /// Shaped like a real key so a substring search over a response body is
+    /// a meaningful leak check rather than a match on a common word.
+    const SECRET: &str = "sk-live-0123456789abcdefABCDEF";
+
+    /// A block over the recording provider-admin handle, on a context where
+    /// `KEY_VAR` resolves to `SECRET`. The handle is returned separately so
+    /// a test can read back what the reload resolved into it.
+    async fn keyed_fixture() -> (TestContext, Arc<RecordingProviderAdmin>, LlmBlock) {
+        let mut ctx = TestContext::with_llm().await;
+        ctx.set_config(KEY_VAR, SECRET);
+        let admin = Arc::new(RecordingProviderAdmin::default());
+        let block = LlmBlock::new(admin.clone());
+        (ctx, admin, block)
+    }
+
+    fn json_input(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(serde_json::to_vec(&value).expect("serialize body"))
+    }
+
+    fn create_body() -> InputStream {
+        json_input(serde_json::json!({
+            "name": "openai-main",
+            "protocol": "open_ai",
+            "endpoint": "https://api.openai.com/v1",
+            "key_var": KEY_VAR,
+            "models": ["gpt-4o"],
+        }))
+    }
+
+    /// The field set a provider row publishes, on every endpoint that returns
+    /// one. This is the assertion the `/openapi.json` schema rests on.
+    fn assert_provider_view(label: &str, row: &serde_json::Value) {
+        let mut got: Vec<&str> = row
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: expected an object, got {row}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            ["enabled", "endpoint", "id", "key_var", "models", "name", "protocol"],
+            "{label}: the wire field set must equal ProviderView's, or the published \
+             schema describes something the handler does not emit"
         );
+    }
+
+    /// The resolved key sits on the very `ProviderConfig`s the handlers hold
+    /// (`block.provider_admin`), one field away from every response. No
+    /// endpoint may carry it, or an `api_key` field of any kind.
+    #[tokio::test]
+    async fn provider_endpoints_never_emit_the_resolved_api_key() {
+        let (ctx, admin, block) = keyed_fixture().await;
+
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+
+        // Control: after the create's reload the secret is on the handle the
+        // handlers read. Without this the assertions below could pass because
+        // nothing was ever within reach.
+        assert_eq!(
+            admin
+                .providers_snapshot()
+                .first()
+                .and_then(|p| p.api_key.as_deref()),
+            Some(SECRET),
+            "fixture must resolve the key into the handlers' provider handle"
+        );
+
+        let listed = output_json(
+            list_providers(&block, &ctx, &admin_msg("retrieve", "/b/llm/api/providers")).await,
+        )
+        .await;
+        let updated = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &admin_msg("update", &format!("/b/llm/api/providers/{id}")),
+                json_input(serde_json::json!({ "models": ["gpt-4o-mini"] })),
+            )
+            .await,
+        )
+        .await;
+        let discovered = output_json(
+            discover_models(
+                &block,
+                &ctx,
+                &admin_msg(
+                    "create",
+                    &format!("/b/llm/api/providers/{id}/discover-models"),
+                ),
+            )
+            .await,
+        )
+        .await;
+
+        for (label, body) in [
+            ("create", &created),
+            ("list", &listed),
+            ("update", &updated),
+            ("discover-models", &discovered),
+        ] {
+            let raw = body.to_string();
+            assert!(
+                !raw.contains(SECRET),
+                "{label} leaked the resolved key: {raw}"
+            );
+            assert!(
+                !raw.to_lowercase().contains("api_key"),
+                "{label} published an api_key field: {raw}"
+            );
+        }
+    }
+
+    /// Every provider endpoint publishes the one row projection, and the
+    /// acknowledgement shapes are exactly what their schemas say.
+    #[tokio::test]
+    async fn provider_endpoints_publish_exactly_the_view_fields() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        assert_provider_view("create", &created);
+        assert_eq!(created["name"], "openai-main");
+        assert_eq!(created["protocol"], "open_ai");
+        assert_eq!(created["endpoint"], "https://api.openai.com/v1");
+        assert_eq!(created["key_var"], KEY_VAR);
+        assert_eq!(created["models"], serde_json::json!(["gpt-4o"]));
+        assert_eq!(created["enabled"], true);
+        let id = created["id"].as_str().expect("created id").to_string();
+
+        let listed = output_json(
+            list_providers(&block, &ctx, &admin_msg("retrieve", "/b/llm/api/providers")).await,
+        )
+        .await;
+        let rows = listed["providers"].as_array().expect("providers array");
+        assert_eq!(rows.len(), 1);
+        assert_provider_view("list", &rows[0]);
+        assert_eq!(
+            rows[0], created,
+            "list must publish the row the create returned"
+        );
+
+        let updated = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &admin_msg("update", &format!("/b/llm/api/providers/{id}")),
+                json_input(serde_json::json!({
+                    "models": ["gpt-4o-mini"],
+                    "enabled": false,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_provider_view("update", &updated);
+        assert_eq!(updated["id"], id);
+        assert_eq!(updated["models"], serde_json::json!(["gpt-4o-mini"]));
+        assert_eq!(updated["enabled"], false);
+        assert_eq!(
+            updated["key_var"], KEY_VAR,
+            "fields absent from the patch are retained"
+        );
+
+        let discovered = output_json(
+            discover_models(
+                &block,
+                &ctx,
+                &admin_msg(
+                    "create",
+                    &format!("/b/llm/api/providers/{id}/discover-models"),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            discovered,
+            serde_json::json!({ "models": ["gpt-4o", "gpt-4o-mini"] })
+        );
+
+        let deleted = output_json(
+            delete_provider(
+                &block,
+                &ctx,
+                &admin_msg("delete", &format!("/b/llm/api/providers/{id}")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted, serde_json::json!({ "deleted": true }));
     }
 
     // -----------------------------------------------------------------
@@ -571,8 +757,6 @@ mod tests {
             interfaces::config::service::ConfigService,
             service_blocks::config::{ConfigBlock, EnvConfigService},
         };
-
-        use crate::test_support::TestContext;
 
         let mut ctx = TestContext::with_admin().await;
         {

@@ -1,3 +1,4 @@
+pub mod contracts;
 pub mod migrations;
 pub mod pages;
 pub mod provider_admin;
@@ -311,24 +312,22 @@ impl LlmBlock {
         let default_provider =
             config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
         let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
-        ok_json(&serde_json::json!({
-            "default_provider": default_provider,
-            "default_model": default_model,
-        }))
+        ok_json(&contracts::LlmConfigResponse {
+            default_provider,
+            default_model,
+        })
     }
 
+    /// `POST /b/llm/api/config`. Three outcomes, two of them successful:
+    /// a `thread_id` creates or updates that thread's override and returns
+    /// the row as [`contracts::ThreadOverrideView`]; a body naming a global
+    /// default is refused (those come from the environment); anything else
+    /// is acknowledged without a write.
     async fn handle_post_config(&self, ctx: &dyn Context, input: InputStream) -> OutputStream {
-        #[derive(serde::Deserialize)]
-        struct ConfigUpdate {
-            thread_id: Option<String>,
-            default_provider: Option<String>,
-            default_model: Option<String>,
-            provider_block: Option<String>,
-            model: Option<String>,
-        }
+        use contracts::{ConfigAcknowledgement, ConfigUpdateResponse, ThreadOverrideView};
 
         let raw = input.collect_to_bytes().await;
-        let body: ConfigUpdate = match serde_json::from_slice(&raw) {
+        let body: contracts::ConfigUpdateRequest = match serde_json::from_slice(&raw) {
             Ok(b) => b,
             Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
         };
@@ -349,7 +348,11 @@ impl LlmBlock {
                 }
                 crate::util::stamp_updated(&mut data);
                 match db::update(ctx, SETTINGS_TABLE, &record.id, data).await {
-                    Ok(r) => return ok_json(&r),
+                    Ok(r) => {
+                        return ok_json(&ConfigUpdateResponse::Override(
+                            ThreadOverrideView::from_record(&r),
+                        ))
+                    }
                     Err(e) => return err_internal("Database error", e),
                 }
             } else {
@@ -361,7 +364,11 @@ impl LlmBlock {
                 }));
                 crate::util::stamp_created(&mut data);
                 match db::create(ctx, SETTINGS_TABLE, data).await {
-                    Ok(r) => return ok_json(&r),
+                    Ok(r) => {
+                        return ok_json(&ConfigUpdateResponse::Override(
+                            ThreadOverrideView::from_record(&r),
+                        ))
+                    }
                     Err(e) => return err_internal("Database error", e),
                 }
             }
@@ -375,7 +382,9 @@ impl LlmBlock {
             );
         }
 
-        ok_json(&serde_json::json!({"updated": true}))
+        ok_json(&ConfigUpdateResponse::Acknowledged(ConfigAcknowledgement {
+            updated: true,
+        }))
     }
 
     // Models aggregation now lives in `routes::list_models`, sourcing data
@@ -386,6 +395,47 @@ impl LlmBlock {
 // ---------------------------------------------------------------------------
 // Block trait implementation
 // ---------------------------------------------------------------------------
+
+/// Path-parameter schema for the `/b/llm/api/providers/{id}…` routes.
+///
+/// Hand-written rather than derived: every handler reads the id with
+/// `path_param(msg, "id", ..)` by name, so a struct declared only to feed
+/// `.path_params::<T>()` would have no runtime user (the `tickets` /
+/// `messages` precedent).
+fn provider_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Provider row id, as returned by `GET /b/llm/api/providers`."
+            }
+        }
+    })
+}
+
+/// Path-parameter schema for the `/b/llm/api/models/{backend_id}/{model_id}…`
+/// routes. Hand-written for the same reason as [`provider_id_path_schema`]:
+/// `routes::models::extract_model_path` reads both by name.
+fn model_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["backend_id", "model_id"],
+        "properties": {
+            "backend_id": {
+                "type": "string",
+                "description": "Backend (provider name) hosting the model, as listed by `GET /b/llm/api/models`."
+            },
+            "model_id": {
+                "type": "string",
+                "description": "Model id within that backend."
+            }
+        }
+    })
+}
 
 #[wafer_block::wafer_async_trait]
 impl Block for LlmBlock {
@@ -418,43 +468,74 @@ impl Block for LlmBlock {
         .endpoints(vec![
             BlockEndpoint::post("/b/llm/api/chat")
                 .summary("Send a chat message")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::ChatRequest>()
+                .output::<contracts::ChatResponse>(),
+            // Same request as `/api/chat`; the response is
+            // `text/event-stream` — one `data:` frame per `ChatChunk`, then
+            // `data: [DONE]` (or `event: error`). No `.output::<T>()`: it
+            // would publish an `application/json` schema for a body this
+            // endpoint never sends, and the frame type is wafer-run's
+            // `ChatChunk`, which carries no JsonSchema derive to mirror.
             BlockEndpoint::post("/b/llm/api/chat/stream")
                 .summary("Send a chat message (SSE streaming)")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::ChatRequest>(),
             BlockEndpoint::get("/b/llm/api/providers")
                 .summary("List configured LLM providers")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .output::<contracts::ProviderListResponse>(),
             BlockEndpoint::post("/b/llm/api/providers")
                 .summary("Create LLM provider")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .input::<contracts::CreateProviderRequest>()
+                .output::<contracts::ProviderView>(),
             BlockEndpoint::patch("/b/llm/api/providers/{id}")
                 .summary("Update LLM provider")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .path_params_schema(provider_id_path_schema())
+                .input::<contracts::UpdateProviderRequest>()
+                .output::<contracts::ProviderView>(),
             BlockEndpoint::delete("/b/llm/api/providers/{id}")
                 .summary("Delete LLM provider")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .path_params_schema(provider_id_path_schema())
+                .output::<contracts::ProviderDeleteResponse>(),
             BlockEndpoint::post("/b/llm/api/providers/{id}/discover-models")
                 .summary("Discover provider models via /v1/models")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .path_params_schema(provider_id_path_schema())
+                .output::<contracts::DiscoveredModelsResponse>(),
             BlockEndpoint::get("/b/llm/api/models")
                 .summary("List available models (aggregated across backends)")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .output::<contracts::ModelListResponse>(),
             BlockEndpoint::get("/b/llm/api/models/{backend_id}/{model_id}/status")
                 .summary("Model status (ready / loading / unloaded)")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .path_params_schema(model_path_schema())
+                .output::<contracts::ModelStatusResponse>(),
+            // Takes no body; answers `text/event-stream`, one `data:` frame
+            // per `LoadProgress`, then `data: [DONE]`. No `.output::<T>()`
+            // for the same reason as `/api/chat/stream`.
             BlockEndpoint::post("/b/llm/api/models/{backend_id}/{model_id}/load")
                 .summary("Load a model (SSE progress)")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .path_params_schema(model_path_schema()),
             BlockEndpoint::post("/b/llm/api/models/{backend_id}/{model_id}/unload")
                 .summary("Unload a model")
-                .auth(AuthLevel::Admin),
+                .auth(AuthLevel::Admin)
+                .path_params_schema(model_path_schema())
+                .output::<contracts::ModelUnloadResponse>(),
             BlockEndpoint::get("/b/llm/api/config")
                 .summary("Get default provider/model config")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .output::<contracts::LlmConfigResponse>(),
             BlockEndpoint::post("/b/llm/api/config")
                 .summary("Update per-thread provider/model override")
-                .auth(AuthLevel::Authenticated),
+                .auth(AuthLevel::Authenticated)
+                .input::<contracts::ConfigUpdateRequest>()
+                .output::<contracts::ConfigUpdateResponse>(),
             // Chat UI is reached from the ADMIN sidebar (nav_groups::admin
             // "Communication" group); the pre-refactor `handle()` gated every
             // non-API page on `is_admin`, so the chat UI was admin-only in
@@ -574,5 +655,176 @@ impl Block for LlmBlock {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use std::sync::Arc;
+
+    use wafer_run::{streams::output::TerminalNotResponse, ErrorCode, InputStream};
+
+    use super::*;
+    use crate::test_support::{output_json, TestContext};
+
+    fn block() -> LlmBlock {
+        LlmBlock::new(Arc::new(provider_admin::NoopProviderAdmin))
+    }
+
+    fn body(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(serde_json::to_vec(&value).expect("serialize body"))
+    }
+
+    fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap_or_else(|| panic!("expected an object, got {value}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    const OVERRIDE_FIELDS: [&str; 6] = [
+        "created_at",
+        "id",
+        "model",
+        "provider_block",
+        "thread_id",
+        "updated_at",
+    ];
+
+    /// The override row is published as a flat view, not the database
+    /// layer's `{id, data: {…}}` envelope the untyped handler echoed.
+    #[tokio::test]
+    async fn post_config_creates_a_flat_thread_override_view() {
+        let ctx = TestContext::with_llm().await;
+
+        let out = output_json(
+            block()
+                .handle_post_config(
+                    &ctx,
+                    body(serde_json::json!({
+                        "thread_id": "t1",
+                        "provider_block": "openai-main",
+                        "model": "gpt-4o",
+                    })),
+                )
+                .await,
+        )
+        .await;
+
+        assert_eq!(
+            sorted_keys(&out),
+            OVERRIDE_FIELDS,
+            "the wire field set must equal ThreadOverrideView's; a `data` key means \
+             the raw row is being echoed again"
+        );
+        assert_eq!(out["thread_id"], "t1");
+        assert_eq!(out["provider_block"], "openai-main");
+        assert_eq!(out["model"], "gpt-4o");
+        assert!(
+            out["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "the row id must be published so the settings page can address it"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_config_updates_the_existing_override_in_place() {
+        let ctx = TestContext::with_llm().await;
+
+        let first = output_json(
+            block()
+                .handle_post_config(
+                    &ctx,
+                    body(serde_json::json!({
+                        "thread_id": "t1",
+                        "provider_block": "openai-main",
+                        "model": "gpt-4o",
+                    })),
+                )
+                .await,
+        )
+        .await;
+        let second = output_json(
+            block()
+                .handle_post_config(
+                    &ctx,
+                    body(serde_json::json!({ "thread_id": "t1", "model": "gpt-4o-mini" })),
+                )
+                .await,
+        )
+        .await;
+
+        assert_eq!(sorted_keys(&second), OVERRIDE_FIELDS);
+        assert_eq!(
+            second["id"], first["id"],
+            "a second write updates the same row"
+        );
+        assert_eq!(
+            second["provider_block"], "openai-main",
+            "fields absent from the request are retained"
+        );
+        assert_eq!(second["model"], "gpt-4o-mini");
+    }
+
+    /// Without `thread_id` there is nothing to write: the handler
+    /// acknowledges and changes nothing. Pinned because the response schema
+    /// publishes this branch alongside the override view.
+    #[tokio::test]
+    async fn post_config_without_a_thread_only_acknowledges() {
+        let ctx = TestContext::with_llm().await;
+
+        let out = output_json(
+            block()
+                .handle_post_config(&ctx, body(serde_json::json!({ "model": "gpt-4o" })))
+                .await,
+        )
+        .await;
+
+        assert_eq!(out, serde_json::json!({ "updated": true }));
+        let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+            .await
+            .expect("list overrides");
+        assert!(
+            rows.is_empty(),
+            "an acknowledgement must not have written an override"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_config_refuses_global_defaults() {
+        let ctx = TestContext::with_llm().await;
+
+        let out = block()
+            .handle_post_config(&ctx, body(serde_json::json!({ "default_model": "gpt-4o" })))
+            .await;
+
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument);
+                assert!(
+                    e.message.contains(DEFAULT_MODEL_VAR),
+                    "the refusal must point at the variable to set instead, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_config_publishes_the_defaults() {
+        let mut ctx = TestContext::with_llm().await;
+        ctx.set_config(DEFAULT_PROVIDER_VAR, "openai-main");
+        ctx.set_config(DEFAULT_MODEL_VAR, "gpt-4o");
+
+        let out = output_json(block().handle_get_config(&ctx).await).await;
+
+        assert_eq!(
+            out,
+            serde_json::json!({ "default_provider": "openai-main", "default_model": "gpt-4o" })
+        );
     }
 }
