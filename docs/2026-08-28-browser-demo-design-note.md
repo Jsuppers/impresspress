@@ -78,14 +78,35 @@ deployed". A demo needs a new consumer crate pulling `impresspress-core` with
 `block-products` and `block-admin`, built for wasm32 and bundled. Same shape as
 `examples/webmcp-demo` (the Cloudflare consumer), so this is known work.
 
-### Nothing serves a shop at `/`
+### (Corrected) A shop at `/` already works — it is just not the default
+
+This was first written here as a gap. It is not one, and the correction matters
+because it changes what the future work is actually *for*.
 
 `routing.rs` sends the root to `/b/auth/login` unless
-`WAFER_RUN_SHARED__HAS_LANDING_PAGE=true`, which instead serves static files
-from storage. impresspress deliberately does not ship a customer-facing
-storefront page — the model is "you bring the site, we own pricing and
-checkout". A demo has to bring one, and it should list products via the
-catalog, which `list_products` (#81) now also exposes to agents.
+`WAFER_RUN_SHARED__HAS_LANDING_PAGE=true`, in which case `wafer-run/web` serves
+static files from the `site` storage folder (on native,
+`<cwd>/data/storage/wafer-run/web/site/`). Setting that variable and dropping in
+one `index.html` that fetches `/b/products/catalog` and mounts an
+`<impresspress-product>` per row gives a working storefront at `/` today —
+verified 2026-08-28 against the local server: four products, four live
+configurators.
+
+Serving it from impresspress rather than a separate origin also removes the CORS
+problem in the next section entirely, and the session cookie rides along, so an
+`/b/admin/` link in the page header works for a signed-in admin.
+
+So impresspress deliberately does not ship a customer-facing storefront page —
+the model is "you bring the site, we own pricing and checkout" — and bringing
+one is genuinely cheap. What the two design notes add on top is different:
+
+- **the pages block** (`2026-08-28-pages-block-design-note.md`) makes that
+  storefront *managed* — sections in the database, editable from the admin
+  panel or by an agent, instead of a hand-written file someone uploads;
+- **this note** removes the server underneath it.
+
+Neither is required to have a shop at `/`. They are required to have one that
+can be edited without a deploy, and one that runs with nothing behind it.
 
 ### There is no cart
 
@@ -171,7 +192,8 @@ Prove the one unproven thing before building a demo on top of it:
    reload, the whole idea is viable; if not, everything below is moot.
 2. Browser consumer crate + bundle, measured for wasm size.
 3. A landing page listing products from the catalog, with the widget for buy
-   flows.
+   flows. Cheap — the native equivalent already works (§3), and the same page
+   should serve from the SW build unchanged.
 4. Then decide on search (§4) and cart (§3) as separate calls.
 
 Steps 1 and 2 are the ones that retire risk. Everything after is ordinary work.
