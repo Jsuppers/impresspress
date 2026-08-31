@@ -99,9 +99,15 @@ Semantics, following the rules #323 and #324 already established:
   will not publish a lie about it"; they are logged and counted per manifest. A
   capability miss is a normal per-caller outcome. Counting it would rebuild the
   existence oracle #324 closed.
-- Capability names are validated at boot beside tool names, and `seal()` fails
-  the boot on a capability no block declares — the same net that catches
-  duplicate tool names.
+- Capability **name format** is validated at boot beside tool names, in
+  wafer-run.
+- Whether a capability is **grantable** is checked in impresspress, not
+  wafer-run. Only the host knows what it can grant — it owns the session
+  table and the resolver — so a `seal()`-style check in the producer would
+  need a registry the producer cannot populate. impresspress asserts at boot
+  that every capability any block gates a tool on is one a session can issue.
+  A typo therefore fails closed twice over: the tool is invisible, and the
+  boot check names it.
 
 **Rejected: gating on the existing `tags` field.** It needs no wafer-run change,
 and that is its only merit. It makes a security decision turn on a free-form
