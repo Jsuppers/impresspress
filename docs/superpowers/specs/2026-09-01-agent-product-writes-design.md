@@ -173,6 +173,21 @@ Soft delete needs a door out or it is a data graveyard, so this layer also adds
 a deleted view and a restore action to the admin product list. That is part of
 the fix, not a follow-up.
 
+**Soft delete cannot land partially.** `handle_catalog` filters only
+`status = 'active'` (`catalog.rs:25-29`), and the single-product route checks
+only `status` (`catalog.rs:67`). That is harmless while delete is hard, because
+no row is ever soft-deleted. The moment `deleted_at` starts being written, a
+soft-deleted product that was `active` stays in the public catalog and remains
+purchasable. Routing the catalog through `repo::products` is therefore not
+cleanup to be deferred — it is part of the same change as the first write of
+`deleted_at`, and the gate test is what enforces that no read is left behind.
+
+Checkout is already correct: `commerce.rs:200-203` gates on `deleted_at`,
+`status == "active"` and `approval_status == "approved"` together. That is
+further evidence the soft-delete convention was intended, and it means
+`archive_product` genuinely stops new purchases rather than merely hiding the
+product.
+
 ### 4. The agent write surface
 
 The write tools point at new `/b/products/agent/*` routes, **not** the existing
@@ -214,6 +229,22 @@ session carrying `products:edit`. Neither check can be satisfied by the other.
 
 There is deliberately no `publish_product`. Publishing is the human half, and it
 is what makes every other verb safe.
+
+**"Forced to draft" means the field does not exist, not that it defaults.**
+`CreateProductRequest` carries `status: Option<ProductStatus>`
+(`contracts.rs:1695`), and `handle_create_product` applies its defaults with
+`data.entry(key).or_insert(value)` (`product.rs:158`) — which fills the column
+only when the caller omitted it. That is correct for a human admin, who may
+legitimately create a product already active. An agent route that reused that
+contract would silently inherit the escape hatch and could publish straight to
+customers, with every schema still true and the safety claim false.
+
+So `AgentProductDraftRequest` is its own type with **no `status` field at all**,
+and the agent handler sets the column unconditionally rather than through
+`or_insert`. `AgentProductDraftRequest` must not be an alias, a `#[serde(flatten)]`
+wrapper, or a `From` of `CreateProductRequest`. A test asserts the published
+input schema names no `status`, and a second asserts that a request smuggling
+`status: "active"` still produces a draft row.
 
 Contracts (`AgentProductDraftRequest`, `AgentProductView`) are typed and enter
 the per-block `/openapi.json` snapshot gate like the rest of the derive
@@ -290,6 +321,10 @@ snapshots. Never regenerate a snapshot to get green; every changed line is read.
   publishes it;
 - a deleted product disappears from the catalog and its order history still
   resolves.
+- a soft-deleted product that was `active` is absent from both the catalog
+  list and the single-product route, not merely from checkout;
+- `create_product_draft` sent `status: "active"` in its body still writes a
+  draft row, and the published input schema names no `status` field.
 
 **Coordination.** `webmcp.spec.ts` asserts exact tool sets in three places
 (`:198`, `:304`, `:329`), where merge debt between #76 and #81 is already
