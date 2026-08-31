@@ -8,18 +8,21 @@
 //! partial unique slug index in 005 is defined on `deleted_at IS NULL`, but
 //! before this module nothing ever wrote the column and the public catalog
 //! filtered on `status` alone.
+//!
+//! Every function here returns `Result<_, WaferError>` — no `OutputStream`,
+//! no `err_internal`/`err_not_found`. HTTP-response construction (and every
+//! other call-site policy: authz, logging, Stripe-retry) stays at the call
+//! site, per the convention documented just above `mod products;` in
+//! `repo/mod.rs`.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database::{self as db, Record, RecordList};
-use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
+use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::{
-    http::{err_internal, err_not_found},
-    util::RecordExt,
-};
+use crate::util::RecordExt;
 
 pub(crate) const TABLE: &str = "impresspress__products__products";
 
@@ -52,7 +55,7 @@ pub(crate) async fn list_page(
     page_size: i64,
     mut filters: Vec<Filter>,
     sort: Option<Vec<SortField>>,
-) -> Result<RecordList, OutputStream> {
+) -> Result<RecordList, WaferError> {
     filters.push(live_filter());
     let sort = sort.unwrap_or_else(|| {
         vec![SortField {
@@ -60,9 +63,7 @@ pub(crate) async fn list_page(
             desc: true,
         }]
     });
-    db::paginated_list(ctx, TABLE, page, page_size, filters, sort)
-        .await
-        .map_err(|e| err_internal("Database error", e))
+    db::paginated_list(ctx, TABLE, page, page_size, filters, sort).await
 }
 
 /// Count live products matching `filters`.
@@ -72,25 +73,24 @@ pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, 
     db::count(ctx, TABLE, &all).await
 }
 
+// `created_at`/`updated_at` are not stamped here: the database service's
+// `DbExec::create`/`update` default impl (shared by every backend) already
+// fills in whichever of the two the caller didn't supply — see
+// `create_stamps_created_and_updated_at` / `update_stamps_a_new_updated_at`
+// below, which pin that behaviour from this module's side of the call.
 pub(crate) async fn create(
     ctx: &dyn Context,
     data: HashMap<String, Value>,
-) -> Result<Record, OutputStream> {
-    db::create(ctx, TABLE, data)
-        .await
-        .map_err(|e| err_internal("Database error", e))
+) -> Result<Record, WaferError> {
+    db::create(ctx, TABLE, data).await
 }
 
 pub(crate) async fn update(
     ctx: &dyn Context,
     id: &str,
     data: HashMap<String, Value>,
-) -> Result<Record, OutputStream> {
-    match db::update(ctx, TABLE, id, data).await {
-        Ok(record) => Ok(record),
-        Err(e) if e.code == ErrorCode::NotFound => Err(err_not_found("Product not found")),
-        Err(e) => Err(err_internal("Database error", e)),
-    }
+) -> Result<Record, WaferError> {
+    db::update(ctx, TABLE, id, data).await
 }
 
 /// Hard-delete a row. Reserved for rolling back a product that failed
@@ -100,15 +100,19 @@ pub(crate) async fn purge(ctx: &dyn Context, id: &str) -> Result<(), WaferError>
     db::delete(ctx, TABLE, id).await
 }
 
-// The DB layer maps a NULL text column to the empty string on read, so a
-// live row is either absent or empty here — checking both keeps this correct
-// on SQLite/D1 and Postgres alike.
+// `RecordExt::str_field` (util.rs) collapses both a missing key and a JSON
+// `Null` value to `""`. A live row's `deleted_at` decodes to exactly one of
+// those on either backend (SQLite and Postgres both store SQL NULL for an
+// unset column and both round-trip it to `Value::Null`), so checking
+// "empty" here is correct on both without a backend-specific branch.
 fn is_deleted(record: &Record) -> bool {
     !record.str_field("deleted_at").is_empty()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::*;
@@ -147,14 +151,7 @@ mod tests {
         let ctx = TestContext::with_products().await;
         seed(&ctx, "live", None).await;
         seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
-        // `list_page` returns `Result<_, OutputStream>` and `OutputStream`
-        // does not implement `Debug`, so `Result::expect` won't compile here;
-        // route through `Option::expect` (no `Debug` bound) instead. Same
-        // assertion, different plumbing.
-        let list = list_page(&ctx, 1, 50, vec![], None)
-            .await
-            .ok()
-            .expect("list");
+        let list = list_page(&ctx, 1, 50, vec![], None).await.expect("list");
         let ids: Vec<&str> = list.records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
     }
@@ -173,7 +170,6 @@ mod tests {
         };
         let list = list_page(&ctx, 1, 50, vec![status_active], None)
             .await
-            .ok()
             .expect("list");
         assert!(
             list.records.is_empty(),
@@ -187,5 +183,64 @@ mod tests {
         seed(&ctx, "live", None).await;
         seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
         assert_eq!(count(&ctx, &[]).await.expect("count"), 1);
+    }
+
+    // Pins the timestamp behaviour that `crud::crud_create` used to provide
+    // via `stamp_created` before call sites are migrated onto this module:
+    // dropping that helper must not silently drop the timestamps. The
+    // database service's own `DbExec::create` default impl fills in any of
+    // `created_at`/`updated_at` the caller omitted, so a bare `db::create`
+    // pass-through (no client-side stamping) still produces both.
+    #[tokio::test]
+    async fn create_stamps_created_and_updated_at() {
+        let ctx = TestContext::with_products().await;
+        let data = HashMap::from([
+            ("id".to_string(), json!("stamped")),
+            ("name".to_string(), json!("stamped")),
+            ("status".to_string(), json!("active")),
+        ]);
+        let record = create(&ctx, data).await.expect("create");
+        assert!(
+            !record.str_field("created_at").is_empty(),
+            "created_at must be stamped"
+        );
+        assert!(
+            !record.str_field("updated_at").is_empty(),
+            "updated_at must be stamped"
+        );
+    }
+
+    // Same rationale as `create_stamps_created_and_updated_at`, for the
+    // `stamp_updated` half: an update that doesn't set `updated_at` itself
+    // must still come back with a fresh one.
+    #[tokio::test]
+    async fn update_stamps_a_new_updated_at() {
+        let ctx = TestContext::with_products().await;
+        let data = HashMap::from([
+            ("id".to_string(), json!("stamped")),
+            ("name".to_string(), json!("stamped")),
+            ("status".to_string(), json!("active")),
+        ]);
+        let created = create(&ctx, data).await.expect("create");
+        let original_updated_at = created.str_field("updated_at").to_string();
+
+        // RFC3339-with-nanoseconds timestamps from two back-to-back
+        // `Utc::now()` calls almost always differ already, but a short sleep
+        // makes the "changed" assertion robust against coarse clock
+        // resolution in CI rather than relying on that.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let updated = update(
+            &ctx,
+            "stamped",
+            HashMap::from([("name".to_string(), json!("stamped-v2"))]),
+        )
+        .await
+        .expect("update");
+        assert_ne!(
+            updated.str_field("updated_at"),
+            original_updated_at,
+            "update must stamp a fresh updated_at"
+        );
     }
 }
