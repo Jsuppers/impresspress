@@ -59,7 +59,7 @@ use wafer_core::interfaces::database::service::{
 
 /// KV TTL applied to every cache PUT (24 h). Also the TTL the per-isolate
 /// runtime cache stamps a freshly-minted config-version with (see
-/// `runtime_cache::current_version`).
+/// `runtime_cache::probe_version`).
 pub(crate) const CACHE_TTL_SECS: u64 = 86_400;
 
 /// Fresh opaque config-version stamp (16 random bytes, lowercase hex).
@@ -431,8 +431,8 @@ impl DatabaseService for KvCachedD1DatabaseService {
         // write for one read — the same op count against the subrequest
         // budget, against the far more generous side of KV's free-tier
         // quotas. Only a genuine config change now costs both.
-        let mut cached_body = match self.kv.get(&key).await {
-            Ok(body) => body,
+        let (mut cached_body, kv_read_failed) = match self.kv.get(&key).await {
+            Ok(body) => (body, false),
             Err(e) => {
                 tracing::warn!(
                     table = %collection,
@@ -440,7 +440,7 @@ impl DatabaseService for KvCachedD1DatabaseService {
                     error = %e,
                     "kv get failed; falling through"
                 );
-                None
+                (None, true)
             }
         };
 
@@ -510,6 +510,20 @@ impl DatabaseService for KvCachedD1DatabaseService {
 
         // Fall through to D1 and populate cache.
         let result = self.inner.list(collection, opts).await?;
+
+        // A failed GET is an availability/quota problem, not a miss: writing
+        // back into the service that just failed converts read exhaustion
+        // into a write storm against the far scarcer write allowance (the
+        // 2026-08-30/31 multi-thousand write-request bursts). D1 already
+        // answered this request; the next healthy read repopulates.
+        if kv_read_failed {
+            tracing::warn!(
+                table = %collection,
+                key = %key,
+                "kv read failed; suppressing cache repopulation put"
+            );
+            return Ok(result);
+        }
 
         // SEC: never let a sensitive row (OAuth/Stripe/email secrets, or any
         // `_SECRET`/`_KEY`-suffixed or explicitly-flagged config var) land in
@@ -657,5 +671,232 @@ impl DatabaseService for KvCachedD1DatabaseService {
         self.bump_config_version(collection, "delete").await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use impresspress_core::blocks::admin::VARIABLES_TABLE;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    /// What the mock KV's `get` returns, to separate a genuine miss
+    /// (`Ok(None)`) from an availability failure (`Err`).
+    enum KvGet {
+        Missing,
+        Fail,
+    }
+
+    /// In-memory [`impresspress_core::kv::KvBackend`] that scripts `get` and
+    /// counts writes. Only the row-cache paths are exercised.
+    struct MockKv {
+        get: KvGet,
+        writes: Cell<u32>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl impresspress_core::kv::KvBackend for MockKv {
+        async fn get(&self, _key: &str) -> Result<Option<String>, String> {
+            match self.get {
+                KvGet::Missing => Ok(None),
+                KvGet::Fail => Err("simulated kv read failure".to_string()),
+            }
+        }
+
+        async fn put_with_ttl(
+            &self,
+            _key: &str,
+            _value: &str,
+            _ttl_secs: u64,
+        ) -> Result<(), String> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+
+        async fn put(&self, _key: &str, _value: &str) -> Result<(), String> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), String> {
+            unreachable!("the cached list path never deletes")
+        }
+    }
+
+    /// [`DatabaseService`] stub whose `list` returns one fixed non-sensitive
+    /// variables row; every other method is unreachable on the list path.
+    struct MockDb;
+
+    fn variables_rows() -> RecordList {
+        let mut data = HashMap::new();
+        data.insert("block".to_string(), serde_json::json!("GDSF__SITE"));
+        data.insert("key".to_string(), serde_json::json!("GDSF__SITE__PUBLIC"));
+        data.insert("value".to_string(), serde_json::json!("on"));
+        RecordList {
+            records: vec![Record {
+                id: "1".to_string(),
+                data,
+            }],
+            total_count: 1,
+            page: 1,
+            page_size: 500,
+        }
+    }
+
+    #[wafer_block::wafer_async_trait]
+    impl DatabaseService for MockDb {
+        async fn get(&self, _collection: &str, _id: &str) -> Result<Record, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn list(
+            &self,
+            _collection: &str,
+            _opts: &ListOptions,
+        ) -> Result<RecordList, DatabaseError> {
+            Ok(variables_rows())
+        }
+
+        async fn create(
+            &self,
+            _collection: &str,
+            _data: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn update(
+            &self,
+            _collection: &str,
+            _id: &str,
+            _data: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn delete(&self, _collection: &str, _id: &str) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+
+        async fn count(
+            &self,
+            _collection: &str,
+            _filters: &[Filter],
+        ) -> Result<i64, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn sum(
+            &self,
+            _collection: &str,
+            _field: &str,
+            _filters: &[Filter],
+        ) -> Result<f64, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn query_raw(
+            &self,
+            _query: &str,
+            _args: &[serde_json::Value],
+        ) -> Result<Vec<Record>, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn exec_raw(
+            &self,
+            _query: &str,
+            _args: &[serde_json::Value],
+        ) -> Result<i64, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn upsert(&self, _collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn aggregate(
+            &self,
+            _collection: &str,
+            _spec: AggregateSpec,
+        ) -> Result<Vec<Record>, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn ensure_schema_table(&self, _table: &Table) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+
+        async fn schema_table_exists(&self, _name: &str) -> Result<bool, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn schema_drop_table(&self, _name: &str) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+
+        async fn schema_add_column(
+            &self,
+            _table: &str,
+            _column: &Column,
+        ) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+    }
+
+    fn cached_service(get: KvGet) -> (KvCachedD1DatabaseService, Arc<MockKv>) {
+        let kv = Arc::new(MockKv {
+            get,
+            writes: Cell::new(0),
+        });
+        let svc = KvCachedD1DatabaseService::new(
+            Arc::new(MockDb),
+            kv.clone() as Arc<dyn impresspress_core::kv::KvBackend>,
+        );
+        (svc, kv)
+    }
+
+    fn variables_list_opts() -> ListOptions {
+        cache_key::block_list_opts(cache_key::CachedTable::Variables, "GDSF__SITE")
+    }
+
+    /// THE August 30/31 write-storm mechanism, row-cache side: a failed KV
+    /// GET must fall through to D1 for availability but must NOT attempt to
+    /// repopulate the same KV service that just failed — under read-quota
+    /// exhaustion that converts every read into a doomed write request
+    /// against the far scarcer write allowance.
+    #[wasm_bindgen_test]
+    async fn row_cache_get_error_falls_through_without_put() {
+        let (svc, kv) = cached_service(KvGet::Fail);
+        let result = svc
+            .list(VARIABLES_TABLE, &variables_list_opts())
+            .await
+            .expect("a KV failure must not fail the query; D1 answers it");
+        assert_eq!(result.records.len(), 1, "D1 rows must still be served");
+        assert_eq!(
+            kv.writes.get(),
+            0,
+            "a KV read error must cause zero KV write attempts"
+        );
+    }
+
+    /// A genuine `Ok(None)` miss keeps today's behavior: fall through to D1
+    /// and repopulate the cache so the next isolate can serve from KV.
+    #[wasm_bindgen_test]
+    async fn row_cache_missing_key_repopulates() {
+        let (svc, kv) = cached_service(KvGet::Missing);
+        let result = svc
+            .list(VARIABLES_TABLE, &variables_list_opts())
+            .await
+            .expect("a cache miss must fall through to D1");
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(
+            kv.writes.get(),
+            1,
+            "a genuine miss must repopulate the cache with one PUT"
+        );
     }
 }
