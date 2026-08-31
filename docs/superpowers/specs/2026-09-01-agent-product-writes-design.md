@@ -189,6 +189,22 @@ admin CRUD endpoints. Three reasons:
 It also makes the opt-in total: gate off, and the routes are never registered,
 so there is nothing to reach even by direct URL.
 
+**Every agent route is `AuthLevel::Admin` *and* requires the capability. Two
+independent checks, and the capability is never a substitute for the first.**
+
+The caller must still be a logged-in admin exactly as they are for the human
+admin UI; the session token only decides whether an already-authenticated admin
+has opened agent editing. This ordering matters: if the capability alone
+sufficed, the token would become a standalone credential, and anyone holding it
+could write without an account. Requiring both makes the token useless on its
+own, which is what lets it be short-lived and header-borne rather than a
+carefully guarded secret.
+
+Concretely, a request to `/b/products/agent/products` is rejected when the
+caller is anonymous or non-admin (401/403, the ordinary auth path, before any
+capability logic runs), and separately when the caller is an admin with no live
+session carrying `products:edit`. Neither check can be satisfied by the other.
+
 | Tool | Behaviour |
 |---|---|
 | `create_product_draft` | `status` forced to `draft`; narrow field subset (name, description, currency, category, tags, image_url); `created_by` is the admin |
@@ -267,6 +283,9 @@ snapshots. Never regenerate a snapshot to get green; every changed line is read.
 - admin with no session sees exactly today's tool set;
 - admin with a live session sees it plus the write tools;
 - a write attempted after expiry returns `isError` and mutates nothing;
+- an anonymous or non-admin caller is rejected by the agent routes **even
+  when presenting a valid, unexpired session token** — the capability never
+  substitutes for the login;
 - a product created by the agent is absent from the public catalog until a human
   publishes it;
 - a deleted product disappears from the catalog and its order history still
