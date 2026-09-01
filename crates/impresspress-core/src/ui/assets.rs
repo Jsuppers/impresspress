@@ -54,25 +54,30 @@ pub fn url(logical: &str) -> String {
     format!("{}{}", base_url(), entry(logical).filename)
 }
 
+/// Delegates to the existing per-asset accessors below (`htmx_js()`,
+/// `favicon_ico()`, ...) rather than re-issuing `include_bytes!`/`include_str!`
+/// on the same source files — Task 1's manifest exists precisely so asset
+/// content has one source-level truth; a second `include_bytes!` per file
+/// here would silently reintroduce the duplication it eliminated.
 #[cfg(feature = "embed-assets")]
 pub fn bytes(logical: &str) -> Option<&'static [u8]> {
     Some(match logical {
         "app.css" => css().as_bytes(),
-        "htmx.min.js" => include_bytes!("assets/htmx.min.js"),
-        "webmcp.js" => include_bytes!("assets/webmcp.js"),
-        "itim-latin.woff2" => include_bytes!("assets/fonts/itim-latin.woff2"),
-        "itim-latin-ext.woff2" => include_bytes!("assets/fonts/itim-latin-ext.woff2"),
-        "impresspress-logo.png" => include_bytes!("assets/impresspress-logo.png"),
-        "impresspress-logo-long.png" => include_bytes!("assets/impresspress-logo-long.png"),
-        "favicon.ico" => include_bytes!("assets/favicon.ico"),
+        "htmx.min.js" => htmx_js().as_bytes(),
+        "webmcp.js" => webmcp_js().as_bytes(),
+        "itim-latin.woff2" => itim_latin_woff2(),
+        "itim-latin-ext.woff2" => itim_latin_ext_woff2(),
+        "impresspress-logo.png" => logo_icon_png(),
+        "impresspress-logo-long.png" => logo_long_png(),
+        "favicon.ico" => favicon_ico(),
         #[cfg(feature = "block-llm")]
-        "marked.min.js" => include_bytes!("assets/marked.min.js"),
+        "marked.min.js" => marked_js().as_bytes(),
         #[cfg(feature = "block-llm")]
-        "purify.min.js" => include_bytes!("assets/purify.min.js"),
+        "purify.min.js" => purify_js().as_bytes(),
         #[cfg(feature = "block-llm")]
-        "llm-chat.js" => include_bytes!("assets/llm-chat.js"),
+        "llm-chat.js" => llm_chat_js().as_bytes(),
         #[cfg(feature = "block-files")]
-        "files-browser.js" => include_bytes!("assets/files-browser.js"),
+        "files-browser.js" => files_browser_js().as_bytes(),
         _ => return None,
     })
 }
