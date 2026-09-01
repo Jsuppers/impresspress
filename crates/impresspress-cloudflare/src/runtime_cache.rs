@@ -111,8 +111,11 @@ impl ReadyRuntime {
     fn note_probe_failure(&self, now: u64) {
         let failures = self.probe_failures.get().saturating_add(1);
         self.probe_failures.set(failures);
-        self.probe_deadline_ms
-            .set(probe_failure_deadline_ms(now, failures, random_probe_jitter_ms()));
+        self.probe_deadline_ms.set(probe_failure_deadline_ms(
+            now,
+            failures,
+            random_probe_jitter_ms(),
+        ));
     }
 }
 
@@ -456,6 +459,18 @@ fn prepared_cached_config_matches(
 /// alternative — trusting an unchanged stamp after a blind window — is
 /// silent, unbounded staleness, which is worse than a bounded, observable
 /// build cost.
+/// Blind-window state a freshly hydrated runtime must START with.
+///
+/// A runtime built while the probe was unavailable was built without ever
+/// confirming the current generation, so it is already inside a blind window
+/// and its first successful probe has to reconcile — see
+/// [`blind_window_requires_rebuild`]. Starting at zero instead let a plan
+/// hydrated during an outage look permanently fresh afterwards, because the
+/// plan's own stamp is what KV reports once it recovers.
+fn initial_probe_failures(probe: &VersionProbe) -> u32 {
+    u32::from(matches!(probe, VersionProbe::Unavailable))
+}
+
 fn blind_window_requires_rebuild(consecutive_failures: u32, probe: &VersionProbe) -> bool {
     consecutive_failures > 0 && !matches!(probe, VersionProbe::Unavailable)
 }
@@ -907,6 +922,14 @@ where
 /// isolate and restores dynamic hydration, preserving admin mutation
 /// semantics without putting D1 structural reads back on the prepared cold
 /// path.
+// Eight arguments, one over clippy's threshold, and deliberately a parameter
+// rather than something the caller sets on the returned handle afterwards.
+// Every call site probes (or knowingly skips probing) differently, and a site
+// that forgot to record a blind window is precisely the defect this argument
+// was added to fix — a compiler-enforced parameter cannot be forgotten, a
+// follow-up call can. Bundling the existing seven into a struct would add
+// indirection to a private function with four call sites and hide that.
+#[allow(clippy::too_many_arguments)]
 async fn hydrate_prepared_runtime<F, G>(
     env: &worker::Env,
     request_config: &std::collections::HashMap<String, String>,
@@ -915,6 +938,7 @@ async fn hydrate_prepared_runtime<F, G>(
     register_post_build: G,
     environment_identity: String,
     started_at: u64,
+    initial_probe_failures: u32,
 ) -> Result<(Rc<ReadyRuntime>, u32, u64), Box<dyn std::error::Error>>
 where
     F: FnOnce(
@@ -964,7 +988,7 @@ where
         config_version: Some(plan.config_generation.clone()),
         environment_identity,
         probe_deadline_ms: Cell::new(next_probe_deadline_ms(started_at)),
-        probe_failures: Cell::new(0),
+        probe_failures: Cell::new(initial_probe_failures),
     });
     Ok((rt, build_ordinal, duration_ms))
 }
@@ -1209,6 +1233,7 @@ where
             register_post_build,
             environment_identity,
             now,
+            initial_probe_failures(&probe),
         )
         .await?;
         tracing::info!(
@@ -1245,6 +1270,11 @@ where
             register_post_build,
             environment_identity,
             now,
+            // This path never probed at all, so it has confirmed nothing
+            // about the current generation — the same position as a probe
+            // that came back unavailable. Reconcile on the first probe that
+            // does reach KV rather than trusting the plan indefinitely.
+            1,
         )
         .await?;
         tracing::info!(
@@ -1288,43 +1318,41 @@ where
                         rt.note_probe_failure(now);
                         return Ok((rt, CacheOutcome::ProbeFailed));
                     }
-                    // The stamp is unchanged, but this is the first probe to
-                    // reach KV after a blind window — during which a config
-                    // bump could have been lost — so an unchanged stamp does
-                    // not prove unchanged config. Re-hydrate the SAME plan
-                    // rather than bypassing it: hydration re-reads D1 config
-                    // through `ConfigSource` at strict-init, which is what
-                    // converges, and it costs ~132us against the multi-second
-                    // dynamic rebuild a bypass would force for the rest of
-                    // this isolate's life.
                     if !blind_window_requires_rebuild(rt.probe_failures.get(), &probe) {
                         rt.note_probe_success(now);
                         return Ok((rt, CacheOutcome::ProbedFresh));
                     }
+                    // The stamp is unchanged, but this is the first probe to
+                    // reach KV after a blind window, during which a bump could
+                    // have been lost — so an unchanged stamp no longer proves
+                    // unchanged state, and this isolate has to reconcile
+                    // against D1 itself.
+                    //
+                    // It falls through to the bypass below rather than
+                    // re-hydrating the plan, and that distinction is the whole
+                    // point. Re-hydration re-reads only the VARIABLES table,
+                    // via `ConfigSource` at strict-init; `block_settings` and
+                    // the WRAP grants come from `plan.structure`, so an admin
+                    // change to either during the blind window would survive a
+                    // re-hydration untouched — and the fresh runtime would
+                    // start at zero failures, so nothing would ever try again.
+                    // Only the dynamic path reloads every mutable table.
+                    //
+                    // The price is the one the bypass always charges: this
+                    // isolate leaves its packaged plan for good and pays
+                    // multi-second dynamic builds until it recycles or a new
+                    // plan/environment clears the bypass. That is the same
+                    // price the branch below already pays for an observed
+                    // admin change, and it is the right way round — a bounded,
+                    // visible build cost beats indefinitely serving structural
+                    // config we know we could not see.
                     tracing::info!(
                         plan_hash = %plan_generation,
                         config_version = %probe.observed(),
-                        "config-version probes reached KV again; re-hydrating the plan once to \
-                         pick up any config bump made while this isolate was blind"
+                        "config-version probes reached KV again after a blind window; \
+                         bypassing the packaged plan once so block settings and grants \
+                         are re-read from D1, not just config variables"
                     );
-                    let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
-                        env,
-                        request_config,
-                        plan.as_ref(),
-                        register_blocks,
-                        register_post_build,
-                        environment_identity,
-                        now,
-                    )
-                    .await?;
-                    store_if_current(&build_guard, rt.clone());
-                    return Ok((
-                        rt,
-                        CacheOutcome::Rebuilt {
-                            build_ordinal,
-                            duration_ms,
-                        },
-                    ));
                 }
 
                 tracing::info!(
@@ -1382,6 +1410,7 @@ where
         register_post_build,
         environment_identity,
         now,
+        initial_probe_failures(&probe),
     )
     .await?;
     if !store_if_current(&build_guard, rt.clone()) {
@@ -1851,6 +1880,38 @@ mod tests {
         ));
     }
 
+    /// A runtime hydrated while KV was unreachable must REMEMBER that it was.
+    ///
+    /// The prepared path trusts the signed plan when the probe is
+    /// unavailable, which keeps the isolate serving — but the resulting
+    /// runtime then carried no blind-window state, so the first successful
+    /// probe found the plan's own stamp unchanged, reported ProbedFresh, and
+    /// never reconciled. If D1 moved and its bump was lost before this
+    /// isolate started, that is stale config for the isolate's whole life.
+    /// Starting at one failure makes the first successful probe end a blind
+    /// window, exactly as it would for a runtime that went blind later.
+    ///
+    /// The dynamic path needs no equivalent: it tags itself with an
+    /// unpersisted local stamp that can never equal a fleet stamp, so its
+    /// first successful probe already forces a rebuild.
+    #[wasm_bindgen_test]
+    fn a_runtime_hydrated_blind_starts_inside_a_blind_window() {
+        assert_eq!(initial_probe_failures(&VersionProbe::Unavailable), 1);
+        assert!(blind_window_requires_rebuild(
+            initial_probe_failures(&VersionProbe::Unavailable),
+            &VersionProbe::Stamped("v1".to_string())
+        ));
+
+        assert_eq!(
+            initial_probe_failures(&VersionProbe::Stamped("v1".to_string())),
+            0
+        );
+        assert!(!blind_window_requires_rebuild(
+            initial_probe_failures(&VersionProbe::Stamped("v1".to_string())),
+            &VersionProbe::Stamped("v1".to_string())
+        ));
+    }
+
     /// A cached prepared runtime must be servable when the probe is
     /// unavailable: the signed plan is already trusted on that path, so
     /// paying a fresh hydration for the same plan is pure waste.
@@ -1914,6 +1975,9 @@ mod tests {
         assert!(probe_failure_window_ms(2) <= PROBE_FAILURE_BACKOFF_CAP_MS);
         assert_eq!(probe_failure_window_ms(10), PROBE_FAILURE_BACKOFF_CAP_MS);
         // Absurd counts must not overflow the shift.
-        assert_eq!(probe_failure_window_ms(u32::MAX), PROBE_FAILURE_BACKOFF_CAP_MS);
+        assert_eq!(
+            probe_failure_window_ms(u32::MAX),
+            PROBE_FAILURE_BACKOFF_CAP_MS
+        );
     }
 }
