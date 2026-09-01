@@ -156,7 +156,16 @@ impl KvCachedD1DatabaseService {
     /// version until an unrelated future write happens to land outside a
     /// throttle window.
     async fn bump_config_version(&self, collection: &str, op: &str) {
-        if !self.mode.bump_on_write || !cache_key::bumps_config_version(collection) {
+        if !cache_key::bumps_config_version(collection) {
+            return;
+        }
+        // Record the local write BEFORE the `bump_on_write` gate. That gate is
+        // about the KV stamp, which the deploy-init funnel suppresses on
+        // purpose — and deploy-init is precisely the pass that seeds config
+        // mid-boot, which is what an in-process config reader has to notice.
+        // See `impresspress_core::config_generation`.
+        impresspress_core::config_generation::note_config_write();
+        if !self.mode.bump_on_write {
             return;
         }
         // This isolate's local D1 state just changed — the next request
