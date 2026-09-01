@@ -24,7 +24,7 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Bootstrap Admin",
         &config,
         auth_split(
-            auth_panel(&config, "Set up your admin account."),
+            auth_panel(&config, Some("Set up your admin account.")),
             html! {
                 div .login-container {
                     p style="font-size:.875rem;color:#6b7280;margin-bottom:1.5rem;text-align:center" {

@@ -13,7 +13,7 @@ pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
         "Change Password",
         &config,
         auth_split(
-            auth_panel(&config, "Update your password."),
+            auth_panel(&config, Some("Update your password.")),
             html! {
                 div .login-container {
                     div #error .login-error style="display:none" {}

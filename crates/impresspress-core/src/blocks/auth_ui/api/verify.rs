@@ -164,7 +164,7 @@ fn html_respond(
         title,
         &config,
         auth_split(
-            auth_panel(&config, "Verify your email."),
+            auth_panel(&config, Some("Verify your email.")),
             html! {
                 div .login-container {
                     div style="text-align:center" {

@@ -43,7 +43,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Reset Password",
         &config,
         auth_split(
-            auth_panel(&config, "Reset your password."),
+            auth_panel(&config, Some("Reset your password.")),
             html! {
                 div .login-container {
                     div #error .login-error style="display:none" {}
@@ -115,7 +115,7 @@ fn html_respond(
         title,
         &config,
         auth_split(
-            auth_panel(&config, "Reset your password."),
+            auth_panel(&config, Some("Reset your password.")),
             html! {
                 div .login-container {
                     div style="text-align:center" {

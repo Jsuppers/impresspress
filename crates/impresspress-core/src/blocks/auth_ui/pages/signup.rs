@@ -36,7 +36,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Sign Up",
         &config,
         auth_split(
-            auth_panel(&config, "Create your account."),
+            auth_panel(&config, Some("Create your account.")),
             html! {
                 div .login-container {
                     div #error .login-error style="display:none" {}

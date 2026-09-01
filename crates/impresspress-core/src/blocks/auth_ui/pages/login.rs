@@ -68,7 +68,11 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Sign In",
         &config,
         auth_split(
-            auth_panel(&config, "Sign in to continue."),
+            // `None`: the right-column heading pair below (`.auth-form__title`
+            // / `.auth-form__subtitle`) already carries "Sign in to
+            // continue." -- passing it here too would render the same
+            // sentence twice on one screen.
+            auth_panel(&config, None),
             html! {
                 div .auth-form {
                     h2 .auth-form__title { "Welcome back" }

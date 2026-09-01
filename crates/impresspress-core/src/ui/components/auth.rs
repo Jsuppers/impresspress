@@ -10,16 +10,18 @@ use crate::ui::{templates::BrandPanel, SiteConfig};
 /// OAuth / change-password / bootstrap).
 ///
 /// `tagline` is page-specific — every caller passes copy that matches what
-/// the page actually does (e.g. "Sign in to continue." on the login page,
-/// "Create your account." on signup); it used to be hardcoded to the login
-/// copy and rendered unchanged on signup, bootstrap, password-reset, and
-/// verify pages too.
+/// the page actually does (e.g. "Create your account." on signup); it used
+/// to be hardcoded to the login copy and rendered unchanged on signup,
+/// bootstrap, password-reset, and verify pages too. Pass `None` when the
+/// caller's own form already owns an equivalent line (login.rs's
+/// `.auth-form__subtitle`) — the panel then renders the app-name headline
+/// alone, rather than duplicating that sentence in both places.
 ///
 /// The logo prefers `logo_icon_url` (mark only, matches the sidebar's
 /// collapsed-state logo) and falls back to `logo_url` (wordmark); both
 /// default to a bundled asset in `SiteConfig::load`, so this is `None` only
 /// when a deployment explicitly overrides both to empty.
-pub fn auth_panel<'a>(config: &'a SiteConfig, tagline: &'a str) -> BrandPanel<'a> {
+pub fn auth_panel<'a>(config: &'a SiteConfig, tagline: Option<&'a str>) -> BrandPanel<'a> {
     let logo_html = if !config.logo_icon_url.is_empty() {
         Some(html! { img .auth-split__logo-img src=(config.logo_icon_url) alt=""; })
     } else if !config.logo_url.is_empty() {
@@ -31,7 +33,7 @@ pub fn auth_panel<'a>(config: &'a SiteConfig, tagline: &'a str) -> BrandPanel<'a
     BrandPanel {
         logo_html,
         headline: &config.app_name,
-        tagline: Some(tagline),
+        tagline,
     }
 }
 
