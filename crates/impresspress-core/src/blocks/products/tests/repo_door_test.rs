@@ -4,13 +4,34 @@
 //! The gate is a source scan because the table name is necessarily reachable
 //! (`mod.rs` registers it in `collections(...)`), so nothing but a test can
 //! catch a call site that names it directly.
+//!
+//! Scope: every `.rs` file in this crate, not just `src/blocks/products`.
+//! A table name is a string — any block can spell it out, and the admin
+//! block's database explorer and the WRAP layer both work in terms of raw
+//! table names. Scanning only the owning block left the whole rest of the
+//! crate free to read the products table directly and answer with rows the
+//! door would have filtered.
+//!
+//! What this gate still does NOT cover, stated so it is not mistaken for
+//! more than it is:
+//!
+//!   * other workspace crates (`impresspress-web`, `-browser`,
+//!     `-cloudflare`, the CLI). `CARGO_MANIFEST_DIR` is this crate, and the
+//!     products block lives entirely here; a cross-crate read would need
+//!     `repo` to be public, which it is not.
+//!   * non-Rust sources. The migrations under `blocks/products/migrations/`
+//!     name the table by design — that is where it is defined.
+//!   * the files on the allowlists below. Each is listed individually, so a
+//!     NEW file reading the table raw fails the gate and has to justify
+//!     itself here; but nothing re-checks that a listed file's reads are
+//!     still fixture setup rather than production reads.
 
-fn block_sources() -> Vec<(String, String)> {
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks/products"));
+fn crate_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read block dir") {
+        for entry in std::fs::read_dir(&dir).expect("read source dir") {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 stack.push(path);
@@ -24,36 +45,43 @@ fn block_sources() -> Vec<(String, String)> {
             }
         }
     }
+    assert!(
+        out.len() > 100,
+        "the scan walks the whole crate; {} files means it lost its way",
+        out.len()
+    );
     out
 }
 
-/// Whether `path` (relative to `src/blocks/products`) matches one of
-/// `allowlist`'s entries. An entry ending in `/` allows every file under
-/// that directory; any other entry must match `path` exactly — a suffix
-/// match would let `"mod.rs"` wrongly allow `repo/mod.rs`, `handlers/mod.rs`,
-/// etc. too.
+/// Whether `path` (relative to `src`) matches one of `allowlist`'s entries.
+/// Every entry must match `path` exactly — no directory prefixes, so an
+/// allowlist can never exempt a file that does not exist yet. A suffix match
+/// would additionally let `"mod.rs"` wrongly allow `repo/mod.rs`,
+/// `handlers/mod.rs`, etc.
 fn matches_allowlist(path: &str, allowlist: &[&str]) -> bool {
-    allowlist.iter().any(|a| match a.strip_suffix('/') {
-        Some(dir) => path == dir || path.starts_with(a),
-        None => path == *a,
-    })
+    allowlist.contains(&path)
 }
 
 const TABLE_LITERAL: &str = "impresspress__products__products";
 
-/// Files/directories allowed to name the products table by its literal
-/// string.
+/// Files allowed to name the products table by its literal string. Listed
+/// one by one, deliberately: the previous blanket `tests/` entry exempted
+/// every test file that would ever exist, including one that quietly read
+/// the table raw and asserted on the unfiltered rows.
 const LITERAL_ALLOWED: &[&str] = &[
-    "repo/products.rs",        // the door itself
-    "tests/repo_door_test.rs", // this file: needs the literal to scan for it
-    "tests/",                  // test fixtures seed rows (including soft-deleted ones) directly
-                               // against the table for setup; that's fixture setup, not a
-                               // production read that must respect the soft-delete filter
+    // the door itself
+    "blocks/products/repo/products.rs",
+    // this file: needs the literal in order to scan for it
+    "blocks/products/tests/repo_door_test.rs",
+    // seeds rows (including soft-deleted ones) straight into the table so the
+    // handler tests have something to act on; fixture setup, not a production
+    // read that has to respect the soft-delete filter
+    "blocks/products/tests/handler_tests.rs",
 ];
 
 #[test]
 fn only_the_repo_module_names_the_products_table() {
-    let offenders: Vec<String> = block_sources()
+    let offenders: Vec<String> = crate_sources()
         .into_iter()
         .filter(|(path, _)| !matches_allowlist(path, LITERAL_ALLOWED))
         .filter(|(_, src)| src.contains(TABLE_LITERAL))
@@ -75,7 +103,7 @@ fn only_the_repo_module_names_the_products_table() {
 /// itself forever.
 #[test]
 fn the_old_products_table_const_is_gone() {
-    let offenders: Vec<String> = block_sources()
+    let offenders: Vec<String> = crate_sources()
         .into_iter()
         .filter(|(path, _)| !matches_allowlist(path, LITERAL_ALLOWED))
         .filter(|(_, src)| src.contains("PRODUCTS_TABLE"))
@@ -100,24 +128,29 @@ fn the_old_products_table_const_is_gone() {
 /// justified on why it isn't a soft-delete bypass.
 const TABLE_IDENT: &str = "products::TABLE";
 
-/// Files/directories allowed to name the products table via the
-/// `repo::products::TABLE` identifier (as opposed to the literal string
-/// above).
+/// Files allowed to name the products table via the `repo::products::TABLE`
+/// identifier (as opposed to the literal string above). Per-file for the same
+/// reason as [`LITERAL_ALLOWED`].
 const TABLE_IDENT_ALLOWED: &[&str] = &[
     // the door itself: `TABLE`'s own definition and internal uses
-    "repo/products.rs",
+    "blocks/products/repo/products.rs",
     // `BlockInfo::collections(...)` is an advisory table listing for
     // admin/WRAP discovery, not a query — nothing to filter
-    "mod.rs",
+    "blocks/products/mod.rs",
     // fixtures seed rows (including soft-deleted ones) and assert on raw rows
-    // directly against the table; that is setup/assertion for the tests
-    // guarding the door, not a production read to filter
-    "tests/",
+    // straight against the table; setup and assertion for the tests guarding
+    // the door, not production reads to filter
+    "blocks/products/tests/handler_tests.rs",
+    "blocks/products/tests/offer_management_tests.rs",
+    "blocks/products/tests/offer_pricing_tests.rs",
+    "blocks/products/tests/repo_door_test.rs",
+    "blocks/products/tests/seller_governance_tests.rs",
+    "blocks/products/tests/stripe_tests.rs",
 ];
 
 #[test]
 fn only_the_allowlist_names_the_products_table_via_the_const() {
-    let offenders: Vec<String> = block_sources()
+    let offenders: Vec<String> = crate_sources()
         .into_iter()
         .filter(|(path, _)| !matches_allowlist(path, TABLE_IDENT_ALLOWED))
         .filter(|(_, src)| src.contains(TABLE_IDENT))
