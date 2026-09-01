@@ -118,7 +118,7 @@
    `justify-content: space-between` on all three children -- which would
    space them out evenly and strand the headline in the middle. */
 .auth-split__headline { font-size: 2.5rem; font-weight: 700; margin: auto 0 0; line-height: 1.15; }
-.auth-split__tagline { font-size: var(--text-base); margin: var(--spacing-sm) 0 0; color: var(--sidebar-text-muted); }
+.auth-split__tagline { font-size: var(--text-base); margin: var(--spacing-sm) 0 0; color: var(--auth-tagline); }
 
 .auth-split__form { display: flex; align-items: center; justify-content: center; padding: var(--space-2xl) var(--spacing-md); background: #fdfdfd; }
 /* No card: the form sits directly on the surface. */

@@ -665,7 +665,9 @@ mod tests {
         let s = m.into_string();
         let stats = s.find("stats-grid").expect("stats-grid div present");
         let top = s.find("dashboard-top").expect("dashboard-top div present");
-        let grid = s.find("dashboard-grid").expect("dashboard-grid div present");
+        let grid = s
+            .find("dashboard-grid")
+            .expect("dashboard-grid div present");
         assert!(stats < top, "stats must render before the mid card");
         assert!(
             top < grid,
@@ -748,6 +750,8 @@ mod tests {
             favicon_url: "/favicon.ico".to_string(),
             primary_color: String::new(),
             embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
         }
     }
 
@@ -871,6 +875,8 @@ mod tests {
             favicon_url: String::new(),
             primary_color: String::new(),
             embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
         };
         let opts = PublicPage {
             title: "Just Title",

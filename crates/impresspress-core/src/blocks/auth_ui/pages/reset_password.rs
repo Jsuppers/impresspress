@@ -15,6 +15,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         .config_get("WAFER_RUN_SHARED__APP_NAME")
         .unwrap_or("Impresspress")
         .to_string();
+    let auth_headline = ctx
+        .config_get("WAFER_RUN_SHARED__AUTH_HEADLINE")
+        .unwrap_or(crate::config_vars::DEFAULT_AUTH_HEADLINE)
+        .to_string();
+    let auth_tagline = ctx
+        .config_get("WAFER_RUN_SHARED__AUTH_TAGLINE")
+        .unwrap_or(crate::config_vars::DEFAULT_AUTH_TAGLINE)
+        .to_string();
 
     let token = msg.get_meta("req.query.token").to_string();
     if token.is_empty() {
@@ -24,6 +32,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             false,
             &logo_url,
             &app_name,
+            &auth_headline,
+            &auth_tagline,
         );
     }
 
@@ -37,6 +47,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         favicon_url: crate::ui::assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
+        auth_headline: auth_headline.clone(),
+        auth_tagline: auth_tagline.clone(),
     };
 
     let markup = ui::layout::page(
@@ -101,6 +113,8 @@ fn html_respond(
     success: bool,
     logo_url: &str,
     app_name: &str,
+    auth_headline: &str,
+    auth_tagline: &str,
 ) -> OutputStream {
     let color = if success { "#10b981" } else { "#ef4444" };
     let config = ui::SiteConfig {
@@ -110,6 +124,8 @@ fn html_respond(
         favicon_url: crate::ui::assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
+        auth_headline: auth_headline.to_string(),
+        auth_tagline: auth_tagline.to_string(),
     };
     let markup = ui::layout::page(
         title,

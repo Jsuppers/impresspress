@@ -66,6 +66,8 @@ mod tests {
             favicon_url: String::new(),
             primary_color: String::new(),
             embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
         };
         let rendered = page("Title", &config, maud::html! { p { "body" } }).into_string();
         assert!(

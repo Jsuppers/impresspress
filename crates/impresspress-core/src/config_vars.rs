@@ -48,6 +48,17 @@ pub const DEFAULT_CSP_DIRECTIVES: &str = "script-src https://js.stripe.com; \
      frame-src https://js.stripe.com https://hooks.stripe.com https://checkout.stripe.com; \
      connect-src https://api.stripe.com https://r.stripe.com";
 
+/// Default headline for the auth-split brand panel (login/signup/reset/etc.
+/// left-hand navy column) — see [`crate::ui::components::auth_panel`].
+/// White-label deployments override via `WAFER_RUN_SHARED__AUTH_HEADLINE`.
+pub const DEFAULT_AUTH_HEADLINE: &str = "The backend that lifts its own weight.";
+
+/// Default sub-line under [`DEFAULT_AUTH_HEADLINE`] on the login page (the
+/// only auth-split page that doesn't already pass its own page-specific
+/// tagline). Overridable via `WAFER_RUN_SHARED__AUTH_TAGLINE`; blank hides
+/// the tagline entirely.
+pub const DEFAULT_AUTH_TAGLINE: &str = "One binary. Batteries included. No lock-in.";
+
 /// Shared config variables readable by all blocks, writable only by admin.
 ///
 /// These are NOT owned by any block — they're platform-level settings.
@@ -124,6 +135,22 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         )
         .name("Auth Logo URL")
         .input_type(InputType::Url),
+        ConfigVar::new(
+            "WAFER_RUN_SHARED__AUTH_HEADLINE",
+            "Headline on the login/signup/etc. left-hand brand panel",
+            DEFAULT_AUTH_HEADLINE,
+        )
+        .name("Auth Headline")
+        .input_type(InputType::Text),
+        ConfigVar::new(
+            "WAFER_RUN_SHARED__AUTH_TAGLINE",
+            "Sub-line under the brand panel headline, shown on the login page \
+             (other auth pages default to their own page-specific line); \
+             blank hides it",
+            DEFAULT_AUTH_TAGLINE,
+        )
+        .name("Auth Tagline")
+        .input_type(InputType::Text),
         ConfigVar::new(
             "WAFER_RUN_SHARED__FAVICON_URL",
             "Browser tab icon",

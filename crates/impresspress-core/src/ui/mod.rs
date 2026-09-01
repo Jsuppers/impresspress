@@ -31,6 +31,15 @@ pub struct SiteConfig {
     /// Browser targets populate this (e.g. `/webllm-engine.js` for the
     /// page-side LLM engine); native targets leave it empty.
     pub embedded_scripts: Vec<String>,
+    /// Headline on the auth-split brand panel (login/signup/reset/etc. left
+    /// navy column) — see `ui::components::auth_panel`. Defaults to
+    /// marketing copy (`config_vars::DEFAULT_AUTH_HEADLINE`); a white-label
+    /// deployment overrides via `WAFER_RUN_SHARED__AUTH_HEADLINE` so the
+    /// stock copy never ships under someone else's brand.
+    pub auth_headline: String,
+    /// Sub-line under `auth_headline`, shown when a page doesn't supply its
+    /// own (see `auth_panel`'s `tagline` param). Empty hides it entirely.
+    pub auth_tagline: String,
 }
 
 impl SiteConfig {
@@ -65,6 +74,18 @@ impl SiteConfig {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
+            auth_headline: config::get_default(
+                ctx,
+                "WAFER_RUN_SHARED__AUTH_HEADLINE",
+                crate::config_vars::DEFAULT_AUTH_HEADLINE,
+            )
+            .await,
+            auth_tagline: config::get_default(
+                ctx,
+                "WAFER_RUN_SHARED__AUTH_TAGLINE",
+                crate::config_vars::DEFAULT_AUTH_TAGLINE,
+            )
+            .await,
         }
     }
 }
@@ -312,6 +333,8 @@ fn minimal_config() -> SiteConfig {
         favicon_url: assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
+        auth_headline: crate::config_vars::DEFAULT_AUTH_HEADLINE.to_string(),
+        auth_tagline: crate::config_vars::DEFAULT_AUTH_TAGLINE.to_string(),
     }
 }
 
@@ -476,7 +499,39 @@ mod tests {
             favicon_url: String::new(),
             primary_color: String::new(),
             embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
         }
+    }
+
+    /// `SiteConfig::load` defaults the auth-panel headline/tagline to the
+    /// requested marketing copy when no config var is set.
+    #[tokio::test]
+    async fn site_config_load_defaults_auth_headline_and_tagline() {
+        let ctx = crate::test_support::TestContext::new().await;
+        let config = SiteConfig::load(&ctx).await;
+        assert_eq!(
+            config.auth_headline,
+            crate::config_vars::DEFAULT_AUTH_HEADLINE
+        );
+        assert_eq!(
+            config.auth_tagline,
+            crate::config_vars::DEFAULT_AUTH_TAGLINE
+        );
+    }
+
+    /// A white-label deployment overrides both via
+    /// `WAFER_RUN_SHARED__AUTH_HEADLINE` / `WAFER_RUN_SHARED__AUTH_TAGLINE`,
+    /// same as `WAFER_RUN_SHARED__APP_NAME` overrides `app_name` — the
+    /// stock marketing copy must never be baked in unconditionally.
+    #[tokio::test]
+    async fn site_config_load_honors_auth_headline_and_tagline_overrides() {
+        let mut ctx = crate::test_support::TestContext::new().await;
+        ctx.set_config("WAFER_RUN_SHARED__AUTH_HEADLINE", "Acme Cloud");
+        ctx.set_config("WAFER_RUN_SHARED__AUTH_TAGLINE", "Built for Acme.");
+        let config = SiteConfig::load(&ctx).await;
+        assert_eq!(config.auth_headline, "Acme Cloud");
+        assert_eq!(config.auth_tagline, "Built for Acme.");
     }
 
     fn dashboard_page<'a>(

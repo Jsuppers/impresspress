@@ -23,6 +23,10 @@
 	--navy-800: #0a1122;
 	--navy-700: #172136;
 	--sidebar-text-muted: #94a3b8;
+	/* Muted steel blue for the auth-split brand panel's tagline, sampled
+	   from the reference design. 6.08:1 against --navy-900, clears the
+	   4.5:1 AA floor for normal text. */
+	--auth-tagline: #7095c4;
 
 	--accent-success: #10b981;
 	--accent-warning: #f59e0b;

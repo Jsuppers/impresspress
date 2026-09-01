@@ -68,10 +68,12 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Sign In",
         &config,
         auth_split(
-            // `None`: the right-column heading pair below (`.auth-form__title`
-            // / `.auth-form__subtitle`) already carries "Sign in to
-            // continue." -- passing it here too would render the same
-            // sentence twice on one screen.
+            // `None`: login is the one auth page that shows the brand
+            // tagline (`config.auth_tagline`, via `auth_panel`'s fallback)
+            // rather than a page-specific line — it reads as the product's
+            // pitch, not a duplicate of the right-column heading pair below
+            // (`.auth-form__title` / `.auth-form__subtitle`, "Welcome back"
+            // / "Sign in to continue."), which is a different sentence.
             auth_panel(&config, None),
             html! {
                 div .auth-form {
@@ -225,6 +227,34 @@ mod tests {
         assert!(
             html.contains(r#"id="password""#),
             "input must carry the id the label's for= references: {html}"
+        );
+    }
+
+    /// The navy brand panel shows the configurable headline and the brand
+    /// tagline (falls back from `auth_panel(&config, None)`) exactly once
+    /// each, and the right column's "Sign in to continue." is not
+    /// duplicated by the panel.
+    #[tokio::test]
+    async fn brand_panel_shows_default_headline_and_tagline_without_duplicating_subtitle() {
+        let ctx = TestContext::new().await;
+        let msg = login_msg(&[]);
+        let html = output_html(handle(&ctx, &msg).await).await;
+
+        assert_eq!(
+            html.matches("The backend that lifts its own weight.").count(),
+            1,
+            "headline must appear exactly once: {html}"
+        );
+        assert_eq!(
+            html.matches("One binary. Batteries included. No lock-in.")
+                .count(),
+            1,
+            "brand tagline must appear exactly once: {html}"
+        );
+        assert_eq!(
+            html.matches("Sign in to continue.").count(),
+            1,
+            "right-column subtitle must not be duplicated by the brand panel: {html}"
         );
     }
 

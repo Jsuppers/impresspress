@@ -62,6 +62,14 @@ pub(super) fn site_config(ctx: &dyn Context) -> SiteConfig {
             .unwrap_or("")
             .to_string(),
         embedded_scripts,
+        auth_headline: ctx
+            .config_get("WAFER_RUN_SHARED__AUTH_HEADLINE")
+            .unwrap_or(crate::config_vars::DEFAULT_AUTH_HEADLINE)
+            .to_string(),
+        auth_tagline: ctx
+            .config_get("WAFER_RUN_SHARED__AUTH_TAGLINE")
+            .unwrap_or(crate::config_vars::DEFAULT_AUTH_TAGLINE)
+            .to_string(),
     }
 }
 
