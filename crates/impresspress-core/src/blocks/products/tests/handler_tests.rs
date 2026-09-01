@@ -154,6 +154,114 @@ async fn admin_product_detail_404s_for_a_soft_deleted_product() {
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
+/// `handle_update_product` (the generic admin PATCH) must not be a second
+/// door onto `deleted_at`: an admin sending `{"deleted_at": null}` for a
+/// soft-deleted product must not silently resurrect it — restore is the
+/// only door back in.
+#[tokio::test]
+async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Oops" }),
+    );
+    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    soft_delete_product(&ctx, &id).await;
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "deleted_at": null }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "an admin PATCH must not resurrect a soft-deleted product"
+    );
+
+    let err = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect_err("the product must still read as deleted");
+    assert_eq!(err.code, ErrorCode::NotFound);
+}
+
+/// A soft-deleted product must be restored before it is editable again — the
+/// generic admin PATCH must refuse it outright rather than silently applying
+/// unrelated field changes to a dead row.
+#[tokio::test]
+async fn admin_update_product_refuses_a_soft_deleted_product() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Oops" }),
+    );
+    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    soft_delete_product(&ctx, &id).await;
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "name": "New Name" }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "a soft-deleted product must not be editable through the normal admin PATCH"
+    );
+}
+
+/// `deleted_at` is `soft_delete`'s door, not the generic PATCH's: even for a
+/// still-live product (so the liveness guard above doesn't reject the
+/// request outright), an admin PATCH carrying `deleted_at` must not be able
+/// to soft-delete it as a side effect of an otherwise ordinary field update.
+#[tokio::test]
+async fn admin_update_product_ignores_deleted_at_in_the_request_body() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Still Live" }),
+    );
+    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "name": "New Name", "deleted_at": "2026-09-01T00:00:00Z" }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    let body = output_to_json(out).await;
+    assert_eq!(
+        body["data"]["name"], "New Name",
+        "unrelated fields in the same request must still apply"
+    );
+
+    let record = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect("the generic PATCH must not have soft-deleted the product");
+    assert!(crate::util::RecordExt::str_field(&record, "deleted_at").is_empty());
+}
+
 /// The bug this whole plan exists for: `line_items.product_id` is `TEXT NOT
 /// NULL`, so a hard delete of a product that was ever ordered orphaned that
 /// order's line item. Soft delete must leave both rows resolvable.
@@ -1189,6 +1297,63 @@ async fn checkout_refuses_a_soft_deleted_product() {
 }
 
 // ============================================================
+// Restoring a soft-deleted product — the door back out
+// ============================================================
+//
+// Soft delete without a way back is worse than the hard delete it replaced:
+// a deleted row would be permanently unreachable by any UI. These tests pin
+// the restore endpoint's two obligations: it must clear `deleted_at` on the
+// right row, and the restored row must be visible again everywhere a live
+// product is visible (the public catalog, here — `repo::products::get`'s
+// own restore test already covers the repo layer directly).
+
+#[tokio::test]
+async fn restore_endpoint_returns_the_product_to_the_catalog() {
+    let ctx = ctx().await;
+
+    let mut oops = HashMap::new();
+    oops.insert("name".to_string(), serde_json::json!("oops"));
+    oops.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "oops", oops).await;
+    soft_delete_product(&ctx, "oops").await;
+
+    let (msg, input) = create_msg(
+        "/b/products/products/oops/restore",
+        "admin_1",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(body["id"], "oops");
+    assert!(
+        body["data"]["deleted_at"].is_null(),
+        "restore must clear deleted_at: {body}"
+    );
+
+    let (catalog_msg, catalog_input) = get_msg("/b/products/catalog", "");
+    let catalog_body = output_to_json(dispatch_user(&ctx, catalog_msg, catalog_input).await).await;
+    assert_eq!(catalog_body["records"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn restore_endpoint_404s_for_a_product_that_was_never_deleted() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Live" }),
+    );
+    dispatch_admin(&ctx, create, create_input).await;
+
+    let (msg, input) = create_msg(
+        "/b/products/products/missing/restore",
+        "admin_1",
+        serde_json::json!({}),
+    );
+    let out = dispatch_user(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+// ============================================================
 // Group products endpoint
 // ============================================================
 
@@ -1984,6 +2149,67 @@ async fn manage_products_uses_data_table_with_mobile_labels() {
         "data_table cells should carry data-label for the mobile card collapse"
     );
     assert!(html.contains("Widget"), "the seeded product should render");
+}
+
+/// `?view=deleted` is the only way to reach a soft-deleted row from the
+/// admin UI — without it, soft delete is a one-way door. Pins that the
+/// deleted view shows exactly the deleted rows (not the live ones), and
+/// that the default (no `view`) list keeps excluding them.
+#[tokio::test]
+async fn manage_products_deleted_view_lists_only_deleted_products() {
+    let ctx = ctx().await;
+
+    let mut live = HashMap::new();
+    live.insert("name".to_string(), serde_json::json!("live"));
+    live.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "live", live).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (default_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    let default_html =
+        output_to_html(super::super::pages::manage_products(&ctx, &default_msg).await).await;
+    assert!(default_html.contains(">live<"), "{default_html}");
+    assert!(!default_html.contains(">gone<"), "{default_html}");
+
+    let (mut deleted_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    deleted_msg.set_meta("req.query.view", "deleted");
+    let deleted_html =
+        output_to_html(super::super::pages::manage_products(&ctx, &deleted_msg).await).await;
+    assert!(deleted_html.contains(">gone<"), "{deleted_html}");
+    assert!(!deleted_html.contains(">live<"), "{deleted_html}");
+}
+
+/// The deleted view is a dead end unless the way back is obvious: pin that
+/// each deleted row's Restore action posts to the actual restore endpoint,
+/// not the edit page (which 404s for a soft-deleted product until it is
+/// restored).
+#[tokio::test]
+async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    assert!(
+        html.contains("/b/products/api/products/gone/restore"),
+        "deleted row should offer a Restore action wired to the restore endpoint: {html}"
+    );
+    assert!(
+        !html.contains(r#"href="/b/products/admin/products/gone""#),
+        "a deleted row must not link into the edit page, which refuses a soft-deleted product: {html}"
+    );
 }
 
 #[tokio::test]

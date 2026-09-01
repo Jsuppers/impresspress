@@ -177,11 +177,26 @@ pub(super) async fn handle_update_product(
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
+    // A soft-deleted product must go through `restore` before it is
+    // editable again, so the generic PATCH refuses it outright rather than
+    // silently applying unrelated field changes to a dead row.
+    // `repo::products::get` already answers `NotFound` for a soft-deleted
+    // row, matching the response every other admin product endpoint gives
+    // for one.
+    match repo::products::get(ctx, id).await {
+        Ok(_) => {}
+        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Product not found"),
+        Err(e) => return err_internal("Database error", e),
+    }
     let raw = input.collect_to_bytes().await;
     let mut data: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
+    // `deleted_at` is `restore`'s door, not this one's: an admin PATCH must
+    // not be able to soft-delete or resurrect a product by writing this
+    // field directly, bypassing the dedicated delete/restore endpoints.
+    data.remove("deleted_at");
     stamp_updated(&mut data);
     match repo::products::update(ctx, id, data).await {
         Ok(record) => ok_json(&record),
@@ -197,6 +212,25 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
     }
     match repo::products::soft_delete(ctx, id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
+        Err(e) => err_internal("Database error", e),
+    }
+}
+
+/// Restore a soft-deleted product — the door back out of `soft_delete`,
+/// without which a deleted product would be unreachable by any UI. Declared
+/// `AuthLevel::Admin` on its `POST /b/products/api/products/{id}/restore`
+/// endpoint (enforced centrally before this handler runs, matching every
+/// other tier check in this module); it dispatches through `handle_user`
+/// rather than `handle_admin` because it addresses a product directly by ID
+/// rather than through the `/admin/b/products/products/...` CRUD shape.
+pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    match repo::products::restore(ctx, id).await {
+        Ok(record) => ok_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
     }

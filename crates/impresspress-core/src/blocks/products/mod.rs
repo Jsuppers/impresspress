@@ -1481,6 +1481,18 @@ crate::impresspress_feature_block! {
                     .path_params_schema(id_path_schema.clone())
                     .output_schema(product_duplicate_schema)
                     .tags(&["products", "seller"]),
+                // Admin-only, not "own product": the door back out of a
+                // soft delete. It sits on the product-by-ID URL rather than
+                // under `/api/admin/products/...` because restore addresses
+                // one row by ID with no admin-CRUD shape around it; `Admin`
+                // here (not `Authenticated`) is what actually gates it.
+                BlockEndpoint::post("/b/products/api/products/{id}/restore")
+                    .summary("Restore a soft-deleted product")
+                    .description("Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(id_path_schema.clone())
+                    .output_schema(record_schema(product_schema.clone()))
+                    .tags(&["products"]),
                 BlockEndpoint::get("/b/products/api/products/{product_id}/offers")
                     .summary("List own product offers")
                     .auth(AuthLevel::Authenticated)

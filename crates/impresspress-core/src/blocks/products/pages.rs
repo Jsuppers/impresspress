@@ -422,6 +422,18 @@ fn render_overview_empty_state(products_count: i64, user_products_enabled: bool)
 pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
     let search = msg.query("search").to_string();
+    // The default list is live products. `?view=deleted` is the only way to
+    // reach a soft-deleted row from this page — without it, soft delete
+    // would be a one-way door: a deleted product would be unreachable by
+    // any UI and there would be no way back to restore it.
+    let deleted_view = msg.query("view") == "deleted";
+    // Carried through the search box and pagination links below so acting
+    // on either one doesn't silently bounce the admin back to the live view.
+    let base_href = if deleted_view {
+        "/b/products/admin/manage?view=deleted"
+    } else {
+        "/b/products/admin/manage"
+    };
 
     let mut filters = Vec::new();
     if let Some(search) = super::handlers::name_like_filter(&search) {
@@ -432,51 +444,114 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         field: "created_at".into(),
         desc: true,
     }];
-    // The soft-delete filter used to be hand-written above; `repo::products::list_page`
-    // now appends it, so `filters` only needs to carry the search narrowing.
-    let result =
-        repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await;
+    // `list_page` appends the live-only filter; `list_deleted` appends the
+    // opposite one. Both append onto this same caller-supplied `filters`,
+    // so the search box narrows either view the same way.
+    let result = if deleted_view {
+        repo::products::list_deleted(ctx, page as i64, page_size as i64, filters, Some(sort)).await
+    } else {
+        repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await
+    };
 
     let new_product_button = html! {
         a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ New Product" }
     };
 
+    let view_tabs = html! {
+        div .products-tabs {
+            (components::tab_navigation(vec![
+                components::Tab {
+                    active: !deleted_view,
+                    href: "/b/products/admin/manage",
+                    label: "Active",
+                    icon: None,
+                },
+                components::Tab {
+                    active: deleted_view,
+                    href: "/b/products/admin/manage?view=deleted",
+                    label: "Deleted",
+                    icon: Some(icons::trash()),
+                },
+            ]))
+        }
+    };
+
     let content = html! {
         (admin_tabs("products"))
-        (components::page_header("Products", Some("Create, publish, and share the things you sell"), Some(new_product_button)))
+        (components::page_header(
+            "Products",
+            Some(if deleted_view {
+                "Restore a product to bring it back into your catalog — a deleted product cannot be edited until it is restored"
+            } else {
+                "Create, publish, and share the things you sell"
+            }),
+            if deleted_view { None } else { Some(new_product_button) },
+        ))
+        (view_tabs)
 
         div .filter-bar {
-            (components::search_input("search", "Search by product name", "/b/products/admin/manage", "#products-content"))
+            (components::search_input("search", "Search by product name", base_href, "#products-content"))
         }
 
         div #products-content {
             @match &result {
                 Ok(list) => {
-                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", record.id)).collect();
-                    @let cols = [
-                        components::TableCol { label: "Name", width: None },
-                        components::TableCol { label: "Availability", width: None },
-                        components::TableCol { label: "Owner", width: None },
-                        components::TableCol { label: "Currency", width: None },
-                        components::TableCol { label: "Updated", width: None },
-                    ];
-                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
-                        let updated = record.str_field("updated_at");
-                        let seller_owned = record.str_field("owner_kind") == "user";
-                        vec![
-                            html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Open to edit pricing and checkout" } } },
-                            html! { div .products-status-stack { (components::status_badge(record.str_field("status"))) @if seller_owned { (components::status_badge(record.str_field("approval_status"))) } } },
-                            html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
-                            html! { span .font-medium { (record.str_field("currency")) } },
-                            html! { span .text-muted .text-sm { (updated.get(..10).unwrap_or("—")) } },
-                        ]
-                    }).collect();
-                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {
-                        (components::empty_state(icons::package(), "No products found", "Try a different search, or create your first product.", Some(html! {
-                            a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
-                        })))
-                    }))
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/admin/manage"))
+                    @if deleted_view {
+                        @let cols = [
+                            components::TableCol { label: "Name", width: None },
+                            components::TableCol { label: "Owner", width: None },
+                            components::TableCol { label: "Currency", width: None },
+                            components::TableCol { label: "Deleted", width: None },
+                            components::TableCol { label: "", width: None },
+                        ];
+                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                            let deleted_at = record.str_field("deleted_at");
+                            let seller_owned = record.str_field("owner_kind") == "user";
+                            let restore_url = format!("/b/products/api/products/{}/restore", record.id);
+                            vec![
+                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
+                                html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
+                                html! { span .font-medium { (record.str_field("currency")) } },
+                                html! { span .text-muted .text-sm { (deleted_at.get(..10).unwrap_or("—")) } },
+                                html! {
+                                    button .btn .btn--secondary .btn--sm type="button"
+                                        hx-post=(restore_url)
+                                        hx-swap="none"
+                                        hx-on--after-request="if(event.detail.successful){location.reload()}"
+                                    { "Restore" }
+                                },
+                            ]
+                        }).collect();
+                        (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
+                            (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
+                        }))
+                    } @else {
+                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", record.id)).collect();
+                        @let cols = [
+                            components::TableCol { label: "Name", width: None },
+                            components::TableCol { label: "Availability", width: None },
+                            components::TableCol { label: "Owner", width: None },
+                            components::TableCol { label: "Currency", width: None },
+                            components::TableCol { label: "Updated", width: None },
+                        ];
+                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                            let updated = record.str_field("updated_at");
+                            let seller_owned = record.str_field("owner_kind") == "user";
+                            vec![
+                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Open to edit pricing and checkout" } } },
+                                html! { div .products-status-stack { (components::status_badge(record.str_field("status"))) @if seller_owned { (components::status_badge(record.str_field("approval_status"))) } } },
+                                html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
+                                html! { span .font-medium { (record.str_field("currency")) } },
+                                html! { span .text-muted .text-sm { (updated.get(..10).unwrap_or("—")) } },
+                            ]
+                        }).collect();
+                        (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {
+                            (components::empty_state(icons::package(), "No products found", "Try a different search, or create your first product.", Some(html! {
+                                a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
+                            })))
+                        }))
+                    }
+                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
                 }
                 Err(e) => { div .login-error { "Error: " (e.message) } }
             }

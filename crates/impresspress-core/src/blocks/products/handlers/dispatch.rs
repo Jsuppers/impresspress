@@ -319,6 +319,7 @@ pub(crate) enum UserRoute {
     UpdateProduct,
     DeleteProduct,
     DuplicateProduct,
+    RestoreProduct,
     ListOffers,
     GetOffer,
     PreviewManagedOffer,
@@ -479,6 +480,18 @@ pub(in crate::blocks::products) const USER_ROUTES: &[EndpointRoute<UserRoute>] =
         HttpMethod::Post,
         "/b/products/products/{id}/duplicate",
         UserRoute::DuplicateProduct,
+    ),
+    // Admin-only despite living on the user dispatch table: the door back
+    // out of `soft_delete`. It addresses a product directly by ID rather
+    // than through the `/admin/b/products/products/...` CRUD shape, so it
+    // is declared here rather than in `ADMIN_ROUTES` — its Admin tier comes
+    // from the endpoint declared in `mod.rs`, enforced centrally before
+    // `handle_user` is ever called, not from which table it's dispatched
+    // through.
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/products/products/{id}/restore",
+        UserRoute::RestoreProduct,
     ),
     EndpointRoute::new(
         HttpMethod::Get,
@@ -831,6 +844,7 @@ pub async fn handle_user(
         UserRoute::UpdateProduct => product::handle_user_update_product(ctx, msg, input).await,
         UserRoute::DeleteProduct => product::handle_user_delete_product(ctx, msg).await,
         UserRoute::DuplicateProduct => product::handle_user_duplicate_product(ctx, msg).await,
+        UserRoute::RestoreProduct => product::handle_restore_product(ctx, msg).await,
         UserRoute::PreviewOffer => commerce::handle_preview(ctx, input).await,
         UserRoute::ListOffers => offers::handle_list(ctx, msg, offers::OfferAccess::Owner).await,
         UserRoute::GetOffer => offers::handle_get(ctx, msg, offers::OfferAccess::Owner).await,

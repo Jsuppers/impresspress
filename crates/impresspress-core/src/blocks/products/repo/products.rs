@@ -66,6 +66,35 @@ pub(crate) async fn list_page(
     db::paginated_list(ctx, TABLE, page, page_size, filters, sort).await
 }
 
+/// List one page of soft-deleted products. `filters` narrows the deleted
+/// set; it cannot widen it — same append-only contract as `list_page`.
+///
+/// This is the one deliberate, named exception to this module's live-only
+/// rule: every other read here is unreachable for a soft-deleted row by
+/// design, which is exactly why an admin needs one door that finds them —
+/// otherwise a deleted product could never be located in order to restore
+/// it, making soft delete permanent in practice.
+pub(crate) async fn list_deleted(
+    ctx: &dyn Context,
+    page: i64,
+    page_size: i64,
+    mut filters: Vec<Filter>,
+    sort: Option<Vec<SortField>>,
+) -> Result<RecordList, WaferError> {
+    filters.push(Filter {
+        field: "deleted_at".to_string(),
+        operator: FilterOp::IsNotNull,
+        value: Value::Null,
+    });
+    let sort = sort.unwrap_or_else(|| {
+        vec![SortField {
+            field: "created_at".to_string(),
+            desc: true,
+        }]
+    });
+    db::paginated_list(ctx, TABLE, page, page_size, filters, sort).await
+}
+
 /// Count live products matching `filters`.
 pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, WaferError> {
     let mut all = filters.to_vec();
@@ -198,6 +227,39 @@ mod tests {
         let list = list_page(&ctx, 1, 50, vec![], None).await.expect("list");
         let ids: Vec<&str> = list.records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
+    }
+
+    #[tokio::test]
+    async fn list_deleted_returns_only_soft_deleted_rows() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+        seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
+        let list = list_deleted(&ctx, 1, 50, vec![], None)
+            .await
+            .expect("list_deleted");
+        let ids: Vec<&str> = list.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["gone"]);
+    }
+
+    // Mirrors `caller_filters_are_added_to_the_soft_delete_filter` for the
+    // inverse predicate: a caller filter that matches a live row must not
+    // let that live row leak into the deleted view.
+    #[tokio::test]
+    async fn list_deleted_caller_filters_do_not_admit_live_rows() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+        let status_active = Filter {
+            field: "status".to_string(),
+            operator: FilterOp::Equal,
+            value: json!("active"),
+        };
+        let list = list_deleted(&ctx, 1, 50, vec![status_active], None)
+            .await
+            .expect("list_deleted");
+        assert!(
+            list.records.is_empty(),
+            "a live active row must not appear in the deleted view"
+        );
     }
 
     #[tokio::test]
