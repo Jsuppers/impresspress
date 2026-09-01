@@ -885,6 +885,131 @@ async fn catalog_get_hides_non_active() {
 }
 
 // ============================================================
+// Soft-deleted products stay off every customer-facing surface
+// ============================================================
+//
+// The catalog historically filtered on `status` alone, so a soft-deleted
+// product that was still `active` stayed listed and purchasable. This is
+// the hole soft delete would otherwise open; these tests pin that a
+// soft-deleted row is invisible on every customer-facing read.
+
+/// Mark a product soft-deleted the way the (future) soft-delete path will:
+/// writing `deleted_at` directly, bypassing any handler.
+async fn soft_delete_product(ctx: &crate::test_support::TestContext, id: &str) {
+    wafer_core::clients::database::update(
+        ctx,
+        super::super::repo::products::TABLE,
+        id,
+        HashMap::from([(
+            "deleted_at".to_string(),
+            serde_json::json!("2026-09-01T00:00:00Z"),
+        )]),
+    )
+    .await
+    .expect("soft delete");
+}
+
+/// Build an active, approved product with one published offer through the
+/// same repo functions `stripe::handle_checkout` calls, so checkout has a
+/// real purchasable offer to refuse once the product is soft-deleted.
+async fn seed_published_offer(ctx: &crate::test_support::TestContext, product_id: &str) -> String {
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), serde_json::json!("Checkout product"));
+    data.insert("status".to_string(), serde_json::json!("active"));
+    seed(ctx, "impresspress__products__products", product_id, data).await;
+
+    let definition: super::super::contracts::OfferDefinitionRequest =
+        serde_json::from_value(serde_json::json!({
+            "name": "Plan",
+            "mode": "payment",
+            "currency": "usd",
+            "pricing_model": "fixed",
+            "usage_type": "licensed",
+            "billing_scheme": "per_unit",
+            "tax_behavior": "exclusive",
+            "components": [{
+                "key": "price",
+                "label": "Plan",
+                "required": true,
+                "amount": {"type": "fixed", "unit_amount_minor": 1000}
+            }]
+        }))
+        .expect("offer definition");
+    let offer = super::super::repo::offers::create(ctx, product_id, "admin_1", &definition)
+        .await
+        .expect("create offer");
+    super::super::repo::offers::publish(ctx, product_id, &offer.offer.id)
+        .await
+        .expect("publish offer");
+    offer.offer.id
+}
+
+#[tokio::test]
+async fn catalog_list_omits_a_soft_deleted_active_product() {
+    let ctx = ctx().await;
+
+    let mut keep = HashMap::new();
+    keep.insert("name".to_string(), serde_json::json!("Keep"));
+    keep.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "keep", keep).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/catalog", "");
+    let out = dispatch_user(&ctx, msg, input).await;
+    let body = output_to_json(out).await;
+    let ids: Vec<&str> = body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["keep"]);
+}
+
+#[tokio::test]
+async fn catalog_detail_404s_for_a_soft_deleted_active_product() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/catalog/gone", "");
+    let out = dispatch_user(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// Characterisation test, not a regression check: `repo::offers::get_public`
+/// already refuses a soft-deleted product's offer today (before this task's
+/// migration), so this must PASS before and after. It pins the behaviour the
+/// migration must not lose, since checkout stops going through
+/// `PRODUCTS_TABLE` directly once this task lands.
+#[tokio::test]
+async fn checkout_refuses_a_soft_deleted_product() {
+    let ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let offer_id = seed_published_offer(&ctx, "gone").await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    let out = super::super::stripe::handle_checkout(&ctx, &msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "checkout must refuse a soft-deleted product's offer"
+    );
+}
+
+// ============================================================
 // Group products endpoint
 // ============================================================
 

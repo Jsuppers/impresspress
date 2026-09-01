@@ -1,6 +1,6 @@
 //! Typed offer lifecycle handlers shared by administrators and seller owners.
 
-use wafer_core::clients::database::{self as db, Record};
+use wafer_core::clients::database::Record;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use super::seller_policy;
@@ -8,8 +8,8 @@ use crate::{
     blocks::products::{
         contracts::{OfferDefinitionRequest, PricingPreviewRequest},
         offer_pricing,
-        repo::offers,
-        stripe, PRODUCTS_TABLE,
+        repo::{offers, products},
+        stripe,
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthorized, ok_json},
     util::RecordExt,
@@ -38,7 +38,7 @@ pub(super) async fn verify_product(
     if product_id.is_empty() {
         return Err(err_bad_request("Missing product ID"));
     }
-    let product = match db::get(ctx, PRODUCTS_TABLE, product_id).await {
+    let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == ErrorCode::NotFound => {
             return Err(err_not_found("Product not found"));

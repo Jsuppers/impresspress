@@ -2,10 +2,7 @@
 
 use serde_json::Value;
 use wafer_block_crypto::primitives;
-use wafer_core::clients::{
-    config,
-    database::{self as db, Record},
-};
+use wafer_core::clients::{config, database::Record};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
@@ -16,8 +13,8 @@ use crate::{
             COMMERCE_SCHEMA_VERSION,
         },
         offer_pricing,
-        repo::{offers, payment_links, purchases},
-        stripe_secret_operations_allowed, PRODUCTS_TABLE,
+        repo::{offers, payment_links, products, purchases},
+        stripe_secret_operations_allowed,
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
     util::{sha256_hex, RecordExt},
@@ -182,20 +179,16 @@ pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) 
     if product_id.is_empty() {
         return err_bad_request("Missing product ID");
     }
-    let product = match db::get(ctx, PRODUCTS_TABLE, product_id).await {
+    let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == ErrorCode::NotFound => {
             return err_not_found("Product not found");
         }
         Err(error) => return err_internal("Could not load product", error),
     };
-    let deleted = product
-        .data
-        .get("deleted_at")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
-    if product.str_field("status") != "active"
-        || product.str_field("approval_status") != "approved"
-        || deleted
+    // `products::get` already answers `NotFound` for a soft-deleted row; only
+    // `status`/`approval_status` are this handler's own rules to enforce.
+    if product.str_field("status") != "active" || product.str_field("approval_status") != "approved"
     {
         return err_not_found("Product not found");
     }
