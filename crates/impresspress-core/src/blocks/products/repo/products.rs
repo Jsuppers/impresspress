@@ -22,10 +22,23 @@ use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::RecordExt;
-
 pub(crate) const TABLE: &str = "impresspress__products__products";
 
+// Column invariant — `deleted_at` holds exactly two kinds of value:
+//
+//   * SQL NULL         — the product is live;
+//   * an RFC3339 stamp — the instant it was soft-deleted.
+//
+// It is never the empty string, and never any other non-timestamp text. The
+// only writers are `soft_delete` (a fresh `now_rfc3339()`) and `restore`
+// (`Value::Null`); every handler that forwards a caller-supplied body strips
+// the field first (`handlers::product::INTERNAL_FIELDS`), which
+// `no_handler_path_can_write_an_empty_deleted_at` in
+// `tests/seller_governance_tests.rs` pins end-to-end across all four
+// create/update handlers. The invariant matters because `''` would otherwise be a
+// third state: SQL (and so `live_filter`, `list_deleted`, and migration
+// 005's partial unique slug index) reads it as deleted, while any
+// string-emptiness check reads it as live.
 /// `deleted_at IS NULL` — the predicate that distinguishes a live product
 /// from a soft-deleted one.
 pub(crate) fn live_filter() -> Filter {
@@ -189,13 +202,21 @@ pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, Wafer
     update(ctx, id, data).await
 }
 
-// `RecordExt::str_field` (util.rs) collapses both a missing key and a JSON
-// `Null` value to `""`. A live row's `deleted_at` decodes to exactly one of
-// those on either backend (SQLite and Postgres both store SQL NULL for an
-// unset column and both round-trip it to `Value::Null`), so checking
-// "empty" here is correct on both without a backend-specific branch.
+// The single definition of "deleted" for one already-loaded row, and the
+// exact per-record twin of [`live_filter`]'s `deleted_at IS NULL`: a row is
+// deleted iff its `deleted_at` is not SQL NULL.
+//
+// Deliberately reads `record.data` rather than `RecordExt::str_field`.
+// `str_field` collapses a missing key, a JSON `Null` and the empty string all
+// to `""`, so it cannot tell NULL from `''` — and SQL can: `'' IS NOT NULL`.
+// A string-emptiness check therefore calls a `deleted_at = ''` row live while
+// every list/count read (and the partial unique slug index from migration
+// 005, which is also keyed on `deleted_at IS NULL`) calls it deleted. Reading
+// the raw value keeps both sides on SQL's answer. A missing key and
+// `Value::Null` are the two shapes an unset column decodes to on either
+// backend, and both mean NULL.
 fn is_deleted(record: &Record) -> bool {
-    !record.str_field("deleted_at").is_empty()
+    !matches!(record.data.get("deleted_at"), None | Some(Value::Null))
 }
 
 #[cfg(test)]
@@ -205,7 +226,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::{test_support::TestContext, util::RecordExt};
 
     async fn seed(ctx: &TestContext, id: &str, deleted_at: Option<&str>) {
         let mut data = HashMap::from([
@@ -276,6 +297,47 @@ mod tests {
             list.records.is_empty(),
             "a live active row must not appear in the deleted view"
         );
+    }
+
+    // `live_filter()` (`deleted_at IS NULL`) is the predicate every list and
+    // count read hands to SQL, so the per-record check `get`/`get_deleted`
+    // apply has to be the same predicate — otherwise "live" means one thing
+    // to a single-row read and another to a listing. An empty-string
+    // `deleted_at` is precisely where the two can disagree: SQL says
+    // `'' IS NOT NULL`, while a string-emptiness check says "live".
+    #[tokio::test]
+    async fn an_empty_deleted_at_reads_the_same_way_through_every_door() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "blank", Some("")).await;
+
+        let get_says_live = get(&ctx, "blank").await.is_ok();
+        let list_says_live = !list_page(&ctx, 1, 50, vec![], None)
+            .await
+            .expect("list")
+            .records
+            .is_empty();
+        assert_eq!(
+            get_says_live, list_says_live,
+            "`get` and `list_page` must classify the same row the same way"
+        );
+
+        let get_deleted_resolves = get_deleted(&ctx, "blank").await.is_ok();
+        let list_deleted_shows_it = !list_deleted(&ctx, 1, 50, vec![], None)
+            .await
+            .expect("list_deleted")
+            .records
+            .is_empty();
+        assert_eq!(
+            get_deleted_resolves, list_deleted_shows_it,
+            "`get_deleted` and `list_deleted` must classify the same row the same way"
+        );
+
+        // And the shared answer is SQL's: `'' IS NOT NULL`, so the row is
+        // deleted. Pinning the direction as well as the agreement stops a
+        // future "fix" from collapsing both onto the wrong side, where a
+        // `''`-stamped row would list as live while the partial unique slug
+        // index (`WHERE deleted_at IS NULL`) still claims its slug.
+        assert!(!get_says_live, "an empty `deleted_at` is not NULL, so the row is deleted");
     }
 
     #[tokio::test]
