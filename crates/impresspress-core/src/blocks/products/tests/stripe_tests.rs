@@ -15,7 +15,7 @@ use super::harness::*;
 use crate::{
     blocks::products::{
         contracts::{OfferDefinitionRequest, PaymentLinkCreateRequest, PricingPreviewRequest},
-        offer_pricing, repo, stripe, PRODUCTS_TABLE,
+        offer_pricing, repo, stripe,
     },
     util::{hex_encode, sha256_hex, RecordExt},
 };
@@ -105,7 +105,7 @@ async fn seed_active_offer(
 ) -> String {
     seed(
         ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Configurable print")),
@@ -3239,7 +3239,7 @@ async fn catalog_sync_persists_fixed_prices_and_reuses_them_in_checkout_and_paym
         .unwrap();
     assert_eq!(fixed.stripe_price_id, "price_catalog_setup");
     assert!(dynamic.stripe_price_id.is_empty());
-    let product = db::get(&ctx, PRODUCTS_TABLE, product_id)
+    let product = db::get(&ctx, repo::products::TABLE, product_id)
         .await
         .expect("synced product row");
     assert_eq!(product.str_field("stripe_product_id"), "prod_catalog");
@@ -3358,7 +3358,7 @@ async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product(
         .components
         .iter()
         .all(|component| component.stripe_price_id.is_empty()));
-    let persisted_product = db::get(&ctx, PRODUCTS_TABLE, product_id).await.unwrap();
+    let persisted_product = db::get(&ctx, repo::products::TABLE, product_id).await.unwrap();
     assert_eq!(
         persisted_product.str_field("stripe_product_id"),
         "prod_catalog_retry"
@@ -3448,7 +3448,7 @@ async fn catalog_reconciliation_refreshes_product_metadata_and_reactivates_fixed
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -3548,7 +3548,7 @@ async fn catalog_reconciliation_replaces_a_missing_product_and_its_dependent_pri
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -3697,7 +3697,7 @@ async fn subscription_catalog_sync_creates_and_persists_a_strict_recurring_price
     let product_id = "subscription_catalog_product";
     seed(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Quarterly care plan")),
@@ -3796,7 +3796,7 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -3975,7 +3975,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -4025,7 +4025,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
         "active"
     );
     assert_eq!(
-        db::get(&ctx, PRODUCTS_TABLE, product_id)
+        db::get(&ctx, repo::products::TABLE, product_id)
             .await
             .unwrap()
             .str_field("status"),
@@ -4067,7 +4067,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
     let suspended = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
     assert_eq!(suspended["status"], "suspended");
     assert_eq!(
-        db::get(&ctx, PRODUCTS_TABLE, product_id)
+        db::get(&ctx, repo::products::TABLE, product_id)
             .await
             .unwrap()
             .str_field("status"),
@@ -4386,7 +4386,7 @@ async fn seed_active_offer_with_restricted_variables(
 ) -> String {
     seed(
         ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Configurable print")),
@@ -4589,7 +4589,7 @@ async fn checkout_and_payment_links_enforce_offer_total_policy_before_stripe() {
         .await
     );
 
-    let product = db::get(&ctx, PRODUCTS_TABLE, "product_total_policy")
+    let product = db::get(&ctx, repo::products::TABLE, "product_total_policy")
         .await
         .unwrap();
     let error = stripe::create_payment_link(
@@ -4623,7 +4623,7 @@ async fn payment_link_redelivery_resumes_partial_order_and_backfills_snapshot() 
     let product_id = "product_payment_link_resume";
     seed(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Care plan")),
@@ -4922,7 +4922,7 @@ async fn payment_link_webhook_reconciles_exact_order_and_rejects_tampering() {
     )
     .await
     .unwrap();
-    let product = db::get(&ctx, PRODUCTS_TABLE, "product_payment_link_webhook")
+    let product = db::get(&ctx, repo::products::TABLE, "product_payment_link_webhook")
         .await
         .unwrap();
     let link = stripe::create_payment_link(

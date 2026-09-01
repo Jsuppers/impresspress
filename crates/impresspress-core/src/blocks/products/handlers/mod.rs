@@ -44,9 +44,6 @@ pub(in crate::blocks::products) use product::name_like_filter;
 use wafer_core::clients::database as db;
 use wafer_run::context::Context;
 
-/// Products catalog table — one row per product offering.
-pub(crate) const PRODUCTS_TABLE: &str = "impresspress__products__products";
-
 /// Product groups (categories / bundles) table.
 pub(crate) const GROUPS_TABLE: &str = "impresspress__products__groups";
 

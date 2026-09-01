@@ -20,7 +20,6 @@ use super::{
         PricingPreviewRequest, WebhookEventList, WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
-    PRODUCTS_TABLE,
 };
 use crate::{
     http::{
@@ -964,7 +963,7 @@ async fn handle_offer_checkout(
         }
         Err(error) => return err_internal("Could not load offer", error),
     };
-    let product = match db::get(ctx, PRODUCTS_TABLE, &offer.product_id).await {
+    let product = match repo::products::get(ctx, &offer.product_id).await {
         Ok(product) => product,
         Err(error) => return err_internal("Could not load offer product", error),
     };
@@ -1664,9 +1663,8 @@ async fn sync_offer_catalog_inner(
         )
         .await?;
         stripe_product_id = validate_stripe_product(&response, None, livemode)?;
-        db::update(
+        repo::products::update(
             ctx,
-            PRODUCTS_TABLE,
             &product.id,
             HashMap::from([(
                 "stripe_product_id".to_string(),
@@ -1855,7 +1853,7 @@ pub(crate) async fn sync_offer_catalog(
             "Stripe catalog synchronization is disabled in the browser runtime",
         ));
     }
-    let product = db::get(ctx, PRODUCTS_TABLE, product_id).await?;
+    let product = repo::products::get(ctx, product_id).await?;
     let managed = repo::offers::get_for_product(ctx, product_id, offer_id).await?;
     repo::offers::mark_syncing(ctx, offer_id).await?;
     match sync_offer_catalog_inner(ctx, &product, managed).await {
@@ -1938,7 +1936,7 @@ pub(crate) async fn archive_offer_catalog(
             "Stripe catalog archival is disabled in the browser runtime",
         ));
     }
-    let product = db::get(ctx, PRODUCTS_TABLE, product_id).await?;
+    let product = repo::products::get(ctx, product_id).await?;
     let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
     let livemode = stripe_client::secret_livemode(&stripe_key).ok_or_else(|| {
         WaferError::new(
@@ -2668,7 +2666,7 @@ async fn reconcile_payment_link_session(
             "Payment Link Checkout Session payment is not complete",
         ));
     }
-    let product = db::get(ctx, PRODUCTS_TABLE, &offer.product_id).await?;
+    let product = repo::products::get(ctx, &offer.product_id).await?;
     pricing.amounts.discount_minor = discount;
     pricing.amounts.tax_minor = tax;
     pricing.amounts.shipping_minor = shipping;

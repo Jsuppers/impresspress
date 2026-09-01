@@ -5,7 +5,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{AuthLevel, Block, ErrorCode, OutputStream};
 
 use super::{
-    super::{contracts::OfferStatus, repo, ProductsBlock, PRODUCTS_TABLE},
+    super::{contracts::OfferStatus, repo, ProductsBlock},
     harness::{
         admin_create_msg, admin_get_msg, create_msg, ctx_with, dispatch_admin, dispatch_user,
         get_msg, output_is_error, output_to_html, output_to_json, seed, update_msg,
@@ -150,7 +150,7 @@ async fn admin_moderation_approves_rejects_and_resubmits_only_ready_sellers() {
         )
         .await
     );
-    let unchanged = db::get(&test_ctx, PRODUCTS_TABLE, &blocked_id)
+    let unchanged = db::get(&test_ctx, repo::products::TABLE, &blocked_id)
         .await
         .expect("blocked product");
     assert_eq!(unchanged.data["status"], "pending_review");
@@ -199,7 +199,7 @@ async fn suspension_archives_catalog_blocks_mutations_and_reactivation_stays_dra
             .is_some()
     );
 
-    let product = db::get(&test_ctx, PRODUCTS_TABLE, &product_id)
+    let product = db::get(&test_ctx, repo::products::TABLE, &product_id)
         .await
         .expect("governed product");
     assert_eq!(product.data["status"], "archived");
@@ -253,7 +253,7 @@ async fn suspension_archives_catalog_blocks_mutations_and_reactivation_stays_dra
             .data["suspended_at"]
             .is_null()
     );
-    let product = db::get(&test_ctx, PRODUCTS_TABLE, &product_id)
+    let product = db::get(&test_ctx, repo::products::TABLE, &product_id)
         .await
         .expect("reactivated product");
     assert_eq!(product.data["status"], "draft");
@@ -398,7 +398,7 @@ async fn activation_validates_merged_values_not_stale_record() {
     pd.insert("product_template_id".to_string(), json!("simple_product"));
     pd.insert("currency".to_string(), json!("USD"));
     pd.insert("status".to_string(), json!("draft"));
-    seed(&test_ctx, PRODUCTS_TABLE, "prod_legacy_ccy", pd).await;
+    seed(&test_ctx, repo::products::TABLE, "prod_legacy_ccy", pd).await;
 
     let (msg, input) = update_msg(
         "/b/products/products/prod_legacy_ccy",
@@ -416,7 +416,7 @@ async fn activation_validates_merged_values_not_stale_record() {
     pd.insert("product_template_id".to_string(), json!("simple_product"));
     pd.insert("currency".to_string(), json!("USD"));
     pd.insert("status".to_string(), json!("draft"));
-    seed(&test_ctx, PRODUCTS_TABLE, "prod_stale_ccy", pd).await;
+    seed(&test_ctx, repo::products::TABLE, "prod_stale_ccy", pd).await;
 
     let (msg, input) = update_msg(
         "/b/products/products/prod_stale_ccy",

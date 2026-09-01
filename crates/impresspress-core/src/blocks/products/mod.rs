@@ -13,9 +13,7 @@ mod stripe_provider;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use handlers::{
-    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCTS_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
-};
+pub(crate) use handlers::{GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE};
 pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
     variables::TABLE as VARIABLES_TABLE,
@@ -1022,7 +1020,7 @@ crate::impresspress_feature_block! {
             // source for both runtime `migrations::apply()` and the
             // Cloudflare D1 build).
             .collections(vec![
-                CollectionSchema::new(PRODUCTS_TABLE),
+                CollectionSchema::new(repo::products::TABLE),
                 CollectionSchema::new(GROUPS_TABLE),
                 CollectionSchema::new(TYPES_TABLE),
                 CollectionSchema::new(PURCHASES_TABLE),

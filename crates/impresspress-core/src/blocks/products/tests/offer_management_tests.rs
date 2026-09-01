@@ -7,7 +7,7 @@ use wafer_run::{AuthLevel, Block, ErrorCode};
 use super::{
     super::{
         contracts::{OfferDefinitionRequest, OfferStatus},
-        repo, ProductsBlock, PRODUCTS_TABLE,
+        repo, ProductsBlock,
     },
     harness::{
         admin_create_msg, admin_get_msg, create_msg, ctx, ctx_with, delete_msg, dispatch_admin,
@@ -72,7 +72,7 @@ fn definition_request(unit_amount_minor: i64) -> OfferDefinitionRequest {
 async fn seed_product(test_ctx: &crate::test_support::TestContext, id: &str, owner_id: &str) {
     seed(
         test_ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         id,
         HashMap::from([
             ("name".to_string(), json!("Print shop")),
@@ -463,7 +463,7 @@ async fn storefront_detail_exposes_only_active_safe_configuration() {
     let test_ctx = ctx().await;
     seed(
         &test_ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         "product_storefront",
         HashMap::from([
             ("name".to_string(), json!("Public print shop")),
@@ -515,7 +515,7 @@ async fn storefront_detail_exposes_only_active_safe_configuration() {
 
     seed(
         &test_ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         "pending_storefront",
         HashMap::from([
             ("name".to_string(), json!("Pending")),

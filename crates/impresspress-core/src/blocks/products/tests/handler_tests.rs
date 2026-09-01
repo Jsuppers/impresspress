@@ -135,6 +135,25 @@ async fn admin_delete_product() {
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
+/// A soft-deleted product must 404 from the admin detail endpoint the same
+/// as one that never existed — `handle_get_product` used to call
+/// `db::get(ctx, PRODUCTS_TABLE, id)` directly, bypassing the soft-delete
+/// filter entirely.
+#[tokio::test]
+async fn admin_product_detail_404s_for_a_soft_deleted_product() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/admin/b/products/products/gone");
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
 // ============================================================
 // Admin Group CRUD
 // ============================================================
@@ -554,6 +573,31 @@ async fn admin_stats_repository_failure_surfaces_as_internal_error() {
         output_is_error(out, ErrorCode::Internal).await,
         "a genuine repository failure must surface as Internal, not a fabricated all-zero stats body"
     );
+}
+
+/// Two counters read the products table with no filter at all (`total_products`
+/// and `active_products`), so a soft-deleted product would still be counted —
+/// both the admin dashboard and this stats endpoint would overstate the
+/// catalog.
+#[tokio::test]
+async fn stats_do_not_count_soft_deleted_products() {
+    let ctx = ctx().await;
+
+    let mut live = HashMap::new();
+    live.insert("name".to_string(), serde_json::json!("Live"));
+    live.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "live", live).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/admin/b/products/stats");
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(body["total_products"].as_i64().unwrap(), 1);
+    assert_eq!(body["active_products"].as_i64().unwrap(), 1);
 }
 
 // ============================================================

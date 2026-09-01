@@ -8,7 +8,7 @@ use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::products::{contracts::OfferStatus, repo, stripe, PRODUCTS_TABLE},
+    blocks::products::{contracts::OfferStatus, repo, stripe},
     http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
     util::{stamp_updated, RecordExt},
 };
@@ -31,10 +31,17 @@ fn equal(field: &str, value: impl Into<Value>) -> Filter {
 }
 
 async fn seller_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
+    // No repo::products list-all shape exists (list_page is paginated), so this
+    // reads the table name and the soft-delete predicate off the repo module —
+    // the two pieces `live_filter` is exported for — rather than hand-rolling
+    // either.
     db::list_all(
         ctx,
-        PRODUCTS_TABLE,
-        vec![equal("owner_id", Value::String(user_id.to_string()))],
+        repo::products::TABLE,
+        vec![
+            equal("owner_id", Value::String(user_id.to_string())),
+            repo::products::live_filter(),
+        ],
     )
     .await
 }
@@ -80,7 +87,7 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
-    let product = match db::get(ctx, PRODUCTS_TABLE, id).await {
+    let product = match repo::products::get(ctx, id).await {
         Ok(product) => product,
         Err(error) => return admin_error(error, "Product not found"),
     };
@@ -126,7 +133,7 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
         ])
     };
     stamp_updated(&mut data);
-    match db::update(ctx, PRODUCTS_TABLE, id, data).await {
+    match repo::products::update(ctx, id, data).await {
         Ok(product) => ok_json(&product),
         Err(error) => err_internal("Could not moderate product", error),
     }
@@ -194,7 +201,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             continue;
         };
         stamp_updated(&mut data);
-        if let Err(error) = db::update(ctx, PRODUCTS_TABLE, &product.id, data).await {
+        if let Err(error) = repo::products::update(ctx, &product.id, data).await {
             return err_internal("Could not update seller product state", error);
         }
     }
