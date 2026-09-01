@@ -7,11 +7,17 @@ use std::sync::OnceLock;
 
 use crate::routing::STATIC_PREFIX;
 
-const TOKENS_CSS: &str = include_str!("assets/tokens.css");
-const BASE_CSS: &str = include_str!("assets/base.css");
-const COMPONENTS_CSS: &str = include_str!("assets/components.css");
-const LAYOUT_CSS: &str = include_str!("assets/layout.css");
-const CHARTS_CSS: &str = include_str!("assets/charts.css");
+include!(concat!(env!("OUT_DIR"), "/asset_manifest.rs"));
+
+/// Look up a manifest entry by logical key. Panics on an unknown key: every
+/// call site passes a literal that `build.rs` also knows, so a miss is a build
+/// mismatch, not a runtime condition.
+pub fn entry(logical: &str) -> &'static AssetEntry {
+    ASSETS
+        .iter()
+        .find(|e| e.logical == logical)
+        .unwrap_or_else(|| panic!("asset not in manifest: {logical}"))
+}
 
 /// Itim font binaries, sourced from `impresspress/site-kit`'s `/fonts/` mirror
 /// and committed here so every impresspress deployment ships its own glyphs
@@ -89,49 +95,9 @@ pub fn itim_latin_ext_woff2() -> &'static [u8] {
     ITIM_LATIN_EXT_WOFF2
 }
 
-/// Itim latin woff2 URL with content hash, e.g. `/b/static/itim-latin-a1b2c3d4.woff2`.
-pub fn itim_latin_woff2_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}itim-latin-{}.woff2",
-            short_hash(ITIM_LATIN_WOFF2)
-        )
-    })
-}
-
-/// Itim latin-ext woff2 URL with content hash, e.g. `/b/static/itim-latin-ext-a1b2c3d4.woff2`.
-pub fn itim_latin_ext_woff2_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}itim-latin-ext-{}.woff2",
-            short_hash(ITIM_LATIN_EXT_WOFF2)
-        )
-    })
-}
-
-/// Embedded CSS bundle — concatenation of tokens / base / components / layout.
-/// Served as one file at the URL returned by `css_url()` so a single
-/// `<link rel="stylesheet">` covers everything. The two font URL placeholders
-/// in tokens.css are substituted with the content-hashed worker-bundled
-/// URLs at bundle generation time.
-///
-/// Cached in a `OnceLock`: every CSS-bundle consumer (`css()`, `css_url()`,
-/// and the static-asset handler) used to rebuild this on each call.
-pub fn css_bundle() -> &'static str {
-    static BUNDLE: OnceLock<String> = OnceLock::new();
-    BUNDLE.get_or_init(|| {
-        let tokens = TOKENS_CSS
-            .replace("__ITIM_LATIN_URL__", itim_latin_woff2_url())
-            .replace("__ITIM_LATIN_EXT_URL__", itim_latin_ext_woff2_url());
-        format!("{tokens}\n{BASE_CSS}\n{COMPONENTS_CSS}\n{LAYOUT_CSS}\n{CHARTS_CSS}\n")
-    })
-}
-
-/// The main CSS stylesheet (all design system styles combined).
+/// The assembled CSS bundle, built by `build.rs` from `CSS_ORDER`.
 pub fn css() -> &'static str {
-    css_bundle()
+    include_str!(concat!(env!("OUT_DIR"), "/app.css"))
 }
 
 /// htmx 2.x minified JS.
@@ -532,65 +498,14 @@ mod tests {
     }
 
     #[test]
-    fn css_bundle_includes_all_layers() {
-        let s = super::css_bundle();
-        assert!(s.contains("--primary-color"), "tokens layer missing");
-        assert!(s.contains("box-sizing"), "base layer missing");
-        assert!(
-            s.contains(".btn") || s.contains(".button"),
-            "components layer missing"
-        );
-        assert!(s.contains(".shell"), "layout layer missing");
-    }
-
-    #[test]
     fn brand_accent_matches_tokens_css() {
         // BRAND_ACCENT_HEX exists for CSS-var-less surfaces (emails). It must
         // stay byte-identical to the stylesheet's --primary-color default.
         assert!(
-            super::TOKENS_CSS.contains(&format!("--primary-color: {}", super::BRAND_ACCENT_HEX)),
+            super::css().contains(&format!("--primary-color: {}", super::BRAND_ACCENT_HEX)),
             "BRAND_ACCENT_HEX ({}) does not match --primary-color in tokens.css",
             super::BRAND_ACCENT_HEX
         );
-    }
-
-    #[test]
-    fn css_bundle_substitutes_itim_font_urls() {
-        let s = super::css_bundle();
-        // No raw placeholders left in the served bundle.
-        assert!(
-            !s.contains("__ITIM_LATIN_URL__"),
-            "tokens.css placeholder __ITIM_LATIN_URL__ not substituted"
-        );
-        assert!(
-            !s.contains("__ITIM_LATIN_EXT_URL__"),
-            "tokens.css placeholder __ITIM_LATIN_EXT_URL__ not substituted"
-        );
-        // No reference to the old hardcoded external host.
-        assert!(
-            !s.contains("impresspress.org/fonts/"),
-            "stale impresspress.org font URL still in bundle"
-        );
-        // The hashed worker-bundled URLs are present.
-        assert!(
-            s.contains(super::itim_latin_woff2_url()),
-            "itim-latin URL missing from bundle"
-        );
-        assert!(
-            s.contains(super::itim_latin_ext_woff2_url()),
-            "itim-latin-ext URL missing from bundle"
-        );
-    }
-
-    #[test]
-    fn itim_font_urls_have_content_hash() {
-        for url in [
-            super::itim_latin_woff2_url(),
-            super::itim_latin_ext_woff2_url(),
-        ] {
-            assert!(url.starts_with("/b/static/itim-latin"));
-            assert!(url.ends_with(".woff2"));
-        }
     }
 
     #[test]
@@ -607,7 +522,7 @@ mod tests {
 
     #[test]
     fn tokens_include_new_scale() {
-        let s = super::css_bundle();
+        let s = super::css();
         for tok in [
             "--text-base",
             "--text-2xl",
@@ -738,5 +653,49 @@ mod tests {
             .trim_end_matches(".js");
         assert_eq!(mid.len(), 8, "expected 8-char short hash, got: {mid}");
         assert!(mid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn manifest_covers_core_assets_with_hashed_filenames() {
+        let by_logical = |k: &str| super::ASSETS.iter().find(|e| e.logical == k);
+        for key in ["app.css", "htmx.min.js", "favicon.ico", "itim-latin.woff2"] {
+            let e = by_logical(key).unwrap_or_else(|| panic!("manifest missing {key}"));
+            assert!(e.len > 0, "{key} has zero length");
+            // `app.css` -> `app-a1b2c3d4.css`: stem, dash, 8 hex chars, extension.
+            let stem = key.split_once('.').unwrap().0;
+            let rest = e.filename.strip_prefix(stem).expect("filename keeps its stem");
+            let hash = &rest[1..9];
+            assert_eq!(hash.len(), 8);
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{key}: {hash} not hex");
+        }
+    }
+
+    #[test]
+    fn css_bundle_includes_all_layers_in_order() {
+        let s = super::css();
+        // Tokens must precede every consumer so custom properties are defined
+        // before use; layouts come last so they can override component defaults.
+        // This guard is what keeps Task 5's split honest — it must pass both
+        // before and after the files are reorganised.
+        let tokens = s.find("--primary-color").expect("tokens layer missing");
+        let button = s.find(".btn").expect("button layer missing");
+        let shell = s.find(".shell").expect("shell layout missing");
+        assert!(tokens < button, "tokens must precede components");
+        assert!(button < shell, "components must precede layouts");
+        for marker in [".card", ".data-table", ".badge", ".modal", ".toast",
+                       ".palette", ".stat-", ".charts-css", ".auth-split"] {
+            assert!(s.contains(marker), "missing layer marker: {marker}");
+        }
+    }
+
+    #[test]
+    fn manifest_font_names_appear_in_css_bundle_as_relative_urls() {
+        let css = super::css();
+        for key in ["itim-latin.woff2", "itim-latin-ext.woff2"] {
+            let e = super::ASSETS.iter().find(|e| e.logical == key).unwrap();
+            assert!(css.contains(&format!("url('{}')", e.filename)), "{key} url not rewritten");
+        }
+        assert!(!css.contains("__ITIM_LATIN_URL__"), "placeholder survived");
+        assert!(!css.contains("/b/static/"), "font url must be relative, not absolute");
     }
 }

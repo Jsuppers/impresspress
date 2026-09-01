@@ -212,6 +212,9 @@ tracing = "0.1"
 [lints]
 workspace = true
 
+[build-dependencies]
+sha2 = { workspace = true }
+
 [dev-dependencies]
 # Self dev-dependency with `test-support` so the `tests/` integration crates
 # can `use impresspress_core::test_support::TestContext` (the shared in-memory
