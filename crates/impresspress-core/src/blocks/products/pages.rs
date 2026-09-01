@@ -509,17 +509,13 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(sellers) => sellers,
         Err(error) => return crate::http::err_internal("Could not read seller status", error),
     };
-    let seller_products = match db::list_all(
+    let seller_products = match repo::products::list_all(
         ctx,
-        repo::products::TABLE,
-        vec![
-            Filter {
-                field: "owner_kind".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!("user"),
-            },
-            repo::products::live_filter(),
-        ],
+        vec![Filter {
+            field: "owner_kind".into(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!("user"),
+        }],
     )
     .await
     {
@@ -631,17 +627,13 @@ pub async fn admin_seller_detail(
         Ok(seller) => seller,
         Err(error) => return crate::http::err_internal("Could not read seller status", error),
     };
-    let products = match db::list_all(
+    let products = match repo::products::list_all(
         ctx,
-        repo::products::TABLE,
-        vec![
-            Filter {
-                field: "owner_id".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(&seller.user_id),
-            },
-            repo::products::live_filter(),
-        ],
+        vec![Filter {
+            field: "owner_id".into(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(&seller.user_id),
+        }],
     )
     .await
     {

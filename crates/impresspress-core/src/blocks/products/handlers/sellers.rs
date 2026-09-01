@@ -31,17 +31,9 @@ fn equal(field: &str, value: impl Into<Value>) -> Filter {
 }
 
 async fn seller_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
-    // No repo::products list-all shape exists (list_page is paginated), so this
-    // reads the table name and the soft-delete predicate off the repo module —
-    // the two pieces `live_filter` is exported for — rather than hand-rolling
-    // either.
-    db::list_all(
+    repo::products::list_all(
         ctx,
-        repo::products::TABLE,
-        vec![
-            equal("owner_id", Value::String(user_id.to_string())),
-            repo::products::live_filter(),
-        ],
+        vec![equal("owner_id", Value::String(user_id.to_string()))],
     )
     .await
 }

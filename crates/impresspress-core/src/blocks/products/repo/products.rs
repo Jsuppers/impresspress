@@ -73,6 +73,18 @@ pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, 
     db::count(ctx, TABLE, &all).await
 }
 
+/// List every live product matching `filters`, unpaged. `filters` narrows
+/// the live set; it cannot widen it — same contract as `list_page`, for
+/// call sites (admin seller/product listings) that need the whole matching
+/// set rather than one page.
+pub(crate) async fn list_all(
+    ctx: &dyn Context,
+    mut filters: Vec<Filter>,
+) -> Result<Vec<Record>, WaferError> {
+    filters.push(live_filter());
+    db::list_all(ctx, TABLE, filters).await
+}
+
 // `created_at`/`updated_at` are not stamped here: the database service's
 // `DbExec::create`/`update` default impl (shared by every backend) already
 // fills in whichever of the two the caller didn't supply — see
@@ -153,6 +165,16 @@ mod tests {
         seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
         let list = list_page(&ctx, 1, 50, vec![], None).await.expect("list");
         let ids: Vec<&str> = list.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["live"]);
+    }
+
+    #[tokio::test]
+    async fn list_all_excludes_soft_deleted_rows() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+        seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
+        let records = list_all(&ctx, vec![]).await.expect("list_all");
+        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
     }
 
