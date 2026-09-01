@@ -440,8 +440,18 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         filters.push(search);
     }
 
+    // Each view is ordered by the timestamp its own table shows: the live
+    // list by `created_at`, the deleted list by the `Deleted` column it
+    // renders. Sorting the deleted list by `created_at` would file the
+    // product an admin just deleted under its creation date — for an old
+    // product, the bottom of the list, on the one page whose whole purpose
+    // is undoing a delete that was probably a moment ago.
     let sort = vec![SortField {
-        field: "created_at".into(),
+        field: if deleted_view {
+            "deleted_at".into()
+        } else {
+            "created_at".into()
+        },
         desc: true,
     }];
     // `list_page` appends the live-only filter; `list_deleted` appends the

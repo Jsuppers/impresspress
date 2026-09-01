@@ -2455,6 +2455,61 @@ async fn manage_products_deleted_view_lists_only_deleted_products() {
     assert!(!deleted_html.contains(">live<"), "{deleted_html}");
 }
 
+/// The deleted view's table has a `Deleted` column, so it has to be ordered
+/// by it. Sorting the deleted list `created_at desc` (the live list's order)
+/// puts the product an admin just deleted wherever its creation date happens
+/// to fall — which for an old product is the bottom of the list, on the one
+/// page whose entire purpose is undoing a delete that was probably a moment
+/// ago.
+#[tokio::test]
+async fn manage_products_deleted_view_sorts_by_when_the_product_was_deleted() {
+    let ctx = ctx().await;
+
+    // Created most recently, deleted longest ago: first by `created_at
+    // desc`, last by `deleted_at desc`.
+    let mut stale = HashMap::new();
+    stale.insert("name".to_string(), serde_json::json!("Deleted long ago"));
+    stale.insert("status".to_string(), serde_json::json!("active"));
+    stale.insert(
+        "created_at".to_string(),
+        serde_json::json!("2026-02-01T00:00:00Z"),
+    );
+    stale.insert(
+        "deleted_at".to_string(),
+        serde_json::json!("2026-03-01T00:00:00Z"),
+    );
+    seed(&ctx, "impresspress__products__products", "stale", stale).await;
+
+    let mut fresh = HashMap::new();
+    fresh.insert("name".to_string(), serde_json::json!("Deleted just now"));
+    fresh.insert("status".to_string(), serde_json::json!("active"));
+    fresh.insert(
+        "created_at".to_string(),
+        serde_json::json!("2026-01-01T00:00:00Z"),
+    );
+    fresh.insert(
+        "deleted_at".to_string(),
+        serde_json::json!("2026-03-02T00:00:00Z"),
+    );
+    seed(&ctx, "impresspress__products__products", "fresh", fresh).await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    let fresh_at = html
+        .find("Deleted just now")
+        .expect("the recently deleted product must render");
+    let stale_at = html
+        .find("Deleted long ago")
+        .expect("the older deletion must render");
+    assert!(
+        fresh_at < stale_at,
+        "the deleted view must be ordered by deleted_at desc, so the product just deleted \
+         is at the top; got 'Deleted long ago' at {stale_at} before 'Deleted just now' at {fresh_at}"
+    );
+}
+
 /// The deleted view is a dead end unless the way back is obvious: pin that
 /// each deleted row's Restore action posts to the actual restore endpoint,
 /// not the edit page (which 404s for a soft-deleted product until it is
