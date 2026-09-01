@@ -11,10 +11,7 @@ use maud::html;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::site_config;
-use crate::{
-    blocks::auth::brand_panel,
-    ui::{self, templates::auth_split},
-};
+use crate::ui::{self, components::auth_panel, templates::auth_split};
 
 pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
@@ -29,7 +26,7 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Bootstrap Admin",
         &config,
         auth_split(
-            brand_panel(&config, "Set up your admin account."),
+            auth_panel(&config, "Set up your admin account."),
             html! {
                 div .login-container {
                     div .login-logo {

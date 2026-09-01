@@ -6,9 +6,10 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::auth::{brand_panel, repo::users},
+    blocks::auth::repo::users,
     http::{err_bad_request, err_internal, ok_json},
     ui,
+    ui::components::auth_panel,
     ui::templates::auth_split,
     util::{hex_encode, sha256_hex},
 };
@@ -163,7 +164,7 @@ fn html_respond(
         title,
         &config,
         auth_split(
-            brand_panel(&config, "Verify your email."),
+            auth_panel(&config, "Verify your email."),
             html! {
                 div .login-container {
                     div .login-logo {

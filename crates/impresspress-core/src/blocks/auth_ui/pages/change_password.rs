@@ -4,10 +4,7 @@ use maud::{html, PreEscaped};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{pw_field, pw_toggle_js, site_config};
-use crate::{
-    blocks::auth::brand_panel,
-    ui::{self, templates::auth_split},
-};
+use crate::ui::{self, components::auth_panel, templates::auth_split};
 
 pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     let config = site_config(ctx);
@@ -18,7 +15,7 @@ pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
         "Change Password",
         &config,
         auth_split(
-            brand_panel(&config, "Update your password."),
+            auth_panel(&config, "Update your password."),
             html! {
                 div .login-container {
                     div .login-logo {

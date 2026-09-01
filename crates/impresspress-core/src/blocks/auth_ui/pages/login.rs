@@ -8,8 +8,8 @@ use super::{
     oauth_provider_label, pw_field, pw_toggle_js, site_config,
 };
 use crate::{
-    blocks::{auth::brand_panel, auth_ui::redirect::is_safe_local_redirect},
-    ui::{self, templates::auth_split},
+    blocks::auth_ui::redirect::is_safe_local_redirect,
+    ui::{self, components::auth_panel, templates::auth_split},
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -67,7 +67,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Sign In",
         &config,
         auth_split(
-            brand_panel(&config, "Sign in to continue."),
+            auth_panel(&config, "Sign in to continue."),
             html! {
                 div .login-container {
                     div .login-logo {

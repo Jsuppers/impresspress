@@ -4,7 +4,7 @@
 use maud::{html, PreEscaped};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use crate::{blocks::auth::brand_panel, ui, ui::templates::auth_split};
+use crate::{ui, ui::components::auth_panel, ui::templates::auth_split};
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let logo_url = ctx
@@ -43,7 +43,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Reset Password",
         &config,
         auth_split(
-            brand_panel(&config, "Reset your password."),
+            auth_panel(&config, "Reset your password."),
             html! {
                 div .login-container {
                     div .login-logo {
@@ -122,7 +122,7 @@ fn html_respond(
         title,
         &config,
         auth_split(
-            brand_panel(&config, "Reset your password."),
+            auth_panel(&config, "Reset your password."),
             html! {
                 div .login-container {
                     div .login-logo {
