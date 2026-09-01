@@ -143,6 +143,50 @@ pub(crate) async fn list_all(
     db::list_all(ctx, TABLE, filters).await
 }
 
+/// List every product matching `filters` *regardless of soft-delete state*,
+/// unpaged.
+///
+/// The second deliberate, named exception to this module's live-only rule,
+/// alongside [`list_deleted`]/[`get_deleted`] — and the only one that spans
+/// both sets at once.
+///
+/// It exists for seller suspension. Suspending a seller is a lifecycle and
+/// fraud operation, so it must cover every row that seller owns: soft delete
+/// touches nothing in Stripe, so a deleted product's Prices and Payment Links
+/// are still live in the connected account and still take money. Reading that
+/// set through [`list_all`] silently exempted exactly the deleted rows from
+/// the archival guarantee, which is the opposite of what a fraud control is
+/// for.
+///
+/// Not a general-purpose escape hatch: a read that merely *displays* products
+/// wants [`list_all`]. Use this only where "every row the owner has" is the
+/// actual requirement.
+pub(crate) async fn list_all_including_deleted(
+    ctx: &dyn Context,
+    filters: Vec<Filter>,
+) -> Result<Vec<Record>, WaferError> {
+    db::list_all(ctx, TABLE, filters).await
+}
+
+/// Fetch one product regardless of soft-delete state.
+///
+/// Third and last named exception, for the same reason as
+/// [`list_all_including_deleted`] and reached from it: archiving a product's
+/// Stripe catalog needs the row's `owner_kind`/`owner_id` (to address the
+/// connected account) and its `stripe_product_id`, and has to keep working
+/// once the product is soft-deleted — that is precisely when its catalog most
+/// needs taking down. The read cannot leak a deleted product to anyone,
+/// because archival only ever *removes* things from the live Stripe catalog.
+///
+/// Not for handlers. A read that decides whether a caller may see or edit a
+/// product wants [`get`], which answers `NotFound` for a deleted row.
+pub(crate) async fn get_including_deleted(
+    ctx: &dyn Context,
+    id: &str,
+) -> Result<Record, WaferError> {
+    db::get(ctx, TABLE, id).await
+}
+
 // `created_at`/`updated_at` are not stamped here: the database service's
 // `DbExec::create`/`update` default impl (shared by every backend) already
 // fills in whichever of the two the caller didn't supply — see

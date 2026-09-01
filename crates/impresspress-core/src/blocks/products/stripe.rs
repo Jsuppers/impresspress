@@ -1936,7 +1936,15 @@ pub(crate) async fn archive_offer_catalog(
             "Stripe catalog archival is disabled in the browser runtime",
         ));
     }
-    let product = repo::products::get(ctx, product_id).await?;
+    // Reads past the soft-delete filter on purpose. Archival takes a
+    // product's Prices out of the live Stripe catalog, and a soft-deleted
+    // product is exactly when that most needs doing: deleting a product
+    // touches nothing in Stripe, so seller suspension has to be able to
+    // archive the catalog of a listing that is already gone locally. The row
+    // is read only for `owner_kind`/`owner_id` (which connected account to
+    // address) and `stripe_product_id`; nothing about a deleted product
+    // reaches a caller, since this path only ever deactivates.
+    let product = repo::products::get_including_deleted(ctx, product_id).await?;
     let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
     let livemode = stripe_client::secret_livemode(&stripe_key).ok_or_else(|| {
         WaferError::new(

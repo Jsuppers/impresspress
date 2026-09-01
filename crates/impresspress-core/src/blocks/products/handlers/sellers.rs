@@ -30,12 +30,28 @@ fn equal(field: &str, value: impl Into<Value>) -> Filter {
     }
 }
 
-async fn seller_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
-    repo::products::list_all(
-        ctx,
-        vec![equal("owner_id", Value::String(user_id.to_string()))],
-    )
-    .await
+fn owned_by(user_id: &str) -> Vec<Filter> {
+    vec![equal("owner_id", Value::String(user_id.to_string()))]
+}
+
+/// The seller's LIVE products — what the admin seller detail page lists.
+/// A deleted listing is not part of a seller's catalog and does not belong in
+/// a catalog view.
+async fn seller_live_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
+    repo::products::list_all(ctx, owned_by(user_id)).await
+}
+
+/// EVERY product the seller owns, soft-deleted ones included — what
+/// suspension and reactivation act on.
+///
+/// Deliberately a different read from [`seller_live_products`] rather than a
+/// shared one: the two callers want genuinely different sets, and a single
+/// read would have to be wrong for one of them. Suspension is a lifecycle and
+/// fraud control, so its set is "everything this seller owns": soft delete
+/// changes nothing in Stripe, so a deleted product's Prices and Payment Links
+/// keep taking money in the connected account until suspension archives them.
+async fn seller_every_product(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
+    repo::products::list_all_including_deleted(ctx, owned_by(user_id)).await
 }
 
 pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
@@ -67,7 +83,7 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(seller) => seller,
         Err(error) => return admin_error(error, "Seller not found"),
     };
-    let products = match seller_products(ctx, &seller.user_id).await {
+    let products = match seller_live_products(ctx, &seller.user_id).await {
         Ok(products) => products,
         Err(error) => return err_internal("Could not list seller products", error),
     };
@@ -154,7 +170,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             Err(error) => admin_error(error, "Seller not found"),
         };
     }
-    let products = match seller_products(ctx, account.str_field("user_id")).await {
+    let products = match seller_every_product(ctx, account.str_field("user_id")).await {
         Ok(products) => products,
         Err(error) => return err_internal("Could not load seller products", error),
     };

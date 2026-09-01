@@ -3937,6 +3937,136 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
     assert!(idempotent_requests.lock().unwrap().is_empty());
 }
 
+/// Suspending a seller is a lifecycle/fraud operation, so it has to reach
+/// every row the seller owns. A soft-deleted product is still one of theirs,
+/// and soft delete touches nothing in Stripe: its Prices and Payment Links
+/// stay live in the connected account until something archives them.
+///
+/// `seller_products` reads through the live-only door, which silently exempted
+/// exactly those rows from the guarantee
+/// `seller_suspension_fails_closed_until_connected_catalog_archival_succeeds`
+/// documents — a suspended fraudster's deleted listings kept taking money.
+#[tokio::test]
+async fn seller_suspension_archives_the_catalog_of_soft_deleted_products_too() {
+    let mut ctx = ctx_with(&[
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            "sk_test_suspend_deleted",
+        ),
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+    ])
+    .await;
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "deleted_suspend_account",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("deleted_suspend")),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_deleted_suspend"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("fee_basis_points".to_string(), serde_json::json!(200)),
+        ]),
+    )
+    .await;
+    let product_id = "deleted_suspend_product";
+    let offer_id = seed_active_offer(&ctx, product_id, "deleted_suspend").await;
+    let fixed = repo::offers::get_managed(&ctx, &offer_id)
+        .await
+        .unwrap()
+        .offer
+        .components
+        .into_iter()
+        .find(|component| component.key == "setup")
+        .unwrap();
+    db::update(
+        &ctx,
+        repo::products::TABLE,
+        product_id,
+        HashMap::from([(
+            "stripe_product_id".to_string(),
+            serde_json::json!("prod_deleted_suspend"),
+        )]),
+    )
+    .await
+    .unwrap();
+    repo::offer_components::set_stripe_price_id(&ctx, &fixed.id, "price_deleted_suspend")
+        .await
+        .unwrap();
+    repo::offers::mark_synced(&ctx, &offer_id, "prod_deleted_suspend", "")
+        .await
+        .unwrap();
+
+    // The seller deletes the listing. Nothing in Stripe changes.
+    repo::products::soft_delete(&ctx, product_id)
+        .await
+        .expect("soft delete");
+
+    let requests = register_stripe_sequence(
+        &mut ctx,
+        vec![
+            (
+                200,
+                serde_json::json!({
+                    "id": "price_deleted_suspend",
+                    "livemode": false,
+                    "active": true,
+                    "product": "prod_deleted_suspend",
+                    "currency": "nzd",
+                    "unit_amount": 1000
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "price_deleted_suspend",
+                    "livemode": false,
+                    "active": false,
+                    "product": "prod_deleted_suspend",
+                    "currency": "nzd",
+                    "unit_amount": 1000
+                }),
+            ),
+        ],
+    );
+    let path = "/admin/b/products/sellers/deleted_suspend_account/suspend";
+    let (msg, input) = admin_create_msg(path, serde_json::json!({}));
+    let suspended = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(suspended["status"], "suspended");
+
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the soft-deleted product's Stripe Price must still be fetched and archived"
+        );
+        assert!(requests
+            .iter()
+            .all(|request| request.headers["Stripe-Account"] == "acct_deleted_suspend"));
+        assert_eq!(
+            requests[1].body.as_deref(),
+            Some(b"active=false".as_slice())
+        );
+    }
+    assert_eq!(
+        repo::offers::get_managed(&ctx, &offer_id)
+            .await
+            .unwrap()
+            .status,
+        crate::blocks::products::contracts::OfferStatus::Archived,
+        "a suspended seller's soft-deleted offer must end up archived"
+    );
+    // The row stays soft-deleted: suspension archives the catalog, it does
+    // not resurrect a deleted listing.
+    assert!(repo::products::get(&ctx, product_id).await.is_err());
+}
+
 #[tokio::test]
 async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeeds() {
     let mut ctx = ctx_with(&[
