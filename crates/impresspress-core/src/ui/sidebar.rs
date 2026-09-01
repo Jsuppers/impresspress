@@ -230,6 +230,39 @@ mod tests {
     }
 
     #[test]
+    fn grouped_sidebar_with_logo_url_never_renders_the_wordmark_image() {
+        // Regression for the navy-sidebar illegibility bug: `logo_url` is
+        // non-empty by default (`WAFER_RUN_SHARED__LOGO_URL` defaults to the
+        // long dark-ink wordmark PNG drawn for the old white sidebar), so
+        // this is the DEFAULT path, not an edge case. Before the fix, a
+        // non-empty `logo_url` rendered `<img class="sidebar__brand-wordmark">`
+        // instead of the white `.sidebar__brand-name` text, which is nearly
+        // invisible against the navy panel.
+        let groups = vec![NavGroup {
+            label: None,
+            items: vec![item("Users", "/b/admin/users")],
+        }];
+        let s = sidebar_grouped(
+            &groups,
+            None,
+            "/b/admin/users",
+            "https://example.com/impresspress-logo-long.png",
+            "https://example.com/impresspress-logo.png",
+            "Impresspress",
+        )
+        .into_string();
+        assert!(
+            !s.contains("sidebar__brand-wordmark"),
+            "navy sidebar must never render the dark-ink wordmark image, even \
+             with a logo_url configured: {s}"
+        );
+        assert!(
+            s.contains("sidebar__brand-name"),
+            "navy sidebar must always render the white text brand name: {s}"
+        );
+    }
+
+    #[test]
     fn grouped_sidebar_marks_active_via_subpath() {
         let groups = vec![NavGroup {
             label: None,
