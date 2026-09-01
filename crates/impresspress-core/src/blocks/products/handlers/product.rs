@@ -9,16 +9,11 @@ use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream}
 
 use super::{default_template_id, seller_policy, GROUPS_TABLE, PRODUCT_TEMPLATES_TABLE};
 use crate::{
-    blocks::{
-        crud,
-        products::repo::{self, offers as offer_repo},
-    },
+    blocks::products::repo::{self, offers as offer_repo},
     http::{
         err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
     },
-    util::{
-        field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt,
-    },
+    util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
 
 /// Escape SQL LIKE wildcards (`%`, `_`) and the escape char (`\`) in user
@@ -196,19 +191,15 @@ pub(super) async fn handle_update_product(
 }
 
 pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    // Still a literal hard delete: converting this to a soft delete (writing
-    // `deleted_at` instead of removing the row) is a later task's job, not
-    // this one's — this call only needs to stop naming the table via a
-    // hardcoded constant, so it reads the table name off the repo module
-    // instead.
-    crud::crud_delete(
-        ctx,
-        msg,
-        repo::products::TABLE,
-        "/admin/b/products/products/",
-        "Product",
-    )
-    .await
+    let id = path_param(msg, "id", "/admin/b/products/products/");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    match repo::products::soft_delete(ctx, id).await {
+        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 fn copied_name(source: &wafer_core::clients::database::Record) -> String {
@@ -610,9 +601,7 @@ pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message)
     if let Err(response) = verify_product_owner(ctx, &id, msg.user_id()).await {
         return response;
     }
-    // Still a literal hard delete for the same reason as `handle_delete_product`
-    // above: this route's write side becomes a soft delete in a later task.
-    match db::delete(ctx, repo::products::TABLE, &id).await {
+    match repo::products::soft_delete(ctx, &id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),

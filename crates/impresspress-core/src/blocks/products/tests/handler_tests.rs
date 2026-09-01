@@ -154,6 +154,107 @@ async fn admin_product_detail_404s_for_a_soft_deleted_product() {
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
+/// The bug this whole plan exists for: `line_items.product_id` is `TEXT NOT
+/// NULL`, so a hard delete of a product that was ever ordered orphaned that
+/// order's line item. Soft delete must leave both rows resolvable.
+#[tokio::test]
+async fn admin_delete_keeps_the_row_and_its_order_history_resolvable() {
+    let ctx = ctx().await;
+
+    let mut sold = HashMap::new();
+    sold.insert("name".to_string(), serde_json::json!("Sold"));
+    sold.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "sold", sold).await;
+
+    let mut order = HashMap::new();
+    order.insert("user_id".to_string(), serde_json::json!("user_1"));
+    order.insert("status".to_string(), serde_json::json!("completed"));
+    seed(&ctx, "impresspress__products__purchases", "order_1", order).await;
+    seed(
+        &ctx,
+        "impresspress__products__line_items",
+        "line_1",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("order_1")),
+            ("product_id".to_string(), serde_json::json!("sold")),
+            ("product_name".to_string(), serde_json::json!("Sold")),
+        ]),
+    )
+    .await;
+
+    let (mut del, del_input) = delete_msg("/admin/b/products/products/sold", "admin_1");
+    del.set_meta("auth.user_roles", "admin");
+    let body = output_to_json(dispatch_admin(&ctx, del, del_input).await).await;
+    assert_eq!(body["deleted"], true);
+
+    let row = wafer_core::clients::database::get(&ctx, "impresspress__products__products", "sold")
+        .await
+        .expect("the row must still exist");
+    assert!(
+        !crate::util::RecordExt::str_field(&row, "deleted_at").is_empty(),
+        "deleted_at must be stamped"
+    );
+
+    let line_item =
+        wafer_core::clients::database::get(&ctx, "impresspress__products__line_items", "line_1")
+            .await
+            .expect("the line item must still resolve");
+    assert_eq!(
+        crate::util::RecordExt::str_field(&line_item, "product_id"),
+        "sold"
+    );
+}
+
+/// A deleted product must disappear from the public catalog end-to-end
+/// through the real delete handler, not just when `deleted_at` is stamped
+/// by hand.
+#[tokio::test]
+async fn admin_delete_removes_the_product_from_the_catalog() {
+    let ctx = ctx().await;
+
+    let mut sold = HashMap::new();
+    sold.insert("name".to_string(), serde_json::json!("Sold"));
+    sold.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "sold", sold).await;
+
+    let (mut del, del_input) = delete_msg("/admin/b/products/products/sold", "admin_1");
+    del.set_meta("auth.user_roles", "admin");
+    dispatch_admin(&ctx, del, del_input).await;
+
+    let (msg, input) = get_msg("/b/products/catalog", "");
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(body["records"].as_array().unwrap().is_empty());
+}
+
+/// A soft-deleted product frees its slug, because the unique index added in
+/// migration 005 is partial on `deleted_at IS NULL`.
+#[tokio::test]
+async fn admin_delete_frees_the_products_slug() {
+    let ctx = ctx().await;
+
+    let mut first = HashMap::new();
+    first.insert("name".to_string(), serde_json::json!("First"));
+    first.insert("slug".to_string(), serde_json::json!("jacket"));
+    seed(&ctx, "impresspress__products__products", "first", first).await;
+
+    let (mut del, del_input) = delete_msg("/admin/b/products/products/first", "admin_1");
+    del.set_meta("auth.user_roles", "admin");
+    dispatch_admin(&ctx, del, del_input).await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({
+            "name": "Second",
+            "slug": "jacket"
+        }),
+    );
+    let body = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    assert_eq!(
+        body["data"]["slug"], "jacket",
+        "the reused slug must not conflict"
+    );
+}
+
 // ============================================================
 // Admin Group CRUD
 // ============================================================
@@ -744,6 +845,40 @@ async fn user_cannot_delete_other_users_products() {
     let (del, del_input) = delete_msg(&format!("/b/products/products/{prod_id}"), "user_2");
     let out = dispatch_user(&ctx, del, del_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// The seller's own-product delete is the path a non-admin actually uses:
+/// leaving it hard-deleting would orphan `line_items.product_id` (`TEXT NOT
+/// NULL`) on exactly the path this task exists to fix.
+#[tokio::test]
+async fn user_delete_own_product_soft_deletes_instead_of_hard_deleting() {
+    let ctx = user_products_ctx().await;
+
+    let (create, create_input) = create_msg(
+        "/b/products/products",
+        "user_1",
+        serde_json::json!({
+            "name": "My Product"
+        }),
+    );
+    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let prod_id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (del, del_input) = delete_msg(&format!("/b/products/products/{prod_id}"), "user_1");
+    let body = output_to_json(dispatch_user(&ctx, del, del_input).await).await;
+    assert_eq!(body["deleted"], true);
+
+    let row =
+        wafer_core::clients::database::get(&ctx, "impresspress__products__products", &prod_id)
+            .await
+            .expect("the row must still exist");
+    assert!(
+        !crate::util::RecordExt::str_field(&row, "deleted_at").is_empty(),
+        "deleted_at must be stamped"
+    );
 }
 
 #[tokio::test]

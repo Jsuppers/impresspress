@@ -86,3 +86,44 @@ fn the_old_products_table_const_is_gone() {
         "PRODUCTS_TABLE still referenced in {offenders:?}"
     );
 }
+
+/// The literal-string scan above only catches a call site that spells the
+/// table name out by hand. It misses the more likely mistake: naming the
+/// table through `repo::products::TABLE` itself (e.g. handing it straight to
+/// `db::list_all`) instead of calling a `repo::products` function. That
+/// compiles cleanly today because `TABLE` is `pub(crate)` for `mod.rs`'s
+/// `collections(...)` registration — so a caller who forgets to also append
+/// `repo::products::live_filter()` gets a silent soft-delete bypass with no
+/// warning from the compiler. This scan closes that gap: every use of the
+/// `products::TABLE` identifier (however many `super::`/`repo::` segments
+/// precede it) must be one of the entries on `TABLE_IDENT_ALLOWED`, each
+/// justified on why it isn't a soft-delete bypass.
+const TABLE_IDENT: &str = "products::TABLE";
+
+/// Files/directories allowed to name the products table via the
+/// `repo::products::TABLE` identifier (as opposed to the literal string
+/// above).
+const TABLE_IDENT_ALLOWED: &[&str] = &[
+    "repo/products.rs",        // the door itself: `TABLE`'s own definition and internal uses
+    "mod.rs",                  // `BlockInfo::collections(...)` is an advisory table listing for
+                               // admin/WRAP discovery, not a query — nothing to filter
+    "tests/",                  // fixtures seed rows (including soft-deleted ones) and assert on
+                               // raw rows directly against the table; that is setup/assertion for
+                               // the tests guarding the door, not a production read to filter
+];
+
+#[test]
+fn only_the_allowlist_names_the_products_table_via_the_const() {
+    let offenders: Vec<String> = block_sources()
+        .into_iter()
+        .filter(|(path, _)| !matches_allowlist(path, TABLE_IDENT_ALLOWED))
+        .filter(|(_, src)| src.contains(TABLE_IDENT))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these files name the products table via `products::TABLE` instead of \
+         calling a repo::products function, silently skipping the soft-delete \
+         filter for a caller who does not also remember `live_filter()`: {offenders:?}"
+    );
+}

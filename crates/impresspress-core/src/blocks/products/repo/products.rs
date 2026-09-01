@@ -112,6 +112,38 @@ pub(crate) async fn purge(ctx: &dyn Context, id: &str) -> Result<(), WaferError>
     db::delete(ctx, TABLE, id).await
 }
 
+/// Soft-delete a product: stamp `deleted_at` and leave the row in place.
+///
+/// The row stays because several tables carry a `product_id` column that is
+/// `TEXT NOT NULL` with no default — `line_items`, `offers`,
+/// `product_versions`, and `entitlements` among them — so a hard delete
+/// would orphan every one of them, most visibly a completed order's line
+/// item. Stamping also frees the product's slug, since the unique index
+/// from migration 005 is partial on `deleted_at IS NULL`.
+///
+/// Routes through `get` first so deleting an already soft-deleted (or
+/// missing) row answers `NotFound`, matching every other read in this
+/// module: a caller can't distinguish "double delete" from "never existed"
+/// any more than they can for `get` itself.
+pub(crate) async fn soft_delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
+    get(ctx, id).await?;
+    let data = HashMap::from([(
+        "deleted_at".to_string(),
+        Value::String(crate::util::now_rfc3339()),
+    )]);
+    update(ctx, id, data).await.map(|_| ())
+}
+
+/// Clear `deleted_at`, bringing a soft-deleted product back.
+///
+/// Uses `update` directly rather than `get` + `update`: `get` refuses to
+/// find a soft-deleted row by design, but restoring one is the one
+/// operation in this module that must act on exactly that row.
+pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
+    let data = HashMap::from([("deleted_at".to_string(), Value::Null)]);
+    update(ctx, id, data).await
+}
+
 // `RecordExt::str_field` (util.rs) collapses both a missing key and a JSON
 // `Null` value to `""`. A live row's `deleted_at` decodes to exactly one of
 // those on either backend (SQLite and Postgres both store SQL NULL for an
@@ -264,5 +296,81 @@ mod tests {
             original_updated_at,
             "update must stamp a fresh updated_at"
         );
+    }
+
+    /// The bug this whole plan exists for: deleting a product used to remove
+    /// the row outright, orphaning every NOT-NULL `product_id` reference to
+    /// it (most visibly a completed order's line item). Soft delete must
+    /// stamp `deleted_at` and leave the row resolvable by a raw `db::get`.
+    #[tokio::test]
+    async fn soft_delete_stamps_deleted_at_and_leaves_the_row_in_place() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+
+        soft_delete(&ctx, "live").await.expect("soft delete");
+
+        let raw = db::get(&ctx, TABLE, "live")
+            .await
+            .expect("the row must still exist");
+        assert!(
+            !raw.str_field("deleted_at").is_empty(),
+            "deleted_at must be stamped"
+        );
+        let err = get(&ctx, "live").await.expect_err("must not resolve as live");
+        assert_eq!(err.code, wafer_run::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_of_a_missing_row_is_not_found() {
+        let ctx = TestContext::with_products().await;
+        let err = soft_delete(&ctx, "missing")
+            .await
+            .expect_err("nothing to delete");
+        assert_eq!(err.code, wafer_run::ErrorCode::NotFound);
+    }
+
+    /// The unique index added in migration 005 on `(owner_kind, owner_id,
+    /// slug)` is partial on `deleted_at IS NULL`, so soft-deleting a product
+    /// must free its slug for reuse rather than leaving it permanently
+    /// claimed.
+    #[tokio::test]
+    async fn soft_delete_frees_the_slug_for_reuse() {
+        let ctx = TestContext::with_products().await;
+        create(
+            &ctx,
+            HashMap::from([
+                ("id".to_string(), json!("first")),
+                ("name".to_string(), json!("first")),
+                ("status".to_string(), json!("active")),
+                ("slug".to_string(), json!("jacket")),
+            ]),
+        )
+        .await
+        .expect("create first");
+
+        soft_delete(&ctx, "first").await.expect("soft delete");
+
+        create(
+            &ctx,
+            HashMap::from([
+                ("id".to_string(), json!("second")),
+                ("name".to_string(), json!("second")),
+                ("status".to_string(), json!("active")),
+                ("slug".to_string(), json!("jacket")),
+            ]),
+        )
+        .await
+        .expect("the freed slug must not conflict");
+    }
+
+    #[tokio::test]
+    async fn restore_brings_a_deleted_product_back() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "oops", None).await;
+        soft_delete(&ctx, "oops").await.expect("delete");
+
+        restore(&ctx, "oops").await.expect("restore");
+
+        assert!(get(&ctx, "oops").await.is_ok());
     }
 }
