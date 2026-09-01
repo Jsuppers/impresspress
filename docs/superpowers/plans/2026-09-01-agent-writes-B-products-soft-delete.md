@@ -562,7 +562,7 @@ git commit -m "test(products): gate the products table behind its repo module"
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-/// The bug this plan exists for: `purchases.product_id` is NOT NULL, so a
+/// The bug this plan exists for: `line_items.product_id` is NOT NULL, so a
 /// hard delete orphaned every order that referenced the product.
 #[tokio::test]
 async fn deleting_a_product_keeps_its_order_history_resolvable() {
@@ -624,7 +624,7 @@ In `repo/products.rs`:
 ```rust
 /// Soft-delete a product: stamp `deleted_at` and leave the row in place.
 ///
-/// The row stays because `purchases.product_id` is NOT NULL — removing it
+/// The row stays because `line_items.product_id` is NOT NULL — removing it
 /// orphans every order that referenced the product. Stamping also frees the
 /// product's slug, since the unique index from migration 005 is partial on
 /// `deleted_at IS NULL`.
@@ -804,7 +804,7 @@ git add -A
 git commit -m "feat(products): deleted view and restore, so soft delete is not one-way"
 git push -u origin fix/products-soft-delete
 gh pr create --title "fix(products): soft-delete products instead of orphaning order history" --body "$(cat <<'BODY'
-`purchases.product_id` is NOT NULL and `handle_delete_product` hard-deleted,
+`line_items.product_id` is NOT NULL and `handle_delete_product` hard-deleted,
 so deleting a product orphaned every order that referenced it.
 
 The schema always assumed otherwise: `deleted_at` has existed since migration

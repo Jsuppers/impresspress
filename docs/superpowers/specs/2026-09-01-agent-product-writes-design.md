@@ -52,7 +52,7 @@ in `pages.rs:427,2845,3446` and `handlers/seller_policy.rs:160` already filter
 it, including the admin product list (`manage_products`, `pages.rs:422`).
 **Nothing anywhere writes it** — `handle_delete_product` goes through
 `crud_delete` to `db::delete` (`blocks/crud.rs:181`), a hard delete. Since
-`purchases.product_id` is `TEXT NOT NULL`, deleting a product orphans its order
+`line_items.product_id` is `TEXT NOT NULL`, deleting a product orphans its order
 history. This is a live bug independent of agents.
 
 **An auth filter with the right shape but the wrong axis.** The manifest route
