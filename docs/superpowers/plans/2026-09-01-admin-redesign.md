@@ -338,11 +338,21 @@ fn cdn_base_template_is_versioned_and_slash_terminated() {
 
 #[cfg(feature = "embed-assets")]
 #[test]
-fn embedded_build_serves_bytes_for_every_manifest_entry() {
+fn embedded_bytes_agree_with_the_manifest() {
+    // The manifest always lists all 11 assets (build.rs panics on a missing
+    // file), but `bytes()` is cfg-gated per asset — under a lean build
+    // `marked.min.js` and friends are simply not compiled in. So: every
+    // asset that IS compiled in must match its manifest length...
     for e in super::ASSETS {
-        let b = super::bytes(e.logical)
-            .unwrap_or_else(|| panic!("no bytes for {}", e.logical));
-        assert_eq!(b.len(), e.len, "{} length disagrees with manifest", e.logical);
+        if let Some(b) = super::bytes(e.logical) {
+            assert_eq!(b.len(), e.len, "{} length disagrees with manifest", e.logical);
+        }
+    }
+    // ...and the assets that are never feature-gated must always be there.
+    for logical in ["app.css", "htmx.min.js", "webmcp.js", "favicon.ico",
+                    "itim-latin.woff2", "itim-latin-ext.woff2",
+                    "impresspress-logo.png", "impresspress-logo-long.png"] {
+        assert!(super::bytes(logical).is_some(), "core asset missing: {logical}");
     }
 }
 ```
@@ -545,21 +555,47 @@ if let Some(filename) = path.strip_prefix(routing::STATIC_PREFIX) {
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 4: Retire the now-unused per-asset accessors**
+
+This step is what finally makes the lean build actually smaller, and it must not be skipped.
+
+`system.rs`'s dispatch tables were the only consumers of the per-asset accessors, and Step 3 just replaced them. Those accessors are **not** gated on `embed-assets`, so until they go, `--no-default-features` still embeds every asset and the ~370 KB saving does not happen. Task 2 deliberately left them in place — deleting them there would have broken the build while `system.rs` still called them.
+
+Delete from `ui/assets.rs`, having confirmed each has no remaining caller (`grep -rn '<name>(' crates/`):
+
+`htmx_js`, `webmcp_js`, `logo_icon_png`, `logo_long_png`, `favicon_ico`, `itim_latin_woff2`, `itim_latin_ext_woff2`, and the feature-gated `marked_js`, `purify_js`, `llm_chat_js`, `files_browser_js` — together with the consts backing them (`LOGO_ICON_PNG`, `LOGO_LONG_PNG`, `FAVICON_ICO`, `ITIM_LATIN_WOFF2`, `ITIM_LATIN_EXT_WOFF2`, `PURIFY_JS`, `LLM_CHAT_JS`, `FILES_BROWSER_JS`).
+
+`bytes()` becomes the single embed point, and its `include_bytes!` calls are the only ones left. Keep the `*_url()` wrappers — they are manifest-driven and still used by the page templates.
+
+Move each deleted accessor's `include_bytes!`/`include_str!` into the matching arm of `bytes()`, so the bytes are expressed exactly once.
+
+- [ ] **Step 5: Run to verify it passes**
 
 Run: `cargo test -p impresspress-core --lib blocks::system`
 Expected: PASS.
 
-- [ ] **Step 5: Confirm no baseline regression**
+- [ ] **Step 6: Confirm no baseline regression**
 
 Run: `cargo test -p impresspress-core --lib`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Verify the lean build now actually drops the bytes**
+
+This is the task's headline claim, so measure it rather than assert it:
 
 ```bash
-git add crates/impresspress-core/src/blocks/system.rs
-git commit -m "refactor(system): manifest-driven static asset lookup"
+cargo build -p impresspress-core --release > /tmp/embed.log 2>&1; echo "embedded: $?"
+cargo build -p impresspress-core --release --no-default-features --features sqlite > /tmp/lean.log 2>&1; echo "lean: $?"
+grep -c 'include_bytes!' crates/impresspress-core/src/ui/assets.rs
+```
+
+Expected: both builds succeed, and every remaining `include_bytes!` sits inside `bytes()`, which is `#[cfg(feature = "embed-assets")]`. Record the count in the report.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/impresspress-core/src/blocks/system.rs crates/impresspress-core/src/ui/assets.rs
+git commit -m "refactor(system): manifest-driven static assets, single embed point"
 ```
 
 ---
