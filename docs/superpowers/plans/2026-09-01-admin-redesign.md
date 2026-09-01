@@ -709,6 +709,81 @@ git commit -m "feat(deploy): publish UI assets to R2 and set asset base URL"
 
 ---
 
+### Task 4b: Serve `/b/static/` from R2 on a lean build
+
+**Added mid-execution.** Task 4's implementer found that nothing serves the published assets, and the controller confirmed `impresspress-cloudflare` contains zero `STATIC_PREFIX` references. The spec's URL-resolution branch 3 — *"R2/storage backend configured → `/b/static/`, worker streams from R2"* — was never assigned to a task: Task 3 was explicitly told not to add a fetch path, and Task 4 only published and configured. Without this task, a lean Cloudflare deploy with R2 uploads every asset, points `IMPRESSPRESS_ASSET_BASE_URL` at `/b/static/`, and then 404s every one of them — an admin UI with no CSS at all.
+
+**Files:**
+- Modify: `crates/impresspress-core/src/blocks/system.rs` (the `#[cfg(not(feature = "embed-assets"))]` arm)
+- Modify: `crates/impresspress-cloudflare/src/` — wire the storage backend to the static route
+- Test: both crates' test modules
+
+**Interfaces:**
+- Consumes: `ui::assets::{ASSETS, entry}` (Task 1), `resolve_asset_base_url` + the R2 keys written by Task 4.
+- Produces: a read-through so `/b/static/<hashed-filename>` resolves from object storage when the bytes are not embedded.
+
+- [ ] **Step 1: Write the failing test**
+
+The asset must come back from storage, with the manifest's content type and the immutable cache header, exactly as the embedded path returns it:
+
+```rust
+#[tokio::test]
+async fn lean_build_serves_static_asset_from_storage() {
+    let ctx = TestContext::new().await;
+    let e = crate::ui::assets::entry("app.css");
+    ctx.put_object(&format!("{}{}", RELEASES_ROOT, e.filename), b"body{}").await;
+
+    let res = handle(&ctx, &anon_msg("retrieve", &format!("/b/static/{}", e.filename))).await;
+
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("Content-Type"), e.content_type);
+    assert_eq!(res.header("Cache-Control"), "public, max-age=31536000, immutable");
+}
+
+#[tokio::test]
+async fn lean_build_404s_an_asset_absent_from_storage() {
+    let ctx = TestContext::new().await;
+    let res = handle(&ctx, &anon_msg("retrieve", "/b/static/app-deadbeef.css")).await;
+    assert_eq!(res.status, 404);
+}
+```
+
+Adapt the harness calls to `TestContext`'s real API — check `crates/impresspress-core/src/test_support.rs` for the actual object-put and response-assertion helpers, and follow whatever the neighbouring `blocks/system.rs` tests already do.
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p impresspress-core --lib blocks::system`
+Expected: FAIL — the lean arm currently falls through to a 404 for every path.
+
+- [ ] **Step 3: Implement the read-through**
+
+Replace the no-op `#[cfg(not(feature = "embed-assets"))]` arm so it looks the filename up in the manifest, fetches that key from the storage backend, and streams it back with the manifest's content type and the same immutable cache header the embedded path uses. A filename absent from the manifest must 404 without touching storage — the manifest lookup stays the security boundary, exactly as in Task 3.
+
+Serving must stay async end to end. **No `poll_once` / `block_on`** — the project forbids sync bridges, and the storage read is async.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `cargo test -p impresspress-core --lib blocks::system`
+Expected: PASS.
+
+- [ ] **Step 5: Confirm both feature paths still work**
+
+```bash
+cargo test -p impresspress-core --lib > /tmp/full.log 2>&1; echo "default: $?"
+cargo build -p impresspress-core --no-default-features --features sqlite > /tmp/lean.log 2>&1; echo "lean: $?"
+```
+
+Expected: both `0`, with no regression against the 1270-test baseline.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/impresspress-core/src/blocks/system.rs crates/impresspress-cloudflare/src
+git commit -m "feat(system): serve static assets from R2 when not embedded"
+```
+
+---
+
 ## Phase 2 — Style layer restructure
 
 Pure refactor. Byte-for-byte identical rendered CSS is not required (whitespace between layers may shift), but no rule may change. Baselines must still pass.
