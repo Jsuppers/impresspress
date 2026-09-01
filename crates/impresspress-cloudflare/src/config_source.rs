@@ -160,11 +160,27 @@ impl D1ConfigSource {
             .await
             .map_err(Box::new)?;
 
-        if snapshot_may_be_truncated(rows.records.len(), cache_key::full_table_list_opts().limit) {
-            tracing::error!(
-                returned = rows.records.len(),
-                "variables snapshot came back exactly full; block config may be                  silently truncated and some blocks left on defaults"
-            );
+        // Refuse to build config from a page that may be truncated. One
+        // unfiltered read shares a single row budget across the whole table
+        // where the per-block query it replaced gave each block its own, and
+        // `skip_count` leaves no `total_count` to check against — so an
+        // exactly-full page cannot be told apart from a truncated one.
+        // Continuing would resolve some blocks against config that exists but
+        // was not returned: silently on defaults, or hard-failing on a
+        // required key that is actually present. `build_runtime` makes the
+        // same call when block settings cannot be read ("Propagate rather than
+        // fabricate ... no requests are served with a fabricated all-enabled
+        // snapshot"), and this is the same situation.
+        let limit = cache_key::full_table_list_opts().limit;
+        if snapshot_may_be_truncated(rows.records.len(), limit) {
+            return Err(format!(
+                "variables snapshot returned {} rows, at or above the {limit}-row query limit: \
+                 the table may be truncated, and resolving block config from a partial \
+                 snapshot would silently leave blocks on their defaults. Raise the limit or \
+                 paginate this read.",
+                rows.records.len()
+            )
+            .into());
         }
 
         let mut grouped: BlockVariables = HashMap::new();
@@ -299,6 +315,10 @@ mod tests {
         /// How many of `rows` a `list` currently returns, so a test can make
         /// seeding actually happen partway through a boot.
         rows_visible: Cell<usize>,
+        /// Report this many rows regardless of `rows`, so a test can simulate
+        /// a full (and therefore possibly truncated) page without building
+        /// ten thousand fixtures.
+        force_returned_len: Cell<Option<usize>>,
     }
 
     impl CountingDb {
@@ -309,6 +329,7 @@ mod tests {
                 filtered_lists: Cell::new(0),
                 rows,
                 rows_visible: Cell::new(visible),
+                force_returned_len: Cell::new(None),
             })
         }
     }
@@ -342,6 +363,19 @@ mod tests {
                     }
                 })
                 .collect();
+            let records = match self.force_returned_len.get() {
+                Some(n) => {
+                    let mut padded = records;
+                    while padded.len() < n {
+                        padded.push(Record {
+                            id: format!("pad-{}", padded.len()),
+                            data: HashMap::new(),
+                        });
+                    }
+                    padded
+                }
+                None => records,
+            };
             let total = records.len() as i64;
             Ok(RecordList {
                 records,
@@ -540,20 +574,46 @@ mod tests {
         );
     }
 
-    /// Truncation must be loud, not silent.
+    /// Truncation must FAIL, not just log.
     ///
     /// The old per-block query gave each block its own 10k budget; one
     /// unfiltered read shares a single budget across the whole table. If it
     /// ever fills, rows are dropped arbitrarily — and because `skip_count` is
-    /// set there is no `total_count` to notice it by, so the symptom would be
-    /// some blocks silently falling back to defaults. Assert the detector
-    /// fires exactly at the boundary.
+    /// set there is no `total_count` to notice it by. Continuing would build a
+    /// runtime from config known to be incomplete: some blocks silently on
+    /// defaults, others hard-failing on a required key that does exist.
+    ///
+    /// `build_runtime` already sets the precedent for exactly this situation
+    /// when block settings cannot be read — "Propagate rather than fabricate
+    /// 'every block enabled': the runtime build fails, so no requests are
+    /// served with a fabricated all-enabled snapshot." Same reasoning, same
+    /// answer.
     #[wasm_bindgen_test]
     fn a_full_page_is_detected_as_possible_truncation() {
         let limit = impresspress_core::cache_key::full_table_list_opts().limit;
         assert!(snapshot_may_be_truncated(limit as usize, limit));
         assert!(!snapshot_may_be_truncated(limit as usize - 1, limit));
         assert!(!snapshot_may_be_truncated(0, limit));
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_truncated_snapshot_fails_the_load_instead_of_serving_partial_config() {
+        let limit = impresspress_core::cache_key::full_table_list_opts().limit as usize;
+        let db = CountingDb::new(vec![("WAFER_RUN__AUTH", "K", "v")]);
+        // Claim a full page came back, which is indistinguishable from a
+        // truncated one.
+        db.force_returned_len.set(Some(limit));
+        let src = D1ConfigSource::new(db.clone() as Arc<dyn DatabaseService>);
+
+        let err = src
+            .load_for_block("wafer-run/auth", &[var("K")])
+            .await
+            .expect_err("incomplete config must not resolve");
+        assert!(
+            matches!(err, ConfigError::Transient { .. }),
+            "must be Transient so the block slot does not cache it \
+             permanently: {err:?}"
+        );
     }
 
     /// The re-read is driven by writes, not by every call. An established
