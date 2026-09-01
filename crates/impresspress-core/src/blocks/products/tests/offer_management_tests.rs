@@ -583,6 +583,9 @@ async fn seller_offer_routes_enforce_feature_gate_and_product_ownership() {
 #[tokio::test]
 async fn seller_product_publication_requires_moderation_and_protects_ownership() {
     let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+
+    // A create body reaching for ownership or approval state is refused
+    // outright — no product is created at all.
     let (msg, input) = create_msg(
         "/b/products/products",
         "seller_a",
@@ -593,6 +596,26 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
             "approval_status": "approved"
         }),
     );
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await
+    );
+    assert!(
+        repo::products::list_all(&test_ctx, vec![])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused create must not have landed a row"
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "seller_a",
+        json!({"name": "Seller print", "status": "active"}),
+    );
     let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = created["id"].as_str().unwrap().to_string();
     assert_eq!(created["data"]["status"], "draft");
@@ -601,6 +624,9 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
     assert_eq!(created["data"]["owner_id"], "seller_a");
     assert_eq!(created["data"]["created_by"], "seller_a");
 
+    // Same on the update side: the publication request is refused whole, so
+    // the product does not enter review as a side effect of a body that also
+    // tried to re-parent it.
     let (msg, input) = update_msg(
         &format!("/b/products/products/{product_id}"),
         "seller_a",
@@ -610,6 +636,22 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
             "created_by": "attacker",
             "approval_status": "approved"
         }),
+    );
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await
+    );
+    let untouched = repo::products::get(&test_ctx, &product_id).await.unwrap();
+    assert_eq!(untouched.str_field("status"), "draft");
+    assert_eq!(untouched.str_field("owner_id"), "seller_a");
+
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{product_id}"),
+        "seller_a",
+        json!({"status": "active"}),
     );
     let submitted = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     assert_eq!(submitted["data"]["status"], "pending_review");

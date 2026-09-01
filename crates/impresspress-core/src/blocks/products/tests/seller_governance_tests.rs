@@ -432,11 +432,11 @@ async fn activation_validates_merged_values_not_stale_record() {
 }
 
 /// The per-seller product cap counts through `repo::products::count`, which
-/// is live-only. So a create body that carries `deleted_at` lands a row the
-/// cap cannot see, and the seller keeps their slot free — unbounded creates
-/// against a cap of one. `deleted_at` belongs to the delete/restore doors,
-/// never to a request body, so create must strip it exactly as both update
-/// handlers already do.
+/// is live-only. So a create body that carries `deleted_at` would land a row
+/// the cap cannot see, and the seller would keep their slot free — unbounded
+/// creates against a cap of one. `deleted_at` belongs to the delete/restore
+/// doors, never to a request body, so create must refuse it exactly as both
+/// update handlers do.
 #[tokio::test]
 async fn a_seller_cannot_outrun_the_product_cap_by_supplying_deleted_at() {
     let test_ctx = ctx_with(&[
@@ -455,21 +455,39 @@ async fn a_seller_cannot_outrun_the_product_cap_by_supplying_deleted_at() {
             "deleted_at": "2020-01-01T00:00:00Z"
         }),
     );
-    let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    let product_id = created["id"].as_str().expect("created product").to_string();
-
-    let stored = db::get(&test_ctx, repo::products::TABLE, &product_id)
-        .await
-        .expect("row exists");
+    let error = terminal_error(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
     assert!(
-        matches!(stored.data.get("deleted_at"), None | Some(Value::Null)),
-        "a create body must not be able to set deleted_at; stored {:?}",
-        stored.data.get("deleted_at")
+        error.message.contains("deleted_at"),
+        "the refusal must name the field the caller may not set: {}",
+        error.message
+    );
+    assert!(
+        repo::products::list_all_including_deleted(&test_ctx, vec![])
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused create must not land a row at all, visible to the cap or not"
     );
 
-    // The seller's one slot is now used, so a second create is refused. It
-    // would not be if the first product were invisible to the live-only
-    // count.
+    // The seller's one slot is used by an ordinary create, so a second create
+    // is refused. It would not be if a `deleted_at` body could land a row the
+    // live-only count cannot see.
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "cap_dodger",
+        json!({
+            "name": "Uses the slot",
+            "product_template_id": "simple_product",
+            "currency": "USD"
+        }),
+    );
+    assert!(
+        output_to_json(dispatch_user(&test_ctx, msg, input).await).await["id"]
+            .as_str()
+            .is_some()
+    );
+
     let (msg, input) = create_msg(
         "/b/products/products",
         "cap_dodger",
@@ -516,13 +534,34 @@ async fn no_handler_path_can_write_an_empty_deleted_at() {
         "deleted_at": ""
     });
 
-    let (msg, input) = admin_create_msg("/admin/b/products/products", blank.clone());
-    let admin_created = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    let admin_id = admin_created["id"]
+    // Two ordinary products for the update paths to aim at. Neither create
+    // body carries `deleted_at`, so both land.
+    let clean = json!({
+        "name": "Clean",
+        "product_template_id": "simple_product",
+        "currency": "USD"
+    });
+    let (msg, input) = admin_create_msg("/admin/b/products/products", clean.clone());
+    let admin_id = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await["id"]
         .as_str()
         .expect("admin create")
         .to_string();
-    assert_null(&test_ctx, &admin_id, "admin create").await;
+    let (msg, input) = create_msg("/b/products/products", "blank_seller", clean);
+    let user_id = output_to_json(dispatch_user(&test_ctx, msg, input).await).await["id"]
+        .as_str()
+        .expect("user create")
+        .to_string();
+
+    // All four create/update handlers refuse a body naming `deleted_at`, so
+    // the column keeps its two-value invariant on every one of them.
+    let (msg, input) = admin_create_msg("/admin/b/products/products", blank.clone());
+    assert_eq!(
+        terminal_error(dispatch_admin(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "admin create must refuse a body naming deleted_at"
+    );
 
     let (msg, input) = update_msg(
         &format!("/admin/b/products/products/{admin_id}"),
@@ -531,24 +570,50 @@ async fn no_handler_path_can_write_an_empty_deleted_at() {
     );
     let mut msg = msg;
     msg.set_meta("auth.user_roles", "admin");
-    output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(
+        terminal_error(dispatch_admin(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "admin update must refuse a body naming deleted_at"
+    );
     assert_null(&test_ctx, &admin_id, "admin update").await;
 
     let (msg, input) = create_msg("/b/products/products", "blank_seller", blank);
-    let user_created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    let user_id = user_created["id"]
-        .as_str()
-        .expect("user create")
-        .to_string();
-    assert_null(&test_ctx, &user_id, "user create").await;
+    assert_eq!(
+        terminal_error(dispatch_user(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "user create must refuse a body naming deleted_at"
+    );
 
     let (msg, input) = update_msg(
         &format!("/b/products/products/{user_id}"),
         "blank_seller",
         json!({"deleted_at": ""}),
     );
-    output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(
+        terminal_error(dispatch_user(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "user update must refuse a body naming deleted_at"
+    );
     assert_null(&test_ctx, &user_id, "user update").await;
+
+    // And nothing a refused create left behind: only the two clean rows
+    // exist, both with a NULL stamp.
+    let rows = repo::products::list_all_including_deleted(&test_ctx, vec![])
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 2, "a refused create must not land a row");
+    for row in rows {
+        assert!(matches!(
+            row.data.get("deleted_at"),
+            None | Some(Value::Null)
+        ));
+    }
 }
 
 #[tokio::test]

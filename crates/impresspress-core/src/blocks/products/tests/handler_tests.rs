@@ -157,7 +157,9 @@ async fn admin_product_detail_404s_for_a_soft_deleted_product() {
 /// `handle_update_product` (the generic admin PATCH) must not be a second
 /// door onto `deleted_at`: an admin sending `{"deleted_at": null}` for a
 /// soft-deleted product must not silently resurrect it — restore is the
-/// only door back in.
+/// only door back in. The refusal now comes from the body check, before the
+/// write's own liveness filter is reached, so it reads as `InvalidArgument`
+/// rather than `NotFound`; either way the row stays deleted.
 #[tokio::test]
 async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
     let ctx = ctx().await;
@@ -182,7 +184,7 @@ async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
     update.set_meta("auth.user_roles", "admin");
     let out = dispatch_admin(&ctx, update, update_input).await;
     assert!(
-        output_is_error(out, ErrorCode::NotFound).await,
+        output_is_error(out, ErrorCode::InvalidArgument).await,
         "an admin PATCH must not resurrect a soft-deleted product"
     );
 
@@ -228,8 +230,12 @@ async fn admin_update_product_refuses_a_soft_deleted_product() {
 /// still-live product (so the liveness guard above doesn't reject the
 /// request outright), an admin PATCH carrying `deleted_at` must not be able
 /// to soft-delete it as a side effect of an otherwise ordinary field update.
+///
+/// The whole request is refused, rather than the field dropped and the rest
+/// applied: a 200 whose body plainly shows `deleted_at` unchanged tells the
+/// caller their write succeeded when part of it was discarded.
 #[tokio::test]
-async fn admin_update_product_ignores_deleted_at_in_the_request_body() {
+async fn admin_update_product_refuses_deleted_at_in_the_request_body() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
@@ -250,16 +256,20 @@ async fn admin_update_product_ignores_deleted_at_in_the_request_body() {
     );
     update.set_meta("auth.user_roles", "admin");
     let out = dispatch_admin(&ctx, update, update_input).await;
-    let body = output_to_json(out).await;
-    assert_eq!(
-        body["data"]["name"], "New Name",
-        "unrelated fields in the same request must still apply"
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "a PATCH naming deleted_at must be refused, not partly applied"
     );
 
     let record = super::super::repo::products::get(&ctx, &id)
         .await
         .expect("the generic PATCH must not have soft-deleted the product");
     assert!(crate::util::RecordExt::str_field(&record, "deleted_at").is_empty());
+    assert_eq!(
+        crate::util::RecordExt::str_field(&record, "name"),
+        "Still Live",
+        "a refused request must not apply its other fields either"
+    );
 }
 
 /// The bug this whole plan exists for: `line_items.product_id` is `TEXT NOT
@@ -1033,7 +1043,8 @@ async fn user_update_prevents_ownership_change() {
         .unwrap()
         .to_string();
 
-    // Try to change created_by — should be stripped
+    // Try to change created_by — the whole request must be refused, not
+    // silently reduced to the fields the caller does own.
     let (update, update_input) = update_msg(
         &format!("/b/products/products/{prod_id}"),
         "user_1",
@@ -1043,8 +1054,16 @@ async fn user_update_prevents_ownership_change() {
         }),
     );
     let out = dispatch_user(&ctx, update, update_input).await;
-    let body = output_to_json(out).await;
-    assert_eq!(body["data"]["created_by"], "user_1");
+    assert!(output_is_error(out, ErrorCode::InvalidArgument).await);
+
+    let record = super::super::repo::products::get(&ctx, &prod_id)
+        .await
+        .expect("the product is still there");
+    assert_eq!(
+        crate::util::RecordExt::str_field(&record, "created_by"),
+        "user_1"
+    );
+    assert_eq!(crate::util::RecordExt::str_field(&record, "name"), "Mine");
 }
 
 // ============================================================
@@ -3281,3 +3300,131 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
 // the router's changed, leaving this gate green while the thing it guards
 // weakened.
 use crate::endpoint_match::auth_rank;
+
+// ============================================================
+// The request body cannot rewrite a product's identity
+// ============================================================
+
+/// A PATCH body carrying `id` used to reach `update_live` verbatim, so the
+/// write became `SET id = 'new' WHERE id = 'old' AND deleted_at IS NULL`:
+/// one row updated, the guard satisfied, and every `product_id` reference in
+/// `line_items`, `offers`, `product_versions` and `entitlements` orphaned —
+/// the exact failure soft delete exists to prevent. The re-read then looked
+/// up the ORIGINAL id, found nothing, and answered "Product not found", so
+/// the caller was told the write had failed while it had in fact rewritten
+/// the primary key.
+#[tokio::test]
+async fn admin_patch_cannot_rewrite_a_products_id() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Original" }),
+    );
+    let id = output_to_json(dispatch_admin(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "id": "p_hijacked", "name": "Renamed" }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "a body that names an unsettable field must be refused outright"
+    );
+
+    // The row still answers to its own id, and no row answers to the one the
+    // body tried to claim.
+    let kept = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect("the product must still answer to its original id");
+    assert_eq!(kept.id, id);
+    assert_eq!(
+        crate::util::RecordExt::str_field(&kept, "name"),
+        "Original",
+        "a refused write must not apply its other fields either"
+    );
+    assert!(
+        wafer_core::clients::database::get(&ctx, "impresspress__products__products", "p_hijacked")
+            .await
+            .is_err(),
+        "no row may answer to the id the body tried to claim"
+    );
+}
+
+/// The seller-owned PATCH reaches the same `update_live` with the same
+/// caller-supplied body, so it carries the identical primary-key rewrite.
+#[tokio::test]
+async fn seller_patch_cannot_rewrite_a_products_id() {
+    let ctx = user_products_ctx().await;
+
+    let (create, create_input) = create_msg(
+        "/b/products/products",
+        "user_1",
+        serde_json::json!({ "name": "Original" }),
+    );
+    let id = output_to_json(dispatch_user(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (update, update_input) = update_msg(
+        &format!("/b/products/products/{id}"),
+        "user_1",
+        serde_json::json!({ "id": "p_hijacked", "name": "Renamed" }),
+    );
+    let out = dispatch_user(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "a body that names an unsettable field must be refused outright"
+    );
+
+    let kept = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect("the product must still answer to its original id");
+    assert_eq!(kept.id, id);
+    assert_eq!(
+        crate::util::RecordExt::str_field(&kept, "name"),
+        "Original",
+        "a refused write must not apply its other fields either"
+    );
+    assert!(
+        wafer_core::clients::database::get(&ctx, "impresspress__products__products", "p_hijacked")
+            .await
+            .is_err(),
+        "no row may answer to the id the body tried to claim"
+    );
+}
+
+/// The handler-level refusal is a 400 for a clear message; the invariant
+/// itself belongs to the repo, which is the layer every future caller goes
+/// through. `update_live` must refuse an `id` in `data` on its own, so a new
+/// call site cannot reintroduce the rewrite by forwarding a map the handler
+/// never saw.
+#[tokio::test]
+async fn update_live_refuses_to_rewrite_the_primary_key() {
+    let ctx = ctx().await;
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), serde_json::json!("Original"));
+    seed(&ctx, "impresspress__products__products", "p1", data).await;
+
+    let error = super::super::repo::products::update_live(
+        &ctx,
+        "p1",
+        HashMap::from([("id".to_string(), serde_json::json!("p_hijacked"))]),
+    )
+    .await
+    .expect_err("a product's id is immutable");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    assert!(
+        super::super::repo::products::get(&ctx, "p1").await.is_ok(),
+        "the row must still answer to its original id"
+    );
+}

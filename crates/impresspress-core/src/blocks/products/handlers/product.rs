@@ -17,26 +17,40 @@ use crate::{
     util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
 
-// Columns the products table owns internally: ownership, moderation state,
-// the lifecycle stamps, and the Stripe/versioning linkage. None of them is a
-// caller-supplied value on any tier or verb — each has a dedicated writer that
-// maintains its invariants (`approve_product`/`reject_product`/`suspend` for
-// `approval_status`, the delete/restore endpoints for `deleted_at`, the Stripe
-// sync for `stripe_product_id`, the publish flow for `submitted_at`/
-// `published_at`, seller onboarding for `owner_*`/`seller_account_id`,
-// versioning for `current_version`). A generic create or PATCH that let a body
-// through verbatim would write them behind those writers' backs: an admin
-// PATCH of `{"stripe_product_id": "prod_wrong"}` desyncs the row from the
-// Stripe catalog, `{"owner_kind":…,"owner_id":…}` re-parents a seller's
-// product, and a create carrying `deleted_at` lands a row that
+// Columns the products table owns internally: the row's identity, ownership,
+// moderation state, the lifecycle stamps, and the Stripe/versioning linkage.
+// None of them is a caller-supplied value on any tier or verb — each has a
+// dedicated writer that maintains its invariants (`approve_product`/
+// `reject_product`/`suspend` for `approval_status`, the delete/restore
+// endpoints for `deleted_at`, the Stripe sync for `stripe_product_id`, the
+// publish flow for `submitted_at`/`published_at`, seller onboarding for
+// `owner_*`/`seller_account_id`, versioning for `current_version`, and the
+// database layer's own UUID synthesis for `id`). A generic create or PATCH
+// that let a body through verbatim would write them behind those writers'
+// backs: an admin PATCH of `{"stripe_product_id": "prod_wrong"}` desyncs the
+// row from the Stripe catalog, `{"owner_kind":…,"owner_id":…}` re-parents a
+// seller's product, and a create carrying `deleted_at` lands a row that
 // `ensure_product_capacity`'s live-only count cannot see.
+//
+// `id` is on the list for both verbs, and is the one that bites hardest.
+// `line_items`, `offers`, `product_versions` and `entitlements` all carry a
+// `product_id` that is `TEXT NOT NULL`, so a PATCH that rewrites the key
+// orphans every one of them — the exact damage soft delete exists to
+// prevent — while the write still reports one row affected. On create the
+// field is not a rewrite, but it is still not the caller's to choose: the
+// database layer synthesizes a UUID when `id` is absent and honours it when
+// present, so a caller-supplied id means a public endpoint picking a primary
+// key, which can only collide (a 500) or claim the key of a row that was
+// purged. The products API therefore never takes an id from a body, on
+// either verb.
 //
 // One list, four handlers: admin/user × create/update. The admin tier is not
 // exempt — this is not a privilege boundary (an admin has other, deliberate
 // doors to each of these fields) but an integrity one, and the two update
 // handlers previously disagreeing about it is exactly the kind of drift a
 // single shared constant prevents.
-const INTERNAL_FIELDS: &[&str] = &[
+const UNSETTABLE_FIELDS: &[&str] = &[
+    "id",
     "created_by",
     "owner_kind",
     "owner_id",
@@ -49,14 +63,35 @@ const INTERNAL_FIELDS: &[&str] = &[
     "deleted_at",
 ];
 
-/// Drop every [`INTERNAL_FIELDS`] entry from a caller-supplied request body,
-/// so what remains is only what a caller may set. Handlers that legitimately
-/// write one of these fields do so *after* this call, from their own computed
-/// value.
-fn strip_internal_fields(data: &mut HashMap<String, serde_json::Value>) {
-    for field in INTERNAL_FIELDS {
-        data.remove(*field);
+/// Refuse a caller-supplied request body that names any [`UNSETTABLE_FIELDS`]
+/// entry, naming the offending fields. `Ok(())` means the whole body is
+/// writable as it stands.
+///
+/// A refusal rather than a silent drop. Dropping answered 200 with a body in
+/// which the dropped field was plainly unchanged, so a client sending
+/// `{"approval_status":"approved","name":"X"}` was told its write had
+/// succeeded when half of it had been discarded — and, having no signal to
+/// act on, would keep re-sending it. 400 is the same shape the seller PATCH
+/// already uses for an unrecognized `status`, and it costs nothing the UI
+/// wants: every request the shipped admin and seller pages issue sends only
+/// caller-owned fields.
+///
+/// Handlers that legitimately write one of these fields do so *after* this
+/// call, from their own computed value — so this must run on the raw parsed
+/// body, before any server-supplied default or stamp is inserted.
+fn reject_unsettable_fields(data: &HashMap<String, serde_json::Value>) -> Result<(), OutputStream> {
+    let named: Vec<&str> = UNSETTABLE_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| data.contains_key(*field))
+        .collect();
+    if named.is_empty() {
+        return Ok(());
     }
+    Err(err_bad_request(&format!(
+        "These fields are not settable through this endpoint: {}",
+        named.join(", ")
+    )))
 }
 
 /// Escape SQL LIKE wildcards (`%`, `_`) and the escape char (`\`) in user
@@ -209,8 +244,10 @@ pub(super) async fn handle_create_product(
     };
     // Runs before `defaults` is applied, so the `or_insert` below always
     // inserts for the four internal fields it covers — a body can no longer
-    // pre-empt them, and it can no longer smuggle in the six it does not.
-    strip_internal_fields(&mut data);
+    // pre-empt them, and it can no longer smuggle in the rest.
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
     stamp_created(&mut data);
     for (key, val) in defaults {
         data.entry(key).or_insert(val);
@@ -235,7 +272,9 @@ pub(super) async fn handle_update_product(
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
-    strip_internal_fields(&mut data);
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
     stamp_updated(&mut data);
     // A soft-deleted product must go through `restore` before it is editable
     // again, so the generic PATCH refuses one outright rather than silently
@@ -579,7 +618,9 @@ pub(super) async fn handle_user_create_product(
     // would otherwise create a row the check's live-only count cannot see,
     // leaving the seller's slot free for the next create and the one after
     // that.
-    strip_internal_fields(&mut data);
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
     if let Err(response) = seller_policy::ensure_product_capacity(ctx, &user_id).await {
         return response;
     }
@@ -691,7 +732,9 @@ pub(super) async fn handle_user_update_product(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    strip_internal_fields(&mut data);
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
     if let Err(response) = seller_policy::validate_product_fields(ctx, &data).await {
         return response;
     }

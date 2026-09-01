@@ -141,8 +141,15 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
         ])
     };
     stamp_updated(&mut data);
-    match repo::products::update(ctx, id, data).await {
+    // `update_live`, not the unfiltered write: moderation acts on the row the
+    // `get` above found live, and the checks between the two are a window a
+    // concurrent delete fits through. Approving a product that has since been
+    // deleted would publish a listing (`status = active`) that no read can
+    // reach, so the write itself has to test liveness — and `NotFound` is the
+    // same answer the `get` would have given a moment earlier.
+    match repo::products::update_live(ctx, id, data).await {
         Ok(product) => ok_json(&product),
+        Err(error) if error.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(error) => err_internal("Could not moderate product", error),
     }
 }
@@ -209,7 +216,11 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             continue;
         };
         stamp_updated(&mut data);
-        if let Err(error) = repo::products::update(ctx, &product.id, data).await {
+        // Deliberately the unfiltered write. `seller_every_product` above
+        // spans the deleted rows on purpose (suspension is a fraud control
+        // and has to cover everything the seller owns), so filtering the
+        // write on liveness here would silently exempt exactly those rows.
+        if let Err(error) = repo::products::update_including_deleted(ctx, &product.id, data).await {
             return err_internal("Could not update seller product state", error);
         }
     }

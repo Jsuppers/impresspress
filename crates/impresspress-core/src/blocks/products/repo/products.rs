@@ -31,8 +31,8 @@ pub(crate) const TABLE: &str = "impresspress__products__products";
 //
 // It is never the empty string, and never any other non-timestamp text. The
 // only writers are `soft_delete` (a fresh `now_rfc3339()`) and `restore`
-// (`Value::Null`); every handler that forwards a caller-supplied body strips
-// the field first (`handlers::product::INTERNAL_FIELDS`), which
+// (`Value::Null`); every handler that forwards a caller-supplied body refuses
+// a body naming the field (`handlers::product::UNSETTABLE_FIELDS`), which
 // `no_handler_path_can_write_an_empty_deleted_at` in
 // `tests/seller_governance_tests.rs` pins end-to-end across all four
 // create/update handlers. The invariant matters because `''` would otherwise be a
@@ -175,13 +175,22 @@ pub(crate) async fn list_all_including_deleted(
 
 /// Fetch one product regardless of soft-delete state.
 ///
-/// Third and last named exception, for the same reason as
+/// Third and last named exception on the read side, for the same reason as
 /// [`list_all_including_deleted`] and reached from it: archiving a product's
 /// Stripe catalog needs the row's `owner_kind`/`owner_id` (to address the
 /// connected account) and its `stripe_product_id`, and has to keep working
 /// once the product is soft-deleted — that is precisely when its catalog most
 /// needs taking down. The read cannot leak a deleted product to anyone,
 /// because archival only ever *removes* things from the live Stripe catalog.
+///
+/// The webhook that reconciles a paid Payment Link session shares it, for the
+/// mirror-image reason: soft delete touches nothing in Stripe, so a deleted
+/// product's Payment Links stay payable and a customer can still be charged
+/// through one. Reading the product live-only there meant the reconciliation
+/// answered `NotFound`, the delivery failed, and Stripe retried it forever —
+/// money captured with no purchase row, no line items, and an order-status
+/// page that never resolves. The row is read for the buyer's own receipt, so
+/// again nothing about a deleted product reaches a third party.
 ///
 /// Not for handlers. A read that decides whether a caller may see or edit a
 /// product wants [`get`], which answers `NotFound` for a deleted row.
@@ -204,12 +213,53 @@ pub(crate) async fn create(
     db::create(ctx, TABLE, data).await
 }
 
-pub(crate) async fn update(
+/// Update one product *regardless of its soft-delete state*.
+///
+/// The write-side twin of [`get_including_deleted`], and the only unfiltered
+/// write in this module. Every handler-reachable update wants
+/// [`update_live`]: an update that lands on an already-deleted row and
+/// reports success is the bug `update_live` exists to prevent, and nothing in
+/// the type system distinguishes a deliberate unfiltered write from a
+/// forgotten filter — so the two are distinguished by name instead, and
+/// `write_side_escape_hatches_are_allowlisted` in `tests/repo_door_test.rs`
+/// fails the build for any new call site that is not justified there.
+///
+/// The two deliberate callers both write a fact that stays true after a
+/// delete: seller suspension (`handlers::sellers::set_suspended`), which must
+/// cover every row the seller owns because soft delete touches nothing in
+/// Stripe; and the `stripe_product_id` write-back in `stripe.rs`, which
+/// records a Stripe Product that has already been created — refusing to
+/// record it because the product was deleted mid-sync would leave the Stripe
+/// object orphaned with nothing pointing at it.
+pub(crate) async fn update_including_deleted(
     ctx: &dyn Context,
     id: &str,
     data: HashMap<String, Value>,
 ) -> Result<Record, WaferError> {
+    reject_id_rewrite(&data)?;
     db::update(ctx, TABLE, id, data).await
+}
+
+// A product's id is its primary key and every other table's foreign key
+// (`line_items`, `offers`, `product_versions`, `entitlements` all carry a
+// `product_id` that is `TEXT NOT NULL`). An update that sets it rewrites the
+// key and orphans all of them — and does so invisibly, because a filtered
+// update's `WHERE id = ?` still matches exactly one row, so the affected-row
+// guard passes while the by-id re-read afterwards looks up an id that no
+// longer exists and reports `NotFound`. The caller is told the write failed
+// while the catalog has already been rewritten.
+//
+// The guard lives here rather than only in the handlers because this module
+// is the single door: `handlers::product::UNSETTABLE_FIELDS` gives a caller a
+// clear 400, but it only covers the four request bodies that exist today.
+fn reject_id_rewrite(data: &HashMap<String, Value>) -> Result<(), WaferError> {
+    if data.contains_key("id") {
+        return Err(WaferError::new(
+            ErrorCode::InvalidArgument,
+            "a product's id is immutable",
+        ));
+    }
+    Ok(())
 }
 
 /// Selects exactly one row by id. Paired with [`live_filter`] to make a
@@ -235,6 +285,7 @@ pub(crate) async fn update_live(
     id: &str,
     data: HashMap<String, Value>,
 ) -> Result<Record, WaferError> {
+    reject_id_rewrite(&data)?;
     let updated =
         db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), live_filter()], data).await?;
     if updated == 0 {
@@ -245,6 +296,13 @@ pub(crate) async fn update_live(
     // write has already established that the row was live when it happened —
     // answering `NotFound` here for a delete that landed afterwards would
     // deny a change that did take effect.
+    //
+    // The re-read is by the SAME id the `WHERE` selected, which is only a
+    // faithful read-back because `reject_id_rewrite` above has already
+    // established that the write cannot have moved the row's identity.
+    // Without that, a `data` carrying `id` produced the worst possible
+    // answer: the write landed, the affected-row guard passed, and this read
+    // missed — reporting `NotFound` for a change that had taken effect.
     db::get(ctx, TABLE, id).await
 }
 
@@ -264,17 +322,29 @@ pub(crate) async fn purge(ctx: &dyn Context, id: &str) -> Result<(), WaferError>
 /// item. Stamping also frees the product's slug, since the unique index
 /// from migration 005 is partial on `deleted_at IS NULL`.
 ///
-/// Routes through `get` first so deleting an already soft-deleted (or
-/// missing) row answers `NotFound`, matching every other read in this
-/// module: a caller can't distinguish "double delete" from "never existed"
-/// any more than they can for `get` itself.
+/// A filtered write for the same reason as [`update_live`], and not a `get`
+/// followed by an unconditional `update`: between those two statements a
+/// concurrent `restore` fits, and the unconditional write then stamps
+/// `deleted_at` back on top of a row the restore had just brought live —
+/// answering 200 to both callers, one of whom was told their restore
+/// succeeded. Two concurrent deletes race the same way, the second rewriting
+/// the first's stamp and moving the row in the `deleted_at desc` view.
+///
+/// Deleting an already soft-deleted (or missing) row matches zero rows and
+/// answers `NotFound`, matching every other read in this module: a caller
+/// can't distinguish "double delete" from "never existed" any more than they
+/// can for `get` itself.
 pub(crate) async fn soft_delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
-    get(ctx, id).await?;
     let data = HashMap::from([(
         "deleted_at".to_string(),
         Value::String(crate::util::now_rfc3339()),
     )]);
-    update(ctx, id, data).await.map(|_| ())
+    let updated =
+        db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), live_filter()], data).await?;
+    if updated == 0 {
+        return Err(WaferError::new(ErrorCode::NotFound, "Product not found"));
+    }
+    Ok(())
 }
 
 /// Clear `deleted_at`, bringing a soft-deleted product back.
@@ -522,7 +592,7 @@ mod tests {
         // resolution in CI rather than relying on that.
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let updated = update(
+        let updated = update_including_deleted(
             &ctx,
             "stamped",
             HashMap::from([("name".to_string(), json!("stamped-v2"))]),
@@ -558,6 +628,67 @@ mod tests {
             .await
             .expect_err("must not resolve as live");
         assert_eq!(err.code, wafer_run::ErrorCode::NotFound);
+    }
+
+    /// `soft_delete` used to `get` and then write unconditionally, which is
+    /// the read-then-write race `update_live` exists to eliminate: between
+    /// the two statements a concurrent `restore` commits and answers 200 with
+    /// a live record, and the unconditional write then stamps `deleted_at`
+    /// back on top of it — the restoring admin is told it worked and the
+    /// product is gone, with no error anywhere.
+    ///
+    /// The liveness test has to be the write's own `WHERE`, so `soft_delete`
+    /// must issue no read at all. Proven by failing every `database.get`
+    /// against the products table: the old shape could not get past its first
+    /// statement, the filtered write never issues one.
+    #[tokio::test]
+    async fn soft_delete_tests_liveness_in_the_write_not_in_a_separate_read() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+
+        let no_reads = crate::test_support::FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.get", TABLE)],
+        );
+        soft_delete(&no_reads, "live")
+            .await
+            .expect("soft delete must not depend on a read of its own row");
+
+        let raw = db::get(&ctx, TABLE, "live").await.expect("row still there");
+        assert!(
+            !raw.str_field("deleted_at").is_empty(),
+            "deleted_at must be stamped"
+        );
+    }
+
+    /// The other half of the same race: a second delete must match zero rows
+    /// and write nothing, rather than re-stamping `deleted_at` and moving the
+    /// row in the admin deleted view's `deleted_at desc` ordering.
+    #[tokio::test]
+    async fn a_second_soft_delete_is_not_found_and_leaves_the_stamp_alone() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+        soft_delete(&ctx, "live").await.expect("first delete");
+        let stamp = db::get(&ctx, TABLE, "live")
+            .await
+            .expect("row")
+            .str_field("deleted_at")
+            .to_string();
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let err = soft_delete(&ctx, "live")
+            .await
+            .expect_err("already deleted");
+        assert_eq!(err.code, wafer_run::ErrorCode::NotFound);
+        assert_eq!(
+            db::get(&ctx, TABLE, "live")
+                .await
+                .expect("row")
+                .str_field("deleted_at"),
+            stamp,
+            "a delete that deleted nothing must not move the stamp"
+        );
     }
 
     #[tokio::test]

@@ -1663,7 +1663,13 @@ async fn sync_offer_catalog_inner(
         )
         .await?;
         stripe_product_id = validate_stripe_product(&response, None, livemode)?;
-        repo::products::update(
+        // The unfiltered write on purpose: the Stripe Product above already
+        // exists. Refusing to record its id because the local product was
+        // soft-deleted while the sync was in flight would leave that Stripe
+        // object orphaned in the connected account with nothing pointing at
+        // it — and it is exactly `stripe_product_id` that
+        // `archive_offer_catalog` later needs in order to take it down.
+        repo::products::update_including_deleted(
             ctx,
             &product.id,
             HashMap::from([(
