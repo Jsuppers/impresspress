@@ -54,6 +54,18 @@ const PROBE_INTERVAL_JITTER_MS: u64 = 300_000;
 /// [`blind_window_requires_rebuild`], which must not fire for a runtime that
 /// already rebuilt during the outage.
 const PROBE_FAILURE_BACKOFF_CAP_MS: u64 = 1_800_000;
+/// Consecutive failed probes before a runtime is treated as having gone
+/// BLIND — see [`blind_window_requires_rebuild`].
+///
+/// Two, not one. A single failed GET is a blip: the write path retries a
+/// lost bump ~1.1s later, so one failure cannot plausibly mean a bump was
+/// lost, and the very next probe reads a current stamp. Reconciling on one
+/// failure made every isolate pay a rebuild on any passing KV hiccup. The
+/// event this actually targets — the daily read allowance running out, which
+/// exhausts writes on the same day and so really can lose a bump — produces
+/// failures continuously until the UTC reset, so it clears this bar
+/// immediately while a blip never does.
+const BLIND_WINDOW_MIN_FAILURES: u32 = 2;
 /// Maximum time an isolate-local build slot may remain owned.
 ///
 /// Normal Rust cancellation drops [`BuildGuard`], but Cloudflare can hard-stop
@@ -449,16 +461,18 @@ fn prepared_cached_config_matches(
 /// a runtime that rebuilt during the outage (already current) starts at zero
 /// and never pays this.
 ///
-/// COST, stated plainly: this trades a read storm for a bounded build storm.
-/// A FLAPPING KV pays one rebuild per fail-then-succeed transition per
-/// isolate — with the backoff floor at 10 minutes after the first failure,
-/// at most ~6/hour/isolate. That price is deliberately paid on the cheap
-/// path wherever possible: the prepared warm path re-hydrates its existing
-/// plan (~132us) instead of bypassing to a full dynamic build, so only
-/// isolates already running dynamically pay the multi-second rebuild. The
-/// alternative — trusting an unchanged stamp after a blind window — is
-/// silent, unbounded staleness, which is worse than a bounded, observable
-/// build cost.
+/// COST, stated plainly: this trades a read storm for a bounded rebuild.
+/// [`BLIND_WINDOW_MIN_FAILURES`] keeps a passing blip from triggering
+/// anything, and a sustained outage costs one rebuild per isolate when KV
+/// comes back — on the prepared path a plan re-hydration (~132us), never a
+/// bypass to the multi-second dynamic build, because a bypass is sticky for
+/// the isolate's life and would make a recovered outage permanently
+/// expensive. The alternative — trusting an unchanged stamp after a blind
+/// window — is silent staleness of every config variable the window hid.
+fn blind_window_requires_rebuild(consecutive_failures: u32, probe: &VersionProbe) -> bool {
+    consecutive_failures >= BLIND_WINDOW_MIN_FAILURES && !matches!(probe, VersionProbe::Unavailable)
+}
+
 /// Blind-window state a freshly hydrated runtime must START with.
 ///
 /// A runtime built while the probe was unavailable was built without ever
@@ -468,11 +482,13 @@ fn prepared_cached_config_matches(
 /// hydrated during an outage look permanently fresh afterwards, because the
 /// plan's own stamp is what KV reports once it recovers.
 fn initial_probe_failures(probe: &VersionProbe) -> u32 {
-    u32::from(matches!(probe, VersionProbe::Unavailable))
-}
-
-fn blind_window_requires_rebuild(consecutive_failures: u32, probe: &VersionProbe) -> bool {
-    consecutive_failures > 0 && !matches!(probe, VersionProbe::Unavailable)
+    if matches!(probe, VersionProbe::Unavailable) {
+        // Not one: this runtime has no confirmed generation at all, so it is
+        // already past the blip threshold rather than one failure into it.
+        BLIND_WINDOW_MIN_FAILURES
+    } else {
+        0
+    }
 }
 
 /// Jitter for one probe deadline, from 32 bits of randomness. Two random
@@ -987,7 +1003,15 @@ where
         version: plan.plan_hash.clone(),
         config_version: Some(plan.config_generation.clone()),
         environment_identity,
-        probe_deadline_ms: Cell::new(next_probe_deadline_ms(started_at)),
+        // Armed from the SAME backoff `note_probe_failure` would apply, so a
+        // runtime hydrated while KV was unreachable does not go on to probe
+        // at full cadence during the outage that made it blind — which is
+        // exactly when the read allowance cannot afford it.
+        probe_deadline_ms: Cell::new(if initial_probe_failures == 0 {
+            next_probe_deadline_ms(started_at)
+        } else {
+            probe_failure_deadline_ms(started_at, initial_probe_failures, random_probe_jitter_ms())
+        }),
         probe_failures: Cell::new(initial_probe_failures),
     });
     Ok((rt, build_ordinal, duration_ms))
@@ -1069,6 +1093,15 @@ where
             && rt.config_version.is_none()
             && transient_dynamic_can_serve_cached(&rt.version, &probe)
         {
+            // Serving across an unavailable probe means this runtime's
+            // freshness went unverified, so the isolate has to remember it
+            // was blind — otherwise its next successful warm probe reads an
+            // unchanged stamp as proof of nothing having changed. Same
+            // invariant `initial_probe_failures` establishes for a runtime
+            // hydrated blind.
+            if matches!(probe, VersionProbe::Unavailable) {
+                rt.note_probe_failure(started_at);
+            }
             return Ok((rt, CacheOutcome::Hit));
         }
     }
@@ -1221,6 +1254,13 @@ where
                 && rt.version == plan_generation
                 && prepared_cached_config_matches(rt.config_version.as_deref(), &probe)
             {
+                // Same reasoning as the transient dynamic path: an
+                // unavailable probe verified nothing, so record the blind
+                // window rather than letting a later unchanged stamp look
+                // like confirmation.
+                if matches!(probe, VersionProbe::Unavailable) {
+                    rt.note_probe_failure(now);
+                }
                 return Ok((rt, CacheOutcome::Hit));
             }
         }
@@ -1272,9 +1312,15 @@ where
             now,
             // This path never probed at all, so it has confirmed nothing
             // about the current generation — the same position as a probe
-            // that came back unavailable. Reconcile on the first probe that
-            // does reach KV rather than trusting the plan indefinitely.
-            1,
+            // that came back unavailable.
+            //
+            // Inert today, and passed anyway: this runtime is request-local
+            // (no `store_if_current` below), so nothing ever probes it again
+            // and the value is dropped unread. It is set correctly so that
+            // the invariant holds by construction rather than by knowing
+            // which call sites happen to publish — if this hydration is ever
+            // stored, it will already carry the right state.
+            BLIND_WINDOW_MIN_FAILURES,
         )
         .await?;
         tracing::info!(
@@ -1323,36 +1369,59 @@ where
                         return Ok((rt, CacheOutcome::ProbedFresh));
                     }
                     // The stamp is unchanged, but this is the first probe to
-                    // reach KV after a blind window, during which a bump could
-                    // have been lost — so an unchanged stamp no longer proves
-                    // unchanged state, and this isolate has to reconcile
-                    // against D1 itself.
+                    // reach KV after a SUSTAINED blind window, during which a
+                    // bump could have been lost — so an unchanged stamp no
+                    // longer proves unchanged config. Re-hydrate the plan
+                    // once: that re-reads the variables table through
+                    // `ConfigSource` at strict-init, and the fresh runtime
+                    // starts at zero failures so this fires once, not
+                    // repeatedly.
                     //
-                    // It falls through to the bypass below rather than
-                    // re-hydrating the plan, and that distinction is the whole
-                    // point. Re-hydration re-reads only the VARIABLES table,
-                    // via `ConfigSource` at strict-init; `block_settings` and
-                    // the WRAP grants come from `plan.structure`, so an admin
-                    // change to either during the blind window would survive a
-                    // re-hydration untouched — and the fresh runtime would
-                    // start at zero failures, so nothing would ever try again.
-                    // Only the dynamic path reloads every mutable table.
+                    // It deliberately does NOT fall through to the bypass
+                    // below. Doing so would abandon the packaged plan for the
+                    // life of the isolate — `bypass_prepared` is sticky for
+                    // this plan+environment — and on a deployment whose read
+                    // allowance is routinely exhausted that is every prepared
+                    // isolate, permanently, on the multi-second dynamic build
+                    // path this file exists to avoid.
                     //
-                    // The price is the one the bypass always charges: this
-                    // isolate leaves its packaged plan for good and pays
-                    // multi-second dynamic builds until it recycles or a new
-                    // plan/environment clears the bypass. That is the same
-                    // price the branch below already pays for an observed
-                    // admin change, and it is the right way round — a bounded,
-                    // visible build cost beats indefinitely serving structural
-                    // config we know we could not see.
+                    // KNOWN LIMIT: `block_settings` and the WRAP grants come
+                    // from `plan.structure`, so re-hydration does not reconcile
+                    // them — a structural admin change whose bump was lost
+                    // stays invisible here. That hole is NOT specific to blind
+                    // isolates: a lost bump is invisible to every isolate,
+                    // blind or not, until some later write bumps the stamp
+                    // successfully or the isolate recycles. Fixing it properly
+                    // means comparing plan structure against D1 (or not losing
+                    // bumps), not making every isolate pay a permanent bypass
+                    // for a hazard it probably never encountered.
                     tracing::info!(
                         plan_hash = %plan_generation,
                         config_version = %probe.observed(),
+                        failures = rt.probe_failures.get(),
                         "config-version probes reached KV again after a blind window; \
-                         bypassing the packaged plan once so block settings and grants \
-                         are re-read from D1, not just config variables"
+                         re-hydrating the plan once to pick up config variables bumped \
+                         while this isolate could not see KV"
                     );
+                    let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
+                        env,
+                        request_config,
+                        plan.as_ref(),
+                        register_blocks,
+                        register_post_build,
+                        environment_identity,
+                        now,
+                        initial_probe_failures(&probe),
+                    )
+                    .await?;
+                    store_if_current(&build_guard, rt.clone());
+                    return Ok((
+                        rt,
+                        CacheOutcome::Rebuilt {
+                            build_ordinal,
+                            duration_ms,
+                        },
+                    ));
                 }
 
                 tracing::info!(
@@ -1862,15 +1931,34 @@ mod tests {
     /// "the change was invisible to us". One rebuild on recovery re-reads D1
     /// and converges; without it the isolate serves pre-write config until
     /// it dies.
+    /// ONE failed GET is a blip, not a blind window.
+    ///
+    /// A single transient failure is followed by a probe that almost
+    /// certainly reads a current stamp: the write path retries its bump ~1.1s
+    /// later, so one blip cannot plausibly have lost a bump. Treating it as a
+    /// blind window made every isolate pay a reconcile — and, before this
+    /// threshold existed, permanently abandon its packaged plan — on any
+    /// passing KV hiccup. Only a SUSTAINED window (the quota exhaustion this
+    /// PR is about, which lasts until the UTC reset and fails writes too)
+    /// makes a lost bump likely enough to be worth a rebuild.
+    #[wasm_bindgen_test]
+    fn a_single_failed_probe_is_not_a_blind_window() {
+        assert!(!blind_window_requires_rebuild(
+            1,
+            &VersionProbe::Stamped("v1".to_string())
+        ));
+        assert!(BLIND_WINDOW_MIN_FAILURES >= 2);
+    }
+
     #[wasm_bindgen_test]
     fn first_successful_probe_after_a_blind_window_forces_one_rebuild() {
         assert!(blind_window_requires_rebuild(
-            1,
+            BLIND_WINDOW_MIN_FAILURES,
             &VersionProbe::Stamped("v1".to_string())
         ));
         // Still blind: keep serving, do not rebuild on an unverifiable probe.
         assert!(!blind_window_requires_rebuild(
-            3,
+            BLIND_WINDOW_MIN_FAILURES,
             &VersionProbe::Unavailable
         ));
         // Never blind: an unchanged stamp means an unchanged config.
@@ -1896,11 +1984,19 @@ mod tests {
     /// first successful probe already forces a rebuild.
     #[wasm_bindgen_test]
     fn a_runtime_hydrated_blind_starts_inside_a_blind_window() {
-        assert_eq!(initial_probe_failures(&VersionProbe::Unavailable), 1);
+        assert_eq!(
+            initial_probe_failures(&VersionProbe::Unavailable),
+            BLIND_WINDOW_MIN_FAILURES
+        );
         assert!(blind_window_requires_rebuild(
             initial_probe_failures(&VersionProbe::Unavailable),
             &VersionProbe::Stamped("v1".to_string())
         ));
+        assert!(
+            initial_probe_failures(&VersionProbe::Unavailable) >= BLIND_WINDOW_MIN_FAILURES,
+            "a runtime built without ever confirming a generation is already \
+             past the blip threshold: it has no prior successful probe to lean on"
+        );
 
         assert_eq!(
             initial_probe_failures(&VersionProbe::Stamped("v1".to_string())),
