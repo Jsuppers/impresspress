@@ -1522,6 +1522,52 @@ async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
     );
 }
 
+/// The slug pre-check exists so a restore that would violate migration 005's
+/// partial unique index says which slug collided instead of surfacing the
+/// index violation as an opaque 500. Reading a *failed* probe as "no
+/// collision" throws that away: the restore proceeds, hits the index, and
+/// produces exactly the 500 the pre-check was built to prevent — with no log
+/// line naming the real cause, and with the Deleted view's Restore button
+/// (which only reloads on success) showing the admin nothing at all.
+///
+/// A probe that could not run is not evidence of a clear slug. Fail the
+/// restore and say so.
+#[tokio::test]
+async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
+    let ctx = ctx().await;
+
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(&ctx, "original").await;
+
+    // `get_deleted` still resolves; the collision probe's listing is what
+    // fails — the exact interleaving a transient database wobble produces,
+    // and the only one that reaches the swallowed branch.
+    let ctx = ctx.break_list_reads();
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::Internal).await,
+        "a probe that could not run must fail the restore, not be read as a clear slug"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "original").await,
+        "a restore that could not check its slug must leave the product deleted"
+    );
+}
+
 // ============================================================
 // Group products endpoint
 // ============================================================

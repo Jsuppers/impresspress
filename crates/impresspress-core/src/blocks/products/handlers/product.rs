@@ -298,14 +298,25 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
     // at all. Name the collision instead, so an admin can free the slug and
     // retry.
     match repo::products::get_deleted(ctx, id).await {
-        Ok(deleted) => {
-            if let Some(slug) = colliding_slug(ctx, &deleted).await {
+        Ok(deleted) => match colliding_slug(ctx, &deleted).await {
+            Ok(Some(slug)) => {
                 return err_conflict(&format!(
                     "Another product already uses the slug \"{slug}\". Rename or delete that \
                      product, then restore this one."
-                ));
+                ))
             }
-        }
+            Ok(None) => {}
+            // A probe that could not run is not evidence of a clear slug.
+            // Proceeding anyway walks straight into the index violation this
+            // pre-check exists to keep out of the response — the opaque 500
+            // comes back regardless, only now with nothing in the logs
+            // explaining it and a Restore button that appears inert.
+            // `err_internal` records the cause against a correlation id the
+            // admin can quote.
+            Err(error) => {
+                return err_internal("Could not check the restored product's slug", error)
+            }
+        },
         // Not in the deleted set. `restore` below still answers for it,
         // unchanged: an unknown id is `NotFound`, and a live product is a
         // no-op that cannot collide with anything since it already holds its
@@ -321,15 +332,22 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
 }
 
 /// The slug `deleted` would re-claim on restore, when a LIVE product of the
-/// same owner already holds it — `None` when the restore is clear to go.
+/// same owner already holds it — `Ok(None)` when the restore is clear to go.
 ///
 /// Keyed on `(owner_kind, owner_id, slug)` because that is the unique index's
 /// own key. An empty slug never collides: the index is also partial on
 /// `slug <> ''`, so any number of rows may carry one.
-async fn colliding_slug(ctx: &dyn Context, deleted: &db::Record) -> Option<String> {
+///
+/// A read failure is returned, not folded into `Ok(None)`: "no collision" and
+/// "could not tell" are different answers, and only the caller knows what to
+/// do with the second one.
+async fn colliding_slug(
+    ctx: &dyn Context,
+    deleted: &db::Record,
+) -> Result<Option<String>, wafer_run::WaferError> {
     let slug = deleted.str_field("slug");
     if slug.is_empty() {
-        return None;
+        return Ok(None);
     }
     let filters = vec![
         eq_filter("owner_kind", deleted.str_field("owner_kind")),
@@ -338,13 +356,8 @@ async fn colliding_slug(ctx: &dyn Context, deleted: &db::Record) -> Option<Strin
     ];
     // `list_all` appends the live-only filter, so a second soft-deleted row
     // sharing the slug is correctly not a collision.
-    match repo::products::list_all(ctx, filters).await {
-        Ok(live) if !live.is_empty() => Some(slug.to_string()),
-        // A failed lookup must not block the restore: the index is still
-        // authoritative, and the caller falls back to the generic error it
-        // had before.
-        Ok(_) | Err(_) => None,
-    }
+    let live = repo::products::list_all(ctx, filters).await?;
+    Ok((!live.is_empty()).then(|| slug.to_string()))
 }
 
 fn eq_filter(field: &str, value: &str) -> Filter {
