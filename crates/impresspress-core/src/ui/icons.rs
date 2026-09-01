@@ -240,3 +240,21 @@ pub fn link() -> Markup {
 pub fn credit_card() -> Markup {
     icon(r#"<rect width="20" height="14" x="2" y="5" rx="2"/><path d="M2 10h20"/>"#)
 }
+
+pub fn user_plus() -> Markup {
+    icon(
+        r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>"#,
+    )
+}
+
+pub fn triangle_alert() -> Markup {
+    icon(
+        r#"<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>"#,
+    )
+}
+
+pub fn activity() -> Markup {
+    icon(
+        r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#,
+    )
+}

@@ -12,7 +12,7 @@ use super::{admin_page, crumb};
 use crate::{
     blocks::{admin::REQUEST_LOGS_TABLE as REQUEST_LOGS, auth::USERS_TABLE as USERS},
     ui::{
-        components,
+        components, icons,
         shell::Topbar,
         templates::{dashboard_page, PageHeader, StatTile},
         SiteConfig, UserInfo,
@@ -351,31 +351,43 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let errors_str = errors_today.to_string();
     let avg_ms_str = format!("{avg_ms:.0}ms");
 
+    // Sparklines reuse the daily series already fetched for the charts below —
+    // no extra D1 statements. "Avg response" has no per-day series fetched, so
+    // its sparkline is `None` rather than reusing an unrelated metric.
+    let new_users_series: Vec<i64> = new_users_daily.iter().map(|(_, v)| *v).collect();
+    let requests_series: Vec<i64> = requests_daily.iter().map(|(_, v)| *v).collect();
+    let errors_series: Vec<i64> = errors_daily.iter().map(|(_, v)| *v).collect();
+
     let stats = vec![
         StatTile {
             label: "Total Users",
             value: &user_count_str,
-            trend: None,
+            icon: icons::users(),
+            spark: Some(components::sparkline(&new_users_series, "var(--primary-color)")),
         },
         StatTile {
             label: "New Today",
             value: &new_users_str,
-            trend: None,
+            icon: icons::user_plus(),
+            spark: Some(components::sparkline(&new_users_series, "var(--primary-color)")),
         },
         StatTile {
             label: "Requests Today",
             value: &requests_str,
-            trend: None,
+            icon: icons::file_text(),
+            spark: Some(components::sparkline(&requests_series, "var(--accent-warning)")),
         },
         StatTile {
             label: "Errors Today",
             value: &errors_str,
-            trend: None,
+            icon: icons::triangle_alert(),
+            spark: Some(components::sparkline(&errors_series, "var(--accent-danger)")),
         },
         StatTile {
             label: "Avg Response",
             value: &avg_ms_str,
-            trend: None,
+            icon: icons::activity(),
+            spark: None,
         },
     ];
 
@@ -453,9 +465,9 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let charts_section = html! {
         div .dashboard-charts {
-            (components::bar_chart_card("New users", "Last 30 days", &new_users_daily, "var(--primary-color)", "/b/admin/users"))
+            (components::line_chart_card("New users", "Last 30 days", &new_users_daily, "var(--primary-color)", "/b/admin/users"))
             (components::bar_chart_card("Requests", "Last 30 days", &requests_daily, "var(--accent-warning)", "/b/admin/logs"))
-            (components::bar_chart_card("Errors", "Last 30 days", &errors_daily, "var(--accent-danger)", "/b/admin/logs?status=ERROR"))
+            (components::line_chart_card("Errors", "Last 30 days", &errors_daily, "var(--accent-danger)", "/b/admin/logs?status=ERROR"))
         }
     };
 
@@ -507,6 +519,24 @@ mod tests {
         REQUEST_LOGS, USERS,
     };
     use crate::test_support::TestContext;
+
+    #[test]
+    fn dashboard_renders_stats_before_charts() {
+        let m = crate::ui::templates::dashboard_page(
+            crate::ui::templates::PageHeader { title: "Dashboard", subtitle: None, primary_action: None },
+            vec![crate::ui::templates::StatTile {
+                label: "TOTAL USERS", value: "1",
+                icon: maud::html! { span .probe-icon {} }, spark: None,
+            }],
+            maud::html! { div .probe-primary {} },
+            maud::html! {},
+            None,
+            None,
+        ).into_string();
+        let stats = m.find("stats-grid").expect("stats grid missing");
+        let charts = m.find("dashboard-grid").expect("charts grid missing");
+        assert!(stats < charts, "stat tiles must precede the charts row");
+    }
 
     async fn seed_user(ctx: &TestContext, id: &str, created_at: &str, deleted_at: Option<&str>) {
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();

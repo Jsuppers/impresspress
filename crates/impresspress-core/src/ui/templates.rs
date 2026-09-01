@@ -213,10 +213,16 @@ pub fn tabbed_page(
 
 pub struct StatTile<'a> {
     pub label: &'a str,
-    pub value: &'a str,         // pre-formatted (caller decides rounding/units)
-    pub trend: Option<&'a str>, // e.g. "+12% 7d"
+    pub value: &'a str, // pre-formatted (caller decides rounding/units)
+    pub icon: Markup,
+    pub spark: Option<Markup>,
 }
 
+/// `top_card` renders between the stat tiles and `dashboard-grid` — e.g. the
+/// admin dashboard's three chart cards. The name is positional relative to
+/// `dashboard-grid` (the two-column primary/secondary row below it), not
+/// relative to the page as a whole: stats always render first, matching the
+/// mockup's stats → charts → tables order.
 pub fn dashboard_page(
     header: PageHeader<'_>,
     stats: Vec<StatTile<'_>>,
@@ -228,18 +234,14 @@ pub fn dashboard_page(
     html! {
         div .page .page--dashboard {
             (render_header(&header))
-            @if let Some(tc) = top_card { div .dashboard-top { (tc) } }
             @if !stats.is_empty() {
                 div .stats-grid {
                     @for s in &stats {
-                        div .stat-tile {
-                            div .stat-tile__label { (s.label) }
-                            div .stat-tile__value { (s.value) }
-                            @if let Some(t) = s.trend { div .stat-tile__trend { (t) } }
-                        }
+                        (crate::ui::components::stat_card(s.label, s.value, s.icon.clone(), s.spark.clone()))
                     }
                 }
             }
+            @if let Some(tc) = top_card { div .dashboard-top { (tc) } }
             div .dashboard-grid {
                 div .dashboard-grid__primary { (primary_card) }
                 div .dashboard-grid__secondary { (secondary_card) }
@@ -617,12 +619,14 @@ mod tests {
             StatTile {
                 label: "Users",
                 value: "142",
-                trend: Some("+5 7d"),
+                icon: html! { span .probe-icon-users {} },
+                spark: Some(html! { span .probe-spark {} }),
             },
             StatTile {
                 label: "Storage",
                 value: "1.2 GB",
-                trend: None,
+                icon: html! { span .probe-icon-storage {} },
+                spark: None,
             },
         ];
         let primary = html! { section .card { "Quick actions" } };
@@ -631,14 +635,15 @@ mod tests {
         assert!(s.contains("stats-grid"));
         assert!(s.contains(">Users<"));
         assert!(s.contains("142"));
-        assert!(s.contains("+5 7d"));
+        assert!(s.contains("probe-icon-users"), "icon must render");
+        assert!(s.contains("probe-spark"), "sparkline must render when Some");
         assert!(s.contains("Quick actions"));
         assert!(s.contains("Recent activity"));
         assert!(!s.contains("dashboard-wide"));
     }
 
     #[test]
-    fn dashboard_page_renders_optional_top_card_above_stats() {
+    fn dashboard_page_renders_optional_top_card_between_stats_and_grid() {
         let header = PageHeader {
             title: "Dash",
             subtitle: None,
@@ -649,7 +654,8 @@ mod tests {
             vec![StatTile {
                 label: "Users",
                 value: "1",
-                trend: None,
+                icon: html! { span .probe-icon {} },
+                spark: None,
             }],
             html! { div #primary {} },
             html! { div #secondary {} },
@@ -657,9 +663,14 @@ mod tests {
             Some(html! { div #top-card { "QA" } }),
         );
         let s = m.into_string();
-        let top = s.find("dashboard-top").expect("dashboard-top div present");
         let stats = s.find("stats-grid").expect("stats-grid div present");
-        assert!(top < stats, "top card must render above stats");
+        let top = s.find("dashboard-top").expect("dashboard-top div present");
+        let grid = s.find("dashboard-grid").expect("dashboard-grid div present");
+        assert!(stats < top, "stats must render before the mid card");
+        assert!(
+            top < grid,
+            "mid card must render before the primary/secondary grid"
+        );
         assert!(s.contains(r#"id="top-card""#));
     }
 
