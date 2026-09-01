@@ -49,6 +49,15 @@ pub(crate) fn live_filter() -> Filter {
     }
 }
 
+/// `deleted_at IS NOT NULL` — [`live_filter`]'s exact complement.
+fn deleted_filter() -> Filter {
+    Filter {
+        field: "deleted_at".to_string(),
+        operator: FilterOp::IsNotNull,
+        value: Value::Null,
+    }
+}
+
 /// Fetch one live product. A soft-deleted row answers `NotFound`, so callers
 /// need no extra check and cannot forget one.
 pub(crate) async fn get(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
@@ -110,11 +119,7 @@ pub(crate) async fn list_deleted(
     mut filters: Vec<Filter>,
     sort: Option<Vec<SortField>>,
 ) -> Result<RecordList, WaferError> {
-    filters.push(Filter {
-        field: "deleted_at".to_string(),
-        operator: FilterOp::IsNotNull,
-        value: Value::Null,
-    });
+    filters.push(deleted_filter());
     let sort = sort.unwrap_or_else(|| {
         vec![SortField {
             field: "created_at".to_string(),
@@ -274,12 +279,22 @@ pub(crate) async fn soft_delete(ctx: &dyn Context, id: &str) -> Result<(), Wafer
 
 /// Clear `deleted_at`, bringing a soft-deleted product back.
 ///
-/// Uses `update` directly rather than `get` + `update`: `get` refuses to
-/// find a soft-deleted row by design, but restoring one is the one
-/// operation in this module that must act on exactly that row.
+/// A filtered update rather than `get` + `update`: `get` refuses to find a
+/// soft-deleted row by design, but restoring one is the one operation in this
+/// module that must act on exactly that row.
+///
+/// The filter is `deleted_at IS NOT NULL`, so restoring a product that was
+/// never deleted matches zero rows and issues no write at all.
+/// `DbExec::update` stamps a fresh `updated_at` on every write, and the admin
+/// product list sorts on the timestamps — an operation that changed nothing
+/// must not reorder it.
 pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
     let data = HashMap::from([("deleted_at".to_string(), Value::Null)]);
-    update(ctx, id, data).await
+    // Zero rows affected means either "already live" (a no-op) or "no such
+    // product". `db::get` below tells those apart, answering `NotFound` only
+    // for the second — the same two responses this function has always given.
+    db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), deleted_filter()], data).await?;
+    db::get(ctx, TABLE, id).await
 }
 
 // The single definition of "deleted" for one already-loaded row, and the
@@ -583,6 +598,37 @@ mod tests {
         )
         .await
         .expect("the freed slug must not conflict");
+    }
+
+    /// Restoring a product that was never deleted changes nothing, so it
+    /// must not stamp a fresh `updated_at`: `DbExec::update` moves the
+    /// column on every write, and the admin product list sorts on the
+    /// timestamps. A no-op has no business reordering it.
+    #[tokio::test]
+    async fn restoring_a_live_product_does_not_stamp_a_new_updated_at() {
+        let ctx = TestContext::with_products().await;
+        seed(&ctx, "live", None).await;
+        let before = db::get(&ctx, TABLE, "live")
+            .await
+            .expect("seeded")
+            .str_field("updated_at")
+            .to_string();
+
+        // Same reason as `update_stamps_a_new_updated_at`: make the
+        // "unchanged" assertion robust against coarse clock resolution
+        // instead of relying on two `Utc::now()` calls differing.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        restore(&ctx, "live").await.expect("restoring a live row is a no-op");
+
+        assert_eq!(
+            db::get(&ctx, TABLE, "live")
+                .await
+                .expect("still there")
+                .str_field("updated_at"),
+            before,
+            "a restore that restored nothing must not move updated_at"
+        );
     }
 
     #[tokio::test]
