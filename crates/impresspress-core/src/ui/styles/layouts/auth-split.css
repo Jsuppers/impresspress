@@ -110,8 +110,12 @@
 
 @media (max-width: 720px) { .auth-split__brand { min-height: 12rem; } }
 
-.auth-split__logo { align-self: flex-start; }
-.auth-split__logo-img { height: 2rem; width: auto; display: block; }
+.auth-split__logo { align-self: flex-start; display: flex; align-items: center; gap: var(--spacing-sm); }
+/* Square mark only -- the long dark-ink wordmark PNG was drawn for the old
+   white chrome and is illegible on navy, so this panel never renders it
+   (see `ui::components::auth_panel`; same fix as `.sidebar__brand-icon`). */
+.auth-split__logo-img { height: 2rem; width: 2rem; object-fit: contain; display: block; flex-shrink: 0; }
+.auth-split__logo-name { font-size: var(--text-lg); font-weight: 600; color: #ffffff; }
 
 /* Logo pinned top (default flex flow); headline+tagline pushed to the
    bottom as a group via the headline's auto top margin, rather than

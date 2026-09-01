@@ -26,18 +26,22 @@ use crate::ui::{templates::BrandPanel, SiteConfig};
 /// auth page keeps its own contextual line — see `login.rs`'s call site for
 /// why that doesn't duplicate its right-column "Sign in to continue.".
 ///
-/// The logo prefers `logo_icon_url` (mark only, matches the sidebar's
-/// collapsed-state logo) and falls back to `logo_url` (wordmark); both
-/// default to a bundled asset in `SiteConfig::load`, so this is `None` only
-/// when a deployment explicitly overrides both to empty.
+/// Icon + white text brand mark — same treatment as the navy sidebar's
+/// `.sidebar__brand` (see `ui::sidebar::sidebar_grouped`). `logo_url` (the
+/// long wordmark PNG, `WAFER_RUN_SHARED__LOGO_URL`) is dark-ink artwork
+/// drawn for the old white chrome and is illegible on navy — that exact bug
+/// shipped in the sidebar, survived two tasks and a review, and was only
+/// caught by eyeballing a screenshot, so this panel must never render it
+/// either. The square icon (`logo_icon_url`) is optional and renders first
+/// when configured; `config.app_name` always renders as text beside it (or
+/// alone, when no icon URL is configured — never a broken `<img>`).
 pub fn auth_panel<'a>(config: &'a SiteConfig, tagline: Option<&'a str>) -> BrandPanel<'a> {
-    let logo_html = if !config.logo_icon_url.is_empty() {
-        Some(html! { img .auth-split__logo-img src=(config.logo_icon_url) alt=""; })
-    } else if !config.logo_url.is_empty() {
-        Some(html! { img .auth-split__logo-img src=(config.logo_url) alt=(config.app_name); })
-    } else {
-        None
-    };
+    let logo_html = Some(html! {
+        @if !config.logo_icon_url.is_empty() {
+            img .auth-split__logo-img src=(config.logo_icon_url) alt="";
+        }
+        span .auth-split__logo-name { (config.app_name) }
+    });
 
     let default_tagline = if config.auth_tagline.is_empty() {
         None
@@ -155,6 +159,72 @@ mod tests {
         let config = config_with("Headline", "");
         let panel = auth_panel(&config, None);
         assert_eq!(panel.tagline, None);
+    }
+
+    /// Regression, same shape as the navy-sidebar illegibility bug
+    /// (`ui::sidebar::sidebar_grouped`'s `grouped_sidebar_with_logo_url_
+    /// never_renders_the_wordmark_image`): when only `logo_url` (the long
+    /// dark-ink wordmark PNG, drawn for the old white chrome) is
+    /// configured and `logo_icon_url` is empty -- exactly the shape
+    /// `reset_password.rs` and `verify.rs` build by hand -- the navy panel
+    /// must never fall back to rendering that PNG. It must show the app
+    /// name as real white text instead, not just tucked into an `alt=`
+    /// attribute nobody sees rendered.
+    #[test]
+    fn brand_panel_with_only_logo_url_configured_never_renders_the_wordmark_image() {
+        let mut config = config_with("Headline", "Tagline");
+        config.app_name = "Acme".to_string();
+        config.logo_url = "https://example.com/impresspress-logo-long.png".to_string();
+        // logo_icon_url stays empty.
+        let panel = auth_panel(&config, None);
+        let html = panel
+            .logo_html
+            .expect("brand row must always render")
+            .into_string();
+        assert!(
+            !html.contains("impresspress-logo-long.png"),
+            "navy panel must never render the long wordmark image, even with \
+             only logo_url configured: {html}"
+        );
+        assert!(
+            html.contains(">Acme<"),
+            "navy panel must render the app name as real text (not just an \
+             alt= attribute) when no icon is configured: {html}"
+        );
+        assert!(
+            !html.contains("<img"),
+            "no icon URL configured -> no <img> tag at all: {html}"
+        );
+    }
+
+    /// Same bug, the other entry point: both URLs configured (the common
+    /// case -- `SiteConfig::load`'s defaults populate both). The icon must
+    /// render, the long wordmark must not, and the app name must still
+    /// show as text beside the icon (crab + "Impresspress", per the
+    /// reference design), not icon-only.
+    #[test]
+    fn brand_panel_with_both_logos_configured_shows_icon_plus_app_name_text_never_wordmark() {
+        let mut config = config_with("Headline", "Tagline");
+        config.app_name = "Acme".to_string();
+        config.logo_url = "https://example.com/impresspress-logo-long.png".to_string();
+        config.logo_icon_url = "https://example.com/impresspress-logo.png".to_string();
+        let panel = auth_panel(&config, None);
+        let html = panel
+            .logo_html
+            .expect("brand row must always render")
+            .into_string();
+        assert!(
+            html.contains("impresspress-logo.png"),
+            "the square icon must still render: {html}"
+        );
+        assert!(
+            !html.contains("impresspress-logo-long.png"),
+            "the long wordmark image must never render: {html}"
+        );
+        assert!(
+            html.contains(">Acme<"),
+            "the app name must render as text beside the icon: {html}"
+        );
     }
 
     #[test]
