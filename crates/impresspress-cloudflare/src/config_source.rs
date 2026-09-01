@@ -12,7 +12,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-15-lazy-block-init-design.md §2, §6
 
-use std::{collections::HashMap, sync::Arc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use async_trait::async_trait;
 use impresspress_core::{blocks::admin::VARIABLES_TABLE, cache_key};
@@ -30,6 +30,12 @@ use wafer_run::{ConfigError, ConfigSource, EnvBlockConfig};
 /// callers may retry on the next request because the runtime does
 /// not cache transient errors in the block slot.
 ///
+/// Every variables row, grouped by the `block` column. Rows whose `block`
+/// is absent or empty are dropped: the per-block `WHERE block = ?` this
+/// replaced never matched them either, and inventing a home for them here
+/// would silently change which config is live.
+type BlockVariables = HashMap<String, HashMap<String, String>>;
+
 pub struct D1ConfigSource {
     db: Arc<dyn DatabaseService>,
     /// Static overlay applied on top of D1 rows in `load_for_block`.
@@ -37,6 +43,21 @@ pub struct D1ConfigSource {
     /// (e.g. `WAFER_RUN__AUTH__JWT_SECRET`) that must not live in D1.
     /// Empty when constructed via [`Self::new`].
     overlay: HashMap<String, String>,
+    /// The whole variables table, fetched at most once per source.
+    ///
+    /// `wafer-run` calls `load_for_block` once per registered block during
+    /// `strict_init_all_blocks`, and the previous per-block query made that
+    /// one KV-cached read EACH — 22 on the production deployment, every cold
+    /// hydration, and (measured 2026-09-01) all 22 returning zero rows,
+    /// because only one block has block-scoped rows at all and its own
+    /// sensitive values keep it out of the cache. One unfiltered query
+    /// answers every block instead.
+    ///
+    /// `Cell` + `Rc` rather than `RefCell`: this crate treats a borrow flag
+    /// stranded by a Cloudflare hard-stop as a wedged-isolate hazard (see
+    /// `runtime_cache`'s thread_local comment). `take`/`set` has no flag to
+    /// strand, and no borrow is ever held across the fetch `await`.
+    snapshot: Cell<Option<Rc<BlockVariables>>>,
 }
 
 impl D1ConfigSource {
@@ -44,6 +65,7 @@ impl D1ConfigSource {
         Self {
             db,
             overlay: HashMap::new(),
+            snapshot: Cell::new(None),
         }
     }
 
@@ -52,7 +74,11 @@ impl D1ConfigSource {
     /// `WAFER_RUN__AUTH__JWT_SECRET` that admins manage via
     /// `wrangler secret put` rather than the admin dashboard.
     pub fn with_overlay(db: Arc<dyn DatabaseService>, overlay: HashMap<String, String>) -> Self {
-        Self { db, overlay }
+        Self {
+            db,
+            overlay,
+            snapshot: Cell::new(None),
+        }
     }
 
     /// Map a kebab-case block name like `"wafer-run/auth"` to the
@@ -67,37 +93,81 @@ impl D1ConfigSource {
         impresspress_core::config_vars::screaming_block(name)
     }
 
-    /// Fetch all rows in the variables table whose `block` column equals
-    /// `screaming_block`. Uses the canonical KV-cacheable list shape from
-    /// [`cache_key::block_list_opts`]; the index on `(block)` (migration
-    /// 002) makes this an indexed lookup, not a scan.
+    /// The memoized snapshot, if this source has already fetched it.
     ///
-    /// Tolerates `no such column: block` on pre-migration-002 D1s (fresh
-    /// CF deploys before the admin block's Init has run its migrations):
-    /// returns an empty map so blocks fall back to their `ConfigVar`
-    /// defaults. The next request — after admin's Init has added the
-    /// column — uses the proper indexed path.
+    /// `take` + `set` rather than a borrow, so there is no flag a
+    /// hard-stopped request can strand.
+    fn cached_snapshot(&self) -> Option<Rc<BlockVariables>> {
+        let current = self.snapshot.take();
+        self.snapshot.set(current.clone());
+        current
+    }
+
+    /// Every variables row, grouped by block — fetched at most once.
+    ///
+    /// ONE unfiltered query rather than one filtered query per block. The
+    /// unfiltered shape is deliberately not a cacheable one
+    /// (`cache_key::read_key` returns `None` for it, pinned by
+    /// `the_config_source_snapshot_shape_is_deliberately_uncacheable`), which
+    /// is what makes this safe: the KV row cache has no invalidation story
+    /// for a whole-table key, and an unfiltered read returns sensitive rows
+    /// that must never reach KV. So this trades N KV reads for one D1 query
+    /// and writes nothing to KV.
+    ///
+    /// Pre-migration-002 D1s no longer need a special case. The old
+    /// per-block query named the `block` column and so failed outright with
+    /// `no such column: block`; an unfiltered read does not name it, and
+    /// rows lacking the column are simply skipped by the grouping below —
+    /// leaving every block on its `ConfigVar` defaults, which is exactly what
+    /// that special case returned.
+    async fn snapshot(
+        &self,
+    ) -> Result<Rc<BlockVariables>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(snapshot) = self.cached_snapshot() {
+            return Ok(snapshot);
+        }
+        let rows = self
+            .db
+            .list(VARIABLES_TABLE, &cache_key::full_table_list_opts())
+            .await
+            .map_err(Box::new)?;
+
+        let mut grouped: BlockVariables = HashMap::new();
+        for record in rows.records {
+            let Some(block) = record.data.get("block").and_then(|b| b.as_str()) else {
+                continue;
+            };
+            if block.is_empty() {
+                continue;
+            }
+            let (Some(key), Some(value)) = (
+                record.data.get("key").and_then(|k| k.as_str()),
+                record.data.get("value").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            grouped
+                .entry(block.to_string())
+                .or_default()
+                .insert(key.to_string(), value.to_string());
+        }
+
+        let snapshot = Rc::new(grouped);
+        self.snapshot.set(Some(snapshot.clone()));
+        Ok(snapshot)
+    }
+
+    /// This block's rows from the snapshot, empty when it has none.
     pub(crate) async fn fetch_block_variables(
         &self,
         screaming_block: &str,
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
-        let opts = cache_key::block_list_opts(cache_key::CachedTable::Variables, screaming_block);
-        let rows = match self.db.list(VARIABLES_TABLE, &opts).await {
-            Ok(rows) => rows,
-            Err(e) if e.to_string().contains("no such column: block") => {
-                return Ok(HashMap::new());
-            }
-            Err(e) => return Err(Box::new(e)),
-        };
-        Ok(rows
-            .records
-            .into_iter()
-            .filter_map(|r| {
-                let key = r.data.get("key")?.as_str()?.to_string();
-                let value = r.data.get("value")?.as_str()?.to_string();
-                Some((key, value))
-            })
-            .collect())
+        Ok(self
+            .snapshot()
+            .await?
+            .get(screaming_block)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Core resolution logic — applied per [`ConfigVar`] against rows
@@ -152,6 +222,14 @@ impl ConfigSource for D1ConfigSource {
         block: &str,
         declared_keys: &[ConfigVar],
     ) -> Result<EnvBlockConfig, ConfigError> {
+        // `wafer-run` calls this for EVERY registered block, including the
+        // many that declare no config at all. Resolving nothing against
+        // anything is still nothing, so return before touching the database:
+        // otherwise the first config-less block to initialize pays for the
+        // snapshot on behalf of blocks that never needed it.
+        if declared_keys.is_empty() {
+            return Ok(EnvBlockConfig::new(HashMap::new()));
+        }
         let screaming = Self::screaming_block(block);
         let rows =
             self.fetch_block_variables(&screaming)
@@ -166,9 +244,231 @@ impl ConfigSource for D1ConfigSource {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use wafer_block::db::{Filter, ListOptions};
+    use wafer_core::interfaces::database::service::{
+        AggregateSpec, Column, DatabaseError, Record, RecordList, Table, UpsertSpec,
+    };
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
+
+    /// Counts `list` calls and records the filters each one carried, so a test
+    /// can assert BOTH how many queries a hydration costs and that they are
+    /// the unfiltered snapshot shape rather than per-block reads.
+    struct CountingDb {
+        lists: Cell<usize>,
+        filtered_lists: Cell<usize>,
+        rows: Vec<(&'static str, &'static str, &'static str)>,
+    }
+
+    impl CountingDb {
+        fn new(rows: Vec<(&'static str, &'static str, &'static str)>) -> Arc<Self> {
+            Arc::new(Self {
+                lists: Cell::new(0),
+                filtered_lists: Cell::new(0),
+                rows,
+            })
+        }
+    }
+
+    #[wafer_block::wafer_async_trait]
+    impl DatabaseService for CountingDb {
+        async fn list(
+            &self,
+            _collection: &str,
+            opts: &ListOptions,
+        ) -> Result<RecordList, DatabaseError> {
+            self.lists.set(self.lists.get() + 1);
+            if !opts.filters.is_empty() {
+                self.filtered_lists.set(self.filtered_lists.get() + 1);
+            }
+            let records: Vec<Record> = self
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, (block, key, value))| {
+                    let mut data = HashMap::new();
+                    if !block.is_empty() {
+                        data.insert("block".to_string(), serde_json::json!(block));
+                    }
+                    data.insert("key".to_string(), serde_json::json!(key));
+                    data.insert("value".to_string(), serde_json::json!(value));
+                    Record {
+                        id: i.to_string(),
+                        data,
+                    }
+                })
+                .collect();
+            let total = records.len() as i64;
+            Ok(RecordList {
+                records,
+                total_count: total,
+                page: 1,
+                page_size: 10_000,
+            })
+        }
+
+        async fn get(&self, _c: &str, _id: &str) -> Result<Record, DatabaseError> {
+            unreachable!()
+        }
+        async fn create(
+            &self,
+            _c: &str,
+            _d: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            unreachable!()
+        }
+        async fn update(
+            &self,
+            _c: &str,
+            _id: &str,
+            _d: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            unreachable!()
+        }
+        async fn delete(&self, _c: &str, _id: &str) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+        async fn count(&self, _c: &str, _f: &[Filter]) -> Result<i64, DatabaseError> {
+            unreachable!()
+        }
+        async fn sum(&self, _c: &str, _f: &str, _x: &[Filter]) -> Result<f64, DatabaseError> {
+            unreachable!()
+        }
+        async fn query_raw(
+            &self,
+            _q: &str,
+            _a: &[serde_json::Value],
+        ) -> Result<Vec<Record>, DatabaseError> {
+            unreachable!()
+        }
+        async fn exec_raw(&self, _q: &str, _a: &[serde_json::Value]) -> Result<i64, DatabaseError> {
+            unreachable!()
+        }
+        async fn upsert(&self, _c: &str, _s: UpsertSpec) -> Result<i64, DatabaseError> {
+            unreachable!()
+        }
+        async fn aggregate(
+            &self,
+            _c: &str,
+            _s: AggregateSpec,
+        ) -> Result<Vec<Record>, DatabaseError> {
+            unreachable!()
+        }
+        async fn ensure_schema_table(&self, _t: &Table) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+        async fn schema_table_exists(&self, _n: &str) -> Result<bool, DatabaseError> {
+            unreachable!()
+        }
+        async fn schema_drop_table(&self, _n: &str) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+        async fn schema_add_column(&self, _t: &str, _c: &Column) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+    }
+
+    fn var(key: &str) -> ConfigVar {
+        ConfigVar::new(key, "doc", "").optional()
+    }
+
+    /// THE read-amplification fix: initializing every block must cost ONE
+    /// query, not one per block. Production ran 22 configured blocks, each
+    /// paying its own KV-cached per-block lookup on every cold hydration.
+    #[wasm_bindgen_test]
+    async fn every_block_is_served_by_one_unfiltered_query() {
+        let db = CountingDb::new(vec![
+            ("WAFER_RUN__AUTH", "WAFER_RUN__AUTH__A", "auth-value"),
+            (
+                "IMPRESSPRESS__EMAIL",
+                "IMPRESSPRESS__EMAIL__B",
+                "email-value",
+            ),
+        ]);
+        let src = D1ConfigSource::new(db.clone() as Arc<dyn DatabaseService>);
+
+        let auth = src
+            .load_for_block("wafer-run/auth", &[var("WAFER_RUN__AUTH__A")])
+            .await
+            .unwrap();
+        assert_eq!(auth.get("WAFER_RUN__AUTH__A"), Some("auth-value"));
+
+        let email = src
+            .load_for_block("impresspress/email", &[var("IMPRESSPRESS__EMAIL__B")])
+            .await
+            .unwrap();
+        assert_eq!(email.get("IMPRESSPRESS__EMAIL__B"), Some("email-value"));
+
+        assert_eq!(
+            db.lists.get(),
+            1,
+            "the snapshot must be fetched once and reused for every block"
+        );
+        assert_eq!(
+            db.filtered_lists.get(),
+            0,
+            "a per-block filter would be a cacheable shape and reintroduce              one KV read per block"
+        );
+    }
+
+    /// Rows must stay scoped to their own block. The snapshot holds every
+    /// row at once, so a grouping bug would silently let one block read
+    /// another's value — which the old per-block WHERE clause made impossible.
+    #[wasm_bindgen_test]
+    async fn a_block_never_sees_another_blocks_row() {
+        let db = CountingDb::new(vec![
+            ("WAFER_RUN__AUTH", "SHARED_NAME", "auth-value"),
+            ("IMPRESSPRESS__EMAIL", "SHARED_NAME", "email-value"),
+            // A NULL-block row (migration-002 backfill gap in production).
+            // The per-block WHERE never matched these; preserve that exactly
+            // rather than quietly changing which config is live.
+            ("", "SHARED_NAME", "unscoped-value"),
+        ]);
+        let src = D1ConfigSource::new(db.clone() as Arc<dyn DatabaseService>);
+
+        let auth = src
+            .load_for_block("wafer-run/auth", &[var("SHARED_NAME")])
+            .await
+            .unwrap();
+        assert_eq!(auth.get("SHARED_NAME"), Some("auth-value"));
+
+        let email = src
+            .load_for_block("impresspress/email", &[var("SHARED_NAME")])
+            .await
+            .unwrap();
+        assert_eq!(email.get("SHARED_NAME"), Some("email-value"));
+
+        let other = src
+            .load_for_block("wafer-run/cors", &[var("SHARED_NAME")])
+            .await
+            .unwrap();
+        assert_eq!(
+            other.get("SHARED_NAME"),
+            None,
+            "a block with no rows of its own must not inherit a NULL-block row"
+        );
+    }
+
+    /// A block declaring no config keys must not touch the database at all.
+    /// `wafer-run` calls `load_for_block` for EVERY block regardless of
+    /// whether it declares any keys, so without this the first config-less
+    /// block still triggered the fetch.
+    #[wasm_bindgen_test]
+    async fn a_block_with_no_declared_keys_issues_no_query() {
+        let db = CountingDb::new(vec![("WAFER_RUN__AUTH", "K", "v")]);
+        let src = D1ConfigSource::new(db.clone() as Arc<dyn DatabaseService>);
+
+        let cfg = src.load_for_block("wafer-run/cors", &[]).await.unwrap();
+        assert_eq!(cfg.get("K"), None);
+        assert_eq!(
+            db.lists.get(),
+            0,
+            "a block declaring no keys has nothing to resolve, so the              snapshot must not be fetched on its behalf"
+        );
+    }
 
     #[wasm_bindgen_test]
     fn screaming_block_handles_two_segments() {
