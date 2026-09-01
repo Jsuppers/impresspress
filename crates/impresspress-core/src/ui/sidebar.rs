@@ -121,7 +121,7 @@ pub fn sidebar_grouped(
                             }
                         }
                     }
-                    div .profile-menu #profile-menu style="display:none" {
+                    div .profile-menu #profile-menu {
                         div .profile-menu-header {
                             div .profile-menu-avatar { (u.avatar_initial()) }
                             div .profile-menu-info {
@@ -152,7 +152,14 @@ pub fn sidebar_grouped(
         script { (maud::PreEscaped(r#"
 function toggleProfileMenu() {
     var m = document.getElementById('profile-menu');
-    if (m) m.style.display = m.style.display === 'none' ? 'block' : 'none';
+    if (!m) return;
+    // The menu starts hidden via the .profile-menu CSS rule, not an inline
+    // style, so before the first toggle m.style.display is '' (not
+    // 'none') -- fall back to the computed style so the first click still
+    // opens it instead of writing a no-op 'none' over an already-hidden
+    // element.
+    var hidden = m.style.display === 'none' || getComputedStyle(m).display === 'none';
+    m.style.display = hidden ? 'block' : 'none';
 }
 document.addEventListener('click', function(e) {
     var m = document.getElementById('profile-menu');

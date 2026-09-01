@@ -1,5 +1,5 @@
 /* ===== Sidebar ===== */
-.sidebar > *:not(.profile-menu):not(.sidebar-user-container) * {
+.sidebar > *:not(.profile-menu):not(.sidebar__user-container) * {
 	transition-property: opacity, transform, width, padding, margin;
 	transition-duration: 0.3s;
 	transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
@@ -9,149 +9,37 @@
 	width: var(--sidebar-width);
 	display: flex; flex-direction: column; gap: var(--spacing-md);
 	position: relative;
-	height: calc(100vh - 2rem);
+	/* Flush to the viewport: this runs the full 100vh, not
+	   calc(100vh - <shell padding>) -- the navy slab in styles/components/
+	   nav.css owns the visual (background/color/radius/margin/shadow); this
+	   file owns sizing. See nav.css for why. */
+	height: 100vh;
 	z-index: 100;
 	transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .sidebar.collapsed { width: var(--sidebar-collapsed-width); }
 
-.sidebar-header {
-	height: 60px;
-	display: flex; align-items: center; justify-content: center;
-	padding: 0 1rem;
-}
-
-.sidebar.collapsed .sidebar-header { padding: 0; }
-
-.sidebar-logo {
-	display: flex; align-items: center; justify-content: start;
-	text-decoration: none; color: var(--text-primary); width: 100%;
-}
-
-.sidebar.collapsed .sidebar-logo { justify-content: center; }
-.sidebar-logo-long { height: 42px; width: auto; display: block; }
-.sidebar-logo-icon { height: 42px; width: 42px; object-fit: contain; display: none; }
-.sidebar.collapsed .sidebar-logo-long { display: none; }
-.sidebar.collapsed .sidebar-logo-icon { display: block; }
-
-.nav-icon { flex-shrink: 0; }
-.sidebar.collapsed .nav-icon { margin: 0; }
-
-.sidebar-nav {
-	flex: 1; padding: 0.5rem; padding-bottom: 2.5rem;
-	overflow-y: auto; overflow-x: hidden;
-	background: white;
-	border: 1px solid var(--border-color);
-	border-radius: 12px;
-	position: relative;
-}
-
-.nav-item { position: relative; }
-
-.nav-separator {
-	height: 1px;
-	background: var(--border-color);
-	margin: 0.5rem 0.75rem;
-}
-
-.nav-link {
-	display: flex; align-items: center; gap: 0.75rem;
-	padding: 0.6rem 0.75rem; margin: 0.15rem 0.25rem;
-	color: var(--text-secondary); text-decoration: none;
-	transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-	cursor: pointer; border: none; background: none;
-	width: calc(100% - 0.5rem); text-align: left;
-	font-size: 0.875rem; border-radius: 8px; position: relative;
-}
-
-.nav-link:hover { background: var(--bg-hover); color: var(--text-primary); }
-.nav-link.active { background: var(--primary-color); color: white; }
-.sidebar.collapsed .nav-link { justify-content: center; padding: 0.6rem; }
-
-.nav-text {
-	flex: 1;
-	transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-	opacity: 1; transform: translateX(0);
-}
-
-.sidebar.collapsed .nav-text {
-	opacity: 0; transform: translateX(-10px);
-	position: absolute; pointer-events: none;
-}
-
-.nav-badge {
-	display: inline-flex; align-items: center; justify-content: center;
-	min-width: 20px; height: 20px; padding: 0 6px;
-	background: var(--accent-success); color: white;
-	border-radius: 10px; font-size: 0.75rem; font-weight: 500;
-}
-
-.sidebar.collapsed .nav-badge {
-	position: absolute; top: 4px; right: 4px;
-	min-width: 8px; height: 8px; padding: 0;
-	border-radius: 50%; font-size: 0;
-}
-
-.nav-tooltip {
-	position: absolute; left: 100%; margin-left: 0.5rem;
-	padding: 0.25rem 0.5rem;
-	background: var(--text-primary); color: white;
-	border-radius: 4px; font-size: 0.75rem; white-space: nowrap;
-	opacity: 0; pointer-events: none; z-index: 1000;
-	transition: opacity 0.2s;
-}
-
-.sidebar.collapsed .nav-link:hover .nav-tooltip { opacity: 1; }
-
-.sidebar-toggle {
-	position: absolute; bottom: 0.5rem; right: 0.5rem;
-	width: 24px; height: 24px;
-	display: flex; align-items: center; justify-content: center;
-	background: white; border: 1px solid var(--border-color);
-	border-radius: 4px; cursor: pointer;
-	transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-	z-index: 10;
-}
-
-.sidebar-toggle:hover {
-	background: var(--primary-color); color: white;
-	border-color: var(--primary-color);
-}
-
-.sidebar.collapsed .sidebar-toggle {
-	right: 50%; transform: translateX(50%);
-}
-
-/* User Section */
-.sidebar-user-container { position: relative; }
-
-.sidebar-user {
-	width: calc(100% - 1rem);
-	display: flex; align-items: center; gap: 0.75rem;
-	padding: 0.75rem 1rem; margin: 0.5rem;
-	background: transparent; border: none; cursor: pointer;
-	transition: background-color 0.2s; text-align: left; border-radius: 0.5rem;
-}
-
-.sidebar-user:hover { background: var(--bg-hover); }
-
+/* `.user-avatar` is NOT sidebar chrome -- the sidebar's own avatar is the
+   shared `.avatar`/`.avatar--*` component (ui/components/avatar.rs), styled
+   in components/badge.css. This rule is consumed by the userportal profile
+   page's larger avatar (blocks/userportal/pages/profile.rs), which sits on
+   a light card background, so it routes to --primary-button (4.99:1) like
+   every other white-on-brand surface, not to navy. */
 .user-avatar {
 	width: 32px; height: 32px; border-radius: 50%;
-	background: var(--primary-color); color: white;
+	background: var(--primary-button); color: white;
 	display: flex; align-items: center; justify-content: center;
 	font-weight: 600; font-size: 0.875rem; flex-shrink: 0;
 }
 
-.user-info { flex: 1; min-width: 0; }
-
-.user-email {
-	font-size: 0.875rem; color: var(--text-primary);
-	white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-
 /* Profile Menu */
 .profile-menu {
+	/* Closed by default -- was an inline style="display:none" in
+	   sidebar.rs; toggleProfileMenu()/the outside-click handler in
+	   sidebar.rs flip this to 'block'/'none' via the element's own inline
+	   style once JS takes over. */
+	display: none;
 	position: absolute; bottom: 100%; left: 0.5rem; right: 0.5rem;
 	margin-bottom: 0.5rem; background: white;
 	border: 1px solid var(--border-color); border-radius: 0.75rem;
@@ -174,9 +62,12 @@
 	padding: 0.75rem; background: var(--bg-secondary);
 }
 
+/* `.profile-menu` is a white floating dropdown card (background: white
+   below), so its avatar routes to --primary-button (4.99:1) like
+   `.user-avatar` above -- it is unaffected by the sidebar's navy repaint. */
 .profile-menu-avatar {
 	width: 40px; height: 40px; border-radius: 50%;
-	background: var(--primary-color); color: white;
+	background: var(--primary-button); color: white;
 	display: flex; align-items: center; justify-content: center;
 	font-weight: 600; font-size: 1rem;
 }
@@ -208,13 +99,13 @@
 .profile-menu-item-danger:hover { background: rgba(239, 68, 68, 0.1); }
 
 /* ===== Sidebar groups (Phase 1) ===== */
+/* `.sidebar__panel` no longer carries its own white/bordered/rounded card
+   look -- the navy slab in components/nav.css is flush, and the nav list
+   sits directly on it. Layout/flex/scroll-containment stays here. */
 .sidebar__panel {
 	flex: 1; min-height: 0;
 	display: flex; flex-direction: column;
 	position: relative;
-	background: var(--surface-1);
-	border: 1px solid var(--border-color);
-	border-radius: var(--radius-lg);
 	overflow: hidden;
 }
 .sidebar__groups {
@@ -223,18 +114,24 @@
 	padding: var(--spacing-sm) var(--spacing-sm) 3rem;
 }
 .sidebar__group { display: flex; flex-direction: column; gap: 2px; }
+/* Foreground is --sidebar-text-muted (7.34:1 on navy), not --text-muted
+   (3.95:1, fails AA) -- see the guard test in ui/assets.rs. */
 .sidebar__group-label {
 	font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.06em;
-	color: var(--text-muted); padding: var(--spacing-sm) var(--spacing-sm) 0.25rem;
+	color: var(--sidebar-text-muted); padding: var(--spacing-sm) var(--spacing-sm) 0.25rem;
 }
 .sidebar__nav { list-style: none; padding: 0; margin: 0; }
 .sidebar__nav-item {
 	display: flex; align-items: center; gap: var(--spacing-sm);
 	padding: 0.4rem var(--spacing-sm); border-radius: var(--radius-md);
-	color: var(--text-secondary); text-decoration: none; font-size: var(--text-sm);
+	color: #ffffff; text-decoration: none; font-size: var(--text-sm);
 }
-.sidebar__nav-item:hover { background: var(--bg-hover); color: var(--text-primary); }
-.sidebar__nav-item.is-active { background: #fff1e6; color: var(--primary-color); font-weight: 500; }
+.sidebar__nav-item:hover { background: var(--navy-700); color: #ffffff; }
+.sidebar__nav-item.is-active {
+	background: var(--navy-700);
+	box-shadow: inset 3px 0 0 0 var(--primary-color);
+	color: #ffffff; font-weight: 500;
+}
 .sidebar__nav-icon { display: inline-flex; width: 16px; height: 16px; }
 .sidebar__brand {
 	display: flex; align-items: center; justify-content: flex-start;
@@ -245,12 +142,14 @@
 }
 .sidebar__brand-icon { display: none; height: 40px; width: 40px; object-fit: contain; flex-shrink: 0; }
 .sidebar__brand-wordmark { max-width: 100%; height: 48px; width: auto; object-fit: contain; display: block; }
-.sidebar__brand-name { font-size: var(--text-lg); font-weight: 600; color: var(--text-primary); }
+.sidebar__brand-name { font-size: var(--text-lg); font-weight: 600; color: #ffffff; }
 
+/* Maps to the brief's `.sidebar__footer` rail -- the sidebar has no
+   separate footer element, so the user block's own top border carries it. */
 .sidebar__user-container {
 	position: relative;
 	padding: var(--spacing-sm);
-	border-top: 1px solid var(--border-light);
+	border-top: 1px solid var(--navy-700);
 }
 .sidebar__user {
 	width: 100%;
@@ -261,13 +160,13 @@
 	font: inherit; font-size: var(--text-sm);
 	transition: background-color 0.15s;
 }
-.sidebar__user:hover { background: var(--bg-hover); }
+.sidebar__user:hover { background: var(--navy-700); }
 .sidebar__user-text { flex: 1; min-width: 0; }
 .sidebar__user-email {
-	color: var(--text-primary);
+	color: #ffffff;
 	white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.sidebar__user-role { color: var(--text-muted); font-size: var(--text-xs); }
+.sidebar__user-role { color: var(--sidebar-text-muted); font-size: var(--text-xs); }
 
 .sidebar__collapse-toggle {
 	/* Pin to the panel header so it sits next to the brand instead of
@@ -275,13 +174,13 @@
 	position: absolute; top: 0.5rem; right: 0.5rem;
 	width: 28px; height: 28px;
 	display: flex; align-items: center; justify-content: center;
-	background: transparent; color: var(--text-muted);
+	background: transparent; color: var(--sidebar-text-muted);
 	border: 1px solid transparent; border-radius: var(--radius-md);
 	cursor: pointer; padding: 0;
 	transition: background-color 0.15s, color 0.15s, border-color 0.15s;
 	z-index: 1;
 }
-.sidebar__collapse-toggle:hover { background: var(--bg-hover); color: var(--text-primary); }
+.sidebar__collapse-toggle:hover { background: var(--navy-700); color: #ffffff; }
 .sidebar__collapse-icon-collapsed { display: none; }
 .sidebar.collapsed .sidebar__collapse-icon-expanded { display: none; }
 .sidebar.collapsed .sidebar__collapse-icon-collapsed { display: inline-flex; }
@@ -295,10 +194,10 @@
 .sidebar.collapsed .sidebar__nav-label,
 .sidebar.collapsed .sidebar__user-text { display: none; }
 .sidebar.collapsed .sidebar__brand-icon { display: block; }
-/* Collapsed keeps the exact expanded structure — transparent brand row above
-   the rounded panel card — just narrower with the icon mark. (An earlier
-   attempt merged the brand INTO the panel with a negative margin; that
-   produced one full-height slab and read as broken.) */
+/* Collapsed keeps the exact expanded structure — brand row above the nav
+   panel, both on the same flush navy slab — just narrower with the icon
+   mark. (An earlier attempt merged the brand INTO the panel with a negative
+   margin; that produced a seam that read as broken.) */
 .sidebar.collapsed .sidebar__brand { justify-content: center; padding: 0; }
 .sidebar.collapsed .sidebar__nav-item { justify-content: center; padding: 0.4rem 0; }
 .sidebar.collapsed .sidebar__user { justify-content: center; }
@@ -309,11 +208,14 @@
 .sidebar.collapsed .sidebar__groups { padding-top: 2.75rem; }
 
 /* ===== Shell + topbar (Phase 1) ===== */
-.shell { display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); height: 100vh; gap: var(--spacing-md); padding: var(--spacing-md); background: var(--surface-2); }
+/* No gap/padding on the grid itself -- the sidebar must be flush to the
+   viewport edges (left/top/bottom). Only the main content column gets the
+   padded/gapped treatment, on .shell__main below. */
+.shell { display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); height: 100vh; background: var(--surface-2); }
 @media (max-width: 720px) {
-	.shell { grid-template-columns: 1fr; padding: 0; gap: 0; }
+	.shell { grid-template-columns: 1fr; }
 }
-.shell__main { display: flex; flex-direction: column; min-height: 0; gap: var(--spacing-md); }
+.shell__main { display: flex; flex-direction: column; min-height: 0; gap: var(--spacing-md); padding: var(--spacing-md); }
 .shell__body { flex: 1; background: var(--surface-1); border: 1px solid var(--border-color); border-radius: var(--radius-lg); overflow-y: auto; }
 
 .topbar { background: var(--surface-1); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: var(--spacing-sm) var(--spacing-md); display: flex; align-items: center; min-height: 56px; }
@@ -397,7 +299,7 @@
 		transform: translateX(-100%);
 		transition: transform 0.2s ease;
 		z-index: 200;
-		background: var(--surface-2);
+		background: var(--bg-sidebar);
 		padding: var(--spacing-md);
 		overflow-y: auto;
 	}

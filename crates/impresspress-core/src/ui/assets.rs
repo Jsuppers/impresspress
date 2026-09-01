@@ -551,13 +551,21 @@ mod tests {
                         continue; // container, not a leaf -- e.g. @media
                     }
                     let prefix: String = chars[..open].iter().collect();
-                    let selector = prefix
+                    let mut selector = prefix
                         .rsplit(|c| c == '{' || c == '}')
                         .next()
                         .unwrap_or(&prefix)
-                        .trim()
-                        .to_string();
-                    blocks.push((selector, body));
+                        .trim();
+                    // A `/* comment */` immediately above a rule folds into
+                    // this same segment (there's no `{`/`}` between them to
+                    // split on), so strip any leading block comments before
+                    // comparing -- otherwise a comment added above an
+                    // allowlisted rule silently stops that entry matching.
+                    while let Some(rest) = selector.strip_prefix("/*") {
+                        let Some(end) = rest.find("*/") else { break };
+                        selector = rest[end + 2..].trim_start();
+                    }
+                    blocks.push((selector.trim().to_string(), body));
                 }
                 _ => {}
             }
@@ -566,26 +574,27 @@ mod tests {
     }
 
     /// Selectors this task's diff deliberately leaves pairing white text with
-    /// `--primary-color` background, because the surfaces they style are
-    /// replaced with navy by name in already-scheduled follow-up tasks:
-    /// `.nav-link.active`, `.sidebar-toggle:hover`, `.user-avatar`,
-    /// `.profile-menu-avatar` (`layouts/shell.css` -- Task 8 replaces the
-    /// sidebar with navy) and `.login-button`, `.auth-split__brand`
-    /// (`layouts/auth-split.css` -- Task 9 replaces the brand panel with
-    /// navy). Fixing them now would be churn overwritten within two tasks.
-    /// Once those tasks land, none of these selectors will set
-    /// `background: var(--primary-color)` any more, so this allowlist goes
-    /// unused rather than becoming permanently necessary -- if a future run
-    /// finds one of these selectors is no longer an offender, that's a sign
-    /// the corresponding follow-up task shipped, not a broken test.
-    const DEFERRED_WHITE_ON_PRIMARY_COLOR: &[&str] = &[
-        ".nav-link.active",
-        ".sidebar-toggle:hover",
-        ".user-avatar",
-        ".profile-menu-avatar",
-        ".login-button",
-        ".auth-split__brand",
-    ];
+    /// `--primary-color` background, because the surface they style is
+    /// replaced with navy by name in an already-scheduled follow-up task:
+    /// `.login-button`, `.auth-split__brand` (`layouts/auth-split.css` --
+    /// Task 9 replaces the brand panel with navy). Fixing them now would be
+    /// churn overwritten within one task. Once that task lands, neither
+    /// selector will set `background: var(--primary-color)` any more, so
+    /// this allowlist goes unused rather than becoming permanently
+    /// necessary -- if a future run finds one of these selectors is no
+    /// longer an offender, that's a sign the follow-up task shipped, not a
+    /// broken test.
+    ///
+    /// Task 8's four entries (`.nav-link.active`, `.sidebar-toggle:hover`,
+    /// `.user-avatar`, `.profile-menu-avatar`) were retired here: the first
+    /// two were unreachable dead CSS (no markup renders `.nav-link` or
+    /// `.sidebar-toggle` any more -- the grouped sidebar uses
+    /// `.sidebar__nav-item` / `.sidebar__collapse-toggle`) and were deleted
+    /// outright; the other two are real but style surfaces the navy
+    /// repaint does NOT touch (the profile page's standalone avatar and the
+    /// white profile-menu dropdown, respectively), so they were routed to
+    /// `--primary-button` like every other white-on-brand surface.
+    const DEFERRED_WHITE_ON_PRIMARY_COLOR: &[&str] = &[".login-button", ".auth-split__brand"];
 
     #[test]
     fn no_new_white_text_on_primary_color_background() {

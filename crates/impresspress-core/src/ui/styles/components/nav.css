@@ -9,6 +9,24 @@
    else in the UI uses --font-ui. */
 .brand__wordmark { font-family: var(--font-brand); }
 
+/* ===== Sidebar shell (navy) =====
+   Flush, full-height navy slab -- no radius, margin, or shadow (the
+   mockup's sidebar is a slab, not an inset card). Sizing (width, height,
+   flex layout) stays in layouts/shell.css per the components/layouts
+   split; this owns the visual surface only. Component-level foreground
+   colors for what sits on this surface (nav item text, group labels, the
+   active row's red rail, the user block) live alongside their existing
+   structural rules in layouts/shell.css, since layouts/shell.css loads
+   after this file in the bundle (build.rs's CSS_FILES order) and would
+   otherwise silently win the cascade over a duplicate declared here. */
+.sidebar {
+	background: var(--bg-sidebar);
+	color: #ffffff;
+	border-radius: 0;
+	margin: 0;
+	box-shadow: none;
+}
+
 /* Tabs */
 .tabs {
 	display: flex;
