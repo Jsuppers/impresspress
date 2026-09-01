@@ -1159,6 +1159,14 @@ In `styles/components/nav.css`:
 
 Remove the inset-card rules (`margin`, `border-radius`, `box-shadow`) from `.shell__sidebar` in `styles/layouts/shell.css` and let the grid column run full height.
 
+- [ ] **Step 1b: Retire this task's allowlist entries in the AA usage test**
+
+Task 7 added a usage-level test asserting no CSS rule pairs white text with `background: var(--primary-color)` — the check that caught every primary button failing WCAG AA at 3.66:1. Four rules in `layouts/shell.css` (lines 69, 118, 141, 179 at the time) were **allowlisted** rather than fixed, because this task replaces those surfaces with navy anyway.
+
+This task's Step 1 does that replacement. **Remove those four entries from the allowlist** and confirm the test still passes. An allowlist that outlives its reason is how a real gate quietly becomes a vacuous one.
+
+If any of the four still pairs white text with `--primary-color` after your restyle, that is a bug in your restyle — fix the rule, do not re-add the entry.
+
 - [ ] **Step 2: Remove the inline style in `sidebar.rs`**
 
 Find the single `style="…"` in `crates/impresspress-core/src/ui/sidebar.rs` and move its declarations into the matching class in `nav.css`.
@@ -1324,6 +1332,14 @@ In `styles/layouts/auth-split.css`:
 	.auth-split__brand { min-height: 12rem; }
 }
 ```
+
+- [ ] **Step 4b: Retire this task's allowlist entries in the AA usage test**
+
+Task 7 added a usage-level test asserting no CSS rule pairs white text with `background: var(--primary-color)`. Two rules in `layouts/auth-split.css` (lines 69 and 140 at the time) were **allowlisted** rather than fixed, because this task replaces the brand panel with `--navy-900`.
+
+Step 4 does that replacement. **Remove those two entries from the allowlist** and confirm the test still passes. After this task the allowlist should be empty; if it is, delete the allowlist mechanism itself rather than leaving an empty list for someone to refill.
+
+The login CTA is the mockup's hero element and carries white text on red — it must use `--primary-button` (`#d92320`, 4.99:1), never `--primary-color` (`#fd3534`, 3.66:1). The usage test is what enforces that; do not weaken it to accommodate the design.
 
 - [ ] **Step 5: Rewrite `login.rs` to use the components**
 
