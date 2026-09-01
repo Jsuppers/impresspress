@@ -99,11 +99,17 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("020_normalize_blank_deleted_at", SQL_020_SQLITE),
 ];
 
-/// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`]. Empty
-/// when the `postgres` feature is off — see `files::migrations`'s doc for the
-/// rationale (Cloudflare/D1 never selects postgres; don't embed dead SQL).
-#[cfg(feature = "postgres")]
-pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
+/// Ordered PostgreSQL migration scripts, one per entry in
+/// [`SQLITE_MIGRATIONS`] and in the same order.
+///
+/// Declared under `test` as well as `postgres` so the parity assertion in
+/// `strict_upgrade_tests` runs in an ordinary `cargo test` build. It has to
+/// be *this* literal and not a test-only copy: a copy would agree with itself
+/// while the shipped list stayed one migration short. [`POSTGRES_MIGRATIONS`]
+/// is an alias for it, so the only list a postgres deployment can run is the
+/// one the test checks.
+#[cfg(any(feature = "postgres", test))]
+const POSTGRES_MIGRATION_FILES: &[&str] = &[
     SQL_001_POSTGRES,
     SQL_002_POSTGRES,
     SQL_003_POSTGRES,
@@ -125,6 +131,12 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_019_POSTGRES,
     SQL_020_POSTGRES,
 ];
+
+/// The PostgreSQL scripts a deployment actually applies. Empty when the
+/// `postgres` feature is off — see `files::migrations`'s doc for the
+/// rationale (Cloudflare/D1 never selects postgres; don't embed dead SQL).
+#[cfg(feature = "postgres")]
+pub(crate) const POSTGRES_MIGRATIONS: &[&str] = POSTGRES_MIGRATION_FILES;
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
 
@@ -144,15 +156,15 @@ mod strict_upgrade_tests {
     use wafer_core::interfaces::database::service::DatabaseService;
 
     use super::{
-        SQLITE_MIGRATIONS, SQL_001_POSTGRES, SQL_001_SQLITE, SQL_002_POSTGRES, SQL_002_SQLITE,
-        SQL_003_POSTGRES, SQL_003_SQLITE, SQL_004_POSTGRES, SQL_004_SQLITE, SQL_005_POSTGRES,
-        SQL_005_SQLITE, SQL_006_POSTGRES, SQL_006_SQLITE, SQL_007_POSTGRES, SQL_007_SQLITE,
-        SQL_008_POSTGRES, SQL_008_SQLITE, SQL_009_POSTGRES, SQL_009_SQLITE, SQL_010_POSTGRES,
-        SQL_010_SQLITE, SQL_011_POSTGRES, SQL_011_SQLITE, SQL_012_POSTGRES, SQL_012_SQLITE,
-        SQL_013_POSTGRES, SQL_013_SQLITE, SQL_014_POSTGRES, SQL_014_SQLITE, SQL_015_POSTGRES,
-        SQL_015_SQLITE, SQL_016_POSTGRES, SQL_016_SQLITE, SQL_017_POSTGRES, SQL_017_SQLITE,
-        SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES, SQL_019_SQLITE, SQL_020_POSTGRES,
-        SQL_020_SQLITE,
+        POSTGRES_MIGRATION_FILES, SQLITE_MIGRATIONS, SQL_001_POSTGRES, SQL_001_SQLITE,
+        SQL_002_POSTGRES, SQL_002_SQLITE, SQL_003_POSTGRES, SQL_003_SQLITE, SQL_004_POSTGRES,
+        SQL_004_SQLITE, SQL_005_POSTGRES, SQL_005_SQLITE, SQL_006_POSTGRES, SQL_006_SQLITE,
+        SQL_007_POSTGRES, SQL_007_SQLITE, SQL_008_POSTGRES, SQL_008_SQLITE, SQL_009_POSTGRES,
+        SQL_009_SQLITE, SQL_010_POSTGRES, SQL_010_SQLITE, SQL_011_POSTGRES, SQL_011_SQLITE,
+        SQL_012_POSTGRES, SQL_012_SQLITE, SQL_013_POSTGRES, SQL_013_SQLITE, SQL_014_POSTGRES,
+        SQL_014_SQLITE, SQL_015_POSTGRES, SQL_015_SQLITE, SQL_016_POSTGRES, SQL_016_SQLITE,
+        SQL_017_POSTGRES, SQL_017_SQLITE, SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES,
+        SQL_019_SQLITE, SQL_020_POSTGRES, SQL_020_SQLITE,
     };
     use crate::migration_helper::apply_ddl_via_service;
 
@@ -162,6 +174,68 @@ mod strict_upgrade_tests {
             .take_while(|(name, _)| *name != "004_strict_schema_columns")
             .map(|(_, sql)| *sql)
             .collect()
+    }
+
+    const NORMALIZE_BLANK: &str = "020_normalize_blank_deleted_at";
+
+    fn pre_020_migrations_sql() -> Vec<&'static str> {
+        SQLITE_MIGRATIONS
+            .iter()
+            .take_while(|(name, _)| *name != NORMALIZE_BLANK)
+            .map(|(_, sql)| *sql)
+            .collect()
+    }
+
+    // Sliced out of `SQLITE_MIGRATIONS` rather than read from
+    // `SQL_020_SQLITE` directly, so the callers cover the wiring as well as
+    // the SQL: an unwired migration yields an empty slice and trips the
+    // assert here instead of silently testing nothing.
+    fn from_020_migrations_sql() -> Vec<&'static str> {
+        let sql: Vec<&str> = SQLITE_MIGRATIONS
+            .iter()
+            .skip_while(|(name, _)| *name != NORMALIZE_BLANK)
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert!(
+            !sql.is_empty(),
+            "020 must be wired into SQLITE_MIGRATIONS to reach a deployed database"
+        );
+        sql
+    }
+
+    async fn ids_matching(db: &Arc<dyn DatabaseService>, predicate: &str) -> Vec<String> {
+        db.query_raw(
+            &format!(
+                "SELECT id FROM impresspress__products__products \
+                 WHERE {predicate} ORDER BY id"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("query `{predicate}`: {error}"))
+        .iter()
+        .filter_map(|row| {
+            row.data
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+    }
+
+    async fn seed_products(db: &Arc<dyn DatabaseService>, rows: &[(&str, &str, Option<&str>)]) {
+        for (id, slug, deleted_at) in rows {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), json!(id));
+            row.insert("name".to_string(), json!(id));
+            row.insert("slug".to_string(), json!(slug));
+            if let Some(stamp) = deleted_at {
+                row.insert("deleted_at".to_string(), json!(stamp));
+            }
+            db.create("impresspress__products__products", row)
+                .await
+                .unwrap_or_else(|error| panic!("seed {id}: {error}"));
+        }
     }
 
     async fn has_column(db: &Arc<dyn DatabaseService>, table: &str, column: &str) -> bool {
@@ -302,33 +376,29 @@ mod strict_upgrade_tests {
         let db: Arc<dyn DatabaseService> =
             Arc::new(SQLiteDatabaseService::open_in_memory().unwrap());
 
-        let pre_020: Vec<&str> = SQLITE_MIGRATIONS
-            .iter()
-            .take_while(|(name, _)| *name != "020_normalize_blank_deleted_at")
-            .map(|(_, sql)| *sql)
-            .collect();
-        apply_ddl_via_service(&db, &pre_020)
+        apply_ddl_via_service(&db, &pre_020_migrations_sql())
             .await
             .expect("apply pre-020 products migrations");
 
         // Every value the column can hold: the historical `''` a
         // pass-through create body produced, a live NULL row, and a genuine
         // soft delete. The last two are here to prove 020 is targeted.
-        for (id, deleted_at) in [
-            ("blank", Some("")),
-            ("live", None),
-            ("gone", Some("2026-01-01T00:00:00Z")),
-        ] {
-            let mut row = HashMap::new();
-            row.insert("id".to_string(), json!(id));
-            row.insert("name".to_string(), json!(id));
-            if let Some(stamp) = deleted_at {
-                row.insert("deleted_at".to_string(), json!(stamp));
-            }
-            db.create("impresspress__products__products", row)
-                .await
-                .unwrap_or_else(|error| panic!("seed {id}: {error}"));
-        }
+        //
+        // The slugs are distinct and NON-EMPTY on purpose. 005's unique index
+        // is partial on `slug <> ''`, so a fixture that let `slug` take its
+        // `''` default would sit outside the index and never exercise the
+        // repair's interaction with it. Distinct slugs take the in-index path
+        // with nothing to collide against; `slug_collision_cannot_fail_020`
+        // takes the same path with a collision waiting.
+        seed_products(
+            &db,
+            &[
+                ("blank", "blank-slug", Some("")),
+                ("live", "live-slug", None),
+                ("gone", "gone-slug", Some("2026-01-01T00:00:00Z")),
+            ],
+        )
+        .await;
 
         let blanks = |db: Arc<dyn DatabaseService>| async move {
             db.query_raw(
@@ -345,19 +415,7 @@ mod strict_upgrade_tests {
             "precondition: the pre-020 schema stores an empty-string deleted_at as-is"
         );
 
-        // Applied from `SQLITE_MIGRATIONS` rather than from `SQL_020_SQLITE`
-        // directly, so the test covers the wiring as well as the SQL: an
-        // unwired migration leaves nothing to apply and fails below.
-        let from_020: Vec<&str> = SQLITE_MIGRATIONS
-            .iter()
-            .skip_while(|(name, _)| *name != "020_normalize_blank_deleted_at")
-            .map(|(_, sql)| *sql)
-            .collect();
-        assert!(
-            !from_020.is_empty(),
-            "020 must be wired into SQLITE_MIGRATIONS to reach a deployed database"
-        );
-        apply_ddl_via_service(&db, &from_020)
+        apply_ddl_via_service(&db, &from_020_migrations_sql())
             .await
             .expect("apply 020 normalization migration");
 
@@ -402,12 +460,132 @@ mod strict_upgrade_tests {
         );
     }
 
+    /// 020's own repair can re-create a slug collision, and an unguarded
+    /// repair turns that into a permanent outage.
+    ///
+    /// 005's unique index is partial on `slug <> '' AND deleted_at IS NULL`,
+    /// so a `deleted_at = ''` row sits OUTSIDE it and cannot stop a second
+    /// product from claiming the same `(owner_kind, owner_id, slug)` —
+    /// and `owner_kind`/`owner_id` default to `'platform'`/`''`, so every
+    /// platform product shares the key. Setting the blank row to NULL pulls
+    /// it back INTO the index against a slug someone else now holds.
+    ///
+    /// An unguarded `UPDATE … SET deleted_at = NULL` raises `UNIQUE
+    /// constraint failed` there, and that is fatal rather than tolerated:
+    /// `migration_helper::apply_if_blessed` forgives only a duplicate
+    /// `ALTER … ADD COLUMN`, so the error propagates, `write_state` never
+    /// stamps the hash, and every later boot re-runs and re-fails. On
+    /// Cloudflare `builder::strict_init_all_blocks` turns a block Init
+    /// failure into `Err`, and `IMPRESSPRESS_RUN_MIGRATIONS` is baked into
+    /// the deployment — so every request 500s until someone hand-edits D1.
+    /// Natively the tolerant `init_all_blocks` logs and continues, but SQLite
+    /// rolls the whole statement back, so not one row gets repaired while
+    /// `is_deleted` has already made them all invisible.
+    ///
+    /// Both collision shapes are covered: a blank row against a LIVE row, and
+    /// two blank rows against each other (repairing both would collide them
+    /// with one another). Rows with nothing to collide against must still be
+    /// repaired in the same pass — the guard is targeted, not a blanket skip.
+    #[tokio::test]
+    async fn slug_collision_cannot_fail_020() {
+        let db: Arc<dyn DatabaseService> =
+            Arc::new(SQLiteDatabaseService::open_in_memory().unwrap());
+        apply_ddl_via_service(&db, &pre_020_migrations_sql())
+            .await
+            .expect("apply pre-020 products migrations");
+
+        // (id, slug, deleted_at). `owner_kind`/`owner_id` take their column
+        // defaults, which is what every platform product carries — so the
+        // slug alone decides the index key.
+        seed_products(
+            &db,
+            &[
+                // Was live under `jacket`; a pass-through update body wrote
+                // `deleted_at: ""`, dropping it out of the index. A second
+                // product then took the slug it had vacated.
+                ("blank_jacket", "jacket", Some("")),
+                ("live_jacket", "jacket", None),
+                // Two blanks holding one slug: repairing both would collide
+                // them with each other, so neither may be repaired.
+                ("blank_hat_a", "hat", Some("")),
+                ("blank_hat_b", "hat", Some("")),
+                // Nothing to collide against — must still be repaired.
+                ("blank_scarf", "scarf", Some("")),
+                // The index is partial on `slug <> ''`, so any number of
+                // empty-slug rows coexist and the repair is always safe —
+                // `live_noslug` is here so a guard that forgot to exempt the
+                // empty slug would wrongly skip `blank_noslug`.
+                ("blank_noslug", "", Some("")),
+                ("live_noslug", "", None),
+                // A genuine soft delete is outside the index too, so it does
+                // not block the blank row that shares its slug.
+                ("gone_boots", "boots", Some("2026-01-01T00:00:00Z")),
+                ("blank_boots", "boots", Some("")),
+            ],
+        )
+        .await;
+
+        // The seed itself is the proof that the state is reachable: the index
+        // accepted `live_jacket` while `blank_jacket` already held that slug.
+        assert_eq!(
+            ids_matching(&db, "deleted_at = ''").await,
+            [
+                "blank_boots",
+                "blank_hat_a",
+                "blank_hat_b",
+                "blank_jacket",
+                "blank_noslug",
+                "blank_scarf",
+            ],
+            "precondition: six rows carry the historical empty-string stamp"
+        );
+
+        apply_ddl_via_service(&db, &from_020_migrations_sql())
+            .await
+            .expect("020 must never fail the deploy over a slug collision");
+
+        assert_eq!(
+            ids_matching(&db, "deleted_at IS NULL").await,
+            [
+                "blank_boots",
+                "blank_noslug",
+                "blank_scarf",
+                "live_jacket",
+                "live_noslug",
+            ],
+            "every blank row whose slug no live row claims must be repaired"
+        );
+        assert_eq!(
+            ids_matching(&db, "deleted_at = ''").await,
+            ["blank_hat_a", "blank_hat_b", "blank_jacket"],
+            "a blank row whose slug is already claimed stays exactly as it \
+             was — the half-state is recoverable, a failed deploy is not"
+        );
+        assert_eq!(
+            ids_matching(&db, "deleted_at = '2026-01-01T00:00:00Z'").await,
+            ["gone_boots"],
+            "020 must not touch a row that carries a real deletion stamp"
+        );
+    }
+
+    /// The repair AND its collision guard have to reach both dialects. The
+    /// guard is what keeps 020 from aborting a deploy (see
+    /// `slug_collision_cannot_fail_020`); a PostgreSQL file that kept the bare
+    /// `UPDATE` would carry the outage the SQLite file no longer has.
     #[test]
     fn normalize_blank_deleted_at_migration_matches_sqlite_and_postgres() {
         for fragment in [
             "impresspress__products__products",
             "SET deleted_at = NULL",
             "WHERE deleted_at = ''",
+            // The guard: exempt the empty slug (outside 005's partial index),
+            // and otherwise repair only a row no other row can collide with.
+            "slug = ''",
+            "OR NOT EXISTS (",
+            "FROM impresspress__products__products AS claimant",
+            "claimant.id <> impresspress__products__products.id",
+            "claimant.slug = impresspress__products__products.slug",
+            "AND (claimant.deleted_at IS NULL OR claimant.deleted_at = '')",
         ] {
             assert!(
                 SQL_020_SQLITE.contains(fragment),
@@ -416,6 +594,42 @@ mod strict_upgrade_tests {
             assert!(
                 SQL_020_POSTGRES.contains(fragment),
                 "PostgreSQL deleted_at normalization migration is missing {fragment}"
+            );
+        }
+    }
+
+    /// Every SQLite migration must have a PostgreSQL twin in the list a
+    /// postgres deployment actually applies.
+    ///
+    /// `POSTGRES_MIGRATIONS` is `#[cfg(feature = "postgres")]` and empty
+    /// otherwise, so forgetting an entry compiles clean and fails no SQLite
+    /// test. CI's `products-postgres` job would not catch it either: it globs
+    /// `*.postgres.sql` off disk and feeds them to `psql`, which proves the
+    /// SQL parses and runs but says nothing about whether the Rust list
+    /// references it. Asserting against `POSTGRES_MIGRATION_FILES` — the same
+    /// literal `POSTGRES_MIGRATIONS` aliases — puts the check in every
+    /// ordinary `cargo test` build instead of a postgres-only one, and holds
+    /// for every migration added after 020.
+    #[test]
+    fn every_sqlite_migration_has_a_wired_postgres_twin() {
+        assert_eq!(
+            SQLITE_MIGRATIONS.len(),
+            POSTGRES_MIGRATION_FILES.len(),
+            "{} SQLite migrations against {} PostgreSQL: a migration was added \
+             to one dialect's list and not the other",
+            SQLITE_MIGRATIONS.len(),
+            POSTGRES_MIGRATION_FILES.len(),
+        );
+
+        // Repeating a const keeps the two lengths equal while silently
+        // dropping a migration, so distinctness is part of the parity.
+        let mut seen = std::collections::HashSet::new();
+        for (index, sql) in POSTGRES_MIGRATION_FILES.iter().enumerate() {
+            assert!(
+                seen.insert(*sql),
+                "the PostgreSQL entry for {} repeats an earlier script — its \
+                 own file is not wired in",
+                SQLITE_MIGRATIONS[index].0,
             );
         }
     }
