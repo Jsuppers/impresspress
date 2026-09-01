@@ -1,7 +1,7 @@
 /* Skip-to-content link — first focusable element in the shell; parked
    off-screen until keyboard focus brings it into view. */
 .skip-link { position: absolute; left: -9999px; top: 0; z-index: 100;
-  background: var(--primary-color); color: #fff; padding: 8px 16px;
+  background: var(--primary-button); color: #fff; padding: 8px 16px;
   border-radius: 0 0 4px 0; }
 .skip-link:focus { left: 0; }
 

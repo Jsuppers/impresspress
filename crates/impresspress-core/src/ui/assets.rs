@@ -532,6 +532,109 @@ mod tests {
         assert!(!body_rule.contains("Itim"), "Itim must not be the body face");
     }
 
+    /// Finds every leaf declaration block (`selector { decl; decl; }`) in a
+    /// CSS bundle, including ones nested inside `@media`. A block whose body
+    /// still contains `{` after being popped off the brace stack is a
+    /// container (e.g. the `@media` wrapper itself) and is skipped -- its
+    /// children are captured on their own pop.
+    fn css_leaf_blocks(s: &str) -> Vec<(String, String)> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut blocks = Vec::new();
+        for (i, c) in chars.iter().enumerate() {
+            match c {
+                '{' => stack.push(i),
+                '}' => {
+                    let Some(open) = stack.pop() else { continue };
+                    let body: String = chars[open + 1..i].iter().collect();
+                    if body.contains('{') {
+                        continue; // container, not a leaf -- e.g. @media
+                    }
+                    let prefix: String = chars[..open].iter().collect();
+                    let selector = prefix
+                        .rsplit(|c| c == '{' || c == '}')
+                        .next()
+                        .unwrap_or(&prefix)
+                        .trim()
+                        .to_string();
+                    blocks.push((selector, body));
+                }
+                _ => {}
+            }
+        }
+        blocks
+    }
+
+    /// Selectors this task's diff deliberately leaves pairing white text with
+    /// `--primary-color` background, because the surfaces they style are
+    /// replaced with navy by name in already-scheduled follow-up tasks:
+    /// `.nav-link.active`, `.sidebar-toggle:hover`, `.user-avatar`,
+    /// `.profile-menu-avatar` (`layouts/shell.css` -- Task 8 replaces the
+    /// sidebar with navy) and `.login-button`, `.auth-split__brand`
+    /// (`layouts/auth-split.css` -- Task 9 replaces the brand panel with
+    /// navy). Fixing them now would be churn overwritten within two tasks.
+    /// Once those tasks land, none of these selectors will set
+    /// `background: var(--primary-color)` any more, so this allowlist goes
+    /// unused rather than becoming permanently necessary -- if a future run
+    /// finds one of these selectors is no longer an offender, that's a sign
+    /// the corresponding follow-up task shipped, not a broken test.
+    const DEFERRED_WHITE_ON_PRIMARY_COLOR: &[&str] = &[
+        ".nav-link.active",
+        ".sidebar-toggle:hover",
+        ".user-avatar",
+        ".profile-menu-avatar",
+        ".login-button",
+        ".auth-split__brand",
+    ];
+
+    #[test]
+    fn no_new_white_text_on_primary_color_background() {
+        // `--primary-color` (#fd3534) is only 3.66:1 against white -- below
+        // the 4.5:1 AA floor for normal text. White text must sit on
+        // `--primary-button` (#d92320, 4.99:1) instead. This scans every
+        // leaf rule in the assembled bundle for a `background`/
+        // `background-color` declaration naming `var(--primary-color)`
+        // paired, in the SAME rule, with a `color` declaration of `white`,
+        // `#fff`, or `#ffffff`.
+        //
+        // What this covers: exactly that literal pattern, anywhere in the
+        // bundle, including inside `@media` blocks -- a direct regression
+        // test for the bug this fix report describes (five component rules
+        // used `--primary-color` where `--primary-button` was needed).
+        //
+        // What this is blind to: a background and a conflicting text color
+        // declared in two DIFFERENT rules that combine at runtime (parent
+        // background + child text color, or a later cascade rule
+        // overriding just one side); a color that resolves to white via a
+        // CSS variable (`color: var(--something-white)`) rather than a
+        // literal; colors applied via inline `style=` attributes or JS;
+        // and any near-white value not literally spelled "white", "#fff",
+        // or "#ffffff". It also cannot see markup -- it has no way to know
+        // whether a flagged selector is actually reachable/rendered.
+        let s = super::css();
+        let offenders: Vec<String> = css_leaf_blocks(s)
+            .into_iter()
+            .filter(|(_, body)| {
+                let has_bg = body.split(';').any(|d| {
+                    let d = d.trim();
+                    (d.starts_with("background:") || d.starts_with("background-color:"))
+                        && d.contains("var(--primary-color)")
+                });
+                let has_white = body.split(';').any(|d| {
+                    let d = d.trim();
+                    d.starts_with("color:") && (d.contains("white") || d.contains("#fff"))
+                });
+                has_bg && has_white
+            })
+            .map(|(selector, _)| selector)
+            .filter(|selector| !DEFERRED_WHITE_ON_PRIMARY_COLOR.contains(&selector.as_str()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "white text paired with --primary-color background (route to --primary-button instead): {offenders:?}"
+        );
+    }
+
     #[test]
     fn palette_js_present_and_self_invoking() {
         let js = super::palette_js();
