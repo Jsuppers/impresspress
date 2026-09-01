@@ -48,6 +48,16 @@ block-messages = ["impresspress-core/block-messages"]
 block-products = ["impresspress-core/block-products"]
 block-userportal = ["impresspress-core/block-userportal"]
 
+# Not enabled by any preset above, and not part of `default-features = false`
+# on the `impresspress-core` dependency below. `run_with_config` (`lib.rs`)
+# always serves `/b/static/` straight from the R2 bucket binding UNLESS this
+# is on — matching the native `impresspress` CLI crate's own
+# `embed-assets = ["impresspress-core/embed-assets"]` passthrough. A consumer
+# that flips this on gets `impresspress-core`'s embedded byte path instead
+# (via ordinary `wafer.run()` block dispatch through `SystemBlock`) at the
+# cost of the wasm bloat `embed-assets` exists to avoid on this target.
+embed-assets = ["impresspress-core/embed-assets"]
+
 # Test-only: compile the shared wafer-run #319 `DatabaseService` conformance
 # suite and the `src/conformance.rs` compile-time assertions that wire the D1
 # and KV-cached adapters into it. Off by default so the ~1.3k-line suite never

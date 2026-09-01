@@ -736,9 +736,10 @@ pub struct UiAssetUploadReport {
 /// under a shared content-addressed `immutable_prefix`: each object's own
 /// filename already carries its content hash (baked in by `build.rs`), so
 /// every object is already immutable and content-addressed on its own — and
-/// a plain root-level key is what a lean (no `embed-assets`) worker needs to
-/// resolve `/b/static/{filename}` once `IMPRESSPRESS_ASSET_BASE_URL` points
-/// at `/b/static/` (see [`super::assets::resolve_asset_base_url`]).
+/// a plain root-level key is exactly what `impresspress_cloudflare::run_with_config`
+/// reads back to resolve `/b/static/{filename}` on a lean (no `embed-assets`)
+/// worker once `IMPRESSPRESS_ASSET_BASE_URL` points at `/b/static/` (see
+/// [`super::assets::resolve_asset_base_url`]).
 pub fn r2_upload_ui_assets(bucket: &str) -> Result<UiAssetUploadReport> {
     let mut client = WranglerR2Client { bucket };
     r2_upload_ui_assets_with_client(&mut client, OBJECT_RETRY_SECS)

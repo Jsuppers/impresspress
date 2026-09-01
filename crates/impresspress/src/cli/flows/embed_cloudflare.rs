@@ -301,7 +301,10 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     // Cloudflare build drops at compile time, and `IMPRESSPRESS_ASSET_BASE_URL`
     // (set in every generated wrangler config via
     // `assets::resolve_asset_base_url`, see `wrangler::base_toml`) points
-    // `/b/static/` at wherever they land here.
+    // `/b/static/` at wherever they land here — served back out by
+    // `impresspress_cloudflare::run_with_config`'s R2 read-through
+    // (`static_asset_target` / `serve_static_asset_from_r2`), not by the
+    // (compiled-out) embedded byte path.
     if !cfg.r2.bucket_name.is_empty() {
         let ui_asset_upload = cf_deploy::r2_upload_ui_assets(&cfg.r2.bucket_name)?;
         println!(
