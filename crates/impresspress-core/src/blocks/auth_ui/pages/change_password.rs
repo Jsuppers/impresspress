@@ -8,8 +8,6 @@ use crate::ui::{self, components::auth_panel, templates::auth_split};
 
 pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let app_name = &config.app_name;
-    let logo_url = &config.logo_url;
 
     let markup = ui::layout::page(
         "Change Password",
@@ -18,15 +16,6 @@ pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
             auth_panel(&config, "Update your password."),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        } @else {
-                            span .login-app-name { (app_name) }
-                        }
-                        p .login-subtitle { "Change your password" }
-                    }
-
                     div #error .login-error style="display:none" {}
 
                     div #success style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:1rem;text-align:center;display:none" {

@@ -1,3 +1,7 @@
+/* ===== Auth form heading (e.g. "Welcome back") ===== */
+.auth-form__title { font-size: var(--text-2xl); font-weight: 700; margin: 0 0 var(--spacing-xs); color: var(--text-primary); }
+.auth-form__subtitle { font-size: var(--text-base); color: var(--text-secondary); margin: 0 0 var(--spacing-lg); }
+
 /* ===== Alert (auth pages: #error / #info) ===== */
 .alert {
 	display: flex; align-items: center; gap: var(--spacing-sm);

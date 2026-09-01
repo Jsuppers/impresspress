@@ -46,13 +46,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             auth_panel(&config, "Reset your password."),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(config.app_name);
-                        }
-                        p .login-subtitle { "Reset your password" }
-                    }
-
                     div #error .login-error style="display:none" {}
                     div #success style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:.75rem;margin-bottom:1rem;font-size:.813rem;color:#059669;display:none" {}
 
@@ -125,11 +118,6 @@ fn html_respond(
             auth_panel(&config, "Reset your password."),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(config.app_name);
-                        }
-                    }
                     div style="text-align:center" {
                         div style={"width:48px;height:48px;background:" (color) "15;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:" (color)} {
                             @if success { "✓" } @else { "✗" }

@@ -15,8 +15,6 @@ use crate::ui::{self, components::auth_panel, templates::auth_split};
 
 pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let app_name = &config.app_name;
-    let logo_url = &config.logo_url;
 
     // Optional convenience: if the holder shared a `?token=...` link, pre-fill
     // the field. The value is rendered as an attribute (maud HTML-escapes it).
@@ -29,15 +27,6 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
             auth_panel(&config, "Set up your admin account."),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        } @else {
-                            span .login-app-name { (app_name) }
-                        }
-                        p .login-subtitle { "Redeem your bootstrap token" }
-                    }
-
                     p style="font-size:.875rem;color:#6b7280;margin-bottom:1.5rem;text-align:center" {
                         "Paste the bootstrap token from your "
                         code style="background:#f3f4f6;padding:.125rem .375rem;border-radius:.25rem;font-size:.813rem" { "BOOTSTRAP_ADMIN_TOKEN" }

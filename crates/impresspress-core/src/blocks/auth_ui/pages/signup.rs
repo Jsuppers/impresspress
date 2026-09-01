@@ -11,7 +11,6 @@ use crate::{
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let app_name = &config.app_name;
     let allow_signup = ctx
         .config_get("WAFER_RUN_SHARED__ALLOW_SIGNUP")
         .unwrap_or("true")
@@ -23,8 +22,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     } else {
         String::new()
     };
-    let logo_url = &config.logo_url;
-
     if !allow_signup {
         return super::login::handle(ctx, msg).await;
     }
@@ -42,15 +39,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             auth_panel(&config, "Create your account."),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        } @else {
-                            span .login-app-name { (app_name) }
-                        }
-                        p .login-subtitle { "Create your " (app_name) " account" }
-                    }
-
                     div #error .login-error style="display:none" {}
 
                     div #success style="text-align:center;display:none" {

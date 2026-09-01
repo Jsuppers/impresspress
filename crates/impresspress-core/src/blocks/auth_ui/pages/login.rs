@@ -71,6 +71,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             auth_panel(&config, "Sign in to continue."),
             html! {
                 div .auth-form {
+                    h2 .auth-form__title { "Welcome back" }
+                    p .auth-form__subtitle { "Sign in to continue." }
+
                     (alert(AlertVariant::Error, "error", ""))
                     (alert(AlertVariant::Success, "info", ""))
 

@@ -167,11 +167,6 @@ fn html_respond(
             auth_panel(&config, "Verify your email."),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        }
-                    }
                     div style="text-align:center" {
                         div style={"width:48px;height:48px;background:" (color) "15;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:" (color)} {
                             @if success { "✓" } @else { "✗" }
