@@ -2,8 +2,17 @@ use wafer_run::{BlockEndpoint, BlockInfo, InstanceMode};
 
 use crate::{
     http::{err_not_found, ok_json, ResponseBuilder},
-    ui,
+    routing,
 };
+
+/// Resolve a hashed filename (the part after `/b/static/`) to its bytes and
+/// content type. Exact-match against the build-time manifest — no prefix
+/// scanning, so no ordering hazard between `itim-latin-` and `itim-latin-ext-`.
+#[cfg(feature = "embed-assets")]
+pub(crate) fn static_asset(filename: &str) -> Option<(&'static [u8], &'static str)> {
+    let e = crate::ui::assets::ASSETS.iter().find(|e| e.filename == filename)?;
+    Some((crate::ui::assets::bytes(e.logical)?, e.content_type))
+}
 
 crate::impresspress_feature_block! {
     /// System health checks and embedded static assets (`impresspress/system`).
@@ -53,118 +62,22 @@ crate::impresspress_feature_block! {
         }
 
         // Embedded static assets (CSS, JS, fonts) with content-hash URLs for
-        // cache busting. The dispatch table replaces a stack of
-        // `_ if path.starts_with(...) && path.ends_with(...)` arms — order
-        // matters in that form (`latin-ext` must precede `latin`), and a
-        // table makes the order explicit and lookup uniform.
-        //
-        // Each entry's bytes-fn returns `&'static [u8]` directly — every
-        // asset is either an `include_str!`/`include_bytes!` literal or a
-        // `OnceLock`-cached `String`/`Vec`, so the reference is genuinely
-        // 'static and the lookup itself allocates nothing. The one
-        // unavoidable copy is `.to_vec()` at the call site: `ResponseBuilder
-        // ::body` (wafer-run's streaming-response protocol) takes ownership
-        // of a `Vec<u8>` chunk, so *some* buffer has to be handed across that
-        // boundary per request — there is no zero-copy response path in the
-        // current wafer-run `OutputStream`/`StreamEvent::Chunk` API. Fixing
-        // that fully (e.g. an `Arc<[u8]>`/`bytes::Bytes`-backed chunk so
-        // concurrent requests can share one buffer via refcount bump instead
-        // of a fresh copy) is a wafer-run API change, out of scope here.
-        //
-        // Split into three tables (core / block-llm / block-files) instead
-        // of one, so the LLM and Files assets — themselves feature-gated in
-        // `ui::assets` — don't need a stub/panic branch when their feature
-        // is off; the table for a disabled group simply doesn't exist.
-        type BytesFn = fn() -> &'static [u8];
-        const CORE_TABLE: &[(&str, &str, &str, BytesFn)] = &[
-            ("/b/static/app-", ".css", "text/css; charset=utf-8", || {
-                ui::assets::css().as_bytes()
-            }),
-            (
-                "/b/static/htmx-",
-                ".min.js",
-                "application/javascript; charset=utf-8",
-                || ui::assets::htmx_js().as_bytes(),
-            ),
-            (
-                "/b/static/webmcp-",
-                ".js",
-                "application/javascript; charset=utf-8",
-                || ui::assets::webmcp_js().as_bytes(),
-            ),
-            // `latin-ext` must come before `latin` so the longer prefix
-            // wins. The table is scanned in order.
-            ("/b/static/itim-latin-ext-", ".woff2", "font/woff2", || {
-                ui::assets::itim_latin_ext_woff2()
-            }),
-            ("/b/static/itim-latin-", ".woff2", "font/woff2", || {
-                ui::assets::itim_latin_woff2()
-            }),
-            // `impresspress-logo-long-` must come before `impresspress-logo-` so the
-            // longer prefix wins (same pattern as `itim-latin-ext-` above).
-            ("/b/static/impresspress-logo-long-", ".png", "image/png", || {
-                ui::assets::logo_long_png()
-            }),
-            ("/b/static/impresspress-logo-", ".png", "image/png", || {
-                ui::assets::logo_icon_png()
-            }),
-            ("/b/static/favicon-", ".ico", "image/x-icon", || {
-                ui::assets::favicon_ico()
-            }),
-        ];
-        for (prefix, suffix, content_type, bytes_fn) in CORE_TABLE {
-            if path.starts_with(prefix) && path.ends_with(suffix) {
+        // cache busting. Looked up by exact filename against the build-time
+        // manifest (`static_asset`, above) — no prefix/suffix scanning, so no
+        // ordering hazard between e.g. `itim-latin-` and `itim-latin-ext-`.
+        if let Some(filename) = path.strip_prefix(routing::STATIC_PREFIX) {
+            #[cfg(feature = "embed-assets")]
+            if let Some((body, content_type)) = static_asset(filename) {
                 return ResponseBuilder::new()
                     .set_header("Cache-Control", "public, max-age=31536000, immutable")
-                    .body(bytes_fn().to_vec(), content_type);
+                    .body(body.to_vec(), content_type);
             }
-        }
-
-        #[cfg(feature = "block-llm")]
-        {
-            const LLM_TABLE: &[(&str, &str, &str, BytesFn)] = &[
-                (
-                    "/b/static/marked-",
-                    ".min.js",
-                    "application/javascript; charset=utf-8",
-                    || ui::assets::marked_js().as_bytes(),
-                ),
-                (
-                    "/b/static/purify-",
-                    ".js",
-                    "application/javascript; charset=utf-8",
-                    || ui::assets::purify_js().as_bytes(),
-                ),
-                (
-                    "/b/static/llm-chat-",
-                    ".js",
-                    "application/javascript; charset=utf-8",
-                    || ui::assets::llm_chat_js().as_bytes(),
-                ),
-            ];
-            for (prefix, suffix, content_type, bytes_fn) in LLM_TABLE {
-                if path.starts_with(prefix) && path.ends_with(suffix) {
-                    return ResponseBuilder::new()
-                        .set_header("Cache-Control", "public, max-age=31536000, immutable")
-                        .body(bytes_fn().to_vec(), content_type);
-                }
-            }
-        }
-
-        #[cfg(feature = "block-files")]
-        {
-            const FILES_TABLE: &[(&str, &str, &str, BytesFn)] = &[(
-                "/b/static/files-browser-",
-                ".js",
-                "application/javascript; charset=utf-8",
-                || ui::assets::files_browser_js().as_bytes(),
-            )];
-            for (prefix, suffix, content_type, bytes_fn) in FILES_TABLE {
-                if path.starts_with(prefix) && path.ends_with(suffix) {
-                    return ResponseBuilder::new()
-                        .set_header("Cache-Control", "public, max-age=31536000, immutable")
-                        .body(bytes_fn().to_vec(), content_type);
-                }
+            #[cfg(not(feature = "embed-assets"))]
+            {
+                // Assets were not compiled in. The deployer is responsible for
+                // publishing them and pointing IMPRESSPRESS_ASSET_BASE_URL at
+                // them (Task 4); reaching this arm means that did not happen.
+                let _ = filename;
             }
         }
 
@@ -205,7 +118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "block-llm")]
+    #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     async fn system_handle_serves_llm_chat_js() {
         let block = SystemBlock::new();
         let url = assets::llm_chat_js_url();
@@ -233,7 +146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "block-files")]
+    #[cfg(all(feature = "block-files", feature = "embed-assets"))]
     async fn system_handle_serves_files_browser_js() {
         let block = SystemBlock::new();
         let url = assets::files_browser_js_url();
@@ -261,7 +174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "block-llm")]
+    #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     async fn system_handle_serves_marked_js() {
         let block = SystemBlock::new();
         let url = assets::marked_js_url();
@@ -289,7 +202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "block-llm")]
+    #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     async fn system_handle_serves_purify_js() {
         let block = SystemBlock::new();
         let url = assets::purify_js_url();
@@ -317,6 +230,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "embed-assets")]
     async fn system_handle_serves_webmcp_js() {
         let block = SystemBlock::new();
         let url = assets::webmcp_js_url();
@@ -372,5 +286,24 @@ mod tests {
              effective auth level above Public would silently disable tools \
              on the public storefront"
         );
+    }
+
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn static_lookup_matches_exact_hashed_filename_without_ordering_hazard() {
+        // The prefix-table version needed `itim-latin-ext-` to be scanned before
+        // `itim-latin-`. Exact-filename matching makes that class of bug impossible.
+        let ext = crate::ui::assets::entry("itim-latin-ext.woff2");
+        let base = crate::ui::assets::entry("itim-latin.woff2");
+        assert_ne!(ext.filename, base.filename);
+        assert_eq!(super::static_asset(ext.filename).unwrap().1, "font/woff2");
+        assert_eq!(super::static_asset(base.filename).unwrap().1, "font/woff2");
+    }
+
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn static_lookup_rejects_unknown_and_traversal_paths() {
+        assert!(super::static_asset("nope.css").is_none());
+        assert!(super::static_asset("../../etc/passwd").is_none());
     }
 }

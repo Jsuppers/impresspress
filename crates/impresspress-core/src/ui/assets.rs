@@ -54,66 +54,88 @@ pub fn url(logical: &str) -> String {
     format!("{}{}", base_url(), entry(logical).filename)
 }
 
-/// Delegates to the existing per-asset accessors below (`htmx_js()`,
-/// `favicon_ico()`, ...) rather than re-issuing `include_bytes!`/`include_str!`
-/// on the same source files — Task 1's manifest exists precisely so asset
-/// content has one source-level truth; a second `include_bytes!` per file
-/// here would silently reintroduce the duplication it eliminated.
+/// The single embed point for every asset's bytes. Each arm is either the
+/// asset's own `include_str!`/`include_bytes!` literal or (for `app.css`)
+/// delegates to `css()`, itself an `include_str!` of the `build.rs`-assembled
+/// bundle — either way, exactly one `include_*!` per source file in the
+/// whole crate, so asset content has one source-level truth.
 #[cfg(feature = "embed-assets")]
 pub fn bytes(logical: &str) -> Option<&'static [u8]> {
     Some(match logical {
         "app.css" => css().as_bytes(),
-        "htmx.min.js" => htmx_js().as_bytes(),
-        "webmcp.js" => webmcp_js().as_bytes(),
-        "itim-latin.woff2" => itim_latin_woff2(),
-        "itim-latin-ext.woff2" => itim_latin_ext_woff2(),
-        "impresspress-logo.png" => logo_icon_png(),
-        "impresspress-logo-long.png" => logo_long_png(),
-        "favicon.ico" => favicon_ico(),
+        // htmx 2.x minified JS.
+        "htmx.min.js" => include_str!("assets/htmx.min.js").as_bytes(),
+        // WebMCP tool-registration script, served on every page. Fetches the
+        // auth-filtered manifest at `/b/webmcp/manifest.json` and registers
+        // each tool via `document.modelContext.registerTool` (no-ops on
+        // browsers without WebMCP support).
+        "webmcp.js" => include_str!("assets/webmcp.js").as_bytes(),
+        // Itim font binaries, sourced from `impresspress/site-kit`'s
+        // `/fonts/` mirror and committed here so every impresspress
+        // deployment ships its own glyphs (no cross-origin runtime
+        // dependency, no `https://impresspress.org/fonts/` 404).
+        "itim-latin.woff2" => include_bytes!("assets/fonts/itim-latin.woff2"),
+        "itim-latin-ext.woff2" => include_bytes!("assets/fonts/itim-latin-ext.woff2"),
+        // Square Impresspress mark used as the sidebar/login icon. Bundled
+        // locally so the admin renders correctly without internet (the
+        // previous default pointed at `https://impresspress.org/images/logo.png`
+        // which 404s offline).
+        "impresspress-logo.png" => include_bytes!("assets/impresspress-logo.png"),
+        // Impresspress wordmark/long logo — used in the sidebar brand and
+        // login splash.
+        "impresspress-logo-long.png" => include_bytes!("assets/impresspress-logo-long.png"),
+        // Impresspress favicon — bundled so every deployment ships its own
+        // `<link rel="icon">` target without depending on a per-deployment
+        // external URL or the implicit browser fallback to `/favicon.ico`
+        // (which 404s by default).
+        "favicon.ico" => include_bytes!("assets/favicon.ico"),
+        // marked.js (markdown parser), vendored from marked@14 — self-hosted
+        // instead of a jsdelivr CDN `<script>` so there's no external
+        // runtime fetch (CSP-friendly, no third-party availability/supply-
+        // chain dependency at page load). Only consumed by the LLM chat
+        // page (`blocks::llm::pages`), which is itself gated behind
+        // `block-llm` — feature-gated here too so a build without the LLM
+        // block (e.g. Cloudflare, which can't enable `block-llm`: the
+        // provider service isn't wasm32-compatible) doesn't embed this JS.
         #[cfg(feature = "block-llm")]
-        "marked.min.js" => marked_js().as_bytes(),
+        "marked.min.js" => include_str!("assets/marked.min.js").as_bytes(),
+        // DOMPurify (HTML sanitizer), vendored from DOMPurify 3.2.4 —
+        // self-hosted instead of a CDN `<script>` so there's no external
+        // runtime fetch (CSP-friendly, no third-party availability/supply-
+        // chain dependency at page load). Loaded before `marked.js`/
+        // `llm-chat.js` so `renderMarkdown` can sanitize the parsed
+        // markdown before it reaches `innerHTML` (P0 stored-XSS fix). Like
+        // marked.js, only the LLM chat page loads this — gated behind
+        // `block-llm` for the same reason.
         #[cfg(feature = "block-llm")]
-        "purify.min.js" => purify_js().as_bytes(),
+        "purify.min.js" => include_str!("assets/purify.min.js").as_bytes(),
+        // Embedded vanilla-JS bundle for the LLM chat surface — markdown,
+        // message rendering, model management, chat submission, thread
+        // creation/selection. Consumed by the unified LLM page handler and
+        // (for the conversation lens) by the Messages context_detail
+        // handler. Gated behind `block-llm`: Cloudflare currently cannot
+        // enable `block-llm` (the provider service isn't wasm32-compatible),
+        // so this JS has no consumer there — embedding it unconditionally
+        // was pure bloat.
         #[cfg(feature = "block-llm")]
-        "llm-chat.js" => llm_chat_js().as_bytes(),
+        "llm-chat.js" => include_str!("assets/llm-chat.js").as_bytes(),
+        // Embedded vanilla-JS bundle for the file-browser surfaces —
+        // drag-drop upload, bulk select, kebab menus, share modal, upload
+        // modal, confirm-delete. Consumed by `pages_user::object_list_page`
+        // and `cloudstorage_page`, both in the `block-files`-gated
+        // `blocks::files` module — gated here to match, so a build without
+        // the Files block drops this JS too.
         #[cfg(feature = "block-files")]
-        "files-browser.js" => files_browser_js().as_bytes(),
+        "files-browser.js" => include_str!("assets/files-browser.js").as_bytes(),
         _ => return None,
     })
 }
-
-/// Itim font binaries, sourced from `impresspress/site-kit`'s `/fonts/` mirror
-/// and committed here so every impresspress deployment ships its own glyphs
-/// (no cross-origin runtime dependency, no `https://impresspress.org/fonts/` 404).
-const ITIM_LATIN_WOFF2: &[u8] = include_bytes!("assets/fonts/itim-latin.woff2");
-const ITIM_LATIN_EXT_WOFF2: &[u8] = include_bytes!("assets/fonts/itim-latin-ext.woff2");
-
-/// Square Impresspress mark used as the sidebar/login icon. Bundled locally so
-/// the admin renders correctly without internet (the previous default pointed
-/// at `https://impresspress.org/images/logo.png` which 404s offline).
-const LOGO_ICON_PNG: &[u8] = include_bytes!("assets/impresspress-logo.png");
-/// Impresspress wordmark/long logo — used in the sidebar brand and login splash.
-const LOGO_LONG_PNG: &[u8] = include_bytes!("assets/impresspress-logo-long.png");
-/// Impresspress favicon — bundled so every deployment ships its own `<link rel="icon">`
-/// target without depending on a per-deployment external URL or the implicit
-/// browser fallback to `/favicon.ico` (which 404s by default).
-const FAVICON_ICO: &[u8] = include_bytes!("assets/favicon.ico");
 
 /// The built-in brand accent, as a hex literal for surfaces that can't use
 /// CSS variables (email inline styles). Must match `--primary-color` in
 /// `assets/tokens.css` — the `brand_accent_matches_tokens_css` test pins the
 /// two together so they can't drift.
 pub const BRAND_ACCENT_HEX: &str = "#f0480f";
-
-/// Impresspress square logo bytes.
-pub fn logo_icon_png() -> &'static [u8] {
-    LOGO_ICON_PNG
-}
-
-/// Impresspress long/wordmark logo bytes.
-pub fn logo_long_png() -> &'static [u8] {
-    LOGO_LONG_PNG
-}
 
 /// Square logo URL with content hash, e.g. `/b/static/impresspress-logo-a1b2c3d4.png`.
 pub fn logo_icon_url() -> String {
@@ -125,42 +147,14 @@ pub fn logo_long_url() -> String {
     url("impresspress-logo-long.png")
 }
 
-/// Impresspress favicon bytes.
-pub fn favicon_ico() -> &'static [u8] {
-    FAVICON_ICO
-}
-
 /// Favicon URL with content hash, e.g. `/b/static/favicon-a1b2c3d4.ico`.
 pub fn favicon_url() -> String {
     url("favicon.ico")
 }
 
-/// Itim latin (basic) woff2 bytes.
-pub fn itim_latin_woff2() -> &'static [u8] {
-    ITIM_LATIN_WOFF2
-}
-
-/// Itim latin-ext woff2 bytes.
-pub fn itim_latin_ext_woff2() -> &'static [u8] {
-    ITIM_LATIN_EXT_WOFF2
-}
-
 /// The assembled CSS bundle, built by `build.rs` from `CSS_ORDER`.
 pub fn css() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/app.css"))
-}
-
-/// htmx 2.x minified JS.
-pub fn htmx_js() -> &'static str {
-    include_str!("assets/htmx.min.js")
-}
-
-/// WebMCP tool-registration script, served on every page. Fetches the
-/// auth-filtered manifest at `/b/webmcp/manifest.json` and registers each
-/// tool via `document.modelContext.registerTool` (no-ops on browsers
-/// without WebMCP support).
-pub fn webmcp_js() -> &'static str {
-    include_str!("assets/webmcp.js")
 }
 
 /// CSS URL with content hash, e.g. `/b/static/app-a1b2c3d4.css`
@@ -178,40 +172,10 @@ pub fn webmcp_js_url() -> String {
     url("webmcp.js")
 }
 
-/// marked.js (markdown parser), vendored from marked@14 — self-hosted instead of
-/// a jsdelivr CDN `<script>` so there's no external runtime fetch (CSP-friendly,
-/// no third-party availability/supply-chain dependency at page load).
-///
-/// Only consumed by the LLM chat page (`blocks::llm::pages`), which is itself
-/// gated behind `block-llm` — feature-gated here too so a build without the
-/// LLM block (e.g. Cloudflare, which can't enable `block-llm`: the provider
-/// service isn't wasm32-compatible) doesn't embed this JS.
-#[cfg(feature = "block-llm")]
-pub fn marked_js() -> &'static str {
-    include_str!("assets/marked.min.js")
-}
-
 /// marked.js URL with content hash, e.g. `/b/static/marked-a1b2c3d4.min.js`
 #[cfg(feature = "block-llm")]
 pub fn marked_js_url() -> String {
     url("marked.min.js")
-}
-
-/// DOMPurify (HTML sanitizer), vendored from DOMPurify 3.2.4 — self-hosted
-/// instead of a CDN `<script>` so there's no external runtime fetch
-/// (CSP-friendly, no third-party availability/supply-chain dependency at
-/// page load). Loaded before `marked.js`/`llm-chat.js` so `renderMarkdown`
-/// can sanitize the parsed markdown before it reaches `innerHTML`
-/// (P0 stored-XSS fix).
-///
-/// Like `marked_js`, only the LLM chat page loads this — gated behind
-/// `block-llm` for the same reason.
-#[cfg(feature = "block-llm")]
-const PURIFY_JS: &str = include_str!("assets/purify.min.js");
-
-#[cfg(feature = "block-llm")]
-pub fn purify_js() -> &'static str {
-    PURIFY_JS
 }
 
 /// DOMPurify JS URL with content hash, e.g. `/b/static/purify-a1b2c3d4.js`
@@ -220,42 +184,12 @@ pub fn purify_js_url() -> String {
     url("purify.min.js")
 }
 
-/// Embedded vanilla-JS bundle for the LLM chat surface — markdown, message
-/// rendering, model management, chat submission, thread creation/selection.
-/// Consumed by the unified LLM page handler and (for the conversation lens)
-/// by the Messages context_detail handler.
-///
-/// Gated behind `block-llm`: Cloudflare currently cannot enable `block-llm`
-/// (the provider service isn't wasm32-compatible), so this JS has no
-/// consumer there — embedding it unconditionally was pure bloat.
-#[cfg(feature = "block-llm")]
-const LLM_CHAT_JS: &str = include_str!("assets/llm-chat.js");
-
-#[cfg(feature = "block-llm")]
-pub fn llm_chat_js() -> &'static str {
-    LLM_CHAT_JS
-}
-
 /// LLM chat JS URL with content hash, e.g. `/b/static/llm-chat-a1b2c3d4.js`.
 /// Not minified — readability matters for a script that's debugged in
 /// Chrome devtools.
 #[cfg(feature = "block-llm")]
 pub fn llm_chat_js_url() -> String {
     url("llm-chat.js")
-}
-
-/// Embedded vanilla-JS bundle for the file-browser surfaces — drag-drop
-/// upload, bulk select, kebab menus, share modal, upload modal,
-/// confirm-delete. Consumed by `pages_user::object_list_page` and
-/// `cloudstorage_page`, both in the `block-files`-gated `blocks::files`
-/// module — gated here to match, so a build without the Files block drops
-/// this JS too.
-#[cfg(feature = "block-files")]
-const FILES_BROWSER_JS: &str = include_str!("assets/files-browser.js");
-
-#[cfg(feature = "block-files")]
-pub fn files_browser_js() -> &'static str {
-    FILES_BROWSER_JS
 }
 
 /// Files-browser JS URL with content hash, e.g. `/b/static/files-browser-a1b2c3d4.js`.
@@ -562,9 +496,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "block-llm")]
+    #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     fn llm_chat_js_is_self_invoking_and_exposes_init() {
-        let js = super::llm_chat_js();
+        let js = std::str::from_utf8(super::bytes("llm-chat.js").expect("llm-chat.js embedded"))
+            .unwrap();
         assert!(js.contains("(function ()") || js.contains("(function()"));
         assert!(js.contains("__impresspressLlmChatLoaded"));
         assert!(js.contains("window.impresspressLlmChat = { init: init }"));
@@ -600,9 +535,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "block-llm")]
+    #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     fn purify_js_is_dompurify_umd_build() {
-        let js = super::purify_js();
+        let js =
+            std::str::from_utf8(super::bytes("purify.min.js").expect("purify.min.js embedded"))
+                .unwrap();
         assert!(
             js.contains("DOMPurify"),
             "vendored asset should be DOMPurify"
@@ -618,9 +555,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "block-files")]
+    #[cfg(all(feature = "block-files", feature = "embed-assets"))]
     fn files_browser_js_exposes_init_and_handles_drag_drop() {
-        let js = super::files_browser_js();
+        let js = std::str::from_utf8(
+            super::bytes("files-browser.js").expect("files-browser.js embedded"),
+        )
+        .unwrap();
         assert!(
             js.contains("impresspressFilesBrowser"),
             "module namespace missing"
