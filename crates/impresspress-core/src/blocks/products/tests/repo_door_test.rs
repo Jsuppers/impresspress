@@ -77,6 +77,14 @@ const LITERAL_ALLOWED: &[&str] = &[
     // handler tests have something to act on; fixture setup, not a production
     // read that has to respect the soft-delete filter
     "blocks/products/tests/handler_tests.rs",
+    // the migration runner's own tests. They necessarily work below the repo
+    // layer: migration 020 exists to repair a `deleted_at = ''` row, and the
+    // repo layer is precisely what can no longer produce one, so the only way
+    // to seed the pre-migration state is against the table. The migration
+    // `.sql` files next to it spell the table out for the same reason — that
+    // is where the table is defined. (Matches CLAUDE.md's standing exceptions
+    // for migration-file runners and test-fixture setup.)
+    "blocks/products/migrations/mod.rs",
 ];
 
 #[test]

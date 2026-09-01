@@ -69,6 +69,9 @@ const SQL_018_POSTGRES: &str = include_str!("018_provider_operation_leases.postg
 const SQL_019_SQLITE: &str = include_str!("019_offer_draft_revision.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_019_POSTGRES: &str = include_str!("019_offer_draft_revision.postgres.sql");
+const SQL_020_SQLITE: &str = include_str!("020_normalize_blank_deleted_at.sqlite.sql");
+#[cfg(any(feature = "postgres", test))]
+const SQL_020_POSTGRES: &str = include_str!("020_normalize_blank_deleted_at.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle_init` apply path.
@@ -93,6 +96,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("017_refund_connect_event_order", SQL_017_SQLITE),
     ("018_provider_operation_leases", SQL_018_SQLITE),
     ("019_offer_draft_revision", SQL_019_SQLITE),
+    ("020_normalize_blank_deleted_at", SQL_020_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`]. Empty
@@ -119,6 +123,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_017_POSTGRES,
     SQL_018_POSTGRES,
     SQL_019_POSTGRES,
+    SQL_020_POSTGRES,
 ];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
@@ -146,7 +151,8 @@ mod strict_upgrade_tests {
         SQL_010_SQLITE, SQL_011_POSTGRES, SQL_011_SQLITE, SQL_012_POSTGRES, SQL_012_SQLITE,
         SQL_013_POSTGRES, SQL_013_SQLITE, SQL_014_POSTGRES, SQL_014_SQLITE, SQL_015_POSTGRES,
         SQL_015_SQLITE, SQL_016_POSTGRES, SQL_016_SQLITE, SQL_017_POSTGRES, SQL_017_SQLITE,
-        SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES, SQL_019_SQLITE,
+        SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES, SQL_019_SQLITE, SQL_020_POSTGRES,
+        SQL_020_SQLITE,
     };
     use crate::migration_helper::apply_ddl_via_service;
 
@@ -276,6 +282,142 @@ mod strict_upgrade_tests {
                 .and_then(|value| value.as_i64()),
             Some(2500)
         );
+    }
+
+    /// `deleted_at` is NULL-or-timestamp by invariant, but `''` was reachable
+    /// historically: until the product handlers began stripping
+    /// `INTERNAL_FIELDS`, all four create/update paths forwarded the request
+    /// body verbatim. Once `is_deleted` became the exact per-record twin of
+    /// `live_filter`'s `deleted_at IS NULL`, such a row reads as DELETED
+    /// everywhere — out of the public catalog, the admin list and the seller
+    /// cap, with no admin action and nothing logged. 020 repairs those rows.
+    ///
+    /// Drives the real migration harness (`apply_ddl_via_service` over
+    /// `SQLITE_MIGRATIONS`), the same shape as
+    /// `strict_stripe_event_write_succeeds_after_004_alter_on_preexisting_table`:
+    /// pre-migration schema, a pre-existing row the new migration has to
+    /// repair, then the migration.
+    #[tokio::test]
+    async fn blank_deleted_at_is_normalized_to_null_by_020() {
+        let db: Arc<dyn DatabaseService> =
+            Arc::new(SQLiteDatabaseService::open_in_memory().unwrap());
+
+        let pre_020: Vec<&str> = SQLITE_MIGRATIONS
+            .iter()
+            .take_while(|(name, _)| *name != "020_normalize_blank_deleted_at")
+            .map(|(_, sql)| *sql)
+            .collect();
+        apply_ddl_via_service(&db, &pre_020)
+            .await
+            .expect("apply pre-020 products migrations");
+
+        // Every value the column can hold: the historical `''` a
+        // pass-through create body produced, a live NULL row, and a genuine
+        // soft delete. The last two are here to prove 020 is targeted.
+        for (id, deleted_at) in [
+            ("blank", Some("")),
+            ("live", None),
+            ("gone", Some("2026-01-01T00:00:00Z")),
+        ] {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), json!(id));
+            row.insert("name".to_string(), json!(id));
+            if let Some(stamp) = deleted_at {
+                row.insert("deleted_at".to_string(), json!(stamp));
+            }
+            db.create("impresspress__products__products", row)
+                .await
+                .unwrap_or_else(|error| panic!("seed {id}: {error}"));
+        }
+
+        let blanks = |db: Arc<dyn DatabaseService>| async move {
+            db.query_raw(
+                "SELECT id FROM impresspress__products__products WHERE deleted_at = ''",
+                &[],
+            )
+            .await
+            .expect("query blank deleted_at")
+            .len()
+        };
+        assert_eq!(
+            blanks(db.clone()).await,
+            1,
+            "precondition: the pre-020 schema stores an empty-string deleted_at as-is"
+        );
+
+        // Applied from `SQLITE_MIGRATIONS` rather than from `SQL_020_SQLITE`
+        // directly, so the test covers the wiring as well as the SQL: an
+        // unwired migration leaves nothing to apply and fails below.
+        let from_020: Vec<&str> = SQLITE_MIGRATIONS
+            .iter()
+            .skip_while(|(name, _)| *name != "020_normalize_blank_deleted_at")
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert!(
+            !from_020.is_empty(),
+            "020 must be wired into SQLITE_MIGRATIONS to reach a deployed database"
+        );
+        apply_ddl_via_service(&db, &from_020)
+            .await
+            .expect("apply 020 normalization migration");
+
+        assert_eq!(
+            blanks(db.clone()).await,
+            0,
+            "020 must leave no empty-string deleted_at behind"
+        );
+
+        // Repaired to NULL — i.e. live — not merely to some other non-blank
+        // value, and the row that was really deleted is untouched.
+        let live = db
+            .query_raw(
+                "SELECT id FROM impresspress__products__products \
+                 WHERE deleted_at IS NULL ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("query live rows");
+        let live_ids: Vec<&str> = live
+            .iter()
+            .filter_map(|row| row.data.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            live_ids,
+            vec!["blank", "live"],
+            "the repaired row must read as live, alongside the row that always was"
+        );
+
+        let still_deleted = db
+            .query_raw(
+                "SELECT id FROM impresspress__products__products \
+                 WHERE deleted_at = '2026-01-01T00:00:00Z'",
+                &[],
+            )
+            .await
+            .expect("query the genuinely deleted row");
+        assert_eq!(
+            still_deleted.len(),
+            1,
+            "020 must not touch a row that carries a real deletion stamp"
+        );
+    }
+
+    #[test]
+    fn normalize_blank_deleted_at_migration_matches_sqlite_and_postgres() {
+        for fragment in [
+            "impresspress__products__products",
+            "SET deleted_at = NULL",
+            "WHERE deleted_at = ''",
+        ] {
+            assert!(
+                SQL_020_SQLITE.contains(fragment),
+                "SQLite deleted_at normalization migration is missing {fragment}"
+            );
+            assert!(
+                SQL_020_POSTGRES.contains(fragment),
+                "PostgreSQL deleted_at normalization migration is missing {fragment}"
+            );
+        }
     }
 
     #[test]
@@ -595,6 +737,8 @@ mod strict_upgrade_tests {
             ("018 postgres", SQL_018_POSTGRES),
             ("019 sqlite", SQL_019_SQLITE),
             ("019 postgres", SQL_019_POSTGRES),
+            ("020 sqlite", SQL_020_SQLITE),
+            ("020 postgres", SQL_020_POSTGRES),
         ] {
             let declares_boolean = sql.lines().any(|line| {
                 let line = line.trim();
