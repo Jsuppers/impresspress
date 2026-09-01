@@ -207,6 +207,42 @@ pub(crate) async fn update(
     db::update(ctx, TABLE, id, data).await
 }
 
+/// Selects exactly one row by id. Paired with [`live_filter`] to make a
+/// by-id write conditional on the row still being live.
+fn id_filter(id: &str) -> Filter {
+    Filter {
+        field: "id".to_string(),
+        operator: FilterOp::Equal,
+        value: Value::String(id.to_string()),
+    }
+}
+
+/// Update one product *if it is still live*, in a single round trip.
+///
+/// [`update`] is unconditional, so a caller wanting "only while it is live"
+/// would have to [`get`] first — and the gap between that read and the write
+/// is a window a concurrent delete fits through, after which the write lands
+/// on an already-deleted row and reports success. Making `deleted_at IS NULL`
+/// part of the write's own `WHERE` closes it: the row's state at write time
+/// is what decides, and zero rows affected is `NotFound`.
+pub(crate) async fn update_live(
+    ctx: &dyn Context,
+    id: &str,
+    data: HashMap<String, Value>,
+) -> Result<Record, WaferError> {
+    let updated =
+        db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), live_filter()], data).await?;
+    if updated == 0 {
+        return Err(WaferError::new(ErrorCode::NotFound, "Product not found"));
+    }
+    // Re-read for the response body: a filtered update reports how many rows
+    // it touched, not what they now hold. Raw rather than `get`, because the
+    // write has already established that the row was live when it happened —
+    // answering `NotFound` here for a delete that landed afterwards would
+    // deny a change that did take effect.
+    db::get(ctx, TABLE, id).await
+}
+
 /// Hard-delete a row. Reserved for rolling back a product that failed
 /// mid-creation and was never visible to anyone — see the cleanup path in
 /// `handlers/product.rs`. Not the delete a user's action reaches.

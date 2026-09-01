@@ -1522,6 +1522,62 @@ async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
     );
 }
 
+/// The admin PATCH refuses a soft-deleted product — a deleted row has to go
+/// back through `restore` before it is editable again. It enforced that with
+/// a separate `get` followed by a separate `update`, which is a guard with a
+/// window in it: a delete landing between the two lets the PATCH write to an
+/// already-deleted row and answer 200.
+///
+/// The window is reproduced exactly rather than raced for. The handler awaits
+/// the request body between its liveness check and its write, so a body that
+/// arrives only after the delete has committed puts the delete precisely
+/// where a concurrent one would land.
+#[tokio::test]
+async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
+    use std::sync::Arc;
+
+    let ctx = Arc::new(ctx().await);
+
+    let mut racer = HashMap::new();
+    racer.insert("name".to_string(), serde_json::json!("before"));
+    racer.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "racer", racer).await;
+
+    let deleting = ctx.clone();
+    let input = wafer_run::InputStream::from_stream(futures::stream::once(async move {
+        super::super::repo::products::soft_delete(deleting.as_ref(), "racer")
+            .await
+            .expect("the concurrent delete lands");
+        serde_json::to_vec(&serde_json::json!({"name": "after"})).unwrap()
+    }));
+    let (msg, _) = update_msg(
+        "/admin/b/products/products/racer",
+        "admin_1",
+        serde_json::json!({}),
+    );
+    let mut msg = msg;
+    msg.set_meta("auth.user_roles", "admin");
+
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "a PATCH whose row was deleted before the write must 404, not report success"
+    );
+
+    let stored = wafer_core::clients::database::get(
+        ctx.as_ref(),
+        super::super::repo::products::TABLE,
+        "racer",
+    )
+    .await
+    .expect("the row still exists");
+    assert_eq!(
+        stored.data.get("name"),
+        Some(&serde_json::json!("before")),
+        "the PATCH must not have written to a deleted row"
+    );
+}
+
 /// The slug pre-check exists so a restore that would violate migration 005's
 /// partial unique index says which slug collided instead of surfacing the
 /// index violation as an opaque 500. Reading a *failed* probe as "no

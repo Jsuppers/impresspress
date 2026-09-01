@@ -230,17 +230,6 @@ pub(super) async fn handle_update_product(
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
-    // A soft-deleted product must go through `restore` before it is
-    // editable again, so the generic PATCH refuses it outright rather than
-    // silently applying unrelated field changes to a dead row.
-    // `repo::products::get` already answers `NotFound` for a soft-deleted
-    // row, matching the response every other admin product endpoint gives
-    // for one.
-    match repo::products::get(ctx, id).await {
-        Ok(_) => {}
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Product not found"),
-        Err(e) => return err_internal("Database error", e),
-    }
     let raw = input.collect_to_bytes().await;
     let mut data: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
         Ok(b) => b,
@@ -248,7 +237,15 @@ pub(super) async fn handle_update_product(
     };
     strip_internal_fields(&mut data);
     stamp_updated(&mut data);
-    match repo::products::update(ctx, id, data).await {
+    // A soft-deleted product must go through `restore` before it is editable
+    // again, so the generic PATCH refuses one outright rather than silently
+    // applying unrelated field changes to a dead row. The liveness test is
+    // the write's own `WHERE`, not a `get` before it: a separate read leaves
+    // a window in which a concurrent delete commits and the PATCH then writes
+    // to the dead row and answers 200 — precisely the outcome this guard
+    // exists to prevent. `NotFound` matches the response every other admin
+    // product endpoint gives for a soft-deleted row.
+    match repo::products::update_live(ctx, id, data).await {
         Ok(record) => ok_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
@@ -744,7 +741,11 @@ pub(super) async fn handle_user_update_product(
     }
 
     stamp_updated(&mut data);
-    match repo::products::update(ctx, &id, data).await {
+    // `update_live`, for the same reason the admin PATCH uses it: the
+    // ownership check above is a separate read, and the validation between it
+    // and this write only widens the window a concurrent delete can land in.
+    // The write itself has to be the thing that tests liveness.
+    match repo::products::update_live(ctx, &id, data).await {
         Ok(record) => ok_json(&record),
         Err(error) if error.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(error) => err_internal("Database error", error),
