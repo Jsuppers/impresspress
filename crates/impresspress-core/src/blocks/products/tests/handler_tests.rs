@@ -137,8 +137,8 @@ async fn admin_delete_product() {
 
 /// A soft-deleted product must 404 from the admin detail endpoint the same
 /// as one that never existed — `handle_get_product` used to call
-/// `db::get(ctx, PRODUCTS_TABLE, id)` directly, bypassing the soft-delete
-/// filter entirely.
+/// `db::get` with the table's old hardcoded constant directly, bypassing
+/// the soft-delete filter entirely.
 #[tokio::test]
 async fn admin_product_detail_404s_for_a_soft_deleted_product() {
     let ctx = ctx().await;
@@ -1033,8 +1033,8 @@ async fn catalog_detail_404s_for_a_soft_deleted_active_product() {
 /// Characterisation test, not a regression check: `repo::offers::get_public`
 /// already refuses a soft-deleted product's offer today (before this task's
 /// migration), so this must PASS before and after. It pins the behaviour the
-/// migration must not lose, since checkout stops going through
-/// `PRODUCTS_TABLE` directly once this task lands.
+/// migration must not lose, since checkout stops going through the table's
+/// old hardcoded constant directly once this task lands.
 #[tokio::test]
 async fn checkout_refuses_a_soft_deleted_product() {
     let ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;

@@ -198,9 +198,9 @@ pub(super) async fn handle_update_product(
 pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Still a literal hard delete: converting this to a soft delete (writing
     // `deleted_at` instead of removing the row) is a later task's job, not
-    // this one's — this call only needs to stop naming the now-deleted
-    // `PRODUCTS_TABLE` constant, so it reads the table name off the repo
-    // module instead.
+    // this one's — this call only needs to stop naming the table via a
+    // hardcoded constant, so it reads the table name off the repo module
+    // instead.
     crud::crud_delete(
         ctx,
         msg,
