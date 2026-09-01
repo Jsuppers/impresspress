@@ -57,9 +57,12 @@ use wafer_core::interfaces::database::service::{
     AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table, UpsertSpec,
 };
 
-/// KV TTL applied to every cache PUT (24 h). Also the TTL the per-isolate
-/// runtime cache stamps a freshly-minted config-version with (see
-/// `runtime_cache::probe_version`).
+/// KV TTL applied to every row-cache PUT (24 h).
+///
+/// Row-cache entries only. The config-version stamp is written WITHOUT a TTL
+/// (`put`, not `put_with_ttl` — see
+/// [`impresspress_core::kv::put_version_stamp_with_retry`]): a quiet day must
+/// not expire the stamp and trigger a fleet-wide restamp.
 pub(crate) const CACHE_TTL_SECS: u64 = 86_400;
 
 /// Fresh opaque config-version stamp (16 random bytes, lowercase hex).
