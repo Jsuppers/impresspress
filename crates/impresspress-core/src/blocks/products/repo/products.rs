@@ -432,7 +432,10 @@ mod tests {
         // future "fix" from collapsing both onto the wrong side, where a
         // `''`-stamped row would list as live while the partial unique slug
         // index (`WHERE deleted_at IS NULL`) still claims its slug.
-        assert!(!get_says_live, "an empty `deleted_at` is not NULL, so the row is deleted");
+        assert!(
+            !get_says_live,
+            "an empty `deleted_at` is not NULL, so the row is deleted"
+        );
     }
 
     #[tokio::test]
@@ -619,7 +622,9 @@ mod tests {
         // instead of relying on two `Utc::now()` calls differing.
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        restore(&ctx, "live").await.expect("restoring a live row is a no-op");
+        restore(&ctx, "live")
+            .await
+            .expect("restoring a live row is a no-op");
 
         assert_eq!(
             db::get(&ctx, TABLE, "live")

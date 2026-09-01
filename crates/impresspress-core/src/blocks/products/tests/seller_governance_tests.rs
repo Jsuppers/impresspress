@@ -518,7 +518,10 @@ async fn no_handler_path_can_write_an_empty_deleted_at() {
 
     let (msg, input) = admin_create_msg("/admin/b/products/products", blank.clone());
     let admin_created = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    let admin_id = admin_created["id"].as_str().expect("admin create").to_string();
+    let admin_id = admin_created["id"]
+        .as_str()
+        .expect("admin create")
+        .to_string();
     assert_null(&test_ctx, &admin_id, "admin create").await;
 
     let (msg, input) = update_msg(
@@ -533,7 +536,10 @@ async fn no_handler_path_can_write_an_empty_deleted_at() {
 
     let (msg, input) = create_msg("/b/products/products", "blank_seller", blank);
     let user_created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    let user_id = user_created["id"].as_str().expect("user create").to_string();
+    let user_id = user_created["id"]
+        .as_str()
+        .expect("user create")
+        .to_string();
     assert_null(&test_ctx, &user_id, "user create").await;
 
     let (msg, input) = update_msg(
