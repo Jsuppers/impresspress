@@ -163,8 +163,15 @@ impl KvCachedD1DatabaseService {
         // about the KV stamp, which the deploy-init funnel suppresses on
         // purpose — and deploy-init is precisely the pass that seeds config
         // mid-boot, which is what an in-process config reader has to notice.
-        // See `impresspress_core::config_generation`.
-        impresspress_core::config_generation::note_config_write();
+        //
+        // Narrower than the stamp bump: only the VARIABLES table feeds the
+        // config snapshot. `block_settings` is written by every block during
+        // its own Init, so treating those as snapshot-invalidating would
+        // discard a good snapshot once per block on a first boot. See
+        // `impresspress_core::config_generation`.
+        if impresspress_core::config_generation::writes_invalidate_config_snapshot(collection) {
+            impresspress_core::config_generation::note_config_write();
+        }
         if !self.mode.bump_on_write {
             return;
         }

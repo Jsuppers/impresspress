@@ -183,6 +183,7 @@ impl D1ConfigSource {
             .into());
         }
 
+        let returned_rows = rows.records.len();
         let mut grouped: BlockVariables = HashMap::new();
         for record in rows.records {
             let Some(block) = record.data.get("block").and_then(|b| b.as_str()) else {
@@ -204,6 +205,24 @@ impl D1ConfigSource {
         }
 
         let snapshot = Rc::new(grouped);
+        // Do not memoize a snapshot that learned nothing from rows that
+        // exist. That is the pre-migration-002 shape — rows present, no
+        // `block` column, so every one is dropped above — and the migration
+        // that fixes it runs as raw SQL through `migration_helper`, which
+        // never reaches a write path and so records no config write to
+        // invalidate this with. The per-block query this replaced tolerated
+        // that by re-reading on every call; caching the emptiness instead
+        // would leave every block on defaults for the rest of the boot.
+        //
+        // An genuinely empty TABLE is not this case and is safely cached:
+        // seeding it goes through `create`, which does record a write.
+        if snapshot.is_empty() && returned_rows > 0 {
+            tracing::warn!(
+                rows = returned_rows,
+                "variables rows carry no usable `block` column (pre-migration-002?);                  re-reading rather than caching an empty snapshot"
+            );
+            return Ok(snapshot);
+        }
         self.snapshot.set(Some((generation, snapshot.clone())));
         Ok(snapshot)
     }
@@ -614,6 +633,55 @@ mod tests {
             "must be Transient so the block slot does not cache it \
              permanently: {err:?}"
         );
+    }
+
+    /// A pre-migration-002 table must not memoize its own emptiness.
+    ///
+    /// Before that migration the variables table has no `block` column, so
+    /// every row is dropped by the grouping and the snapshot resolves to
+    /// nothing. The migration then ALTERs and backfills through
+    /// `migration_helper` -> `exec_raw`, which is raw SQL: it never reaches
+    /// the wrapper's write paths, so it records no config write and cannot
+    /// invalidate anything. Seeding does not save it either — `seed_defaults`
+    /// is hash-gated and `insert_if_absent` finds the rows already present,
+    /// so neither issues a `create`.
+    ///
+    /// The old per-block query tolerated this by returning empty PER CALL, so
+    /// blocks initialized after the migration re-queried and saw the
+    /// backfilled rows. Memoizing makes that emptiness permanent for the
+    /// whole boot, which is a silent fallback to defaults for every block —
+    /// or `MissingRequired` cached in the slot for a key that does exist.
+    #[wasm_bindgen_test]
+    async fn rows_without_a_block_column_are_not_memoized_as_empty() {
+        let db = CountingDb::new(vec![
+            // Pre-migration shape: a row with no `block` column at all.
+            ("", "PRE_MIGRATION", "value"),
+            // What the backfill adds later.
+            ("WAFER_RUN__AUTH", "WAFER_RUN__AUTH__A", "backfilled"),
+        ]);
+        db.rows_visible.set(1);
+        let src = D1ConfigSource::new(db.clone() as Arc<dyn DatabaseService>);
+
+        let first = src
+            .load_for_block("wafer-run/auth", &[var("WAFER_RUN__AUTH__A")])
+            .await
+            .unwrap();
+        assert_eq!(first.get("WAFER_RUN__AUTH__A"), None);
+        assert_eq!(db.lists.get(), 1);
+
+        // The migration lands out of band, via raw SQL that records nothing.
+        db.rows_visible.set(2);
+
+        let second = src
+            .load_for_block("wafer-run/auth", &[var("WAFER_RUN__AUTH__A")])
+            .await
+            .unwrap();
+        assert_eq!(
+            second.get("WAFER_RUN__AUTH__A"),
+            Some("backfilled"),
+            "a snapshot that grouped to nothing must be re-read, not trusted"
+        );
+        assert_eq!(db.lists.get(), 2);
     }
 
     /// The re-read is driven by writes, not by every call. An established
