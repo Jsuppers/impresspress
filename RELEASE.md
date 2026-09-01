@@ -8,6 +8,54 @@ Impresspress uses [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH
 - **MINOR** — new features, new blocks, new config options
 - **PATCH** — bug fixes, security patches, dependency updates
 
+## Upgrade Notes
+
+Notes for operators upgrading an **existing** deployment. Migrations are gated:
+they run on a fresh install, or when the operator opts in with
+`impresspress --run-migrations` (native) / `deploy-cloudflare.sh deploy
+--run-migrations` (Cloudflare). So whenever a release's code half assumes a
+data repair the migration half performs, it has to be called out here — the
+two ship together but only one of them runs by default.
+
+### Products: `deleted_at` normalization (migration 020) — upgrade with `--run-migrations`
+
+Product deletion is a soft delete, and `deleted_at` now carries a strict
+two-value invariant: SQL NULL for a live product, an RFC3339 stamp for a
+deleted one. The empty string is neither, and it now reads as **deleted**
+everywhere — the public catalog, the storefront, the admin product list and
+the per-seller product cap.
+
+Earlier releases disagreed with themselves about `''`: the customer-facing
+paths tested `!is_null && != ""`, so an empty string meant *live*, while the
+list reads used `deleted_at IS NULL`. And `''` was reachable — until the
+product handlers began stripping internal fields, every create/update path
+forwarded the request body verbatim, so a client sending `"deleted_at": ""`
+produced such a row.
+
+Migration `020_normalize_blank_deleted_at` repairs those rows back to NULL.
+**Upgrade with `--run-migrations`.** Without it the code half lands alone and
+any affected product drops out of the catalog and the storefront with no admin
+action; the only signal is the generic `schema drift; redeploy with
+--run-migrations to apply` warning each boot logs for the products block.
+
+020 deliberately skips a row whose slug a live product of the same owner
+already holds. Repairing it would violate migration 005's partial unique slug
+index and abort the migration, which is unrecoverable in place: the hash never
+gets stamped, so every later boot retries and re-fails, and on Cloudflare that
+is a 500 on every request. A skipped row keeps its current half-state and stays
+listed in the admin *deleted products* view, where **Restore** is the remedy —
+it reports the slug conflict in plain language instead of failing opaquely. To
+find them:
+
+```sql
+SELECT id, owner_kind, owner_id, slug
+FROM impresspress__products__products WHERE deleted_at = '';
+```
+
+Rename whichever product should not hold the slug, then restore. Re-running 020
+is *not* the remedy: once applied, its hash is stamped and the migration
+short-circuits for good.
+
 ## Pre-Release Checklist
 
 Before tagging a release, verify:
@@ -22,6 +70,9 @@ Before tagging a release, verify:
   ./target/release/impresspress
   ```
 - [ ] If this release changes config variables or CLI flags, update the docs
+- [ ] If this release ships a migration that repairs existing data, add an entry
+      to [Upgrade Notes](#upgrade-notes) so operators know to pass
+      `--run-migrations`
 
 ## Creating a Release
 
