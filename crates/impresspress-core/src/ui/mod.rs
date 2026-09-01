@@ -43,19 +43,19 @@ impl SiteConfig {
             logo_url: config::get_default(
                 ctx,
                 "WAFER_RUN_SHARED__LOGO_URL",
-                assets::logo_long_url(),
+                &assets::logo_long_url(),
             )
             .await,
             logo_icon_url: config::get_default(
                 ctx,
                 "WAFER_RUN_SHARED__LOGO_ICON_URL",
-                assets::logo_icon_url(),
+                &assets::logo_icon_url(),
             )
             .await,
             favicon_url: config::get_default(
                 ctx,
                 "WAFER_RUN_SHARED__FAVICON_URL",
-                assets::favicon_url(),
+                &assets::favicon_url(),
             )
             .await,
             primary_color: config::get_default(ctx, "WAFER_RUN_SHARED__PRIMARY_COLOR", "").await,
@@ -309,7 +309,7 @@ fn minimal_config() -> SiteConfig {
         app_name: "Impresspress".to_string(),
         logo_url: String::new(),
         logo_icon_url: String::new(),
-        favicon_url: assets::favicon_url().to_string(),
+        favicon_url: assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
     }

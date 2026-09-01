@@ -99,7 +99,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         ConfigVar::new(
             "WAFER_RUN_SHARED__LOGO_URL",
             "Logo shown in header and emails",
-            crate::ui::assets::logo_long_url(),
+            &crate::ui::assets::logo_long_url(),
         )
         .name("Logo URL")
         .input_type(InputType::Url),
@@ -113,7 +113,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         ConfigVar::new(
             "WAFER_RUN_SHARED__LOGO_ICON_URL",
             "Small icon logo (used when sidebar is collapsed)",
-            crate::ui::assets::logo_icon_url(),
+            &crate::ui::assets::logo_icon_url(),
         )
         .name("Logo Icon URL")
         .input_type(InputType::Url),
@@ -127,7 +127,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         ConfigVar::new(
             "WAFER_RUN_SHARED__FAVICON_URL",
             "Browser tab icon",
-            crate::ui::assets::favicon_url(),
+            &crate::ui::assets::favicon_url(),
         )
         .name("Favicon URL")
         .input_type(InputType::Url),

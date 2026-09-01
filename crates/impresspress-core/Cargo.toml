@@ -29,8 +29,14 @@ default = [
     "block-tickets",
     "block-userportal",
     "block-products",
+    "embed-assets",
 ]
 sqlite = []
+# Compile the static assets (CSS/JS/fonts/logos) into the binary. On by
+# default so a native single-file binary stays self-contained. The Cloudflare
+# build runs `--no-default-features`, so it drops ~370 KB of embedded assets
+# automatically — the same fail-safe-lean pattern the block features use.
+embed-assets = []
 postgres = []
 # Exposes `impresspress_core::test_support::TestContext` (the shared in-memory
 # SQLite + block harness) as part of the public API so the `tests/`

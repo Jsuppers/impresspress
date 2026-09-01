@@ -146,7 +146,7 @@ impl UserPortalBlock {
         };
 
         let config_val = serde_json::json!({
-            "logo_url": config::get_default(ctx, "WAFER_RUN_SHARED__LOGO_URL", crate::ui::assets::logo_long_url()).await,
+            "logo_url": config::get_default(ctx, "WAFER_RUN_SHARED__LOGO_URL", &crate::ui::assets::logo_long_url()).await,
             "app_name": config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await,
             // Blank = "use the built-in brand accent" (same contract as the
             // admin chrome; see layout::page). The old `#6366f1` fallback here

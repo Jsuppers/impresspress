@@ -1446,7 +1446,7 @@ mod tests {
 
         let out = route_to_block(
             &ctx,
-            anon_msg("retrieve", crate::ui::assets::webmcp_js_url()),
+            anon_msg("retrieve", &crate::ui::assets::webmcp_js_url()),
             InputStream::empty(),
             &AllEnabled,
             &[],

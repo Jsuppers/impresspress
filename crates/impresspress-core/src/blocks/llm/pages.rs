@@ -166,7 +166,7 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         &models,
         default_model.as_str(),
         thread_id,
-        llm_chat_js_url,
+        &llm_chat_js_url,
     );
 
     // Build mobile-friendly crumbs:
@@ -896,8 +896,8 @@ mod tests {
             "missing external marked.js script tag (expected src={marked_url}): {html}"
         );
 
-        let purify_pos = html.find(purify_url).expect("purify script tag present");
-        let marked_pos = html.find(marked_url).expect("marked script tag present");
+        let purify_pos = html.find(&purify_url).expect("purify script tag present");
+        let marked_pos = html.find(&marked_url).expect("marked script tag present");
         let llm_chat_pos = html.find(url).expect("llm-chat.js script tag present");
         assert!(
             purify_pos < marked_pos,

@@ -792,7 +792,7 @@ mod tests {
         };
         let s = public_page(opts, html! { p { "body" } }).into_string();
         assert!(
-            s.contains(assets::webmcp_js_url()),
+            s.contains(&assets::webmcp_js_url()),
             "the WebMCP script must be on every public page: {s}"
         );
     }

@@ -19,6 +19,64 @@ pub fn entry(logical: &str) -> &'static AssetEntry {
         .unwrap_or_else(|| panic!("asset not in manifest: {logical}"))
 }
 
+/// Where assets are fetched from when no explicit base is configured.
+/// Version-pinned so publishing a new release never breaks a deployment
+/// still running an older one.
+pub const DEFAULT_CDN_BASE_TEMPLATE: &str = concat!(
+    "https://cdn.impresspress.org/ui/v",
+    env!("CARGO_PKG_VERSION"),
+    "/"
+);
+
+/// Resolve the asset base URL once.
+///
+/// 1. `IMPRESSPRESS_ASSET_BASE_URL` (infrastructure config — `IMPRESSPRESS_*`,
+///    no `__`, never stored in the DB) wins outright. The deployer sets this
+///    when assets live somewhere other than this origin.
+/// 2. Otherwise `/b/static/`, served by the system block — from memory when
+///    `embed-assets` is on, streamed from R2 when it is off.
+///
+/// Whether R2 is configured is deploy-time knowledge, so the CLI writes that
+/// decision into the env var rather than the runtime sniffing for a backend.
+pub fn base_url() -> &'static str {
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| match std::env::var("IMPRESSPRESS_ASSET_BASE_URL") {
+        Ok(v) if !v.trim().is_empty() => {
+            let v = v.trim().to_string();
+            if v.ends_with('/') { v } else { format!("{v}/") }
+        }
+        _ => STATIC_PREFIX.to_string(),
+    })
+}
+
+/// Full URL for a logical asset key, e.g. `url("app.css")`.
+pub fn url(logical: &str) -> String {
+    format!("{}{}", base_url(), entry(logical).filename)
+}
+
+#[cfg(feature = "embed-assets")]
+pub fn bytes(logical: &str) -> Option<&'static [u8]> {
+    Some(match logical {
+        "app.css" => css().as_bytes(),
+        "htmx.min.js" => include_bytes!("assets/htmx.min.js"),
+        "webmcp.js" => include_bytes!("assets/webmcp.js"),
+        "itim-latin.woff2" => include_bytes!("assets/fonts/itim-latin.woff2"),
+        "itim-latin-ext.woff2" => include_bytes!("assets/fonts/itim-latin-ext.woff2"),
+        "impresspress-logo.png" => include_bytes!("assets/impresspress-logo.png"),
+        "impresspress-logo-long.png" => include_bytes!("assets/impresspress-logo-long.png"),
+        "favicon.ico" => include_bytes!("assets/favicon.ico"),
+        #[cfg(feature = "block-llm")]
+        "marked.min.js" => include_bytes!("assets/marked.min.js"),
+        #[cfg(feature = "block-llm")]
+        "purify.min.js" => include_bytes!("assets/purify.min.js"),
+        #[cfg(feature = "block-llm")]
+        "llm-chat.js" => include_bytes!("assets/llm-chat.js"),
+        #[cfg(feature = "block-files")]
+        "files-browser.js" => include_bytes!("assets/files-browser.js"),
+        _ => return None,
+    })
+}
+
 /// Itim font binaries, sourced from `impresspress/site-kit`'s `/fonts/` mirror
 /// and committed here so every impresspress deployment ships its own glyphs
 /// (no cross-origin runtime dependency, no `https://impresspress.org/fonts/` 404).
@@ -53,25 +111,13 @@ pub fn logo_long_png() -> &'static [u8] {
 }
 
 /// Square logo URL with content hash, e.g. `/b/static/impresspress-logo-a1b2c3d4.png`.
-pub fn logo_icon_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}impresspress-logo-{}.png",
-            short_hash(LOGO_ICON_PNG)
-        )
-    })
+pub fn logo_icon_url() -> String {
+    url("impresspress-logo.png")
 }
 
 /// Long/wordmark logo URL with content hash, e.g. `/b/static/impresspress-logo-long-a1b2c3d4.png`.
-pub fn logo_long_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}impresspress-logo-long-{}.png",
-            short_hash(LOGO_LONG_PNG)
-        )
-    })
+pub fn logo_long_url() -> String {
+    url("impresspress-logo-long.png")
 }
 
 /// Impresspress favicon bytes.
@@ -80,9 +126,8 @@ pub fn favicon_ico() -> &'static [u8] {
 }
 
 /// Favicon URL with content hash, e.g. `/b/static/favicon-a1b2c3d4.ico`.
-pub fn favicon_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| format!("{STATIC_PREFIX}favicon-{}.ico", short_hash(FAVICON_ICO)))
+pub fn favicon_url() -> String {
+    url("favicon.ico")
 }
 
 /// Itim latin (basic) woff2 bytes.
@@ -113,39 +158,19 @@ pub fn webmcp_js() -> &'static str {
     include_str!("assets/webmcp.js")
 }
 
-/// Short content hash (first 8 chars of hex SHA-256) for cache busting.
-fn short_hash(content: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(content);
-    hash.iter().take(4).map(|b| format!("{b:02x}")).collect()
-}
-
 /// CSS URL with content hash, e.g. `/b/static/app-a1b2c3d4.css`
-pub fn css_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| format!("{STATIC_PREFIX}app-{}.css", short_hash(css().as_bytes())))
+pub fn css_url() -> String {
+    url("app.css")
 }
 
 /// htmx JS URL with content hash, e.g. `/b/static/htmx-a1b2c3d4.min.js`
-pub fn htmx_js_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}htmx-{}.min.js",
-            short_hash(htmx_js().as_bytes())
-        )
-    })
+pub fn htmx_js_url() -> String {
+    url("htmx.min.js")
 }
 
 /// WebMCP script URL with content hash, e.g. `/b/static/webmcp-a1b2c3d4.js`
-pub fn webmcp_js_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}webmcp-{}.js",
-            short_hash(webmcp_js().as_bytes())
-        )
-    })
+pub fn webmcp_js_url() -> String {
+    url("webmcp.js")
 }
 
 /// marked.js (markdown parser), vendored from marked@14 — self-hosted instead of
@@ -163,14 +188,8 @@ pub fn marked_js() -> &'static str {
 
 /// marked.js URL with content hash, e.g. `/b/static/marked-a1b2c3d4.min.js`
 #[cfg(feature = "block-llm")]
-pub fn marked_js_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}marked-{}.min.js",
-            short_hash(marked_js().as_bytes())
-        )
-    })
+pub fn marked_js_url() -> String {
+    url("marked.min.js")
 }
 
 /// DOMPurify (HTML sanitizer), vendored from DOMPurify 3.2.4 — self-hosted
@@ -192,14 +211,8 @@ pub fn purify_js() -> &'static str {
 
 /// DOMPurify JS URL with content hash, e.g. `/b/static/purify-a1b2c3d4.js`
 #[cfg(feature = "block-llm")]
-pub fn purify_js_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}purify-{}.js",
-            short_hash(purify_js().as_bytes())
-        )
-    })
+pub fn purify_js_url() -> String {
+    url("purify.min.js")
 }
 
 /// Embedded vanilla-JS bundle for the LLM chat surface — markdown, message
@@ -222,14 +235,8 @@ pub fn llm_chat_js() -> &'static str {
 /// Not minified — readability matters for a script that's debugged in
 /// Chrome devtools.
 #[cfg(feature = "block-llm")]
-pub fn llm_chat_js_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}llm-chat-{}.js",
-            short_hash(llm_chat_js().as_bytes())
-        )
-    })
+pub fn llm_chat_js_url() -> String {
+    url("llm-chat.js")
 }
 
 /// Embedded vanilla-JS bundle for the file-browser surfaces — drag-drop
@@ -248,14 +255,8 @@ pub fn files_browser_js() -> &'static str {
 
 /// Files-browser JS URL with content hash, e.g. `/b/static/files-browser-a1b2c3d4.js`.
 #[cfg(feature = "block-files")]
-pub fn files_browser_js_url() -> &'static str {
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}files-browser-{}.js",
-            short_hash(files_browser_js().as_bytes())
-        )
-    })
+pub fn files_browser_js_url() -> String {
+    url("files-browser.js")
 }
 
 /// Small inline JS for toast notifications (triggered by htmx HX-Trigger).
@@ -581,10 +582,14 @@ mod tests {
     fn purify_js_url_has_content_hash() {
         let url = super::purify_js_url();
         assert!(url.starts_with("/b/static/purify-"));
-        assert!(url.ends_with(".js"));
+        // Source file is `purify.min.js`; the manifest's `hashed_name` splits
+        // on the *first* dot, so the hashed filename keeps the full
+        // `.min.js` extension (same shape as `marked-{hash}.min.js`) rather
+        // than the pre-manifest ad-hoc `purify-{hash}.js`.
+        assert!(url.ends_with(".min.js"));
         let hash = url
             .trim_start_matches("/b/static/purify-")
-            .trim_end_matches(".js");
+            .trim_end_matches(".min.js");
         assert_eq!(hash.len(), 8, "expected 8-char short hash, got: {hash}");
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -685,6 +690,47 @@ mod tests {
         for marker in [".card", ".data-table", ".badge", ".modal", ".toast",
                        ".palette", ".stat-", ".charts-css", ".auth-split"] {
             assert!(s.contains(marker), "missing layer marker: {marker}");
+        }
+    }
+
+    #[test]
+    fn base_url_defaults_to_static_prefix() {
+        // No IMPRESSPRESS_ASSET_BASE_URL in the test environment.
+        assert_eq!(super::base_url(), "/b/static/");
+    }
+
+    #[test]
+    fn url_joins_base_and_hashed_filename() {
+        let u = super::url("app.css");
+        assert!(u.starts_with("/b/static/app-"), "unexpected url: {u}");
+        assert!(u.ends_with(".css"), "unexpected url: {u}");
+    }
+
+    #[test]
+    fn cdn_base_template_is_versioned_and_slash_terminated() {
+        let t = super::DEFAULT_CDN_BASE_TEMPLATE;
+        assert!(t.starts_with("https://cdn.impresspress.org/ui/v"));
+        assert!(t.ends_with('/'), "base must end in / so joins are plain concatenation");
+        assert!(t.contains(env!("CARGO_PKG_VERSION")), "base must pin the crate version");
+    }
+
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn embedded_bytes_agree_with_the_manifest() {
+        // The manifest always lists all 11 assets (build.rs panics on a missing
+        // file), but `bytes()` is cfg-gated per asset — under a lean build
+        // `marked.min.js` and friends are simply not compiled in. So: every
+        // asset that IS compiled in must match its manifest length...
+        for e in super::ASSETS {
+            if let Some(b) = super::bytes(e.logical) {
+                assert_eq!(b.len(), e.len, "{} length disagrees with manifest", e.logical);
+            }
+        }
+        // ...and the assets that are never feature-gated must always be there.
+        for logical in ["app.css", "htmx.min.js", "webmcp.js", "favicon.ico",
+                        "itim-latin.woff2", "itim-latin-ext.woff2",
+                        "impresspress-logo.png", "impresspress-logo-long.png"] {
+            assert!(super::bytes(logical).is_some(), "core asset missing: {logical}");
         }
     }
 

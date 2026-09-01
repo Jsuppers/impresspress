@@ -28,9 +28,10 @@ pub(super) fn site_config(ctx: &dyn Context) -> SiteConfig {
         .unwrap_or("");
     let logo_url = if auth_logo.is_empty() {
         ctx.config_get("WAFER_RUN_SHARED__LOGO_URL")
-            .unwrap_or_else(|| ui::assets::logo_long_url())
+            .map(str::to_string)
+            .unwrap_or_else(ui::assets::logo_long_url)
     } else {
-        auth_logo
+        auth_logo.to_string()
     };
 
     let embedded_scripts = ctx
@@ -47,15 +48,15 @@ pub(super) fn site_config(ctx: &dyn Context) -> SiteConfig {
             .config_get("WAFER_RUN_SHARED__APP_NAME")
             .unwrap_or("Impresspress")
             .to_string(),
-        logo_url: logo_url.to_string(),
+        logo_url,
         logo_icon_url: ctx
             .config_get("WAFER_RUN_SHARED__LOGO_ICON_URL")
-            .unwrap_or_else(|| ui::assets::logo_icon_url())
-            .to_string(),
+            .map(str::to_string)
+            .unwrap_or_else(ui::assets::logo_icon_url),
         favicon_url: ctx
             .config_get("WAFER_RUN_SHARED__FAVICON_URL")
-            .unwrap_or_else(|| ui::assets::favicon_url())
-            .to_string(),
+            .map(str::to_string)
+            .unwrap_or_else(ui::assets::favicon_url),
         primary_color: ctx
             .config_get("WAFER_RUN_SHARED__PRIMARY_COLOR")
             .unwrap_or("")

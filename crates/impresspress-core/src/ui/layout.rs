@@ -69,7 +69,7 @@ mod tests {
         };
         let rendered = page("Title", &config, maud::html! { p { "body" } }).into_string();
         assert!(
-            rendered.contains(assets::webmcp_js_url()),
+            rendered.contains(&assets::webmcp_js_url()),
             "the WebMCP script must be on every page: {rendered}"
         );
     }

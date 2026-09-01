@@ -155,7 +155,7 @@ fn html_respond(
         app_name: app_name.to_string(),
         logo_url: logo_url.to_string(),
         logo_icon_url: String::new(),
-        favicon_url: crate::ui::assets::favicon_url().to_string(),
+        favicon_url: crate::ui::assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
     };
