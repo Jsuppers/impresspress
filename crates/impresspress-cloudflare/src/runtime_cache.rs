@@ -112,7 +112,7 @@ impl ReadyRuntime {
         let failures = self.probe_failures.get().saturating_add(1);
         self.probe_failures.set(failures);
         self.probe_deadline_ms
-            .set(now + probe_failure_window_ms(failures) + random_probe_jitter_ms());
+            .set(probe_failure_deadline_ms(now, failures, random_probe_jitter_ms()));
     }
 }
 
@@ -445,6 +445,17 @@ fn prepared_cached_config_matches(
 /// Bounded by construction: the counter lives on the runtime being served, so
 /// a runtime that rebuilt during the outage (already current) starts at zero
 /// and never pays this.
+///
+/// COST, stated plainly: this trades a read storm for a bounded build storm.
+/// A FLAPPING KV pays one rebuild per fail-then-succeed transition per
+/// isolate — with the backoff floor at 10 minutes after the first failure,
+/// at most ~6/hour/isolate. That price is deliberately paid on the cheap
+/// path wherever possible: the prepared warm path re-hydrates its existing
+/// plan (~132us) instead of bypassing to a full dynamic build, so only
+/// isolates already running dynamically pay the multi-second rebuild. The
+/// alternative — trusting an unchanged stamp after a blind window — is
+/// silent, unbounded staleness, which is worse than a bounded, observable
+/// build cost.
 fn blind_window_requires_rebuild(consecutive_failures: u32, probe: &VersionProbe) -> bool {
     consecutive_failures > 0 && !matches!(probe, VersionProbe::Unavailable)
 }
@@ -480,6 +491,17 @@ fn probe_failure_window_ms(consecutive_failures: u32) -> u64 {
         .checked_shl(consecutive_failures.min(16))
         .unwrap_or(PROBE_FAILURE_BACKOFF_CAP_MS)
         .min(PROBE_FAILURE_BACKOFF_CAP_MS)
+}
+
+/// Absolute deadline for the next probe after `consecutive_failures`
+/// failures. The cap bounds the DEADLINE, jitter included — clamping the
+/// window and then adding jitter on top would overshoot
+/// [`PROBE_FAILURE_BACKOFF_CAP_MS`] by the full jitter width.
+fn probe_failure_deadline_ms(now: u64, consecutive_failures: u32, jitter_ms: u64) -> u64 {
+    let window = probe_failure_window_ms(consecutive_failures)
+        .saturating_add(jitter_ms)
+        .min(PROBE_FAILURE_BACKOFF_CAP_MS);
+    now + window
 }
 
 fn cached() -> Option<Rc<ReadyRuntime>> {
@@ -625,6 +647,13 @@ where
     // them unused when the completed runtime is visible.
     let mut register_blocks = Some(register_blocks);
     let mut register_post_build = Some(register_post_build);
+    // Whether this request's build attempt CONSUMED the isolate dirty flag.
+    // Only a consumed signal may be re-marked if the build then fails: the
+    // cold branch never takes DIRTY, and re-marking there would force the
+    // NEXT successful runtime into an immediate full dynamic rebuild
+    // (read_through, D1 structural reads — the multi-second path this file's
+    // own comments flag for Cloudflare 1102 risk).
+    let mut dirty_consumed = false;
 
     let (probed_version, read_through, is_cold, built_at, build_guard) = loop {
         let now = impresspress_core::util::now_millis();
@@ -698,6 +727,7 @@ where
         // completed a build while this one was waiting on its timer.
         let resolution = if let Some(rt) = cached() {
             let dirty = take_dirty();
+            dirty_consumed = dirty;
             let environment_changed = rt.environment_identity != environment_identity;
 
             if !dirty
@@ -710,7 +740,18 @@ where
 
             // Always derive the probe handle from THIS request's Env. The
             // immutable cached runtime intentionally retains no KV binding.
-            let probe_kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+            let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
+                Ok(kv) => kv,
+                Err(e) => {
+                    // Same reasoning as the build-failure paths below: this
+                    // attempt already took the flag, so propagating without
+                    // restoring it strands the isolate on pre-write state.
+                    if dirty {
+                        mark_dirty();
+                    }
+                    return Err(e.into());
+                }
+            };
             let probe = probe_version(&probe_kv).await;
 
             // A pure deadline-elapsed probe (not dirty) that finds the
@@ -756,9 +797,9 @@ where
     // would keep serving the pre-write runtime as zero-await hits until the
     // probe deadline elapses — a window this change widened from 30-60s to
     // 5-10 minutes, and up to the backoff cap when probes are failing too.
-    // Re-marking is safe in every case: the worst it costs is one extra
-    // re-evaluation by the next request, and a failed build means this
-    // isolate has nothing fresh to serve regardless of why it failed.
+    // Gated on `dirty_consumed` so a cold build failure (which never took the
+    // flag) cannot manufacture a dirty signal and charge the next runtime a
+    // full dynamic rebuild it does not need.
     let mut built = match crate::build_runtime(
         env,
         request_config,
@@ -779,7 +820,9 @@ where
     {
         Ok(built) => built,
         Err(e) => {
-            mark_dirty();
+            if dirty_consumed {
+                mark_dirty();
+            }
             return Err(e);
         }
     };
@@ -798,7 +841,9 @@ where
     })
     .await
     {
-        mark_dirty();
+        if dirty_consumed {
+            mark_dirty();
+        }
         return Err(e.into());
     }
     crate::request_services::scope_sync(built.services.clone(), || {
@@ -1225,17 +1270,61 @@ where
                     return Ok((rt, CacheOutcome::Hit));
                 }
 
-                let probe_kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+                let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        // `dirty` was consumed above; losing it here would
+                        // strand the isolate on pre-write state for a full
+                        // probe window.
+                        if dirty {
+                            mark_dirty();
+                        }
+                        return Err(e.into());
+                    }
+                };
                 let probe = probe_version(&probe_kv).await;
                 if !prepared_probe_requires_fallback(dirty, cached_config_version, &probe) {
-                    let outcome = if matches!(probe, VersionProbe::Unavailable) {
+                    if matches!(probe, VersionProbe::Unavailable) {
                         rt.note_probe_failure(now);
-                        CacheOutcome::ProbeFailed
-                    } else {
+                        return Ok((rt, CacheOutcome::ProbeFailed));
+                    }
+                    // The stamp is unchanged, but this is the first probe to
+                    // reach KV after a blind window — during which a config
+                    // bump could have been lost — so an unchanged stamp does
+                    // not prove unchanged config. Re-hydrate the SAME plan
+                    // rather than bypassing it: hydration re-reads D1 config
+                    // through `ConfigSource` at strict-init, which is what
+                    // converges, and it costs ~132us against the multi-second
+                    // dynamic rebuild a bypass would force for the rest of
+                    // this isolate's life.
+                    if !blind_window_requires_rebuild(rt.probe_failures.get(), &probe) {
                         rt.note_probe_success(now);
-                        CacheOutcome::ProbedFresh
-                    };
-                    return Ok((rt, outcome));
+                        return Ok((rt, CacheOutcome::ProbedFresh));
+                    }
+                    tracing::info!(
+                        plan_hash = %plan_generation,
+                        config_version = %probe.observed(),
+                        "config-version probes reached KV again; re-hydrating the plan once to \
+                         pick up any config bump made while this isolate was blind"
+                    );
+                    let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
+                        env,
+                        request_config,
+                        plan.as_ref(),
+                        register_blocks,
+                        register_post_build,
+                        environment_identity,
+                        now,
+                    )
+                    .await?;
+                    store_if_current(&build_guard, rt.clone());
+                    return Ok((
+                        rt,
+                        CacheOutcome::Rebuilt {
+                            build_ordinal,
+                            duration_ms,
+                        },
+                    ));
                 }
 
                 tracing::info!(
@@ -1789,6 +1878,35 @@ mod tests {
     /// Retrying an exhausted daily allowance at the normal cadence provides
     /// no freshness and just manufactures failed operations: consecutive
     /// probe failures must widen the window, up to a cap.
+    /// The cap must bound the DEADLINE, not just the pre-jitter window.
+    /// `probe_failure_window_ms` is clamped and then jitter was added on top,
+    /// so the real ceiling exceeded the documented one by the full jitter
+    /// width — the helper's own test could not see it because it never looked
+    /// at the deadline.
+    #[wasm_bindgen_test]
+    fn probe_failure_deadline_never_exceeds_the_documented_cap() {
+        let now = 1_000_000;
+        for failures in [1u32, 2, 5, 10, u32::MAX] {
+            for jitter in [0, PROBE_INTERVAL_JITTER_MS - 1] {
+                let deadline = probe_failure_deadline_ms(now, failures, jitter);
+                assert!(
+                    deadline > now,
+                    "a widened window must still be in the future"
+                );
+                assert!(
+                    deadline <= now + PROBE_FAILURE_BACKOFF_CAP_MS,
+                    "failures={failures} jitter={jitter} produced {} past the cap",
+                    deadline - now
+                );
+            }
+        }
+        // Jitter must still spread isolates apart below the cap.
+        assert_ne!(
+            probe_failure_deadline_ms(now, 1, 0),
+            probe_failure_deadline_ms(now, 1, 60_000)
+        );
+    }
+
     #[wasm_bindgen_test]
     fn probe_failure_backoff_doubles_and_caps() {
         assert_eq!(probe_failure_window_ms(0), PROBE_INTERVAL_FLOOR_MS);
