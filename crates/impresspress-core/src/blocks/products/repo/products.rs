@@ -66,6 +66,22 @@ pub(crate) async fn list_page(
     db::paginated_list(ctx, TABLE, page, page_size, filters, sort).await
 }
 
+/// Fetch one soft-deleted product. A live (or missing) row answers
+/// `NotFound` — the mirror image of [`get`].
+///
+/// Shares [`list_deleted`]'s named exception to this module's live-only
+/// rule, and exists for the same reason: `restore` re-claims the row's slug
+/// against the partial unique index from migration 005, so its caller has to
+/// be able to read the slug of a row that `get` cannot see, in order to say
+/// which slug collided instead of surfacing the index violation as a 500.
+pub(crate) async fn get_deleted(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
+    let record = db::get(ctx, TABLE, id).await?;
+    if !is_deleted(&record) {
+        return Err(WaferError::new(ErrorCode::NotFound, "Product not deleted"));
+    }
+    Ok(record)
+}
+
 /// List one page of soft-deleted products. `filters` narrows the deleted
 /// set; it cannot widen it — same append-only contract as `list_page`.
 ///
@@ -378,7 +394,9 @@ mod tests {
             !raw.str_field("deleted_at").is_empty(),
             "deleted_at must be stamped"
         );
-        let err = get(&ctx, "live").await.expect_err("must not resolve as live");
+        let err = get(&ctx, "live")
+            .await
+            .expect_err("must not resolve as live");
         assert_eq!(err.code, wafer_run::ErrorCode::NotFound);
     }
 

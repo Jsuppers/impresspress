@@ -13,7 +13,9 @@ mod stripe_provider;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use handlers::{GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE};
+pub(crate) use handlers::{
+    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
+};
 pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
     variables::TABLE as VARIABLES_TABLE,
@@ -1169,6 +1171,13 @@ crate::impresspress_feature_block! {
                     .path_params_schema(id_path_schema.clone())
                     .output_schema(record_schema(product_schema.clone()))
                     .tags(&["products", "admin", "moderation"]),
+                BlockEndpoint::post("/b/products/api/admin/products/{id}/restore")
+                    .summary("Restore a soft-deleted product")
+                    .description("Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(id_path_schema.clone())
+                    .output_schema(record_schema(product_schema.clone()))
+                    .tags(&["products", "admin"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers")
                     .summary("List product offers")
                     .auth(AuthLevel::Admin)
@@ -1481,18 +1490,6 @@ crate::impresspress_feature_block! {
                     .path_params_schema(id_path_schema.clone())
                     .output_schema(product_duplicate_schema)
                     .tags(&["products", "seller"]),
-                // Admin-only, not "own product": the door back out of a
-                // soft delete. It sits on the product-by-ID URL rather than
-                // under `/api/admin/products/...` because restore addresses
-                // one row by ID with no admin-CRUD shape around it; `Admin`
-                // here (not `Authenticated`) is what actually gates it.
-                BlockEndpoint::post("/b/products/api/products/{id}/restore")
-                    .summary("Restore a soft-deleted product")
-                    .description("Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.")
-                    .auth(AuthLevel::Admin)
-                    .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
-                    .tags(&["products"]),
                 BlockEndpoint::get("/b/products/api/products/{product_id}/offers")
                     .summary("List own product offers")
                     .auth(AuthLevel::Authenticated)

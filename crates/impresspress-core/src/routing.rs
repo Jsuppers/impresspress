@@ -1534,18 +1534,30 @@ mod tests {
         assert!(crate::test_support::output_is_error(out, "PermissionDenied").await);
     }
 
-    /// Task 6 fix-round-1 finding: the products block's own `dispatch_user`
-    /// tests (`handlers::handle_user`) call the handler directly and never
+    /// Task 6 fix-round-1 finding: the products block's own `dispatch_admin`
+    /// tests (`handlers::handle_admin`) call the handler directly and never
     /// go through `route_to_block`/`check_access`, so they prove the
     /// restore handler's behaviour but not its authorization boundary —
     /// nothing previously exercised the fact that
-    /// `POST /b/products/api/products/{id}/restore` is `AuthLevel::Admin`
-    /// at the layer that actually enforces it. This test drives that real
-    /// path through the real router with the real `ProductsBlock` `BlockInfo`
-    /// (not a synthetic fixture — a typo'd path, method, or `AuthLevel` in
-    /// `blocks/products/mod.rs`'s declaration must fail this test), the same
-    /// way `pipeline.rs`'s `discovery_tests::real_block_infos()` favors the
-    /// real declaration over a hand-rolled one for exactly this reason.
+    /// `POST /b/products/api/admin/products/{id}/restore` is
+    /// `AuthLevel::Admin` at the layer that actually enforces it. This test
+    /// drives that real path through the real router with the real
+    /// `ProductsBlock` `BlockInfo` (not a synthetic fixture — a typo'd path,
+    /// method, or `AuthLevel` in `blocks/products/mod.rs`'s declaration must
+    /// fail this test), the same way `pipeline.rs`'s
+    /// `discovery_tests::real_block_infos()` favors the real declaration
+    /// over a hand-rolled one for exactly this reason.
+    ///
+    /// This covers the DECLARED spelling only, which is not the whole
+    /// boundary: `ProductsBlock::handle` reaches its dispatch tables from
+    /// more than one wire path, and a tier proven on one spelling says
+    /// nothing about the others (that gap is how restore shipped reachable
+    /// at `Authenticated` through `/b/products/products/{id}/restore`).
+    /// The companion
+    /// `blocks::products::tests::handler_tests
+    /// ::restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it`
+    /// drives the same router against the REAL block for every spelling; it
+    /// lives there because it needs the products database harness.
     #[tokio::test]
     async fn restore_product_endpoint_is_admin_only_end_to_end() {
         use wafer_run::Block;
@@ -1555,11 +1567,11 @@ mod tests {
             test_support::{admin_msg, auth_msg, TestContext},
         };
 
-        // The real wire path — `/api/` intact, exactly what `route_to_block`
-        // sees before `ProductsBlock::handle`'s own `/b/products/api` ->
-        // `/b/products` normalization (which happens after this gate, not
-        // before it).
-        let restore_path = "/b/products/api/products/prod_1/restore";
+        // The real wire path — `/api/admin/` intact, exactly what
+        // `route_to_block` sees before `ProductsBlock::handle`'s own
+        // `/b/products/api/admin` -> `/admin/b/products` normalization
+        // (which happens after this gate, not before it).
+        let restore_path = "/b/products/api/admin/products/prod_1/restore";
         let block_infos = vec![ProductsBlock::new().info()];
 
         // 1. The endpoint resolves to Admin via the same resolver

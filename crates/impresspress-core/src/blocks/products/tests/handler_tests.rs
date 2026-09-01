@@ -1196,6 +1196,21 @@ async fn soft_delete_product(ctx: &crate::test_support::TestContext, id: &str) {
     .expect("soft delete");
 }
 
+/// Whether `id`'s row still carries a `deleted_at` stamp, read straight from
+/// the table.
+///
+/// Not `repo::products::get`, which cannot see a soft-deleted row at all and
+/// so cannot tell "still deleted" from "never existed" — the distinction
+/// every restore-authorization assertion below turns on.
+async fn is_soft_deleted(ctx: &crate::test_support::TestContext, id: &str) -> bool {
+    use crate::util::RecordExt;
+
+    let record = wafer_core::clients::database::get(ctx, super::super::repo::products::TABLE, id)
+        .await
+        .expect("the product row must still exist");
+    !record.str_field("deleted_at").is_empty()
+}
+
 /// Build an active, approved product with one published offer through the
 /// same repo functions `stripe::handle_checkout` calls, so checkout has a
 /// real purchasable offer to refuse once the product is soft-deleted.
@@ -1317,12 +1332,11 @@ async fn restore_endpoint_returns_the_product_to_the_catalog() {
     seed(&ctx, "impresspress__products__products", "oops", oops).await;
     soft_delete_product(&ctx, "oops").await;
 
-    let (msg, input) = create_msg(
-        "/b/products/products/oops/restore",
-        "admin_1",
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/oops/restore",
         serde_json::json!({}),
     );
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
     assert_eq!(body["id"], "oops");
     assert!(
         body["data"]["deleted_at"].is_null(),
@@ -1335,22 +1349,177 @@ async fn restore_endpoint_returns_the_product_to_the_catalog() {
 }
 
 #[tokio::test]
-async fn restore_endpoint_404s_for_a_product_that_was_never_deleted() {
+async fn restore_endpoint_404s_for_an_unknown_product_id() {
+    let ctx = ctx().await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/missing/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// The live-product case the old `restore_endpoint_404s_for_a_product_that_
+/// was_never_deleted` claimed to cover and did not: it created a product,
+/// ignored its id, and posted restore for the literal id `"missing"`, so it
+/// only ever exercised the unknown-id path above.
+///
+/// Restoring a product that was never deleted is a no-op that answers 200
+/// with the record — clearing an already-null `deleted_at` changes nothing.
+/// Pinned rather than "fixed" because nothing reaches this endpoint except
+/// the Deleted view's Restore button, which only renders for rows that ARE
+/// deleted; see the report accompanying this branch for why a 409 here would
+/// be defensible but is not this wave's change.
+#[tokio::test]
+async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
         "/admin/b/products/products",
         serde_json::json!({ "name": "Live" }),
     );
-    dispatch_admin(&ctx, create, create_input).await;
+    let created = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    let id = created["id"]
+        .as_str()
+        .expect("created product id")
+        .to_string();
 
-    let (msg, input) = create_msg(
-        "/b/products/products/missing/restore",
-        "admin_1",
+    let (msg, input) = admin_create_msg(
+        &format!("/admin/b/products/products/{id}/restore"),
         serde_json::json!({}),
     );
-    let out = dispatch_user(&ctx, msg, input).await;
-    assert!(output_is_error(out, ErrorCode::NotFound).await);
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], id,
+        "restoring a live product answers 200 with it: {body}"
+    );
+    assert!(
+        !is_soft_deleted(&ctx, &id).await,
+        "the product must stay live"
+    );
+}
+
+/// Restore is the only endpoint outside `/b/products/api/admin/` that is
+/// declared `Admin`, and it must be unreachable for a non-admin through
+/// EVERY wire path that reaches its handler — not merely through the one
+/// path its declaration happens to match.
+///
+/// `ProductsBlock::handle` enters `handle_user` from two prefixes: the
+/// `/b/products/api`-stripped one and the raw `/b/products/...` one. A
+/// `USER_ROUTES` entry therefore answers at two spellings while
+/// `declared_access` only ever matches the declared one, so restore declared
+/// `Admin` at `/b/products/api/products/{id}/restore` left
+/// `POST /b/products/products/{id}/restore` resolving to the undeclared
+/// fallback tier (`Authenticated`): any logged-in user could resurrect any
+/// soft-deleted product — straight back into the public catalog, and
+/// purchasable, when it was active/approved. Product ids are not secret;
+/// `/b/products/catalog` hands them out.
+///
+/// Driven through `dispatch_routed` (the real `route_to_block`) because that
+/// is where the tier is enforced — a `dispatch_user` test cannot see this
+/// boundary at all, which is exactly how the escalation shipped.
+#[tokio::test]
+async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    for path in [
+        "/b/products/products/gone/restore",
+        "/b/products/api/products/gone/restore",
+        "/b/products/api/admin/products/gone/restore",
+    ] {
+        let (msg, input) = create_msg(path, "user_1", serde_json::json!({}));
+        let out = dispatch_routed(&ctx, msg, input).await;
+        assert!(
+            out.collect_buffered().await.is_err(),
+            "a non-admin POST to {path} must not succeed"
+        );
+        assert!(
+            is_soft_deleted(&ctx, "gone").await,
+            "a non-admin POST to {path} restored a soft-deleted product"
+        );
+    }
+
+    // Positive control: the declared admin path DOES restore through the
+    // same router, so the assertions above cannot be passing merely because
+    // nothing routes anywhere.
+    let (msg, input) = admin_create_msg(
+        "/b/products/api/admin/products/gone/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], "gone",
+        "an admin must be able to restore: {body}"
+    );
+    assert!(!is_soft_deleted(&ctx, "gone").await);
+}
+
+/// Soft delete frees the product's slug (migration 005's unique index is
+/// partial on `deleted_at IS NULL`), and nothing stops a product created
+/// afterwards from claiming it. Restoring the original then violates
+/// `impresspress__products__products_owner_slug_uniq`.
+///
+/// That must read as a conflict naming the slug, not an opaque 500: the
+/// Deleted view's Restore button only reloads on success, so a 500 renders
+/// as nothing happening at all on the only door out of soft delete.
+#[tokio::test]
+async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
+    let ctx = ctx().await;
+
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(&ctx, "original").await;
+
+    // Legal only because the delete freed the slug.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("restore over a claimed slug must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug collision is a conflict, not an internal error: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug so an admin can act on it: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(&ctx, "original").await,
+        "a refused restore must leave the product deleted"
+    );
 }
 
 // ============================================================
@@ -2203,12 +2372,41 @@ async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
     let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
 
     assert!(
-        html.contains("/b/products/api/products/gone/restore"),
+        html.contains("/b/products/api/admin/products/gone/restore"),
         "deleted row should offer a Restore action wired to the restore endpoint: {html}"
     );
     assert!(
         !html.contains(r#"href="/b/products/admin/products/gone""#),
         "a deleted row must not link into the edit page, which refuses a soft-deleted product: {html}"
+    );
+}
+
+/// The Restore button reloads the page on success. Without an explicit
+/// failure branch a refused restore — a slug collision is reachable, see
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — renders as
+/// nothing happening at all: no reload, no message, on the only door out of
+/// soft delete. Pin that the button feeds the failure into the shared toast
+/// channel `ui::assets::toast_js` already listens on.
+#[tokio::test]
+async fn manage_products_deleted_view_reports_a_failed_restore() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    // `showToast` alone would match the page shell's own listener script,
+    // which every admin page carries — the assertion has to see the BUTTON
+    // raising the event.
+    assert!(
+        html.contains("new CustomEvent('showToast'"),
+        "a failed restore must surface, not vanish: {html}"
     );
 }
 
@@ -2837,6 +3035,8 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
     // two surfaces cannot drift again.
     use wafer_run::{AuthLevel, Block};
 
+    use crate::endpoint_match;
+
     let info = super::super::ProductsBlock::new().info();
 
     for route in super::super::handlers::ADMIN_ROUTES {
@@ -2857,21 +3057,75 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
         );
     }
 
+    // A user dispatch route answers at BOTH wire spellings, because
+    // `ProductsBlock::handle` enters `handle_user` from `/b/products/api/...`
+    // (normalized) AND from the raw `/b/products/...` path. Declaring only
+    // one of them is legal — the other then resolves to `declared_access`'s
+    // `Authenticated` fallback — but only while that fallback is no weaker
+    // than the declaration. Restore was declared `Admin` at the `/api/`
+    // spelling alone and was therefore reachable at `Authenticated` through
+    // the raw one: any logged-in user could resurrect any soft-deleted
+    // product. So the rule is not "some spelling is declared" (which that
+    // route satisfied) but "EVERY spelling that reaches the handler is
+    // enforced at least as strictly as the strictest declaration" — which
+    // in practice keeps `Admin` routes off this table entirely, where they
+    // belong on `ADMIN_ROUTES` behind the single `/b/products/api/admin`
+    // prefix.
     for route in super::super::handlers::USER_ROUTES {
-        // User dispatch paths are reached both from `/b/products/api/...`
-        // (normalized) and directly (`catalog`, `checkout`, ...). Either
-        // declaration form keeps the central gate authoritative.
         let api_path = route.template.replacen("/b/products", "/b/products/api", 1);
+        let action = endpoint_match::action_for_method(route.method);
+        let spellings = [
+            (
+                api_path.as_str(),
+                endpoint_match::endpoint_auth(&info.endpoints, action, &api_path),
+            ),
+            (
+                route.template,
+                endpoint_match::endpoint_auth(&info.endpoints, action, route.template),
+            ),
+        ];
         assert!(
-            info.endpoints.iter().any(|endpoint| {
-                endpoint.method == route.method
-                    && (endpoint.path == api_path || endpoint.path == route.template)
-            }),
+            spellings.iter().any(|(_, declared)| declared.is_some()),
             "user dispatch route {:?} {} declared neither as {} nor as {}",
             route.method,
             route.template,
             api_path,
             route.template,
         );
+        let strictest = spellings
+            .iter()
+            .filter_map(|(_, declared)| *declared)
+            .max_by_key(|auth| auth_rank(*auth))
+            .expect("at least one spelling is declared");
+        for (spelling, declared) in spellings {
+            // Undeclared spellings get `declared_access`'s fail-closed
+            // fallback, mirroring routing.rs:567's `route.access.max(..)`
+            // (the `/b/products` prefix tier is `Public`, so the fallback is
+            // the whole decision).
+            let enforced = declared.unwrap_or(AuthLevel::Authenticated);
+            assert!(
+                auth_rank(enforced) >= auth_rank(strictest),
+                "user dispatch route {:?} {} is enforced at {:?} on the {} spelling but \
+                 declared {:?} elsewhere — the weaker spelling reaches the same handler, \
+                 so the declaration is not the tier a caller actually faces. Move it to \
+                 ADMIN_ROUTES (one prefix, one spelling) or declare every spelling.",
+                route.method,
+                route.template,
+                enforced,
+                spelling,
+                strictest,
+            );
+        }
+    }
+}
+
+/// Strictness ordering for [`AuthLevel`], which is declared upstream without
+/// `Ord`. Mirrors `endpoint_match::auth_rank` (private there).
+fn auth_rank(level: wafer_run::AuthLevel) -> u8 {
+    use wafer_run::AuthLevel;
+    match level {
+        AuthLevel::Public => 0,
+        AuthLevel::Authenticated => 1,
+        AuthLevel::Admin => 2,
     }
 }

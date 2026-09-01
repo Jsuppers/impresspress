@@ -104,12 +104,15 @@ const TABLE_IDENT: &str = "products::TABLE";
 /// `repo::products::TABLE` identifier (as opposed to the literal string
 /// above).
 const TABLE_IDENT_ALLOWED: &[&str] = &[
-    "repo/products.rs",        // the door itself: `TABLE`'s own definition and internal uses
-    "mod.rs",                  // `BlockInfo::collections(...)` is an advisory table listing for
-                               // admin/WRAP discovery, not a query — nothing to filter
-    "tests/",                  // fixtures seed rows (including soft-deleted ones) and assert on
-                               // raw rows directly against the table; that is setup/assertion for
-                               // the tests guarding the door, not a production read to filter
+    // the door itself: `TABLE`'s own definition and internal uses
+    "repo/products.rs",
+    // `BlockInfo::collections(...)` is an advisory table listing for
+    // admin/WRAP discovery, not a query — nothing to filter
+    "mod.rs",
+    // fixtures seed rows (including soft-deleted ones) and assert on raw rows
+    // directly against the table; that is setup/assertion for the tests
+    // guarding the door, not a production read to filter
+    "tests/",
 ];
 
 #[test]

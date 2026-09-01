@@ -507,7 +507,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
                             let deleted_at = record.str_field("deleted_at");
                             let seller_owned = record.str_field("owner_kind") == "user";
-                            let restore_url = format!("/b/products/api/products/{}/restore", record.id);
+                            let restore_url = format!("/b/products/api/admin/products/{}/restore", record.id);
                             vec![
                                 html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
                                 html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
@@ -517,7 +517,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                     button .btn .btn--secondary .btn--sm type="button"
                                         hx-post=(restore_url)
                                         hx-swap="none"
-                                        hx-on--after-request="if(event.detail.successful){location.reload()}"
+                                        hx-on--after-request="if(event.detail.successful){location.reload()}else{var m='Restore failed';try{m=JSON.parse(event.detail.xhr.responseText).message||m}catch(err){}document.body.dispatchEvent(new CustomEvent('showToast',{detail:{type:'error',message:m}}))}"
                                     { "Restore" }
                                 },
                             ]

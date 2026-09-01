@@ -11,7 +11,8 @@ use super::{default_template_id, seller_policy, GROUPS_TABLE, PRODUCT_TEMPLATES_
 use crate::{
     blocks::products::repo::{self, offers as offer_repo},
     http::{
-        err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
+        err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
+        err_unauthorized, ok_json,
     },
     util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
@@ -106,8 +107,14 @@ async fn verify_product_owner(
 
 pub(super) async fn handle_list_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
-    match repo::products::list_page(ctx, page as i64, page_size as i64, product_filters(msg), None)
-        .await
+    match repo::products::list_page(
+        ctx,
+        page as i64,
+        page_size as i64,
+        product_filters(msg),
+        None,
+    )
+    .await
     {
         Ok(result) => ok_json(&result),
         Err(e) => err_internal("Database error", e),
@@ -218,21 +225,90 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
 }
 
 /// Restore a soft-deleted product — the door back out of `soft_delete`,
-/// without which a deleted product would be unreachable by any UI. Declared
-/// `AuthLevel::Admin` on its `POST /b/products/api/products/{id}/restore`
-/// endpoint (enforced centrally before this handler runs, matching every
-/// other tier check in this module); it dispatches through `handle_user`
-/// rather than `handle_admin` because it addresses a product directly by ID
-/// rather than through the `/admin/b/products/products/...` CRUD shape.
+/// without which a deleted product would be unreachable by any UI.
+///
+/// `POST /b/products/api/admin/products/{id}/restore`, declared
+/// `AuthLevel::Admin` and dispatched from `ADMIN_ROUTES`, so the one wire
+/// path that reaches this handler is the one its declaration matches.
+/// It previously sat on `USER_ROUTES` (declared under `/b/products/api/`,
+/// dispatched from the user table). `ProductsBlock::handle` also enters
+/// `handle_user` with the RAW path, so the same handler answered at
+/// `/b/products/products/{id}/restore` — a spelling matching no declaration
+/// at all, and so resolving to the `Authenticated` fallback. That was a live
+/// privilege escalation: any logged-in user could resurrect any soft-deleted
+/// product. An Admin-tier route must not live on the user dispatch table for
+/// exactly that reason, and
+/// `dispatch_tables_are_backed_by_declared_endpoints` now fails the build if
+/// one does.
 pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
+    // Soft delete FREES the product's slug — migration 005's unique index is
+    // partial on `deleted_at IS NULL` — and nothing stops a product created
+    // afterwards from claiming it. Restoring the original then violates that
+    // index's `(owner_kind, owner_id, slug)` key, which arrives here as a
+    // generic database failure and would go out as an opaque 500. The
+    // Deleted view's Restore button only acts on success, so that 500 is
+    // invisible: the one door out of soft delete would appear to do nothing
+    // at all. Name the collision instead, so an admin can free the slug and
+    // retry.
+    match repo::products::get_deleted(ctx, id).await {
+        Ok(deleted) => {
+            if let Some(slug) = colliding_slug(ctx, &deleted).await {
+                return err_conflict(&format!(
+                    "Another product already uses the slug \"{slug}\". Rename or delete that \
+                     product, then restore this one."
+                ));
+            }
+        }
+        // Not in the deleted set. `restore` below still answers for it,
+        // unchanged: an unknown id is `NotFound`, and a live product is a
+        // no-op that cannot collide with anything since it already holds its
+        // own slug. Both are pinned by the `restore_endpoint_*` tests.
+        Err(e) if e.code == ErrorCode::NotFound => {}
+        Err(e) => return err_internal("Database error", e),
+    }
     match repo::products::restore(ctx, id).await {
         Ok(record) => ok_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
+    }
+}
+
+/// The slug `deleted` would re-claim on restore, when a LIVE product of the
+/// same owner already holds it — `None` when the restore is clear to go.
+///
+/// Keyed on `(owner_kind, owner_id, slug)` because that is the unique index's
+/// own key. An empty slug never collides: the index is also partial on
+/// `slug <> ''`, so any number of rows may carry one.
+async fn colliding_slug(ctx: &dyn Context, deleted: &db::Record) -> Option<String> {
+    let slug = deleted.str_field("slug");
+    if slug.is_empty() {
+        return None;
+    }
+    let filters = vec![
+        eq_filter("owner_kind", deleted.str_field("owner_kind")),
+        eq_filter("owner_id", deleted.str_field("owner_id")),
+        eq_filter("slug", slug),
+    ];
+    // `list_all` appends the live-only filter, so a second soft-deleted row
+    // sharing the slug is correctly not a collision.
+    match repo::products::list_all(ctx, filters).await {
+        Ok(live) if !live.is_empty() => Some(slug.to_string()),
+        // A failed lookup must not block the restore: the index is still
+        // authoritative, and the caller falls back to the generic error it
+        // had before.
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn eq_filter(field: &str, value: &str) -> Filter {
+    Filter {
+        field: field.to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(value.to_string()),
     }
 }
 

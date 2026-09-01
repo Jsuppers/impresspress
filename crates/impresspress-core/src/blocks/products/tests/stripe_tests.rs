@@ -3358,7 +3358,9 @@ async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product(
         .components
         .iter()
         .all(|component| component.stripe_price_id.is_empty()));
-    let persisted_product = db::get(&ctx, repo::products::TABLE, product_id).await.unwrap();
+    let persisted_product = db::get(&ctx, repo::products::TABLE, product_id)
+        .await
+        .unwrap();
     assert_eq!(
         persisted_product.str_field("stripe_product_id"),
         "prod_catalog_retry"
