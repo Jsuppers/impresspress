@@ -135,7 +135,7 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
 /// CSS variables (email inline styles). Must match `--primary-color` in
 /// `styles/tokens.css` — the `brand_accent_matches_tokens_css` test pins the
 /// two together so they can't drift.
-pub const BRAND_ACCENT_HEX: &str = "#f0480f";
+pub const BRAND_ACCENT_HEX: &str = "#fd3534";
 
 /// Square logo URL with content hash, e.g. `/b/static/impresspress-logo-a1b2c3d4.png`.
 pub fn logo_icon_url() -> String {
@@ -473,6 +473,63 @@ mod tests {
         ] {
             assert!(s.contains(tok), "missing token: {tok}");
         }
+    }
+
+    /// Relative luminance per WCAG 2.1.
+    fn luminance(hex: &str) -> f64 {
+        let h = hex.trim_start_matches('#');
+        let ch = |i| {
+            let c = u8::from_str_radix(&h[i..i + 2], 16).unwrap() as f64 / 255.0;
+            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch(0) + 0.7152 * ch(2) + 0.0722 * ch(4)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn brand_tokens_meet_wcag_aa() {
+        // White-on-red button surfaces carry normal-size text: 4.5:1 required.
+        assert!(contrast("#d92320", "#ffffff") >= 4.5,
+            "primary-button fails AA: {}", contrast("#d92320", "#ffffff"));
+        // Sidebar foregrounds on navy.
+        assert!(contrast("#ffffff", "#0a1122") >= 4.5);
+        assert!(contrast("#94a3b8", "#0a1122") >= 4.5,
+            "sidebar muted text fails AA");
+        // The regression this guards: --text-muted is 3.95:1 on navy and must
+        // never be reused as a sidebar foreground.
+        assert!(contrast("#64748b", "#0a1122") < 4.5,
+            "if this now passes, the sidebar-specific token may be redundant");
+    }
+
+    #[test]
+    fn tokens_css_declares_the_new_palette() {
+        let s = super::css();
+        for (name, value) in [
+            ("--primary-color", "#fd3534"),
+            ("--primary-button", "#d92320"),
+            ("--primary-hover", "#e02523"),
+            ("--navy-900", "#02112a"),
+            ("--navy-800", "#0a1122"),
+            ("--navy-700", "#172136"),
+            ("--sidebar-text-muted", "#94a3b8"),
+        ] {
+            assert!(s.contains(&format!("{name}: {value}")), "missing {name}: {value}");
+        }
+    }
+
+    #[test]
+    fn ui_font_stack_is_system_and_itim_is_wordmark_only() {
+        let s = super::css();
+        assert!(s.contains("--font-ui: system-ui"), "UI face must be the system stack");
+        assert!(s.contains(".brand__wordmark"), "Itim must be scoped to the wordmark");
+        // The body must not name Itim any more.
+        let body_rule = s.split("body {").nth(1).expect("body rule").split('}').next().unwrap();
+        assert!(!body_rule.contains("Itim"), "Itim must not be the body face");
     }
 
     #[test]

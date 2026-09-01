@@ -11,9 +11,18 @@
 
 /* ===== Variables ===== */
 :root {
-	--primary-color: #f0480f;
-	--primary-hover: #d23a0a;
+	--primary-color: #fd3534;
+	--primary-hover: #e02523;
+	/* White text on this needs 4.5:1. #fd3534 is only 3.66:1, so button
+	   surfaces use the darker #d92320 (4.99:1) while #fd3534 stays for
+	   accents, borders and large text. */
+	--primary-button: #d92320;
 	--secondary-color: #64748b;
+
+	--navy-900: #02112a;
+	--navy-800: #0a1122;
+	--navy-700: #172136;
+	--sidebar-text-muted: #94a3b8;
 
 	--accent-success: #10b981;
 	--accent-warning: #f59e0b;
@@ -23,12 +32,12 @@
 	   sit inside the warm brand palette (the old #3b82f6 blue clashed on
 	   every page it appeared). --accent-info-bg is its 10%-alpha tint for
 	   chip backgrounds. */
-	--accent-info: #f0480f;
-	--accent-info-bg: #f0480f19;
+	--accent-info: #fd3534;
+	--accent-info-bg: #fd353419;
 
 	--bg-primary: #ffffff;
 	--bg-secondary: #f0f0f0;
-	--bg-sidebar: #ffffff;
+	--bg-sidebar: var(--navy-800);
 	--bg-hover: #f1f5f9;
 
 	--text-primary: #1e293b;
@@ -77,14 +86,13 @@
 
 	/* Layered surfaces — same values the codebase already uses ad-hoc */
 	--surface-1: #ffffff;
-	--surface-2: #f0f0f0;
+	--surface-2: #f8f8f9;
 	--surface-3: #fafafa;
-
-	/* Primary button color — bumped for WCAG AA at small sizes.
-	   Use this for button backgrounds; --primary-color stays for
-	   accent backgrounds, links, and large text. */
-	--primary-button: #e5571f;
 
 	/* Focus-visible ring */
 	--focus-ring: 0 0 0 2px var(--primary-color);
+
+	--font-ui: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+	           Roboto, 'Helvetica Neue', Arial, sans-serif;
+	--font-brand: 'Itim', var(--font-ui);
 }

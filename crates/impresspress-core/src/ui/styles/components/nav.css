@@ -5,6 +5,10 @@
   border-radius: 0 0 4px 0; }
 .skip-link:focus { left: 0; }
 
+/* Brand wordmark — the one surface that keeps the Itim voice; everything
+   else in the UI uses --font-ui. */
+.brand__wordmark { font-family: var(--font-brand); }
+
 /* Tabs */
 .tabs {
 	display: flex;

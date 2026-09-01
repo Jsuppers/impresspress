@@ -128,7 +128,7 @@
 }
 
 .form-checkbox input, .form-radio input {
-	width: 1rem; height: 1rem; cursor: pointer; accent-color: #f0480f;
+	width: 1rem; height: 1rem; cursor: pointer; accent-color: var(--primary-color);
 }
 
 .input-group { display: flex; gap: 0.5rem; }

@@ -10,7 +10,7 @@
 [hidden] { display: none !important; }
 html, body {
 	height: 100%;
-	font-family: 'Itim', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+	font-family: var(--font-ui);
 	background: var(--bg-secondary);
 	color: var(--text-primary);
 }

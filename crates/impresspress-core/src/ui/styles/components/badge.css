@@ -6,7 +6,7 @@
 }
 
 .badge-success { background: #10b98119; color: var(--accent-success); }
-.badge-primary { background: #f0480f19; color: var(--primary-color); }
+.badge-primary { background: var(--accent-info-bg); color: var(--primary-color); }
 .badge-danger { background: #ef444419; color: var(--accent-danger); }
 .badge-warning { background: #f59e0b19; color: var(--accent-warning); }
 .badge-info { background: var(--accent-info-bg); color: var(--accent-info); }
