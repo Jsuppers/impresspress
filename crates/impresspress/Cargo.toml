@@ -31,9 +31,18 @@ default = [
     "block-tickets",
     "block-userportal",
     "block-products",
+    "embed-assets",
 ]
 sqlite = ["impresspress-core/sqlite"]
 storage-local = ["impresspress-core/storage-local"]
+# Compile the static UI assets (CSS/JS/fonts/logos) into this binary. On by
+# default: the native server needs them embedded to serve `/b/static/`, and
+# `impresspress deploy --target cloudflare` needs them embedded to publish
+# them to R2 (`cli::helpers::cloudflare::assets::ui_asset_entries`). Unlike
+# a downstream consumer's own wasm32 crate — which sets `impresspress-core`'s
+# `embed-assets` independently via its own `--no-default-features` build —
+# this CLI/native-binary crate always wants its own copy embedded.
+embed-assets = ["impresspress-core/embed-assets"]
 otel = ["impresspress-native/otel"]
 storage-s3 = ["impresspress-core/storage-s3", "impresspress-native/s3"]
 postgres = ["impresspress-core/postgres", "impresspress-native/postgres"]

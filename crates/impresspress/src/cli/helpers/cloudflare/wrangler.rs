@@ -14,7 +14,7 @@ pub use impresspress_core::{
 };
 
 use super::{
-    assets::ReleaseManifest,
+    assets::{resolve_asset_base_url, ReleaseManifest},
     build::WORKER_BUILD_VERSION,
     prepared::{
         ApplicationArtifactIdentity, PreparedModule, PREPARED_MODULE_DIR, PREPARED_SHIM_FILE,
@@ -31,6 +31,11 @@ pub const RELEASE_ASSET_PREFIX_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_PREFIX";
 pub const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST";
 pub const PREPARED_WAFER_LOCK_IDENTITY_VAR: &str =
     impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR;
+
+/// Points a lean (no `embed-assets`) worker at wherever `impresspress deploy`
+/// published the UI asset set. The literal name must match exactly what
+/// `impresspress_core::ui::assets::base_url()` reads via `std::env::var`.
+pub const ASSET_BASE_URL_VAR: &str = "IMPRESSPRESS_ASSET_BASE_URL";
 
 #[derive(Debug, Clone)]
 pub struct CloudflareConfig {
@@ -450,6 +455,15 @@ fn base_toml(cfg: &CloudflareConfig) -> toml::Value {
     vars.insert(
         wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY.into(),
         Value::String("true".into()),
+    );
+    // Every generated config represents code that can actually run
+    // (`wrangler dev`, the upload-only candidate, or the final promoted
+    // version), so this belongs at the base level rather than only on the
+    // release-bound variants: a lean (no `embed-assets`) Cloudflare build
+    // has nowhere else to learn where its static assets live.
+    vars.insert(
+        ASSET_BASE_URL_VAR.into(),
+        Value::String(resolve_asset_base_url(!cfg.r2.bucket_name.is_empty())),
     );
     root.insert("vars".into(), Value::Table(vars));
 

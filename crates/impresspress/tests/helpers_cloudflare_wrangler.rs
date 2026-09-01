@@ -6,7 +6,7 @@ use impresspress::cli::helpers::cloudflare::{
     prepared::{stage_prepared_module, ApplicationArtifactIdentity, PREPARED_TEXT_GLOB},
     wrangler::{
         generate, generate_candidate_upload, generate_final_upload, generate_upload,
-        generate_upload_with_release, CloudflareConfig, D1Config, R2Config,
+        generate_upload_with_release, CloudflareConfig, D1Config, R2Config, ASSET_BASE_URL_VAR,
         PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR,
         PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_WAFER_LOCK_IDENTITY_VAR, RELEASE_ASSET_ID_VAR,
         RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
@@ -76,6 +76,43 @@ fn generate_writes_wrangler_toml_with_required_fields() {
         body.contains(r#"WAFER_RUN__DATABASE__STRICT_SCHEMA = "true""#),
         "deploy toml must enable STRICT_SCHEMA so the D1 adapter trusts its \
          migrated schema and skips per-op introspection round-trips:\n{body}"
+    );
+}
+
+#[test]
+fn generate_points_asset_base_url_at_own_origin_when_r2_is_configured() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    // sample_cfg() always sets a non-empty r2.bucket_name.
+    let path = generate(&sample_cfg(), repo_root, &out).unwrap();
+    let body = fs::read_to_string(&path).unwrap();
+
+    assert!(
+        body.contains(&format!(r#"{ASSET_BASE_URL_VAR} = "/b/static/""#)),
+        "expected same-origin asset base URL when R2 is configured:\n{body}"
+    );
+}
+
+#[test]
+fn generate_falls_back_asset_base_url_to_cdn_without_r2() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    let mut cfg = sample_cfg();
+    cfg.r2.bucket_name = String::new();
+    let path = generate(&cfg, repo_root, &out).unwrap();
+    let body = fs::read_to_string(&path).unwrap();
+
+    assert!(
+        body.contains(&format!(
+            r#"{ASSET_BASE_URL_VAR} = "https://cdn.impresspress.org/ui/v"#
+        )),
+        "expected the versioned CDN fallback without R2:\n{body}"
     );
 }
 

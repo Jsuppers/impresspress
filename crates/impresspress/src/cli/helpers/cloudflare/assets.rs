@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use impresspress_core::ui::assets as ui_assets;
+
 /// Source dirs (relative to repo_root) to mirror into out_dir/assets/.
 const ASSET_DIRS: &[&str] = &["dist", "content", "public"];
 
@@ -25,6 +27,44 @@ pub struct ReleaseAssetEntry {
     pub size: u64,
     pub sha256: String,
     pub content_type: String,
+}
+
+/// Where a deployed worker should fetch UI assets (CSS/JS/fonts/logos) from.
+///
+/// With an R2 bucket configured, the worker serves them from its own origin
+/// — no cross-org runtime dependency, and the `/b/static/` URL contract pages
+/// already emit stays unchanged. Without one there is nowhere to publish, so
+/// fall back to the shared version-pinned CDN.
+pub fn resolve_asset_base_url(has_r2: bool) -> String {
+    if has_r2 {
+        "/b/static/".to_string()
+    } else {
+        ui_assets::DEFAULT_CDN_BASE_TEMPLATE.to_string()
+    }
+}
+
+/// The UI asset set (`impresspress_core::ui::assets::ASSETS`) as release
+/// entries, keyed by hashed filename (e.g. `app-a1b2c3d4.css`) rather than
+/// the source-relative `logical` name, so the published R2 objects are
+/// immutable and match the URLs `ui::assets::url()` emits.
+///
+/// Requires an `embed-assets`-enabled build (the CLI's default): publishing
+/// needs the real bytes to hash and upload, and a lean build genuinely
+/// doesn't have them compiled in.
+pub fn ui_asset_entries() -> Vec<ReleaseAssetEntry> {
+    ui_assets::ASSETS
+        .iter()
+        .map(|e| {
+            let bytes = ui_assets::bytes(e.logical)
+                .expect("publishing requires an embed-assets-enabled CLI build");
+            ReleaseAssetEntry {
+                logical_key: e.filename.to_string(),
+                size: bytes.len() as u64,
+                sha256: impresspress_core::util::sha256_hex(bytes),
+                content_type: e.content_type.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// Deterministic identity and inventory of the local release asset set.

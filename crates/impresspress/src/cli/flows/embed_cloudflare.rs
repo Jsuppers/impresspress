@@ -295,6 +295,21 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     );
     deployment_gate.assets_verified()?;
 
+    // Publish impresspress's own UI asset set (CSS/JS/fonts/logos) to R2 at
+    // their hashed filenames. Independent of this app's release-asset gate
+    // above: these are the shared static assets a lean (no `embed-assets`)
+    // Cloudflare build drops at compile time, and `IMPRESSPRESS_ASSET_BASE_URL`
+    // (set in every generated wrangler config via
+    // `assets::resolve_asset_base_url`, see `wrangler::base_toml`) points
+    // `/b/static/` at wherever they land here.
+    if !cfg.r2.bucket_name.is_empty() {
+        let ui_asset_upload = cf_deploy::r2_upload_ui_assets(&cfg.r2.bucket_name)?;
+        println!(
+            "-> published {} UI asset object(s) to R2",
+            ui_asset_upload.uploaded
+        );
+    }
+
     // 3. One authenticated request owns every mutation: migrate, seed, reload
     //    final structural state, and export the strict immutable plan.
     let prepared_response =
