@@ -1706,12 +1706,20 @@ fn pages_carry_no_static_inline_styles() {
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+            .filter(|e| !e.path().ends_with("blocks/email.rs"))
         {
             let src = std::fs::read_to_string(entry.path()).unwrap();
             for (n, line) in src.lines().enumerate() {
                 // A `style=` carrying `--` is a runtime value handed to CSS as
                 // a custom property (--size, --chart-color). That is the
                 // correct mechanism and is deliberately allowed.
+                //
+                // `blocks/email.rs` is exempt entirely: it builds HTML email
+                // bodies, and email clients strip `<style>` blocks and do not
+                // load external stylesheets, so inline styles are the only
+                // mechanism that works there. This is the same reason
+                // `assets::BRAND_ACCENT_HEX` exists. Removing them would break
+                // email rendering, not improve it.
                 if line.contains("style=") && !line.contains("--") {
                     offenders.push(format!("{}:{}", entry.path().display(), n + 1));
                 }
@@ -1731,9 +1739,20 @@ Add `walkdir` to `[dev-dependencies]` in `crates/impresspress-core/Cargo.toml`.
 Run: `cargo test -p impresspress-core --lib block_pages_carry_no_static_inline_styles`
 Expected: FAIL, listing roughly 419 locations. **This list is the task's worklist.**
 
-- [ ] **Step 3: Clear the list, largest file first**
+- [ ] **Step 3: Clear the list, in four sub-tasks**
 
-For each file, replace its inline styles with classes, then re-run the guard test to watch the list shrink. Commit per file:
+**Split decision (made during execution).** Measured at this point in the branch: **435 static inline styles** remain across ~20 files. That is far too much for one task — one implementer would run a very long session under heavy context pressure, and a single 435-change diff cannot be reviewed carefully. The plan's own self-review anticipated this and named splitting per-area as the right call. Each sub-task below is dispatched and reviewed separately, and the guard test provides an objective, shrinking worklist across all of them.
+
+The guard test is added once, in **12a**, where it first fails. It stays failing (with a shrinking offender list) until 12c completes — that is expected and correct. **Do not weaken or `#[ignore]` it to get a green suite in the meantime**; its failure output *is* the worklist.
+
+| Sub-task | Files | Sites |
+|---|---|---|
+| **12a** | `blocks/products/pages.rs` | 133 |
+| **12b** | `blocks/llm/pages.rs` (44), `blocks/llm/ui.rs` (21), `blocks/messages/pages.rs` (30), `blocks/legalpages/pages.rs` (23) | 118 |
+| **12c** | `blocks/admin/pages/{permissions,blocks,variables,network}.rs` (64), `blocks/userportal/pages/{admin_buttons,profile,security}.rs` (32), `blocks/auth_ui/**` (23), `blocks/tickets/pages.rs` (26), `blocks/vector/pages_ui.rs` (4), plus any remaining stragglers the guard reports | ~156 |
+| **12d** | `ui/settings_form.rs` (28) + the template design pass in Step 4 | 28 + templates |
+
+Within each sub-task, commit per file so a regression bisects to a single page:
 
 ```bash
 git add crates/impresspress-core/src/blocks/products/pages.rs crates/impresspress-core/src/ui/styles
