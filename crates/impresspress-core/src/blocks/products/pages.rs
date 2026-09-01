@@ -46,17 +46,17 @@ fn analytics_section(analytics: &[CommerceAnalytics], title: &str, seller_view: 
                         }
                         div .card__body {
                             div .stats-grid {
-                                (components::stat_card("Gross sales", &display_money(currency.gross_volume_minor, &currency.currency), icons::dollar_sign()))
-                                (components::stat_card("Customer refunds", &display_money(currency.refunded_volume_minor, &currency.currency), icons::arrow_down_left()))
-                                (components::stat_card(if seller_view { "After refunds" } else { "Net sales" }, &display_money(currency.net_volume_minor, &currency.currency), icons::arrow_up_right()))
-                                (components::stat_card("Platform fees", &display_money(currency.platform_fees_minor, &currency.currency), icons::dollar_sign()))
+                                (components::stat_card("Gross sales", &display_money(currency.gross_volume_minor, &currency.currency), icons::dollar_sign(), None))
+                                (components::stat_card("Customer refunds", &display_money(currency.refunded_volume_minor, &currency.currency), icons::arrow_down_left(), None))
+                                (components::stat_card(if seller_view { "After refunds" } else { "Net sales" }, &display_money(currency.net_volume_minor, &currency.currency), icons::arrow_up_right(), None))
+                                (components::stat_card("Platform fees", &display_money(currency.platform_fees_minor, &currency.currency), icons::dollar_sign(), None))
                                 @if seller_view {
-                                    (components::stat_card("Before Stripe fees", &display_money(currency.net_volume_minor.saturating_sub(currency.platform_fees_minor), &currency.currency), icons::arrow_up_right()))
+                                    (components::stat_card("Before Stripe fees", &display_money(currency.net_volume_minor.saturating_sub(currency.platform_fees_minor), &currency.currency), icons::arrow_up_right(), None))
                                 }
-                                (components::stat_card("Failed orders", &currency.failed_order_count.to_string(), icons::info()))
-                                (components::stat_card("Past due", &currency.past_due_subscription_count.to_string(), icons::help_circle()))
-                                (components::stat_card("Open disputes", &format!("{} · {}", currency.open_dispute_count, display_money(currency.open_disputed_volume_minor, &currency.currency)), icons::help_circle()))
-                                (components::stat_card("Lost disputes", &format!("{} · {}", currency.lost_dispute_count, display_money(currency.lost_disputed_volume_minor, &currency.currency)), icons::arrow_down_left()))
+                                (components::stat_card("Failed orders", &currency.failed_order_count.to_string(), icons::info(), None))
+                                (components::stat_card("Past due", &currency.past_due_subscription_count.to_string(), icons::help_circle(), None))
+                                (components::stat_card("Open disputes", &format!("{} · {}", currency.open_dispute_count, display_money(currency.open_disputed_volume_minor, &currency.currency)), icons::help_circle(), None))
+                                (components::stat_card("Lost disputes", &format!("{} · {}", currency.lost_dispute_count, display_money(currency.lost_disputed_volume_minor, &currency.currency)), icons::arrow_down_left(), None))
                             }
                             p .text-muted .text-sm {
                                 "Subscriptions: " (currency.active_subscription_count) " active, "
@@ -331,10 +331,10 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
             a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
         })))
         div .stats-grid {
-            (components::stat_card("Products", &products_count.to_string(), icons::package()))
-            (components::stat_card("Groups", &groups_count.to_string(), icons::folder()))
-            (components::stat_card("Offers", &offers_count.to_string(), icons::dollar_sign()))
-            (components::stat_card("Orders", &purchases_count.to_string(), icons::shopping_cart()))
+            (components::stat_card("Products", &products_count.to_string(), icons::package(), None))
+            (components::stat_card("Groups", &groups_count.to_string(), icons::folder(), None))
+            (components::stat_card("Offers", &offers_count.to_string(), icons::dollar_sign(), None))
+            (components::stat_card("Orders", &purchases_count.to_string(), icons::shopping_cart(), None))
         }
         div .products-section__head style="margin-top:1.5rem" {
             div {
@@ -691,10 +691,10 @@ pub async fn admin_seller_detail(
             }
             div .card__body {
                 div .stats-grid {
-                    (components::stat_card("Payments", if seller.capabilities.charges_enabled { "Enabled" } else { "Disabled" }, icons::dollar_sign()))
-                    (components::stat_card("Payouts", if seller.capabilities.payouts_enabled { "Enabled" } else { "Disabled" }, icons::arrow_up_right()))
-                    (components::stat_card("Verification", if seller.capabilities.details_submitted { "Complete" } else { "Incomplete" }, icons::info()))
-                    (components::stat_card("Platform fee", &format!("{:.2}%", seller.fee_basis_points as f64 / 100.0), icons::dollar_sign()))
+                    (components::stat_card("Payments", if seller.capabilities.charges_enabled { "Enabled" } else { "Disabled" }, icons::dollar_sign(), None))
+                    (components::stat_card("Payouts", if seller.capabilities.payouts_enabled { "Enabled" } else { "Disabled" }, icons::arrow_up_right(), None))
+                    (components::stat_card("Verification", if seller.capabilities.details_submitted { "Complete" } else { "Incomplete" }, icons::info(), None))
+                    (components::stat_card("Platform fee", &format!("{:.2}%", seller.fee_basis_points as f64 / 100.0), icons::dollar_sign(), None))
                 }
                 details .products-plain-details {
                     summary { "Technical account details" }
@@ -2363,9 +2363,9 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
                     p #stripe-error .text-sm .text-muted style="margin-top:0" {}
                 }
                 div .stats-grid {
-                    (components::stat_card("Payments", if status.charges_enabled { "Enabled" } else { "Unavailable" }, icons::credit_card()))
-                    (components::stat_card("Payouts", if status.payouts_enabled { "Enabled" } else { "Unavailable" }, icons::arrow_up_right()))
-                    (components::stat_card("Currency", if status.default_currency.is_empty() { "—" } else { &status.default_currency }, icons::dollar_sign()))
+                    (components::stat_card("Payments", if status.charges_enabled { "Enabled" } else { "Unavailable" }, icons::credit_card(), None))
+                    (components::stat_card("Payouts", if status.payouts_enabled { "Enabled" } else { "Unavailable" }, icons::arrow_up_right(), None))
+                    (components::stat_card("Currency", if status.default_currency.is_empty() { "—" } else { &status.default_currency }, icons::dollar_sign(), None))
                 }
                 details .products-plain-details {
                     summary { "Technical connection details" }
@@ -2892,9 +2892,9 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
             a .btn .btn--secondary .btn--sm href="/b/products/my-purchases" { "View order history" }
         }
         div .stats-grid {
-            (components::stat_card("Purchases", &purchases_count.to_string(), icons::shopping_cart()))
+            (components::stat_card("Purchases", &purchases_count.to_string(), icons::shopping_cart(), None))
             @if seller_enabled {
-                (components::stat_card("Products for sale", &product_count.to_string(), icons::package()))
+                (components::stat_card("Products for sale", &product_count.to_string(), icons::package(), None))
             }
         }
         section .card style="margin-top:1rem" {
@@ -3230,10 +3230,10 @@ async fn order_detail(
         }
         div #order-detail-error .login-error hidden {}
         div .stats-grid {
-            (components::stat_card("Total", &display_money(purchase.i64_field("total_cents"), currency), icons::dollar_sign()))
-            (components::stat_card("Refunded", &display_money(refunded_total, currency), icons::arrow_down_left()))
-            (components::stat_card("Customer", if buyer.is_empty() { "Guest" } else { buyer }, icons::users()))
-            (components::stat_card("Items", &line_items.len().to_string(), icons::package()))
+            (components::stat_card("Total", &display_money(purchase.i64_field("total_cents"), currency), icons::dollar_sign(), None))
+            (components::stat_card("Refunded", &display_money(refunded_total, currency), icons::arrow_down_left(), None))
+            (components::stat_card("Customer", if buyer.is_empty() { "Guest" } else { buyer }, icons::users(), None))
+            (components::stat_card("Items", &line_items.len().to_string(), icons::package(), None))
         }
         details .products-plain-details {
             summary { "View order total breakdown" }

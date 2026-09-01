@@ -37,6 +37,7 @@
 .card { background: var(--surface-1); border: 1px solid var(--border-color); border-radius: var(--radius-lg); margin-bottom: var(--spacing-md); }
 .card__head { display: flex; align-items: center; gap: var(--spacing-md); padding: var(--spacing-md) var(--spacing-lg); border-bottom: 1px solid var(--border-light); }
 .card__title { margin: 0; font-size: var(--text-lg); font-weight: 500; color: var(--text-primary); }
+.card__subtitle { margin: 0; font-size: var(--text-xs); color: var(--text-muted); }
 .card__actions { margin-left: auto; display: flex; gap: var(--spacing-sm); }
 .card__body { padding: var(--spacing-lg); }
 

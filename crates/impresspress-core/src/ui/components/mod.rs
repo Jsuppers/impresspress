@@ -19,7 +19,7 @@ pub use avatar::{avatar, CtrlSize};
 pub use badge::{badge, status_badge, BadgeVariant};
 pub use button::{button, tab_navigation, BtnVariant, Tab};
 pub use card::page_header;
-pub use chart::bar_chart_card;
+pub use chart::{bar_chart_card, line_chart_card, sparkline};
 pub use empty::empty_state;
 pub use form::{search_input, search_input_with_value};
 pub use modal::modal;
