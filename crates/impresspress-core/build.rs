@@ -60,7 +60,8 @@ fn main() {
     for (rel, logical, ct) in FILE_ASSETS {
         let path = ui.join(rel);
         println!("cargo:rerun-if-changed={}", path.display());
-        let Ok(bytes) = fs::read(&path) else { continue }; // feature-gated assets may be absent
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|e| panic!("missing asset {}: {e}", path.display()));
         let name = hashed_name(logical, &short_hash(&bytes));
         if logical.ends_with(".woff2") {
             font_names.push((logical.to_string(), name.clone()));
