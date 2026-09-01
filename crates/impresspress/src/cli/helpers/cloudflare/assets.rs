@@ -32,9 +32,9 @@ pub struct ReleaseAssetEntry {
 /// Where a deployed worker should fetch UI assets (CSS/JS/fonts/logos) from.
 ///
 /// With an R2 bucket configured, the worker serves them from its own origin
-/// — no cross-org runtime dependency, and the `/b/static/` URL contract pages
-/// already emit stays unchanged. Without one there is nowhere to publish, so
-/// fall back to the shared version-pinned CDN.
+/// — no cross-org runtime dependency, and the `/b/static/` URL contract that
+/// pages already emit stays unchanged. Without one there is nowhere to
+/// publish, so fall back to the shared version-pinned CDN.
 pub fn resolve_asset_base_url(has_r2: bool) -> String {
     if has_r2 {
         "/b/static/".to_string()
