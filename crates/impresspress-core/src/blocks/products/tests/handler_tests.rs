@@ -3221,13 +3221,8 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
     }
 }
 
-/// Strictness ordering for [`AuthLevel`], which is declared upstream without
-/// `Ord`. Mirrors `endpoint_match::auth_rank` (private there).
-fn auth_rank(level: wafer_run::AuthLevel) -> u8 {
-    use wafer_run::AuthLevel;
-    match level {
-        AuthLevel::Public => 0,
-        AuthLevel::Authenticated => 1,
-        AuthLevel::Admin => 2,
-    }
-}
+// The strictness ordering below is `endpoint_match::auth_rank`, not a copy of
+// it. A copy would go on asserting against its own idea of strictness after
+// the router's changed, leaving this gate green while the thing it guards
+// weakened.
+use crate::endpoint_match::auth_rank;

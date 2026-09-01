@@ -235,7 +235,13 @@ pub fn endpoint_auth(
 /// this is the local ordering used by [`endpoint_auth`] to pick the strictest
 /// matching endpoint. The numbers are an internal detail — only their relative
 /// order matters.
-fn auth_rank(level: AuthLevel) -> u8 {
+///
+/// `pub(crate)` so the gate tests that assert "every wire spelling of a route
+/// is enforced at least as strictly as its declaration" compare with the same
+/// ordering the router itself applies. A test-local copy would keep passing
+/// against its own idea of strictness while this one changed underneath it —
+/// which is the failure mode those gates exist to catch, wearing their name.
+pub(crate) fn auth_rank(level: AuthLevel) -> u8 {
     match level {
         AuthLevel::Public => 0,
         AuthLevel::Authenticated => 1,
