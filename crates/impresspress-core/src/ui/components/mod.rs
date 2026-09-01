@@ -14,7 +14,7 @@ mod pagination;
 mod stat;
 mod table;
 
-pub use auth::auth_panel;
+pub use auth::{alert, auth_panel, oauth_button, AlertVariant};
 pub use avatar::{avatar, CtrlSize};
 pub use badge::{badge, status_badge, BadgeVariant};
 pub use button::{button, tab_navigation, BtnVariant, Tab};

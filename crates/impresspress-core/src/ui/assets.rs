@@ -573,29 +573,14 @@ mod tests {
         blocks
     }
 
-    /// Selectors this task's diff deliberately leaves pairing white text with
-    /// `--primary-color` background, because the surface they style is
-    /// replaced with navy by name in an already-scheduled follow-up task:
-    /// `.login-button`, `.auth-split__brand` (`layouts/auth-split.css` --
-    /// Task 9 replaces the brand panel with navy). Fixing them now would be
-    /// churn overwritten within one task. Once that task lands, neither
-    /// selector will set `background: var(--primary-color)` any more, so
-    /// this allowlist goes unused rather than becoming permanently
-    /// necessary -- if a future run finds one of these selectors is no
-    /// longer an offender, that's a sign the follow-up task shipped, not a
-    /// broken test.
-    ///
-    /// Task 8's four entries (`.nav-link.active`, `.sidebar-toggle:hover`,
-    /// `.user-avatar`, `.profile-menu-avatar`) were retired here: the first
-    /// two were unreachable dead CSS (no markup renders `.nav-link` or
-    /// `.sidebar-toggle` any more -- the grouped sidebar uses
-    /// `.sidebar__nav-item` / `.sidebar__collapse-toggle`) and were deleted
-    /// outright; the other two are real but style surfaces the navy
-    /// repaint does NOT touch (the profile page's standalone avatar and the
-    /// white profile-menu dropdown, respectively), so they were routed to
-    /// `--primary-button` like every other white-on-brand surface.
-    const DEFERRED_WHITE_ON_PRIMARY_COLOR: &[&str] = &[".login-button", ".auth-split__brand"];
-
+    // The `DEFERRED_WHITE_ON_PRIMARY_COLOR` allowlist that used to live here
+    // (Task 7, retired down to `.login-button` / `.auth-split__brand` by
+    // Task 8) is gone. Task 9 repaints `.auth-split__brand` navy and routes
+    // `.login-button` to `--primary-button`, so neither pairs white text
+    // with `--primary-color` any more -- the allowlist's last two entries
+    // are retired and, with the list empty, the mechanism (the const and
+    // the `.filter(...)` consuming it) is deleted rather than left for a
+    // future task to refill.
     #[test]
     fn no_new_white_text_on_primary_color_background() {
         // `--primary-color` (#fd3534) is only 3.66:1 against white -- below
@@ -636,7 +621,6 @@ mod tests {
                 has_bg && has_white
             })
             .map(|(selector, _)| selector)
-            .filter(|selector| !DEFERRED_WHITE_ON_PRIMARY_COLOR.contains(&selector.as_str()))
             .collect();
         assert!(
             offenders.is_empty(),

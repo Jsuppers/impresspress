@@ -9,12 +9,15 @@ use super::{
 };
 use crate::{
     blocks::auth_ui::redirect::is_safe_local_redirect,
-    ui::{self, components::auth_panel, templates::auth_split},
+    ui::{
+        self,
+        components::{alert, auth_panel, oauth_button, AlertVariant},
+        templates::auth_split,
+    },
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let app_name = &config.app_name;
     let allow_signup = ctx
         .config_get("WAFER_RUN_SHARED__ALLOW_SIGNUP")
         .unwrap_or("true")
@@ -37,8 +40,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     } else {
         String::new()
     };
-    let logo_url = &config.logo_url;
-
     let signup_redirect = if redirect.is_empty() {
         String::new()
     } else {
@@ -69,38 +70,17 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         auth_split(
             auth_panel(&config, "Sign in to continue."),
             html! {
-                div .login-container {
-                    div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        } @else {
-                            span .login-app-name { (app_name) }
-                        }
-                        p .login-subtitle { "Sign in to " (app_name) }
-                    }
-
-                    div #error .login-error style="display:none" {}
-                    div #info style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:.75rem;margin-bottom:1.5rem;font-size:.813rem;color:#059669;display:none" {}
+                div .auth-form {
+                    (alert(AlertVariant::Error, "error", ""))
+                    (alert(AlertVariant::Success, "info", ""))
 
                     @if !oauth_providers.is_empty() {
-                        div .oauth-buttons style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:1rem" {
+                        div .oauth-buttons {
                             @for provider in &oauth_providers {
-                                button
-                                    type="button"
-                                    class="oauth-button"
-                                    data-provider=(provider)
-                                    onclick={"oauthStart('"(provider)"')"}
-                                    style="display:flex;align-items:center;justify-content:center;gap:.5rem;padding:.625rem 1rem;background:#000;color:#fff;border:1px solid #000;border-radius:.5rem;font-weight:500;font-size:.95rem;cursor:pointer;transition:background .15s" {
-                                    (oauth_provider_icon(provider))
-                                    "Continue with " (oauth_provider_label(provider))
-                                }
+                                (oauth_button(provider, oauth_provider_label(provider), oauth_provider_icon(provider)))
                             }
                         }
-                        div style="display:flex;align-items:center;gap:.75rem;margin:.5rem 0 1rem;color:var(--sa-text-muted, #6b7280);font-size:.75rem" {
-                            div style="flex:1;height:1px;background:var(--sa-border, #e5e7eb)" {}
-                            "or"
-                            div style="flex:1;height:1px;background:var(--sa-border, #e5e7eb)" {}
-                        }
+                        div .auth-divider { "or" }
                     }
 
                     form #form .login-form onsubmit="return handleLogin(event)" {
@@ -116,7 +96,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             (pw_field("password", "Enter your password", None))
                         }
 
-                        div style="text-align:right;margin-bottom:1rem" {
+                        div .auth-actions {
                             button type="button" class="btn btn-ghost btn-sm" onclick="handleForgot()" {
                                 "Forgot password?"
                             }

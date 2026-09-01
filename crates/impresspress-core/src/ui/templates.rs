@@ -317,7 +317,9 @@ pub struct BrandPanel<'a> {
     pub tagline: Option<&'a str>,
 }
 
-pub fn auth_split(brand: BrandPanel<'_>, form_card: Markup) -> Markup {
+/// `form` is the bare form markup — no card wrapper. It sits directly on
+/// `.auth-split__form`'s `#fdfdfd` surface; see `layouts/auth-split.css`.
+pub fn auth_split(brand: BrandPanel<'_>, form: Markup) -> Markup {
     html! {
         div .auth-split {
             aside .auth-split__brand {
@@ -325,7 +327,7 @@ pub fn auth_split(brand: BrandPanel<'_>, form_card: Markup) -> Markup {
                 h1 .auth-split__headline { (brand.headline) }
                 @if let Some(t) = brand.tagline { p .auth-split__tagline { (t) } }
             }
-            main .auth-split__form { (form_card) }
+            main .auth-split__form { (form) }
         }
     }
 }

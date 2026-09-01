@@ -66,18 +66,20 @@
 
 .login-button {
 	width: 100%; padding: 0.875rem 1.5rem;
-	background: var(--primary-color); color: white;
+	/* White text needs --primary-button (4.99:1), not --primary-color
+	   (3.66:1, fails WCAG AA) — see no_new_white_text_on_primary_color_background. */
+	background: var(--primary-button); color: white;
 	border: none; border-radius: 10px;
 	font-size: 0.9375rem; font-weight: 600;
 	cursor: pointer; transition: all 0.2s;
 	display: flex; align-items: center; justify-content: center; gap: 0.5rem;
-	box-shadow: 0 1px 3px rgba(254, 102, 39, 0.3);
+	box-shadow: 0 1px 3px rgba(217, 35, 32, 0.3);
 }
 
 .login-button:hover:not(:disabled) {
 	background: var(--primary-hover);
 	transform: translateY(-1px);
-	box-shadow: 0 4px 12px rgba(254, 102, 39, 0.3);
+	box-shadow: 0 4px 12px rgba(217, 35, 32, 0.3);
 }
 
 .login-button:disabled { cursor: not-allowed; opacity: 0.7; box-shadow: none; }
@@ -94,53 +96,36 @@
 
 .signup-link a:hover { color: var(--primary-hover); text-decoration: underline; }
 
-/* OAuth */
-.oauth-divider {
-	position: relative; text-align: center; margin: 1.5rem 0;
-}
-
-.oauth-divider::before {
-	content: ''; position: absolute; top: 50%;
-	left: 0; right: 0; height: 1px;
-	background: var(--border-color);
-}
-
-.oauth-divider span {
-	position: relative; display: inline-block;
-	padding: 0 1rem; background: white;
-	color: var(--text-secondary); font-size: 0.875rem; font-weight: 500;
-}
-
-.oauth-buttons {
-	display: flex; flex-direction: column;
-	gap: 0.75rem; margin-bottom: 1.5rem;
-}
-
-.oauth-button {
-	width: 100%; padding: 0.75rem 1rem;
-	border: 1.5px solid var(--border-color);
-	border-radius: 10px; background: white;
-	color: var(--text-primary); font-size: 0.875rem; font-weight: 500;
-	cursor: pointer; transition: all 0.2s;
-	display: flex; align-items: center; justify-content: center; gap: 0.75rem;
-}
-
-.oauth-button:hover:not(:disabled) {
-	background: #f9fafb; border-color: #9ca3af;
-	transform: translateY(-1px);
-	box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-}
-
-.oauth-button:disabled { opacity: 0.5; cursor: not-allowed; }
-.oauth-button span { font-weight: 600; }
+/* Old OAuth button/divider markup (`.oauth-button`, `.oauth-divider`) was
+   retired with `login.rs`'s inline-style cleanup — replaced by the
+   `oauth_button()` component's `.btn-oauth` (styles/components/auth.css)
+   and the plain `.auth-divider` div. `.oauth-buttons` (the button-stack
+   wrapper) moved there too, alongside the component it wraps. */
 
 /* ===== Auth split ===== */
 .auth-split { display: grid; grid-template-columns: 1fr; min-height: 100vh; }
 @media (min-width: 1024px) { .auth-split { grid-template-columns: minmax(280px, 480px) 1fr; } }
-.auth-split__brand { background: var(--primary-color); color: #fff; padding: var(--space-2xl) var(--spacing-xl); display: flex; flex-direction: column; justify-content: center; gap: var(--spacing-md); }
-.auth-split__logo { font-size: 2rem; }
-.auth-split__headline { font-size: var(--text-2xl); font-weight: 500; margin: 0; line-height: 1.2; }
-.auth-split__tagline { font-size: var(--text-base); margin: 0; opacity: 0.9; }
-.auth-split__form { display: flex; align-items: center; justify-content: center; padding: var(--space-2xl) var(--spacing-md); background: #fff; }
-.auth-split__form > * { width: 100%; max-width: 400px; }
 
+.auth-split__brand {
+	background: var(--navy-900);
+	color: #ffffff;
+	display: flex;
+	flex-direction: column;
+	padding: var(--space-2xl) var(--spacing-xl);
+}
+
+@media (max-width: 720px) { .auth-split__brand { min-height: 12rem; } }
+
+.auth-split__logo { align-self: flex-start; }
+.auth-split__logo-img { height: 2rem; width: auto; display: block; }
+
+/* Logo pinned top (default flex flow); headline+tagline pushed to the
+   bottom as a group via the headline's auto top margin, rather than
+   `justify-content: space-between` on all three children -- which would
+   space them out evenly and strand the headline in the middle. */
+.auth-split__headline { font-size: 2.5rem; font-weight: 700; margin: auto 0 0; line-height: 1.15; }
+.auth-split__tagline { font-size: var(--text-base); margin: var(--spacing-sm) 0 0; color: var(--sidebar-text-muted); }
+
+.auth-split__form { display: flex; align-items: center; justify-content: center; padding: var(--space-2xl) var(--spacing-md); background: #fdfdfd; }
+/* No card: the form sits directly on the surface. */
+.auth-split__form > * { width: 100%; max-width: 26rem; }

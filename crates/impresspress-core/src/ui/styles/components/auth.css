@@ -1,3 +1,43 @@
-@media (max-width: 720px) {
-	.oauth-button { width: 100%; }
+/* ===== Alert (auth pages: #error / #info) ===== */
+.alert {
+	display: flex; align-items: center; gap: var(--spacing-sm);
+	padding: var(--spacing-sm) var(--spacing-md);
+	border-radius: var(--radius-md);
+	margin-bottom: var(--spacing-md);
+	font-size: var(--text-sm);
 }
+
+.alert--error { background: #ef444419; color: var(--accent-danger); }
+.alert--info { background: var(--accent-info-bg); color: var(--accent-info); }
+.alert--success { background: #10b98119; color: var(--accent-success); }
+
+/* ===== OAuth ===== */
+.oauth-buttons {
+	display: flex; flex-direction: column;
+	gap: var(--spacing-sm); margin-bottom: var(--spacing-md);
+}
+
+.btn-oauth {
+	width: 100%; gap: var(--spacing-sm);
+	padding: 0.625rem 1rem;
+	background: #000; color: #fff;
+	border: 1px solid #000; border-radius: var(--radius-md);
+	font-weight: 500; font-size: 0.95rem;
+}
+
+.btn-oauth:hover:not(:disabled) { background: #1a1a1a; }
+.btn-oauth:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.auth-divider {
+	display: flex; align-items: center; gap: var(--spacing-sm);
+	margin: var(--spacing-sm) 0 var(--spacing-md);
+	color: var(--text-muted); font-size: var(--text-xs);
+}
+
+.auth-divider::before, .auth-divider::after {
+	content: ""; flex: 1; height: 1px;
+	background: var(--border-color);
+}
+
+/* ===== Auth form row actions (e.g. "Forgot password?") ===== */
+.auth-actions { text-align: right; margin-bottom: var(--spacing-md); }

@@ -122,6 +122,12 @@ pub(super) fn oauth_provider_icon(provider: &str) -> Markup {
 /// reads `auth_url`, and redirects. The fetch path uses same-origin cookies
 /// implicitly. On error we surface the message in the existing `#error`
 /// area so it's consistent with the email/password flow.
+///
+/// `login.rs` renders `#error`/`#info` via `components::alert`, which starts
+/// `hidden` (not `style="display:none"`). `base.css` pins
+/// `[hidden] { display: none !important; }`, so revealing the element must
+/// clear the `hidden` IDL property (`el.hidden = false`), not set
+/// `el.style.display` — a plain inline style loses to that `!important`.
 pub(super) fn oauth_button_script() -> &'static str {
     r#"
 async function oauthStart(provider){
@@ -132,7 +138,7 @@ async function oauthStart(provider){
     if(!r.ok||!d.auth_url){throw new Error((d&&d.error&&d.error.message)||d&&d.message||'OAuth start failed');}
     window.location.href=d.auth_url;
   }catch(ex){
-    if(err){err.textContent=ex.message||'Failed to start OAuth flow';err.style.display='flex';}
+    if(err){err.textContent=ex.message||'Failed to start OAuth flow';err.hidden=false;}
   }
 }
 "#
@@ -168,17 +174,21 @@ pub(super) fn pw_toggle_js() -> &'static str {
 /// the auth cookie from the response body client-side in that case. On native
 /// targets the server's `Set-Cookie` already works, so we emit a version of
 /// this JS without the client-side assignment — no HttpOnly regression.
+///
+/// `#error`/`#info` are `components::alert`, which starts `hidden`. Toggling
+/// visibility must clear/set the `hidden` IDL property, not `style.display`
+/// — see the doc comment on `oauth_button_script`.
 pub(super) fn login_script() -> &'static str {
     #[cfg(target_arch = "wasm32")]
     {
         r#"
 var $=function(id){return document.getElementById(id)};
-function showErr(m){var e=$('error');e.textContent=m;e.style.display='flex';$('info').style.display='none'}
-function showInfo(m){var i=$('info');i.textContent=m;i.style.display='block';$('error').style.display='none'}
+function showErr(m){var e=$('error');e.textContent=m;e.hidden=false;$('info').hidden=true}
+function showInfo(m){var i=$('info');i.textContent=m;i.hidden=false;$('error').hidden=true}
 async function handleLogin(ev){
   ev.preventDefault();
   var btn=$('btn');btn.disabled=true;btn.textContent='Signing in...';
-  $('error').style.display='none';$('info').style.display='none';
+  $('error').hidden=true;$('info').hidden=true;
   try{
     var r=await fetch('/b/auth/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('email').value,password:$('password').value})});
     var d=await r.json();
@@ -198,7 +208,7 @@ async function handleLogin(ev){
 async function handleForgot(){
   var email=$('email').value.trim();
   if(!email){showErr('Enter your email address first.');return}
-  $('error').style.display='none';$('info').style.display='none';
+  $('error').hidden=true;$('info').hidden=true;
   try{await fetch('/b/auth/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email})})}catch(e){}
   showInfo('If that email is registered, a password reset link has been sent.');
 }
@@ -208,12 +218,12 @@ async function handleForgot(){
     {
         r#"
 var $=function(id){return document.getElementById(id)};
-function showErr(m){var e=$('error');e.textContent=m;e.style.display='flex';$('info').style.display='none'}
-function showInfo(m){var i=$('info');i.textContent=m;i.style.display='block';$('error').style.display='none'}
+function showErr(m){var e=$('error');e.textContent=m;e.hidden=false;$('info').hidden=true}
+function showInfo(m){var i=$('info');i.textContent=m;i.hidden=false;$('error').hidden=true}
 async function handleLogin(ev){
   ev.preventDefault();
   var btn=$('btn');btn.disabled=true;btn.textContent='Signing in...';
-  $('error').style.display='none';$('info').style.display='none';
+  $('error').hidden=true;$('info').hidden=true;
   try{
     var r=await fetch('/b/auth/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('email').value,password:$('password').value})});
     var d=await r.json();
@@ -226,7 +236,7 @@ async function handleLogin(ev){
 async function handleForgot(){
   var email=$('email').value.trim();
   if(!email){showErr('Enter your email address first.');return}
-  $('error').style.display='none';$('info').style.display='none';
+  $('error').hidden=true;$('info').hidden=true;
   try{await fetch('/b/auth/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email})})}catch(e){}
   showInfo('If that email is registered, a password reset link has been sent.');
 }
