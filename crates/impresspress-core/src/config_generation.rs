@@ -49,6 +49,22 @@ pub fn config_write_generation() -> u64 {
     CONFIG_WRITE_GENERATION.with(Cell::get)
 }
 
+/// Whether a write to `table` can change what the config snapshot holds.
+///
+/// Narrower than [`crate::cache_key::bumps_config_version`] on purpose. That
+/// predicate covers every table a runtime bakes in — variables,
+/// block_settings and wrap_grants — because all three must move the KV
+/// version stamp. The snapshot is built from the VARIABLES table alone, so
+/// bumping it for the other two would discard a perfectly good snapshot:
+/// every block writes its migration state to `block_settings` during its own
+/// `Init` (`migration_helper::write_state`), so on a first boot after a code
+/// change that is one discarded snapshot and one re-query per block — the
+/// per-block read amplification this whole mechanism exists to remove,
+/// reintroduced in the pass that can least afford it.
+pub fn writes_invalidate_config_snapshot(table: &str) -> bool {
+    table == crate::blocks::admin::VARIABLES_TABLE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +88,29 @@ mod tests {
         let after_one = config_write_generation();
         note_config_write();
         assert_ne!(config_write_generation(), after_one);
+    }
+
+    /// Only the table the snapshot is BUILT from may invalidate it.
+    ///
+    /// `block_settings` is the one that matters: every block writes its
+    /// migration state there during `Init`, so treating those writes as
+    /// snapshot-invalidating costs one full re-query per block on a first
+    /// boot — exactly the amplification the snapshot removes.
+    #[test]
+    fn only_variables_writes_invalidate_the_snapshot() {
+        assert!(writes_invalidate_config_snapshot(
+            crate::blocks::admin::VARIABLES_TABLE
+        ));
+        assert!(!writes_invalidate_config_snapshot(
+            crate::blocks::admin::BLOCK_SETTINGS_TABLE
+        ));
+        assert!(!writes_invalidate_config_snapshot("unrelated_table"));
+
+        // Every table this returns true for must also bump the KV version
+        // stamp, or a runtime could rebuild from config no isolate is told
+        // to re-read.
+        assert!(crate::cache_key::bumps_config_version(
+            crate::blocks::admin::VARIABLES_TABLE
+        ));
     }
 }

@@ -74,8 +74,14 @@ fn key_column(table: CachedTable) -> &'static str {
 /// NO PRODUCTION CALLER TODAY. `D1ConfigSource` was the only one; it now reads
 /// the variables table once via [`full_table_list_opts`] and groups in memory,
 /// because one query per block meant one KV read per block on every cold
-/// hydration. Nothing consequently reads `cfg:v1:variables:*` any more — those
-/// keys are written and invalidated but never served, and expire on their TTL.
+/// hydration. With no caller issuing that shape, [`read_key`] never matches a
+/// variables read, so `cfg:v1:variables:*` keys are no longer written EITHER —
+/// any left over from before expire on their 24h TTL. Writes still emit an
+/// invalidating `delete` per variables row (see [`invalidate_keys`]),
+/// which now targets keys that cannot exist; that is deliberate belt-and-braces
+/// for a future cached per-block reader rather than an oversight, but it does
+/// spend a KV write op per row and is worth revisiting if the write budget
+/// tightens.
 /// This constructor stays because the per-block shape is still what
 /// [`read_key`] recognizes and [`write_key`] invalidates against, and the
 /// round-trip test pins the two together.
