@@ -431,6 +431,120 @@ async fn activation_validates_merged_values_not_stale_record() {
     );
 }
 
+/// The per-seller product cap counts through `repo::products::count`, which
+/// is live-only. So a create body that carries `deleted_at` lands a row the
+/// cap cannot see, and the seller keeps their slot free — unbounded creates
+/// against a cap of one. `deleted_at` belongs to the delete/restore doors,
+/// never to a request body, so create must strip it exactly as both update
+/// handlers already do.
+#[tokio::test]
+async fn a_seller_cannot_outrun_the_product_cap_by_supplying_deleted_at() {
+    let test_ctx = ctx_with(&[
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+        ("IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS", "1"),
+    ])
+    .await;
+
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "cap_dodger",
+        json!({
+            "name": "Invisible to the cap",
+            "product_template_id": "simple_product",
+            "currency": "USD",
+            "deleted_at": "2020-01-01T00:00:00Z"
+        }),
+    );
+    let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let product_id = created["id"].as_str().expect("created product").to_string();
+
+    let stored = db::get(&test_ctx, repo::products::TABLE, &product_id)
+        .await
+        .expect("row exists");
+    assert!(
+        matches!(stored.data.get("deleted_at"), None | Some(Value::Null)),
+        "a create body must not be able to set deleted_at; stored {:?}",
+        stored.data.get("deleted_at")
+    );
+
+    // The seller's one slot is now used, so a second create is refused. It
+    // would not be if the first product were invisible to the live-only
+    // count.
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "cap_dodger",
+        json!({
+            "name": "Over the cap",
+            "product_template_id": "simple_product",
+            "currency": "USD"
+        }),
+    );
+    let error = terminal_error(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains("product limit reached (1)"),
+        "{}",
+        error.message
+    );
+}
+
+/// `deleted_at` carries a column invariant (see `repo::products`): SQL NULL
+/// for a live product, an RFC3339 stamp for a deleted one, never the empty
+/// string. `''` is the value that would split "live" into two disagreeing
+/// answers — SQL reads `'' IS NOT NULL` as deleted, a string-emptiness check
+/// reads it as live. Nothing a caller can send may produce it, on any tier or
+/// verb.
+#[tokio::test]
+async fn no_handler_path_can_write_an_empty_deleted_at() {
+    let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+
+    async fn assert_null(test_ctx: &crate::test_support::TestContext, id: &str, via: &str) {
+        let stored = db::get(test_ctx, repo::products::TABLE, id)
+            .await
+            .unwrap_or_else(|e| panic!("row {id} exists after {via}: {}", e.message));
+        assert!(
+            matches!(stored.data.get("deleted_at"), None | Some(Value::Null)),
+            "{via} wrote deleted_at = {:?}; the column is NULL or a timestamp, never anything else",
+            stored.data.get("deleted_at")
+        );
+    }
+
+    let blank = json!({
+        "name": "Blank stamp",
+        "product_template_id": "simple_product",
+        "currency": "USD",
+        "deleted_at": ""
+    });
+
+    let (msg, input) = admin_create_msg("/admin/b/products/products", blank.clone());
+    let admin_created = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let admin_id = admin_created["id"].as_str().expect("admin create").to_string();
+    assert_null(&test_ctx, &admin_id, "admin create").await;
+
+    let (msg, input) = update_msg(
+        &format!("/admin/b/products/products/{admin_id}"),
+        "admin_1",
+        json!({"deleted_at": ""}),
+    );
+    let mut msg = msg;
+    msg.set_meta("auth.user_roles", "admin");
+    output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_null(&test_ctx, &admin_id, "admin update").await;
+
+    let (msg, input) = create_msg("/b/products/products", "blank_seller", blank);
+    let user_created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let user_id = user_created["id"].as_str().expect("user create").to_string();
+    assert_null(&test_ctx, &user_id, "user create").await;
+
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{user_id}"),
+        "blank_seller",
+        json!({"deleted_at": ""}),
+    );
+    output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_null(&test_ctx, &user_id, "user update").await;
+}
+
 #[tokio::test]
 async fn admin_seller_policy_is_enforced_by_apis_and_reflected_in_the_wizard() {
     let test_ctx = ctx_with(&[

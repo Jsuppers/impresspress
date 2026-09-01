@@ -17,6 +17,48 @@ use crate::{
     util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
 
+// Columns the products table owns internally: ownership, moderation state,
+// the lifecycle stamps, and the Stripe/versioning linkage. None of them is a
+// caller-supplied value on any tier or verb — each has a dedicated writer that
+// maintains its invariants (`approve_product`/`reject_product`/`suspend` for
+// `approval_status`, the delete/restore endpoints for `deleted_at`, the Stripe
+// sync for `stripe_product_id`, the publish flow for `submitted_at`/
+// `published_at`, seller onboarding for `owner_*`/`seller_account_id`,
+// versioning for `current_version`). A generic create or PATCH that let a body
+// through verbatim would write them behind those writers' backs: an admin
+// PATCH of `{"stripe_product_id": "prod_wrong"}` desyncs the row from the
+// Stripe catalog, `{"owner_kind":…,"owner_id":…}` re-parents a seller's
+// product, and a create carrying `deleted_at` lands a row that
+// `ensure_product_capacity`'s live-only count cannot see.
+//
+// One list, four handlers: admin/user × create/update. The admin tier is not
+// exempt — this is not a privilege boundary (an admin has other, deliberate
+// doors to each of these fields) but an integrity one, and the two update
+// handlers previously disagreeing about it is exactly the kind of drift a
+// single shared constant prevents.
+const INTERNAL_FIELDS: &[&str] = &[
+    "created_by",
+    "owner_kind",
+    "owner_id",
+    "seller_account_id",
+    "approval_status",
+    "stripe_product_id",
+    "current_version",
+    "submitted_at",
+    "published_at",
+    "deleted_at",
+];
+
+/// Drop every [`INTERNAL_FIELDS`] entry from a caller-supplied request body,
+/// so what remains is only what a caller may set. Handlers that legitimately
+/// write one of these fields do so *after* this call, from their own computed
+/// value.
+fn strip_internal_fields(data: &mut HashMap<String, serde_json::Value>) {
+    for field in INTERNAL_FIELDS {
+        data.remove(*field);
+    }
+}
+
 /// Escape SQL LIKE wildcards (`%`, `_`) and the escape char (`\`) in user
 /// input so a user searching for `100% off` doesn't also match arbitrary
 /// characters.
@@ -165,6 +207,10 @@ pub(super) async fn handle_create_product(
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
+    // Runs before `defaults` is applied, so the `or_insert` below always
+    // inserts for the four internal fields it covers — a body can no longer
+    // pre-empt them, and it can no longer smuggle in the six it does not.
+    strip_internal_fields(&mut data);
     stamp_created(&mut data);
     for (key, val) in defaults {
         data.entry(key).or_insert(val);
@@ -200,10 +246,7 @@ pub(super) async fn handle_update_product(
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
-    // `deleted_at` is `restore`'s door, not this one's: an admin PATCH must
-    // not be able to soft-delete or resurrect a product by writing this
-    // field directly, bypassing the dedicated delete/restore endpoints.
-    data.remove("deleted_at");
+    strip_internal_fields(&mut data);
     stamp_updated(&mut data);
     match repo::products::update(ctx, id, data).await {
         Ok(record) => ok_json(&record),
@@ -522,6 +565,11 @@ pub(super) async fn handle_user_create_product(
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
+    // Before the capacity check, not after: a body carrying `deleted_at`
+    // would otherwise create a row the check's live-only count cannot see,
+    // leaving the seller's slot free for the next create and the one after
+    // that.
+    strip_internal_fields(&mut data);
     if let Err(response) = seller_policy::ensure_product_capacity(ctx, &user_id).await {
         return response;
     }
@@ -633,20 +681,7 @@ pub(super) async fn handle_user_update_product(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    for protected in [
-        "created_by",
-        "owner_kind",
-        "owner_id",
-        "seller_account_id",
-        "approval_status",
-        "stripe_product_id",
-        "current_version",
-        "submitted_at",
-        "published_at",
-        "deleted_at",
-    ] {
-        data.remove(protected);
-    }
+    strip_internal_fields(&mut data);
     if let Err(response) = seller_policy::validate_product_fields(ctx, &data).await {
         return response;
     }
