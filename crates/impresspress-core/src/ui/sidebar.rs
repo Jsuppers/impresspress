@@ -53,11 +53,17 @@ pub struct NavGroup {
 /// Grouped sidebar — same layout as `sidebar(...)`, but items are
 /// partitioned into labeled groups. The brand at top, the user pinned
 /// at bottom (when `user` is `Some`).
+/// `logo_url` (the header/email wordmark, `WAFER_RUN_SHARED__LOGO_URL`) is
+/// accepted but intentionally unused here: the navy sidebar always renders
+/// the icon + white text brand, never an `<img>` of that wordmark PNG (see
+/// the `.sidebar__brand` block below). The parameter is kept so this
+/// signature still matches `shell()`'s, which threads the same `SiteConfig`
+/// fields through to every chrome surface.
 pub fn sidebar_grouped(
     groups: &[NavGroup],
     user: Option<&crate::ui::UserInfo>,
     current_path: &str,
-    logo_url: &str,
+    _logo_url: &str,
     logo_icon_url: &str,
     app_name: &str,
 ) -> maud::Markup {
@@ -69,11 +75,13 @@ pub fn sidebar_grouped(
                 @if !logo_icon_url.is_empty() {
                     img src=(logo_icon_url) alt="" .sidebar__brand-icon;
                 }
-                @if !logo_url.is_empty() {
-                    img src=(logo_url) alt=(app_name) .sidebar__brand-wordmark;
-                } @else {
-                    span .sidebar__brand-name { (app_name) }
-                }
+                // The navy sidebar always shows the white text wordmark, never
+                // an `<img>` of `logo_url` — that PNG is dark-ink artwork drawn
+                // for the old white sidebar and is illegible on navy (task-11
+                // review finding). `logo_url` (header/email wordmark) is a
+                // different surface's concern; the sidebar only ever needs the
+                // square icon (`logo_icon_url`) plus this text.
+                span .sidebar__brand-name { (app_name) }
             }
             div .sidebar__panel {
                 div .sidebar__groups {

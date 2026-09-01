@@ -110,8 +110,27 @@ pub fn line_chart_card(
     view_href: &str,
 ) -> Markup {
     let max = data.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
-    // Three gridlines plus the baseline, matching the mockup's 0/1/2/3.
-    let ticks: Vec<i64> = (0..=3).map(|i| max * i / 3).collect();
+    // Four gridlines (top/max down to the baseline/0), matching the mockup's
+    // 0/1/2/3. Integer division repeats values for a small `max` — e.g.
+    // max=1 gives max*i/3 for i=3..=0 as [1, 0, 0, 0] — which would render
+    // the same number three times in a row and read as a rendering bug, not
+    // "count is small". `tick_labels` keeps all four gridlines (geometry
+    // `line_chart_card`'s tests and the CSS depend on is unchanged) but
+    // blanks a label that repeats the value immediately above it, so the
+    // axis never shows a duplicate.
+    let ticks: Vec<i64> = (0..=3).rev().map(|i| max * i / 3).collect();
+    let mut prev_tick: Option<i64> = None;
+    let tick_labels: Vec<Option<i64>> = ticks
+        .iter()
+        .map(|&t| {
+            if prev_tick == Some(t) {
+                None
+            } else {
+                prev_tick = Some(t);
+                Some(t)
+            }
+        })
+        .collect();
     let step = if data.len() > 1 { 100.0 / (data.len() - 1) as f64 } else { 0.0 };
     let pts = |f: &dyn Fn(usize, i64) -> String| {
         data.iter().enumerate().map(|(i, (_, v))| f(i, *v)).collect::<Vec<_>>().join(" ")
@@ -135,7 +154,9 @@ pub fn line_chart_card(
             div .card__body {
                 div .chart {
                     div .chart__yaxis {
-                        @for t in ticks.iter().rev() { span .chart__ytick { (t) } }
+                        @for label in &tick_labels {
+                            span .chart__ytick { @if let Some(v) = label { (v) } }
+                        }
                     }
                     // `--chart-color` is declared on this wrapper (not the <svg>
                     // itself) so it's visible to both the plot and the `.chart__dot`
@@ -239,5 +260,51 @@ mod tests {
         assert!(m.contains("chart__ytick"), "y-axis ticks missing");
         assert!(m.contains("Aug 1") && m.contains("Aug 2"), "x range labels missing");
         assert!(m.contains("chart__dot"), "endpoint dot missing");
+    }
+
+    #[test]
+    fn line_chart_card_small_max_series_has_no_duplicate_y_tick_labels() {
+        // A max of 1 (e.g. a fresh install with a single user) previously
+        // computed integer-division ticks of [1, 0, 0, 0] — three identical
+        // "0" labels in a row, which reads as a rendering bug rather than
+        // "the count is small". This is the common case for a fresh
+        // install, not an edge case.
+        let data = vec![("2026-08-01".to_string(), 0), ("2026-08-02".to_string(), 1)];
+        let m = super::line_chart_card(
+            "New users",
+            "Last 30 days",
+            &data,
+            "var(--primary-color)",
+            "/b/admin/users",
+        )
+        .into_string();
+
+        // Isolate the y-axis tick spans from the rest of the markup (the
+        // plot itself also contains numbers, e.g. viewBox coordinates).
+        let yaxis_start = m.find("chart__yaxis").expect("yaxis missing");
+        let yaxis_end = m.find("chart__plot-wrap").expect("plot-wrap missing");
+        let yaxis_html = &m[yaxis_start..yaxis_end];
+        let labels: Vec<&str> = yaxis_html
+            .split("chart__ytick\">")
+            .skip(1)
+            .map(|s| s.split("</span>").next().unwrap())
+            .collect();
+
+        assert_eq!(
+            labels.len(),
+            4,
+            "gridline geometry (4 ticks) must be unchanged: {labels:?}"
+        );
+        let shown: Vec<&&str> = labels.iter().filter(|l| !l.is_empty()).collect();
+        for pair in shown.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "adjacent shown y-axis labels must not repeat: {labels:?}"
+            );
+        }
+        assert!(
+            labels.contains(&"1"),
+            "the max value must still be labeled: {labels:?}"
+        );
     }
 }

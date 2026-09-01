@@ -140,8 +140,11 @@
 	padding: 0 var(--spacing-md);
 	min-width: 0;
 }
-.sidebar__brand-icon { display: none; height: 40px; width: 40px; object-fit: contain; flex-shrink: 0; }
-.sidebar__brand-wordmark { max-width: 100%; height: 48px; width: auto; object-fit: contain; display: block; }
+/* Square mark only -- the long dark-ink wordmark PNG was drawn for the old
+   white sidebar and is illegible on navy, so the brand row never renders it
+   (see `ui::sidebar::sidebar_grouped`). This icon shows in both the
+   expanded (icon + white text) and collapsed (icon only) states. */
+.sidebar__brand-icon { display: block; height: 40px; width: 40px; object-fit: contain; flex-shrink: 0; }
 .sidebar__brand-name { font-size: var(--text-lg); font-weight: 600; color: #ffffff; }
 
 /* Maps to the brief's `.sidebar__footer` rail -- the sidebar has no
@@ -188,12 +191,13 @@
 /* Collapsed sidebar: icon-only mode */
 .shell:has(.sidebar.collapsed) { grid-template-columns: var(--sidebar-collapsed-width) minmax(0, 1fr); }
 .sidebar.collapsed { width: var(--sidebar-collapsed-width); }
-.sidebar.collapsed .sidebar__brand-wordmark,
 .sidebar.collapsed .sidebar__brand-name,
 .sidebar.collapsed .sidebar__group-label,
 .sidebar.collapsed .sidebar__nav-label,
 .sidebar.collapsed .sidebar__user-text { display: none; }
-.sidebar.collapsed .sidebar__brand-icon { display: block; }
+/* .sidebar__brand-icon has no collapsed override -- it's `display: block` by
+   default now (shown in both states), so collapsing only needs to hide the
+   name/labels above. */
 /* Collapsed keeps the exact expanded structure — brand row above the nav
    panel, both on the same flush navy slab — just narrower with the icon
    mark. (An earlier attempt merged the brand INTO the panel with a negative
