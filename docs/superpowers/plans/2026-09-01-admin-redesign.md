@@ -713,73 +713,103 @@ git commit -m "feat(deploy): publish UI assets to R2 and set asset base URL"
 
 **Added mid-execution.** Task 4's implementer found that nothing serves the published assets, and the controller confirmed `impresspress-cloudflare` contains zero `STATIC_PREFIX` references. The spec's URL-resolution branch 3 — *"R2/storage backend configured → `/b/static/`, worker streams from R2"* — was never assigned to a task: Task 3 was explicitly told not to add a fetch path, and Task 4 only published and configured. Without this task, a lean Cloudflare deploy with R2 uploads every asset, points `IMPRESSPRESS_ASSET_BASE_URL` at `/b/static/`, and then 404s every one of them — an admin UI with no CSS at all.
 
+**Re-scoped after the first attempt escalated.** The original sketch put the read-through in `impresspress-core`'s `blocks/system.rs`, reading storage through `ctx: &dyn Context`. That does not work, and the escalation was verified:
+
+- `Context` (external `wafer-run`, pinned rev `61e68a0`) exposes `call_block` and `config_get` and **no storage capability** — confirmed in `wafer-run/src/context.rs:406,439`.
+- The only reachable storage path, `ctx.call_block("wafer-run/storage", …)`, namespaces every key under the *calling block's* name and requires WRAP authorization. Task 4 deliberately wrote flat, root-level, content-hashed keys, so the key shapes are incompatible and the security model is wrong for a public asset.
+- `impresspress-cloudflare`'s `run_with_config` already special-cases paths before block dispatch with raw `env` access (`lib.rs:618-635`, for `/_deploy/verify`, `/_deploy/prepared`, `/_deploy/init`, `/_deploy/prepare`) — verified. That is the layer with the R2 binding, and the established precedent for exactly this shape.
+
+So the read-through belongs in the Cloudflare adapter, not in target-agnostic core. `blocks/system.rs`'s lean arm stays a 404: correct for a lean build on a target with no object storage.
+
 **Files:**
-- Modify: `crates/impresspress-core/src/blocks/system.rs` (the `#[cfg(not(feature = "embed-assets"))]` arm)
-- Modify: `crates/impresspress-cloudflare/src/` — wire the storage backend to the static route
-- Test: both crates' test modules
+- Modify: `crates/impresspress-cloudflare/src/lib.rs` (`run_with_config`, alongside the existing special-cased paths)
+- Test: `crates/impresspress-cloudflare`'s test module
+- Leave `crates/impresspress-core/src/blocks/system.rs` **unchanged**
 
 **Interfaces:**
-- Consumes: `ui::assets::{ASSETS, entry}` (Task 1), `resolve_asset_base_url` + the R2 keys written by Task 4.
-- Produces: a read-through so `/b/static/<hashed-filename>` resolves from object storage when the bytes are not embedded.
+- Consumes: `impresspress_core::ui::assets::ASSETS` and `impresspress_core::routing::STATIC_PREFIX` (Task 1 / existing), plus the flat R2 keys Task 4 writes.
+- Produces: `/b/static/<hashed-filename>` resolving from R2 when the bytes are not embedded.
 
-- [ ] **Step 1: Write the failing test**
+`ASSETS` is available in a lean build — `build.rs` generates the manifest regardless of the feature; only `bytes()` is gated. That is what makes this possible.
 
-The asset must come back from storage, with the manifest's content type and the immutable cache header, exactly as the embedded path returns it:
+- [ ] **Step 1: Extract a pure, testable seam**
+
+A worker `fetch` handler is awkward to unit-test, so keep the decision logic pure and the I/O thin around it:
 
 ```rust
-#[tokio::test]
-async fn lean_build_serves_static_asset_from_storage() {
-    let ctx = TestContext::new().await;
-    let e = crate::ui::assets::entry("app.css");
-    ctx.put_object(&format!("{}{}", RELEASES_ROOT, e.filename), b"body{}").await;
-
-    let res = handle(&ctx, &anon_msg("retrieve", &format!("/b/static/{}", e.filename))).await;
-
-    assert_eq!(res.status, 200);
-    assert_eq!(res.header("Content-Type"), e.content_type);
-    assert_eq!(res.header("Cache-Control"), "public, max-age=31536000, immutable");
-}
-
-#[tokio::test]
-async fn lean_build_404s_an_asset_absent_from_storage() {
-    let ctx = TestContext::new().await;
-    let res = handle(&ctx, &anon_msg("retrieve", "/b/static/app-deadbeef.css")).await;
-    assert_eq!(res.status, 404);
+/// Resolve a `/b/static/…` request path to the R2 object key and content type
+/// for that asset, or `None` if the path is not a known asset.
+///
+/// The manifest lookup IS the security boundary: a filename absent from
+/// `ASSETS` returns `None` before any key is constructed, so no request input
+/// ever reaches a storage key.
+pub(crate) fn static_asset_target(path: &str) -> Option<(&'static str, &'static str)> {
+    let filename = path.strip_prefix(impresspress_core::routing::STATIC_PREFIX)?;
+    let e = impresspress_core::ui::assets::ASSETS
+        .iter()
+        .find(|e| e.filename == filename)?;
+    Some((e.filename, e.content_type))
 }
 ```
 
-Adapt the harness calls to `TestContext`'s real API — check `crates/impresspress-core/src/test_support.rs` for the actual object-put and response-assertion helpers, and follow whatever the neighbouring `blocks/system.rs` tests already do.
+- [ ] **Step 2: Write the failing tests**
 
-- [ ] **Step 2: Run to verify it fails**
+```rust
+#[test]
+fn static_asset_target_resolves_a_known_asset() {
+    let e = impresspress_core::ui::assets::entry("app.css");
+    let path = format!("{}{}", impresspress_core::routing::STATIC_PREFIX, e.filename);
+    let (key, ct) = super::static_asset_target(&path).expect("known asset must resolve");
+    assert_eq!(key, e.filename, "R2 key is the flat hashed filename Task 4 uploads");
+    assert_eq!(ct, e.content_type);
+}
 
-Run: `cargo test -p impresspress-core --lib blocks::system`
-Expected: FAIL — the lean arm currently falls through to a 404 for every path.
+#[test]
+fn static_asset_target_rejects_unknown_and_traversal_before_building_a_key() {
+    for p in ["/b/static/app-deadbeef.css", "/b/static/../../etc/passwd",
+              "/b/static/", "/not-static/app.css"] {
+        assert!(super::static_asset_target(p).is_none(), "must not resolve: {p}");
+    }
+}
+```
 
-- [ ] **Step 3: Implement the read-through**
+- [ ] **Step 3: Run to verify they fail**
 
-Replace the no-op `#[cfg(not(feature = "embed-assets"))]` arm so it looks the filename up in the manifest, fetches that key from the storage backend, and streams it back with the manifest's content type and the same immutable cache header the embedded path uses. A filename absent from the manifest must 404 without touching storage — the manifest lookup stays the security boundary, exactly as in Task 3.
+Run: `cargo test -p impresspress-cloudflare static_asset_target`
+Expected: FAIL — function not found.
 
-Serving must stay async end to end. **No `poll_once` / `block_on`** — the project forbids sync bridges, and the storage read is async.
+- [ ] **Step 4: Implement**
 
-- [ ] **Step 4: Run to verify it passes**
+Add `static_asset_target`, then in `run_with_config` — beside the existing `/_deploy/*` special cases, and **before** block dispatch — handle a matching path by fetching that key from the R2 bucket binding and returning it with the manifest's content type and `Cache-Control: public, max-age=31536000, immutable`, matching the embedded path's headers exactly. A miss in R2 is a 404.
 
-Run: `cargo test -p impresspress-core --lib blocks::system`
+Gate this on `#[cfg(not(feature = "embed-assets"))]`, or let the embedded path win first — either is fine, but an embedded build must not pay an R2 round-trip.
+
+Serving stays async end to end. **No `poll_once` / `block_on`.**
+
+- [ ] **Step 5: Run to verify they pass**
+
+Run: `cargo test -p impresspress-cloudflare static_asset_target`
 Expected: PASS.
 
-- [ ] **Step 5: Confirm both feature paths still work**
+- [ ] **Step 6: Confirm nothing regressed**
 
 ```bash
-cargo test -p impresspress-core --lib > /tmp/full.log 2>&1; echo "default: $?"
+cargo test -p impresspress-core --lib > /tmp/full.log 2>&1; echo "core: $?"
+cargo test -p impresspress-cloudflare > /tmp/cf.log 2>&1; echo "cloudflare: $?"
 cargo build -p impresspress-core --no-default-features --features sqlite > /tmp/lean.log 2>&1; echo "lean: $?"
 ```
 
-Expected: both `0`, with no regression against the 1270-test baseline.
+Expected: all `0`, with no regression against the 1270-test core baseline.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Make Task 4's doc comments true**
+
+Task 4 left two comments reading as though `/b/static/` already served the uploaded objects — `deploy.rs:229-231` and `embed_cloudflare.rs:76`. This task is what makes them accurate. Re-read both and correct any wording still overstating what works.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/impresspress-core/src/blocks/system.rs crates/impresspress-cloudflare/src
-git commit -m "feat(system): serve static assets from R2 when not embedded"
+git add crates/impresspress-cloudflare/src crates/impresspress/src/cli/helpers/cloudflare
+git commit -m "feat(cloudflare): serve /b/static/ from R2 when assets are not embedded"
 ```
 
 ---
