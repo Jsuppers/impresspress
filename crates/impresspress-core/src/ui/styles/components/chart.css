@@ -118,6 +118,14 @@
  * preserveAspectRatio="none" so it stretches to whatever size the card
  * gives it; `vector-effect: non-scaling-stroke` on the line and gridlines
  * keeps stroke width uniform despite that non-uniform scale.
+ *
+ * The endpoint dot is deliberately NOT an SVG <circle>: the same
+ * non-uniform scale that non-scaling-stroke corrects for strokes also
+ * distorts a circle's fill geometry into an ellipse, and vector-effect
+ * does not apply to fill. `.chart__dot` is an HTML div positioned by
+ * percentage (via the `--dot-y` custom property) over `.chart__plot-wrap`
+ * instead, so it stays circular regardless of the plot's rendered aspect
+ * ratio.
  */
 .chart {
 	display: flex;
@@ -139,8 +147,13 @@
 	line-height: 1;
 }
 
-.chart__plot {
+.chart__plot-wrap {
+	position: relative;
 	flex: 1;
+}
+
+.chart__plot {
+	display: block;
 	width: 100%;
 	height: 100%;
 	overflow: visible;
@@ -164,7 +177,14 @@
 }
 
 .chart__dot {
-	fill: var(--chart-color);
+	position: absolute;
+	left: 100%;
+	top: var(--dot-y);
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--chart-color);
+	transform: translate(-50%, -50%);
 }
 
 /* Sparkline — tiny decorative trend line inside a stat tile. */

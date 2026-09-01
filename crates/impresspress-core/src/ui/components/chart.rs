@@ -60,16 +60,22 @@ pub fn sparkline(series: &[i64], color_var: &str) -> Markup {
     }
     let max = series.iter().copied().max().unwrap_or(0);
     let min = series.iter().copied().min().unwrap_or(0);
-    // A flat series has zero span; clamp the divisor so it renders as a
-    // centred straight line instead of dividing by zero.
-    let span = (max - min).max(1) as f64;
+    // A flat series has zero span. Rendering it along the bottom edge would
+    // read as "zero" / "lowest", which is wrong when the value is nonzero —
+    // a flat line means "no change", so it belongs at the vertical centre
+    // of the 24-tall viewBox (y = 12.0), not at y = 24.0.
+    let flat = max == min;
     let step = if series.len() > 1 { 100.0 / (series.len() - 1) as f64 } else { 0.0 };
     let points = series
         .iter()
         .enumerate()
         .map(|(i, v)| {
             let x = i as f64 * step;
-            let y = 24.0 - ((*v - min) as f64 / span) * 24.0;
+            let y = if flat {
+                12.0
+            } else {
+                24.0 - ((*v - min) as f64 / (max - min) as f64) * 24.0
+            };
             format!("{x:.2},{y:.2}")
         })
         .collect::<Vec<_>>()
@@ -81,7 +87,13 @@ pub fn sparkline(series: &[i64], color_var: &str) -> Markup {
             // rather than maud's `;` void syntax — it matters once a shape has
             // siblings, but keeping it consistent here avoids relying on the
             // enclosing `</svg>` to implicitly close a dangling tag.
-            polyline points=(points) fill="none" stroke="var(--chart-color)" stroke-width="1.5" {}
+            //
+            // `vector-effect="non-scaling-stroke"` matters here too: `.stat-spark`
+            // is 4rem x 1.5rem, a different aspect ratio than the 100x24 viewBox,
+            // so preserveAspectRatio="none" scales x and y unevenly. Without this,
+            // the stroke renders visibly thicker in one axis than the other.
+            polyline points=(points) fill="none" stroke="var(--chart-color)"
+                stroke-width="1.5" vector-effect="non-scaling-stroke" {}
         }
     }
 }
@@ -125,28 +137,42 @@ pub fn line_chart_card(
                     div .chart__yaxis {
                         @for t in ticks.iter().rev() { span .chart__ytick { (t) } }
                     }
-                    svg .chart__plot viewBox="0 0 100 60" preserveAspectRatio="none"
-                        role="img" aria-label=(format!("{title}, {subtitle}"))
-                        style=(format!("--chart-color: {color_var}")) {
-                        // maud's `;` void-element syntax emits `<tag attrs>` with no
-                        // closing tag for *any* element name — it isn't restricted to
-                        // real HTML5 void elements. Browsers require SVG shape elements
-                        // (line/polygon/polyline/circle) to be explicitly closed; without
-                        // that, each of these becomes a nested *child* of the previous
-                        // one instead of a sibling, and browsers refuse to paint shape
-                        // elements nested inside another shape element — only the first
-                        // gridline would render. `{}` (an empty block body) generates a
-                        // matched `<tag></tag>` pair, keeping them proper siblings.
-                        @for i in 0..4 {
-                            line .chart__gridline x1="0" x2="100"
-                                y1=(i as f64 * 20.0) y2=(i as f64 * 20.0) {}
+                    // `--chart-color` is declared on this wrapper (not the <svg>
+                    // itself) so it's visible to both the plot and the `.chart__dot`
+                    // div below — a CSS custom property only inherits to descendants
+                    // of the element it's set on, and the dot is now a sibling of the
+                    // svg, not nested inside it.
+                    div .chart__plot-wrap style=(format!("--chart-color: {color_var}")) {
+                        svg .chart__plot viewBox="0 0 100 60" preserveAspectRatio="none"
+                            role="img" aria-label=(format!("{title}, {subtitle}")) {
+                            // maud's `;` void-element syntax emits `<tag attrs>` with no
+                            // closing tag for *any* element name — it isn't restricted to
+                            // real HTML5 void elements. Browsers require SVG shape elements
+                            // (line/polygon/polyline/circle) to be explicitly closed; without
+                            // that, each of these becomes a nested *child* of the previous
+                            // one instead of a sibling, and browsers refuse to paint shape
+                            // elements nested inside another shape element — only the first
+                            // gridline would render. `{}` (an empty block body) generates a
+                            // matched `<tag></tag>` pair, keeping them proper siblings.
+                            @for i in 0..4 {
+                                line .chart__gridline x1="0" x2="100"
+                                    y1=(i as f64 * 20.0) y2=(i as f64 * 20.0) {}
+                            }
+                            polygon .chart__area points=(area) {}
+                            polyline .chart__line points=(line) fill="none" {}
                         }
-                        polygon .chart__area points=(area) {}
-                        polyline .chart__line points=(line) fill="none" {}
+                        // The endpoint dot is an HTML div positioned with CSS, not an
+                        // SVG <circle>. `viewBox="0 0 100 60"` with
+                        // preserveAspectRatio="none" scales x and y by different
+                        // factors depending on the rendered box size, which distorts a
+                        // circle's *fill geometry* into an ellipse — vector-effect only
+                        // preserves stroke width, it does not help here. A circular div
+                        // positioned by percentage over the plot stays circular at any
+                        // width; `--dot-y` is the one legitimate use of an inline style,
+                        // a dynamic runtime value passed as a custom property.
                         @if let Some((_, last)) = data.last() {
-                            circle .chart__dot cx="100"
-                                cy=(format!("{:.2}", 60.0 - (*last as f64 / max as f64) * 60.0))
-                                r="2" {}
+                            div .chart__dot
+                                style=(format!("--dot-y: {:.2}%", (1.0 - *last as f64 / max as f64) * 100.0)) {}
                         }
                     }
                 }
@@ -178,6 +204,19 @@ mod tests {
         let m = super::sparkline(&[4, 4, 4], "var(--primary-color)").into_string();
         assert!(m.contains("points="), "flat series must still render");
         assert!(!m.contains("NaN"), "flat series produced NaN: {m}");
+    }
+
+    #[test]
+    fn sparkline_flat_series_renders_at_vertical_centre() {
+        // A flat line means "no change"; drawing it along the bottom edge
+        // (y = 24.0) would misleadingly read as "zero" / "lowest" instead.
+        // It must sit at the viewBox's vertical midpoint, y = 12.0.
+        let m = super::sparkline(&[4, 4, 4], "var(--primary-color)").into_string();
+        let pts = m.split("points=\"").nth(1).unwrap().split('"').next().unwrap();
+        for point in pts.split_whitespace() {
+            let y = point.split(',').nth(1).unwrap();
+            assert_eq!(y, "12.00", "flat series must sit at the centre, not an edge: {pts}");
+        }
     }
 
     #[test]
