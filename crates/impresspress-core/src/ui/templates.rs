@@ -388,7 +388,7 @@ pub struct PublicPage<'a> {
 /// `.public-page__content` to inherit the prose typography.
 pub fn public_page(opts: PublicPage<'_>, body: Markup) -> Markup {
     // Build a tiny inline `:root` override only when overrides are present;
-    // otherwise the defaults from tokens.css apply.
+    // otherwise the defaults from styles/tokens.css apply.
     let inline_vars = match (opts.bg_color, opts.accent_color) {
         (None, None) => String::new(),
         (bg, accent) => {

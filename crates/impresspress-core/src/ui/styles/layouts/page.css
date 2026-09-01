@@ -1,0 +1,122 @@
+/* ===== Dashboard page — default rules ===== */
+/* Declared BEFORE the @media (max-width: 720px) block below so the mobile
+ * 1-col override (line ~358) wins at equal specificity. Companion
+ * @media (min-width: 1024px) widening rule lives next to the default. */
+.stats-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--spacing-md); }
+@media (min-width: 1024px) { .stats-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+
+/* ===== Responsive ===== */
+/* Live mobile rules migrated from former (max-width: 767px) block — Phase 5c. */
+@media (max-width: 720px) {
+	.page-header { padding: 1rem; }
+	.card { padding: 1rem; margin-bottom: 1rem; }
+	.stats-grid { grid-template-columns: 1fr; gap: 1rem; }
+	.stat-card { padding: 1rem; }
+	.stat-value { font-size: 1.5rem; }
+	.btn { width: 100%; justify-content: center; }
+	.pagination { flex-direction: column; align-items: stretch; gap: 1rem; }
+	.pagination-info { margin-right: 0; text-align: center; }
+	.pagination-controls { justify-content: center; }
+	.tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+	.tab { flex-shrink: 0; }
+}
+
+/* ===== Page templates — Phase 1 ===== */
+.page { display: flex; flex-direction: column; gap: var(--spacing-md); padding: var(--spacing-md); }
+.page-header { display: flex; align-items: flex-start; gap: var(--spacing-md); }
+.page-header__text { flex: 1; }
+.page-header__title { font-size: var(--text-xl); font-weight: 500; margin: 0; color: var(--text-primary); }
+.page-header__subtitle { font-size: var(--text-sm); color: var(--text-secondary); margin: 0.25rem 0 0; }
+.page-header__action { margin-left: auto; }
+.page-filters { display: flex; flex-wrap: wrap; gap: var(--spacing-sm); }
+.page-body { min-height: 100px; }
+.page-pagination { padding-top: var(--spacing-sm); }
+
+/* ===== Detail page ===== */
+.detail-hero { display: flex; align-items: center; gap: var(--spacing-md); }
+.detail-hero__icon { flex-shrink: 0; }
+.detail-hero__text { flex: 1; }
+.detail-hero__title { font-size: var(--text-xl); font-weight: 500; margin: 0; }
+.detail-hero__subtitle { font-size: var(--text-sm); color: var(--text-secondary); margin: 0.25rem 0 0; }
+.detail-hero__badges { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
+.detail-hero__action { margin-left: auto; }
+.detail-body { display: grid; grid-template-columns: 1fr; gap: var(--spacing-lg); }
+@media (min-width: 1024px) {
+	.detail-body { grid-template-columns: minmax(0,1fr) 280px; }
+}
+.detail-meta { background: var(--surface-3); border: 1px solid var(--border-light); border-radius: var(--radius-md); padding: var(--spacing-md); }
+.detail-meta dl { display: grid; grid-template-columns: max-content 1fr; column-gap: var(--spacing-md); row-gap: 0.4rem; margin: 0; font-size: var(--text-sm); }
+.detail-meta dt { color: var(--text-muted); }
+.detail-meta dd { margin: 0; color: var(--text-primary); word-break: break-word; }
+
+/* ===== Form page ===== */
+.form-page { background: var(--surface-1); border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+.form-grid { display: grid; grid-template-columns: 1fr; gap: var(--spacing-lg); padding: var(--spacing-lg); }
+@media (min-width: 1024px) {
+	.form-grid--with-tabs { grid-template-columns: 220px minmax(0,1fr); }
+}
+.form-tabs ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 2px; }
+.form-tabs li a { display: block; padding: 0.4rem 0.7rem; border-radius: var(--radius-md); color: var(--text-secondary); text-decoration: none; font-size: var(--text-sm); }
+.form-tabs li.is-active a { background: #fff1e6; color: var(--primary-color); }
+.form-sections { display: flex; flex-direction: column; gap: var(--spacing-xl); }
+.form-section { display: flex; flex-direction: column; gap: var(--spacing-sm); }
+.form-section__title { font-size: var(--text-lg); font-weight: 500; margin: 0; }
+.form-section__desc { font-size: var(--text-sm); color: var(--text-secondary); margin: 0.2rem 0 0; }
+.form-section__body { padding-top: var(--spacing-sm); }
+.form-bar { padding: var(--spacing-md) var(--spacing-lg); border-top: 1px solid var(--border-light); display: flex; justify-content: flex-end; gap: var(--spacing-sm); position: sticky; bottom: 0; background: var(--surface-1); }
+
+/* ===== Dashboard page ===== */
+/* .stats-grid default + min-width:1024px rules live above the @media (max-width: 720px) block (cascade order). */
+.stat-tile { background: var(--surface-1); border: 1px solid var(--border-light); border-radius: var(--radius-md); padding: var(--spacing-sm) var(--spacing-md); }
+.stat-tile__label { font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.stat-tile__value { font-size: var(--text-2xl); font-weight: 500; color: var(--text-primary); margin-top: 0.25rem; }
+.stat-tile__trend { font-size: var(--text-xs); color: var(--text-secondary); margin-top: 0.2rem; }
+
+.dashboard-charts { display: grid; grid-template-columns: 1fr; gap: var(--spacing-md); }
+@media (min-width: 1024px) { .dashboard-charts { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.dashboard-grid { display: grid; grid-template-columns: 1fr; gap: var(--spacing-md); }
+@media (min-width: 1024px) { .dashboard-grid { grid-template-columns: 2fr 1fr; } }
+.dashboard-wide > * { width: 100%; }
+
+/* ===== Chat page ===== */
+/* Fill the shell body exactly: `.shell__body` is the height-constrained flex
+   child (flex:1 + min-height:0 up the chain), so 100% pins the composer to
+   its bottom edge. The old `calc(100vh - 2rem)` ignored the topbar + shell
+   gaps and pushed the composer below the fold. */
+.page--chat { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 0; height: 100%; }
+.page--chat:has(.chat-rail) { grid-template-columns: 280px minmax(0,1fr) 320px; }
+@media (max-width: 720px) {
+	/* Mobile: stack threads above chat so the "+ new thread" control stays
+	   reachable. Previously both side panels were `display:none`, leaving
+	   the user with no way to start a conversation. The model rail is still
+	   hidden because the chat itself ships a model selector inline. */
+	.page--chat, .page--chat:has(.chat-rail) {
+		grid-template-columns: 1fr;
+		grid-template-rows: minmax(120px, 30vh) 1fr;
+	}
+	.chat-threads {
+		border-right: none;
+		border-bottom: 1px solid var(--border-light);
+	}
+	.chat-rail { display: none; }
+}
+.chat-threads { background: var(--surface-3); border-right: 1px solid var(--border-light); overflow-y: auto; }
+/* Active thread/conversation card — brand tint, same pair as the active
+   sidebar item. One rule serves both SSR (data-active from the server) and
+   the LLM page's client-side thread switcher (llm-chat.js toggles the same
+   attribute; it previously painted inline styles via a nonexistent
+   `--primary-light` token whose blue fallback always won). */
+.chat-threads .card[data-active="true"] { border-color: var(--primary-color); background: #fff1e6; }
+.chat-main { display: flex; flex-direction: column; min-height: 0; }
+.chat-messages { flex: 1; overflow-y: auto; padding: var(--spacing-md) var(--spacing-lg); }
+.chat-composer { border-top: 1px solid var(--border-light); padding: var(--spacing-md); background: var(--surface-1); }
+.chat-rail { background: var(--surface-3); border-left: 1px solid var(--border-light); overflow-y: auto; padding: var(--spacing-md); }
+
+/* ===== Status page ===== */
+.status-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: var(--spacing-xl); background: var(--surface-2); }
+.status-page__inner { text-align: center; max-width: 480px; display: flex; flex-direction: column; gap: var(--spacing-sm); align-items: center; }
+.status-page__code { font-size: 4rem; font-weight: 500; color: var(--text-muted); line-height: 1; }
+.status-page__title { font-size: var(--text-xl); font-weight: 500; margin: 0; }
+.status-page__body { font-size: var(--text-base); color: var(--text-secondary); margin: 0; }
+.status-page .btn { margin-top: var(--spacing-md); text-decoration: none; }
+

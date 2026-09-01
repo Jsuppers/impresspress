@@ -1,0 +1,111 @@
+/* Skip-to-content link — first focusable element in the shell; parked
+   off-screen until keyboard focus brings it into view. */
+.skip-link { position: absolute; left: -9999px; top: 0; z-index: 100;
+  background: var(--primary-color); color: #fff; padding: 8px 16px;
+  border-radius: 0 0 4px 0; }
+.skip-link:focus { left: 0; }
+
+/* Tabs */
+.tabs {
+	display: flex;
+	border-bottom: 1px solid var(--border-color);
+	margin-bottom: 1.5rem;
+}
+
+.tab {
+	padding: 0.75rem 1rem; border: none; background: none;
+	color: var(--text-secondary); font-size: 0.875rem;
+	font-weight: 500; cursor: pointer; position: relative;
+	transition: color 0.2s; text-decoration: none;
+	display: inline-flex; align-items: center; gap: 0.5rem;
+}
+
+.tab:hover { color: var(--text-primary); }
+
+.tab.active { color: var(--primary-color); }
+
+.tab.active::after {
+	content: ''; position: absolute;
+	bottom: -1px; left: 0; right: 0;
+	height: 2px; background: var(--primary-color);
+}
+
+/* ===== Account card admin shortcut =====
+   When the portal user is also an admin, dashboard renders an "Open admin"
+   call-to-action above the nav list. Visually distinct from the regular nav
+   items so it reads as a special link, not a peer of Profile/Sessions. */
+.account-admin-link {
+	display: inline-flex; align-items: center; gap: 0.5rem;
+	padding: var(--spacing-sm) var(--spacing-md);
+	margin-bottom: var(--spacing-md);
+	background: #fff1e6;
+	color: var(--primary-color);
+	border: 1px solid #ffd2b5;
+	border-radius: var(--radius-md);
+	text-decoration: none;
+	font-weight: 500; font-size: var(--text-sm);
+	transition: background 0.15s;
+}
+.account-admin-link:hover { background: #ffe1cc; }
+
+/* Nav button list — used by the dashboard variant of the card. */
+.account-nav {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+}
+
+.account-nav__divider {
+	height: 1px;
+	background: var(--border-light);
+	border: 0;
+	margin: 0.5rem 0.75rem;
+}
+
+.account-nav__item {
+	display: flex;
+	align-items: center;
+	gap: 0.875rem;
+	padding: 0.875rem 0.875rem;
+	color: var(--text-primary);
+	text-decoration: none;
+	border-radius: var(--radius-md);
+	transition: background var(--transition-fast);
+}
+
+.account-nav__item:hover,
+.account-nav__item:focus-visible {
+	background: var(--bg-hover);
+	outline: none;
+}
+
+.account-nav__icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	color: var(--text-secondary);
+	flex-shrink: 0;
+}
+
+.account-nav__icon svg {
+	width: 20px;
+	height: 20px;
+}
+
+.account-nav__label {
+	flex: 1;
+	font-size: 0.95rem;
+	font-weight: 500;
+}
+
+.account-nav__chev {
+	color: var(--text-muted);
+	font-size: 1.125rem;
+	line-height: 1;
+}
+

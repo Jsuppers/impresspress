@@ -133,7 +133,7 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
 
 /// The built-in brand accent, as a hex literal for surfaces that can't use
 /// CSS variables (email inline styles). Must match `--primary-color` in
-/// `assets/tokens.css` — the `brand_accent_matches_tokens_css` test pins the
+/// `styles/tokens.css` — the `brand_accent_matches_tokens_css` test pins the
 /// two together so they can't drift.
 pub const BRAND_ACCENT_HEX: &str = "#f0480f";
 

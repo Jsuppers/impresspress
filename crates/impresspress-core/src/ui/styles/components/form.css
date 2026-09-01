@@ -1,0 +1,186 @@
+/* Search Input */
+.search-input { position: relative; }
+.search-input input { padding-left: 2.5rem; }
+
+.search-input-icon {
+	position: absolute; left: 0.75rem; top: 50%;
+	transform: translateY(-50%); color: var(--text-muted);
+}
+
+/* Toggle */
+.toggle {
+	position: relative; display: inline-block;
+	width: 44px; height: 24px;
+}
+
+.toggle input { opacity: 0; width: 0; height: 0; }
+
+.toggle-slider {
+	position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+	background: var(--border-color); border-radius: 24px;
+	cursor: pointer; transition: background 0.2s;
+}
+
+.toggle-slider::before {
+	content: ''; position: absolute;
+	left: 2px; bottom: 2px;
+	width: 20px; height: 20px;
+	background: white; border-radius: 50%;
+	transition: transform 0.2s;
+}
+
+.toggle input:checked + .toggle-slider { background: var(--primary-color); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(20px); }
+
+/* Filter Bar */
+.filter-bar {
+	display: flex; align-items: center; gap: 1rem;
+	margin-bottom: 1.5rem; flex-wrap: wrap;
+}
+
+.filter-bar .search-input { flex: 1; min-width: 200px; }
+
+/* ===== Forms ===== */
+.form-group { margin-bottom: 1.25rem; }
+.form-group:last-child { margin-bottom: 0; }
+
+.form-row {
+	display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
+}
+
+.form-label {
+	display: flex; align-items: center; gap: 0.5rem;
+	margin-bottom: 0.5rem; font-size: 0.875rem;
+	font-weight: 500; color: #374151;
+}
+
+.form-label.required::after { content: ' *'; color: #ef4444; }
+
+.form-input,
+.form-select,
+.form-textarea {
+	width: 100%; padding: 0.6875rem 0.875rem;
+	border: 1px solid #e8ecf1; border-radius: 10px;
+	background: #f8fafc; color: #111827;
+	font-size: 0.9rem; transition: all 0.2s ease;
+}
+
+.form-input::placeholder,
+.form-textarea::placeholder { color: #a0aec0; }
+
+.form-input:hover:not(:disabled),
+.form-select:hover:not(:disabled),
+.form-textarea:hover:not(:disabled) {
+	border-color: #dde3ea; background: #f1f5f9;
+}
+
+.form-input:focus,
+.form-select:focus,
+.form-textarea:focus {
+	border-color: rgba(24, 154, 180, 0.5);
+	background: white;
+	box-shadow: 0 0 0 3px rgba(24, 154, 180, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.form-input:disabled,
+.form-select:disabled,
+.form-textarea:disabled {
+	background: #f3f4f6; color: #6b7280;
+	cursor: not-allowed; border-color: #e5e7eb;
+}
+
+.form-input.error,
+.form-select.error,
+.form-textarea.error { border-color: #ef4444; }
+
+.form-textarea { min-height: 100px; resize: vertical; }
+
+.form-select {
+	appearance: none;
+	background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+	background-repeat: no-repeat;
+	background-position: right 0.75rem center;
+	background-size: 1rem;
+	padding-right: 2.5rem; cursor: pointer;
+}
+
+.form-input-wrapper { position: relative; }
+.form-input-wrapper .form-input { padding-left: 2.5rem; }
+
+.form-input-wrapper .input-icon {
+	position: absolute; left: 0.75rem; top: 50%;
+	transform: translateY(-50%); color: #6b7280; pointer-events: none;
+}
+
+.form-hint {
+	display: block; margin-top: 0.375rem;
+	font-size: 0.75rem; color: #6b7280;
+}
+
+.form-error {
+	display: block; margin-top: 0.375rem;
+	font-size: 0.75rem; color: #ef4444;
+}
+
+.form-checkbox, .form-radio {
+	display: inline-flex; align-items: center; gap: 0.5rem;
+	cursor: pointer; font-size: 0.875rem; color: #374151;
+}
+
+.form-checkbox input, .form-radio input {
+	width: 1rem; height: 1rem; cursor: pointer; accent-color: #f0480f;
+}
+
+.input-group { display: flex; gap: 0.5rem; }
+.input-group .form-input { flex: 1; }
+
+.form-actions {
+	display: flex; justify-content: flex-end;
+	gap: 0.75rem; margin-top: 1.5rem;
+	padding-top: 1.5rem; border-top: 1px solid #e5e7eb;
+}
+
+/* ===== htmx indicators ===== */
+.htmx-indicator { display: none; }
+.htmx-request .htmx-indicator { display: inline-flex; }
+.htmx-request.htmx-indicator { display: inline-flex; }
+
+/* ===== Utility ===== */
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+.text-muted { color: var(--text-muted); }
+.text-danger { color: var(--accent-danger); }
+.text-success { color: var(--accent-success); }
+.text-sm { font-size: 0.875rem; }
+.text-xs { font-size: 0.75rem; }
+.font-medium { font-weight: 500; }
+.font-semibold { font-weight: 600; }
+.mt-1 { margin-top: 0.25rem; }
+.mt-2 { margin-top: 0.5rem; }
+.mt-4 { margin-top: 1rem; }
+.mb-2 { margin-bottom: 0.5rem; }
+.mb-4 { margin-bottom: 1rem; }
+.flex { display: flex; }
+.flex-1 { flex: 1; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.gap-2 { gap: 0.5rem; }
+.gap-4 { gap: 1rem; }
+.hidden { display: none; }
+
+@media (max-width: 720px) {
+	/* Forms: two-column form rows stack on narrow screens. */
+	.form-row { grid-template-columns: 1fr; }
+	/* Form inputs / buttons: ≥44px touch target, full-width. */
+	.form-input,
+	.form-control,
+	.btn { min-height: 44px; }
+}
+/* ===== Email/form sensitive input wrapper =====
+   The Mailgun API Key field uses an inline `display:flex` row with the input
+   + an eye-toggle button. On narrow screens the wrapper collapsed because
+   the parent form-group's inline width wasn't enforced; the input could shrink
+   below its content. Force the wrapper to fill and let the input flex. */
+.form-group > div[style*="display:flex"] { width: 100%; }
+.form-group > div[style*="display:flex"] > .form-input { flex: 1 1 auto; min-width: 0; }
+

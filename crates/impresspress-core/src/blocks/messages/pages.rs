@@ -434,8 +434,9 @@ fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) ->
 
 fn render_conversation_messages(entries: &[db::Record]) -> Markup {
     // The `chat_page` template's `.chat-messages` wrapper already owns
-    // scroll, padding, and background for this pane (see layout.css
-    // `.page--chat .chat-messages`). We just need the #entries-list ID
+    // scroll, padding, and background for this pane (see
+    // styles/layouts/page.css `.page--chat .chat-messages`). We just need
+    // the #entries-list ID
     // for the htmx composer's hx-target — no extra scroll container or
     // we double-scroll and end up with a boxed-inside-boxed look.
     html! {

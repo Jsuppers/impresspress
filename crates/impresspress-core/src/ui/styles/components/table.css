@@ -1,0 +1,310 @@
+/* Tables */
+.table-container { overflow-x: auto; }
+
+.table { width: 100%; border-collapse: collapse; }
+
+.table th {
+	text-align: left; padding: 0.75rem;
+	background: var(--bg-secondary);
+	border-bottom: 1px solid var(--border-color);
+	font-size: 0.75rem; font-weight: 600;
+	text-transform: uppercase; color: var(--text-muted);
+	letter-spacing: 0.5px;
+}
+
+.table td {
+	padding: 0.75rem;
+	border-bottom: 1px solid var(--border-light);
+	font-size: 0.875rem;
+}
+
+.table tbody tr:hover { background: var(--bg-hover); }
+
+.table th.sortable { cursor: pointer; user-select: none; }
+.table th.sortable:hover { color: var(--text-primary); }
+
+/* Pagination */
+.pagination {
+	display: flex; align-items: center; gap: 0.5rem; margin-top: 1.5rem;
+}
+
+.pagination-info {
+	font-size: 0.875rem; color: var(--text-secondary); margin-right: auto;
+}
+
+.pagination-controls { display: flex; gap: 0.25rem; }
+
+.pagination-btn {
+	padding: 0.5rem 0.75rem;
+	border: 1px solid var(--border-color);
+	background: white; color: var(--text-primary);
+	border-radius: 4px; cursor: pointer; font-size: 0.875rem;
+}
+
+.pagination-btn:hover { background: var(--bg-hover); }
+.pagination-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.pagination-btn.active {
+	background: var(--primary-color); color: white;
+	border-color: var(--primary-color);
+}
+
+/* Empty State */
+.empty-state {
+	text-align: center; padding: 3rem 1.5rem;
+	color: var(--text-muted);
+}
+
+.empty-state-icon {
+	margin-bottom: 1rem; opacity: 0.5;
+}
+
+.empty-state-title {
+	font-size: 1.125rem; font-weight: 600;
+	color: var(--text-primary); margin-bottom: 0.5rem;
+}
+
+.empty-state-description {
+	font-size: 0.875rem; color: var(--text-secondary);
+	margin-bottom: 1.5rem;
+}
+
+/* ===== Data table ===== */
+.data-table { overflow-x: auto; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--surface-1); }
+.data-table table { width: 100%; border-collapse: collapse; }
+.data-table thead th { position: sticky; top: 0; background: var(--surface-3); text-align: left; padding: 0.55rem 0.75rem; font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); border-bottom: 1px solid var(--border-color); font-weight: 500; }
+.data-table tbody td { padding: 0.55rem 0.75rem; font-size: var(--text-sm); border-bottom: 1px dashed var(--border-light); color: var(--text-primary); }
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table__row--linked:hover { background: var(--bg-hover); cursor: pointer; }
+.data-table__row-href { width: 3rem; text-align: right; color: var(--text-muted); }
+/* The chevron is the row's accessible link; give it a real touch target
+   (~44px) — the rest of the row is made clickable by the delegated handler
+   in assets.rs, which routes clicks to this anchor. */
+.data-table__row-href a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    margin: -0.75rem -0.5rem;
+    border-radius: 8px;
+}
+.data-table__empty { padding: var(--spacing-xl); }
+
+/* ===== Empty state ===== */
+.empty { text-align: center; padding: var(--spacing-xl) var(--spacing-md); color: var(--text-secondary); }
+.empty__icon { font-size: 2.4rem; color: var(--text-muted); margin-bottom: var(--spacing-md); }
+.empty__title { font-size: var(--text-lg); font-weight: 500; color: var(--text-primary); margin: 0 0 0.4rem; }
+.empty__body { font-size: var(--text-base); margin: 0 0 var(--spacing-md); }
+
+/* ===== Pagination ===== */
+.pagination { display: flex; align-items: center; gap: var(--spacing-md); padding: var(--spacing-md) 0; font-size: var(--text-sm); color: var(--text-secondary); }
+.pagination__count { margin-right: auto; }
+.pagination__prev, .pagination__next { color: var(--primary-color); text-decoration: none; }
+.pagination__prev.is-disabled, .pagination__next.is-disabled { color: var(--text-muted); pointer-events: none; }
+
+/* ── Database admin ─────────────────────────────────────── */
+.db-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 32%) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.db-pane {
+  background: var(--bg-card, #ffffff);
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.db-pane--left { padding: 12px; }
+.db-pane--right { padding: 12px; min-height: 360px; }
+.db-pane__head { margin-bottom: 8px; }
+.db-pane__head input {
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+}
+.db-table-list { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow-y: auto; }
+.db-table-list__item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  text-decoration: none;
+  color: inherit;
+  font-size: 13px;
+}
+.db-table-list__item:hover { background: var(--bg-secondary, #f8f9fa); }
+.db-table-list__item.is-active { background: #fef9e7; border: 1px solid #f0d78c; }
+.db-table-list__name { font-weight: 500; word-break: break-all; }
+.db-table-list__empty { padding: 8px; }
+
+/* Grouped tables (left pane) — one card per `org__block` prefix.
+   No inner max-height: groups expand to fit all their rows and the page
+   itself scrolls. The earlier 60vh + overflow-y clipped rows mid-line at
+   the scroll edges, which read like the list was broken. */
+.db-table-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.db-table-group {
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  background: var(--bg-card, #fff);
+  overflow: hidden;
+}
+.db-table-group__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-secondary, #f8f9fa);
+  border-bottom: 1px solid var(--border, #e2e8f0);
+}
+.db-table-group__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--primary-color);
+  flex: 0 0 auto;
+}
+.db-table-group__icon svg { width: 16px; height: 16px; }
+.db-table-group__title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.db-table-group__title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary, #0f172a);
+  word-break: break-all;
+}
+.db-table-group__org {
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+.db-table-group__count {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--primary-color);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+.db-table-group__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 6px;
+}
+.db-panel { padding: 4px 0; }
+.db-panel__head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.db-panel__head h3 { font-size: 14px; margin: 0; word-break: break-all; }
+.db-panel-body { padding-top: 8px; }
+.db-sql { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.db-sql__input {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  padding: 10px;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+  background: #0f172a;
+  color: #cbd5e1;
+  resize: vertical;
+}
+.db-sql__actions { display: flex; align-items: center; gap: 12px; }
+.db-sql-results { border-top: 1px solid var(--border, #e2e8f0); padding-top: 12px; }
+@media (max-width: 720px) {
+  .db-layout { grid-template-columns: 1fr; }
+}
+
+/* ===== Sessions page (Phase 4 PR-2) ===== */
+.session-row td:last-child { text-align: right; white-space: nowrap; }
+
+@media (max-width: 720px) {
+	/* Sessions / orgs tables → card list. The data-table doesn't fit at
+	   360px; collapse rows to stacked cards using ::before from data-label. */
+	.data-table { display: block; }
+	.data-table thead { display: none; }
+	.data-table tbody, .data-table tr { display: block; }
+	.data-table tr {
+		border: 1px solid var(--border-light);
+		border-radius: var(--radius-md);
+		margin-bottom: var(--spacing-sm);
+		padding: var(--spacing-sm);
+		background: var(--surface-1);
+	}
+	.data-table td {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: var(--spacing-sm);
+		border: none;
+		padding: 4px 0;
+		text-align: right;
+		/* min-width: 0 lets the value shrink below its intrinsic content width;
+		   overflow-wrap: anywhere allows long unbroken values (ISO timestamps,
+		   share-tokens, file keys) to wrap rather than push the parent card
+		   past the viewport edge. Without this, seeded data with long
+		   non-wrapping strings (e.g. /b/storage/photos/) overflowed the 375px
+		   mobile viewport by ~20px, causing horizontal scroll on real mobile
+		   and width-drift in CI baselines. */
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+	.data-table td::before {
+		content: attr(data-label);
+		color: var(--text-muted);
+		font-size: var(--text-xs);
+		text-transform: uppercase;
+		text-align: left;
+		flex-shrink: 0;
+	}
+	.data-table td:last-child { padding-top: var(--spacing-sm); }
+}
+/* ===== Mobile table fallback =====
+   `.table-container` already has `overflow-x: auto`, but several admin
+   pages render `.table` directly (Logs, Network, Permissions) without the
+   wrapper. Apply the same scroll behavior to the parent .card so the page
+   body never blows out the viewport on narrow screens. */
+@media (max-width: 720px) {
+	.card > .table,
+	.card .table:not(.table-container .table) {
+		display: block;
+		overflow-x: auto;
+		-webkit-overflow-scrolling: touch;
+	}
+	/* Permissions / Crypto pills: prevent column wrap that wastes space. */
+	.table th, .table td { white-space: nowrap; }
+}
+
+/* ===== Users table: don't wrap the Created date column ===== */
+.users-table td[data-label="Created"],
+.users-table .col-created { white-space: nowrap; }
+
+/* ===== Sessions row (userportal) — less cramped =====
+   The data-table → card collapse on mobile leaves a row that's tight.
+   Give each cell breathing room and a clear value alignment. */
+.session-row td { padding: 0.5rem 0; }
+@media (max-width: 720px) {
+	.session-row { padding: var(--spacing-md) !important; row-gap: var(--spacing-xs); }
+	.session-row td { padding: 0.25rem 0; }
+	.session-row td:last-child { padding-top: var(--spacing-sm); }
+	.session-row .btn { width: auto; min-width: 88px; }
+}
+

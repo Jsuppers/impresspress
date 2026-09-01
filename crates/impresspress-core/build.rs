@@ -11,16 +11,28 @@ use sha2::{Digest, Sha256};
 
 /// CSS bundle order. Explicit, never a glob — see CLAUDE.md, "no magic code".
 ///
-/// These are the CURRENT five layers. Task 5 splits them into `styles/` and
-/// rewrites this list to the 17-file form; until then these paths are the
-/// ones that exist, and a build.rs referencing files that are not there yet
-/// would panic.
+/// Tokens first so custom properties are defined before use; layouts last so
+/// they can override component defaults. Every entry must exist on disk —
+/// this build.rs panics on a missing layer (see `main`'s `fs::read_to_string`
+/// below), even for a layer that has no rules yet.
 const CSS_ORDER: &[&str] = &[
-    "assets/tokens.css",
-    "assets/base.css",
-    "assets/components.css",
-    "assets/layout.css",
-    "assets/charts.css",
+    "styles/tokens.css",
+    "styles/base.css",
+    "styles/components/button.css",
+    "styles/components/card.css",
+    "styles/components/table.css",
+    "styles/components/form.css",
+    "styles/components/badge.css",
+    "styles/components/modal.css",
+    "styles/components/nav.css",
+    "styles/components/toast.css",
+    "styles/components/palette.css",
+    "styles/components/stat.css",
+    "styles/components/chart.css",
+    "styles/components/auth.css",
+    "styles/layouts/shell.css",
+    "styles/layouts/page.css",
+    "styles/layouts/auth-split.css",
 ];
 
 /// Single-file assets: (relative path under src/ui, logical key, content type).
