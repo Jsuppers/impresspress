@@ -90,24 +90,17 @@ use std::{env, fs, path::{Path, PathBuf}};
 use sha2::{Digest, Sha256};
 
 /// CSS bundle order. Explicit, never a glob — see CLAUDE.md, "no magic code".
+///
+/// These are the CURRENT five layers. Task 5 splits them into `styles/` and
+/// rewrites this list to the 17-file form; until then these paths are the
+/// ones that exist, and a build.rs referencing files that are not there yet
+/// would panic.
 const CSS_ORDER: &[&str] = &[
-    "styles/tokens.css",
-    "styles/base.css",
-    "styles/components/button.css",
-    "styles/components/card.css",
-    "styles/components/table.css",
-    "styles/components/form.css",
-    "styles/components/badge.css",
-    "styles/components/modal.css",
-    "styles/components/nav.css",
-    "styles/components/toast.css",
-    "styles/components/palette.css",
-    "styles/components/stat.css",
-    "styles/components/chart.css",
-    "styles/components/auth.css",
-    "styles/layouts/shell.css",
-    "styles/layouts/page.css",
-    "styles/layouts/auth-split.css",
+    "assets/tokens.css",
+    "assets/base.css",
+    "assets/components.css",
+    "assets/layout.css",
+    "assets/charts.css",
 ];
 
 /// Single-file assets: (relative path under src/ui, logical key, content type).
@@ -214,6 +207,24 @@ fn manifest_covers_core_assets_with_hashed_filenames() {
         let hash = &rest[1..9];
         assert_eq!(hash.len(), 8);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{key}: {hash} not hex");
+    }
+}
+
+#[test]
+fn css_bundle_includes_all_layers_in_order() {
+    let s = super::css();
+    // Tokens must precede every consumer so custom properties are defined
+    // before use; layouts come last so they can override component defaults.
+    // This guard is what keeps Task 5's split honest — it must pass both
+    // before and after the files are reorganised.
+    let tokens = s.find("--primary-color").expect("tokens layer missing");
+    let button = s.find(".btn").expect("button layer missing");
+    let shell = s.find(".shell").expect("shell layout missing");
+    assert!(tokens < button, "tokens must precede components");
+    assert!(button < shell, "components must precede layouts");
+    for marker in [".card", ".data-table", ".badge", ".modal", ".toast",
+                   ".palette", ".stat-", ".charts-css", ".auth-split"] {
+        assert!(s.contains(marker), "missing layer marker: {marker}");
     }
 }
 
@@ -471,7 +482,10 @@ The current handler is three hand-maintained prefix/suffix tables with ordering 
 
 - [ ] **Step 1: Write the failing test**
 
+Both tests are gated on `embed-assets`, because `static_asset` only exists when the bytes do:
+
 ```rust
+#[cfg(feature = "embed-assets")]
 #[test]
 fn static_lookup_matches_exact_hashed_filename_without_ordering_hazard() {
     // The prefix-table version needed `itim-latin-ext-` to be scanned before
@@ -483,6 +497,7 @@ fn static_lookup_matches_exact_hashed_filename_without_ordering_hazard() {
     assert_eq!(super::static_asset(base.filename).unwrap().1, "font/woff2");
 }
 
+#[cfg(feature = "embed-assets")]
 #[test]
 fn static_lookup_rejects_unknown_and_traversal_paths() {
     assert!(super::static_asset("nope.css").is_none());
@@ -675,32 +690,9 @@ Pure refactor. Byte-for-byte identical rendered CSS is not required (whitespace 
 
 `components.css` is 46 KB and `layout.css` 28 KB. Split them by the class prefixes already present, so each file matches the component that renders it.
 
-- [ ] **Step 1: Write the failing test**
+This task is a pure file reorganisation: no rule changes, so there is no behaviour to drive with a failing test. Its verification is the selector-diff in Step 4 (objective — every selector must survive the move) plus the ordering guard already added in Task 1, which must keep passing.
 
-```rust
-#[test]
-fn css_bundle_includes_all_layers_in_order() {
-    let s = super::css();
-    // Tokens must precede every consumer so custom properties are defined
-    // before use; layouts come last so they can override component defaults.
-    let tokens = s.find("--primary-color").expect("tokens layer missing");
-    let button = s.find(".btn").expect("button layer missing");
-    let shell = s.find(".shell").expect("shell layout missing");
-    assert!(tokens < button, "tokens must precede components");
-    assert!(button < shell, "components must precede layouts");
-    for marker in [".card", ".data-table", ".badge", ".modal", ".toast",
-                   ".palette", ".stat-", ".charts-css", ".auth-split"] {
-        assert!(s.contains(marker), "missing layer marker: {marker}");
-    }
-}
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cargo test -p impresspress-core --lib css_bundle`
-Expected: FAIL — the old `assets/*.css` paths no longer match `CSS_ORDER`, so `build.rs` panics with "missing CSS layer".
-
-- [ ] **Step 3: Move and split the files**
+- [ ] **Step 1: Move and split the files**
 
 ```bash
 cd crates/impresspress-core/src/ui
@@ -712,12 +704,40 @@ git mv assets/charts.css styles/components/chart.css
 
 Then split `assets/components.css` into `styles/components/{button,card,table,form,badge,modal,nav,toast,palette,stat,auth}.css` and `assets/layout.css` into `styles/layouts/{shell,page,auth-split}.css`, moving each rule under the file whose name matches its class prefix. Every rule must land in exactly one file — no duplication, no drops. Delete the two originals when empty.
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 2: Rewrite `CSS_ORDER` in `build.rs`**
+
+Replace the five-entry list from Task 1 with the 17-entry split, in this exact order — tokens first so custom properties are defined before use, layouts last so they can override component defaults:
+
+```rust
+const CSS_ORDER: &[&str] = &[
+    "styles/tokens.css",
+    "styles/base.css",
+    "styles/components/button.css",
+    "styles/components/card.css",
+    "styles/components/table.css",
+    "styles/components/form.css",
+    "styles/components/badge.css",
+    "styles/components/modal.css",
+    "styles/components/nav.css",
+    "styles/components/toast.css",
+    "styles/components/palette.css",
+    "styles/components/stat.css",
+    "styles/components/chart.css",
+    "styles/components/auth.css",
+    "styles/layouts/shell.css",
+    "styles/layouts/page.css",
+    "styles/layouts/auth-split.css",
+];
+```
+
+Every listed file must exist, even if empty — `build.rs` panics on a missing layer. `auth.css` and `stat.css` may have no rules yet; Tasks 9 and 10 fill them.
+
+- [ ] **Step 3: Run to verify nothing broke**
 
 Run: `cargo test -p impresspress-core --lib`
-Expected: PASS.
+Expected: PASS, including Task 1's `css_bundle_includes_all_layers_in_order`.
 
-- [ ] **Step 5: Confirm no rule was lost**
+- [ ] **Step 4: Confirm no rule was lost**
 
 ```bash
 git show HEAD:crates/impresspress-core/src/ui/assets/components.css \
@@ -775,12 +795,12 @@ mod pagination;
 mod stat;
 mod table;
 
-pub use auth::{alert, auth_panel, oauth_button, AlertVariant};
+pub use auth::auth_panel;
 pub use avatar::{avatar, CtrlSize};
 pub use badge::{badge, status_badge, BadgeVariant};
 pub use button::{button, tab_navigation, Tab};
 pub use card::page_header;
-pub use chart::{bar_chart_card, line_chart_card, sparkline};
+pub use chart::bar_chart_card;
 pub use empty::empty_state;
 pub use form::{search_input, search_input_with_value};
 pub use modal::modal;
@@ -789,7 +809,12 @@ pub use stat::stat_card;
 pub use table::{data_table, TableCol};
 ```
 
-`auth.rs` and `chart.rs` are created empty-but-declared here; Tasks 9 and 10 fill them. To keep this task compiling on its own, stub them with the items they will own, moved verbatim from their current homes: `bar_chart_card` from `blocks/admin/pages/dashboard.rs:52` (change `fn` to `pub fn`) and `brand_panel` from `blocks/auth` renamed to `auth_panel`.
+**The re-export list names only what exists at the end of THIS task.** Task 9 adds `alert`, `oauth_button`, `AlertVariant` to the `auth` line; Task 10 adds `sparkline`, `line_chart_card` to the `chart` line. Listing them now would not compile.
+
+`auth.rs` and `chart.rs` are not empty — each starts life owning one function moved verbatim from its current home:
+
+- `bar_chart_card` from `blocks/admin/pages/dashboard.rs:52`, changing `fn` to `pub fn`. Update its call sites in `dashboard.rs` to `components::bar_chart_card(...)`.
+- `brand_panel` from `blocks/auth`, **renamed** to `auth_panel`. Update its call site in `blocks/auth_ui/pages/login.rs`, which imports it via `crate::blocks::auth::brand_panel`.
 
 - [ ] **Step 2: Verify the API did not shift**
 
@@ -1511,23 +1536,36 @@ In `crates/impresspress-core/src/ui/mod.rs` tests:
 /// design system one hardcoded colour at a time. The only legitimate use is
 /// handing a runtime value to CSS as a custom property.
 #[test]
-fn block_pages_carry_no_static_inline_styles() {
+fn pages_carry_no_static_inline_styles() {
+    // Both trees: `src/blocks` holds the page code, but `ui/settings_form.rs`
+    // carries 28 of its own and is just as much a drift source.
+    let roots = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+    ];
     let mut offenders = Vec::new();
-    for entry in walkdir::WalkDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"))
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-    {
-        let src = std::fs::read_to_string(entry.path()).unwrap();
-        for (n, line) in src.lines().enumerate() {
-            if line.contains("style=") && !line.contains("--") {
-                offenders.push(format!("{}:{}", entry.path().display(), n + 1));
+    for root in roots {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+        {
+            let src = std::fs::read_to_string(entry.path()).unwrap();
+            for (n, line) in src.lines().enumerate() {
+                // A `style=` carrying `--` is a runtime value handed to CSS as
+                // a custom property (--size, --chart-color). That is the
+                // correct mechanism and is deliberately allowed.
+                if line.contains("style=") && !line.contains("--") {
+                    offenders.push(format!("{}:{}", entry.path().display(), n + 1));
+                }
             }
         }
     }
     assert!(offenders.is_empty(), "static inline styles remain:\n{}", offenders.join("\n"));
 }
 ```
+
+The guard lives in `ui/mod.rs`'s test module but scans both trees, so it also covers the `ui/settings_form.rs` styles this task removes.
 
 Add `walkdir` to `[dev-dependencies]` in `crates/impresspress-core/Cargo.toml`.
 
