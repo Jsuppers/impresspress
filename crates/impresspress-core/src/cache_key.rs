@@ -71,11 +71,14 @@ fn key_column(table: CachedTable) -> &'static str {
 /// wants a KV-cached per-block read constructs its `ListOptions` here instead
 /// of open-coding the shape, so it can't silently drift out of cache coverage.
 ///
-/// `D1ConfigSource` no longer uses it — it reads the variables table once via
-/// [`full_table_list_opts`] and groups in memory, because one query per block
-/// meant one KV read per block on every cold hydration. This stays because the
-/// shape is still the supported way to do a cached per-block read, and
-/// `read_key` must keep round-tripping it.
+/// NO PRODUCTION CALLER TODAY. `D1ConfigSource` was the only one; it now reads
+/// the variables table once via [`full_table_list_opts`] and groups in memory,
+/// because one query per block meant one KV read per block on every cold
+/// hydration. Nothing consequently reads `cfg:v1:variables:*` any more — those
+/// keys are written and invalidated but never served, and expire on their TTL.
+/// This constructor stays because the per-block shape is still what
+/// [`read_key`] recognizes and [`write_key`] invalidates against, and the
+/// round-trip test pins the two together.
 pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
     ListOptions {
         filters: vec![Filter {
@@ -95,8 +98,8 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
 /// Two callers with deliberately different outcomes, both served by this one
 /// constructor so the shape cannot drift between them:
 ///
-/// - `runner::load_block_settings` — recognized by [`read_key`] and cached
-///   under the `__all__` sentinel;
+/// - [`crate::features::load_block_settings`]'s full-table read — recognized
+///   by [`read_key`] and cached under the `__all__` sentinel;
 /// - `D1ConfigSource`'s single variables snapshot — deliberately NOT cached
 ///   (see `read_key`'s zero-filter arm, and the test that pins it). One
 ///   uncached D1 query replaces one KV read per configured block, which on a
