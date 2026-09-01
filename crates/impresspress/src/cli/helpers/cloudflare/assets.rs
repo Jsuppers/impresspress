@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use impresspress_core::ui::assets as ui_assets;
+use impresspress_core::{routing::STATIC_PREFIX, ui::assets as ui_assets};
 
 /// Source dirs (relative to repo_root) to mirror into out_dir/assets/.
 const ASSET_DIRS: &[&str] = &["dist", "content", "public"];
@@ -37,7 +37,7 @@ pub struct ReleaseAssetEntry {
 /// publish, so fall back to the shared version-pinned CDN.
 pub fn resolve_asset_base_url(has_r2: bool) -> String {
     if has_r2 {
-        "/b/static/".to_string()
+        STATIC_PREFIX.to_string()
     } else {
         ui_assets::DEFAULT_CDN_BASE_TEMPLATE.to_string()
     }
