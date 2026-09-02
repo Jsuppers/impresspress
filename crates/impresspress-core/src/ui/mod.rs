@@ -694,4 +694,48 @@ mod tests {
             "body should contain 'Something went wrong' title"
         );
     }
+
+    /// Inline styles bypass the shared style layer, so pages drift out of the
+    /// design system one hardcoded colour at a time. The only legitimate use is
+    /// handing a runtime value to CSS as a custom property.
+    #[test]
+    fn pages_carry_no_static_inline_styles() {
+        // Both trees: `src/blocks` holds the page code, but `ui/settings_form.rs`
+        // carries 28 of its own and is just as much a drift source.
+        let roots = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+        ];
+        let mut offenders = Vec::new();
+        for root in roots {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                .filter(|e| !e.path().ends_with("blocks/email.rs"))
+            {
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                for (n, line) in src.lines().enumerate() {
+                    // A `style=` carrying `--` is a runtime value handed to CSS as
+                    // a custom property (--size, --chart-color). That is the
+                    // correct mechanism and is deliberately allowed.
+                    //
+                    // `blocks/email.rs` is exempt entirely: it builds HTML email
+                    // bodies, and email clients strip `<style>` blocks and do not
+                    // load external stylesheets, so inline styles are the only
+                    // mechanism that works there. This is the same reason
+                    // `assets::BRAND_ACCENT_HEX` exists. Removing them would break
+                    // email rendering, not improve it.
+                    if line.contains("style=") && !line.contains("--") {
+                        offenders.push(format!("{}:{}", entry.path().display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "static inline styles remain:\n{}",
+            offenders.join("\n")
+        );
+    }
 }
