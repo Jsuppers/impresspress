@@ -223,11 +223,41 @@ pub struct BrowserRuntimeControl {
     /// Read by [`install`] to decide whether the runtime already carries the
     /// block set the ledger says is active. The generation counter alone
     /// cannot answer that: `activation::restore` folds a failed
-    /// `rebuild(previous)` into a message and returns, so a runtime can be
+    /// `restore_previous` into a message and returns, so a runtime can be
     /// left carrying the block set of a generation the ledger has just marked
     /// `Failed` — with the counter bumped by the rebuild that *did* succeed
     /// on the way in.
     last_built: RefCell<Option<Vec<DynamicBlockSpec>>>,
+    /// The runtime the last successful [`RuntimeControl::rebuild`] swapped
+    /// out, and the block set it was serving — design §7.3 step 4's "retaining
+    /// the previous `Rc`".
+    ///
+    /// This is the whole point of [`impresspress_browser::replace_wafer`]
+    /// handing its return value back: the old `Wafer` lives exactly as long as
+    /// the last handle to it, so a caller that dropped the `Rc` could not undo
+    /// the swap and had to build a *different* runtime from the same block set
+    /// instead. Taken by [`RuntimeControl::restore_previous`], and replaced by
+    /// the next successful rebuild — a runtime two activations old is not
+    /// something any failure path asks for, and holding it would pin its
+    /// wasmi instances and linear memories for no reader.
+    ///
+    /// `last_built` travels with it because `already_built` has to describe
+    /// the runtime that is *live*, and a restore changes which one that is.
+    retained: RefCell<Option<RetainedRuntime>>,
+}
+
+/// The runtime a rebuild swapped out, and what it was serving.
+///
+/// A named pair rather than a tuple because the two halves are restored
+/// together or not at all: putting the `Wafer` back without its block set
+/// would leave `already_built` describing a runtime that is no longer live,
+/// and boot would then decline to rebuild a set the runtime does not carry.
+struct RetainedRuntime {
+    /// The `Rc` [`impresspress_browser::replace_wafer`] handed back.
+    wafer: Rc<wafer_run::Wafer>,
+    /// The `last_built` value that went with it — `None` before any rebuild
+    /// had succeeded.
+    blocks: Option<Vec<DynamicBlockSpec>>,
 }
 
 impl BrowserRuntimeControl {
@@ -239,6 +269,7 @@ impl BrowserRuntimeControl {
             factory: RefCell::new(Weak::new()),
             generation: Cell::new(0),
             last_built: RefCell::new(None),
+            retained: RefCell::new(None),
         })
     }
 
@@ -442,6 +473,10 @@ impl RuntimeControl for BrowserRuntimeControl {
     /// has booted, so a failure anywhere leaves the live runtime exactly as it
     /// was. The generation counter is bumped last, after the swap, because it
     /// is what the `/b/dev` page keys its tool re-registration on.
+    ///
+    /// The `Rc` [`impresspress_browser::replace_wafer`] hands back is kept in
+    /// [`Self::retained`], which is what makes the swap reversible — see
+    /// [`Self::restore_previous`].
     async fn rebuild(&self, blocks: &[DynamicBlockSpec]) -> Result<(), String> {
         let factory = self.factory()?;
         let storage = impresspress_browser::make_storage_service();
@@ -460,8 +495,37 @@ impl RuntimeControl for BrowserRuntimeControl {
             .build(&dynamic)
             .await
             .map_err(|e| describe_js(&e, "building the runtime"))?;
-        impresspress_browser::replace_wafer(wafer).map_err(|e| e.to_string())?;
-        *self.last_built.borrow_mut() = Some(blocks.to_vec());
+        let previous = impresspress_browser::replace_wafer(wafer).map_err(|e| e.to_string())?;
+        let was_built = self.last_built.borrow_mut().replace(blocks.to_vec());
+        *self.retained.borrow_mut() = Some(RetainedRuntime {
+            wafer: previous,
+            blocks: was_built,
+        });
+        self.generation.set(self.generation.get().saturating_add(1));
+        Ok(())
+    }
+
+    /// Put the retained runtime back, without building one.
+    ///
+    /// [`impresspress_browser::restore_wafer`] takes the very `Rc` the last
+    /// [`Self::rebuild`] swapped out, so this is a pointer swap: no artifact
+    /// is read, no guest is compiled, no block's `Init` runs a second time.
+    /// That is what design §7.3 asks for, and it is also the only version of
+    /// this that cannot fail on its own account once there is something to
+    /// restore.
+    ///
+    /// The generation counter still moves: the live runtime changed, and the
+    /// `/b/dev` page's tool registration is keyed on the counter rather than
+    /// on which direction the change went.
+    async fn restore_previous(&self) -> Result<(), String> {
+        // Taken out of the `RefCell` before anything else touches it — the
+        // same rule `factory()` follows, and the reason `retained` is never
+        // borrowed across a call.
+        let Some(retained) = self.retained.borrow_mut().take() else {
+            return Err("no previous runtime was retained to restore".to_string());
+        };
+        impresspress_browser::restore_wafer(retained.wafer);
+        *self.last_built.borrow_mut() = retained.blocks;
         self.generation.set(self.generation.get().saturating_add(1));
         Ok(())
     }

@@ -613,6 +613,12 @@ async fn activate_staged(
 /// swap restores the previous `Rc`), then the previous site files are
 /// republished with the half-published manifest as the "before" — that is what
 /// removes files the failed publish had already added.
+///
+/// The runtime half is [`RuntimeControl::restore_previous`], not a second
+/// `rebuild(previous_blocks)`: §7.3 says the *retained* runtime goes back, and
+/// a rebuild is a different runtime that happens to carry the same block set.
+/// It also re-seals and re-runs every built-in block's `Init` on a path that
+/// is already failing, and can fail again on its own account.
 async fn restore(
     ctx: &dyn Context,
     shared: &super::DevShared,
@@ -624,8 +630,7 @@ async fn restore(
     let mut message = format!("publishing the site failed: {}", failure.message);
     let previous_manifest = previous.map(|(_, manifest)| manifest);
     if rebuilt {
-        let blocks: &[DynamicBlockSpec] = previous_manifest.map_or(&[], |m| m.blocks.as_slice());
-        if let Err(e) = shared.control.rebuild(blocks).await {
+        if let Err(e) = shared.control.restore_previous().await {
             message.push_str(&format!(
                 "; restoring the previous runtime also failed: {e}"
             ));

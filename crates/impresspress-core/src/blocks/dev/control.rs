@@ -285,7 +285,30 @@ pub trait RuntimeControl: wafer_run::MaybeSend + wafer_run::MaybeSync {
     ) -> Result<(), ValidationFailure>;
 
     /// Rebuild the runtime with exactly this block set and swap it in.
+    ///
+    /// A successful call **retains** the runtime it swapped out, so that
+    /// [`Self::restore_previous`] can put it back. The retained handle is
+    /// released by the next successful `rebuild`, or by the `restore_previous`
+    /// that consumes it.
     async fn rebuild(&self, blocks: &[DynamicBlockSpec]) -> Result<(), String>;
+
+    /// Restore the runtime the last successful [`Self::rebuild`] swapped out,
+    /// **without rebuilding it**.
+    ///
+    /// This is design §7.3 step 4: an activation swaps the runtime in before
+    /// it publishes the site, "retaining the previous `Rc`", and "a failure
+    /// after step 4 restores the previous `Rc`". Restoring the *value* rather
+    /// than rebuilding from the same block set matters for three reasons: a
+    /// rebuild is not guaranteed to reproduce the runtime it is undoing (it
+    /// re-seals and re-runs every built-in block's `Init`), it costs that work
+    /// twice on a path that is already failing, and it can itself fail —
+    /// which is precisely when the rollback is needed.
+    ///
+    /// `Err` when there is nothing retained (no rebuild has succeeded since
+    /// the last restore) or when the swap itself failed. Both leave the
+    /// caller's failure report to say so; the runtime is then whatever the
+    /// rebuild left live.
+    async fn restore_previous(&self) -> Result<(), String>;
 
     /// Monotonic runtime generation counter (bumped by every successful
     /// rebuild). The `/b/dev` page re-registers its agent tools whenever this

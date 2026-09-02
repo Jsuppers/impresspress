@@ -20,6 +20,12 @@ use super::control::{DynamicBlockSpec, RuntimeControl, ValidationFailure, Valida
 /// `inspect` reports whatever `BlockInfo` the test set, and `probe` records
 /// the spec it was handed, so a test can assert that the guest was executed
 /// under the ACCEPTED capabilities rather than its own declaration.
+///
+/// It also models the *retained runtime* half of design §7.3: `rebuild` keeps
+/// the block set it swapped out and `restore_previous` puts it back without
+/// rebuilding. That is what makes "the swap was undone, not redone" an
+/// assertion a test can make — [`Self::restores`] against [`Self::rebuilds`],
+/// with [`Self::live_blocks`] for what is actually serving.
 pub struct FakeControl {
     /// Every block set handed to `rebuild`, oldest first.
     pub rebuilt: Mutex<Vec<Vec<DynamicBlockSpec>>>,
@@ -66,6 +72,24 @@ pub struct FakeControl {
     /// would never be contended. This is the one place a test can hold an
     /// activation open on purpose.
     gate_rebuild: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    /// The block set the runtime is serving right now, or `None` before the
+    /// first rebuild.
+    live: Mutex<Option<Vec<DynamicBlockSpec>>>,
+    /// What the last successful `rebuild` swapped out, retained for
+    /// `restore_previous` — the fixture's stand-in for the browser control's
+    /// retained `Rc<Wafer>`.
+    ///
+    /// Two layers of `Option` and both are load-bearing: the outer says
+    /// whether there is anything to restore *at all* (a `restore_previous`
+    /// with nothing retained is an error, exactly as it is in the browser),
+    /// the inner is the block set that runtime was serving, which is `None`
+    /// before the first rebuild.
+    retained: Mutex<Option<Option<Vec<DynamicBlockSpec>>>>,
+    /// Bumped by every `restore_previous` that put a runtime back.
+    restores: AtomicU64,
+    /// Set by [`Self::fail_next_restore`]: the message the next
+    /// `restore_previous` refuses with, consumed by that call.
+    fail_restore: Mutex<Option<String>>,
     /// Bumped by every successful `rebuild`.
     generation: AtomicU64,
 }
@@ -82,6 +106,10 @@ impl FakeControl {
             inspections: AtomicU64::new(0),
             fail_rebuild: Mutex::new(None),
             gate_rebuild: Mutex::new(None),
+            live: Mutex::new(None),
+            retained: Mutex::new(None),
+            restores: AtomicU64::new(0),
+            fail_restore: Mutex::new(None),
             generation: AtomicU64::new(0),
         })
     }
@@ -133,6 +161,30 @@ impl FakeControl {
     /// generation still live.
     pub fn fail_next_rebuild(&self, message: &str) {
         *self.fail_rebuild.lock().expect("fail_rebuild mutex") = Some(message.to_string());
+    }
+
+    /// Make the next `restore_previous` refuse with `message`, restoring
+    /// nothing.
+    ///
+    /// The retained runtime is *kept*, so the refusal is the swap failing
+    /// rather than there being nothing to swap back.
+    pub fn fail_next_restore(&self, message: &str) {
+        *self.fail_restore.lock().expect("fail_restore mutex") = Some(message.to_string());
+    }
+
+    /// How many times `restore_previous` has put a runtime back.
+    ///
+    /// The counter that separates §7.3's restore from a second `rebuild`: a
+    /// test asserting the swap was *undone* rather than *redone* reads this
+    /// against [`Self::rebuilds`].
+    pub fn restores(&self) -> u64 {
+        self.restores.load(Ordering::SeqCst)
+    }
+
+    /// The block set the runtime is serving now — what a `rebuild` last
+    /// installed, or what a `restore_previous` put back.
+    pub fn live_blocks(&self) -> Option<Vec<DynamicBlockSpec>> {
+        self.live.lock().expect("live mutex").clone()
     }
 
     /// Hold the next `rebuild` open until the returned sender fires (or is
@@ -195,7 +247,27 @@ impl RuntimeControl for FakeControl {
             .lock()
             .expect("rebuilt mutex")
             .push(blocks.to_vec());
+        // Retain what was live, then install the new set — the fixture's
+        // model of `replace_wafer` handing back the runtime it swapped out.
+        let previous = self
+            .live
+            .lock()
+            .expect("live mutex")
+            .replace(blocks.to_vec());
+        *self.retained.lock().expect("retained mutex") = Some(previous);
         self.generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn restore_previous(&self) -> Result<(), String> {
+        if let Some(message) = self.fail_restore.lock().expect("fail_restore mutex").take() {
+            return Err(message);
+        }
+        let Some(previous) = self.retained.lock().expect("retained mutex").take() else {
+            return Err("no retained runtime to restore".to_string());
+        };
+        *self.live.lock().expect("live mutex") = previous;
+        self.restores.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 

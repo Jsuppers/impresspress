@@ -974,12 +974,18 @@ async fn a_publish_that_fails_after_the_swap_restores_the_previous_runtime_and_s
     );
     assert_eq!(err.status(), 500);
 
-    // The runtime was rebuilt with the new block set, then rebuilt again with
-    // the previous one — which here is empty.
+    // The runtime was rebuilt with the new block set exactly once, and the
+    // swap was then UNDONE — the retained runtime put back, not a second
+    // runtime built from the previous block set (design §7.3 step 4).
     let rebuilds = control.rebuilds();
-    assert_eq!(rebuilds.len(), 2, "the swap must be unwound");
+    assert_eq!(rebuilds.len(), 1, "the swap must not be redone");
     assert_eq!(rebuilds[0].len(), 1);
-    assert!(rebuilds[1].is_empty(), "restored to the previous block set");
+    assert_eq!(control.restores(), 1, "the swap must be unwound");
+    assert_eq!(
+        control.live_blocks(),
+        None,
+        "the runtime that was live before the rebuild is live again"
+    );
 
     // The previous generation is still live, still serving its own content.
     let status = status_of(&ctx).await;
@@ -992,6 +998,99 @@ async fn a_publish_that_fails_after_the_swap_restores_the_previous_runtime_and_s
 
     let l = list_generations(&ctx, Some(10)).await;
     assert_eq!(l["generations"][0]["status"], "failed");
+}
+
+/// The same unwind with a block already live, which is what separates the two
+/// possible implementations: a `rebuild(previous_blocks)` would show up as a
+/// second forward rebuild and would produce a *different* runtime carrying the
+/// same set, while restoring the retained handle shows up as a restore and
+/// carries the runtime that was actually serving (design §7.3 step 4).
+#[tokio::test]
+async fn a_failed_publish_restores_the_retained_runtime_instead_of_rebuilding_it() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let first = compile_of(&ctx, &["hello"]).await;
+    activation::request(
+        &ctx,
+        &ctx.dev_shared(),
+        GenerationCause::BlockCompile,
+        first,
+    )
+    .await
+    .expect("the first activation goes live");
+    assert_eq!(control.rebuilds().len(), 1);
+
+    // A second activation that adds a block and then fails while publishing.
+    let site = site_of(&ctx, "v2").await;
+    let intent = ActivationIntent::BlockSet {
+        site: Some(site),
+        blocks: vec![
+            block_spec(&ctx, "hello").await,
+            block_spec(&ctx, "second").await,
+        ],
+    };
+    ctx.fail_next_storage_put("disk is on fire");
+    activation::request(
+        &ctx,
+        &ctx.dev_shared(),
+        GenerationCause::BlockCompile,
+        intent,
+    )
+    .await
+    .expect_err("a publish that fails must fail the activation");
+
+    assert_eq!(
+        control.rebuilds().len(),
+        2,
+        "the unwind must not be a third rebuild"
+    );
+    assert_eq!(control.restores(), 1, "the retained runtime went back");
+    let live: Vec<String> = control
+        .live_blocks()
+        .expect("a block set is live")
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert_eq!(live, vec!["site/hello".to_string()]);
+    assert_eq!(
+        active_block_names(&ctx).await,
+        vec!["site/hello".to_string()]
+    );
+}
+
+/// A restore that itself fails is still reported — the sandbox says both what
+/// went wrong and that it could not undo it, rather than claiming a clean
+/// rollback it did not perform.
+#[tokio::test]
+async fn a_restore_that_fails_is_reported_alongside_the_publish_failure() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let site = site_of(&ctx, "v2").await;
+    let intent = ActivationIntent::BlockSet {
+        site: Some(site),
+        blocks: vec![block_spec(&ctx, "hello").await],
+    };
+    ctx.fail_next_storage_put("disk is on fire");
+    control.fail_next_restore("the runtime slot is empty");
+    let err = activation::request(
+        &ctx,
+        &ctx.dev_shared(),
+        GenerationCause::BlockCompile,
+        intent,
+    )
+    .await
+    .expect_err("a publish that fails must fail the activation");
+
+    let message = err.to_string();
+    assert!(message.contains("disk is on fire"), "{message}");
+    assert!(
+        message.contains("restoring the previous runtime also failed")
+            && message.contains("the runtime slot is empty"),
+        "{message}"
+    );
+    assert_eq!(control.restores(), 0, "nothing was restored");
 }
 
 /// A journal whose `desired` already names the live generation must converge

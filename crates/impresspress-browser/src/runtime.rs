@@ -65,6 +65,11 @@ pub fn store_wafer(wafer: wafer_run::Wafer) -> Result<(), StoreError> {
 /// that path; drop it once the activation has committed. A caller that
 /// discards it cannot undo the swap — the old runtime is gone as soon as the
 /// last handle to it is.
+///
+/// The caller that does this is `impresspress-web`'s `BrowserRuntimeControl`:
+/// it parks the handle in its `retained` slot on every successful `rebuild`
+/// and hands it to [`restore_wafer`] from `RuntimeControl::restore_previous`,
+/// which is the rollback half of design §7.3.
 pub fn replace_wafer(wafer: wafer_run::Wafer) -> Result<Rc<wafer_run::Wafer>, StoreError> {
     RUNTIME.with(|r| {
         let mut slot = r.borrow_mut();
@@ -74,7 +79,11 @@ pub fn replace_wafer(wafer: wafer_run::Wafer) -> Result<Rc<wafer_run::Wafer>, St
     })
 }
 
-/// Restore a runtime handed back by `replace_wafer`.
+/// Restore a runtime handed back by [`replace_wafer`].
+///
+/// Infallible by construction, and that is the point of restoring the value
+/// rather than rebuilding one: the caller is already on a failure path, and
+/// the runtime it wants back is the one it is holding.
 pub fn restore_wafer(previous: Rc<wafer_run::Wafer>) {
     RUNTIME.with(|r| *r.borrow_mut() = Some(previous));
 }
