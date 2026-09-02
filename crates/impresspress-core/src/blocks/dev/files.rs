@@ -9,21 +9,19 @@
 //! agent and a human editing the same workspace at the same time; making the
 //! check optional would make that race invisible.
 //!
-//! That guard is **per path**, and it is the only guard these handlers hold.
-//! A write is read-modify-write over the whole manifest — `workspace::load`,
-//! mutate one entry, `workspace::save` — so two writers interleaving between
-//! the load and the save would each save a manifest built from a snapshot
-//! that predates the other, and the later save would drop the earlier
-//! writer's entry even though both passed their own hash check. Nothing here
-//! prevents that.
+//! That guard is **per path**. A write is read-modify-write over the whole
+//! manifest — `workspace::load`, mutate one entry, `workspace::save` — so two
+//! writers interleaving between the load and the save would each save a
+//! manifest built from a snapshot that predates the other, and the later save
+//! would drop the earlier writer's entry even though both passed their own
+//! hash check: the hash check is about the path each writer named and says
+//! nothing about the rest of the file.
 //!
-//! It does not happen on the sandbox's own target: the Service Worker is
-//! single-threaded and runs one request to completion, so the load and the
-//! save cannot interleave. On native and Cloudflare, where concurrent
-//! requests are real, the serialization has to come from above — Task 7's
-//! activation queue is what orders workspace mutations there, and any handler
-//! added to this module must go through it rather than assume the browser's
-//! scheduling.
+//! The whole load-mutate-save therefore runs under `DevShared::workspace`, an
+//! async mutex held across those storage calls. It guards the *manifest*, not
+//! the publish: the guard is released before the activation the mutation
+//! requests, so editing never waits behind a runtime rebuild. Any handler
+//! added to this module that mutates `workspace.json` must take it.
 //!
 //! # Refusal shapes
 //!
@@ -41,13 +39,13 @@ use base64ct::{Base64, Encoding};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use super::{
-    activation, blobs,
+    activation::{self, ActivationIntent},
+    blobs,
     contracts::{
         FileConflict, FileDeleteRequest, FileDeleteResponse, FileEncoding, FileListQuery,
         FileListResponse, FileReadRequest, FileReadResponse, FileWriteRequest, FileWriteResponse,
-        GenerationSummary, SiteManifest,
+        GenerationSummary,
     },
-    generation::{self, GenerationManifest},
     no_store, no_store_error, no_store_error_status,
     paths::{self, WorkspaceArea},
     repo::generations::GenerationCause,
@@ -151,57 +149,65 @@ pub async fn handle_write(
         ));
     }
 
-    let mut ws = match workspace::load(ctx).await {
-        Ok(ws) => ws,
-        Err(e) => return err_internal("dev workspace load", e),
-    };
-    let current = ws.get(&request.path);
-    if !hash_matches(current, request.expected_sha256.as_deref()) {
-        return conflict(&request.path, current);
-    }
+    // The manifest is read, changed and written back under `shared.workspace`,
+    // so two writers cannot each save a snapshot that predates the other. The
+    // guard is dropped before the publish below: the mutation is what has to
+    // be serialized, not the activation it asks for.
+    let entry = {
+        let _serialized = shared.workspace.lock().await;
+        let mut ws = match workspace::load(ctx).await {
+            Ok(ws) => ws,
+            Err(e) => return err_internal("dev workspace load", e),
+        };
+        let current = ws.get(&request.path);
+        if !hash_matches(current, request.expected_sha256.as_deref()) {
+            return conflict(&request.path, current);
+        }
 
-    // How much the blob store would grow by. Content some entry already names
-    // is certainly stored (the collector only reclaims unreachable blobs), so
-    // re-writing it — an undo, or the same asset at a second path — needs no
-    // headroom. Content that is stored but unreferenced is treated as if it
-    // were new: those bytes are garbage awaiting collection, and refusing
-    // rather than assuming they will be there is the safe direction.
-    let sha = blobs::sha256_hex(&bytes);
-    let new_blob_bytes = if ws.references(&sha) {
-        0
-    } else {
-        bytes.len() as u64
-    };
-    if let Err(e) = check_quotas(&ws, &request.path, &area, new_blob_bytes) {
-        return e.into_response();
-    }
+        // How much the blob store would grow by. Content some entry already
+        // names is certainly stored (the collector only reclaims unreachable
+        // blobs), so re-writing it — an undo, or the same asset at a second
+        // path — needs no headroom. Content that is stored but unreferenced is
+        // treated as if it were new: those bytes are garbage awaiting
+        // collection, and refusing rather than assuming they will be there is
+        // the safe direction.
+        let sha = blobs::sha256_hex(&bytes);
+        let new_blob_bytes = if ws.references(&sha) {
+            0
+        } else {
+            bytes.len() as u64
+        };
+        if let Err(e) = check_quotas(&ws, &request.path, &area, new_blob_bytes) {
+            return e.into_response();
+        }
 
-    // Store, then save. The other order would let a manifest name a blob that
-    // was never written, and every later read of that path would be a 500. In
-    // this order a save that fails leaves an uncharged blob behind — the
-    // workspace under-counts its own store until the collector reconciles it,
-    // which costs headroom rather than correctness.
-    match blobs::put_hashed(ctx, &sha, &bytes).await {
-        // Charge the workspace only when the store actually grew.
-        Ok(blobs::Stored::New) => ws.record_blob_stored(bytes.len() as u64),
-        Ok(blobs::Stored::Deduplicated) => {}
-        Err(e) => return err_internal("dev workspace blob write", e),
-    }
-    let entry = ws.insert(&request.path, sha, bytes.len() as u64);
-    if let Err(e) = workspace::save(ctx, &ws).await {
-        return err_internal("dev workspace save", e);
-    }
+        // Store, then save. The other order would let a manifest name a blob
+        // that was never written, and every later read of that path would be a
+        // 500. In this order a save that fails leaves an uncharged blob behind
+        // — the workspace under-counts its own store until the collector
+        // reconciles it, which costs headroom rather than correctness.
+        match blobs::put_hashed(ctx, &sha, &bytes).await {
+            // Charge the workspace only when the store actually grew.
+            Ok(blobs::Stored::New) => ws.record_blob_stored(bytes.len() as u64),
+            Ok(blobs::Stored::Deduplicated) => {}
+            Err(e) => return err_internal("dev workspace blob write", e),
+        }
+        let entry = ws.insert(&request.path, sha, bytes.len() as u64);
+        if let Err(e) = workspace::save(ctx, &ws).await {
+            return err_internal("dev workspace save", e);
+        }
+        entry
+    };
 
     // Publish, if the file that changed is one the site serves. The order is
-    // load-bearing: the workspace is saved first, so the manifest the
-    // activation freezes is one that has already been persisted — an
-    // activation that published content the workspace had lost would be
-    // unreproducible from the workspace it claims to project.
-    let generation =
-        match publish_if_site(ctx, shared, &area, &ws, GenerationCause::SiteWrite).await {
-            Ok(generation) => generation,
-            Err(refusal) => return refusal,
-        };
+    // load-bearing: the workspace is saved first, and the activation reads it
+    // back, so the generation is composed from persisted state. An activation
+    // that published content the workspace had lost would be unreproducible
+    // from the workspace it claims to project.
+    let generation = match publish_if_site(ctx, shared, &area, GenerationCause::SiteWrite).await {
+        Ok(generation) => generation,
+        Err(refusal) => return refusal,
+    };
     no_store().json(&FileWriteResponse {
         path: entry.path,
         sha256: entry.sha256,
@@ -224,24 +230,29 @@ pub async fn handle_delete(
         Ok(area) => area,
         Err(e) => return no_store_error(ErrorCode::InvalidArgument, &e.to_string()),
     };
-    let mut ws = match workspace::load(ctx).await {
-        Ok(ws) => ws,
-        Err(e) => return err_internal("dev workspace load", e),
-    };
-    let current = ws.get(&request.path);
-    if !hash_matches(current, Some(&request.expected_sha256)) {
-        return conflict(&request.path, current);
-    }
-    // The blob stays: a generation that can still be rolled back to names it.
-    ws.remove(&request.path);
-    if let Err(e) = workspace::save(ctx, &ws).await {
-        return err_internal("dev workspace save", e);
-    }
-    let generation =
-        match publish_if_site(ctx, shared, &area, &ws, GenerationCause::SiteDelete).await {
-            Ok(generation) => generation,
-            Err(refusal) => return refusal,
+    {
+        // Same serialization as a write, for the same reason: a delete is a
+        // read-modify-write of the whole manifest.
+        let _serialized = shared.workspace.lock().await;
+        let mut ws = match workspace::load(ctx).await {
+            Ok(ws) => ws,
+            Err(e) => return err_internal("dev workspace load", e),
         };
+        let current = ws.get(&request.path);
+        if !hash_matches(current, Some(&request.expected_sha256)) {
+            return conflict(&request.path, current);
+        }
+        // The blob stays: a generation that can still be rolled back to names
+        // it.
+        ws.remove(&request.path);
+        if let Err(e) = workspace::save(ctx, &ws).await {
+            return err_internal("dev workspace save", e);
+        }
+    }
+    let generation = match publish_if_site(ctx, shared, &area, GenerationCause::SiteDelete).await {
+        Ok(generation) => generation,
+        Err(refusal) => return refusal,
+    };
     no_store().json(&FileDeleteResponse {
         path: request.path,
         generation,
@@ -256,32 +267,24 @@ pub async fn handle_delete(
 /// `.rs` file would rebuild the runtime from an artifact that has not been
 /// rebuilt.
 ///
-/// The block half of the manifest is the *active* generation's, unchanged —
-/// this is a site republish, so `block_set_changed` is false and the runtime
-/// is left alone.
+/// Nothing about the manifest is decided here. [`ActivationIntent::SiteOnly`]
+/// says only "publish what the workspace holds", and both halves are resolved
+/// inside the queue once this request is the one running: the site from the
+/// workspace file this handler has already saved, the blocks from the
+/// generation that is active at that moment. Composing a manifest here instead
+/// would freeze the block set as it looked *before* an activation that is
+/// still in flight — and publishing that would tear the in-flight block back
+/// out of the runtime.
 async fn publish_if_site(
     ctx: &dyn Context,
     shared: &DevShared,
     area: &WorkspaceArea,
-    ws: &Workspace,
     cause: GenerationCause,
 ) -> Result<Option<GenerationSummary>, OutputStream> {
     if !matches!(area, WorkspaceArea::Site) {
         return Ok(None);
     }
-    let blocks = match generation::active(ctx).await {
-        Ok(active) => active
-            .map(|(_row, manifest)| manifest.blocks)
-            .unwrap_or_default(),
-        Err(e) => return Err(err_internal("dev active generation", e)),
-    };
-    let next = GenerationManifest::staged(
-        SiteManifest {
-            files: workspace::site_manifest(ws),
-        },
-        blocks,
-    );
-    match activation::request(ctx, shared, cause, next).await {
+    match activation::request(ctx, shared, cause, ActivationIntent::SiteOnly).await {
         Ok(outcome) => Ok(Some(outcome.generation)),
         Err(e) => Err(e.into_response()),
     }

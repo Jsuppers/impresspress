@@ -217,7 +217,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "Aged out of the retention window.",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
                             "type": "string"
                           }
                         ]
@@ -514,7 +514,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "Aged out of the retention window.",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
                             "type": "string"
                           }
                         ]
@@ -703,7 +703,7 @@
                             },
                             {
                               "const": "superseded",
-                              "description": "Aged out of the retention window.",
+                              "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
                               "type": "string"
                             }
                           ]
@@ -1073,7 +1073,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "Aged out of the retention window.",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
                             "type": "string"
                           }
                         ]
@@ -1237,7 +1237,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "Aged out of the retention window.",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
                             "type": "string"
                           }
                         ]
@@ -1508,7 +1508,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "Aged out of the retention window.",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
                             "type": "string"
                           }
                         ]

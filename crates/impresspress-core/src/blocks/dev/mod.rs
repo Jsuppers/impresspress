@@ -226,6 +226,21 @@ pub struct DevShared {
     /// what re-instantiates the block: a queue owned by the block would be
     /// dropped halfway through the operation that dropped it.
     pub activation: activation::ActivationQueue,
+    /// Serializes the read-modify-write of `workspace.json`.
+    ///
+    /// Every workspace mutation is load-whole-manifest, change one entry,
+    /// save-whole-manifest. Two of those interleaving between the load and the
+    /// save would each save a manifest built from a snapshot that predates the
+    /// other, and the later save would drop the earlier writer's entry — even
+    /// though both passed their own per-path `expected_sha256` check, because
+    /// that check is about the path each writer names and says nothing about
+    /// the rest of the file.
+    ///
+    /// An **async** mutex, because the critical section spans storage calls;
+    /// a `std::sync::Mutex` cannot be held across an `await` at all. It guards
+    /// the manifest only: it is released before the activation the mutation
+    /// requests, so ordinary editing never waits behind a publish.
+    pub workspace: futures::lock::Mutex<()>,
 }
 
 impl DevShared {
@@ -234,6 +249,7 @@ impl DevShared {
         Arc::new(Self {
             control,
             activation: activation::ActivationQueue::new(),
+            workspace: futures::lock::Mutex::new(()),
         })
     }
 }

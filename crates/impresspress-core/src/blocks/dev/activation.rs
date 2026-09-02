@@ -39,7 +39,7 @@ use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 
 use super::{
     artifacts, blobs,
-    contracts::GenerationSummary,
+    contracts::{GenerationSummary, SiteManifest},
     control::DynamicBlockSpec,
     generation::{self, GenerationManifest},
     no_store_error_status,
@@ -49,6 +49,7 @@ use super::{
         generations::{GenerationCause, GenerationRow, GenerationStatus, NewGeneration},
         runtime_state::{ActivationPhase, RuntimeState},
     },
+    workspace,
 };
 use crate::util::now_millis;
 
@@ -152,8 +153,121 @@ fn storage_error(e: WaferError) -> ActivationError {
 }
 
 // ---------------------------------------------------------------------------
+// Intents
+// ---------------------------------------------------------------------------
+
+/// What a caller wants to be true, expressed so that it can be resolved
+/// against state that is *current when it runs* rather than current when it
+/// was asked for.
+///
+/// This is the whole reason activation takes an intent and not a finished
+/// [`GenerationManifest`]. A manifest baked at request time freezes two things
+/// that a queued request has no business freezing: the active block set (the
+/// journal still names the previous generation while a block activation is in
+/// flight, so a site write composed then would publish an empty block set and
+/// tear the block back out at dequeue) and the workspace's `site/` half (a
+/// caller that read the workspace early but reached the queue late would
+/// displace content written after its own read). Both are read inside
+/// [`activate`], after the journal, so the newest persisted state always wins.
+pub enum ActivationIntent {
+    /// Publish the workspace's `site/` half, keeping whatever block set is
+    /// live. Never rebuilds the runtime (design §7.2) — the block half is
+    /// copied from the generation that is active at dequeue, so
+    /// `block_set_changed` is false by construction.
+    SiteOnly,
+    /// Publish `blocks` as the complete desired block set.
+    ///
+    /// `site` is `None` for "whatever the workspace holds", which is what a
+    /// compile or a block removal wants; `Some` is for a caller that is
+    /// publishing a site it did not take from the workspace.
+    ///
+    /// The block set is the caller's, resolved at request time, so two block
+    /// activations in flight together would still let the later one's snapshot
+    /// win. Design §6.6 allows one compile at a time and the compile lock is
+    /// what upholds that; a future that lifts the lock should carry the block
+    /// *delta* here rather than the whole set.
+    BlockSet {
+        /// The site to publish, or `None` for the workspace's own.
+        site: Option<SiteManifest>,
+        /// Every block the generation runs.
+        blocks: Vec<DynamicBlockSpec>,
+    },
+    /// Republish an earlier generation's manifests under a new id.
+    ///
+    /// The target is carried rather than re-read because a ledger row is
+    /// immutable: the manifest cannot have changed between the handler's
+    /// lookup (which is what answers `404`) and the dequeue.
+    Rollback {
+        /// The generation whose contents are being republished.
+        target: GenerationManifest,
+    },
+    /// Generation 0, imported from the seed bundle on cold boot.
+    ///
+    /// Carries a whole manifest because there is no workspace and no active
+    /// generation to resolve anything against yet.
+    Seed {
+        /// The manifest the seed bundle describes.
+        manifest: GenerationManifest,
+    },
+}
+
+impl ActivationIntent {
+    /// Whether this intent should replace `pending` in the queue's single
+    /// slot.
+    ///
+    /// A site-only publish never displaces a richer pending intent. It has
+    /// nothing of its own to lose: every intent publishes a site, and the ones
+    /// that do not name one explicitly read the same persisted workspace at
+    /// dequeue that this request has already written to. A rollback or a seed
+    /// *does* name one explicitly, and replaces the workspace wholesale, so a
+    /// site write racing with it was going to be overwritten either way.
+    fn supersedes(&self, pending: &Self) -> bool {
+        !matches!(self, Self::SiteOnly) || matches!(pending, Self::SiteOnly)
+    }
+}
+
+/// Resolve `intent` into the manifest to stage, against the state that is
+/// current now.
+async fn compose(
+    ctx: &dyn Context,
+    intent: ActivationIntent,
+    previous: Option<&(GenerationRow, GenerationManifest)>,
+) -> Result<GenerationManifest, ActivationError> {
+    let active_blocks =
+        || previous.map_or_else(Vec::new, |(_row, manifest)| manifest.blocks.clone());
+    Ok(match intent {
+        ActivationIntent::SiteOnly => {
+            GenerationManifest::staged(workspace_site(ctx).await?, active_blocks())
+        }
+        ActivationIntent::BlockSet { site, blocks } => {
+            let site = match site {
+                Some(site) => site,
+                None => workspace_site(ctx).await?,
+            };
+            GenerationManifest::staged(site, blocks)
+        }
+        ActivationIntent::Rollback { target } => {
+            GenerationManifest::staged(target.site, target.blocks)
+        }
+        ActivationIntent::Seed { manifest } => manifest,
+    })
+}
+
+/// The workspace's `site/` half as a site manifest, read from storage.
+async fn workspace_site(ctx: &dyn Context) -> Result<SiteManifest, ActivationError> {
+    let ws = workspace::load(ctx).await.map_err(storage_error)?;
+    Ok(SiteManifest {
+        files: workspace::site_manifest(&ws),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The queue
 // ---------------------------------------------------------------------------
+
+/// What a waiter is told when the activation it was folded into never
+/// finished — the driving request was cancelled, or its task died.
+const ABANDONED: &str = "activation abandoned before it completed";
 
 /// The serialized activation queue. One per [`super::DevShared`].
 #[derive(Default)]
@@ -169,19 +283,78 @@ struct QueueState {
     pending: Option<Pending>,
 }
 
-/// A coalesced request: one manifest, and every caller that will resolve with
+/// A coalesced request: one intent, and every caller that will resolve with
 /// its outcome.
 struct Pending {
     cause: GenerationCause,
-    manifest: GenerationManifest,
+    intent: ActivationIntent,
     waiters: Vec<oneshot::Sender<Result<ActivationOutcome, ActivationError>>>,
 }
 
+/// The right to drive the queue, released when it is dropped.
+///
+/// Liveness is the whole point. `running` was previously cleared only by the
+/// driver reaching the end of its own drain loop, so a driver that was
+/// cancelled — a dropped request future, a task that panicked — left the flag
+/// set forever and every later `request` waited on a oneshot nobody would ever
+/// send. `Drop` runs on those paths too, which is what makes the release
+/// unconditional.
+struct QueueLease<'q> {
+    queue: &'q ActivationQueue,
+    /// Set once the driver has drained the queue cleanly; `Drop` then has
+    /// nothing to do.
+    released: bool,
+}
+
+impl QueueLease<'_> {
+    /// Take the next queued request, or release the queue when there is none.
+    ///
+    /// Releasing and taking are the same operation on purpose: a gap between
+    /// "I found nothing pending" and "I marked myself not running" is a gap in
+    /// which a new request would queue behind a driver that has already
+    /// stopped draining.
+    fn next(&mut self) -> Option<Pending> {
+        let mut state = self.queue.inner.lock().expect("activation queue mutex");
+        let pending = state.pending.take();
+        if pending.is_none() {
+            state.running = false;
+            self.released = true;
+        }
+        pending
+    }
+}
+
+impl Drop for QueueLease<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let orphaned = {
+            let mut state = self.queue.inner.lock().expect("activation queue mutex");
+            state.running = false;
+            state.pending.take()
+        };
+        // Fail the waiters explicitly rather than dropping their senders. A
+        // dropped sender is indistinguishable from a bug at the receiving end;
+        // an error says what happened, and says it identically on every
+        // platform.
+        if let Some(pending) = orphaned {
+            tracing::warn!(
+                waiters = pending.waiters.len(),
+                "dev sandbox: an activation was abandoned; failing the requests folded into it",
+            );
+            for waiter in pending.waiters {
+                let _ = waiter.send(Err(ActivationError::Runtime(ABANDONED.to_string())));
+            }
+        }
+    }
+}
+
 /// What [`ActivationQueue::admit`] decided for a caller.
-enum Admission {
+enum Admission<'q> {
     /// The caller runs the activation itself, and then drains whatever queued
-    /// up behind it.
-    Drive(GenerationCause, GenerationManifest),
+    /// up behind it. Holds the lease for as long as it does.
+    Drive(QueueLease<'q>, GenerationCause, ActivationIntent),
     /// Someone else is running; the caller waits for the coalesced outcome.
     Wait(oneshot::Receiver<Result<ActivationOutcome, ActivationError>>),
 }
@@ -194,48 +367,41 @@ impl ActivationQueue {
 
     /// Admit one request: drive it, or fold it into the pending state.
     ///
-    /// Folding replaces the pending *manifest* (the newest desired state is
-    /// the one to converge on) but keeps every waiter, so a caller whose
-    /// manifest was superseded still resolves — with the generation that
-    /// carries its change, because the newer manifest was built from a
-    /// workspace that already contained it.
-    fn admit(&self, cause: GenerationCause, manifest: GenerationManifest) -> Admission {
+    /// Folding keeps every waiter — a caller whose intent was superseded still
+    /// resolves, with the generation that carries its change, because that
+    /// generation is composed from the persisted state the caller has already
+    /// written to.
+    fn admit(&self, cause: GenerationCause, intent: ActivationIntent) -> Admission<'_> {
         let mut state = self.inner.lock().expect("activation queue mutex");
         if !state.running {
             state.running = true;
-            return Admission::Drive(cause, manifest);
+            return Admission::Drive(
+                QueueLease {
+                    queue: self,
+                    released: false,
+                },
+                cause,
+                intent,
+            );
         }
         let (tx, rx) = oneshot::channel();
         match state.pending.as_mut() {
             Some(pending) => {
-                pending.cause = cause;
-                pending.manifest = manifest;
+                if intent.supersedes(&pending.intent) {
+                    pending.cause = cause;
+                    pending.intent = intent;
+                }
                 pending.waiters.push(tx);
             }
             None => {
                 state.pending = Some(Pending {
                     cause,
-                    manifest,
+                    intent,
                     waiters: vec![tx],
                 });
             }
         }
         Admission::Wait(rx)
-    }
-
-    /// Take the next queued request, or release the queue when there is none.
-    ///
-    /// Releasing and taking are the same operation on purpose: a gap between
-    /// "I found nothing pending" and "I marked myself not running" is a gap in
-    /// which a new request would queue behind a driver that has already
-    /// stopped draining.
-    fn next(&self) -> Option<Pending> {
-        let mut state = self.inner.lock().expect("activation queue mutex");
-        let pending = state.pending.take();
-        if pending.is_none() {
-            state.running = false;
-        }
-        pending
     }
 }
 
@@ -243,26 +409,28 @@ impl ActivationQueue {
 // Requesting an activation
 // ---------------------------------------------------------------------------
 
-/// Publish `next` as a new generation, waiting for it (or for the generation
-/// that supersedes it) to go live.
+/// Make `intent` true as a new generation, waiting for it (or for the
+/// generation that supersedes it) to go live.
 pub async fn request(
     ctx: &dyn Context,
     shared: &super::DevShared,
     cause: GenerationCause,
-    next: GenerationManifest,
+    intent: ActivationIntent,
 ) -> Result<ActivationOutcome, ActivationError> {
-    match shared.activation.admit(cause, next) {
-        Admission::Wait(rx) => rx.await.unwrap_or_else(|_| {
-            Err(ActivationError::Runtime(
-                "the activation this change was folded into was abandoned".to_string(),
-            ))
-        }),
-        Admission::Drive(cause, manifest) => {
-            let mine = activate(ctx, shared, cause, manifest).await;
+    match shared.activation.admit(cause, intent) {
+        // A dropped sender means the driver went away without releasing the
+        // lease — which [`QueueLease::drop`] makes impossible — so this arm is
+        // the belt to that braces: a defined error either way, never a panic
+        // and never a silent hang.
+        Admission::Wait(rx) => rx
+            .await
+            .unwrap_or_else(|_| Err(ActivationError::Runtime(ABANDONED.to_string()))),
+        Admission::Drive(mut lease, cause, intent) => {
+            let mine = activate(ctx, shared, cause, intent).await;
             // Drain: whoever queued up while this ran gets their outcome from
             // here, because they have no task of their own to run it on.
-            while let Some(pending) = shared.activation.next() {
-                let outcome = activate(ctx, shared, pending.cause, pending.manifest).await;
+            while let Some(pending) = lease.next() {
+                let outcome = activate(ctx, shared, pending.cause, pending.intent).await;
                 for waiter in pending.waiters {
                     // A caller that went away is not an error; the activation
                     // it asked for still happened.
@@ -274,22 +442,28 @@ pub async fn request(
     }
 }
 
-/// Stage `manifest` as a new generation and activate it.
+/// Resolve `intent`, stage it as a new generation, and activate it.
+///
+/// Everything the manifest is made of is read *here* — the journal, the
+/// generation it names, the workspace — so a request that waited in the queue
+/// is composed against the state it will actually be applied to rather than
+/// the state its caller saw.
 async fn activate(
     ctx: &dyn Context,
     shared: &super::DevShared,
     cause: GenerationCause,
-    mut manifest: GenerationManifest,
+    intent: ActivationIntent,
 ) -> Result<ActivationOutcome, ActivationError> {
     let state = repo::runtime_state::read(ctx)
         .await
         .map_err(storage_error)?;
     let previous = load_previous(ctx, &state).await?;
+    let mut manifest = compose(ctx, intent, previous.as_ref()).await?;
 
     // The id is minted here, not by the repo, because the manifest has to
     // carry it before it is hashed (design §11.3) — and the parent is
     // whatever is active *now*, which for a coalesced request is not what was
-    // active when the caller built the manifest.
+    // active when the caller made it.
     let id = repo::new_id();
     manifest.identify(id.clone(), state.active_generation_id.clone());
 
@@ -598,28 +772,46 @@ pub async fn converge_on_boot(
         .await
         .map_err(|e| e.message)?;
     if let Some(desired) = state.desired_generation_id.clone() {
-        let (row, manifest) = generation::load(ctx, &desired)
-            .await
-            .map_err(|e| e.message)?;
         let previous = load_previous(ctx, &state)
             .await
             .map_err(|e| e.to_string())?;
-        // A failed convergence is not a failed boot, and the failure is not
-        // discarded: `activate_staged` has already written it to the
-        // generation's `failure_message` and put the journal back at rest, so
-        // it is readable at `GET /b/dev/api/generations/{id}`. What it cannot
-        // do is guarantee the published folder matches the generation that is
-        // live again — the interrupted publish may have written half of the
-        // desired one — so republish that from the manifest authoritative for
-        // it, treating the abandoned manifest as what is currently out there.
-        if activate_staged(ctx, shared, &row, &manifest, previous.as_ref(), &state)
-            .await
-            .is_err()
-        {
-            if let Some((_, previous_manifest)) = previous.as_ref() {
-                publish_site(ctx, Some(&manifest.site), &previous_manifest.site)
+
+        match generation::load(ctx, &desired).await {
+            Ok((row, manifest)) => {
+                // A failed convergence is not a failed boot, and the failure
+                // is not discarded: `activate_staged` has already written it
+                // to the generation's `failure_message` and put the journal
+                // back at rest, so it is readable at
+                // `GET /b/dev/api/generations/{id}`. What it cannot do is
+                // guarantee the published folder matches the generation that
+                // is live again — the interrupted publish may have written
+                // half of the desired one — so republish that from the
+                // manifest authoritative for it, treating the abandoned
+                // manifest as what is currently out there.
+                if activate_staged(ctx, shared, &row, &manifest, previous.as_ref(), &state)
                     .await
-                    .map_err(|e| e.message)?;
+                    .is_err()
+                {
+                    restore_active_site(ctx, Some(&manifest.site), previous.as_ref()).await?;
+                }
+            }
+            // The journal names a generation that cannot be loaded: the row
+            // is gone, or a column does not parse. Refusing the boot would be
+            // the worst possible answer — the journal is persistent, so every
+            // subsequent boot would fail identically and the instance would
+            // never serve again over a row nothing can use. Treat it as a
+            // convergence that failed: restore what is live, clear the
+            // journal, and record the refusal on the row when there is one.
+            Err(e) => {
+                tracing::error!(
+                    generation_id = %desired,
+                    error = %e.message,
+                    "dev sandbox: the activation journal names a generation that cannot be \
+                     loaded; restoring the active generation",
+                );
+                abandon_dangling(ctx, &desired, &e.message).await?;
+                restore_active_site(ctx, None, previous.as_ref()).await?;
+                clear_journal(ctx, &state).await?;
             }
         }
     }
@@ -629,6 +821,61 @@ pub async fn converge_on_boot(
         .map_err(|e| e.message)?
         .map(|(_, manifest)| manifest.blocks)
         .unwrap_or_default())
+}
+
+/// Republish the active generation's site after a convergence that did not
+/// happen.
+///
+/// `published` is what the interrupted run is believed to have left in the
+/// folder, when that is known — passing it is what removes files the failed
+/// publish had already added. It is `None` when the desired manifest could not
+/// be read at all, and then the restore can only write the active generation's
+/// own files back; anything the interrupted run added beyond them stays until
+/// the next publish that knows about it. That is a stale extra object, not a
+/// wrong `index.html`, because the entrypoint is always rewritten last.
+async fn restore_active_site(
+    ctx: &dyn Context,
+    published: Option<&SiteManifest>,
+    previous: Option<&(GenerationRow, GenerationManifest)>,
+) -> Result<(), String> {
+    let Some((_, manifest)) = previous else {
+        return Ok(());
+    };
+    publish_site(ctx, published, &manifest.site)
+        .await
+        .map_err(|e| e.message)
+}
+
+/// Record why a generation the journal pointed at could not be converged on.
+///
+/// Best effort by design: the row may not exist at all (that is one of the two
+/// ways loading it fails), and a journal that cannot be cleaned up must not
+/// stop the instance from booting.
+async fn abandon_dangling(ctx: &dyn Context, id: &str, message: &str) -> Result<(), String> {
+    match repo::generations::get(ctx, id).await {
+        Ok(_) => {
+            repo::generations::set_status(ctx, id, GenerationStatus::Failed, Some(message), None)
+                .await
+                .map_err(|e| e.message)
+        }
+        // Nothing to mark: the journal outlived the row.
+        Err(_) => Ok(()),
+    }
+}
+
+/// Put the journal back at rest, leaving the active generation alone.
+async fn clear_journal(ctx: &dyn Context, state: &RuntimeState) -> Result<(), String> {
+    repo::runtime_state::write(
+        ctx,
+        &RuntimeState {
+            active_generation_id: state.active_generation_id.clone(),
+            desired_generation_id: None,
+            activation_phase: ActivationPhase::Idle,
+            generation: state.generation,
+        },
+    )
+    .await
+    .map_err(|e| e.message)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,62 +914,148 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::dev::contracts::SiteManifest;
 
-    fn manifest(id: &str) -> GenerationManifest {
-        let mut manifest = GenerationManifest::staged(SiteManifest::default(), Vec::new());
-        manifest.identify(id.to_string(), None);
-        manifest
+    fn site_only() -> ActivationIntent {
+        ActivationIntent::SiteOnly
+    }
+
+    fn block_set(marker: &str) -> ActivationIntent {
+        ActivationIntent::BlockSet {
+            site: None,
+            blocks: vec![DynamicBlockSpec {
+                name: format!("site/{marker}"),
+                artifact_sha256: marker.to_string(),
+                routes: Vec::new(),
+                capabilities: wafer_block::BlockCapabilities::default(),
+                wafer_guest_version: 1,
+            }],
+        }
+    }
+
+    fn block_marker(intent: &ActivationIntent) -> Option<&str> {
+        match intent {
+            ActivationIntent::BlockSet { blocks, .. } => {
+                Some(blocks.first()?.artifact_sha256.as_str())
+            }
+            _ => None,
+        }
     }
 
     /// The first caller drives; the queue is then busy.
     #[test]
     fn the_first_request_drives_and_the_rest_wait() {
         let queue = ActivationQueue::new();
+        let admitted = queue.admit(GenerationCause::SiteWrite, site_only());
         assert!(matches!(
-            queue.admit(GenerationCause::SiteWrite, manifest("a")),
-            Admission::Drive(GenerationCause::SiteWrite, _)
+            admitted,
+            Admission::Drive(_, GenerationCause::SiteWrite, ActivationIntent::SiteOnly)
         ));
         assert!(matches!(
-            queue.admit(GenerationCause::SiteWrite, manifest("b")),
+            queue.admit(GenerationCause::SiteWrite, site_only()),
             Admission::Wait(_)
         ));
     }
 
-    /// Coalescing: the newest manifest wins, and every waiter is carried over
-    /// to it — including the one whose own manifest was displaced.
+    /// Coalescing: the newest intent wins, and every waiter is carried over to
+    /// it — including the one whose own intent was displaced.
     #[test]
-    fn queued_requests_coalesce_onto_the_newest_manifest() {
+    fn queued_requests_coalesce_onto_the_newest_intent() {
         let queue = ActivationQueue::new();
-        let _driver = queue.admit(GenerationCause::SiteWrite, manifest("a"));
-        let _first = queue.admit(GenerationCause::SiteWrite, manifest("b"));
-        let _second = queue.admit(GenerationCause::BlockCompile, manifest("c"));
+        let mut driver = expect_drive(queue.admit(GenerationCause::SiteWrite, site_only()));
+        let _first = queue.admit(GenerationCause::SiteWrite, site_only());
+        let _second = queue.admit(GenerationCause::BlockCompile, block_set("bb"));
 
-        let pending = queue.next().expect("something is pending");
-        assert_eq!(pending.manifest.generation_id, "c");
+        let pending = driver.next().expect("something is pending");
+        assert_eq!(block_marker(&pending.intent), Some("bb"));
         assert_eq!(pending.cause, GenerationCause::BlockCompile);
         assert_eq!(pending.waiters.len(), 2, "the displaced waiter is kept");
+    }
+
+    /// A site-only publish never displaces a pending block change. Both
+    /// resolve the same persisted workspace at dequeue, so the site write is
+    /// carried either way — but replacing the intent would drop the block set
+    /// the compile staged.
+    #[test]
+    fn a_site_write_does_not_displace_a_pending_block_change() {
+        let queue = ActivationQueue::new();
+        let mut driver = expect_drive(queue.admit(GenerationCause::SiteWrite, site_only()));
+        let _compile = queue.admit(GenerationCause::BlockCompile, block_set("bb"));
+        let _write = queue.admit(GenerationCause::SiteWrite, site_only());
+
+        let pending = driver.next().expect("something is pending");
+        assert_eq!(block_marker(&pending.intent), Some("bb"));
+        assert_eq!(pending.cause, GenerationCause::BlockCompile);
+        assert_eq!(pending.waiters.len(), 2, "the site writer still resolves");
+    }
+
+    /// The reverse still replaces: a block change is not subsumed by anything.
+    #[test]
+    fn a_block_change_displaces_a_pending_site_write() {
+        let queue = ActivationQueue::new();
+        let mut driver = expect_drive(queue.admit(GenerationCause::SiteWrite, site_only()));
+        let _write = queue.admit(GenerationCause::SiteWrite, site_only());
+        let _compile = queue.admit(GenerationCause::BlockCompile, block_set("bb"));
+
+        let pending = driver.next().expect("something is pending");
+        assert_eq!(block_marker(&pending.intent), Some("bb"));
     }
 
     /// Draining an empty queue releases it, so the next request drives.
     #[test]
     fn the_queue_is_released_only_when_nothing_is_pending() {
         let queue = ActivationQueue::new();
-        let _driver = queue.admit(GenerationCause::SiteWrite, manifest("a"));
-        let _waiter = queue.admit(GenerationCause::SiteWrite, manifest("b"));
+        let mut driver = expect_drive(queue.admit(GenerationCause::SiteWrite, site_only()));
+        let _waiter = queue.admit(GenerationCause::SiteWrite, site_only());
 
-        assert!(queue.next().is_some());
+        assert!(driver.next().is_some());
         // Still running: the driver has not finished the batch it just took.
         assert!(matches!(
-            queue.admit(GenerationCause::SiteWrite, manifest("c")),
+            queue.admit(GenerationCause::SiteWrite, site_only()),
             Admission::Wait(_)
         ));
-        assert!(queue.next().is_some());
-        assert!(queue.next().is_none());
+        assert!(driver.next().is_some());
+        assert!(driver.next().is_none());
+        drop(driver);
         assert!(matches!(
-            queue.admit(GenerationCause::SiteWrite, manifest("d")),
+            queue.admit(GenerationCause::SiteWrite, site_only()),
             Admission::Drive(..)
         ));
+    }
+
+    /// A driver that goes away without draining — a cancelled request future,
+    /// a task that died — must release the queue and tell its waiters, not
+    /// leave every later request hanging on a oneshot nobody will send.
+    #[test]
+    fn a_dropped_lease_releases_the_queue_and_fails_its_waiters() {
+        let queue = ActivationQueue::new();
+        let driver = expect_drive(queue.admit(GenerationCause::SiteWrite, site_only()));
+        let Admission::Wait(mut waiter) = queue.admit(GenerationCause::SiteWrite, site_only())
+        else {
+            panic!("the second request must wait");
+        };
+
+        drop(driver);
+
+        match waiter.try_recv() {
+            Ok(Some(Err(ActivationError::Runtime(message)))) => {
+                assert!(message.contains("abandoned"), "{message}");
+            }
+            other => panic!("the orphaned waiter must be failed, not dropped: {other:?}"),
+        }
+        assert!(
+            matches!(
+                queue.admit(GenerationCause::SiteWrite, site_only()),
+                Admission::Drive(..)
+            ),
+            "the queue must be free again"
+        );
+    }
+
+    fn expect_drive(admission: Admission<'_>) -> QueueLease<'_> {
+        match admission {
+            Admission::Drive(lease, _, _) => lease,
+            Admission::Wait(_) => panic!("expected to drive"),
+        }
     }
 
     #[test]

@@ -17,13 +17,12 @@
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use super::{
-    activation,
+    activation::{self, ActivationIntent},
     contracts::{
         ActivationResponse, GenerationDetail, GenerationListQuery, GenerationListResponse,
         SiteManifest,
     },
-    generation::{self, GenerationManifest},
-    no_store, no_store_error,
+    generation, no_store, no_store_error,
     repo::{self, generations::GenerationCause},
     workspace::{self, SITE_PREFIX},
     DevShared,
@@ -101,10 +100,15 @@ pub async fn handle_rollback(ctx: &dyn Context, shared: &DevShared, msg: &Messag
     };
 
     // A new generation carrying the target's contents — not the target row
-    // re-activated. `staged` refuses to carry the target's identity, which is
-    // the property that keeps the history a straight line.
-    let next = GenerationManifest::staged(target.site.clone(), target.blocks.clone());
-    let outcome = match activation::request(ctx, shared, GenerationCause::Rollback, next).await {
+    // re-activated. The intent carries the target manifest rather than its id
+    // because a ledger row is immutable: nothing can have changed it between
+    // the lookup above (which is what answers the `404`) and the dequeue. The
+    // new id and parent are assigned inside the queue, which is what keeps the
+    // history a straight line.
+    let intent = ActivationIntent::Rollback {
+        target: target.clone(),
+    };
+    let outcome = match activation::request(ctx, shared, GenerationCause::Rollback, intent).await {
         Ok(outcome) => outcome,
         Err(e) => return e.into_response(),
     };
@@ -113,7 +117,7 @@ pub async fn handle_rollback(ctx: &dyn Context, shared: &DevShared, msg: &Messag
     // pointing at content the published site does not have. The reverse order
     // would rewrite the workspace on every refused rollback — including the
     // ordinary case of a target whose blobs have been collected.
-    if let Err(e) = adopt_site(ctx, &target.site).await {
+    if let Err(e) = adopt_site(ctx, shared, &target.site).await {
         return err_internal("dev workspace rollback", e);
     }
 
@@ -130,7 +134,16 @@ pub async fn handle_rollback(ctx: &dyn Context, shared: &DevShared, msg: &Messag
 /// never written), so nothing has been stored and nothing has been reclaimed.
 /// Charging for it would make a rollback look like a fresh upload of the whole
 /// site and eat the workspace's quota for content it already paid for.
-async fn adopt_site(ctx: &dyn Context, site: &SiteManifest) -> Result<(), WaferError> {
+async fn adopt_site(
+    ctx: &dyn Context,
+    shared: &DevShared,
+    site: &SiteManifest,
+) -> Result<(), WaferError> {
+    // Under the same lock every file mutation takes: this is a
+    // read-modify-write of the whole manifest, and a concurrent write that
+    // loaded before it and saved after it would resurrect the site half this
+    // is replacing.
+    let _serialized = shared.workspace.lock().await;
     let mut ws = workspace::load(ctx).await?;
     let stale: Vec<String> = ws
         .files
@@ -197,6 +210,7 @@ mod tests {
 
         adopt_site(
             &ctx,
+            &DevShared::new(FakeControl::new()),
             &SiteManifest {
                 files: vec![entry("index.html", "old")],
             },

@@ -7,19 +7,19 @@
 
 use impresspress_core::{
     blocks::dev::{
-        activation::{self, ActivationError},
+        activation::{self, ActivationError, ActivationIntent},
         artifacts, blobs,
         contracts::SiteManifest,
         control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind},
         generation::{self, GenerationManifest},
         repo::{
             self,
-            generations::{self, GenerationCause, NewGeneration},
+            generations::{self, GenerationCause, GenerationStatus, NewGeneration},
             runtime_state::{self, ActivationPhase, RuntimeState},
         },
         test_support::FakeControl,
         workspace::FileEntry,
-        DevShared, WAFER_GUEST_VERSION,
+        WAFER_GUEST_VERSION,
     },
     test_support::{
         admin_msg, anon_msg, auth_msg, output_http_header, output_http_status, output_json,
@@ -64,6 +64,12 @@ async fn write_file(
 /// The published site object at `key`, or `None` when nothing is there.
 async fn served(ctx: &TestContext, key: &str) -> Option<Vec<u8>> {
     ctx.storage_get("wafer-run/web", "site", key).await.ok()
+}
+
+/// The sha256 of `content`, as the files API reports it — the value a write
+/// passes back as `expected_sha256`.
+fn sha_of(content: &str) -> String {
+    blobs::sha256_hex(content.as_bytes())
 }
 
 async fn status_of(ctx: &TestContext) -> serde_json::Value {
@@ -161,15 +167,6 @@ async fn block_source_writes_do_not_create_generations() {
     assert_eq!(d["generation"], serde_json::Value::Null);
 }
 
-/// The queue lives on the shared state, not on the block, so a re-instantiated
-/// block cannot lose an in-flight activation.
-#[test]
-fn the_activation_queue_is_shared_state() {
-    let shared: std::sync::Arc<DevShared> = DevShared::new(FakeControl::new());
-    let also = shared.clone();
-    assert!(std::sync::Arc::ptr_eq(&shared, &also));
-}
-
 // ---------------------------------------------------------------------------
 // Driving the queue directly
 // ---------------------------------------------------------------------------
@@ -189,16 +186,18 @@ async fn site_of(ctx: &TestContext, content: &str) -> SiteManifest {
     }
 }
 
-/// One block, with its artifact stored so validation passes.
-async fn block_spec(ctx: &TestContext) -> DynamicBlockSpec {
-    let artifact_sha256 = artifacts::put(ctx, b"\0asm\x01\0\0\0")
+/// One block named `name`, with its own artifact stored so validation passes.
+async fn block_spec(ctx: &TestContext, name: &str) -> DynamicBlockSpec {
+    // Distinct bytes per block, so two specs are distinguishable by artifact
+    // as well as by name.
+    let artifact_sha256 = artifacts::put(ctx, format!("\0asm\x01{name}").as_bytes())
         .await
         .expect("store the artifact a manifest names");
     DynamicBlockSpec {
-        name: "site/hello".to_string(),
+        name: format!("site/{name}"),
         artifact_sha256,
         routes: vec![DynamicRoute {
-            prefix: "/b/hello/".to_string(),
+            prefix: format!("/b/{name}/"),
             access: RouteAccessKind::Public,
         }],
         capabilities: wafer_block::BlockCapabilities::default(),
@@ -206,10 +205,27 @@ async fn block_spec(ctx: &TestContext) -> DynamicBlockSpec {
     }
 }
 
-/// The manifest Task 8 will produce from a successful compile: the site as it
-/// stands, plus one block.
-async fn manifest_with_block(ctx: &TestContext, content: &str) -> GenerationManifest {
-    GenerationManifest::staged(site_of(ctx, content).await, vec![block_spec(ctx).await])
+/// The intent Task 8 will produce from a successful compile: the workspace's
+/// own site, plus this block set.
+async fn compile_of(ctx: &TestContext, names: &[&str]) -> ActivationIntent {
+    let mut blocks = Vec::new();
+    for name in names {
+        blocks.push(block_spec(ctx, name).await);
+    }
+    ActivationIntent::BlockSet { site: None, blocks }
+}
+
+/// The block names the active generation declares, sorted.
+async fn active_block_names(ctx: &TestContext) -> Vec<String> {
+    let status = status_of(ctx).await;
+    let mut names: Vec<String> = status["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|b| b["name"].as_str().expect("name").to_string())
+        .collect();
+    names.sort();
+    names
 }
 
 #[tokio::test]
@@ -286,7 +302,7 @@ async fn a_failed_runtime_rebuild_leaves_the_previous_generation_active() {
         &ctx,
         &ctx.dev_shared(),
         GenerationCause::BlockCompile,
-        manifest_with_block(&ctx, "v1").await,
+        compile_of(&ctx, &["hello"]).await,
     )
     .await
     .expect_err("a refused rebuild must refuse the activation");
@@ -316,14 +332,20 @@ async fn a_failed_runtime_rebuild_leaves_the_previous_generation_active() {
 #[tokio::test]
 async fn a_manifest_naming_content_that_is_not_stored_is_refused() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
-    let mut next = site_of(&ctx, "v1").await;
-    next.files[0].sha256 = blobs::sha256_hex(b"never stored");
+    // An explicit site (rather than the workspace's own) is the only way to
+    // name content the store does not hold: a `SiteOnly` intent reads the
+    // workspace, whose every entry is stored by construction.
+    let mut site = site_of(&ctx, "v1").await;
+    site.files[0].sha256 = blobs::sha256_hex(b"never stored");
 
     let err = activation::request(
         &ctx,
         &ctx.dev_shared(),
         GenerationCause::SiteWrite,
-        GenerationManifest::staged(next, Vec::new()),
+        ActivationIntent::BlockSet {
+            site: Some(site),
+            blocks: Vec::new(),
+        },
     )
     .await
     .expect_err("a manifest naming content that is not stored cannot activate");
@@ -480,11 +502,12 @@ async fn a_failed_convergence_restores_the_previous_generation() {
 async fn boot_reports_the_active_block_set_when_nothing_is_owed() {
     let control = FakeControl::new();
     let ctx = TestContext::with_dev(control.clone()).await;
+    write_file(&ctx, "site/index.html", "v1", None).await;
     activation::request(
         &ctx,
         &ctx.dev_shared(),
         GenerationCause::BlockCompile,
-        manifest_with_block(&ctx, "v1").await,
+        compile_of(&ctx, &["hello"]).await,
     )
     .await
     .expect("activate a generation with a block");
@@ -629,49 +652,162 @@ async fn only_the_last_twenty_generations_are_retained() {
 
 /// Requests that arrive while an activation is running collapse into one, and
 /// every waiter resolves with the generation that carries its change.
+///
+/// Two writes to *different* paths, because the point is that both survive:
+/// the queue keeps one pending slot, so a coalesced site publish has to be
+/// composed from the persisted workspace rather than from whatever either
+/// caller happened to be holding.
 #[tokio::test]
-async fn requests_that_arrive_during_an_activation_coalesce() {
+async fn site_writes_that_arrive_during_an_activation_coalesce_and_both_publish() {
     let control = FakeControl::new();
     let ctx = TestContext::with_dev(control.clone()).await;
     let shared = ctx.dev_shared();
-
-    // Prepare every manifest up front: building one is itself asynchronous,
-    // and the point of the test is what the queue does, not what storage does.
-    let first = manifest_with_block(&ctx, "v1").await;
-    let second = manifest_with_block(&ctx, "v2").await;
-    let third = manifest_with_block(&ctx, "v3").await;
+    let compile = compile_of(&ctx, &["hello"]).await;
 
     // The driver parks inside `rebuild` — the one place an activation can be
-    // held open — so the other two are admitted while it is in flight.
+    // held open — so the two writes are admitted while it is in flight.
     let release = control.gate_next_rebuild();
-    let (driver, waiter_a, waiter_b, ()) = tokio::join!(
-        activation::request(&ctx, &shared, GenerationCause::BlockCompile, first),
-        activation::request(&ctx, &shared, GenerationCause::SiteWrite, second),
-        activation::request(&ctx, &shared, GenerationCause::SiteWrite, third),
+    let (driver, first, second, ()) = tokio::join!(
+        activation::request(&ctx, &shared, GenerationCause::BlockCompile, compile),
+        write_file(&ctx, "site/a.css", "a{}", None),
+        write_file(&ctx, "site/b.css", "b{}", None),
         async {
             let _ = release.send(());
         },
     );
+    let driver = driver.expect("the driver activates its own intent");
 
-    let driver = driver.expect("the driver activates its own manifest");
-    let waiter_a = waiter_a.expect("a coalesced waiter resolves");
-    let waiter_b = waiter_b.expect("a coalesced waiter resolves");
-
-    // The two waiters resolved with the same generation — the one carrying the
-    // newest desired state — and it is not the driver's.
-    assert_eq!(waiter_a.generation.id, waiter_b.generation.id);
-    assert_ne!(driver.generation.id, waiter_a.generation.id);
+    // Both writes resolved with the same generation — the one composed from
+    // the workspace after both had saved — and it is not the driver's.
+    assert_eq!(first["generation"]["id"], second["generation"]["id"]);
+    assert_ne!(first["generation"]["id"], json!(driver.generation.id));
+    assert_eq!(first["generation"]["site_files"], 2);
     assert_eq!(
-        served(&ctx, "index.html").await.as_deref(),
-        Some(&b"v3"[..])
+        served(&ctx, "a.css").await.as_deref(),
+        Some(&b"a{}"[..]),
+        "the displaced writer's file must still be published"
     );
+    assert_eq!(served(&ctx, "b.css").await.as_deref(), Some(&b"b{}"[..]));
 
-    // Two publishes for three requests: the displaced manifest never became a
-    // generation at all.
+    // Two publishes for three requests, and one rebuild: the site writes
+    // changed no block set.
     let l = list_generations(&ctx, Some(100)).await;
     assert_eq!(l["generations"].as_array().expect("generations").len(), 2);
-    // And one rebuild for three requests: the block set only changed once.
     assert_eq!(control.rebuilds().len(), 1);
+}
+
+/// The regression the intent design exists for: a site write admitted while a
+/// block activation is in flight must not be composed against the *previous*
+/// block set. Composed at request time it would carry the pre-compile blocks
+/// and, at dequeue, rebuild the runtime back to them — tearing out the block
+/// that had just been published.
+#[tokio::test]
+async fn a_site_write_during_a_block_activation_keeps_the_block_set() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let shared = ctx.dev_shared();
+    write_file(&ctx, "site/index.html", "v1", None).await;
+
+    // One block is already live, so the in-flight activation is a change from
+    // a non-empty set to a different non-empty set — a site write composed
+    // from either would be wrong in a visible way.
+    activation::request(
+        &ctx,
+        &shared,
+        GenerationCause::BlockCompile,
+        compile_of(&ctx, &["hello"]).await,
+    )
+    .await
+    .expect("activate the first block");
+    assert_eq!(active_block_names(&ctx).await, vec!["site/hello"]);
+
+    let second = compile_of(&ctx, &["hello", "goodbye"]).await;
+    let v1 = sha_of("v1");
+    let release = control.gate_next_rebuild();
+    let (compile, write, ()) = tokio::join!(
+        activation::request(&ctx, &shared, GenerationCause::BlockCompile, second),
+        write_file(&ctx, "site/index.html", "v2", Some(&v1)),
+        async {
+            let _ = release.send(());
+        },
+    );
+    compile.expect("the second compile activates");
+
+    // The generation the write published still carries both blocks...
+    assert_eq!(write["generation"]["blocks"], 2);
+    assert_eq!(
+        active_block_names(&ctx).await,
+        vec!["site/goodbye", "site/hello"]
+    );
+    // ...and the write itself rebuilt nothing: two compiles, two rebuilds.
+    assert_eq!(control.rebuilds().len(), 2);
+    assert_eq!(control.rebuilds()[1].len(), 2);
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v2"[..])
+    );
+}
+
+/// Liveness: a driver that is cancelled mid-activation must release the queue
+/// and fail the requests folded into it, not wedge every later request on a
+/// oneshot nobody will send.
+#[tokio::test]
+async fn a_cancelled_driver_releases_the_queue_and_fails_its_waiters() {
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context as TaskContext, Poll, Waker},
+    };
+
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let shared = ctx.dev_shared();
+    let compile = compile_of(&ctx, &["hello"]).await;
+
+    // The gate's sender is held for the whole test, so the driver can never
+    // finish: cancelling it is the only way it ends.
+    let _never_released = control.gate_next_rebuild();
+    let mut cx = TaskContext::from_waker(Waker::noop());
+
+    let mut driver = Box::pin(activation::request(
+        &ctx,
+        &shared,
+        GenerationCause::BlockCompile,
+        compile,
+    ));
+    assert!(
+        driver.as_mut().poll(&mut cx).is_pending(),
+        "the driver must park inside rebuild"
+    );
+
+    let mut waiter = Box::pin(activation::request(
+        &ctx,
+        &shared,
+        GenerationCause::SiteWrite,
+        ActivationIntent::SiteOnly,
+    ));
+    assert!(
+        waiter.as_mut().poll(&mut cx).is_pending(),
+        "the second request must queue behind the driver"
+    );
+
+    // Cancel the driver.
+    drop(driver);
+
+    match Pin::new(&mut waiter).poll(&mut cx) {
+        Poll::Ready(Err(ActivationError::Runtime(message))) => {
+            assert!(message.contains("abandoned"), "{message}");
+        }
+        other => panic!("the orphaned waiter must be failed: {other:?}"),
+    }
+
+    // And the queue is usable again.
+    let after = write_file(&ctx, "site/index.html", "v1", None).await;
+    assert_eq!(after["generation"]["status"], "active");
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -815,11 +951,23 @@ async fn a_publish_that_fails_after_the_swap_restores_the_previous_runtime_and_s
     let g1 = write_file(&ctx, "site/index.html", "v1", None).await;
     let active = g1["generation"]["id"].as_str().expect("id").to_string();
 
-    let next = manifest_with_block(&ctx, "v2").await;
+    // The intent names its own site, different from what is published: a
+    // publish only writes what changed, so an activation whose site matched
+    // the live one would reach the commit without ever calling `put`.
+    let site = site_of(&ctx, "v2").await;
+    let intent = ActivationIntent::BlockSet {
+        site: Some(site),
+        blocks: vec![block_spec(&ctx, "hello").await],
+    };
     ctx.fail_next_storage_put("disk is on fire");
-    let err = activation::request(&ctx, &ctx.dev_shared(), GenerationCause::BlockCompile, next)
-        .await
-        .expect_err("a publish that fails must fail the activation");
+    let err = activation::request(
+        &ctx,
+        &ctx.dev_shared(),
+        GenerationCause::BlockCompile,
+        intent,
+    )
+    .await
+    .expect_err("a publish that fails must fail the activation");
     assert!(
         matches!(&err, ActivationError::Storage(m) if m.contains("disk is on fire")),
         "{err:?}"
@@ -877,5 +1025,107 @@ async fn converging_on_the_generation_that_is_already_live_leaves_it_live() {
     assert_eq!(
         served(&ctx, "index.html").await.as_deref(),
         Some(&b"v1"[..])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A journal that points nowhere useful
+// ---------------------------------------------------------------------------
+
+/// Point the journal at `desired`, mid-publish, leaving `active` alone.
+async fn journal_desired(ctx: &TestContext, desired: &str) {
+    let state = runtime_state::read(ctx).await.expect("read journal");
+    runtime_state::write(
+        ctx,
+        &RuntimeState {
+            desired_generation_id: Some(desired.to_string()),
+            activation_phase: ActivationPhase::Publishing,
+            ..state
+        },
+    )
+    .await
+    .expect("journal");
+}
+
+/// The journal is persistent, so a `desired` that cannot be loaded would fail
+/// every boot identically and the instance would never serve again. Boot has
+/// to get past it.
+#[tokio::test]
+async fn boot_clears_a_journal_that_names_a_generation_that_is_gone() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let g1 = write_file(&ctx, "site/index.html", "v1", None).await;
+    let active = g1["generation"]["id"].as_str().expect("id").to_string();
+
+    journal_desired(&ctx, "a-generation-that-never-existed").await;
+
+    let blocks = activation::converge_on_boot(&ctx, &ctx.dev_shared())
+        .await
+        .expect("a dangling journal must not fail the boot");
+    assert!(blocks.is_empty());
+
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    assert_eq!(state.desired_generation_id, None);
+    assert_eq!(state.activation_phase, ActivationPhase::Idle);
+    assert_eq!(state.active_generation_id.as_deref(), Some(active.as_str()));
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
+
+    // And it stays cleared: a second boot is an ordinary one.
+    activation::converge_on_boot(&ctx, &ctx.dev_shared())
+        .await
+        .expect("the second boot has nothing owed");
+    assert_eq!(status_of_generation(&ctx, &active).await, "active");
+}
+
+/// The same, for a row that exists but cannot be read: its manifest columns do
+/// not parse. Here there *is* a row, so the refusal is recorded on it.
+#[tokio::test]
+async fn boot_clears_a_journal_that_names_an_unreadable_generation() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let g1 = write_file(&ctx, "site/index.html", "v1", None).await;
+    let active = g1["generation"]["id"].as_str().expect("id").to_string();
+
+    let corrupt = repo::new_id();
+    generations::insert(
+        &ctx,
+        &NewGeneration {
+            id: corrupt.clone(),
+            parent_id: Some(active.clone()),
+            cause: GenerationCause::BlockCompile,
+            site_manifest_json: r#"{"files":[]}"#.to_string(),
+            // Written by a build this one cannot read.
+            block_manifest_json: "not-json-at-all".to_string(),
+            manifest_sha256: "cc".to_string(),
+        },
+    )
+    .await
+    .expect("stage a corrupt generation");
+    journal_desired(&ctx, &corrupt).await;
+
+    activation::converge_on_boot(&ctx, &ctx.dev_shared())
+        .await
+        .expect("an unreadable generation must not fail the boot");
+
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    assert_eq!(state.desired_generation_id, None);
+    assert_eq!(state.activation_phase, ActivationPhase::Idle);
+    assert_eq!(state.active_generation_id.as_deref(), Some(active.as_str()));
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
+
+    // The row that could not be read says so, rather than sitting `staged`
+    // forever with nothing explaining why it never activated.
+    let row = generations::get(&ctx, &corrupt).await.expect("row");
+    assert_eq!(row.status, GenerationStatus::Failed);
+    assert!(
+        row.failure_message
+            .as_deref()
+            .is_some_and(|m| m.contains("block_manifest_json")),
+        "{:?}",
+        row.failure_message
     );
 }

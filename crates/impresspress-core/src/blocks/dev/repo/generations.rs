@@ -28,7 +28,8 @@ pub enum GenerationStatus {
     Active,
     /// Abandoned; `failure_message` says why.
     Failed,
-    /// Aged out of the retention window.
+    /// No longer serving — superseded by a later generation; retention keeps
+    /// the 20 most recent rows.
     Superseded,
 }
 
