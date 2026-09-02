@@ -23,11 +23,15 @@
 //! (design §13) depends on this block being absent from every normal
 //! deployment, not merely disabled in one.
 
+pub mod blobs;
 pub mod contracts;
 pub mod control;
+pub mod files;
 pub mod migrations;
+pub mod paths;
 pub mod repo;
 pub mod status;
+pub mod workspace;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -66,14 +70,42 @@ pub const WAFER_GUEST_VERSION: u32 = 1;
 pub enum Route {
     /// `GET /b/dev/api/status`
     ApiStatus,
+    /// `GET /b/dev/api/files`
+    ApiFilesList,
+    /// `POST /b/dev/api/files/read`
+    ApiFilesRead,
+    /// `POST /b/dev/api/files/write`
+    ApiFilesWrite,
+    /// `POST /b/dev/api/files/delete`
+    ApiFilesDelete,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
-pub const ROUTES: &[EndpointRoute<Route>] = &[EndpointRoute::new(
-    HttpMethod::Get,
-    "/b/dev/api/status",
-    Route::ApiStatus,
-)];
+///
+/// Reading and deleting are `POST`s, not a `GET` with a query and a `DELETE`
+/// with one: a workspace path is a `/`-separated string with its own
+/// separators, and putting it in the URL would mean every client had to
+/// percent-encode it correctly to name a file in a subdirectory. The path
+/// travels in the JSON body, where it needs no encoding at all.
+pub const ROUTES: &[EndpointRoute<Route>] = &[
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/api/status", Route::ApiStatus),
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/api/files", Route::ApiFilesList),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/dev/api/files/read",
+        Route::ApiFilesRead,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/dev/api/files/write",
+        Route::ApiFilesWrite,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/dev/api/files/delete",
+        Route::ApiFilesDelete,
+    ),
+];
 
 /// A response builder pre-seeded with `Cache-Control: no-store`.
 ///
@@ -102,6 +134,32 @@ pub(crate) fn no_store() -> ResponseBuilder {
 /// any client without explicit headers, so the block keeps the shared
 /// sanitizer rather than hand-rolling a header-carrying copy of it.
 pub(crate) fn no_store_error(code: wafer_run::ErrorCode, message: &str) -> OutputStream {
+    OutputStream::error(no_store_wafer_error(code, message))
+}
+
+/// [`no_store_error`] for a refusal whose HTTP status is not the one its
+/// [`wafer_run::ErrorCode`] maps to.
+///
+/// The quota refusals in [`files`] are `413`s, and `ErrorCode` has no
+/// payload-too-large member. `wafer_block::http_codec::resolve_error_status`
+/// lets an explicit `resp.status` on the error's meta win over the
+/// code-derived default, which is how a status outside the enum is expressed
+/// without inventing a code the rest of the runtime would not understand.
+pub(crate) fn no_store_error_status(
+    code: wafer_run::ErrorCode,
+    status: u16,
+    message: &str,
+) -> OutputStream {
+    let mut error = no_store_wafer_error(code, message);
+    error.meta.push(wafer_run::MetaEntry {
+        key: wafer_block::meta::META_RESP_STATUS.to_string(),
+        value: status.to_string(),
+    });
+    OutputStream::error(error)
+}
+
+/// A [`WaferError`] carrying the block-wide `Cache-Control: no-store`.
+fn no_store_wafer_error(code: wafer_run::ErrorCode, message: &str) -> WaferError {
     let mut error = WaferError::new(code, message);
     error.meta.push(wafer_run::MetaEntry {
         key: format!(
@@ -110,7 +168,7 @@ pub(crate) fn no_store_error(code: wafer_run::ErrorCode, message: &str) -> Outpu
         ),
         value: "no-store".to_string(),
     });
-    OutputStream::error(error)
+    error
 }
 
 /// The WRAP grants the sandbox needs beyond its own namespace.
@@ -179,10 +237,32 @@ impl Block for DevBlock {
             CollectionSchema::new(repo::runtime_state::TABLE),
         ])
         .category(wafer_run::BlockCategory::Feature)
-        .endpoints(vec![BlockEndpoint::get("/b/dev/api/status")
-            .summary("Sandbox status")
-            .auth(AuthLevel::Admin)
-            .output::<contracts::StatusResponse>()])
+        .endpoints(vec![
+            BlockEndpoint::get("/b/dev/api/status")
+                .summary("Sandbox status")
+                .auth(AuthLevel::Admin)
+                .output::<contracts::StatusResponse>(),
+            BlockEndpoint::get("/b/dev/api/files")
+                .summary("List workspace files")
+                .auth(AuthLevel::Admin)
+                .query_params::<contracts::FileListQuery>()
+                .output::<contracts::FileListResponse>(),
+            BlockEndpoint::post("/b/dev/api/files/read")
+                .summary("Read a workspace file")
+                .auth(AuthLevel::Admin)
+                .input::<contracts::FileReadRequest>()
+                .output::<contracts::FileReadResponse>(),
+            BlockEndpoint::post("/b/dev/api/files/write")
+                .summary("Write a workspace file")
+                .auth(AuthLevel::Admin)
+                .input::<contracts::FileWriteRequest>()
+                .output::<contracts::FileWriteResponse>(),
+            BlockEndpoint::post("/b/dev/api/files/delete")
+                .summary("Delete a workspace file")
+                .auth(AuthLevel::Admin)
+                .input::<contracts::FileDeleteRequest>()
+                .output::<contracts::FileDeleteResponse>(),
+        ])
         .admin_url(ROUTE_PREFIX)
         // The sandbox is registered only where it is meant to exist; a
         // deployment turns it off by not building it, not by an admin toggle
@@ -194,7 +274,7 @@ impl Block for DevBlock {
         &self,
         ctx: &dyn Context,
         mut msg: Message,
-        _input: InputStream,
+        input: InputStream,
     ) -> OutputStream {
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
             return no_store_error(wafer_run::ErrorCode::NotFound, "endpoint not found");
@@ -203,6 +283,10 @@ impl Block for DevBlock {
         // re-check the caller's role.
         match route {
             Route::ApiStatus => status::handle(ctx, &self.shared).await,
+            Route::ApiFilesList => files::handle_list(ctx, &msg).await,
+            Route::ApiFilesRead => files::handle_read(ctx, input).await,
+            Route::ApiFilesWrite => files::handle_write(ctx, input).await,
+            Route::ApiFilesDelete => files::handle_delete(ctx, input).await,
         }
     }
 

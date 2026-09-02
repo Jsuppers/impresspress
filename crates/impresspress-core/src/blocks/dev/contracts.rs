@@ -13,6 +13,7 @@ use super::{
         generations::{GenerationCause, GenerationStatus},
         runtime_state::ActivationPhase,
     },
+    workspace::FileEntry,
 };
 
 /// Response of `GET /b/dev/api/status`.
@@ -80,27 +81,18 @@ pub struct ActivationView {
     pub detail: String,
 }
 
-/// One file in a generation's site manifest (design §11.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SiteFileEntry {
-    /// Workspace-relative path under `site/`.
-    pub path: String,
-    /// SHA-256 of the file's content-addressed blob, hex-encoded.
-    pub sha256: String,
-    /// Size in bytes.
-    pub size: u64,
-    /// Content type the site publisher serves the file with.
-    pub content_type: String,
-}
-
-/// The `site` half of a generation manifest.
+/// The `site` half of a generation manifest (design §11.3).
+///
+/// Its entries are [`FileEntry`] — the workspace manifest's own type, with
+/// the `site/` prefix stripped. A generation IS the workspace's `site/`
+/// entries frozen, so a separate identically-shaped type would be a mapping
+/// layer between two spellings of one thing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SiteManifest {
-    /// Every file the generation publishes.
+    /// Every file the generation publishes, path relative to the site root.
     #[serde(default)]
-    pub files: Vec<SiteFileEntry>,
+    pub files: Vec<FileEntry>,
 }
 
 impl ActiveBlockView {
@@ -113,6 +105,167 @@ impl ActiveBlockView {
             name: spec.name.clone(),
             artifact_sha256: spec.artifact_sha256.clone(),
             routes: spec.routes.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The files API (`/b/dev/api/files*`)
+// ---------------------------------------------------------------------------
+
+/// Query parameters of `GET /b/dev/api/files`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FileListQuery {
+    /// List only files whose workspace path starts with this prefix, e.g.
+    /// `site/` or `blocks/hello/`. Omit to list the whole workspace.
+    pub prefix: Option<String>,
+}
+
+impl FileListQuery {
+    /// Read the query off a request.
+    ///
+    /// The type has a runtime user, not just a published schema: this is the
+    /// one place `?prefix=` is parsed, so the schema and the handler cannot
+    /// describe different parameters.
+    pub fn from_message(msg: &wafer_run::Message) -> Self {
+        let prefix = msg.query("prefix");
+        Self {
+            prefix: (!prefix.is_empty()).then(|| prefix.to_string()),
+        }
+    }
+}
+
+/// Response of `GET /b/dev/api/files`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileListResponse {
+    /// Matching files, in path order.
+    pub files: Vec<FileEntry>,
+}
+
+/// How a file's bytes are carried in a JSON body.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum FileEncoding {
+    /// `content` is the file's text. The default.
+    #[default]
+    Utf8,
+    /// `content` is the file's bytes, standard base64 with padding.
+    Base64,
+}
+
+/// Request of `POST /b/dev/api/files/read`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FileReadRequest {
+    /// Workspace-relative path, e.g. `site/index.html`.
+    pub path: String,
+}
+
+/// Response of `POST /b/dev/api/files/read`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileReadResponse {
+    /// Workspace-relative path that was read.
+    pub path: String,
+    /// SHA-256 of the content, hex-encoded. Pass it back as
+    /// `expected_sha256` to write over what you just read.
+    pub sha256: String,
+    /// Size in bytes of the decoded content.
+    pub size: u64,
+    /// How `content` is encoded. Text files come back as `utf8`; anything
+    /// else, including text that is not valid UTF-8, comes back as `base64`.
+    pub encoding: FileEncoding,
+    /// The file's content, in `encoding`.
+    pub content: String,
+}
+
+/// Request of `POST /b/dev/api/files/write`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FileWriteRequest {
+    /// Workspace-relative path under `site/` or `blocks/<name>/`.
+    pub path: String,
+    /// The file's content, in `encoding`.
+    pub content: String,
+    /// How `content` is encoded. Defaults to `utf8`.
+    #[serde(default)]
+    pub encoding: FileEncoding,
+    /// The SHA-256 you expect the file to have right now, or `null` if you
+    /// expect it not to exist yet. A mismatch is a `409` carrying the hash
+    /// the file actually has, so a caller that has fallen behind re-reads
+    /// instead of silently overwriting an edit it never saw.
+    ///
+    /// Omitting the field means the same as `null` — serde defaults an
+    /// absent `Option` to `None`, and `#[serde(default)]` says so in the
+    /// source rather than leaving it to a rule the schema does not show. That
+    /// is a safe default rather than a lax one: over a file that exists,
+    /// "I expect nothing here" is itself a conflict.
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
+}
+
+/// Response of `POST /b/dev/api/files/write`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileWriteResponse {
+    /// Workspace-relative path that was written.
+    pub path: String,
+    /// SHA-256 of the stored content, hex-encoded. Pass it as the next
+    /// write's `expected_sha256`.
+    pub sha256: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// The generation this write published, when it published one. A
+    /// `blocks/` write never publishes on its own, and a `site/` write
+    /// publishes only once activation is wired.
+    pub generation: Option<GenerationSummary>,
+}
+
+/// Request of `POST /b/dev/api/files/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FileDeleteRequest {
+    /// Workspace-relative path to remove.
+    pub path: String,
+    /// The SHA-256 you expect the file to have right now. A mismatch — a
+    /// file that changed, or is already gone — is a `409`.
+    pub expected_sha256: String,
+}
+
+/// Response of `POST /b/dev/api/files/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileDeleteResponse {
+    /// Workspace-relative path that was removed.
+    pub path: String,
+    /// The generation this delete published, when it published one.
+    pub generation: Option<GenerationSummary>,
+}
+
+/// Body of the `409` a write or delete answers when `expected_sha256` does not
+/// describe the file as it stands.
+///
+/// It reports the *current* state so a caller can re-read, merge and retry
+/// without a second round trip. Both fields are `null` when the path holds no
+/// file at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileConflict {
+    /// Workspace-relative path the conflict is about.
+    pub path: String,
+    /// SHA-256 the file currently has, or `null` when there is no file.
+    pub current_sha256: Option<String>,
+    /// Size the file currently has, or `null` when there is no file.
+    pub current_size: Option<u64>,
+}
+
+impl FileConflict {
+    /// Describe `path` given the entry it currently holds, if any.
+    pub fn new(path: &str, current: Option<&FileEntry>) -> Self {
+        Self {
+            path: path.to_string(),
+            current_sha256: current.map(|entry| entry.sha256.clone()),
+            current_size: current.map(|entry| entry.size),
         }
     }
 }

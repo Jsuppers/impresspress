@@ -1,4 +1,577 @@
 {
+  "/b/dev/api/files": {
+    "get": {
+      "parameters": [
+        {
+          "in": "query",
+          "name": "prefix",
+          "required": false,
+          "schema": {
+            "description": "List only files whose workspace path starts with this prefix, e.g.\n`site/` or `blocks/hello/`. Omit to list the whole workspace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `GET /b/dev/api/files`.",
+                "properties": {
+                  "files": {
+                    "description": "Matching files, in path order.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One file in the workspace: where it is, which blob holds it, how big it is\nand what it is served as.\n\nThe same type is what a generation's site manifest is made of — a\ngeneration *is* the workspace's `site/` entries, frozen — so there is one\ndefinition rather than a wire type and a stored type that have to be kept\nin step.",
+                      "properties": {
+                        "content_type": {
+                          "description": "Content type the file is served with.",
+                          "type": "string"
+                        },
+                        "path": {
+                          "description": "Where the file lives. Workspace-relative (`site/index.html`) in the\nfiles API; relative to its area's root (`index.html`) in a\ngeneration's site manifest and in a block's source listing.",
+                          "type": "string"
+                        },
+                        "sha256": {
+                          "description": "SHA-256 of the file's content-addressed blob, hex-encoded.",
+                          "type": "string"
+                        },
+                        "size": {
+                          "description": "Size in bytes.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "sha256",
+                        "size",
+                        "content_type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "files"
+                ],
+                "title": "FileListResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List workspace files"
+    }
+  },
+  "/b/dev/api/files/delete": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "Request of `POST /b/dev/api/files/delete`.",
+              "properties": {
+                "expected_sha256": {
+                  "description": "The SHA-256 you expect the file to have right now. A mismatch — a\nfile that changed, or is already gone — is a `409`.",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Workspace-relative path to remove.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "expected_sha256"
+              ],
+              "title": "FileDeleteRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `POST /b/dev/api/files/delete`.",
+                "properties": {
+                  "generation": {
+                    "additionalProperties": false,
+                    "description": "The generation this delete published, when it published one.",
+                    "properties": {
+                      "activated_at": {
+                        "description": "RFC 3339 time the generation went live, or null if it never did.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "blocks": {
+                        "description": "Number of blocks in the generation's block manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cause": {
+                        "description": "What created this generation.",
+                        "oneOf": [
+                          {
+                            "const": "site_write",
+                            "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "site_delete",
+                            "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_compile",
+                            "description": "A successful compile stage; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_remove",
+                            "description": "A block was removed; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "rollback",
+                            "description": "A republish of an earlier generation's manifests.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "seed",
+                            "description": "Generation 0, imported from the seed bundle on cold boot.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "description": "RFC 3339 creation time.",
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "Generation id.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "site_files": {
+                        "description": "Number of files in the generation's site manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "status": {
+                        "description": "Where the generation sits in its lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "staged",
+                            "description": "Recorded, not yet examined.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "validating",
+                            "description": "Blobs, artifacts and guests are being checked.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "activating",
+                            "description": "The runtime swap and site publish are in progress.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "active",
+                            "description": "Currently serving.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "failed",
+                            "description": "Abandoned; `failure_message` says why.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "superseded",
+                            "description": "Aged out of the retention window.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "parent_id",
+                      "cause",
+                      "status",
+                      "created_at",
+                      "activated_at",
+                      "site_files",
+                      "blocks"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "description": "Workspace-relative path that was removed.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "generation"
+                ],
+                "title": "FileDeleteResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Delete a workspace file"
+    }
+  },
+  "/b/dev/api/files/read": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "Request of `POST /b/dev/api/files/read`.",
+              "properties": {
+                "path": {
+                  "description": "Workspace-relative path, e.g. `site/index.html`.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "title": "FileReadRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `POST /b/dev/api/files/read`.",
+                "properties": {
+                  "content": {
+                    "description": "The file's content, in `encoding`.",
+                    "type": "string"
+                  },
+                  "encoding": {
+                    "description": "How `content` is encoded. Text files come back as `utf8`; anything\nelse, including text that is not valid UTF-8, comes back as `base64`.",
+                    "oneOf": [
+                      {
+                        "const": "utf8",
+                        "description": "`content` is the file's text. The default.",
+                        "type": "string"
+                      },
+                      {
+                        "const": "base64",
+                        "description": "`content` is the file's bytes, standard base64 with padding.",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "path": {
+                    "description": "Workspace-relative path that was read.",
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "description": "SHA-256 of the content, hex-encoded. Pass it back as\n`expected_sha256` to write over what you just read.",
+                    "type": "string"
+                  },
+                  "size": {
+                    "description": "Size in bytes of the decoded content.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path",
+                  "sha256",
+                  "size",
+                  "encoding",
+                  "content"
+                ],
+                "title": "FileReadResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Read a workspace file"
+    }
+  },
+  "/b/dev/api/files/write": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "Request of `POST /b/dev/api/files/write`.",
+              "properties": {
+                "content": {
+                  "description": "The file's content, in `encoding`.",
+                  "type": "string"
+                },
+                "encoding": {
+                  "default": "utf8",
+                  "description": "How `content` is encoded. Defaults to `utf8`.",
+                  "oneOf": [
+                    {
+                      "const": "utf8",
+                      "description": "`content` is the file's text. The default.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "base64",
+                      "description": "`content` is the file's bytes, standard base64 with padding.",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "expected_sha256": {
+                  "default": null,
+                  "description": "The SHA-256 you expect the file to have right now, or `null` if you\nexpect it not to exist yet. A mismatch is a `409` carrying the hash\nthe file actually has, so a caller that has fallen behind re-reads\ninstead of silently overwriting an edit it never saw.\n\nOmitting the field means the same as `null` — serde defaults an\nabsent `Option` to `None`, and `#[serde(default)]` says so in the\nsource rather than leaving it to a rule the schema does not show. That\nis a safe default rather than a lax one: over a file that exists,\n\"I expect nothing here\" is itself a conflict.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "path": {
+                  "description": "Workspace-relative path under `site/` or `blocks/<name>/`.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "title": "FileWriteRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `POST /b/dev/api/files/write`.",
+                "properties": {
+                  "generation": {
+                    "additionalProperties": false,
+                    "description": "The generation this write published, when it published one. A\n`blocks/` write never publishes on its own, and a `site/` write\npublishes only once activation is wired.",
+                    "properties": {
+                      "activated_at": {
+                        "description": "RFC 3339 time the generation went live, or null if it never did.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "blocks": {
+                        "description": "Number of blocks in the generation's block manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cause": {
+                        "description": "What created this generation.",
+                        "oneOf": [
+                          {
+                            "const": "site_write",
+                            "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "site_delete",
+                            "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_compile",
+                            "description": "A successful compile stage; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_remove",
+                            "description": "A block was removed; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "rollback",
+                            "description": "A republish of an earlier generation's manifests.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "seed",
+                            "description": "Generation 0, imported from the seed bundle on cold boot.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "description": "RFC 3339 creation time.",
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "Generation id.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "site_files": {
+                        "description": "Number of files in the generation's site manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "status": {
+                        "description": "Where the generation sits in its lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "staged",
+                            "description": "Recorded, not yet examined.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "validating",
+                            "description": "Blobs, artifacts and guests are being checked.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "activating",
+                            "description": "The runtime swap and site publish are in progress.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "active",
+                            "description": "Currently serving.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "failed",
+                            "description": "Abandoned; `failure_message` says why.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "superseded",
+                            "description": "Aged out of the retention window.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "parent_id",
+                      "cause",
+                      "status",
+                      "created_at",
+                      "activated_at",
+                      "site_files",
+                      "blocks"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "description": "Workspace-relative path that was written.",
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "description": "SHA-256 of the stored content, hex-encoded. Pass it as the next\nwrite's `expected_sha256`.",
+                    "type": "string"
+                  },
+                  "size": {
+                    "description": "Size in bytes.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path",
+                  "sha256",
+                  "size",
+                  "generation"
+                ],
+                "title": "FileWriteResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Write a workspace file"
+    }
+  },
   "/b/dev/api/status": {
     "get": {
       "responses": {

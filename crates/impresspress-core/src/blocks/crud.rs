@@ -86,8 +86,27 @@ pub fn path_id<'m>(
 /// into. The error text names the serde failure so a client learns which
 /// field was wrong.
 pub async fn read_json_body<T: DeserializeOwned>(input: InputStream) -> Result<T, OutputStream> {
+    read_json_body_or(input, |detail| {
+        err_bad_request(&format!("Invalid body: {detail}"))
+    })
+    .await
+}
+
+/// [`read_json_body`] for a block that must build the 400 itself.
+///
+/// `on_error` receives the serde failure text and returns the refusal to send.
+/// The dev sandbox is the caller that needs this: every `/b/dev` response —
+/// the refusals included — has to carry `Cache-Control: no-store`, which
+/// [`err_bad_request`]'s plain error terminal does not. Parameterizing the
+/// error here keeps one body reader rather than a second copy of it in the
+/// block.
+pub async fn read_json_body_or<T, F>(input: InputStream, on_error: F) -> Result<T, OutputStream>
+where
+    T: DeserializeOwned,
+    F: FnOnce(String) -> OutputStream,
+{
     let raw = input.collect_to_bytes().await;
-    serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))
+    serde_json::from_slice(&raw).map_err(|e| on_error(e.to_string()))
 }
 
 /// One page of `collection`, with caller-supplied filters and sort (`None` =

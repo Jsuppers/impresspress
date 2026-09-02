@@ -335,6 +335,18 @@ impl TestContext {
             dev::BLOCK_NAME,
             Arc::new(dev::DevBlock::new(dev::DevShared::new(control))),
         );
+        // The workspace store (blobs + `workspace.json`) lives in storage,
+        // so the fixture needs a real object store behind the production
+        // namespacing wrapper — that wrapper is what turns the block's own
+        // `blobs` / `""` folders into `impresspress/dev/…`, and what would
+        // refuse a cross-block reach that the grant list did not cover.
+        ctx.register_block(
+            "wafer-run/storage",
+            crate::blocks::storage::create(
+                Arc::new(InMemoryStorageService::new()),
+                Arc::from("impresspress/admin"),
+            ),
+        );
         ctx.add_extra_route(ExtraRoute {
             prefix: dev::ROUTE_PREFIX.to_string(),
             access: crate::routing::RouteAccess::Admin,
@@ -358,15 +370,34 @@ impl TestContext {
     /// anonymous or non-admin caller without the block containing any
     /// role check of its own.
     pub async fn dispatch(&self, msg: Message) -> OutputStream {
+        self.dispatch_with_input(msg, InputStream::empty()).await
+    }
+
+    /// [`Self::dispatch`] for a request that carries a body.
+    ///
+    /// `dispatch` exists for the reads; a `POST`/`PATCH` handler reads its
+    /// body off the `InputStream`, which `dispatch` hands it empty. Routing a
+    /// write by calling the block's `handle()` directly would skip the
+    /// router's access gate — the very thing `dispatch` exists to exercise —
+    /// so the body belongs on this path, not on a second one.
+    pub async fn dispatch_with_input(&self, msg: Message, input: InputStream) -> OutputStream {
         crate::routing::route_to_block(
             self,
             msg,
-            InputStream::empty(),
+            input,
             &crate::features::AllEnabled,
             &self.block_infos,
             &self.extra_routes,
         )
         .await
+    }
+
+    /// [`Self::dispatch_with_input`] with `body` serialized as the JSON
+    /// request body.
+    pub async fn dispatch_json<T: serde::Serialize>(&self, msg: Message, body: &T) -> OutputStream {
+        let bytes = serde_json::to_vec(body).expect("serialize test request body");
+        self.dispatch_with_input(msg, InputStream::from_bytes(bytes))
+            .await
     }
 
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
@@ -1020,6 +1051,19 @@ impl Context for TestContext {
         }
     }
 
+    /// The block identity a test opted into via [`Self::with_wrap`].
+    ///
+    /// The same field already backs `check_resource_access` and the
+    /// `call_block` grant check; publishing it here is what makes handler code
+    /// that *reads* its caller — `blocks::storage::ImpresspressStorageBlock`
+    /// namespaces every path under `ctx.caller_id()` — behave in a test the
+    /// way it does in production. Without this it saw `None`, filed every
+    /// object under `unknown/…`, and the per-block isolation the storage
+    /// wrapper exists for went untested.
+    fn caller_id(&self) -> Option<&str> {
+        self.caller_id.as_deref()
+    }
+
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -1457,6 +1501,200 @@ pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_
 ))]
 pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
     discovery_json(ctx, "/openapi.json", "impresspress.example.com").await
+}
+
+// ---------------------------------------------------------------------------
+// In-memory storage backend
+// ---------------------------------------------------------------------------
+
+/// One object held by [`InMemoryStorageService`].
+struct StoredObject {
+    data: Vec<u8>,
+    content_type: String,
+    last_modified: chrono::DateTime<chrono::Utc>,
+}
+
+/// In-memory [`StorageService`](wafer_core::interfaces::storage::service::StorageService)
+/// for fixtures that need a working object store.
+///
+/// The counterpart of this module's in-memory SQLite: a *real* backend with
+/// real semantics (a `get` of an absent key is `NotFound`, a `list` honours
+/// prefix/offset/limit, a `put` overwrites), not a stub that answers `Ok` to
+/// everything. Tests that assert content-addressed storage — same bytes
+/// stored once, a stale read failing — only mean something against a backend
+/// that can actually say no.
+///
+/// Registered under `wafer-run/storage` behind
+/// [`crate::blocks::storage::ImpresspressStorageBlock`], so a fixture also
+/// exercises the per-block namespacing (`{caller}/{folder}/{key}`) and the
+/// cross-block grant checks that wrapper adds.
+#[derive(Default)]
+pub struct InMemoryStorageService {
+    /// Objects keyed by `(folder, key)`. `BTreeMap` so `list` is ordered
+    /// without a sort, matching the lexicographic order object stores return.
+    objects: Mutex<std::collections::BTreeMap<(String, String), StoredObject>>,
+    /// Folder name → `(public, created_at)`. A `put` auto-creates the folder,
+    /// as a filesystem backend's `create_dir_all` and S3's implicit prefixes
+    /// both do.
+    folders: Mutex<std::collections::BTreeMap<String, (bool, chrono::DateTime<chrono::Utc>)>>,
+}
+
+impl InMemoryStorageService {
+    /// A store with no folders and no objects.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[wafer_block::wafer_async_trait]
+impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorageService {
+    async fn put(
+        &self,
+        folder: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+    ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
+        let now = chrono::Utc::now();
+        self.folders
+            .lock()
+            .expect("folders mutex poisoned")
+            .entry(folder.to_string())
+            .or_insert((false, now));
+        self.objects.lock().expect("objects mutex poisoned").insert(
+            (folder.to_string(), key.to_string()),
+            StoredObject {
+                data: data.to_vec(),
+                content_type: content_type.to_string(),
+                last_modified: now,
+            },
+        );
+        Ok(())
+    }
+
+    async fn get(
+        &self,
+        folder: &str,
+        key: &str,
+    ) -> Result<
+        (
+            Vec<u8>,
+            wafer_core::interfaces::storage::service::ObjectInfo,
+        ),
+        wafer_core::interfaces::storage::service::StorageError,
+    > {
+        let guard = self.objects.lock().expect("objects mutex poisoned");
+        let object = guard
+            .get(&(folder.to_string(), key.to_string()))
+            .ok_or(wafer_core::interfaces::storage::service::StorageError::NotFound)?;
+        Ok((
+            object.data.clone(),
+            wafer_core::interfaces::storage::service::ObjectInfo {
+                key: key.to_string(),
+                size: object.data.len() as i64,
+                content_type: object.content_type.clone(),
+                last_modified: object.last_modified,
+            },
+        ))
+    }
+
+    async fn delete(
+        &self,
+        folder: &str,
+        key: &str,
+    ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
+        self.objects
+            .lock()
+            .expect("objects mutex poisoned")
+            .remove(&(folder.to_string(), key.to_string()))
+            .map(|_| ())
+            .ok_or(wafer_core::interfaces::storage::service::StorageError::NotFound)
+    }
+
+    async fn list(
+        &self,
+        folder: &str,
+        opts: &wafer_core::interfaces::storage::service::ListOptions,
+    ) -> Result<
+        wafer_core::interfaces::storage::service::ObjectList,
+        wafer_core::interfaces::storage::service::StorageError,
+    > {
+        let guard = self.objects.lock().expect("objects mutex poisoned");
+        let matched: Vec<wafer_core::interfaces::storage::service::ObjectInfo> = guard
+            .iter()
+            .filter(|((f, k), _)| f == folder && k.starts_with(&opts.prefix))
+            .map(
+                |((_, k), object)| wafer_core::interfaces::storage::service::ObjectInfo {
+                    key: k.clone(),
+                    size: object.data.len() as i64,
+                    content_type: object.content_type.clone(),
+                    last_modified: object.last_modified,
+                },
+            )
+            .collect();
+        let total_count = matched.len() as i64;
+        let skipped = matched.into_iter().skip(opts.offset.max(0) as usize);
+        let objects = if opts.limit > 0 {
+            skipped.take(opts.limit as usize).collect()
+        } else {
+            skipped.collect()
+        };
+        Ok(wafer_core::interfaces::storage::service::ObjectList {
+            objects,
+            total_count,
+            // No cursor support: the backend is offset-only, which
+            // `ObjectList::next_cursor` documents as the `None` case.
+            next_cursor: None,
+        })
+    }
+
+    async fn create_folder(
+        &self,
+        name: &str,
+        public: bool,
+    ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
+        self.folders
+            .lock()
+            .expect("folders mutex poisoned")
+            .insert(name.to_string(), (public, chrono::Utc::now()));
+        Ok(())
+    }
+
+    async fn delete_folder(
+        &self,
+        name: &str,
+    ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
+        self.folders
+            .lock()
+            .expect("folders mutex poisoned")
+            .remove(name);
+        self.objects
+            .lock()
+            .expect("objects mutex poisoned")
+            .retain(|(folder, _), _| folder != name);
+        Ok(())
+    }
+
+    async fn list_folders(
+        &self,
+    ) -> Result<
+        Vec<wafer_core::interfaces::storage::service::FolderInfo>,
+        wafer_core::interfaces::storage::service::StorageError,
+    > {
+        Ok(self
+            .folders
+            .lock()
+            .expect("folders mutex poisoned")
+            .iter()
+            .map(|(name, (public, created_at))| {
+                wafer_core::interfaces::storage::service::FolderInfo {
+                    name: name.clone(),
+                    public: *public,
+                    created_at: *created_at,
+                }
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
