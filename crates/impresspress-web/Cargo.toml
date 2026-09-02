@@ -8,6 +8,12 @@ description = "Impresspress compiled to WASM for running in the browser via Serv
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Feasibility spike: embed WAFER's interpreter so wasm32-wasip1 guest blocks
+# can be loaded from bytes by the browser-hosted ImpressPress runtime. This is
+# intentionally opt-in until the browser editor/compiler pipeline exists.
+dynamic-wasm-blocks = ["wafer-run/wasmi"]
+
 [dependencies]
 # Browser framework (platform services + SW plumbing)
 impresspress-browser = { path = "../impresspress-browser" }
