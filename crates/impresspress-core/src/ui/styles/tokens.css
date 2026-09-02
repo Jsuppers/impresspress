@@ -37,13 +37,18 @@
 	   stays for non-text use -- icons, borders, chart marks -- which need
 	   only 3:1. Mirrors how --primary-button relates to --primary-color. */
 	--accent-danger-text: #b91c1c;
-	/* "Info" reads as the brand accent, not blue — success/warning/danger
-	   keep their universal hues, but informational chips/toasts/charts must
-	   sit inside the warm brand palette (the old #3b82f6 blue clashed on
-	   every page it appeared). --accent-info-bg is its 10%-alpha tint for
-	   chip backgrounds. */
-	--accent-info: #fd3534;
-	--accent-info-bg: #fd353419;
+	/* "Info" reads as the brand accent, not blue -- success/warning/danger
+	   keep their universal hues, but informational chips/toasts/charts sit
+	   inside the warm brand palette (the old #3b82f6 blue clashed on every
+	   page it appeared). This used to be its own --accent-info/
+	   --accent-info-bg pair, but --accent-info was byte-identical to
+	   --primary-color (#fd3534) -- an alias carrying the same too-light-
+	   for-text value under a different name, invisible to a guard that
+	   matched on token name rather than resolved value (Task 15). Retired:
+	   every former --accent-info/--accent-info-bg consumer now references
+	   --primary-color/--primary-button (or a local color-mix of
+	   --primary-color) directly -- "info" was always just the brand
+	   accent, so the separate token added a name without adding a value. */
 
 	--bg-primary: #ffffff;
 	--bg-secondary: #f0f0f0;

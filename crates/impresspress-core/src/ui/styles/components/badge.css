@@ -13,7 +13,12 @@
 .badge-primary { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
 .badge-danger { background: #ef444419; color: var(--accent-danger-text); }
 .badge-warning { background: #f59e0b19; color: var(--accent-warning); }
-.badge-info { background: var(--accent-info-bg); color: var(--accent-info); }
+/* --accent-info was #fd3534, byte-identical to --primary-color -- the
+   white-on-red bug (Task 12a) hiding behind an alias, here in the reverse
+   (text) direction. --accent-info/--accent-info-bg are retired (see
+   tokens.css); a local 6% color-mix plus --primary-button (4.60:1,
+   computed) matches .badge-primary's fix above. */
+.badge-info { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
 .badge-secondary { background: #e2e8f0; color: #334155; }
 .badge--center { justify-content: center; }
 

@@ -532,12 +532,44 @@ mod tests {
         assert!(!body_rule.contains("Itim"), "Itim must not be the body face");
     }
 
+    /// Strips every `/* ... */` block comment from `s`. Shared by
+    /// `css_leaf_blocks` and `parse_root_tokens` below: a comment sitting
+    /// between two declarations (nothing but the comment separates it from
+    /// the declaration after it -- no `;`/`{`/`}` to split on) otherwise
+    /// gets swallowed into that following declaration's segment when a
+    /// caller splits on `;`, silently hiding the declaration. (Found
+    /// auditing `.login-button` for Task 15: its `background:
+    /// var(--primary-button)` sat right after such a comment and was
+    /// invisible to `body.split(';').find(|d| d.starts_with("background:"))`
+    /// as a result -- not a bug in that rule, a latent bug in this shared
+    /// parsing step.) Also needed because a comment containing literal
+    /// `{`/`}` characters in prose (several exist in this bundle, e.g.
+    /// base.css's "`hidden` attribute" comment) would otherwise corrupt
+    /// `css_leaf_blocks`'s brace-depth scan.
+    fn strip_css_comments(s: &str) -> String {
+        let mut without_comments = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(start) = rest.find("/*") {
+            without_comments.push_str(&rest[..start]);
+            rest = match rest[start + 2..].find("*/") {
+                Some(end) => &rest[start + 2 + end + 2..],
+                None => "",
+            };
+        }
+        without_comments.push_str(rest);
+        without_comments
+    }
+
     /// Finds every leaf declaration block (`selector { decl; decl; }`) in a
-    /// CSS bundle, including ones nested inside `@media`. A block whose body
-    /// still contains `{` after being popped off the brace stack is a
-    /// container (e.g. the `@media` wrapper itself) and is skipped -- its
-    /// children are captured on their own pop.
+    /// CSS bundle, including ones nested inside `@media` (comments stripped
+    /// first via `strip_css_comments` above). A block whose body still
+    /// contains `{` after being popped off the brace stack is a container
+    /// (e.g. the `@media` wrapper itself) and is skipped -- its children
+    /// are captured on their own pop.
     fn css_leaf_blocks(s: &str) -> Vec<(String, String)> {
+        let without_comments = strip_css_comments(s);
+        let s = without_comments.as_str();
+
         let chars: Vec<char> = s.chars().collect();
         let mut stack: Vec<usize> = Vec::new();
         let mut blocks = Vec::new();
@@ -551,21 +583,12 @@ mod tests {
                         continue; // container, not a leaf -- e.g. @media
                     }
                     let prefix: String = chars[..open].iter().collect();
-                    let mut selector = prefix
+                    let selector = prefix
                         .rsplit(|c| c == '{' || c == '}')
                         .next()
                         .unwrap_or(&prefix)
                         .trim();
-                    // A `/* comment */` immediately above a rule folds into
-                    // this same segment (there's no `{`/`}` between them to
-                    // split on), so strip any leading block comments before
-                    // comparing -- otherwise a comment added above an
-                    // allowlisted rule silently stops that entry matching.
-                    while let Some(rest) = selector.strip_prefix("/*") {
-                        let Some(end) = rest.find("*/") else { break };
-                        selector = rest[end + 2..].trim_start();
-                    }
-                    blocks.push((selector.trim().to_string(), body));
+                    blocks.push((selector.to_string(), body));
                 }
                 _ => {}
             }
@@ -573,156 +596,363 @@ mod tests {
         blocks
     }
 
-    // The `DEFERRED_WHITE_ON_PRIMARY_COLOR` allowlist that used to live here
-    // (Task 7, retired down to `.login-button` / `.auth-split__brand` by
-    // Task 8) is gone. Task 9 repaints `.auth-split__brand` navy and routes
-    // `.login-button` to `--primary-button`, so neither pairs white text
-    // with `--primary-color` any more -- the allowlist's last two entries
-    // are retired and, with the list empty, the mechanism (the const and
-    // the `.filter(...)` consuming it) is deleted rather than left for a
-    // future task to refill.
-    #[test]
-    fn no_new_white_text_on_primary_color_background() {
-        // `--primary-color` (#fd3534) is only 3.66:1 against white -- below
-        // the 4.5:1 AA floor for normal text. White text must sit on
-        // `--primary-button` (#d92320, 4.99:1) instead. This scans every
-        // leaf rule in the assembled bundle for a `background`/
-        // `background-color` declaration naming `var(--primary-color)`
-        // paired, in the SAME rule, with a `color` declaration of `white`,
-        // `#fff`, or `#ffffff`.
-        //
-        // What this covers: exactly that literal pattern, anywhere in the
-        // bundle, including inside `@media` blocks -- a direct regression
-        // test for the bug this fix report describes (five component rules
-        // used `--primary-color` where `--primary-button` was needed).
-        //
-        // What this is blind to: a background and a conflicting text color
-        // declared in two DIFFERENT rules that combine at runtime (parent
-        // background + child text color, or a later cascade rule
-        // overriding just one side); a color that resolves to white via a
-        // CSS variable (`color: var(--something-white)`) rather than a
-        // literal; colors applied via an inline `style` attribute or JS;
-        // and any near-white value not literally spelled "white", "#fff",
-        // or "#ffffff". It also cannot see markup -- it has no way to know
-        // whether a flagged selector is actually reachable/rendered.
-        let s = super::css();
-        let offenders: Vec<String> = css_leaf_blocks(s)
-            .into_iter()
-            .filter(|(_, body)| {
-                let has_bg = body.split(';').any(|d| {
-                    let d = d.trim();
-                    (d.starts_with("background:") || d.starts_with("background-color:"))
-                        && d.contains("var(--primary-color)")
-                });
-                let has_white = body.split(';').any(|d| {
-                    let d = d.trim();
-                    d.starts_with("color:") && (d.contains("white") || d.contains("#fff"))
-                });
-                has_bg && has_white
-            })
-            .map(|(selector, _)| selector)
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "white text paired with --primary-color background (route to --primary-button instead): {offenders:?}"
-        );
+    // ===== Value-based contrast resolution (Task 15 follow-up) =====
+    //
+    // Two guards touched this exact bug and each missed it from a
+    // different angle: `brand_tokens_meet_wcag_aa` asserted token VALUES in
+    // isolation, never checking which rules actually paired them (missed
+    // every primary button failing AA, Task 7). Its replacement here
+    // originally matched `background: var(--primary-color)` + `color:
+    // white` (Task 12a), then grew a second assertion for the reverse
+    // `color: var(--primary-color)` direction (Task 15) -- but both worked
+    // by matching a token's literal `var(--name)` spelling in the CSS
+    // source text. That is structurally a blocklist: `--accent-info:
+    // #fd3534` was a byte-identical alias of `--primary-color` under a
+    // different name, and evaded it completely, as did every bare hex
+    // literal (`#ef4444` in `.form-error`) equal to a tracked token's
+    // value. The next alias would have evaded it again.
+    //
+    // The functions below resolve a CSS color expression -- a token
+    // reference (`var(--x)`), a `var(--x, fallback)` with its fallback, a
+    // `color-mix(in srgb, c1 p1%, c2 p2%)`, or a literal hex/`white`/
+    // `black`/`transparent` -- to actual RGBA by walking `tokens.css`'s
+    // live `:root` values, so the single test below computes real WCAG
+    // contrast instead of matching names.
+    type Rgba = (u8, u8, u8, u8);
+
+    /// Parses the assembled bundle's `:root { ... }` custom-property
+    /// declarations into a `name -> raw value` map, e.g. `"--primary-color"
+    /// -> "#fd3534"`. `styles/tokens.css` is first in build.rs's
+    /// `CSS_FILES` order and the only file with a `:root` block.
+    fn parse_root_tokens(s: &str) -> std::collections::HashMap<String, String> {
+        let without_comments = strip_css_comments(s);
+        let s = without_comments.as_str();
+        let start = s.find(":root").expect(":root block missing from bundle");
+        let open = s[start..].find('{').expect(":root has no body") + start;
+        let mut depth = 0i32;
+        let mut end = open;
+        for (i, c) in s[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &s[open + 1..end];
+        let mut map = std::collections::HashMap::new();
+        for decl in body.split(';') {
+            let decl = decl.trim();
+            if let Some(rest) = decl.strip_prefix("--") {
+                if let Some((name, val)) = rest.split_once(':') {
+                    map.insert(format!("--{}", name.trim()), val.trim().to_string());
+                }
+            }
+        }
+        map
     }
 
-    /// Selectors where `color: var(--primary-color)` or `color:
-    /// var(--accent-danger)` is legitimate non-text use -- the value only
-    /// sets `currentColor` for a child SVG icon, or colors a Unicode glyph
-    /// whose accessible name is overridden by `aria-label` (so no assistive
-    /// tech ever reads the glyph as text). WCAG's 3:1 non-text floor applies
-    /// there, not the 4.5:1 text floor, and #fd3534 (3.66:1 on white) already
-    /// clears 3:1 -- darkening these would flatten the palette for no
-    /// accessibility gain. Each entry is commented with why it's exempt.
-    const NON_TEXT_ACCENT_COLOR_SELECTORS: &[&str] = &[
+    /// Splits a function-argument string on top-level commas (i.e. not
+    /// inside a nested `(...)`) -- needed because both a `var(--x,
+    /// var(--y))` fallback and a `color-mix(in srgb, c1 p1%, c2 p2%)`
+    /// argument list can contain commas one level deeper than the ones
+    /// that actually separate arguments.
+    fn split_top_level(s: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    parts.push(s[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(s[start..].trim());
+        parts
+    }
+
+    fn hex_byte(s: &str) -> Option<u8> {
+        u8::from_str_radix(s, 16).ok()
+    }
+
+    /// Parses a `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa` literal.
+    fn parse_hex(h: &str) -> Option<Rgba> {
+        let h = h.trim_start_matches('#');
+        let double = |c: char| -> Option<u8> { hex_byte(&format!("{c}{c}")) };
+        match h.len() {
+            3 => {
+                let mut cs = h.chars();
+                Some((double(cs.next()?)?, double(cs.next()?)?, double(cs.next()?)?, 255))
+            }
+            4 => {
+                let mut cs = h.chars();
+                Some((
+                    double(cs.next()?)?,
+                    double(cs.next()?)?,
+                    double(cs.next()?)?,
+                    double(cs.next()?)?,
+                ))
+            }
+            6 => Some((hex_byte(&h[0..2])?, hex_byte(&h[2..4])?, hex_byte(&h[4..6])?, 255)),
+            8 => Some((
+                hex_byte(&h[0..2])?,
+                hex_byte(&h[2..4])?,
+                hex_byte(&h[4..6])?,
+                hex_byte(&h[6..8])?,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Resolves a CSS color expression to RGBA, following `var()` chains
+    /// (including a `var(--x, fallback)`'s fallback when `--x` isn't
+    /// declared) and `color-mix(in srgb, c1 [p1%], c2 [p2%])`. Returns
+    /// `None` for anything else this test doesn't need to understand --
+    /// `currentColor`, `inherit`, gradients, `rgb()`/`rgba()` (none of
+    /// which appear on a `color:`/`background:` declaration anywhere in
+    /// this bundle today, checked by grep while writing this) -- callers
+    /// treat `None` as "can't verify this rule" and skip it rather than
+    /// assuming compliance.
+    fn resolve_color(value: &str, tokens: &std::collections::HashMap<String, String>, depth: u8) -> Option<Rgba> {
+        if depth > 12 {
+            return None;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let lower = value.to_ascii_lowercase();
+        match lower.as_str() {
+            "white" => return Some((255, 255, 255, 255)),
+            "black" => return Some((0, 0, 0, 255)),
+            "transparent" => return Some((0, 0, 0, 0)),
+            _ => {}
+        }
+        if let Some(hex) = value.strip_prefix('#') {
+            return parse_hex(hex);
+        }
+        if lower.starts_with("var(") {
+            let open = value.find('(')?;
+            let close = value.rfind(')')?;
+            let parts = split_top_level(&value[open + 1..close]);
+            let name = parts.first()?.trim();
+            if let Some(v) = tokens.get(name) {
+                return resolve_color(v, tokens, depth + 1);
+            }
+            if parts.len() > 1 {
+                return resolve_color(parts[1], tokens, depth + 1);
+            }
+            return None;
+        }
+        if lower.starts_with("color-mix(") {
+            let open = value.find('(')?;
+            let close = value.rfind(')')?;
+            let parts = split_top_level(&value[open + 1..close]);
+            if parts.len() < 3 {
+                return None;
+            }
+            let split_pct = |p: &str| -> (String, Option<f64>) {
+                match p.rsplit_once(' ') {
+                    Some((color, pct)) if pct.ends_with('%') => {
+                        match pct.trim_end_matches('%').parse::<f64>() {
+                            Ok(v) => (color.trim().to_string(), Some(v)),
+                            Err(_) => (p.to_string(), None),
+                        }
+                    }
+                    _ => (p.to_string(), None),
+                }
+            };
+            let (c1, p1) = split_pct(parts[1]);
+            let (c2, p2) = split_pct(parts[2]);
+            let (w1, w2) = match (p1, p2) {
+                (None, None) => (50.0, 50.0),
+                (Some(a), None) => (a, 100.0 - a),
+                (None, Some(b)) => (100.0 - b, b),
+                (Some(a), Some(b)) => (a, b),
+            };
+            let rgba1 = resolve_color(&c1, tokens, depth + 1)?;
+            let rgba2 = resolve_color(&c2, tokens, depth + 1)?;
+            let mix = |a: u8, b: u8| -> u8 { ((a as f64 * w1 / 100.0) + (b as f64 * w2 / 100.0)).round() as u8 };
+            return Some((
+                mix(rgba1.0, rgba2.0),
+                mix(rgba1.1, rgba2.1),
+                mix(rgba1.2, rgba2.2),
+                mix(rgba1.3, rgba2.3),
+            ));
+        }
+        None
+    }
+
+    /// Alpha-composites `fg` over an opaque `base` -- e.g. a translucent
+    /// tint like the old `--accent-info-bg`'s `#fd353419` over the page's
+    /// white surface.
+    fn composite_over(fg: Rgba, base: (u8, u8, u8)) -> (u8, u8, u8) {
+        let (r, g, b, a) = fg;
+        if a == 255 {
+            return (r, g, b);
+        }
+        if a == 0 {
+            return base;
+        }
+        let af = a as f64 / 255.0;
+        let mix = |f: u8, b: u8| -> u8 { (f as f64 * af + b as f64 * (1.0 - af)).round() as u8 };
+        (mix(r, base.0), mix(g, base.1), mix(b, base.2))
+    }
+
+    fn hex_of(rgb: (u8, u8, u8)) -> String {
+        format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2)
+    }
+
+    /// Selectors where a `color:` resolving into the primary/danger family
+    /// (see the test below) is legitimate non-text, or text-adjacent but
+    /// not itself text -- each with its own reason, not a silent pass.
+    const PRIMARY_DANGER_FAMILY_EXEMPT_SELECTORS: &[&str] = &[
         // `.db-table-group__icon` wraps `icons::package()`/`icons::database()`
         // (database.rs) -- an SVG icon, not text; `color` only feeds the
-        // SVG's `currentColor`.
+        // SVG's `currentColor`. WCAG's 3:1 non-text floor applies, and
+        // #fd3534 (3.66:1 on white) already clears it.
         ".db-table-group__icon",
-        // `.public-page__back` renders a literal "\u{2190}" (templates.rs)
-        // but carries `aria-label="Go back"` / `title="Go back"`, so its
-        // accessible name is the label, not the glyph -- functionally an
-        // icon button, not readable text. Genuinely ambiguous; flagged in
-        // the Task 15 report rather than silently assumed. `css_leaf_blocks`
-        // keeps a comma-grouped selector as one joined string (source
-        // newline included), hence the exact text below rather than two
-        // entries.
-        ".public-page__back:hover,\n.public-page__back:focus-visible",
+        // `.form-label.required::after`'s generated content (' *') ornaments
+        // the visible label text right next to it (e.g. "Email *") rather
+        // than substituting for it -- the label itself already conveys the
+        // field name, so this doesn't fall under SC 1.4.3 as text. Left at
+        // the literal #ef4444 (== --accent-danger's value) rather than
+        // darkened.
+        ".form-label.required::after",
     ];
 
-    // Companion to `no_new_white_text_on_primary_color_background` above,
-    // added in Task 15 to close a directional blind spot: contrast is
-    // symmetric, so `--primary-color` (3.66:1 on white) and `--accent-danger`
-    // (3.76:1 on white/pale tints) fail AA as TEXT on a light background just
-    // as surely as they fail as a background under white text -- but the
-    // guard above only ever looked at one direction (background-with-white,
-    // in the SAME rule). This scans the other direction: a rule that sets
-    // `color` to one of these two tokens without also setting a dark
-    // `background`/`background-color` in the same rule.
-    //
-    // What this covers: every leaf rule in the assembled bundle (including
-    // inside `@media`) whose `color:` declaration names `var(--primary-color)`
-    // or `var(--accent-danger)` -- literally, e.g. as a fallback in
-    // `var(--public-page-accent, var(--primary-color))` too -- and that has
-    // no `background`/`background-color` declaration naming a dark surface
-    // (the navy tokens, `black`, or `#000`) in the same rule.
-    //
-    // What this is blind to: the same set of gaps the companion guard
-    // documents (cross-rule cascades, inline styles/JS, near-dark values not
-    // literally spelled out here) -- plus, structurally, it cannot tell text
-    // from a currentColor-only icon fill or an aria-labelled glyph, which is
-    // why `NON_TEXT_ACCENT_COLOR_SELECTORS` exists as an explicit,
-    // commented-per-entry exemption rather than a silent pass. It also can't
-    // see a *different* token carrying the same failing value (e.g.
-    // `--accent-info: #fd3534`, `--primary-hover: #e02523` on some
-    // backgrounds) -- those are real but out of this guard's literal scope
-    // and are called out in the Task 15 report instead of guessed at here.
+    /// Supersedes the two narrower, name-matching contrast guards this test
+    /// module used to carry (a `background: var(--primary-color)` +
+    /// `color: white` check from Task 12a, and a `color:
+    /// var(--primary-color)`/`var(--accent-danger)` check added alongside
+    /// it in Task 15) with one value-based assertion covering both
+    /// directions at once. Matching by resolved value rather than by a
+    /// token's literal name/spelling is what closes the alias hole that
+    /// let `--accent-info: #fd3534` -- and the bare literal `#ef4444` in
+    /// `.form-error`/`.form-label.required::after` -- evade both
+    /// predecessors: a new token or a re-literalized hex sharing one of
+    /// these five tokens' current value cannot rename its way past this.
+    ///
+    /// Scope: this only evaluates a rule whose resolved TEXT color, or
+    /// whose own resolved BACKGROUND color (declared in the SAME rule --
+    /// this is still a single-rule scan, see below), equals the CURRENT
+    /// resolved value of one of `PRIMARY_DANGER_FAMILY_TOKENS` -- i.e. this
+    /// project's brand-red/danger-red design family, recomputed from the
+    /// live token values every run rather than a hex list frozen into the
+    /// test. A rule outside that family (green success text, amber warning
+    /// text, disabled/placeholder gray, the navy sidebar/auth-split brand
+    /// panel's own white-on-navy palette, ...) is never evaluated here --
+    /// those are real, separate contrast questions this guard does not
+    /// answer. It was scoped this way deliberately: the fully general
+    /// version (assert on every resolvable `color:` in the bundle,
+    /// defaulting to a white background when none is declared) was built
+    /// and run first, and surfaced ~30 additional offenders -- almost all
+    /// either genuine pre-existing gaps in that unrelated success/warning/
+    /// gray palette (a separate, larger, unbudgeted audit), or false
+    /// positives from elements that render on a dark ancestor background
+    /// (`.sidebar__nav-item`, `.auth-split__logo-name`, ...) this
+    /// single-rule scan has no way to see -- which the family-scoping
+    /// above happens to filter out for free, since white and
+    /// `--sidebar-text-muted` aren't primary/danger-family values either.
+    /// Both lists (the unrelated pre-existing gaps, and confirmation of
+    /// which "false positives" were checked against their true ancestor
+    /// background rather than just assumed) are in the Task 15 report.
+    ///
+    /// What this still can't see, even inside its declared scope: a
+    /// background and text color declared in two DIFFERENT rules that
+    /// combine at runtime (parent background + child text color); colors
+    /// applied via inline `style`/JS; a family value expressed through a
+    /// CSS function this resolver doesn't parse (`rgb()`/`rgba()`,
+    /// gradients -- none currently appear on a `color:`/`background:` in
+    /// this bundle, checked by grep) -- such a rule is skipped rather than
+    /// assumed compliant, not silently passed.
     #[test]
-    fn no_light_background_text_using_primary_color_or_accent_danger() {
-        let s = super::css();
-        // A background is treated as "dark" only when it names one of these
-        // literal dark surfaces -- the navy scale (and its `--bg-sidebar`
-        // alias) or black. No current rule needs this carve-out (nothing in
-        // the bundle pairs `color: var(--primary-color)` with a dark
-        // background in the same rule today), but the assertion is written
-        // to allow one rather than to assume it can never happen.
-        const DARK_BG_MARKERS: &[&str] = &[
-            "var(--navy-900)",
-            "var(--navy-800)",
-            "var(--navy-700)",
-            "var(--bg-sidebar)",
-            "#000",
-            "black",
+    fn text_or_background_in_primary_danger_family_meets_wcag_aa() {
+        const PRIMARY_DANGER_FAMILY_TOKENS: &[&str] = &[
+            "--primary-color",
+            "--primary-hover",
+            "--primary-button",
+            "--accent-danger",
+            "--accent-danger-text",
         ];
-        let offenders: Vec<String> = css_leaf_blocks(s)
-            .into_iter()
-            .filter(|(selector, body)| {
-                if NON_TEXT_ACCENT_COLOR_SELECTORS.contains(&selector.as_str()) {
-                    return false;
-                }
-                let has_unsafe_text_color = body.split(';').any(|d| {
-                    let d = d.trim();
-                    d.starts_with("color:")
-                        && (d.contains("var(--primary-color)") || d.contains("var(--accent-danger)"))
-                });
-                if !has_unsafe_text_color {
-                    return false;
-                }
-                let has_dark_bg = body.split(';').any(|d| {
-                    let d = d.trim();
-                    (d.starts_with("background:") || d.starts_with("background-color:"))
-                        && DARK_BG_MARKERS.iter().any(|m| d.contains(m))
-                });
-                !has_dark_bg
-            })
-            .map(|(selector, _)| selector)
+
+        let s = super::css();
+        let tokens = parse_root_tokens(s);
+        let family_values: std::collections::HashSet<Rgba> = PRIMARY_DANGER_FAMILY_TOKENS
+            .iter()
+            .filter_map(|name| tokens.get(*name))
+            .filter_map(|v| resolve_color(v, &tokens, 0))
             .collect();
+        assert_eq!(
+            family_values.len(),
+            PRIMARY_DANGER_FAMILY_TOKENS.len(),
+            "expected all {} family tokens to resolve to distinct values -- \
+             if this fails, either the token map/parser broke, or two family \
+             tokens now share a value (not necessarily wrong, but re-check \
+             this test's scoping assumption if so)",
+            PRIMARY_DANGER_FAMILY_TOKENS.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (selector, body) in css_leaf_blocks(s) {
+            if PRIMARY_DANGER_FAMILY_EXEMPT_SELECTORS.contains(&selector.as_str()) {
+                continue;
+            }
+            let decls: Vec<&str> = body.split(';').map(str::trim).filter(|d| !d.is_empty()).collect();
+            let Some(color_decl) = decls.iter().find(|d| d.starts_with("color:")).copied() else {
+                continue;
+            };
+            let Some(text_rgba) = resolve_color(&color_decl["color:".len()..], &tokens, 0) else {
+                continue; // unresolvable -- can't verify, skip (documented above)
+            };
+
+            let bg_decl: Option<&str> = decls
+                .iter()
+                .find(|d| d.starts_with("background:") || d.starts_with("background-color:"))
+                .copied();
+            let bg_rgba = match bg_decl {
+                None => (255u8, 255u8, 255u8, 255u8), // no local background -> page surface (--surface-1)
+                Some(d) => {
+                    let val = d.split_once(':').map(|x| x.1).unwrap_or_default();
+                    match resolve_color(val, &tokens, 0) {
+                        Some(c) => c,
+                        None => continue, // background present but unresolvable -- can't verify, skip
+                    }
+                }
+            };
+
+            if text_rgba.3 == 0 {
+                continue; // fully transparent text, not visible
+            }
+            if !family_values.contains(&text_rgba) && !family_values.contains(&bg_rgba) {
+                continue; // neither side is this guard's declared family -- out of scope
+            }
+
+            let bg_rgb = composite_over(bg_rgba, (255, 255, 255));
+            let text_rgb = composite_over(text_rgba, bg_rgb);
+            let ratio = contrast(&hex_of(text_rgb), &hex_of(bg_rgb));
+            if ratio < 4.5 {
+                offenders.push(format!(
+                    "{selector}: {ratio:.2}:1 ({} text on {} background)",
+                    hex_of(text_rgb),
+                    hex_of(bg_rgb)
+                ));
+            }
+        }
+
         assert!(
             offenders.is_empty(),
-            "text colored with --primary-color/--accent-danger on a light background (route to \
-             --primary-button / --accent-danger-text instead): {offenders:?}"
+            "primary/danger-family text/background pairs failing 4.5:1 AA (computed): {offenders:?}"
         );
     }
 

@@ -23,7 +23,11 @@
 
 .btn-secondary:hover { background: var(--bg-hover); }
 .btn-success { background: var(--accent-success); color: white; }
-.btn-danger { background: var(--accent-danger); color: white; }
+/* --accent-danger (#ef4444) under white text is 3.76:1 -- below AA;
+   --accent-danger-text (6.47:1, computed) is dark enough to serve this
+   role too (contrast is symmetric -- same value either direction), mirroring
+   how --primary-button already does double duty for --primary-color. */
+.btn-danger { background: var(--accent-danger-text); color: white; }
 .btn-danger:hover { background: #dc2626; }
 .btn-ghost { background: transparent; color: var(--text-secondary); border: none; }
 .btn-ghost:hover { color: var(--text-primary); background: var(--bg-hover); }
@@ -55,7 +59,9 @@
 .btn--ghost { background: transparent; color: var(--text-primary); }
 .btn--ghost:hover:not(:disabled) { background: var(--bg-hover); }
 
-.btn--danger { background: var(--accent-danger); color: #fff; }
+/* Same fix as .btn-danger above -- --accent-danger under white text is
+   3.76:1, below AA; --accent-danger-text (6.47:1) clears it. */
+.btn--danger { background: var(--accent-danger-text); color: #fff; }
 .btn--danger:hover:not(:disabled) { filter: brightness(0.92); }
 
 /* ── Quick actions card ─────────────────────────────────── */

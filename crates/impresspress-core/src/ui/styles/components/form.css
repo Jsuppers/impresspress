@@ -54,6 +54,13 @@
 	font-weight: 500; color: #374151;
 }
 
+/* Generated " *" ornaments the visible label text right next to it (e.g.
+   "Email *") rather than substituting for it -- the label itself already
+   conveys the field name, this is a supplementary visual cue. Literal
+   #ef4444 = --accent-danger's value, 3.76:1 on white -- below the 4.5:1 text
+   floor, but this is the "merely ornaments a visible label" case, not text;
+   left as-is and exempted in the contrast guard (ui/assets.rs) rather than
+   darkened. */
 .form-label.required::after { content: ' *'; color: #ef4444; }
 
 .form-input,
@@ -135,9 +142,12 @@
 	font-size: 0.75rem; color: #6b7280;
 }
 
+/* Literal #ef4444 = --accent-danger's own value, 3.76:1 on white -- below
+   AA for this validation-error text; --accent-danger-text (6.47:1,
+   computed) replaces it. */
 .form-error {
 	display: block; margin-top: 0.375rem;
-	font-size: 0.75rem; color: #ef4444;
+	font-size: 0.75rem; color: var(--accent-danger-text);
 }
 
 .form-checkbox, .form-radio {

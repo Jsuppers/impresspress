@@ -20,9 +20,18 @@
 }
 
 .toast-success { background: #10b981; color: white; }
-.toast-error { background: #ef4444; color: white; }
+/* Literal #ef4444 = --accent-danger's own value, 3.76:1 under white text --
+   below AA. --accent-danger-text (6.47:1, computed) replaces it; contrast is
+   symmetric so the same "AA-safe as text" token works as a background under
+   white text too. */
+.toast-error { background: var(--accent-danger-text); color: white; }
 .toast-warning { background: #f59e0b; color: white; }
-.toast-info { background: var(--accent-info); color: white; }
+/* --accent-info was #fd3534 -- byte-identical to --primary-color, so this
+   was the white-on-red bug (Task 12a) hiding behind an alias name a
+   token-name-based guard couldn't see. --accent-info/--accent-info-bg are
+   retired (see tokens.css); --primary-button (4.99:1, computed) is the
+   direct fix, matching every other "info == brand accent" surface. */
+.toast-info { background: var(--primary-button); color: white; }
 
 .toast-dismiss {
 	margin-left: auto; background: none; border: none;

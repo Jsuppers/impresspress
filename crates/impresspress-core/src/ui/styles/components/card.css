@@ -177,9 +177,16 @@
 	text-decoration: none;
 	transition: background var(--transition-fast), color var(--transition-fast);
 }
+/* The rendered glyph ("\u2190") substitutes for a text link -- it carries
+   `aria-label="Go back"`/`title="Go back"` (templates.rs), so it's read as
+   navigation text, not decoration. Fallback was --primary-color, 3.34:1 on
+   --bg-hover -- below AA; --primary-button (4.55:1 on --bg-hover, computed)
+   is the text-safe sibling. A caller-supplied --public-page-accent override
+   is per-deploy config, same as --primary-color itself -- out of this
+   guard's reach either way. */
 .public-page__back:hover,
 .public-page__back:focus-visible {
-	color: var(--public-page-accent, var(--primary-color));
+	color: var(--public-page-accent, var(--primary-button));
 	background: var(--bg-hover);
 }
 .public-page {
@@ -403,7 +410,12 @@
 	padding: 2px 8px; border-radius: var(--radius-sm);
 	font-weight: 500;
 }
-.block-card__runtime--wasm { background: var(--accent-info-bg); color: var(--primary-hover); }
+/* --primary-hover on the old --accent-info-bg tint was 4.11:1 -- below AA
+   (same shape of bug as .badge--tone-brand's pre-existing pair, different
+   background). --accent-info-bg is retired (see tokens.css); a local 6%
+   color-mix plus --primary-button (4.60:1, computed) matches the fix used
+   for .badge-primary/.products-guide__number above. */
+.block-card__runtime--wasm { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
 .block-card__version { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .block-card__open {
 	margin-left: auto;
