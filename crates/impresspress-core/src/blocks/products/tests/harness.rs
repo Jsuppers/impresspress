@@ -110,7 +110,7 @@ pub fn admin_create_msg(path: &str, body: serde_json::Value) -> (Message, InputS
 /// path already in `req.resource`: the normalized sub-path is now an explicit
 /// argument (no `req.resource` rewrite), so here it equals `msg.path()`.
 pub async fn dispatch_admin(
-    ctx: &TestContext,
+    ctx: &dyn wafer_run::context::Context,
     mut msg: Message,
     input: InputStream,
 ) -> OutputStream {
@@ -121,12 +121,35 @@ pub async fn dispatch_admin(
 /// Dispatch a user request the same way (normalized `/b/products/...` path is
 /// already in `req.resource` for these tests).
 pub async fn dispatch_user(
-    ctx: &TestContext,
+    ctx: &dyn wafer_run::context::Context,
     mut msg: Message,
     input: InputStream,
 ) -> OutputStream {
     let norm = msg.path().to_string();
     super::super::handlers::handle_user(ctx, &mut msg, &norm, input).await
+}
+
+/// Dispatch a request through the central router — `route_to_block` →
+/// `check_access` → `ProductsBlock::handle` — rather than straight into a
+/// dispatch table.
+///
+/// `dispatch_admin`/`dispatch_user` above enter the block *below* the layer
+/// that enforces a declared endpoint's `AuthLevel`, so they can prove a
+/// handler's behaviour but never its authorization tier, nor which wire
+/// paths reach it. A test about who may invoke an endpoint must use this.
+pub async fn dispatch_routed(ctx: &TestContext, msg: Message, input: InputStream) -> OutputStream {
+    use wafer_run::Block;
+
+    let block_infos = vec![super::super::ProductsBlock::new().info()];
+    crate::routing::route_to_block(
+        ctx,
+        msg,
+        input,
+        &crate::features::AllEnabled,
+        &block_infos,
+        &[],
+    )
+    .await
 }
 
 /// Collect an `OutputStream`'s body and decode it as JSON.
