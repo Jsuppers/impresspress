@@ -9,7 +9,9 @@ pub mod site_main;
 
 use wafer_run::{RuntimeError, Wafer};
 
-/// The middleware blocks whose config this module contributes to, named once.
+/// The blocks whose config this module contributes to, named once.
+const ROUTER_BLOCK: &str = "wafer-run/router";
+const WEB_BLOCK: &str = "wafer-run/web";
 const CORS_BLOCK: &str = "wafer-run/cors";
 const SECURITY_HEADERS_BLOCK: &str = "wafer-run/security-headers";
 
@@ -59,30 +61,38 @@ pub fn register_site_main(
 /// which keys survive a second declaration — is testable without a `Wafer`,
 /// and so the untested remainder is a three-line loop.
 ///
-/// # Why two of these merge and two do not
+/// # Why three of these merge and one does not
 ///
-/// `Wafer::add_block_config` replaces a block's whole config. For
-/// `wafer-run/router` and `wafer-run/web` that is the intent: `site_main`
-/// owns the route table and the SPA root, and a consumer that means to
-/// override them says so with
+/// `Wafer::add_block_config` replaces a block's whole config, and for three
+/// of the four blocks here that was a bug. Their config is not one setting
+/// but a **bag** of them, and this function is not their only author:
+///
+/// * `wafer-run/security-headers` — the browser sandbox declares
+///   `{"csp": "… worker-src 'self' blob:; frame-src 'self'", "frame_ancestors": "self"}`
+///   so the `/b/dev` page can spawn its compiler worker and frame its own
+///   live preview. Replacing that with `{"csp": <shared directives>}` dropped
+///   both — silently, visible only as a browser refusing to start a worker.
+///   Plan 1 Task 10's e2e measured the two bundles' `Content-Security-Policy`
+///   side by side and found them byte-identical.
+/// * `wafer-run/web` — the sandbox declares `{"cache_mode": "no-cache"}`,
+///   because a sandbox republishes the site under the same URLs on every
+///   keystroke and a cached page shows the previous generation. Replacing it
+///   with the three route keys dropped that too.
+/// * `wafer-run/cors` — nothing declares a neighbouring key today; it merges
+///   for the same reason, so the next one to do so is not a fourth bug.
+///
+/// **`wafer-run/router` is the exception and stays a replacement.** Its
+/// config is one setting (`routes`), `site_main` owns the route table
+/// outright, and a consumer that means to replace it says so with
 /// [`crate::builder::ImpresspressBuilder::final_block_config`], which runs
-/// after this.
+/// after this. Merging a route *table* is not a well-defined operation
+/// anyway — two tables are not a union, they are an ordering.
 ///
-/// For the two middleware blocks it was a bug. Their config is not one
-/// setting but a bag of them, and this function is not their only author:
-/// the browser sandbox declares
-/// `{"csp": "… worker-src 'self' blob:; frame-src 'self'", "frame_ancestors": "self"}`
-/// on `wafer-run/security-headers` so the `/b/dev` page can spawn its
-/// compiler worker and frame its own live preview. Replacing that with
-/// `{"csp": <shared directives>}` dropped both — silently, and only visible
-/// as a browser refusing to start a worker. Plan 1 Task 10's e2e measured the
-/// two bundles' `Content-Security-Policy` side by side and found them
-/// byte-identical, which is what this fixes.
-///
-/// So: every key the consumer set is preserved, and `csp` — a `;`-separated
-/// directive list that the security-headers block itself merges
-/// directive-by-directive over its hard baseline — is **concatenated**, the
-/// consumer's first. `allowed_origins` is not concatenated: it is a
+/// Within a merge, every key the flow does not set is preserved and the keys
+/// it does set win, except `csp`: a `;`-separated directive list that the
+/// security-headers block itself merges directive-by-directive over its hard
+/// baseline, so the two authors' values are **concatenated**, the consumer's
+/// first. `allowed_origins` is deliberately not concatenated — it is a
 /// comma-separated allow-list with its own separator, and joining two of them
 /// with `; ` would produce a value neither author meant.
 pub fn site_main_block_configs(
@@ -91,15 +101,24 @@ pub fn site_main_block_configs(
     existing_block_configs: &[(String, serde_json::Value)],
 ) -> Vec<(String, serde_json::Value)> {
     let mut out = vec![
-        // Inject default routes into the router block config.
+        // Inject default routes into the router block config. A replacement,
+        // not a merge — see the note above.
         (
-            "wafer-run/router".to_string(),
+            ROUTER_BLOCK.to_string(),
             serde_json::json!({ "routes": site_main::default_routes() }),
         ),
-        // Serve from the "site" storage bucket as an SPA.
+        // Serve from the "site" storage bucket as an SPA. The three route
+        // keys are the flow's to decide; anything else the consumer set on
+        // this block (`cache_mode`) is theirs and survives.
         (
-            "wafer-run/web".to_string(),
-            serde_json::json!({ "web_root": "site", "web_spa": "true", "web_index": "index.html" }),
+            WEB_BLOCK.to_string(),
+            merged(
+                declared(existing_block_configs, WEB_BLOCK),
+                serde_json::json!({
+                    "web_root": "site", "web_spa": "true", "web_index": "index.html"
+                }),
+                &[],
+            ),
         ),
     ];
 
@@ -304,32 +323,46 @@ mod tests {
         );
     }
 
-    /// The router and the SPA root are `site_main`'s to own; a consumer that
-    /// means to override them uses `final_block_config`, which runs after
-    /// this. Pinned so "merge everything" is never applied here by analogy.
+    /// The web block merges: the flow owns the three route keys, the consumer
+    /// keeps everything else.
+    ///
+    /// `cache_mode: "no-cache"` is the one that matters — the browser sandbox
+    /// declares it because a sandbox republishes the site under the same URLs
+    /// on every keystroke, so a cached asset shows the previous generation.
+    /// Replacing the config dropped it, and the `/b/dev` preview would have
+    /// served stale CSS after every edit.
     #[test]
-    fn the_router_and_web_configs_are_still_replacements() {
-        let declared = vec![
-            (
-                "wafer-run/web".to_string(),
-                serde_json::json!({ "web_root": "somewhere-else", "cache_mode": "no-cache" }),
-            ),
-            (
-                "wafer-run/router".to_string(),
-                serde_json::json!({ "routes": [] }),
-            ),
-        ];
-        let out = site_main_block_configs("", "", &declared);
-        assert_eq!(config_for(&out, "wafer-run/web")["web_root"], "site");
-        assert!(
-            config_for(&out, "wafer-run/web")
-                .get("cache_mode")
-                .is_none(),
-            "web config is replaced wholesale, not merged"
+    fn the_web_config_merges_but_the_flow_owns_the_route_keys() {
+        let declared = vec![(
+            WEB_BLOCK.to_string(),
+            serde_json::json!({ "web_root": "somewhere-else", "cache_mode": "no-cache" }),
+        )];
+        let web = config_for(&site_main_block_configs("", "", &declared), WEB_BLOCK).clone();
+        assert_eq!(web["web_root"], "site", "the flow owns the SPA root");
+        assert_eq!(web["web_spa"], "true");
+        assert_eq!(web["web_index"], "index.html");
+        assert_eq!(
+            web["cache_mode"], "no-cache",
+            "a key the flow does not set is the consumer's and survives"
         );
-        assert_ne!(
-            config_for(&out, "wafer-run/router")["routes"],
-            serde_json::json!([]),
+    }
+
+    /// The router is the one block still replaced wholesale: its config is
+    /// one setting, `site_main` owns the route table, and two tables are an
+    /// ordering rather than a union. A consumer that means to replace it uses
+    /// `final_block_config`, which runs after this. Pinned so "merge
+    /// everything" is never applied here by analogy.
+    #[test]
+    fn the_router_config_is_still_a_replacement() {
+        let declared = vec![(
+            ROUTER_BLOCK.to_string(),
+            serde_json::json!({ "routes": [], "something_else": "kept?" }),
+        )];
+        let router = config_for(&site_main_block_configs("", "", &declared), ROUTER_BLOCK).clone();
+        assert_ne!(router["routes"], serde_json::json!([]));
+        assert!(
+            router.get("something_else").is_none(),
+            "the router config is replaced wholesale, not merged"
         );
     }
 

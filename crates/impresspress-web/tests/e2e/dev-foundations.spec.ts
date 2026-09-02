@@ -220,8 +220,11 @@ test('a fresh origin seeds itself, serves the seeded site, and keeps the sandbox
 
   await page.goto('/', { waitUntil: 'commit' });
   await expect(page.locator('body')).toContainText(SEED_TEXT, { timeout: 60_000 });
-  // A sandbox republishes the site under the same URLs on every keystroke, so
-  // `wafer-run/web` is configured `cache_mode: no-cache` here and nowhere else.
+  // `no-cache` on the entrypoint — but note this one does NOT discriminate:
+  // `wafer-block-web` answers `no-cache` for any `text/html` whatever its
+  // `cache_mode`. The assertion that the sandbox's
+  // `cache_mode: "no-cache"` really reached the block is on a *stylesheet*,
+  // in the test below, because a `.css` is `public, max-age=3600` without it.
   const siteCache = await page.evaluate(
     async () => (await fetch('/')).headers.get('cache-control'),
   );
@@ -304,6 +307,24 @@ test('the dev sandbox stages a guest, survives a restart and rolls back', async 
 
   await page.goto('/', { waitUntil: 'commit' });
   await expect(page.locator('h1')).toHaveText('sandbox v1', { timeout: 60_000 });
+
+  // A sandbox republishes the site under the same URLs on every keystroke, so
+  // a cached asset shows the previous generation. `runtime_factory.rs`
+  // declares `cache_mode: "no-cache"` on `wafer-run/web` for exactly that,
+  // and this is the assertion that it survives the flow's own config for the
+  // same block: a stylesheet is `public, max-age=3600` under the default
+  // mode and `no-cache` only under this one. (The entrypoint cannot show it —
+  // `wafer-block-web` never caches `text/html`.)
+  const stylesheet = await postJson(page, '/b/dev/api/files/write', {
+    path: 'site/style.css',
+    content: 'body { color: rebeccapurple }',
+    expected_sha256: null,
+  });
+  expect(stylesheet.generation, JSON.stringify(stylesheet)).not.toBeNull();
+  const assetCache = await page.evaluate(
+    async () => (await fetch('/style.css')).headers.get('cache-control'),
+  );
+  expect(assetCache).toBe('no-cache');
 
   // --- 4. The proof guest's own name is refused, as a diagnostic --------
   const refused = await postJson(page, '/b/dev/api/builds/stage', {
@@ -391,10 +412,15 @@ test('the dev sandbox stages a guest, survives a restart and rolls back', async 
   // --- 8. Rollback to the generation before the block -------------------
   const listed = await getJson(page, '/b/dev/api/generations');
   const causes = listed.generations.map((g: { cause: string }) => g.cause);
-  expect(causes).toEqual(['block_compile', 'site_write', 'seed']);
+  // Newest first: the block compile, the stylesheet write, the index write,
+  // the seed.
+  expect(causes).toEqual(['block_compile', 'site_write', 'site_write', 'seed']);
+  // `find` takes the newest `site_write` — the stylesheet one, which is the
+  // generation immediately before the block and carries both site files.
   const beforeTheBlock = listed.generations.find(
     (g: { cause: string }) => g.cause === 'site_write',
   );
+  expect(beforeTheBlock.site_files).toBe(2);
   const rolledBack = await postJson(
     page,
     `/b/dev/api/generations/${beforeTheBlock.id}/rollback`,

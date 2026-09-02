@@ -108,9 +108,11 @@ pub async fn request_to_message(
     // * a navigation into the scope is dispatched to the worker whoever
     //   started it, which is exactly the CSRF case a cross-site `<form>`
     //   POST uses. `Request::referrer` — an attribute, not a header, and so
-    //   readable here — is what separates them: our own page, no referrer at
-    //   all (a typed URL or bookmark, `Sec-Fetch-Site: none`), or somebody
-    //   else's page.
+    //   readable here — is the only thing that can separate our own page
+    //   from somebody else's, and a referrer that is ABSENT separates
+    //   nothing: suppression is attacker-controllable, so it is refused
+    //   rather than reported as `Sec-Fetch-Site: none` (which the policy
+    //   accepts). See [`fetch_site_for`] for the full argument.
     //
     // Anything that does not positively match one of those is `cross-site`,
     // so a value this cannot prove stays a refusal. A header that really is
@@ -213,9 +215,27 @@ fn request_mode(request: &web_sys::Request) -> &'static str {
 /// The security argument is at the call site. The rule, restated: a
 /// non-navigation reaching this worker came from a client this worker
 /// controls, so a same-origin URL makes it same-origin; a navigation is
-/// judged on its referrer, with no referrer meaning `none` (a typed URL or a
-/// bookmark, which carries no cross-site intent); everything else is
-/// `cross-site`, which is what an unprovable case must resolve to.
+/// same-origin only when its referrer says so; everything else — **including
+/// a navigation with no referrer at all** — is `cross-site`, which is what an
+/// unprovable case must resolve to.
+///
+/// # Why a referrer-less navigation is not `none`
+///
+/// `Sec-Fetch-Site: none` means "no initiator" — a typed URL, a bookmark — and
+/// `csrf::enforce_origin_policy` accepts it. A service worker cannot tell that
+/// apart from a navigation whose referrer was **suppressed**, and suppression
+/// is attacker-controllable: `<form referrerpolicy="no-referrer">`, a
+/// `<meta name="referrer">` on the attacking page, or a redirect that drops
+/// it. A same-site sibling's top-level `<form>` POST is exactly the shape
+/// `SameSite=Lax` still attaches the `auth_token` cookie to, so answering
+/// `none` here would hand that request the CSRF check's approval.
+///
+/// Nothing legitimate is lost by refusing it. This value is only ever
+/// consulted for a cookie-authenticated **unsafe** method (the policy returns
+/// early otherwise), and a same-origin form POST carries a referrer under the
+/// `Referrer-Policy: strict-origin-when-cross-origin` the security-headers
+/// block sets — a bookmark or typed URL is a `GET`, which never reaches the
+/// check at all.
 fn fetch_site_for(
     mode: &str,
     referrer: &str,
@@ -242,10 +262,12 @@ fn fetch_site_for(
                 "cross-site"
             }
         }
+        // A navigation is judged on its referrer, and ONLY a referrer that
+        // is provably ours passes. An absent one is refused rather than
+        // reported as `none` — see the note above; this function never
+        // returns `none`.
         "navigate" => {
-            if referrer.is_empty() {
-                "none"
-            } else if origin_of(referrer) == self_origin {
+            if !referrer.is_empty() && origin_of(referrer) == self_origin {
                 "same-origin"
             } else {
                 "cross-site"
@@ -640,13 +662,47 @@ mod fetch_site_tests {
         );
     }
 
-    /// A typed URL or a bookmark — no referrer, and no cross-site intent.
+    /// A referrer-less navigation is REFUSED, not reported as `none`.
+    ///
+    /// `none` would mean "no initiator" (a typed URL, a bookmark) and
+    /// `csrf::enforce_origin_policy` accepts it — but a worker cannot tell
+    /// that from a navigation whose referrer an attacker suppressed with
+    /// `referrerpolicy="no-referrer"`, a `<meta name=referrer>`, or a
+    /// redirect. A same-site sibling's top-level `<form>` POST carries the
+    /// `SameSite=Lax` cookie, so `none` here would be a CSRF bypass. Nothing
+    /// legitimate is lost: this value is only consulted for a
+    /// cookie-authenticated unsafe method, and a real same-origin form POST
+    /// has a referrer.
     #[wasm_bindgen_test]
-    fn a_navigation_with_no_referrer_is_none() {
+    fn a_navigation_with_no_referrer_is_cross_site() {
         assert_eq!(
             fetch_site_for("navigate", "", SELF_ORIGIN, SELF_ORIGIN),
-            "none"
+            "cross-site"
         );
+    }
+
+    /// Stated on its own because it is the property the arm above exists for:
+    /// nothing this function can answer is ever `none`.
+    #[wasm_bindgen_test]
+    fn no_input_produces_none() {
+        for mode in [
+            "same-origin",
+            "cors",
+            "no-cors",
+            "navigate",
+            "websocket",
+            "",
+        ] {
+            for referrer in ["", "about:client", SELF_ORIGIN, "https://evil.example/a"] {
+                for request_origin in ["", SELF_ORIGIN, "https://evil.example"] {
+                    assert_ne!(
+                        fetch_site_for(mode, referrer, request_origin, SELF_ORIGIN),
+                        "none",
+                        "mode {mode}, referrer {referrer}, origin {request_origin}",
+                    );
+                }
+            }
+        }
     }
 
     /// The CSRF case this whole mapping exists to keep refused: a cross-site

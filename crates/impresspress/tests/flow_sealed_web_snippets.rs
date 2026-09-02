@@ -8,9 +8,13 @@
 //! about the flow's output *looks* wrong when this regresses, which is why it
 //! is a test rather than a comment.
 //!
-//! Its own integration-test binary because it sets `IMPRESSPRESS_WEB_PKG_DIR`,
-//! which is process-global: a test in `flow_sealed_web.rs` running
-//! concurrently would see it too.
+//! `IMPRESSPRESS_WEB_PKG_DIR` is process-global, so both halves live in ONE
+//! `#[tokio::test]` that runs them in sequence. Two `#[test]`s would race
+//! under the parallel harness — the override-case's `set_var` would be
+//! observed by the baked-default case and vice versa, and the failure would
+//! be a flake that reproduces on some machines and not others. A separate
+//! integration-test binary keeps `flow_sealed_web.rs`'s own test out of the
+//! same process; this keeps these two out of each other's.
 
 use std::fs;
 
@@ -41,12 +45,21 @@ fn fake_pkg_dir(dir: &std::path::Path) {
     fs::write(snippet_dir.join("bridge.js"), "export function ping() {}\n").unwrap();
 }
 
+/// Both scenarios, in sequence. See the module docs for why they are one
+/// test: `IMPRESSPRESS_WEB_PKG_DIR` is process-global.
 #[tokio::test]
+async fn sealed_web_ships_snippets_from_an_override_and_from_the_bake() {
+    a_pkg_dir_override_ships_its_snippets_beside_the_wasm_and_glue().await;
+    the_baked_default_also_ships_snippets().await;
+}
+
 async fn a_pkg_dir_override_ships_its_snippets_beside_the_wasm_and_glue() {
     let pkg = tempdir().unwrap();
     fake_pkg_dir(pkg.path());
     let app = tempdir().unwrap();
 
+    // Removed on every path, including the failing one: the next scenario
+    // asserts on the *baked* tree and would otherwise read this fixture's.
     std::env::set_var(PKG_DIR_ENV, pkg.path());
     let built = sealed_web::build(app.path(), false).await;
     std::env::remove_var(PKG_DIR_ENV);
@@ -108,7 +121,6 @@ async fn a_pkg_dir_override_ships_its_snippets_beside_the_wasm_and_glue() {
 
 /// Without the override, the flow writes the tree `build.rs` baked — which is
 /// what makes the *default* sealed bundle work, not just an overridden one.
-#[tokio::test]
 async fn the_baked_default_also_ships_snippets() {
     let app = tempdir().unwrap();
     std::env::remove_var(PKG_DIR_ENV);

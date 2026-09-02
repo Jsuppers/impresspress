@@ -57,13 +57,13 @@ EOF
   exit 1
 }
 
-# The CLI's build.rs `include_bytes!`s the ordinary pkg/ build. It is not what
-# gets served — the env overrides below replace it — but the crate does not
-# compile without it, so say so here rather than in a build script backtrace.
-if [ ! -f "$WEB/pkg/impresspress_web.js" ]; then
-  echo "build-dev-bundle.sh: $WEB/pkg is missing; the impresspress CLI cannot be built without it" >&2
-  exit 1
-fi
+# Note: `crates/impresspress/build.rs` `include_bytes!`s `pkg/` and so the CLI
+# cannot be COMPILED without it — but this script does not compile the CLI, it
+# runs one that is already on PATH, and what gets served comes from `pkg-dev/`
+# through the override below. `pkg/` is deliberately not required here: the
+# embed x web flow content-hashes it in place and removes the unhashed pair,
+# so a tree that has just built the ordinary bundle would fail a check that
+# has nothing to do with this script's job.
 
 # 1. The feature-on wasm. `--out-dir pkg-dev` keeps it away from `pkg/`, which
 #    is the ordinary (feature-off) bundle every other e2e serves.
