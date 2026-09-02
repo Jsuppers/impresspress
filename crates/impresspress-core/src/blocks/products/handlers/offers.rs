@@ -34,6 +34,13 @@ pub(super) enum OfferAccess {
 /// admin or owner has to be able to shut that surface down *without* first
 /// restoring the listing to the public catalog. Refusing to let them was not
 /// a safe default; it was a money-taking surface with no off switch.
+///
+/// `pages::deleted_product_close` is the UI that reaches it — the close-only
+/// manager the admin Deleted view links to. Widening these four operations
+/// without shipping that page left the whole thing dead code, reachable only
+/// by an operator who already knew every id, while the one affordance the
+/// Deleted view did offer (Restore) is the one that puts the product back in
+/// front of customers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProductState {
     /// The product must still be live. Everything that creates, edits,

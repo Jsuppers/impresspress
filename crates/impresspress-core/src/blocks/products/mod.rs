@@ -27,7 +27,10 @@ use super::rate_limit::{
     check_route_limits, check_user_rate_limit, LimitKey, RateLimit, RateLimitOutcome, RouteLimit,
     UserRateLimiter,
 };
-use crate::http::{err_forbidden, err_not_found};
+use crate::{
+    http::{err_forbidden, err_not_found},
+    util,
+};
 
 /// Public commerce operations are keyed by client IP because guest storefronts
 /// deliberately have no authenticated user. Each category can be overridden
@@ -1103,6 +1106,12 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/admin/manage").summary("Manage products").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/new").summary("Create product").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/products/{id}").summary("Manage product").auth(AuthLevel::Admin),
+                // `/b/products` is a PUBLIC route prefix, so this declaration
+                // is the only thing that makes the page admin-only.
+                BlockEndpoint::get("/b/products/admin/products/{id}/close")
+                    .summary("Close a deleted product's Stripe surface")
+                    .description("Archive the offers and deactivate the payment links of a soft-deleted product, without restoring it to the catalog.")
+                    .auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/groups").summary("Manage groups").auth(AuthLevel::Admin),
 
                 BlockEndpoint::get("/b/products/admin/purchases").summary("Purchases").auth(AuthLevel::Admin),
@@ -2049,9 +2058,36 @@ crate::impresspress_feature_block! {
                                 return pages::admin_seller_detail(ctx, &msg, seller_id).await;
                             }
                         }
-                        if let Some(product_id) = admin_sub.strip_prefix("/products/") {
-                            if !product_id.is_empty() && !product_id.contains('/') {
-                                return pages::product_manager(ctx, &msg, product_id, true).await;
+                        if let Some(rest) = admin_sub.strip_prefix("/products/") {
+                            // `/products/{id}/close` first: the plain manager
+                            // below rejects any remainder containing a `/`,
+                            // so an ordering slip here is a 404, not a
+                            // mis-dispatch.
+                            if let Some(product_id) = rest.strip_suffix("/close") {
+                                if !product_id.is_empty() && !product_id.contains('/') {
+                                    return pages::deleted_product_close(
+                                        ctx,
+                                        &msg,
+                                        &util::url_path_decode(product_id),
+                                    )
+                                    .await;
+                                }
+                            }
+                            // Decoded for the same reason `endpoint_match`
+                            // decodes its `{name}` bindings: the id reaches
+                            // here exactly as it appeared on the wire, and
+                            // both the pages that link here and
+                            // `productManagerDuplicate`'s
+                            // `encodeURIComponent` navigation put it there
+                            // encoded.
+                            if !rest.is_empty() && !rest.contains('/') {
+                                return pages::product_manager(
+                                    ctx,
+                                    &msg,
+                                    &util::url_path_decode(rest),
+                                    true,
+                                )
+                                .await;
                             }
                         }
                         err_not_found("not found")
@@ -2100,7 +2136,13 @@ crate::impresspress_feature_block! {
                     }
                     let product_id = sub.strip_prefix("/my-products/").unwrap_or_default();
                     if !product_id.is_empty() && !product_id.contains('/') {
-                        return pages::product_manager(ctx, &msg, product_id, false).await;
+                        return pages::product_manager(
+                            ctx,
+                            &msg,
+                            &util::url_path_decode(product_id),
+                            false,
+                        )
+                        .await;
                     }
                 }
                 "/my-purchases" => return pages::my_purchases(ctx, &msg).await,

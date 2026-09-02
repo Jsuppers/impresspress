@@ -529,21 +529,34 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             // path and the Restore button posts somewhere
                             // that matches no route, on the only door out of
                             // soft delete. maud escapes HTML, not URLs.
-                            let restore_url = format!(
-                                "/b/products/api/admin/products/{}/restore",
-                                crate::util::url_path_encode(&record.id),
-                            );
+                            let encoded_id = crate::util::url_path_encode(&record.id);
+                            let restore_url =
+                                format!("/b/products/api/admin/products/{encoded_id}/restore");
+                            // Restore is the DANGEROUS half of what an admin
+                            // can do here: it puts an active, approved product
+                            // straight back into the public catalog. Soft
+                            // delete takes nothing down in Stripe, so the row
+                            // also needs the other half — a way to shut the
+                            // product's Prices and Payment Links down without
+                            // relisting it. That is what
+                            // `ProductState::LiveOrDeleted` exists for, and
+                            // until this link nothing reached it.
+                            let close_url =
+                                format!("/b/products/admin/products/{encoded_id}/close");
                             vec![
                                 html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
                                 html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
                                 html! { span .font-medium { (record.str_field("currency")) } },
                                 html! { span .text-muted .text-sm { (deleted_at.get(..10).unwrap_or("—")) } },
                                 html! {
-                                    button .btn .btn--secondary .btn--sm type="button"
-                                        hx-post=(restore_url)
-                                        hx-swap="none"
-                                        hx-on--after-request="if(event.detail.successful){location.reload()}else{var m='Restore failed';try{m=JSON.parse(event.detail.xhr.responseText).message||m}catch(err){}document.body.dispatchEvent(new CustomEvent('showToast',{detail:{type:'error',message:m}}))}"
-                                    { "Restore" }
+                                    div .products-actions {
+                                        a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
+                                        button .btn .btn--secondary .btn--sm type="button"
+                                            hx-post=(restore_url)
+                                            hx-swap="none"
+                                            hx-on--after-request=(reload_or_toast("Restore failed"))
+                                        { "Restore" }
+                                    }
                                 },
                             ]
                         }).collect();
@@ -551,7 +564,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
                         }))
                     } @else {
-                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", record.id)).collect();
+                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&record.id))).collect();
                         @let cols = [
                             components::TableCol { label: "Name", width: None },
                             components::TableCol { label: "Availability", width: None },
@@ -590,6 +603,165 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         content,
     )
     .await
+}
+
+/// The `hx-on--after-request` body shared by every one-shot action button on
+/// these pages: reload on success, and on failure raise the message the API
+/// sent on the shared `showToast` channel `ui::assets::toast_js` listens on.
+///
+/// Without the failure half a refused action renders as nothing happening at
+/// all — no reload, no message — which is the worst outcome on a page whose
+/// buttons are the only way to undo a delete or shut a money surface down.
+fn reload_or_toast(failure_label: &str) -> String {
+    format!(
+        "if(event.detail.successful){{location.reload()}}else{{var m='{failure_label}';\
+         try{{m=JSON.parse(event.detail.xhr.responseText).message||m}}catch(err){{}}\
+         document.body.dispatchEvent(new CustomEvent('showToast',{{detail:{{type:'error',message:m}}}}))}}"
+    )
+}
+
+/// Close-only manager for a soft-deleted product: archive its offers,
+/// deactivate its Payment Links, and nothing else.
+///
+/// Soft delete touches nothing in Stripe. A deleted product's Prices and
+/// Payment Links stay live in the connected account and keep taking money,
+/// and the delete handler archives none of them — so
+/// `offers::handle_list`/`handle_archive` and
+/// `payment_links::list_links`/`deactivate_link` read through
+/// `ProductState::LiveOrDeleted` precisely so that surface can be shut down.
+/// This page is what reaches them: [`product_manager`] loads through the live-only
+/// `repo::products::get` and 404s for a deleted product, and the Deleted view
+/// offered only **Restore** — which returns an active, approved product to
+/// the public catalog before anything has been closed. The one affordance on
+/// offer was the dangerous one.
+///
+/// Deliberately NOT a mode of [`product_manager`]: that page's every other
+/// control creates, edits, publishes, syncs, duplicates or opens a new way to
+/// charge, and every one of those is refused for a deleted product by the
+/// `ProductState::Live` gate below it. Rendering them disabled would be a
+/// page that mostly does not work; rendering them live would be an invitation
+/// to do the opposite of what this page is for.
+///
+/// Reads through `repo::products::get_deleted`, so it exists only for a
+/// product that is actually deleted — a live one belongs in
+/// [`product_manager`], which can do everything.
+pub async fn deleted_product_close(
+    ctx: &dyn Context,
+    msg: &Message,
+    product_id: &str,
+) -> OutputStream {
+    let product = match repo::products::get_deleted(ctx, product_id).await {
+        Ok(product) => product,
+        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
+            return crate::http::err_not_found("Product not found");
+        }
+        Err(error) => return crate::http::err_internal("Could not load product", error),
+    };
+    let offers = match repo::offers::list_for_product(ctx, product_id).await {
+        Ok(offers) => offers,
+        Err(error) => return crate::http::err_internal("Could not load product pricing", error),
+    };
+    // One listing per offer rather than a join: `list_links` is the same read
+    // the API exposes, and there are as many of them as the offer list the
+    // admin is about to act on.
+    let mut links = Vec::with_capacity(offers.len());
+    for offer in &offers {
+        match repo::payment_links::list_for_offer(ctx, &offer.offer.id).await {
+            Ok(list) => links.push(list),
+            Err(error) => return crate::http::err_internal("Could not load payment links", error),
+        }
+    }
+
+    let api_base = format!(
+        "/b/products/api/admin/products/{}",
+        crate::util::url_path_encode(product_id)
+    );
+    let deleted_at = product.str_field("deleted_at");
+    let content = html! {
+        (admin_tabs("products"))
+        (components::page_header(
+            product.str_field("name"),
+            Some("This product is deleted. Archive its offers and deactivate its payment links so it stops taking money — deleting a product does none of that in Stripe."),
+            Some(html! { a .btn .btn--secondary .btn--sm href="/b/products/admin/manage?view=deleted" { "Back to deleted products" } }),
+        ))
+        p .text-muted .text-sm {
+            "Deleted " (deleted_at.get(..10).unwrap_or("—"))
+            ". Restoring it is on the Deleted tab — a restored product returns to your catalog immediately, so close anything that should stop selling first."
+        }
+        p #close-manager-error .login-error role="alert" aria-live="assertive" hidden {}
+
+        @if offers.is_empty() {
+            (components::empty_state(
+                icons::package(),
+                "Nothing left to close",
+                "This product has no offers, so it has no prices or payment links in Stripe.",
+                None,
+            ))
+        }
+        @for (offer, offer_links) in offers.iter().zip(links.iter()) {
+            @let offer_url = format!("{api_base}/offers/{}", crate::util::url_path_encode(&offer.offer.id));
+            article .card style="margin-top:1rem" {
+                header .card__head {
+                    div .products-status-stack {
+                        h3 .card__title style="margin:0" { (offer.offer.name) }
+                        (components::status_badge(offer_status_label(offer.status)))
+                    }
+                    div .products-actions {
+                        @if offer.status != OfferStatus::Archived {
+                            button .btn .btn--secondary .btn--sm type="button"
+                                hx-delete=(offer_url)
+                                hx-swap="none"
+                                hx-on--after-request=(reload_or_toast("Could not archive this offer"))
+                            { "Archive offer" }
+                        }
+                    }
+                }
+                div .card__body {
+                    @if offer_links.is_empty() {
+                        p .text-muted .text-sm style="margin:0" { "No payment links." }
+                    } @else {
+                        ul style="list-style:none;margin:0;padding:0;display:grid;gap:.5rem" {
+                            @for link in offer_links {
+                                @let link_url = format!("{offer_url}/payment-links/{}", crate::util::url_path_encode(&link.id));
+                                li style="display:flex;gap:.75rem;align-items:center;justify-content:space-between;flex-wrap:wrap" {
+                                    span .text-sm style="word-break:break-all" {
+                                        (if link.url.is_empty() { link.id.as_str() } else { link.url.as_str() })
+                                    }
+                                    div style="display:flex;gap:.5rem;align-items:center" {
+                                        (components::status_badge(if link.active { "active" } else { "inactive" }))
+                                        @if link.active {
+                                            button .btn .btn--secondary .btn--sm type="button"
+                                                hx-delete=(link_url)
+                                                hx-swap="none"
+                                                hx-on--after-request=(reload_or_toast("Could not deactivate this payment link"))
+                                            { "Deactivate" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    ui::shell_page(
+        ctx,
+        msg,
+        ui::Shell::simple("Products", ui::NavKind::Admin, "Products"),
+        content,
+    )
+    .await
+}
+
+/// The wire spelling of an [`OfferStatus`], for the status badge.
+fn offer_status_label(status: OfferStatus) -> &'static str {
+    match status {
+        OfferStatus::Draft => "draft",
+        OfferStatus::Active => "active",
+        OfferStatus::Archived => "archived",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +830,7 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
             @if pending.is_empty() {
                 (components::empty_state(icons::info(), "Queue clear", "No seller listings are waiting for review.", None))
             } @else {
-                @let row_hrefs: Vec<String> = pending.iter().map(|product| format!("/b/products/admin/products/{}", product.id)).collect();
+                @let row_hrefs: Vec<String> = pending.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
                 @let cols = [
                     components::TableCol { label: "Product", width: None },
                     components::TableCol { label: "Seller", width: None },
@@ -807,7 +979,7 @@ pub async fn admin_seller_detail(
             @if products.is_empty() {
                 (components::empty_state(icons::package(), "No products", "This seller has not created any products.", None))
             } @else {
-                @let row_hrefs: Vec<String> = products.iter().map(|product| format!("/b/products/admin/products/{}", product.id)).collect();
+                @let row_hrefs: Vec<String> = products.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
                 @let cols = [
                     components::TableCol { label: "Product", width: None },
                     components::TableCol { label: "Status", width: None },
@@ -3538,7 +3710,7 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         div #my-products-content {
             @match &result {
                 Ok(list) => {
-                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-products/{}", record.id)).collect();
+                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-products/{}", crate::util::url_path_encode(&record.id))).collect();
                     @let cols = [
                         components::TableCol { label: "Name", width: None },
                         components::TableCol { label: "Status", width: None },

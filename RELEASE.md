@@ -85,9 +85,25 @@ Admin → Products now has a **Deleted** tab listing those rows most-recently-
 deleted first, with **Restore** on each. A deleted product is not editable
 until it is restored.
 
-**Known gap — a seller cannot restore their own product.** There is no
-seller-facing deleted view and no seller restore route; both are a follow-up.
-A seller who deletes a product has to ask an administrator to restore it.
+**Closing a deleted product's Stripe surface.** Soft delete touches nothing in
+Stripe: a deleted product's Prices and Payment Links stay live in the connected
+account and keep taking money, and deleting the product archives none of them.
+Each row in the Deleted tab therefore also carries **Close Stripe surface**,
+which opens a close-only manager for that product: archive its offers,
+deactivate its payment links, nothing else. Use it *before* Restore if the
+reason for the delete was that the product should stop selling — Restore puts
+an active, approved product back into the public catalog immediately.
+
+**Known gaps.**
+
+- A seller cannot restore their own deleted product, and has no deleted view
+  or close-only manager of their own. The seller-tier API already permits both
+  (archiving an offer and deactivating a payment link work for a seller's own
+  deleted product); only the UI is missing. A seller has to ask an
+  administrator.
+- The close-only manager acts one offer and one link at a time. There is no
+  "close everything" action, and nothing blocks Restore while a money surface
+  is still open.
 
 ### Products: restoring a deleted product whose slug was taken
 

@@ -1722,7 +1722,13 @@ async fn seed_a_deleted_product_holding_widget(ctx: &crate::test_support::TestCo
     let mut original = HashMap::new();
     original.insert("name".to_string(), serde_json::json!("Original"));
     original.insert("slug".to_string(), serde_json::json!("widget"));
-    seed(ctx, "impresspress__products__products", "original", original).await;
+    seed(
+        ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
     soft_delete_product(ctx, "original").await;
 }
 
@@ -2926,6 +2932,264 @@ async fn manage_products_deleted_view_reports_a_failed_restore() {
         html.contains("new CustomEvent('showToast'"),
         "a failed restore must surface, not vanish: {html}"
     );
+}
+
+// ============================================================
+// The close-only manager for a deleted product
+// ============================================================
+
+/// Seed a soft-deleted product with one published offer and one Payment Link
+/// that never reached Stripe, and return the offer and link ids.
+///
+/// The link is deliberately pending: deactivating it is then a purely local
+/// write, so these tests need no Stripe stand-in for the thing they are
+/// actually about — whether the UI can reach the close operations at all.
+async fn seed_a_deleted_product_with_a_money_surface(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+) -> (String, String) {
+    use super::super::{
+        contracts::PricingPreviewRequest,
+        offer_pricing,
+        repo::{offers as offer_repo, payment_links, products},
+    };
+
+    let offer_id = seed_published_offer(ctx, product_id).await;
+    let managed = offer_repo::get_managed(ctx, &offer_id)
+        .await
+        .expect("the offer is readable");
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: Default::default(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .expect("price the offer");
+    let link_id =
+        payment_links::create_pending(ctx, &offer_id, "", "", "", false, "close-me", &preview, 0)
+            .await
+            .expect("a pending Payment Link")
+            .managed
+            .id;
+
+    products::soft_delete(ctx, product_id)
+        .await
+        .expect("soft delete");
+    (offer_id, link_id)
+}
+
+/// The `ProductState::LiveOrDeleted` widening exists so a deleted product's
+/// Stripe surface can be closed without restoring the listing, but the
+/// Deleted view offered only **Restore** — which puts an active, approved
+/// product straight back into the public catalog. The one affordance on
+/// offer was the dangerous one, and the safe one was reachable only by an
+/// operator who already knew every id.
+#[tokio::test]
+async fn deleted_view_links_to_the_close_only_manager() {
+    let ctx = ctx().await;
+
+    // An id that is not URL-safe, so the link is pinned to carry the same
+    // percent-encoding the Restore action does.
+    let awkward_id = "prod/1?x#y";
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", awkward_id, gone).await;
+    soft_delete_product(&ctx, awkward_id).await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    let close_url = "/b/products/admin/products/prod%2F1%3Fx%23y/close";
+    assert!(
+        html.contains(close_url),
+        "a deleted row must offer a way to close its Stripe surface, not only Restore: {html}"
+    );
+
+    // And the link resolves: the SSR page dispatch decodes its id segment the
+    // same way `endpoint_match` decodes an API one, so the encoding the row
+    // applies has an inverse on the other end.
+    let (msg, input) = admin_get_msg(close_url);
+    let page = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        page.contains("Nothing left to close"),
+        "the rendered close link must resolve to that product's close manager: {page}"
+    );
+}
+
+/// The whole point of the page, end to end: the action it renders for a
+/// deleted product's offer actually archives that offer — the first
+/// `ProductState::LiveOrDeleted` operation any UI has ever reached.
+///
+/// The URL is read back out of the rendered HTML rather than hand-built, and
+/// the page itself is fetched through the real router, so both halves — the
+/// SSR route and the API the button targets — are the shipped ones.
+#[tokio::test]
+async fn the_close_manager_archives_a_deleted_products_offer_from_its_own_rendered_action() {
+    let ctx = ctx().await;
+    let (offer_id, _link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    let archive_url = rendered_attr(&html, "hx-delete=\"", &offer_id).unwrap_or_else(|| {
+        panic!("the close manager must render an archive action for offer {offer_id}: {html}")
+    });
+    let (mut msg, input) = delete_msg(&archive_url, "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let archived = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        archived["status"], "archived",
+        "the rendered archive action must archive the deleted product's offer: {archived}"
+    );
+
+    // And it did not resurrect the product.
+    assert!(
+        is_soft_deleted(&ctx, "gone").await,
+        "closing a money surface must not restore the listing"
+    );
+}
+
+/// The same for a Payment Link, which is the half that is actually still
+/// taking money.
+#[tokio::test]
+async fn the_close_manager_deactivates_a_deleted_products_payment_link() {
+    let ctx = ctx().await;
+    let (_offer_id, link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    let deactivate_url = rendered_attr(&html, "hx-delete=\"", &link_id).unwrap_or_else(|| {
+        panic!("the close manager must render a deactivate action for link {link_id}: {html}")
+    });
+    let (mut msg, input) = delete_msg(&deactivate_url, "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let deactivated = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the rendered deactivate action must take the link down: {deactivated}"
+    );
+}
+
+/// Close-only means close-only. A deleted product's manager must not carry
+/// anything that keeps it selling — no create, publish, sync, duplicate or
+/// storefront link — because every one of those is an operation the
+/// `ProductState::Live` gate below it would refuse anyway, and offering it
+/// on a page about shutting a product down is an invitation to do the
+/// opposite.
+#[tokio::test]
+async fn the_close_manager_offers_nothing_that_keeps_selling() {
+    let ctx = ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    // Positive control first, so the refusals below cannot pass on an empty
+    // page.
+    assert!(
+        html.contains("Checkout product") && html.contains("hx-delete="),
+        "the page must render the product and its closing actions: {html}"
+    );
+
+    for forbidden in [
+        "productManagerPublishOffer",
+        "productManagerSyncOffer",
+        "productManagerDuplicate",
+        "productManagerCreateLink",
+        "productManagerSetStatus",
+        "product-manager-form",
+        "/b/products/catalog/gone",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "the close-only manager must not offer `{forbidden}`: {html}"
+        );
+    }
+    // POST and PATCH open or change a money surface; only DELETE closes one.
+    assert!(
+        !html.contains("hx-post=") && !html.contains("hx-patch="),
+        "the close-only manager must only ever issue closing requests: {html}"
+    );
+}
+
+/// A live product belongs in the ordinary manager, which can do everything.
+/// This page reads through `get_deleted`, so it simply does not exist for one.
+#[tokio::test]
+async fn the_close_manager_404s_for_a_live_product() {
+    let ctx = ctx().await;
+    seed_published_offer(&ctx, "alive").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/alive/close");
+    assert!(
+        output_is_error(dispatch_routed(&ctx, msg, input).await, ErrorCode::NotFound).await,
+        "the close-only manager is for deleted products"
+    );
+
+    // Positive control: the same path for a DELETED product renders, so the
+    // 404 above is about the product's state and not about the route.
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "the route itself must exist: {html}"
+    );
+}
+
+/// `/b/products` is a PUBLIC route prefix — every admin page under it is
+/// admin-only solely because its `BlockEndpoint` declares
+/// `AuthLevel::Admin`. A new page path with no declaration is therefore
+/// reachable by anyone, so this drives the real router the way
+/// `restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it`
+/// does.
+#[tokio::test]
+async fn the_close_manager_is_admin_only() {
+    let ctx = ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/admin/products/gone/close", "user_1");
+    assert!(
+        dispatch_routed(&ctx, msg, input)
+            .await
+            .collect_buffered()
+            .await
+            .is_err(),
+        "a non-admin must not reach the close-only manager"
+    );
+
+    // Positive control: the admin does.
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "an admin must reach the page the assertion above denies: {html}"
+    );
+}
+
+/// The value of the first `attr` whose element also mentions `needle`.
+///
+/// Attribute values are unique enough here that a plain scan for the id and a
+/// backwards walk to the attribute would be fragile; this instead takes every
+/// value of `attr` and returns the one containing `needle`.
+fn rendered_attr(html: &str, attr: &str, needle: &str) -> Option<String> {
+    let mut rest = html;
+    while let Some(start) = rest.find(attr) {
+        rest = &rest[start + attr.len()..];
+        let end = rest.find('"')?;
+        let value = &rest[..end];
+        if value.contains(needle) {
+            return Some(value.to_string());
+        }
+        rest = &rest[end..];
+    }
+    None
 }
 
 #[tokio::test]

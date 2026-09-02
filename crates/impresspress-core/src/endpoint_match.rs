@@ -195,7 +195,7 @@ pub fn dispatch_path<H: Copy>(
         if let Some(params) = match_template(route.template, path) {
             let owned: Vec<(String, String)> = params
                 .into_iter()
-                .map(|(k, v)| (k, decode_param(v)))
+                .map(|(k, v)| (k, crate::util::url_path_decode(v)))
                 .collect();
             for (name, value) in owned {
                 msg.set_meta(
@@ -207,27 +207,6 @@ pub fn dispatch_path<H: Copy>(
         }
     }
     None
-}
-
-/// Percent-decode one matched path variable.
-///
-/// The inverse of `util::url_path_encode`, which is what a page applies when
-/// it interpolates a record id into an `href`/`hx-post`. Applied to rest
-/// (`{name...}`) variables too: an object key holding a space arrives as
-/// `%20` for exactly the same reason an id holding `/` arrives as `%2F`.
-///
-/// A sequence that does not decode to valid UTF-8 yields the raw segment
-/// unchanged. Bytes that are not text cannot be a record id or an object key
-/// here, so the alternatives are to lose them silently (`decode_utf8_lossy`
-/// substitutes U+FFFD) or to fail the whole match and turn a lookup that would
-/// have 404'd into a route that does not exist. Passing the segment through
-/// keeps the failure where the caller can read it: the handler looks the value
-/// up and answers "not found".
-fn decode_param(value: &str) -> String {
-    percent_encoding::percent_decode_str(value)
-        .decode_utf8()
-        .map(|decoded| decoded.into_owned())
-        .unwrap_or_else(|_| value.to_string())
 }
 
 /// The access policy a path resolves to for a single block, combining its
