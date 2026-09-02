@@ -1,0 +1,6 @@
+# worker-build output and the deploy CLI's staging dir (generated wrangler.toml,
+# staged assets). Both are rebuilt by `impresspress build --target cloudflare`.
+build/
+target/
+# Deployer identifiers (see README) — never commit.
+.env
