@@ -189,6 +189,7 @@
 .my-1 { margin: 0.25rem 0; }
 .my-3 { margin: 0.75rem 0; }
 .ml-auto { margin-left: auto; }
+.mr-1 { margin-right: 0.25rem; }
 .mr-2 { margin-right: 0.5rem; }
 /* Padding scale, same 0.25rem step as the margin scale above. */
 .p-0 { padding: 0; }
@@ -227,6 +228,7 @@
 .w-full { width: 100%; }
 /* Fixed narrow table column (e.g. a "Method"/"Auth" header cell). */
 .w-60 { width: 60px; }
+.w-70 { width: 70px; }
 .w-80 { width: 80px; }
 .w-110 { width: 110px; }
 .h-fit { height: fit-content; }

@@ -84,9 +84,8 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     all_blocks.sort_by(|a, b| a.name.cmp(&b.name));
 
     let page_action = html! {
-        div style="display:flex;gap:8px" {
-            a .btn .btn-sm .btn-secondary href="https://wafer.run/registry" target="_blank"
-                style="display:inline-flex;align-items:center;gap:4px"
+        div .flex .gap-2 {
+            a .btn .btn-sm .btn-secondary .gap-1 href="https://wafer.run/registry" target="_blank"
             {
                 (icons::arrow_up_right()) " Explore WASM blocks"
             }
@@ -204,7 +203,7 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         div .modal-overlay #block-detail-modal-overlay hidden
             onclick="if(event.target===this)closeModal('block-detail-modal-overlay')"
         {
-            div .modal style="max-width:700px;max-height:85vh;overflow-y:auto" {
+            div .modal .modal--lg {
                 div #block-detail-modal {}
             }
         }
@@ -313,7 +312,7 @@ pub async fn handle_block_detail(
                         span .toggle-slider {}
                     }
                 }
-                p style="font-size:0.875rem;color:var(--text-muted);margin-top:1rem" {
+                p .modal-note {
                     @if is_enabled {
                         "Restart the server to see its full details."
                     } @else {
@@ -331,8 +330,8 @@ pub async fn handle_block_detail(
             div {
                 div .flex .items-center .gap-2 {
                     h3 .modal-title { (block.name) }
-                    span .badge .badge-info style="font-size:11px" { "v" (block.version) }
-                    span .badge style="font-size:11px;background:#f1f5f9;color:#475569" { (format!("{:?}", block.category)) }
+                    span .badge .badge-info .text-11 { "v" (block.version) }
+                    span .badge .badge--tone-slate .text-11 { (format!("{:?}", block.category)) }
                 }
             }
             button .modal-close onclick="closeModal('block-detail-modal-overlay')" {
@@ -368,41 +367,32 @@ pub async fn handle_block_detail(
 
             // Description
             @if !block.description.is_empty() {
-                p style="font-size:0.875rem;color:#64748b;line-height:1.6;margin-bottom:1rem" { (block.description) }
+                p .modal-description { (block.description) }
             }
 
             // Endpoints
             @if !block.endpoints.is_empty() {
-                h4 style="font-size:0.875rem;font-weight:600;margin:1rem 0 0.5rem" { "Endpoints" }
+                h4 .modal-section-title { "Endpoints" }
                 div .table-container {
                     table .table {
                         thead {
                             tr {
-                                th style="width:70px" { "Method" }
+                                th .w-70 { "Method" }
                                 th { "Path" }
                                 th { "Description" }
-                                th style="width:80px" { "Auth" }
+                                th .w-80 { "Auth" }
                             }
                         }
                         tbody {
                             @for ep in &block.endpoints {
                                 tr {
                                     td {
-                                        span .badge style={"font-size:11px;" (match ep.method {
-                                            wafer_run::HttpMethod::Get => "background:#fff1e6;color:var(--primary-hover)",
-                                            wafer_run::HttpMethod::Post => "background:#dcfce7;color:#166534",
-                                            wafer_run::HttpMethod::Patch => "background:#fef3c7;color:#92400e",
-                                            wafer_run::HttpMethod::Delete => "background:#fce4ec;color:#c62828",
-                                        })} { (ep.method) }
+                                        span .badge .(method_badge_tone(ep.method)) .text-11 { (ep.method) }
                                     }
-                                    td .text-sm { code style="font-size:12px" { (ep.path) } }
+                                    td .text-sm { code .text-xs { (ep.path) } }
                                     td .text-sm .text-muted { (ep.summary) }
                                     td {
-                                        span .badge style={"font-size:10px;" (match ep.auth {
-                                            wafer_run::AuthLevel::Public => "background:#dcfce7;color:#166534",
-                                            wafer_run::AuthLevel::Admin => "background:#fce4ec;color:#c62828",
-                                            wafer_run::AuthLevel::Authenticated => "background:#fef3c7;color:#92400e",
-                                        })} { (ep.auth) }
+                                        span .badge .(auth_badge_tone(ep.auth)) .text-10 { (ep.auth) }
                                     }
                                 }
                             }
@@ -413,7 +403,7 @@ pub async fn handle_block_detail(
 
             // Config Keys
             @if !block.config_keys.is_empty() {
-                h4 style="font-size:0.875rem;font-weight:600;margin:1rem 0 0.5rem" { "Configuration" }
+                h4 .modal-section-title { "Configuration" }
                 div .table-container {
                     table .table {
                         thead {
@@ -426,9 +416,9 @@ pub async fn handle_block_detail(
                         tbody {
                             @for ck in &block.config_keys {
                                 tr {
-                                    td { code style="font-size:12px" { (ck.key) } }
+                                    td { code .text-xs { (ck.key) } }
                                     td .text-sm .text-muted { (ck.description) }
-                                    td .text-sm { code style="font-size:11px" { @if ck.default.is_empty() { "\u{2014}" } @else { (ck.default) } } }
+                                    td .text-sm { code .text-11 { @if ck.default.is_empty() { "\u{2014}" } @else { (ck.default) } } }
                                 }
                             }
                         }
@@ -437,17 +427,17 @@ pub async fn handle_block_detail(
             }
 
             // Technical details
-            h4 style="font-size:0.875rem;font-weight:600;margin:1rem 0 0.5rem" { "Technical" }
-            div style="font-size:13px;color:#64748b" {
+            h4 .modal-section-title { "Technical" }
+            div .modal-tech {
                 div .mb-2 {
                     b { "Interface: " }
-                    span .badge style="font-size:11px;background:#f1f5f9;color:#475569" { (block.interface) }
+                    span .badge .badge--tone-slate .text-11 { (block.interface) }
                 }
                 @if !block.requires.is_empty() {
                     div .mb-2 {
                         b { "Requires: " }
                         @for req in &block.requires {
-                            span .badge .badge-primary style="font-size:11px;margin-right:4px" { (req) }
+                            span .badge .badge-primary .text-11 .mr-1 { (req) }
                         }
                     }
                 }
@@ -455,7 +445,7 @@ pub async fn handle_block_detail(
                     div .mb-2 {
                         b { "Database tables: " }
                         @for col in &block.collections {
-                            span .badge style="font-size:11px;margin-right:4px;background:#f1f5f9;color:#475569" { (col.name) }
+                            span .badge .badge--tone-slate .text-11 .mr-1 { (col.name) }
                         }
                     }
                 }
@@ -466,6 +456,28 @@ pub async fn handle_block_detail(
     };
 
     ui::html_response(markup)
+}
+
+/// Tone class for an endpoint's HTTP-method badge. Shares its colour set with
+/// [`auth_badge_tone`] — `Post`/`Public` and `Patch`/`Authenticated` render
+/// identically, so the tones live once in `styles/components/badge.css`
+/// rather than being declared per-enum.
+fn method_badge_tone(method: wafer_run::HttpMethod) -> &'static str {
+    match method {
+        wafer_run::HttpMethod::Get => "badge--tone-brand",
+        wafer_run::HttpMethod::Post => "badge--tone-green",
+        wafer_run::HttpMethod::Patch => "badge--tone-amber",
+        wafer_run::HttpMethod::Delete => "badge--tone-red",
+    }
+}
+
+/// Tone class for an endpoint's auth-level badge. See [`method_badge_tone`].
+fn auth_badge_tone(auth: wafer_run::AuthLevel) -> &'static str {
+    match auth {
+        wafer_run::AuthLevel::Public => "badge--tone-green",
+        wafer_run::AuthLevel::Admin => "badge--tone-red",
+        wafer_run::AuthLevel::Authenticated => "badge--tone-amber",
+    }
 }
 
 // ---------------------------------------------------------------------------

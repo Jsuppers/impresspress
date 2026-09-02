@@ -22,6 +22,10 @@
 	animation: modalSlideUp 0.2s ease-out;
 }
 
+/* Wider variant — block detail modal (blocks/admin/pages/blocks.rs) needs
+   room for endpoint/config-key tables. */
+.modal--lg { max-width: 700px; max-height: 85vh; overflow-y: auto; }
+
 @keyframes modalSlideUp {
 	from { opacity: 0; transform: translateY(20px); }
 	to { opacity: 1; transform: translateY(0); }
@@ -134,5 +138,11 @@ dialog.modal .modal-error {
 	color: #991b1b;
 	font-size: 0.875rem;
 }
+
+/* ===== Block detail modal (blocks/admin/pages/blocks.rs) ===== */
+.modal-note { font-size: var(--text-sm); color: var(--text-muted); margin-top: 1rem; }
+.modal-description { font-size: var(--text-sm); color: var(--text-muted); line-height: 1.6; margin-bottom: 1rem; }
+.modal-section-title { font-size: var(--text-sm); font-weight: 600; margin: 1rem 0 0.5rem; }
+.modal-tech { font-size: 13px; color: var(--text-muted); }
 dialog.modal .modal-error[hidden] { display: none; }
 

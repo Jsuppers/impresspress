@@ -13,6 +13,23 @@
 .badge-secondary { background: #e2e8f0; color: #334155; }
 .badge--center { justify-content: center; }
 
+/* ===== Tone badges (blocks/admin/pages/blocks.rs block-detail modal) =====
+   HTTP-method and auth-level chips used the same five literal colour pairs
+   under two different Rust match arms (HttpMethod::Get/Post/Patch/Delete and
+   AuthLevel::Public/Admin/Authenticated) — the tones below are shared across
+   both call sites rather than re-declared per-enum. None of these five
+   colours has a matching design token; carried over unchanged from the
+   original inline styles (#fff1e6 already has precedent as a literal "brand
+   tint" — see card.css's .message-card--user — the other four do not and are
+   flagged here). */
+.badge--tone-brand { background: #fff1e6; color: var(--primary-hover); }
+.badge--tone-green { background: #dcfce7; color: #166534; }
+.badge--tone-amber { background: #fef3c7; color: #92400e; }
+.badge--tone-red { background: #fce4ec; color: #c62828; }
+/* Slate tone reuses --bg-hover (#f1f5f9 is already that token's value) but
+   #475569 has no matching token — carried over unchanged. */
+.badge--tone-slate { background: var(--bg-hover); color: #475569; }
+
 /* ===== Avatar ===== */
 .avatar { display: inline-flex; align-items: center; justify-content: center; border-radius: var(--radius-full); background: var(--primary-button); color: #fff; font-weight: 600; }
 .avatar--sm { width: 22px; height: 22px; font-size: var(--text-xs); }
