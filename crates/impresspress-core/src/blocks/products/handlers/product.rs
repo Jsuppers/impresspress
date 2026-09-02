@@ -11,7 +11,8 @@ use super::{default_template_id, seller_policy, GROUPS_TABLE, PRODUCT_TEMPLATES_
 use crate::{
     blocks::products::repo::{self, offers as offer_repo},
     http::{
-        err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
+        err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
+        err_unauthorized, ok_json,
     },
     util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
@@ -20,8 +21,8 @@ use crate::{
 // moderation state, the lifecycle stamps, and the Stripe/versioning linkage.
 // None of them is a caller-supplied value on any tier or verb — each has a
 // dedicated writer that maintains its invariants (`approve_product`/
-// `reject_product`/`suspend` for `approval_status`, the delete endpoints for
-// `deleted_at`, the Stripe sync for `stripe_product_id`, the
+// `reject_product`/`suspend` for `approval_status`, the delete/restore
+// endpoints for `deleted_at`, the Stripe sync for `stripe_product_id`, the
 // publish flow for `submitted_at`/`published_at`, seller onboarding for
 // `owner_*`/`seller_account_id`, versioning for `current_version`, and the
 // database layer's own UUID synthesis for `id`). A generic create or PATCH
@@ -334,16 +335,14 @@ pub(super) async fn handle_update_product(
         return response;
     }
     stamp_updated(&mut data);
-    // A soft-deleted product is not editable: the generic PATCH refuses one
-    // outright rather than silently applying unrelated field changes to a
-    // dead row. Until the restore endpoint ships, clearing `deleted_at` is an
-    // operator statement against the database — see the recovery note at the
-    // top of `repo::products`. The liveness test is the write's own `WHERE`,
-    // not a `get` before it: a separate read leaves a window in which a
-    // concurrent delete commits and the PATCH then writes to the dead row and
-    // answers 200 — precisely the outcome this guard exists to prevent.
-    // `NotFound` matches the response every other admin product endpoint
-    // gives for a soft-deleted row.
+    // A soft-deleted product must go through `restore` before it is editable
+    // again, so the generic PATCH refuses one outright rather than silently
+    // applying unrelated field changes to a dead row. The liveness test is
+    // the write's own `WHERE`, not a `get` before it: a separate read leaves
+    // a window in which a concurrent delete commits and the PATCH then writes
+    // to the dead row and answers 200 — precisely the outcome this guard
+    // exists to prevent. `NotFound` matches the response every other admin
+    // product endpoint gives for a soft-deleted row.
     match repo::products::update_live(ctx, id, data).await {
         Ok(record) => ok_json(&record),
         Err(e) => write_error(e, "Database error"),
@@ -359,6 +358,213 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
+    }
+}
+
+/// Restore a soft-deleted product — the door back out of `soft_delete`,
+/// without which a deleted product would be unreachable by any UI.
+///
+/// `POST /b/products/api/admin/products/{id}/restore`, declared
+/// `AuthLevel::Admin` and dispatched from `ADMIN_ROUTES`, so the one wire
+/// path that reaches this handler is the one its declaration matches.
+/// It previously sat on `USER_ROUTES` (declared under `/b/products/api/`,
+/// dispatched from the user table). `ProductsBlock::handle` also enters
+/// `handle_user` with the RAW path, so the same handler answered at
+/// `/b/products/products/{id}/restore` — a spelling matching no declaration
+/// at all, and so resolving to the `Authenticated` fallback. That was a live
+/// privilege escalation: any logged-in user could resurrect any soft-deleted
+/// product. An Admin-tier route must not live on the user dispatch table for
+/// exactly that reason, and
+/// `dispatch_tables_are_backed_by_declared_endpoints` now fails the build if
+/// one does.
+pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    // Soft delete FREES the product's slug — migration 005's unique index is
+    // partial on `deleted_at IS NULL` — and nothing stops a product created
+    // afterwards from claiming it. Restoring the original then violates that
+    // index's `(owner_kind, owner_id, slug)` key, which arrives here as a
+    // generic database failure and would go out as an opaque 500. The
+    // Deleted view's Restore button only reloads on success, so that 500 is
+    // invisible: the one door out of soft delete would appear to do nothing
+    // at all. Name the collision instead, so an admin can free the slug and
+    // retry.
+    //
+    // The write is what asks the question. This used to be a pre-check
+    // *before* `restore`, which left the answer stale by exactly the gap
+    // between the two statements — a slug claimed inside that gap produced
+    // the same opaque 500 the check existed to prevent. Reading the collision
+    // off the failed write cannot be raced that way: the write either landed,
+    // in which case there was no collision, or it did not, in which case the
+    // row is still deleted and still there to be probed. It also drops two
+    // reads from every successful restore, which is the common case.
+    //
+    // What the probe reads afterwards CAN still move — see the
+    // `SlugProbe::Clear` arm below for what is done about that.
+    match repo::products::restore(ctx, id).await {
+        Ok(record) => ok_json(&record),
+        // The filtered write matched zero rows: no such product, or one that
+        // was never deleted. Never a slug collision, so it does not go near
+        // the probe.
+        Err(e) if e.code == ErrorCode::NotFound => write_error(e, RESTORE_FAILED),
+        Err(e) => match restore_slug_conflict(ctx, id).await {
+            SlugProbe::Claimed(slug) => slug_taken(&slug),
+            // Nothing holds the slug, so nothing stands between this product
+            // and the catalog — try again rather than reporting a failure the
+            // database would no longer produce.
+            //
+            // The probe reads rows that go on changing after the write it is
+            // explaining, which is the one thing writing first does NOT fix:
+            // a claimant renamed or deleted in that gap leaves the probe with
+            // nothing to blame, and a clear probe reported as-is would send
+            // back the opaque 500 this whole branch exists to avoid — for a
+            // restore that would now succeed. A clear probe is therefore a
+            // reason to retry, not an answer.
+            //
+            // Exactly one retry, and its failure is CLASSIFIED rather than
+            // forwarded. The retry is itself a write, so the gap the probe
+            // closed reopens behind it: a claimant arriving between the clear
+            // probe and the retry violates the same index the first write
+            // did, and handing that second error to `write_error` gave back
+            // the very 500 this branch exists to avoid — on a request that is
+            // a slug conflict, whose slug the probe has right here. A retry
+            // LOOP is not the fix: a competing request is free to go on
+            // re-claiming the slug, and the answer worth giving (someone
+            // holds it; free it and restore again) is already known.
+            //
+            // One retry stays safe for the reason it always was: `restore`
+            // only clears `deleted_at` on the same already-deleted row, so
+            // repeating it creates no duplicate record and no ancillary
+            // state.
+            //
+            // (Retrying is the best available answer, not the ideal one. The
+            // ideal is for the write's own error to say "unique constraint
+            // violated" — then nothing needs re-reading. No `DatabaseService`
+            // backend maps constraint violations to `ErrorCode::AlreadyExists`
+            // today, and sniffing driver message text would be both magic and
+            // backend-specific, so that fix belongs in wafer-run.)
+            SlugProbe::Clear(slug) => match repo::products::restore(ctx, id).await {
+                Ok(record) => ok_json(&record),
+                // The row stopped being a deleted product in the meantime —
+                // a concurrent restore landed first, or it was purged. That
+                // is not this caller's slug conflict, and the 404 every other
+                // product endpoint gives for a row it cannot act on is the
+                // honest answer. Same reasoning as the first write's
+                // `NotFound` arm above.
+                Err(again) if again.code == ErrorCode::NotFound => {
+                    write_error(again, RESTORE_FAILED)
+                }
+                // Refused twice with a clear probe in between: the slug was
+                // free when it was read and is not free now, which is a
+                // claimant that arrived in the gap. Report the conflict.
+                Err(_) => slug_taken(&slug),
+            },
+            // The probe could not run. "Could not tell" is not "clear" — a
+            // retry would be guessing — and it is not "conflict" either, so
+            // the write's own error is the one worth recording, against a
+            // correlation id the admin can quote.
+            SlugProbe::Unknown => write_error(e, RESTORE_FAILED),
+        },
+    }
+}
+
+/// Log context for a restore that could not be explained as a slug conflict.
+const RESTORE_FAILED: &str = "Database error";
+
+/// The 409 a restore answers when a live product of the same owner holds the
+/// slug it has to re-claim.
+///
+/// One definition, two callers: the collision probe that named the claimant,
+/// and the retry that a clear probe earned and a newcomer failed anyway. They
+/// are the same fact for the admin, so they say the same thing — and the
+/// advice is what makes the response actionable, which is the whole reason
+/// this is not a 500.
+fn slug_taken(slug: &str) -> OutputStream {
+    err_conflict(&format!(
+        "Another product already uses the slug \"{slug}\". Rename or delete that \
+         product, then restore this one."
+    ))
+}
+
+/// What [`restore_slug_conflict`] found. Three answers, not two: "no
+/// claimant" and "no answer" lead to opposite responses — one retries, one
+/// gives up — and a probe that returned a plain "is it claimed?" boolean
+/// would fold them together, which is how a transient read failure gets
+/// reported as a clear slug.
+enum SlugProbe {
+    /// A live product of the same owner holds the slug, named here so the
+    /// admin can free it.
+    Claimed(String),
+    /// Nothing holds the slug. It is carried anyway, because the retry a
+    /// clear probe earns can be refused on that same slug — and then the slug
+    /// is exactly what the response has to name.
+    Clear(String),
+    /// Neither answer is available: the probe could not run, or the row
+    /// carries no slug and so cannot have collided on one at all.
+    Unknown,
+}
+
+/// Whether a live product has claimed the slug a failed
+/// [`handle_restore_product`] write was trying to re-claim.
+///
+/// Safe to call only after the write failed: the row is then still
+/// soft-deleted, so `get_deleted` can still read the slug in question. A
+/// `get_deleted` that comes back `NotFound` is [`SlugProbe::Unknown`] rather
+/// than [`SlugProbe::Clear`] — the row moved under us and there is nothing
+/// left to reason about. So is a row carrying no slug, which the index the
+/// write was refused by does not apply to at all.
+async fn restore_slug_conflict(ctx: &dyn Context, id: &str) -> SlugProbe {
+    let Ok(deleted) = repo::products::get_deleted(ctx, id).await else {
+        return SlugProbe::Unknown;
+    };
+    let slug = deleted.str_field("slug").to_string();
+    // Migration 005's index is partial on `slug <> ''` as well as on
+    // `deleted_at IS NULL`, so any number of rows may hold an empty slug and
+    // a row holding one cannot have been refused by that index. Neither
+    // "claimed" nor "clear" describes such a write's failure — it is not a
+    // slug question at all — so the write's own error is what the caller
+    // gets, and no retry is attempted for a collision that cannot exist.
+    if slug.is_empty() {
+        return SlugProbe::Unknown;
+    }
+    match slug_is_claimed(ctx, &deleted, &slug).await {
+        Ok(true) => SlugProbe::Claimed(slug),
+        Ok(false) => SlugProbe::Clear(slug),
+        Err(_) => SlugProbe::Unknown,
+    }
+}
+
+/// Whether a LIVE product of the same owner already holds `slug`, the
+/// non-empty slug `deleted` would re-claim on restore.
+///
+/// Keyed on `(owner_kind, owner_id, slug)` because that is the unique index's
+/// own key.
+///
+/// A read failure is returned, not folded into `Ok(false)`: "no collision"
+/// and "could not tell" are different answers, and only the caller knows what
+/// to do with the second one.
+async fn slug_is_claimed(
+    ctx: &dyn Context,
+    deleted: &db::Record,
+    slug: &str,
+) -> Result<bool, wafer_run::WaferError> {
+    let filters = vec![
+        eq_filter("owner_kind", deleted.str_field("owner_kind")),
+        eq_filter("owner_id", deleted.str_field("owner_id")),
+        eq_filter("slug", slug),
+    ];
+    // `list_all` appends the live-only filter, so a second soft-deleted row
+    // sharing the slug is correctly not a collision.
+    Ok(!repo::products::list_all(ctx, filters).await?.is_empty())
+}
+
+fn eq_filter(field: &str, value: &str) -> Filter {
+    Filter {
+        field: field.to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(value.to_string()),
     }
 }
 

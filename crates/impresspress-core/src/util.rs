@@ -234,6 +234,30 @@ pub fn url_path_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, PATH_SEGMENT).to_string()
 }
 
+/// Percent-decode a URL path segment — the inverse of [`url_path_encode`].
+///
+/// Every part of impresspress that reads an id or key back out of a path owes
+/// this: adapters hand the pipeline the path exactly as it appeared on the
+/// wire (axum's `Uri::path`, `url::Url::path` on Cloudflare, `Url.pathname`
+/// in the Service Worker), so an id encoded into an `href` arrives with its
+/// escapes intact. Route matching has to happen on that encoded form — a
+/// decoded `/` would split the route — so the decode belongs on the extracted
+/// value, which is what `endpoint_match::dispatch_path` and the products
+/// block's SSR page dispatch both do with it.
+///
+/// A sequence that does not decode to valid UTF-8 yields `s` unchanged.
+/// Non-text bytes are never a record id or an object key here, so the
+/// alternatives are to lose them silently (`decode_utf8_lossy` substitutes
+/// U+FFFD) or to reject the path outright; passing the segment through leaves
+/// the failure where the caller can read it — a lookup that answers "not
+/// found".
+pub fn url_path_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| s.to_string())
+}
+
 /// Validate a URL-type config value against SSRF attacks.
 ///
 /// Empty values are allowed (clears the setting). Relative paths starting with

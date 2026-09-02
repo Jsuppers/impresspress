@@ -156,9 +156,8 @@ async fn admin_product_detail_404s_for_a_soft_deleted_product() {
 
 /// `handle_update_product` (the generic admin PATCH) must not be a second
 /// door onto `deleted_at`: an admin sending `{"deleted_at": null}` for a
-/// soft-deleted product must not silently resurrect it — clearing
-/// `deleted_at` is an operator statement against the database until the
-/// restore endpoint ships. The refusal now comes from the body check, before the
+/// soft-deleted product must not silently resurrect it — restore is the
+/// only door back in. The refusal now comes from the body check, before the
 /// write's own liveness filter is reached, so it reads as `InvalidArgument`
 /// rather than `NotFound`; either way the row stays deleted.
 #[tokio::test]
@@ -195,9 +194,9 @@ async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
     assert_eq!(err.code, ErrorCode::NotFound);
 }
 
-/// A soft-deleted product is not editable — the generic admin PATCH must
-/// refuse it outright rather than silently applying unrelated field changes
-/// to a dead row.
+/// A soft-deleted product must be restored before it is editable again — the
+/// generic admin PATCH must refuse it outright rather than silently applying
+/// unrelated field changes to a dead row.
 #[tokio::test]
 async fn admin_update_product_refuses_a_soft_deleted_product() {
     let ctx = ctx().await;
@@ -1216,6 +1215,21 @@ async fn soft_delete_product(ctx: &crate::test_support::TestContext, id: &str) {
     .expect("soft delete");
 }
 
+/// Whether `id`'s row still carries a `deleted_at` stamp, read straight from
+/// the table.
+///
+/// Not `repo::products::get`, which cannot see a soft-deleted row at all and
+/// so cannot tell "still deleted" from "never existed" — the distinction
+/// every restore-authorization assertion below turns on.
+async fn is_soft_deleted(ctx: &crate::test_support::TestContext, id: &str) -> bool {
+    use crate::util::RecordExt;
+
+    let record = wafer_core::clients::database::get(ctx, super::super::repo::products::TABLE, id)
+        .await
+        .expect("the product row must still exist");
+    !record.str_field("deleted_at").is_empty()
+}
+
 /// Build an active, approved product with one published offer through the
 /// same repo functions `stripe::handle_checkout` calls, so checkout has a
 /// real purchasable offer to refuse once the product is soft-deleted.
@@ -1316,7 +1330,225 @@ async fn checkout_refuses_a_soft_deleted_product() {
     );
 }
 
-/// The admin PATCH refuses a soft-deleted product. It enforced that with
+// ============================================================
+// Restoring a soft-deleted product — the door back out
+// ============================================================
+//
+// Soft delete without a way back is worse than the hard delete it replaced:
+// a deleted row would be permanently unreachable by any UI. These tests pin
+// the restore endpoint's two obligations: it must clear `deleted_at` on the
+// right row, and the restored row must be visible again everywhere a live
+// product is visible (the public catalog, here — `repo::products::get`'s
+// own restore test already covers the repo layer directly).
+
+#[tokio::test]
+async fn restore_endpoint_returns_the_product_to_the_catalog() {
+    let ctx = ctx().await;
+
+    let mut oops = HashMap::new();
+    oops.insert("name".to_string(), serde_json::json!("oops"));
+    oops.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "oops", oops).await;
+    soft_delete_product(&ctx, "oops").await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/oops/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(body["id"], "oops");
+    assert!(
+        body["data"]["deleted_at"].is_null(),
+        "restore must clear deleted_at: {body}"
+    );
+
+    let (catalog_msg, catalog_input) = get_msg("/b/products/catalog", "");
+    let catalog_body = output_to_json(dispatch_user(&ctx, catalog_msg, catalog_input).await).await;
+    assert_eq!(catalog_body["records"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn restore_endpoint_404s_for_an_unknown_product_id() {
+    let ctx = ctx().await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/missing/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// The live-product case the old `restore_endpoint_404s_for_a_product_that_
+/// was_never_deleted` claimed to cover and did not: it created a product,
+/// ignored its id, and posted restore for the literal id `"missing"`, so it
+/// only ever exercised the unknown-id path above.
+///
+/// Restoring a product that was never deleted is a no-op that answers 200
+/// with the record — clearing an already-null `deleted_at` changes nothing.
+/// Pinned rather than "fixed" because nothing reaches this endpoint except
+/// the Deleted view's Restore button, which only renders for rows that ARE
+/// deleted; see the report accompanying this branch for why a 409 here would
+/// be defensible but is not this wave's change.
+#[tokio::test]
+async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Live" }),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    let id = created["id"]
+        .as_str()
+        .expect("created product id")
+        .to_string();
+
+    let (msg, input) = admin_create_msg(
+        &format!("/admin/b/products/products/{id}/restore"),
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], id,
+        "restoring a live product answers 200 with it: {body}"
+    );
+    assert!(
+        !is_soft_deleted(&ctx, &id).await,
+        "the product must stay live"
+    );
+}
+
+/// Restore is the only endpoint outside `/b/products/api/admin/` that is
+/// declared `Admin`, and it must be unreachable for a non-admin through
+/// EVERY wire path that reaches its handler — not merely through the one
+/// path its declaration happens to match.
+///
+/// `ProductsBlock::handle` enters `handle_user` from two prefixes: the
+/// `/b/products/api`-stripped one and the raw `/b/products/...` one. A
+/// `USER_ROUTES` entry therefore answers at two spellings while
+/// `declared_access` only ever matches the declared one, so restore declared
+/// `Admin` at `/b/products/api/products/{id}/restore` left
+/// `POST /b/products/products/{id}/restore` resolving to the undeclared
+/// fallback tier (`Authenticated`): any logged-in user could resurrect any
+/// soft-deleted product — straight back into the public catalog, and
+/// purchasable, when it was active/approved. Product ids are not secret;
+/// `/b/products/catalog` hands them out.
+///
+/// Driven through `dispatch_routed` (the real `route_to_block`) because that
+/// is where the tier is enforced — a `dispatch_user` test cannot see this
+/// boundary at all, which is exactly how the escalation shipped.
+#[tokio::test]
+async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    for path in [
+        "/b/products/products/gone/restore",
+        "/b/products/api/products/gone/restore",
+        "/b/products/api/admin/products/gone/restore",
+    ] {
+        let (msg, input) = create_msg(path, "user_1", serde_json::json!({}));
+        let out = dispatch_routed(&ctx, msg, input).await;
+        assert!(
+            out.collect_buffered().await.is_err(),
+            "a non-admin POST to {path} must not succeed"
+        );
+        assert!(
+            is_soft_deleted(&ctx, "gone").await,
+            "a non-admin POST to {path} restored a soft-deleted product"
+        );
+    }
+
+    // Positive control: the declared admin path DOES restore through the
+    // same router, so the assertions above cannot be passing merely because
+    // nothing routes anywhere.
+    let (msg, input) = admin_create_msg(
+        "/b/products/api/admin/products/gone/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], "gone",
+        "an admin must be able to restore: {body}"
+    );
+    assert!(!is_soft_deleted(&ctx, "gone").await);
+}
+
+/// Soft delete frees the product's slug (migration 005's unique index is
+/// partial on `deleted_at IS NULL`), and nothing stops a product created
+/// afterwards from claiming it. Restoring the original then violates
+/// `impresspress__products__products_owner_slug_uniq`.
+///
+/// That must read as a conflict naming the slug, not an opaque 500: the
+/// Deleted view's Restore button only reloads on success, so a 500 renders
+/// as nothing happening at all on the only door out of soft delete.
+///
+/// The conflict is read off the failed write, not from a pre-check ahead of
+/// it. A pre-check answers about the moment before the write, so a slug
+/// claimed in between produced the very 500 it existed to prevent; the
+/// write's own failure cannot be raced, because the row is still deleted and
+/// still probeable exactly when the write did not land.
+#[tokio::test]
+async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
+    let ctx = ctx().await;
+
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(&ctx, "original").await;
+
+    // Legal only because the delete freed the slug.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("restore over a claimed slug must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug collision is a conflict, not an internal error: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug so an admin can act on it: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(&ctx, "original").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// The admin PATCH refuses a soft-deleted product — a deleted row has to go
+/// back through `restore` before it is editable again. It enforced that with
 /// a separate `get` followed by a separate `update`, which is a guard with a
 /// window in it: a delete landing between the two lets the PATCH write to an
 /// already-deleted row and answer 200.
@@ -1368,6 +1600,489 @@ async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
         stored.data.get("name"),
         Some(&serde_json::json!("before")),
         "the PATCH must not have written to a deleted row"
+    );
+}
+
+/// Move a competing product in or out of the slug at the exact moment one of
+/// the restore's `UPDATE`s goes out, so a test can stand on any side of the
+/// windows the handler's ordering leaves open.
+#[derive(Clone, Copy)]
+enum RaceMove {
+    /// A live product claims the freed slug just BEFORE the first restore
+    /// write reaches the database — after any pre-check would have looked.
+    ClaimantAppearsFirst,
+    /// The claimant is deleted just AFTER the first restore write refused it,
+    /// so the collision probe that runs next finds nothing to blame.
+    ClaimantVanishesFirst,
+    /// Both moves in sequence, which is the one window the probe cannot
+    /// close: the claimant is deleted after the first write, so the probe
+    /// comes back clear and the handler retries — and a FRESH claimant takes
+    /// the slug before that retry reaches the database.
+    ReclaimedBeforeTheRetry,
+}
+
+/// The id of the second claimant, which takes the slug in the gap between a
+/// clear probe and the retry that probe earned. A different row from
+/// `claimant_id`: the first one is soft-deleted by then, and a deleted row
+/// cannot violate a partial index keyed on `deleted_at IS NULL`.
+const LATE_CLAIMANT: &str = "late_claimant";
+
+/// Run a [`RaceMove`] against the restore's writes, then let each proceed.
+///
+/// The writes themselves are real: they go to the real database and succeed
+/// or violate `..._owner_slug_uniq` exactly as production would. Only the
+/// timing of the competing row is arranged.
+#[derive(Clone)]
+struct RaceTheRestoreWrite {
+    inner: std::sync::Arc<crate::test_support::TestContext>,
+    claimant_id: String,
+    slug: String,
+    when: RaceMove,
+    /// How many of the HANDLER's own filtered writes to the products table
+    /// have gone out, so a move can be hung on the first (the restore) or the
+    /// second (the retry it earns).
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Set while a move is running. The moves write to the products table
+    /// themselves, and a move's own write is not one of the handler's — left
+    /// uncounted it would shift every later move onto the wrong write.
+    moving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RaceTheRestoreWrite {
+    /// Seed a LIVE product holding the contested slug. Legal only while no
+    /// other live row holds it, which is exactly the state each caller below
+    /// has arranged.
+    async fn claim_the_slug(&self, claimant_id: &str) {
+        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut claimant = HashMap::new();
+        claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+        claimant.insert("slug".to_string(), serde_json::json!(self.slug.clone()));
+        seed(
+            self.inner.as_ref(),
+            "impresspress__products__products",
+            claimant_id,
+            claimant,
+        )
+        .await;
+        self.moving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Soft-delete the claimant, freeing the slug again — the same write the
+    /// delete endpoint issues, so the row goes on existing and the index
+    /// stops seeing it.
+    async fn release_the_slug(&self) {
+        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+        super::super::repo::products::soft_delete(self.inner.as_ref(), &self.claimant_id)
+            .await
+            .expect("the concurrent delete of the claimant lands");
+        self.moving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl wafer_run::context::Context for RaceTheRestoreWrite {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), wafer_run::WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: wafer_run::Message,
+        input: wafer_run::InputStream,
+    ) -> wafer_run::OutputStream {
+        #[derive(serde::Deserialize)]
+        struct CollectionPeek {
+            collection: String,
+        }
+
+        if name != "wafer-run/database" || msg.action() != "database.update_where_count" {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|peek| peek.collection)
+            .unwrap_or_default();
+        let ours = collection == super::super::repo::products::TABLE
+            && !self.moving.load(std::sync::atomic::Ordering::SeqCst);
+        let nth = ours.then(|| {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        });
+
+        match (self.when, nth) {
+            (RaceMove::ClaimantAppearsFirst, Some(0)) => {
+                self.claim_the_slug(&self.claimant_id).await
+            }
+            (RaceMove::ReclaimedBeforeTheRetry, Some(1)) => {
+                self.claim_the_slug(LATE_CLAIMANT).await
+            }
+            _ => {}
+        }
+        let out = self
+            .inner
+            .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+            .await;
+        match (self.when, nth) {
+            (RaceMove::ClaimantVanishesFirst, Some(0))
+            | (RaceMove::ReclaimedBeforeTheRetry, Some(0)) => self.release_the_slug().await,
+            _ => {}
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+/// Seed `original`, soft-deleted, holding slug `widget`.
+async fn seed_a_deleted_product_holding_widget(ctx: &crate::test_support::TestContext) {
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(ctx, "original").await;
+}
+
+/// The ordering itself, not just its happy outcome: the restore WRITES first
+/// and only reads if the write refused.
+///
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` seeds its
+/// claimant before the request, so it answers 409 under a pre-check
+/// implementation exactly as it does under this one — it pins the response,
+/// not the ordering the response's correctness depends on. This pins the
+/// ordering, by putting the claimant *inside* the window a pre-check leaves
+/// open: it appears after any look-before-you-write would have looked, and
+/// before the write it makes fail.
+///
+/// A pre-check therefore sees a clear slug, writes, and can only report the
+/// index violation as an opaque 500 — the exact failure it was added to
+/// prevent. Reading the collision off the write's own refusal cannot be
+/// raced this way: the write either landed, in which case there was no
+/// collision, or it did not, in which case the row is still deleted and the
+/// claimant is still there to be named.
+#[tokio::test]
+async fn restore_names_a_slug_claimed_after_a_pre_check_would_have_looked() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ClaimantAppearsFirst,
+        writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&racing, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("restore over a slug claimed mid-flight must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug claimed inside the window must still read as a conflict, not a 500: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(ctx.as_ref(), "original").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// Writing first removed the pre-check's window, but the *classification*
+/// still asks the database a second question, and the rows it asks about are
+/// mutable. If the claimant is renamed or deleted between the failed write
+/// and the probe, the probe finds nothing to blame and the admin gets back
+/// the opaque 500 the whole branch exists to avoid — on a restore that would
+/// now succeed if simply attempted again.
+///
+/// So a clear probe is not an answer, it is a reason to try again: a slug
+/// nothing holds is a slug this product can re-claim. One retry, which either
+/// lands (the collision really had gone) or fails again and is reported for
+/// what it is.
+#[tokio::test]
+async fn restore_lands_when_the_claimant_vanishes_before_the_probe() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    // Legal only because the delete freed the slug.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx.as_ref(),
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ClaimantVanishesFirst,
+        writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&racing, msg, input).await).await;
+    assert_eq!(
+        body["id"], "original",
+        "a collision that has gone by the time it is probed must not become a 500: {body}"
+    );
+    assert!(
+        !is_soft_deleted(ctx.as_ref(), "original").await,
+        "the retried restore must have landed"
+    );
+}
+
+/// The window the retry above opens and does not close. The retry is itself
+/// a write, and the slug it re-claims is free only until someone else takes
+/// it: probe reads clear, another request claims the slug, the retry violates
+/// the same index the first write did.
+///
+/// That second failure used to go straight to `write_error`, which answers
+/// the opaque 500 this entire branch exists to prevent — on a request that
+/// IS a slug conflict and has the slug in hand to name. The Deleted view's
+/// Restore button only reloads on success, so what an admin sees is a button
+/// that does nothing at all, with nothing said about why.
+///
+/// A second failure after a CLEAR probe is therefore reported as the conflict
+/// it is. It is not retried again: a retry loop would chase a slug another
+/// request is free to go on re-claiming, and the honest answer — someone else
+/// holds this slug, free it and try again — is already available. One retry
+/// stays safe for the reason it always was: `restore` only clears
+/// `deleted_at` on the same already-deleted row, so a repeat creates no
+/// duplicate record and no ancillary state.
+#[tokio::test]
+async fn restore_reports_a_conflict_when_the_slug_is_reclaimed_before_the_retry() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    // Legal only because the delete freed the slug, and what makes the FIRST
+    // restore write violate `..._owner_slug_uniq`.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx.as_ref(),
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ReclaimedBeforeTheRetry,
+        writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&racing, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("a retry over a re-claimed slug must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug re-claimed between the probe and the retry must still read as \
+         a conflict, not as the 500 the probe exists to prevent: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(ctx.as_ref(), "original").await,
+        "a refused restore must leave the product deleted"
+    );
+    // The late claimant is the one holding the slug now, and it is live: the
+    // conflict named a real, current claim rather than a stale one.
+    assert!(
+        !is_soft_deleted(ctx.as_ref(), LATE_CLAIMANT).await,
+        "the slug's new holder must still be live"
+    );
+}
+
+/// The third direction of the same rule, and the one the retry's new
+/// classification could get wrong: "cannot have collided" is not "clear".
+///
+/// Migration 005's unique index is partial on `slug <> ''` as well as on
+/// `deleted_at IS NULL`, so a product with no slug cannot be refused by it —
+/// any number of rows may carry an empty one. A failed restore of such a row
+/// is therefore not a slug question at all, and reading the probe's "nothing
+/// holds that slug" as a clear slug would retry a collision that cannot
+/// exist and then, on the second failure, blame a slug that is the empty
+/// string: `Another product already uses the slug ""`, 409, for what is
+/// really a database wobble.
+///
+/// So an empty slug is [`SlugProbe::Unknown`], and the write's own error goes
+/// out against a correlation id — the same answer as a probe that could not
+/// run, for the same reason: no slug answer is available.
+#[tokio::test]
+async fn restore_of_a_slugless_product_reports_the_write_failure_not_a_slug_conflict() {
+    let ctx = ctx().await;
+
+    // No `slug` key at all, which is what every product created without one
+    // carries.
+    let mut slugless = HashMap::new();
+    slugless.insert("name".to_string(), serde_json::json!("Slugless"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "slugless",
+        slugless,
+    )
+    .await;
+    soft_delete_product(&ctx, "slugless").await;
+
+    // Mutations now fail while reads still resolve: the restore write fails
+    // for a reason that has nothing to do with any index, and the probe that
+    // runs next can still read the row it is asked about.
+    let ctx = ctx.break_writes();
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/slugless/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("a restore whose write failed must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::Internal,
+        "a product with no slug cannot collide on the slug index, so its \
+         failed restore must carry the write's own error rather than a \
+         conflict blaming an empty slug: {error:?}"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "slugless").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// The other direction of the same rule: "could not tell" is not "conflict".
+/// When the restore write fails and the collision probe that would name the
+/// slug cannot itself run, the response must carry the write's real failure —
+/// an `Internal` error against a correlation id an admin can quote — rather
+/// than a confident 409 blaming a slug nothing has confirmed is taken.
+///
+/// The restore write is failed by a REAL slug collision (the claimant seeded
+/// below), not by breaking the write itself. That matters: the earlier
+/// version of this test seeded no claimant and relied on
+/// `TestContext::break_list_reads` to fail the write too, which it did only
+/// because `FailingReadsDb` inherited the `DatabaseService` trait's
+/// read-based `update_where_count` default — count, then update. Every real
+/// backend overrides that with one `UPDATE` carrying no `count`, so in
+/// production the write landed, the handler returned 200, and the branch
+/// this test names was unreachable. The test asserted an outcome production
+/// could not produce. With the double corrected, the failure has to come
+/// from something production can actually do — and the unique index from
+/// migration 005 is exactly that.
+#[tokio::test]
+async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
+    let ctx = ctx().await;
+
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(&ctx, "original").await;
+
+    // Legal only because the delete freed the slug — and it is what makes
+    // the restore's `UPDATE` violate `..._owner_slug_uniq`, exactly as in
+    // `restore_reports_a_slug_conflict_instead_of_an_opaque_error`.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    // Listings now fail while by-id reads still resolve: the restore write
+    // fails on the index, `get_deleted` still finds the row, and the
+    // collision probe's `list_all` is the one read that cannot run — the
+    // exact interleaving a transient database wobble produces on top of a
+    // genuine collision, and the only one that reaches the "probe could not
+    // tell" branch.
+    let ctx = ctx.break_list_reads();
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::Internal).await,
+        "a probe that could not run must fail the restore, not be read as a clear slug"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "original").await,
+        "a restore that could not check its slug must leave the product deleted"
     );
 }
 
@@ -2169,6 +2884,491 @@ async fn manage_products_uses_data_table_with_mobile_labels() {
     assert!(html.contains("Widget"), "the seeded product should render");
 }
 
+/// `?view=deleted` is the only way to reach a soft-deleted row from the
+/// admin UI — without it, soft delete is a one-way door. Pins that the
+/// deleted view shows exactly the deleted rows (not the live ones), and
+/// that the default (no `view`) list keeps excluding them.
+#[tokio::test]
+async fn manage_products_deleted_view_lists_only_deleted_products() {
+    let ctx = ctx().await;
+
+    let mut live = HashMap::new();
+    live.insert("name".to_string(), serde_json::json!("live"));
+    live.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "live", live).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (default_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    let default_html =
+        output_to_html(super::super::pages::manage_products(&ctx, &default_msg).await).await;
+    assert!(default_html.contains(">live<"), "{default_html}");
+    assert!(!default_html.contains(">gone<"), "{default_html}");
+
+    let (mut deleted_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    deleted_msg.set_meta("req.query.view", "deleted");
+    let deleted_html =
+        output_to_html(super::super::pages::manage_products(&ctx, &deleted_msg).await).await;
+    assert!(deleted_html.contains(">gone<"), "{deleted_html}");
+    assert!(!deleted_html.contains(">live<"), "{deleted_html}");
+}
+
+/// The deleted view's table has a `Deleted` column, so it has to be ordered
+/// by it. Sorting the deleted list `created_at desc` (the live list's order)
+/// puts the product an admin just deleted wherever its creation date happens
+/// to fall — which for an old product is the bottom of the list, on the one
+/// page whose entire purpose is undoing a delete that was probably a moment
+/// ago.
+#[tokio::test]
+async fn manage_products_deleted_view_sorts_by_when_the_product_was_deleted() {
+    let ctx = ctx().await;
+
+    // Created most recently, deleted longest ago: first by `created_at
+    // desc`, last by `deleted_at desc`.
+    let mut stale = HashMap::new();
+    stale.insert("name".to_string(), serde_json::json!("Deleted long ago"));
+    stale.insert("status".to_string(), serde_json::json!("active"));
+    stale.insert(
+        "created_at".to_string(),
+        serde_json::json!("2026-02-01T00:00:00Z"),
+    );
+    stale.insert(
+        "deleted_at".to_string(),
+        serde_json::json!("2026-03-01T00:00:00Z"),
+    );
+    seed(&ctx, "impresspress__products__products", "stale", stale).await;
+
+    let mut fresh = HashMap::new();
+    fresh.insert("name".to_string(), serde_json::json!("Deleted just now"));
+    fresh.insert("status".to_string(), serde_json::json!("active"));
+    fresh.insert(
+        "created_at".to_string(),
+        serde_json::json!("2026-01-01T00:00:00Z"),
+    );
+    fresh.insert(
+        "deleted_at".to_string(),
+        serde_json::json!("2026-03-02T00:00:00Z"),
+    );
+    seed(&ctx, "impresspress__products__products", "fresh", fresh).await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    let fresh_at = html
+        .find("Deleted just now")
+        .expect("the recently deleted product must render");
+    let stale_at = html
+        .find("Deleted long ago")
+        .expect("the older deletion must render");
+    assert!(
+        fresh_at < stale_at,
+        "the deleted view must be ordered by deleted_at desc, so the product just deleted \
+         is at the top; got 'Deleted long ago' at {stale_at} before 'Deleted just now' at {fresh_at}"
+    );
+}
+
+/// The deleted view is a dead end unless the way back is obvious: pin that
+/// each deleted row's Restore action posts to the actual restore endpoint,
+/// not the edit page (which 404s for a soft-deleted product until it is
+/// restored).
+#[tokio::test]
+async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    assert!(
+        html.contains("/b/products/api/admin/products/gone/restore"),
+        "deleted row should offer a Restore action wired to the restore endpoint: {html}"
+    );
+    assert!(
+        !html.contains(r#"href="/b/products/admin/products/gone""#),
+        "a deleted row must not link into the edit page, which refuses a soft-deleted product: {html}"
+    );
+}
+
+// The Restore button's URL is built server-side by interpolating the row's id
+// into a path segment, so the id has to be percent-encoded — every
+// browser-side URL in this file already runs its ids through
+// `encodeURIComponent`, and this one had nothing. maud escapes HTML, not URLs.
+//
+// Ids containing `/`, `?` or `#` are reachable, not hypothetical: `db::create`
+// synthesizes a UUID only when the body omits `id`, and the admin create
+// endpoint forwarded the body verbatim until this branch began refusing `id`,
+// so any deployment that ever ran a seeding client against it can hold such a
+// row.
+//
+// Encoding alone is only half a round trip, and the half that is easy to
+// assert. The test below therefore asserts the WHOLE trip — render the URL,
+// send it through the real router, and check the product came back — because
+// an "the HTML contains %2F" assertion passes just as happily when the
+// endpoint on the other end 404s.
+
+/// The URL the Deleted view renders for `id` is the URL that restores `id`.
+///
+/// Drives the real path: `manage_products` renders the row, the `hx-post`
+/// target is read back out of that HTML verbatim (no hand-built URL, so a
+/// change to either half of the encoding is caught), and it goes through
+/// `route_to_block` → `ProductsBlock::handle` → `endpoint_match::dispatch_path`
+/// → `handle_restore_product` → the repository.
+///
+/// The id carries `/`, `?` and `#`, which end a path segment for three
+/// different reasons: path separator, query start, fragment start. Every HTTP
+/// adapter hands impresspress the path still percent-encoded — axum's
+/// `Uri::path`, `url::Url::path` on Cloudflare, `Url.pathname` in the Service
+/// Worker — so `%2F` reaches the matcher intact and the route does not split;
+/// the decode owed is on the matched `{id}`, and that is what
+/// `dispatch_path` now does.
+#[tokio::test]
+async fn the_restore_url_the_deleted_view_renders_restores_that_product() {
+    let ctx = ctx().await;
+
+    let awkward_id = "prod/1?x#y";
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", awkward_id, gone).await;
+    soft_delete_product(&ctx, awkward_id).await;
+
+    let (mut page_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    page_msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &page_msg).await).await;
+
+    let restore_url = rendered_hx_post(&html)
+        .unwrap_or_else(|| panic!("the deleted row must render an hx-post Restore action: {html}"));
+    assert_eq!(
+        restore_url, "/b/products/api/admin/products/prod%2F1%3Fx%23y/restore",
+        "the Restore action must percent-encode the product id into its path segment"
+    );
+
+    // The wire path, unmodified, through the real router.
+    let (msg, input) = admin_create_msg(&restore_url, serde_json::json!({}));
+    let out = dispatch_routed(&ctx, msg, input).await;
+    let body = output_to_json(out).await;
+    assert_eq!(
+        body["id"], awkward_id,
+        "posting the rendered Restore URL must reach the product it names"
+    );
+
+    // And the product is actually live again, not merely answered about.
+    let restored = super::super::repo::products::get(&ctx, awkward_id)
+        .await
+        .expect("the restored product must be readable through the live-only door");
+    assert!(
+        crate::util::RecordExt::str_field(&restored, "deleted_at").is_empty(),
+        "restore must clear deleted_at: {restored:?}"
+    );
+}
+
+/// The value of the first `hx-post="..."` attribute in `html`.
+fn rendered_hx_post(html: &str) -> Option<String> {
+    let start = html.find("hx-post=\"")? + "hx-post=\"".len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The Restore button reloads the page on success. Without an explicit
+/// failure branch a refused restore — a slug collision is reachable, see
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — renders as
+/// nothing happening at all: no reload, no message, on the only door out of
+/// soft delete. Pin that the button feeds the failure into the shared toast
+/// channel `ui::assets::toast_js` already listens on.
+#[tokio::test]
+async fn manage_products_deleted_view_reports_a_failed_restore() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    // `showToast` alone would match the page shell's own listener script,
+    // which every admin page carries — the assertion has to see the BUTTON
+    // raising the event.
+    assert!(
+        html.contains("new CustomEvent('showToast'"),
+        "a failed restore must surface, not vanish: {html}"
+    );
+}
+
+// ============================================================
+// The close-only manager for a deleted product
+// ============================================================
+
+/// Seed a soft-deleted product with one published offer and one Payment Link
+/// that never reached Stripe, and return the offer and link ids.
+///
+/// The link is deliberately pending: deactivating it is then a purely local
+/// write, so these tests need no Stripe stand-in for the thing they are
+/// actually about — whether the UI can reach the close operations at all.
+async fn seed_a_deleted_product_with_a_money_surface(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+) -> (String, String) {
+    use super::super::{
+        contracts::PricingPreviewRequest,
+        offer_pricing,
+        repo::{offers as offer_repo, payment_links, products},
+    };
+
+    let offer_id = seed_published_offer(ctx, product_id).await;
+    let managed = offer_repo::get_managed(ctx, &offer_id)
+        .await
+        .expect("the offer is readable");
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: Default::default(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .expect("price the offer");
+    let link_id =
+        payment_links::create_pending(ctx, &offer_id, "", "", "", false, "close-me", &preview, 0)
+            .await
+            .expect("a pending Payment Link")
+            .managed
+            .id;
+
+    products::soft_delete(ctx, product_id)
+        .await
+        .expect("soft delete");
+    (offer_id, link_id)
+}
+
+/// The `ProductState::LiveOrDeleted` widening exists so a deleted product's
+/// Stripe surface can be closed without restoring the listing, but the
+/// Deleted view offered only **Restore** — which puts an active, approved
+/// product straight back into the public catalog. The one affordance on
+/// offer was the dangerous one, and the safe one was reachable only by an
+/// operator who already knew every id.
+#[tokio::test]
+async fn deleted_view_links_to_the_close_only_manager() {
+    let ctx = ctx().await;
+
+    // An id that is not URL-safe, so the link is pinned to carry the same
+    // percent-encoding the Restore action does.
+    let awkward_id = "prod/1?x#y";
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", awkward_id, gone).await;
+    soft_delete_product(&ctx, awkward_id).await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    let close_url = "/b/products/admin/products/prod%2F1%3Fx%23y/close";
+    assert!(
+        html.contains(close_url),
+        "a deleted row must offer a way to close its Stripe surface, not only Restore: {html}"
+    );
+
+    // And the link resolves: the SSR page dispatch decodes its id segment the
+    // same way `endpoint_match` decodes an API one, so the encoding the row
+    // applies has an inverse on the other end.
+    let (msg, input) = admin_get_msg(close_url);
+    let page = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        page.contains("Nothing left to close"),
+        "the rendered close link must resolve to that product's close manager: {page}"
+    );
+}
+
+/// The whole point of the page, end to end: the action it renders for a
+/// deleted product's offer actually archives that offer — the first
+/// `ProductState::LiveOrDeleted` operation any UI has ever reached.
+///
+/// The URL is read back out of the rendered HTML rather than hand-built, and
+/// the page itself is fetched through the real router, so both halves — the
+/// SSR route and the API the button targets — are the shipped ones.
+#[tokio::test]
+async fn the_close_manager_archives_a_deleted_products_offer_from_its_own_rendered_action() {
+    let ctx = ctx().await;
+    let (offer_id, _link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    let archive_url = rendered_attr(&html, "hx-delete=\"", &offer_id).unwrap_or_else(|| {
+        panic!("the close manager must render an archive action for offer {offer_id}: {html}")
+    });
+    let (mut msg, input) = delete_msg(&archive_url, "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let archived = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        archived["status"], "archived",
+        "the rendered archive action must archive the deleted product's offer: {archived}"
+    );
+
+    // And it did not resurrect the product.
+    assert!(
+        is_soft_deleted(&ctx, "gone").await,
+        "closing a money surface must not restore the listing"
+    );
+}
+
+/// The same for a Payment Link, which is the half that is actually still
+/// taking money.
+#[tokio::test]
+async fn the_close_manager_deactivates_a_deleted_products_payment_link() {
+    let ctx = ctx().await;
+    let (_offer_id, link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    let deactivate_url = rendered_attr(&html, "hx-delete=\"", &link_id).unwrap_or_else(|| {
+        panic!("the close manager must render a deactivate action for link {link_id}: {html}")
+    });
+    let (mut msg, input) = delete_msg(&deactivate_url, "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let deactivated = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the rendered deactivate action must take the link down: {deactivated}"
+    );
+}
+
+/// Close-only means close-only. A deleted product's manager must not carry
+/// anything that keeps it selling — no create, publish, sync, duplicate or
+/// storefront link — because every one of those is an operation the
+/// `ProductState::Live` gate below it would refuse anyway, and offering it
+/// on a page about shutting a product down is an invitation to do the
+/// opposite.
+#[tokio::test]
+async fn the_close_manager_offers_nothing_that_keeps_selling() {
+    let ctx = ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    // Positive control first, so the refusals below cannot pass on an empty
+    // page.
+    assert!(
+        html.contains("Checkout product") && html.contains("hx-delete="),
+        "the page must render the product and its closing actions: {html}"
+    );
+
+    for forbidden in [
+        "productManagerPublishOffer",
+        "productManagerSyncOffer",
+        "productManagerDuplicate",
+        "productManagerCreateLink",
+        "productManagerSetStatus",
+        "product-manager-form",
+        "/b/products/catalog/gone",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "the close-only manager must not offer `{forbidden}`: {html}"
+        );
+    }
+    // POST and PATCH open or change a money surface; only DELETE closes one.
+    assert!(
+        !html.contains("hx-post=") && !html.contains("hx-patch="),
+        "the close-only manager must only ever issue closing requests: {html}"
+    );
+}
+
+/// A live product belongs in the ordinary manager, which can do everything.
+/// This page reads through `get_deleted`, so it simply does not exist for one.
+#[tokio::test]
+async fn the_close_manager_404s_for_a_live_product() {
+    let ctx = ctx().await;
+    seed_published_offer(&ctx, "alive").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/alive/close");
+    assert!(
+        output_is_error(dispatch_routed(&ctx, msg, input).await, ErrorCode::NotFound).await,
+        "the close-only manager is for deleted products"
+    );
+
+    // Positive control: the same path for a DELETED product renders, so the
+    // 404 above is about the product's state and not about the route.
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "the route itself must exist: {html}"
+    );
+}
+
+/// `/b/products` is a PUBLIC route prefix — every admin page under it is
+/// admin-only solely because its `BlockEndpoint` declares
+/// `AuthLevel::Admin`. A new page path with no declaration is therefore
+/// reachable by anyone, so this drives the real router the way
+/// `restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it`
+/// does.
+#[tokio::test]
+async fn the_close_manager_is_admin_only() {
+    let ctx = ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/admin/products/gone/close", "user_1");
+    assert!(
+        dispatch_routed(&ctx, msg, input)
+            .await
+            .collect_buffered()
+            .await
+            .is_err(),
+        "a non-admin must not reach the close-only manager"
+    );
+
+    // Positive control: the admin does.
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "an admin must reach the page the assertion above denies: {html}"
+    );
+}
+
+/// The value of the first `attr` whose element also mentions `needle`.
+///
+/// Attribute values are unique enough here that a plain scan for the id and a
+/// backwards walk to the attribute would be fragile; this instead takes every
+/// value of `attr` and returns the one containing `needle`.
+fn rendered_attr(html: &str, attr: &str, needle: &str) -> Option<String> {
+    let mut rest = html;
+    while let Some(start) = rest.find(attr) {
+        rest = &rest[start + attr.len()..];
+        let end = rest.find('"')?;
+        let value = &rest[..end];
+        if value.contains(needle) {
+            return Some(value.to_string());
+        }
+        rest = &rest[end..];
+    }
+    None
+}
+
 #[tokio::test]
 async fn stripe_setup_guides_configuration_without_rendering_credentials() {
     let ctx = ctx_with(&[
@@ -2821,11 +4021,10 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
     // (normalized) AND from the raw `/b/products/...` path. Declaring only
     // one of them is legal — the other then resolves to `declared_access`'s
     // `Authenticated` fallback — but only while that fallback is no weaker
-    // than the declaration. The rule was written against a real escalation:
-    // a product-restore route declared `Admin` at the `/api/` spelling alone
-    // was reachable at `Authenticated` through the raw one, so any logged-in
-    // user could resurrect any soft-deleted product. So the rule is not
-    // "some spelling is declared" (which that
+    // than the declaration. Restore was declared `Admin` at the `/api/`
+    // spelling alone and was therefore reachable at `Authenticated` through
+    // the raw one: any logged-in user could resurrect any soft-deleted
+    // product. So the rule is not "some spelling is declared" (which that
     // route satisfied) but "EVERY spelling that reaches the handler is
     // enforced at least as strictly as the strictest declaration" — which
     // in practice keeps `Admin` routes off this table entirely, where they
