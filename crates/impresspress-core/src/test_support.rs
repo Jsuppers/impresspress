@@ -19,6 +19,8 @@ use wafer_run::{
     Block, BlockInfo, ErrorCode, InputStream, Message, OutputStream, ResourceGrant, WaferError,
 };
 
+use crate::routing::ExtraRoute;
+
 /// Minimal test context backed by a real in-memory SQLite database.
 ///
 /// Routes `"wafer-run/database"` calls to the production `DatabaseBlock`.
@@ -62,6 +64,12 @@ pub struct TestContext {
     wrap_grants: Vec<ResourceGrant>,
     /// Admin block id for the WRAP check (`""` = no admin override).
     wrap_admin_block: String,
+    /// Routes a fixture registered the way a downstream project would, via
+    /// `ImpresspressBuilder::add_route`. Fed to [`Self::dispatch`] so a test
+    /// exercises the same router path — including its access gate — that the
+    /// consumer's registration produces, instead of calling a block's
+    /// `handle()` past the gate.
+    extra_routes: Vec<ExtraRoute>,
 }
 
 impl TestContext {
@@ -84,6 +92,7 @@ impl TestContext {
             caller_id: None,
             wrap_grants: Vec::new(),
             wrap_admin_block: String::new(),
+            extra_routes: Vec::new(),
         }
     }
 
@@ -297,6 +306,67 @@ impl TestContext {
             Arc::new(crate::blocks::products::ProductsBlock::new()),
         );
         ctx
+    }
+
+    /// Build a `TestContext` with admin + dev-sandbox migrations applied, the
+    /// `impresspress/dev` block registered over `control`, and the `/b/dev`
+    /// `Admin` extra route added the way `ImpresspressBuilder::add_route`
+    /// would.
+    ///
+    /// WRAP enforcement is switched on with
+    /// [`crate::blocks::dev::wrap_grants`], so a test exercises the real
+    /// grant set: the block's own
+    /// `impresspress__dev__*` tables self-admit under the own-namespace rule,
+    /// and the published site under `wafer-run/web/site/*` is reachable only
+    /// because that grant is present. Migrations run before enforcement
+    /// starts, exactly as they do at boot.
+    #[cfg(feature = "block-dev")]
+    pub async fn with_dev(control: Arc<dyn crate::blocks::dev::RuntimeControl>) -> Self {
+        use crate::blocks::dev;
+
+        let mut ctx = Self::with_admin().await;
+        ctx.apply_block_migrations(
+            dev::BLOCK_NAME,
+            dev::migrations::SQLITE_MIGRATIONS,
+            dev::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        ctx.register_block(
+            dev::BLOCK_NAME,
+            Arc::new(dev::DevBlock::new(dev::DevShared::new(control))),
+        );
+        ctx.add_extra_route(ExtraRoute {
+            prefix: dev::ROUTE_PREFIX.to_string(),
+            access: crate::routing::RouteAccess::Admin,
+            block_name: dev::BLOCK_NAME.to_string(),
+        });
+        ctx.with_wrap(dev::BLOCK_NAME, dev::wrap_grants(), "impresspress/admin")
+    }
+
+    /// Register a route the way `ImpresspressBuilder::add_route` does, so
+    /// [`Self::dispatch`] routes through it.
+    pub fn add_extra_route(&mut self, route: ExtraRoute) {
+        self.extra_routes.push(route);
+    }
+
+    /// Route `msg` through [`crate::routing::route_to_block`] using this
+    /// context's registered `BlockInfo`s and extra routes.
+    ///
+    /// This is the whole request path a block sees in production minus the
+    /// pipeline's auth/CSRF preamble: in particular the router's access gate
+    /// runs, so a test can assert that an admin-only route rejects an
+    /// anonymous or non-admin caller without the block containing any
+    /// role check of its own.
+    pub async fn dispatch(&self, msg: Message) -> OutputStream {
+        crate::routing::route_to_block(
+            self,
+            msg,
+            InputStream::empty(),
+            &crate::features::AllEnabled,
+            &self.block_infos,
+            &self.extra_routes,
+        )
+        .await
     }
 
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
@@ -1143,6 +1213,26 @@ pub async fn output_status(out: OutputStream) -> u16 {
         .unwrap_or(200)
 }
 
+/// The HTTP status an adapter would send for `out`, **including** for the
+/// error terminals the router and the `err_*` helpers produce.
+///
+/// [`output_status`] deliberately panics on an error terminal, because a
+/// handler under test erroring is normally a bug. A test asserting the
+/// router's access gate is the opposite case: a 403 there arrives as
+/// `TerminalNotResponse::Error(PermissionDenied)`, never as `resp.status`
+/// meta. The mapping is `wafer_block::http_codec`'s, the same one the real
+/// adapters use, so this reports the status the caller would actually see.
+pub async fn output_http_status(out: OutputStream) -> u16 {
+    match out.collect_buffered().await {
+        Ok(buf) => wafer_block::http_codec::resolve_status(&buf.meta, 200),
+        Err(TerminalNotResponse::Halt(buf)) => {
+            wafer_block::http_codec::resolve_status(&buf.meta, 200)
+        }
+        Err(TerminalNotResponse::Error(e)) => wafer_block::http_codec::resolve_error_status(&e),
+        Err(other) => panic!("unexpected terminal: {other:?}"),
+    }
+}
+
 /// Read a named response header (e.g. `"Location"` for redirects).
 /// The lookup is case-sensitive — pass the exact name handlers used in
 /// `set_header(name, _)`.
@@ -1200,7 +1290,8 @@ pub async fn output_is_error(out: OutputStream, code: &str) -> bool {
     feature = "block-vector"
 ))]
 pub fn real_block_infos() -> Vec<BlockInfo> {
-    vec![
+    #[allow(unused_mut)]
+    let mut infos = vec![
         crate::blocks::auth_ui::AuthUiBlock::new().info(),
         crate::blocks::files::FilesBlock::new().info(),
         crate::blocks::products::ProductsBlock::new().info(),
@@ -1215,7 +1306,21 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
         ))
         .info(),
         crate::blocks::vector::VectorBlock::new().info(),
-    ]
+    ];
+
+    // The dev sandbox ships only under its own (non-default) feature, so its
+    // `BlockInfo` joins the document only when the block is compiled in. Like
+    // `llm` above, `info()` is declarative — the `RuntimeControl` handle it is
+    // built with is never called here, so the test double suffices.
+    #[cfg(feature = "block-dev")]
+    infos.push(
+        crate::blocks::dev::DevBlock::new(crate::blocks::dev::DevShared::new(
+            crate::blocks::dev::test_support::FakeControl::new(),
+        ))
+        .info(),
+    );
+
+    infos
 }
 
 /// The JWT secret every `handle_request` test call passes.

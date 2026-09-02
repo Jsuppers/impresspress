@@ -123,11 +123,9 @@ fn make_msg_with_admin(path: &str, user_id: &str) -> Message {
 /// `resp.status` override, else the `ErrorCode`-derived status for Error
 /// terminals — NotFound → 404, PermissionDenied → 403, Unauthenticated → 401).
 async fn response_status(stream: OutputStream) -> i64 {
-    match stream.collect_buffered().await {
-        Ok(buf) => i64::from(http_codec::resolve_status(&buf.meta, 200)),
-        Err(TerminalNotResponse::Error(err)) => i64::from(http_codec::resolve_error_status(&err)),
-        Err(other) => panic!("unexpected terminal: {other:?}"),
-    }
+    // Delegates to the shared harness helper so the status-resolution rules
+    // (including the error-terminal mapping) have one implementation.
+    i64::from(impresspress_core::test_support::output_http_status(stream).await)
 }
 
 /// Like [`response_status`], but also returns the `Location` response header

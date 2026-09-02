@@ -100,8 +100,9 @@ fn build_error_response(status: u16, body: &str) -> Result<web_sys::Response, Js
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
-    use super::*;
     use wasm_bindgen_test::*;
+
+    use super::*;
 
     fn empty_wafer() -> wafer_run::Wafer {
         let cfg: std::sync::Arc<dyn wafer_run::ConfigSource> =
