@@ -15,7 +15,7 @@ use super::harness::*;
 use crate::{
     blocks::products::{
         contracts::{OfferDefinitionRequest, PaymentLinkCreateRequest, PricingPreviewRequest},
-        offer_pricing, repo, stripe, PRODUCTS_TABLE,
+        offer_pricing, repo, stripe,
     },
     util::{hex_encode, sha256_hex, RecordExt},
 };
@@ -105,7 +105,7 @@ async fn seed_active_offer(
 ) -> String {
     seed(
         ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Configurable print")),
@@ -3239,7 +3239,7 @@ async fn catalog_sync_persists_fixed_prices_and_reuses_them_in_checkout_and_paym
         .unwrap();
     assert_eq!(fixed.stripe_price_id, "price_catalog_setup");
     assert!(dynamic.stripe_price_id.is_empty());
-    let product = db::get(&ctx, PRODUCTS_TABLE, product_id)
+    let product = db::get(&ctx, repo::products::TABLE, product_id)
         .await
         .expect("synced product row");
     assert_eq!(product.str_field("stripe_product_id"), "prod_catalog");
@@ -3358,7 +3358,9 @@ async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product(
         .components
         .iter()
         .all(|component| component.stripe_price_id.is_empty()));
-    let persisted_product = db::get(&ctx, PRODUCTS_TABLE, product_id).await.unwrap();
+    let persisted_product = db::get(&ctx, repo::products::TABLE, product_id)
+        .await
+        .unwrap();
     assert_eq!(
         persisted_product.str_field("stripe_product_id"),
         "prod_catalog_retry"
@@ -3448,7 +3450,7 @@ async fn catalog_reconciliation_refreshes_product_metadata_and_reactivates_fixed
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -3548,7 +3550,7 @@ async fn catalog_reconciliation_replaces_a_missing_product_and_its_dependent_pri
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -3697,7 +3699,7 @@ async fn subscription_catalog_sync_creates_and_persists_a_strict_recurring_price
     let product_id = "subscription_catalog_product";
     seed(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Quarterly care plan")),
@@ -3796,7 +3798,7 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -3935,6 +3937,136 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
     assert!(idempotent_requests.lock().unwrap().is_empty());
 }
 
+/// Suspending a seller is a lifecycle/fraud operation, so it has to reach
+/// every row the seller owns. A soft-deleted product is still one of theirs,
+/// and soft delete touches nothing in Stripe: its Prices and Payment Links
+/// stay live in the connected account until something archives them.
+///
+/// `seller_products` reads through the live-only door, which silently exempted
+/// exactly those rows from the guarantee
+/// `seller_suspension_fails_closed_until_connected_catalog_archival_succeeds`
+/// documents — a suspended fraudster's deleted listings kept taking money.
+#[tokio::test]
+async fn seller_suspension_archives_the_catalog_of_soft_deleted_products_too() {
+    let mut ctx = ctx_with(&[
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            "sk_test_suspend_deleted",
+        ),
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+    ])
+    .await;
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "deleted_suspend_account",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("deleted_suspend")),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_deleted_suspend"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("fee_basis_points".to_string(), serde_json::json!(200)),
+        ]),
+    )
+    .await;
+    let product_id = "deleted_suspend_product";
+    let offer_id = seed_active_offer(&ctx, product_id, "deleted_suspend").await;
+    let fixed = repo::offers::get_managed(&ctx, &offer_id)
+        .await
+        .unwrap()
+        .offer
+        .components
+        .into_iter()
+        .find(|component| component.key == "setup")
+        .unwrap();
+    db::update(
+        &ctx,
+        repo::products::TABLE,
+        product_id,
+        HashMap::from([(
+            "stripe_product_id".to_string(),
+            serde_json::json!("prod_deleted_suspend"),
+        )]),
+    )
+    .await
+    .unwrap();
+    repo::offer_components::set_stripe_price_id(&ctx, &fixed.id, "price_deleted_suspend")
+        .await
+        .unwrap();
+    repo::offers::mark_synced(&ctx, &offer_id, "prod_deleted_suspend", "")
+        .await
+        .unwrap();
+
+    // The seller deletes the listing. Nothing in Stripe changes.
+    repo::products::soft_delete(&ctx, product_id)
+        .await
+        .expect("soft delete");
+
+    let requests = register_stripe_sequence(
+        &mut ctx,
+        vec![
+            (
+                200,
+                serde_json::json!({
+                    "id": "price_deleted_suspend",
+                    "livemode": false,
+                    "active": true,
+                    "product": "prod_deleted_suspend",
+                    "currency": "nzd",
+                    "unit_amount": 1000
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "price_deleted_suspend",
+                    "livemode": false,
+                    "active": false,
+                    "product": "prod_deleted_suspend",
+                    "currency": "nzd",
+                    "unit_amount": 1000
+                }),
+            ),
+        ],
+    );
+    let path = "/admin/b/products/sellers/deleted_suspend_account/suspend";
+    let (msg, input) = admin_create_msg(path, serde_json::json!({}));
+    let suspended = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(suspended["status"], "suspended");
+
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the soft-deleted product's Stripe Price must still be fetched and archived"
+        );
+        assert!(requests
+            .iter()
+            .all(|request| request.headers["Stripe-Account"] == "acct_deleted_suspend"));
+        assert_eq!(
+            requests[1].body.as_deref(),
+            Some(b"active=false".as_slice())
+        );
+    }
+    assert_eq!(
+        repo::offers::get_managed(&ctx, &offer_id)
+            .await
+            .unwrap()
+            .status,
+        crate::blocks::products::contracts::OfferStatus::Archived,
+        "a suspended seller's soft-deleted offer must end up archived"
+    );
+    // The row stays soft-deleted: suspension archives the catalog, it does
+    // not resurrect a deleted listing.
+    assert!(repo::products::get(&ctx, product_id).await.is_err());
+}
+
 #[tokio::test]
 async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeeds() {
     let mut ctx = ctx_with(&[
@@ -3975,7 +4107,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
         .unwrap();
     db::update(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([(
             "stripe_product_id".to_string(),
@@ -4025,7 +4157,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
         "active"
     );
     assert_eq!(
-        db::get(&ctx, PRODUCTS_TABLE, product_id)
+        db::get(&ctx, repo::products::TABLE, product_id)
             .await
             .unwrap()
             .str_field("status"),
@@ -4067,7 +4199,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
     let suspended = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
     assert_eq!(suspended["status"], "suspended");
     assert_eq!(
-        db::get(&ctx, PRODUCTS_TABLE, product_id)
+        db::get(&ctx, repo::products::TABLE, product_id)
             .await
             .unwrap()
             .str_field("status"),
@@ -4386,7 +4518,7 @@ async fn seed_active_offer_with_restricted_variables(
 ) -> String {
     seed(
         ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Configurable print")),
@@ -4589,7 +4721,7 @@ async fn checkout_and_payment_links_enforce_offer_total_policy_before_stripe() {
         .await
     );
 
-    let product = db::get(&ctx, PRODUCTS_TABLE, "product_total_policy")
+    let product = db::get(&ctx, repo::products::TABLE, "product_total_policy")
         .await
         .unwrap();
     let error = stripe::create_payment_link(
@@ -4623,7 +4755,7 @@ async fn payment_link_redelivery_resumes_partial_order_and_backfills_snapshot() 
     let product_id = "product_payment_link_resume";
     seed(
         &ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Care plan")),
@@ -4922,7 +5054,7 @@ async fn payment_link_webhook_reconciles_exact_order_and_rejects_tampering() {
     )
     .await
     .unwrap();
-    let product = db::get(&ctx, PRODUCTS_TABLE, "product_payment_link_webhook")
+    let product = db::get(&ctx, repo::products::TABLE, "product_payment_link_webhook")
         .await
         .unwrap();
     let link = stripe::create_payment_link(
@@ -5110,4 +5242,156 @@ async fn payment_link_webhook_reconciles_exact_order_and_rejects_tampering() {
                 .is_none()
         );
     }
+}
+
+/// Soft delete touches nothing in Stripe, so a deleted product's Payment
+/// Links stay live in the connected account and stay payable. Reconciliation
+/// used to read the product through the live-only `repo::products::get`, so
+/// the delivery for a session paid through such a link answered `NotFound`,
+/// `fail_webhook!` turned that into an error, and Stripe retried it forever:
+/// money captured, no purchase row, no line items, and a buyer's order-status
+/// page that never resolves. The reconciliation reads past the filter for the
+/// same reason `archive_offer_catalog` does — its subject is a payment that
+/// has already happened, and the row is read for the buyer's own receipt.
+#[tokio::test]
+async fn a_paid_link_for_a_soft_deleted_product_still_reconciles_into_an_order() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let product_id = "product_deleted_but_payable";
+    seed(
+        &ctx,
+        repo::products::TABLE,
+        product_id,
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Field guide")),
+            ("slug".to_string(), serde_json::json!(product_id)),
+            ("status".to_string(), serde_json::json!("active")),
+            ("approval_status".to_string(), serde_json::json!("approved")),
+            ("owner_kind".to_string(), serde_json::json!("platform")),
+        ]),
+    )
+    .await;
+    let definition: OfferDefinitionRequest = serde_json::from_value(serde_json::json!({
+        "name": "One-off purchase",
+        "mode": "payment",
+        "currency": "nzd",
+        "pricing_model": "fixed",
+        "usage_type": "licensed",
+        "billing_scheme": "per_unit",
+        "tax_behavior": "exclusive",
+        "components": [{
+            "key": "guide",
+            "label": "Field guide",
+            "required": true,
+            "amount": {"type": "fixed", "unit_amount_minor": 4900}
+        }]
+    }))
+    .unwrap();
+    let offer = repo::offers::create(&ctx, product_id, "admin_1", &definition)
+        .await
+        .unwrap();
+    let offer_id = offer.offer.id;
+    repo::offers::publish(&ctx, product_id, &offer_id)
+        .await
+        .unwrap();
+    let managed = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: Default::default(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let pending_link = repo::payment_links::create_pending(
+        &ctx,
+        &offer_id,
+        "",
+        "",
+        "",
+        false,
+        "deleted-product-link-config",
+        &preview,
+        0,
+    )
+    .await
+    .unwrap();
+    let link_id = pending_link.managed.id;
+    repo::payment_links::mark_synced(
+        &ctx,
+        &link_id,
+        "plink_deleted",
+        "https://buy.stripe.com/deleted",
+    )
+    .await
+    .unwrap();
+
+    // The product is deleted locally. Its Payment Link is untouched in
+    // Stripe, so a customer can still pay through it.
+    repo::products::soft_delete(&ctx, product_id)
+        .await
+        .expect("soft delete");
+
+    let event = serde_json::json!({
+        "id": "evt_deleted_product_link",
+        "type": "checkout.session.completed",
+        "livemode": false,
+        "data": {
+            "object": {
+                "id": "cs_deleted_product_link",
+                "payment_link": "plink_deleted",
+                "mode": "payment",
+                "payment_status": "paid",
+                "metadata": {
+                    "impresspress_payment_link_id": link_id,
+                    "offer_id": offer_id,
+                    "offer_version": "1"
+                },
+                "currency": "nzd",
+                "amount_subtotal": 4900,
+                "amount_total": 4900,
+                "total_details": {
+                    "amount_discount": 0,
+                    "amount_tax": 0,
+                    "amount_shipping": 0
+                },
+                "customer_details": {"email": "buyer@example.com"},
+                "customer": "cus_deleted",
+                "payment_intent": "pi_deleted",
+                "livemode": false
+            }
+        }
+    });
+
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let body = output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await;
+    assert_eq!(body["received"], true, "the delivery must not fail: {body}");
+
+    let order = repo::purchases::find_by_session(&ctx, "cs_deleted_product_link")
+        .await
+        .unwrap()
+        .expect("the captured payment must have produced an order");
+    assert_eq!(order.data["status"], "completed");
+    assert_eq!(order.data["total_cents"], 4900);
+    assert_eq!(order.data["buyer_email"], "buyer@example.com");
+
+    let items = repo::purchases::list_line_items(&ctx, &order.id)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1, "the order must carry its line item");
+    assert_eq!(
+        RecordExt::str_field(&items[0], "product_id"),
+        product_id,
+        "the line item still points at the soft-deleted product row, which is \
+         why the row has to stay"
+    );
+
+    // And the product is still deleted — reconciling a payment must not
+    // resurrect a listing into the public catalog.
+    assert!(repo::products::get(&ctx, product_id).await.is_err());
 }

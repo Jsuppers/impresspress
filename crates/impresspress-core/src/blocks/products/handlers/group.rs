@@ -9,9 +9,9 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
-use super::{default_template_id, GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCTS_TABLE};
+use super::{default_template_id, GROUPS_TABLE, GROUP_TEMPLATES_TABLE};
 use crate::{
-    blocks::crud,
+    blocks::{crud, products::repo},
     http::{err_bad_request, err_internal, err_unauthorized, ok_json},
     util::stamp_created,
 };
@@ -182,7 +182,11 @@ pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message)
         operator: FilterOp::Equal,
         value: serde_json::Value::String(group_id.to_string()),
     }];
-    crud::crud_list(ctx, msg, PRODUCTS_TABLE, filters, None).await
+    let (page, page_size, _) = msg.pagination_params(20);
+    match repo::products::list_page(ctx, page as i64, page_size as i64, filters, None).await {
+        Ok(result) => ok_json(&result),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 // User-accessible group templates (read-only)
