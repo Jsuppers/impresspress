@@ -1,0 +1,15 @@
+# Deep-merged into the wrangler.toml that `impresspress build --target
+# cloudflare` generates (see `wrangler_overrides_path` in impresspress.toml).
+#
+# The D1 config cache reads `env.CONFIG_CACHE`; the generator emits the D1 and
+# R2 bindings but not this one. Namespace created with
+# `wrangler kv namespace create impresspress_webmcp_demo_CONFIG_CACHE`.
+[[kv_namespaces]]
+binding = "CONFIG_CACHE"
+id      = "e3dd805e96bc40129096bb96af201e5a"
+
+# The adapter answers 404 on *.workers.dev hosts unless a consumer opts in
+# (`impresspress-cloudflare/src/lib.rs`, `host_is_workers_dev`): the demo has no
+# custom domain, so it serves on workers.dev deliberately.
+[vars]
+IMPRESSPRESS_ALLOW_WORKERS_DEV = "1"

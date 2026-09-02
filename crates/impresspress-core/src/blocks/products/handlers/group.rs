@@ -11,14 +11,17 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
-use super::{default_template_id, GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCTS_TABLE};
+use super::{default_template_id, GROUPS_TABLE, GROUP_TEMPLATES_TABLE};
 use crate::{
     blocks::{
         crud,
-        products::contracts::{
-            CreateGroupRequest, CreateOwnGroupRequest, GroupListResponse,
-            GroupTemplateListResponse, GroupView, PageQuery, ProductListResponse,
-            UpdateGroupRequest, UpdateOwnGroupRequest,
+        products::{
+            contracts::{
+                CreateGroupRequest, CreateOwnGroupRequest, GroupListResponse,
+                GroupTemplateListResponse, GroupView, PageQuery, ProductListResponse,
+                UpdateGroupRequest, UpdateOwnGroupRequest,
+            },
+            repo,
         },
     },
     http::{err_bad_request, err_internal, err_unauthorized, ok_json},
@@ -233,9 +236,11 @@ pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message)
         operator: FilterOp::Equal,
         value: serde_json::Value::String(group_id.to_string()),
     }];
-    match crud::list_page(
+    // The door, not a generic paginated read against the table: a group's
+    // product list is a read like any other, so it takes the soft-delete
+    // filter and then the typed projection.
+    match repo::products::list_page(
         ctx,
-        PRODUCTS_TABLE,
         i64::from(query.page),
         i64::from(query.page_size),
         filters,
@@ -244,7 +249,7 @@ pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message)
     .await
     {
         Ok(list) => ok_json(&ProductListResponse::from_record_list(&list)),
-        Err(response) => response,
+        Err(e) => err_internal("Database error", e),
     }
 }
 

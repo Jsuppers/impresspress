@@ -1336,7 +1336,7 @@ pub enum ProductStatus {
 }
 
 /// A product row as published to its owner and to administrators: every
-/// column of `impresspress__products__products`.
+/// column of the products table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProductView {
     /// Stable product identifier.
@@ -1409,7 +1409,7 @@ pub struct ProductView {
 }
 
 impl ProductView {
-    /// Project an `impresspress__products__products` row.
+    /// Project a products-table row.
     pub fn from_record(record: &Record) -> Self {
         Self {
             id: record.id.clone(),
@@ -1445,7 +1445,7 @@ impl ProductView {
     }
 }
 
-// The public catalog row. Nine columns of `impresspress__products__products`
+// The public catalog row. Nine columns of the products table
 // that `ProductView` publishes to owners and administrators are deliberately
 // NOT published here, on the `AuthLevel::Public` catalog. The reasons live
 // in this plain comment rather than the doc comment: a `///` line is
@@ -1520,8 +1520,7 @@ pub struct CatalogProductView {
 }
 
 impl CatalogProductView {
-    /// Project an `impresspress__products__products` row for the public
-    /// catalog.
+    /// Project a products-table row for the public catalog.
     pub fn from_record(record: &Record) -> Self {
         Self {
             id: record.id.clone(),

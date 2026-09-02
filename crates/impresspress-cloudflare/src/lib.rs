@@ -1475,18 +1475,25 @@ fn host_is_workers_dev(req: &worker::Request) -> worker::Result<bool> {
 /// dash.
 fn host_is_version_preview(req: &worker::Request, env: &worker::Env) -> worker::Result<bool> {
     let host = req.url()?.host_str().unwrap_or("").to_ascii_lowercase();
+    // `.filter(|id| !id.is_empty())` matters, and matches what the two other
+    // readers of this binding already do: an empty id is `Some("")`, and
+    // `"".starts_with(prefix)` is false for every prefix, so the host would
+    // be judged NOT a version preview and the lockdown would fail OPEN — the
+    // opposite of the conservative fallback below. Dropping it to `None`
+    // falls back to the hex-prefix pattern, which locks.
     let version_id = env
         .get_binding::<worker::WorkerVersionMetadata>(VERSION_METADATA_BINDING)
         .ok()
-        .map(|metadata| metadata.id());
+        .map(|metadata| metadata.id())
+        .filter(|id| !id.is_empty());
     Ok(is_version_preview_host(&host, version_id.as_deref()))
 }
 
 /// The pure half of [`host_is_version_preview`].
 fn is_version_preview_host(host: &str, version_id: Option<&str>) -> bool {
-    let Some(first_label) = host.split('.').next() else {
-        return false;
-    };
+    // `split` always yields at least one item (including for ""), so this is
+    // total rather than a fallible lookup.
+    let first_label = host.split('.').next().unwrap_or(host);
     let Some((prefix, _worker)) = first_label.split_once('-') else {
         return false;
     };
@@ -1803,6 +1810,46 @@ mod request_config_tests {
         assert!(is_version_preview_host(
             "deadbeef-shop.example.workers.dev",
             None
+        ));
+    }
+
+    /// The lockdown must fail CLOSED when the version id is unusable.
+    ///
+    /// `CF_VERSION_METADATA` can be present and yield an empty id (wrangler
+    /// dev, a hand-written `[version_metadata]` on an unversioned deploy).
+    /// That reaches this function as `Some("")`, and `"".starts_with(prefix)`
+    /// is false for every prefix — so before the `.filter(|id| !id.is_empty())`
+    /// on the caller, an opt-in consumer served the full app anonymously on
+    /// its unpromoted preview URL.
+    #[wasm_bindgen_test]
+    fn an_unusable_version_id_still_locks_the_preview_host() {
+        // What the caller now passes for an empty id.
+        assert!(is_version_preview_host(
+            "c89ac716-impresspress-webmcp-demo.jorissuppers.workers.dev",
+            None
+        ));
+        // And the shape that used to slip through, asserted directly.
+        assert!(
+            !is_version_preview_host(
+                "c89ac716-impresspress-webmcp-demo.jorissuppers.workers.dev",
+                Some("")
+            ),
+            "an empty id cannot match any prefix — the caller must not pass it"
+        );
+        // The canonical host stays open on both.
+        assert!(!is_version_preview_host(
+            "impresspress-webmcp-demo.jorissuppers.workers.dev",
+            None
+        ));
+    }
+
+    /// The function requires a pre-lowercased host — its only caller
+    /// lowercases, and that invariant is invisible from the signature.
+    #[wasm_bindgen_test]
+    fn version_preview_matching_is_case_insensitive_on_the_id() {
+        assert!(is_version_preview_host(
+            "c89ac716-worker.example.workers.dev",
+            Some("C89AC716-7F68-437C-8484-640B5B9F2B42")
         ));
     }
 

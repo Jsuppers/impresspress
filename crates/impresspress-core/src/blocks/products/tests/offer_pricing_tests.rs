@@ -16,8 +16,8 @@ use super::{
         offer_pricing::{
             evaluate_condition, evaluate_offer, validate_inputs, validate_offer, InputScope,
         },
-        repo::{offer_components, offers, variables},
-        ProductsBlock, PRODUCTS_TABLE,
+        repo::{self, offer_components, offers, variables},
+        ProductsBlock,
     },
     harness::{create_msg, ctx, dispatch_user, output_is_error, output_to_json, seed},
 };
@@ -723,7 +723,7 @@ async fn seed_persisted_preview_offer(
 ) {
     seed(
         ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         "product_preview",
         HashMap::from([
             ("name".to_string(), json!("Custom print")),

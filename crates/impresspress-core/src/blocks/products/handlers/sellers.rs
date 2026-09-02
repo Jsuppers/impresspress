@@ -10,7 +10,7 @@ use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 use crate::{
     blocks::products::{
         contracts::{AdminSellerDetail, OfferStatus, ProductView, SellerAccountList},
-        repo, stripe, PRODUCTS_TABLE,
+        repo, stripe,
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
     util::{stamp_updated, RecordExt},
@@ -33,13 +33,28 @@ fn equal(field: &str, value: impl Into<Value>) -> Filter {
     }
 }
 
-async fn seller_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
-    db::list_all(
-        ctx,
-        PRODUCTS_TABLE,
-        vec![equal("owner_id", Value::String(user_id.to_string()))],
-    )
-    .await
+fn owned_by(user_id: &str) -> Vec<Filter> {
+    vec![equal("owner_id", Value::String(user_id.to_string()))]
+}
+
+/// The seller's LIVE products — what the admin seller detail page lists.
+/// A deleted listing is not part of a seller's catalog and does not belong in
+/// a catalog view.
+async fn seller_live_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
+    repo::products::list_all(ctx, owned_by(user_id)).await
+}
+
+/// EVERY product the seller owns, soft-deleted ones included — what
+/// suspension and reactivation act on.
+///
+/// Deliberately a different read from [`seller_live_products`] rather than a
+/// shared one: the two callers want genuinely different sets, and a single
+/// read would have to be wrong for one of them. Suspension is a lifecycle and
+/// fraud control, so its set is "everything this seller owns": soft delete
+/// changes nothing in Stripe, so a deleted product's Prices and Payment Links
+/// keep taking money in the connected account until suspension archives them.
+async fn seller_every_product(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
+    repo::products::list_all_including_deleted(ctx, owned_by(user_id)).await
 }
 
 pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
@@ -71,7 +86,7 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(seller) => seller,
         Err(error) => return admin_error(error, "Seller not found"),
     };
-    let products = match seller_products(ctx, &seller.user_id).await {
+    let products = match seller_live_products(ctx, &seller.user_id).await {
         Ok(products) => products,
         Err(error) => return err_internal("Could not list seller products", error),
     };
@@ -86,7 +101,7 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
-    let product = match db::get(ctx, PRODUCTS_TABLE, id).await {
+    let product = match repo::products::get(ctx, id).await {
         Ok(product) => product,
         Err(error) => return admin_error(error, "Product not found"),
     };
@@ -132,9 +147,17 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
         ])
     };
     stamp_updated(&mut data);
-    match db::update(ctx, PRODUCTS_TABLE, id, data).await {
+    // `update_live`, not the unfiltered write: moderation acts on the row the
+    // `get` above found live, and the checks between the two are a window a
+    // concurrent delete fits through. Approving a product that has since been
+    // deleted would publish a listing (`status = active`) that no read can
+    // reach, so the write itself has to test liveness — and `NotFound` is the
+    // same answer the `get` would have given a moment earlier.
+    match repo::products::update_live(ctx, id, data).await {
         Ok(product) => ok_json(&ProductView::from_record(&product)),
-        Err(error) => err_internal("Could not moderate product", error),
+        // The shared mapper, so this site cannot drift back to answering 500
+        // for a repository refusal that names what the caller must change.
+        Err(error) => super::write_error(error, "Could not moderate product"),
     }
 }
 
@@ -161,7 +184,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             Err(error) => admin_error(error, "Seller not found"),
         };
     }
-    let products = match seller_products(ctx, account.str_field("user_id")).await {
+    let products = match seller_every_product(ctx, account.str_field("user_id")).await {
         Ok(products) => products,
         Err(error) => return err_internal("Could not load seller products", error),
     };
@@ -200,7 +223,11 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             continue;
         };
         stamp_updated(&mut data);
-        if let Err(error) = db::update(ctx, PRODUCTS_TABLE, &product.id, data).await {
+        // Deliberately the unfiltered write. `seller_every_product` above
+        // spans the deleted rows on purpose (suspension is a fraud control
+        // and has to cover everything the seller owns), so filtering the
+        // write on liveness here would silently exempt exactly those rows.
+        if let Err(error) = repo::products::update_including_deleted(ctx, &product.id, data).await {
             return err_internal("Could not update seller product state", error);
         }
     }
