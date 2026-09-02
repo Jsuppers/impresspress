@@ -916,4 +916,684 @@ mod tests {
             style_assignment_offenders.join("\n"),
         );
     }
+
+    /// From `chars[open]` (which must be `{`), scan forward tracking brace
+    /// depth, skipping over string/char literals (plain and raw) and
+    /// comments so their contents never perturb brace counting or get
+    /// misread as markup. Returns the index one past the matching closing
+    /// `}`, plus a "masked" copy of `chars[open..end]` where every
+    /// string/char-literal character and every comment character has been
+    /// replaced with a space (newlines are kept as newlines, so
+    /// line-number arithmetic on the masked copy still lines up with the
+    /// real source).
+    fn scan_delimited_block(chars: &[char], open: usize) -> (usize, Vec<char>) {
+        enum St {
+            Code,
+            Str,
+            Char,
+            RawStr(usize),
+            LineComment,
+            BlockComment,
+        }
+        let n = chars.len();
+        let mut depth = 0i32;
+        let mut j = open;
+        let mut masked = Vec::with_capacity(n - open);
+        let mut state = St::Code;
+        while j < n {
+            let c = chars[j];
+            match state {
+                St::LineComment => {
+                    masked.push(if c == '\n' { '\n' } else { ' ' });
+                    if c == '\n' {
+                        state = St::Code;
+                    }
+                    j += 1;
+                }
+                St::BlockComment => {
+                    if c == '*' && chars.get(j + 1) == Some(&'/') {
+                        masked.push(' ');
+                        masked.push(' ');
+                        j += 2;
+                        state = St::Code;
+                        continue;
+                    }
+                    masked.push(if c == '\n' { '\n' } else { ' ' });
+                    j += 1;
+                }
+                St::Str => {
+                    if c == '\\' && j + 1 < n {
+                        masked.push(' ');
+                        masked.push(' ');
+                        j += 2;
+                        continue;
+                    }
+                    masked.push(if c == '\n' { '\n' } else { ' ' });
+                    j += 1;
+                    if c == '"' {
+                        state = St::Code;
+                    }
+                }
+                St::RawStr(hashes) => {
+                    if c == '"' {
+                        let mut k = j + 1;
+                        let mut cnt = 0;
+                        while k < n && chars[k] == '#' && cnt < hashes {
+                            k += 1;
+                            cnt += 1;
+                        }
+                        if cnt == hashes {
+                            masked.resize(masked.len() + (k - j), ' ');
+                            j = k;
+                            state = St::Code;
+                            continue;
+                        }
+                    }
+                    masked.push(if c == '\n' { '\n' } else { ' ' });
+                    j += 1;
+                }
+                St::Char => {
+                    if c == '\\' && j + 1 < n {
+                        masked.push(' ');
+                        masked.push(' ');
+                        j += 2;
+                        continue;
+                    }
+                    masked.push(if c == '\n' { '\n' } else { ' ' });
+                    j += 1;
+                    if c == '\'' {
+                        state = St::Code;
+                    }
+                }
+                St::Code => {
+                    if c == '/' && chars.get(j + 1) == Some(&'/') {
+                        state = St::LineComment;
+                        masked.push(' ');
+                        masked.push(' ');
+                        j += 2;
+                        continue;
+                    }
+                    if c == '/' && chars.get(j + 1) == Some(&'*') {
+                        state = St::BlockComment;
+                        masked.push(' ');
+                        masked.push(' ');
+                        j += 2;
+                        continue;
+                    }
+                    if c == 'r' {
+                        let mut k = j + 1;
+                        let mut hashes = 0usize;
+                        while k < n && chars[k] == '#' {
+                            hashes += 1;
+                            k += 1;
+                        }
+                        if k < n && chars[k] == '"' {
+                            masked.resize(masked.len() + (k + 1 - j), ' ');
+                            j = k + 1;
+                            state = St::RawStr(hashes);
+                            continue;
+                        }
+                    }
+                    if c == '"' {
+                        state = St::Str;
+                        masked.push(' ');
+                        j += 1;
+                        continue;
+                    }
+                    if c == '\'' {
+                        // Distinguish a char literal ('x' or '\x' followed
+                        // by a closing quote) from a lifetime ('a, 'static)
+                        // -- a lifetime is not a string, so it must not
+                        // suppress brace-counting or get masked.
+                        let is_char_lit = (chars.get(j + 1) != Some(&'\\')
+                            && chars.get(j + 2) == Some(&'\''))
+                            || (chars.get(j + 1) == Some(&'\\') && chars.get(j + 3) == Some(&'\''));
+                        if is_char_lit {
+                            state = St::Char;
+                            masked.push(' ');
+                            j += 1;
+                            continue;
+                        }
+                        masked.push(c);
+                        j += 1;
+                        continue;
+                    }
+                    if c == '{' {
+                        depth += 1;
+                        masked.push(c);
+                        j += 1;
+                        continue;
+                    }
+                    if c == '}' {
+                        depth -= 1;
+                        masked.push(c);
+                        j += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    masked.push(c);
+                    j += 1;
+                }
+            }
+        }
+        (j, masked)
+    }
+
+    /// Every `#[cfg(test)] mod ident { ... }` span in the file, as
+    /// `(attribute_start, block_end)` char indices. `html!` invocations
+    /// inside these spans are unit-test fixtures, not real pages -- a
+    /// throwaway `html! { span .av {} }` built to exercise a template
+    /// function's slot handling was never meant as a real design-system
+    /// class, and scanning it produces exactly that false positive (this
+    /// guard's own development tripped on `.av`/`.logo`/`.probe-icon`/
+    /// `.probe-primary`/`.probe-spark`/`.probe-icon-users`/
+    /// `.probe-icon-storage`, all test-only, none ever rendered on a real
+    /// page). Only the `#[cfg(test)] mod ...` shape is recognized -- the
+    /// only shape this codebase actually uses for gating a whole test
+    /// module (154 of 164 `#[cfg(test)]` occurrences in `src/blocks` +
+    /// `src/ui`; the other 10 gate individual non-html!-bearing seed-data
+    /// helper functions, which this scan simply won't find a `mod` after,
+    /// so they're harmlessly skipped).
+    fn find_test_mod_spans(chars: &[char]) -> Vec<(usize, usize)> {
+        let attr: Vec<char> = "#[cfg(test)]".chars().collect();
+        let mut spans = Vec::new();
+        let mut i = 0;
+        'outer: while i + attr.len() <= chars.len() {
+            if chars[i..i + attr.len()] != attr[..] {
+                i += 1;
+                continue;
+            }
+            let attr_start = i;
+            let search_end = (i + attr.len() + 400).min(chars.len());
+            let mut k = i + attr.len();
+            while k + 3 < search_end {
+                let is_mod_kw = chars[k] == 'm'
+                    && chars[k + 1] == 'o'
+                    && chars[k + 2] == 'd'
+                    && chars.get(k + 3).is_some_and(|c| c.is_whitespace());
+                if is_mod_kw {
+                    let mut p = k + 3;
+                    while p < search_end && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    while p < search_end && (chars[p].is_alphanumeric() || chars[p] == '_') {
+                        p += 1;
+                    }
+                    while p < search_end && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < search_end && chars[p] == '{' {
+                        let (end, _masked) = scan_delimited_block(chars, p);
+                        spans.push((attr_start, end));
+                        i = end;
+                        continue 'outer;
+                    }
+                }
+                k += 1;
+            }
+            i += 1;
+        }
+        spans
+    }
+
+    /// Maud's dot-shorthand class syntax (`div .card__body { ... }`,
+    /// `.alert .alert--success .mb-4`). A `.` only starts a class token
+    /// when the previous character is a maud "new selector position"
+    /// boundary (whitespace, `{`, `}`, `;`, or the very start of the
+    /// block) -- this is what tells a real class shorthand apart from an
+    /// ordinary Rust field/method access like `readiness.reasons` or
+    /// `c.label` (preceded by an identifier character, never a boundary)
+    /// inside the very same `html! { ... }` block, without needing to
+    /// parse the surrounding Rust expression at all.
+    ///
+    /// Runs against the *masked* body (string/char-literal contents and
+    /// comments already blanked by `scan_delimited_block`) so a raw CSS
+    /// blob embedded via `style { (PreEscaped("...")) }` never gets read
+    /// as if it were maud markup.
+    ///
+    /// A token immediately followed by `(` is a method call
+    /// (`.into_iter()`, `.filter_map(...)`), not a class -- skipped
+    /// *without* backtracking to a shorter match. (An earlier version of
+    /// this scan used a greedy-regex-style match with a `(?!\()`
+    /// lookahead; on backtracking failure the engine retried with the
+    /// match one character shorter, which passed the lookahead and
+    /// silently reported truncated garbage like `.as_st` for
+    /// `.as_str()`. Consuming the full identifier once and only then
+    /// checking the next character -- never re-shortening the match --
+    /// avoids that class of bug entirely.)
+    fn find_shorthand_classes(masked: &[char]) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < masked.len() {
+            if masked[i] == '.' {
+                let boundary_ok = i == 0
+                    || matches!(masked[i - 1], ' ' | '\t' | '\n' | '\r' | '{' | '}' | ';');
+                if boundary_ok && masked.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < masked.len()
+                        && (masked[j].is_ascii_alphanumeric() || masked[j] == '_' || masked[j] == '-')
+                    {
+                        j += 1;
+                    }
+                    if masked.get(j) == Some(&'(') {
+                        // Method call, not a class -- record nothing, and
+                        // resume scanning right after the identifier (not
+                        // a shorter prefix of it).
+                        i = j;
+                        continue;
+                    }
+                    out.push((start, masked[start..j].iter().collect()));
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Maud's static `class="foo bar"` attribute form -- a plain
+    /// space-separated literal, never dynamic. No escape handling: every
+    /// instance of this attribute in `src/blocks`/`src/ui` (verified by
+    /// grep before writing this) is a plain token list with no embedded
+    /// quote, so a naive scan-to-next-`"` is exact here, not just a
+    /// heuristic approximation.
+    fn find_class_attr_literals(body: &[char]) -> Vec<(usize, String)> {
+        let needle: Vec<char> = "class=\"".chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + needle.len() <= body.len() {
+            if body[i..i + needle.len()] == needle[..] {
+                let val_start = i + needle.len();
+                let mut j = val_start;
+                while j < body.len() && body[j] != '"' {
+                    j += 1;
+                }
+                out.push((i, body[val_start..j].iter().collect()));
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Maud's dynamic `class={ ... }` attribute -- a mix of literal string
+    /// fragments and interpolated/conditional pieces, e.g.
+    /// `class={ "block-card" @if !is_enabled { " block-card--disabled" } }`.
+    /// Only the literal `"..."` fragments are extracted (both come back
+    /// here: `"block-card"` and `" block-card--disabled"`); the `@if`
+    /// keyword and any `(expr)` splice inside the block are left alone --
+    /// per this guard's documented scope, a class name assembled from a
+    /// Rust expression rather than written as a literal isn't something a
+    /// static scan can verify, so it's silently skipped rather than
+    /// guessed at.
+    fn find_class_dyn_literals(body: &[char]) -> Vec<(usize, Vec<String>)> {
+        let needle: Vec<char> = "class={".chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + needle.len() <= body.len() {
+            if body[i..i + needle.len()] == needle[..] {
+                let open = i + needle.len() - 1;
+                let (end, _masked_unused) = scan_delimited_block(body, open);
+                let mut literals = Vec::new();
+                let mut j = open;
+                while j < end {
+                    if body[j] == '"' {
+                        let vs = j + 1;
+                        let mut k = vs;
+                        while k < end && body[k] != '"' {
+                            k += 1;
+                        }
+                        literals.push(body[vs..k].iter().collect());
+                        j = k + 1;
+                        continue;
+                    }
+                    j += 1;
+                }
+                out.push((i, literals));
+                i = end;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Walks one `.rs` file's `html! { ... }` invocations (skipping any
+    /// inside a `#[cfg(test)]` module -- see `find_test_mod_spans`) and
+    /// records every class the three mechanisms above find, keyed by class
+    /// name with the first `(file, line, snippet)` it was seen at.
+    fn collect_markup_classes(
+        src: &str,
+        path: &str,
+        used: &mut std::collections::BTreeMap<String, (String, usize, String)>,
+    ) {
+        let chars: Vec<char> = src.chars().collect();
+        let test_spans = find_test_mod_spans(&chars);
+        let in_test = |pos: usize| test_spans.iter().any(|&(s, e)| pos >= s && pos < e);
+
+        let needle: Vec<char> = "html!".chars().collect();
+        let mut i = 0;
+        while i + needle.len() <= chars.len() {
+            if chars[i..i + needle.len()] != needle[..] {
+                i += 1;
+                continue;
+            }
+            let mut p = i + needle.len();
+            while p < chars.len() && chars[p].is_whitespace() {
+                p += 1;
+            }
+            if chars.get(p) != Some(&'{') || in_test(i) {
+                i += 1;
+                continue;
+            }
+            let open = p;
+            let (end, masked) = scan_delimited_block(&chars, open);
+            let base_line = 1 + chars[..open].iter().filter(|&&c| c == '\n').count();
+            let real_body = &chars[open..end];
+
+            for (idx, name) in find_shorthand_classes(&masked) {
+                let line = base_line + masked[..idx].iter().filter(|&&c| c == '\n').count();
+                let snip_start = idx.saturating_sub(20);
+                let snip_end = (idx + 30).min(masked.len());
+                let snippet: String = masked[snip_start..snip_end]
+                    .iter()
+                    .collect::<String>()
+                    .replace('\n', " ");
+                used.entry(name)
+                    .or_insert_with(|| (path.to_string(), line, snippet));
+            }
+
+            for (attr_idx, value) in find_class_attr_literals(real_body) {
+                let line = base_line + real_body[..attr_idx].iter().filter(|&&c| c == '\n').count();
+                for tok in value.split_whitespace() {
+                    if tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                        used.entry(tok.to_string()).or_insert_with(|| {
+                            (path.to_string(), line, format!("class=\"{value}\""))
+                        });
+                    }
+                }
+            }
+
+            for (blk_idx, literals) in find_class_dyn_literals(real_body) {
+                let line = base_line + real_body[..blk_idx].iter().filter(|&&c| c == '\n').count();
+                for value in &literals {
+                    for tok in value.split_whitespace() {
+                        if tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                            used.entry(tok.to_string()).or_insert_with(|| {
+                                (path.to_string(), line, format!("class={{\"{value}\"}}"))
+                            });
+                        }
+                    }
+                }
+            }
+
+            i = end;
+        }
+    }
+
+    /// Non-nested `/* ... */` stripper -- CSS comments never nest, so this
+    /// is exact, not a heuristic.
+    fn strip_css_comments_for_class_scan(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                while let Some(c2) = chars.next() {
+                    if c2 == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// Every `.classname` token appearing in `text`. Used both for a CSS
+    /// selector (everything before a `{`) and it does not need to know the
+    /// selector's full grammar -- comma-separated lists, compound
+    /// selectors (`.foo.bar`), descendant combinators (`.foo .bar`),
+    /// pseudo-classes/elements, attribute selectors -- extracting every
+    /// `.ident` substring finds every class in all of them alike.
+    fn collect_class_tokens(text: &str, out: &mut std::collections::HashSet<String>) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '.' && matches!(chars.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == '_')
+            {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len()
+                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-')
+                {
+                    j += 1;
+                }
+                out.insert(chars[start..j].iter().collect());
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Every class any rule in a stylesheet defines -- selector text is
+    /// everything since the last `{`/`}`/`;` boundary, up to (not
+    /// including) the next `{`; this naturally covers rules nested inside
+    /// `@media`/`@supports` blocks too, since their inner rules' `{` are
+    /// found by the same scan.
+    fn collect_css_classes(css_no_comments: &str, out: &mut std::collections::HashSet<String>) {
+        let chars: Vec<char> = css_no_comments.chars().collect();
+        let mut last_boundary = 0usize;
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '{' {
+                let selector: String = chars[last_boundary..i].iter().collect();
+                collect_class_tokens(&selector, out);
+                last_boundary = i + 1;
+            } else if c == '}' || c == ';' {
+                last_boundary = i + 1;
+            }
+        }
+    }
+
+    /// Nothing in this codebase checked that a class used in maud markup
+    /// actually has a matching rule in `ui/styles/` -- exactly how
+    /// `.card-body` (a typo for `.card__body`), `.alert-success`/
+    /// `.alert-warning` (stragglers from a superseded single-dash naming
+    /// scheme; the BEM family is `.alert--success`/`.alert--warning`),
+    /// `.breadcrumbs`/`.breadcrumbs__sep`, and `.row--folder` all shipped
+    /// rendering with silent no-op styling (admin-redesign task,
+    /// 2026-09-01/02 -- see `.superpowers/sdd/2026-09-01-admin-redesign/
+    /// undefined-classes-report.md`). This guard closes that hole: it
+    /// extracts every class maud markup in `src/blocks`/`src/ui` actually
+    /// renders, extracts every class `ui/styles/**/*.css` actually
+    /// defines, and asserts the former is a subset of the latter.
+    ///
+    /// Three extraction mechanisms, each a real maud class-authoring
+    /// syntax used in this codebase (see the three `find_*` helpers above
+    /// for how each works):
+    ///   1. Shorthand `.foo` tokens -- the overwhelming majority of usage,
+    ///      and the syntax all five original bugs used.
+    ///   2. A static `class="foo bar"` attribute.
+    ///   3. The *literal string* fragments of a dynamic
+    ///      `class={ "foo" @if c { " bar" } }` attribute.
+    ///
+    /// What this deliberately cannot see -- skipped outright, not silently
+    /// assumed fine:
+    ///   - `class=(expr)` -- a single fully-dynamic Rust expression (e.g.
+    ///     `img class=(class) ...` in `templates.rs`). The class name
+    ///     isn't a literal anywhere in the markup to check.
+    ///   - `.(expr)` -- maud's dynamic-class shorthand. This never even
+    ///     reaches the skip logic: `find_shorthand_classes` requires a
+    ///     *letter* immediately after the `.`, so `.(` fails on the very
+    ///     first character, by construction.
+    ///   - Any interpolated `(expr)` piece inside a `class={ ... }` block
+    ///     (e.g. `(variant.class())`, `(size_class)`) -- only the literal
+    ///     string fragments around it are read.
+    ///   - A class name that only ever exists inside a big JS
+    ///     template-literal string spliced into a `<script>` (e.g. the
+    ///     wizard-row `innerHTML` templates in `blocks/products/pages.rs`,
+    ///     which build raw `<div class="...">` HTML as plain text). That
+    ///     text lives inside a Rust string constant, not as maud attribute
+    ///     syntax, so this guard's html!-scoped extraction never sees it
+    ///     even though the string is spliced into an `html! {}` block
+    ///     elsewhere in the same file.
+    ///   - Test-fixture markup: every `#[cfg(test)] mod ... { ... }`
+    ///     module is excluded outright (see `find_test_mod_spans`), not
+    ///     just its assertions -- unit tests routinely stand up throwaway
+    ///     `html! { span .av {} }`-style placeholders to exercise a
+    ///     template function's slot handling, never meaning `.av` as a
+    ///     real design-system class.
+    ///
+    /// Two named exceptions where a real, non-test usage has no
+    /// stylesheet rule *by design*:
+    ///   - `cf-turnstile` (`blocks/tickets/public.rs`) -- Cloudflare
+    ///     Turnstile's own script finds and fills this element by class
+    ///     name per Cloudflare's public embed contract; not this
+    ///     codebase's CSS to own.
+    ///   - `bulk-select` (`blocks/files/pages_user/objects.rs`) -- a pure
+    ///     JS selector hook (`files-browser.js`'s
+    ///     `document.querySelectorAll('.bulk-select')`, confirmed by
+    ///     grep) on a native `<input type="checkbox">`; the browser's
+    ///     native checkbox rendering *is* the entire visual treatment,
+    ///     deliberately unstyled.
+    ///
+    /// Everything else this guard finds -- i.e. that this task's five-class
+    /// fix didn't touch -- is real, pre-existing drift outside this task's
+    /// scope, listed explicitly in `KNOWN_PRE_EXISTING_GAPS` below (each
+    /// with a file:line) rather than silently passed, so this guard still
+    /// catches every *new* undefined-class regression from here on, and a
+    /// fixed entry has to be deleted from the list (the trailing
+    /// self-check below fails loudly if a listed name stops being both
+    /// used and undefined -- so the list can't silently rot into covering
+    /// for a class nobody uses any more, or one that got a real rule
+    /// without anyone remembering to shrink this list). Some of these are
+    /// styled only in the page's own inline
+    /// `style { (PreEscaped("...")) }` block rather than centrally in
+    /// `ui/styles/` -- the exact drift `pages_carry_no_page_local_style_drift`
+    /// exists to catch, but that guard fingerprints named `_CSS: &str`
+    /// consts, not these anonymous blocks, a gap in *that* guard this one
+    /// incidentally exposes. The rest have no rule anywhere at all. See
+    /// the admin-redesign task report for the full inventory (38 names)
+    /// and a recommended follow-up; this task's mandate was five specific
+    /// classes, not an unbounded stylesheet audit.
+    #[test]
+    fn pages_use_only_classes_defined_in_the_stylesheet() {
+        let styles_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/styles");
+        let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in walkdir::WalkDir::new(styles_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
+        {
+            let src = std::fs::read_to_string(entry.path()).unwrap();
+            collect_css_classes(&strip_css_comments_for_class_scan(&src), &mut defined);
+        }
+
+        let roots = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+        ];
+        let mut used: std::collections::BTreeMap<String, (String, usize, String)> =
+            Default::default();
+        for root in roots {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+            {
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                collect_markup_classes(&src, &entry.path().display().to_string(), &mut used);
+            }
+        }
+
+        const NO_STYLESHEET_RULE_NEEDED: &[&str] = &["cf-turnstile", "bulk-select"];
+
+        const KNOWN_PRE_EXISTING_GAPS: &[&str] = &[
+            // Styled only in the page's own inline
+            // `style { (PreEscaped("...")) }` block, not centrally --
+            // blocks/tickets/pages.rs and blocks/admin/pages/network.rs.
+            "ticket-col-type",
+            "ticket-col-source",
+            "ticket-col-age",
+            "ticket-filter-assignee",
+            "tickets-table",
+            "ticket-analysis-meta",
+            "ticket-analysis-actions",
+            "detail-rows",
+            "expand-row",
+            // No rule anywhere.
+            "auth-form",
+            "bulk-select-all",
+            "chat-form",
+            "checkbox-inline",
+            "custom-tab",
+            "custom-tab__hint",
+            "dashboard-grid__primary",
+            "dashboard-grid__secondary",
+            "db-table-list__count",
+            "detail-body__main",
+            "empty__action",
+            "form-section__head",
+            "kebab-trigger",
+            "kv-list",
+            "messages-new__title",
+            "messages-new__type",
+            "nav-icon",
+            "page--dashboard",
+            "page--detail",
+            "page--form",
+            "page--list",
+            "pagination__page",
+            "palette__item-label",
+            "quota-card",
+            "quota-warning",
+            "section",
+            "sidebar__brand--text",
+        ];
+
+        let exempt: std::collections::HashSet<&str> = NO_STYLESHEET_RULE_NEEDED
+            .iter()
+            .chain(KNOWN_PRE_EXISTING_GAPS.iter())
+            .copied()
+            .collect();
+
+        let mut offenders = Vec::new();
+        for (class, (file, line, snippet)) in &used {
+            if defined.contains(class) || exempt.contains(class.as_str()) {
+                continue;
+            }
+            offenders.push(format!("{file}:{line}: .{class}  ({snippet})"));
+        }
+        assert!(
+            offenders.is_empty(),
+            "classes used in markup with no matching rule in ui/styles/**/*.css:\n{}",
+            offenders.join("\n")
+        );
+
+        // Anti-rot: every named exception must still be both actually used
+        // and actually undefined, or it's either dead weight (nothing uses
+        // that name any more -- delete it) or stale (something now defines
+        // it -- delete it and let the main assertion above re-verify the
+        // usage for real).
+        let mut stale = Vec::new();
+        for name in NO_STYLESHEET_RULE_NEEDED.iter().chain(KNOWN_PRE_EXISTING_GAPS.iter()) {
+            let still_used = used.contains_key(*name);
+            let still_undefined = !defined.contains(*name);
+            if !(still_used && still_undefined) {
+                stale.push(*name);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "exception list entries no longer both used and undefined -- remove them: {stale:?}"
+        );
+    }
 }

@@ -107,7 +107,7 @@ pub fn render_objects_table(
             } }
             tbody {
                 @for folder in &listing.folders {
-                    tr .row--folder {
+                    tr {
                         td {} // bulk-select disabled on folders
                         td data-label="Name" {
                             a .row--folder__link href={"/b/storage/" (url_path_encode(bucket)) "/" (url_encode_prefix(current_prefix)) (url_path_encode(folder)) "/"} {

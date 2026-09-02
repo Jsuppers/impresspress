@@ -627,7 +627,8 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header("Settings", Some("Customize the public legal pages appearance"), None))
 
         @if saved {
-            div .alert .alert-success .mb-4 {
+            div .alert .alert--success .mb-4 {
+                span aria-hidden="true" { (icons::check()) }
                 "Settings saved successfully."
             }
         }

@@ -37,6 +37,12 @@
 	   stays for non-text use -- icons, borders, chart marks -- which need
 	   only 3:1. Mirrors how --primary-button relates to --primary-color. */
 	--accent-danger-text: #b91c1c;
+	/* Same problem as --accent-danger-text above: #f59e0b (amber) is only
+	   ~2.3:1 on white, nowhere near the 4.5:1 AA floor for text. #92400e
+	   (amber-800) is 7.09:1 on white and 6.56:1 on the #f59e0b19 tint
+	   (computed) -- the text-safe sibling; #f59e0b stays for non-text use
+	   (icons, borders) which only needs 3:1. */
+	--accent-warning-text: #92400e;
 	/* "Info" reads as the brand accent, not blue -- success/warning/danger
 	   keep their universal hues, but informational chips/toasts/charts sit
 	   inside the warm brand palette (the old #3b82f6 blue clashed on every

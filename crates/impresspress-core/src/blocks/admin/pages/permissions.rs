@@ -71,7 +71,7 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                     "These grants are declared in block source code via BlockInfo.grants and cannot be modified here."
                 }
             }
-            div .card-body {
+            div .card__body {
                 table .table {
                     thead {
                         tr {
@@ -145,7 +145,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                     (icons::plus()) " Add Grant"
                 }
             }
-            div .card-body {
+            div .card__body {
                 @if grants.is_empty() {
                     p .text-muted { "No custom grants configured." }
                 } @else {
@@ -497,7 +497,7 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
 
     html! {
         div .card .mt-4 {
-            div .card-body {
+            div .card__body {
                 @if all_rows.is_empty() {
                     p .text-muted .p-8 .text-center {
                         "No permissions configured yet."

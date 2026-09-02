@@ -231,9 +231,12 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Some(html! { a .btn .btn-ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
         ))
         @if escalation != "none" {
-            div .alert .alert-warning .mb-4 {
-                strong { "Human review required: " } (escalation)
-                ". Do not automatically contact the reporter or change content."
+            div .alert .alert--warning .mb-4 {
+                span aria-hidden="true" { (ui::icons::triangle_alert()) }
+                div {
+                    strong { "Human review required: " } (escalation)
+                    ". Do not automatically contact the reporter or change content."
+                }
             }
         }
         div .ticket-detail-grid {
@@ -313,7 +316,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
         section .mt-5 {
             h2 { "Timeline" }
-            @if detail.events_truncated { p .alert .alert-warning { "Older events are not shown." } }
+            @if detail.events_truncated { p .alert .alert--warning { span aria-hidden="true" { (ui::icons::triangle_alert()) } "Older events are not shown." } }
             @for event in &detail.events {
                 article .card .p-3 .mb-2 {
                     strong { (service::str_field(event, "event_type")) }
@@ -327,7 +330,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
         section .mt-5 {
             h2 { "Analyses" }
-            @if detail.analyses_truncated { p .alert .alert-warning { "Older analyses are not shown." } }
+            @if detail.analyses_truncated { p .alert .alert--warning { span aria-hidden="true" { (ui::icons::triangle_alert()) } "Older analyses are not shown." } }
             @if detail.analyses.is_empty() { p .text-muted { "No analysis has been attached." } }
             @for analysis in &detail.analyses {
                 article .card .p-3 .mb-2 {
@@ -484,10 +487,17 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
         div .card .p-4 .mb-4 {
             h3 { "Security readiness" }
             @if readiness.ready {
-                div .alert .alert-success { "Ready for public submissions." }
+                div .alert .alert--success {
+                    span aria-hidden="true" { (ui::icons::check()) }
+                    "Ready for public submissions."
+                }
             } @else {
-                div .alert .alert-warning {
-                    ul { @for reason in &readiness.reasons { li { (reason) } } }
+                div .alert .alert--warning {
+                    span aria-hidden="true" { (ui::icons::triangle_alert()) }
+                    div {
+                        strong { "Not ready: " }
+                        ul { @for reason in &readiness.reasons { li { (reason) } } }
+                    }
                 }
             }
             p {

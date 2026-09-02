@@ -229,7 +229,7 @@ fn var_table(header: Markup, show_default: bool, body: Markup) -> Markup {
     html! {
         div .card .mt-4 {
             (header)
-            div .card-body {
+            div .card__body {
                 div .table-container {
                     table .table {
                         thead {
