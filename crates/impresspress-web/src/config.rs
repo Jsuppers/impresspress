@@ -17,12 +17,21 @@ use std::{collections::HashMap, sync::Arc};
 
 use wafer_core::interfaces::database::service::DatabaseService;
 
+/// Config key recording that this bundle booted with the development sandbox.
+///
+/// `IMPRESSPRESS_*` with single underscores: infrastructure, not a
+/// `WAFER_RUN_SHARED__*` app setting and not a `{ORG}__{BLOCK}__*` block-scoped
+/// one. The same spelling is used in the database, the config service and the
+/// wafer config snapshot — there is no second representation of it anywhere.
+pub const DEV_ENABLED_KEY: &str = "IMPRESSPRESS_DEV_ENABLED";
+
 /// Seed the browser-only default variables, auto-generate declared secrets,
 /// and return the full variable map. Browser-equivalent of the native
 /// `seed_and_load_variables()` — there are no process env vars in the browser,
 /// only the local defaults below plus auto-generated secrets.
 pub async fn seed_and_load_variables(
     db: &Arc<dyn DatabaseService>,
+    dev_enabled: bool,
 ) -> Result<HashMap<String, String>, String> {
     // Browser-only defaults. These are not declared `ConfigVar`s (so the
     // auto-gen pass won't seed them) and there's no env to source them from —
@@ -57,6 +66,37 @@ pub async fn seed_and_load_variables(
         false,
     )
     .await?;
+
+    if dev_enabled {
+        // The sandbox owns `/` — an editable site is the point of it — so the
+        // router must serve `wafer-run/web` there instead of bouncing
+        // anonymous visitors to the login page.
+        impresspress_core::boot::seed_variable_if_absent(
+            db,
+            "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+            "true",
+            "Has Landing Page",
+            "Serve a static landing page (wafer-run/web) at `/` instead of \
+             redirecting anonymous visitors to the login page",
+            false,
+        )
+        .await?;
+        // Infrastructure naming (`IMPRESSPRESS_*`, single underscores): this
+        // records what the *bundle* was built and booted with, so the admin UI
+        // and the `/b/dev` page can both see that the sandbox is live without
+        // either of them re-deriving it. Seeded rather than set, so an
+        // operator edit survives the next boot.
+        impresspress_core::boot::seed_variable_if_absent(
+            db,
+            DEV_ENABLED_KEY,
+            "true",
+            "Development Sandbox",
+            "Whether this bundle booted with the browser development sandbox \
+             (`impresspress/dev`, `/b/dev`) enabled",
+            false,
+        )
+        .await?;
+    }
 
     // Auto-generate declared secrets (incl. the auth JWT secret) and load the
     // full set back — the shared core path, over BrowserDatabaseService.

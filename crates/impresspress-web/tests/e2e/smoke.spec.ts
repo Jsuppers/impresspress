@@ -72,3 +72,30 @@ test('admin can log in and reach the dashboard', async ({ page }) => {
   await page.waitForURL(/\/b\/admin\//, { timeout: 30_000 });
   await expect(page).toHaveURL(/\/b\/admin\//);
 });
+
+test('the default bundle has no dev block', async ({ page }) => {
+  // The sandbox's security model (design §13) is that `impresspress/dev` is
+  // ABSENT from a normal deployment, not merely disabled in one. `pkg/` is
+  // built without `browser-devtools` and without `[dev] enabled`, so both
+  // halves of that must hold: no route, and no relaxed header for the
+  // compiler worker / preview iframe the sandbox would need.
+  //
+  // Wait for the SW-served boot redirect to land rather than for
+  // `navigator.serviceWorker.controller`: loader.js navigates to
+  // `boot_redirect` the moment the SW takes control, which destroys the
+  // execution context out from under an `evaluate()` that raced it. Landing
+  // on /b/auth/login means the wasm router has already answered a request,
+  // which is the precondition both fetches below need anyway.
+  await page.goto('/', { waitUntil: 'commit' });
+  await page.waitForURL(/\/b\/auth\/login/, { timeout: 30_000 });
+
+  const status = await page.evaluate(async () => (await fetch('/b/dev/api/status')).status);
+  expect(status).toBe(404);
+
+  const csp = await page.evaluate(
+    async () => (await fetch('/b/auth/login')).headers.get('content-security-policy'),
+  );
+  expect(csp).not.toBeNull();
+  expect(csp).not.toContain('worker-src');
+  expect(csp).not.toContain('frame-src');
+});

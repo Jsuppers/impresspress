@@ -13,6 +13,13 @@ crate-type = ["cdylib", "rlib"]
 # can be loaded from bytes by the browser-hosted ImpressPress runtime. This is
 # intentionally opt-in until the browser editor/compiler pipeline exists.
 dynamic-wasm-blocks = ["wafer-run/wasmi"]
+# The browser development sandbox: the `impresspress/dev` control plane plus
+# wasmi for the guest blocks it activates. Off by default; a bundle built with
+# it still needs `[dev] enabled = true` in `impresspress.toml` to register
+# anything, and a bundle built without it ignores the flag entirely — the
+# sandbox's security model is that the block is absent from normal
+# deployments, not merely switched off in one.
+browser-devtools = ["dynamic-wasm-blocks", "impresspress-core/block-dev"]
 
 [dependencies]
 # Browser framework (platform services + SW plumbing)

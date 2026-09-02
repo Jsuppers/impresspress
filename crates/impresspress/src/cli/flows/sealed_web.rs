@@ -42,15 +42,11 @@ pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
             extra_bypass_prefix: c.assets.extra_bypass_prefix.clone(),
             extra_bypass_exact: c.assets.extra_bypass_exact.clone(),
             opfs_wipe_on_recovery: c.assets.opfs_wipe_on_recovery,
+            dev_enabled: c.dev.enabled,
         },
-        None => impresspress_bundle::bundle::AppConfig {
-            app_name: None,
-            app_title: None,
-            boot_redirect: None,
-            extra_bypass_prefix: vec![],
-            extra_bypass_exact: vec![],
-            opfs_wipe_on_recovery: false,
-        },
+        // No `impresspress.toml` — every knob, the sandbox included, stays
+        // at its default.
+        None => impresspress_bundle::bundle::AppConfig::default(),
     };
 
     impresspress_bundle::assets::write_to(&dist)?;

@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 /// Consumer-supplied configuration that controls how templates are rendered.
 /// All fields are optional; sensible defaults are derived from the discovered
 /// wasm-pack output pair when omitted.
+#[derive(Default)]
 pub struct AppConfig {
     /// Log prefix shown in sw.js / loader.js console messages
     /// (e.g. `"impresspress-web"`). Defaults to the discovered base name.
@@ -43,6 +44,13 @@ pub struct AppConfig {
     /// action; other apps surface the error to the user instead and let
     /// them choose whether to clear data.
     pub opfs_wipe_on_recovery: bool,
+    /// Whether the Service Worker boots the runtime with the browser
+    /// development sandbox on (`initialize({ dev: true })` via the
+    /// `__DEV_ENABLED__` placeholder in `sw.js.tmpl`). **Default: false.**
+    /// Driven by `[dev] enabled` in `impresspress.toml`; the runtime still
+    /// needs to have been compiled with `impresspress-web/browser-devtools`
+    /// for the flag to register anything.
+    pub dev_enabled: bool,
 }
 
 /// Discover the wasm-pack output pair (`{base}.js` + `{base}_bg.wasm`) in
@@ -326,6 +334,16 @@ fn build_template_vars(
     vars.insert(
         "OPFS_WIPE_ON_RECOVERY".to_string(),
         if app.opfs_wipe_on_recovery {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        },
+    );
+    // Rendered into `initialize({ dev: __DEV_ENABLED__ })` — a JS boolean
+    // literal, not a string, so the runtime reads it back as `Some(bool)`.
+    vars.insert(
+        "DEV_ENABLED".to_string(),
+        if app.dev_enabled {
             "true".to_string()
         } else {
             "false".to_string()

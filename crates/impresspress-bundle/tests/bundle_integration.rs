@@ -6,25 +6,30 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/bundle_fixtures/pkg-in")
 }
 
-fn default_app() -> AppConfig {
-    AppConfig {
-        app_name: None,
-        app_title: None,
-        boot_redirect: None,
-        extra_bypass_prefix: Vec::new(),
-        extra_bypass_exact: Vec::new(),
-        opfs_wipe_on_recovery: false,
-    }
+/// Copy the fixture pkg into a fresh temp dir.
+fn pkg_copy() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    copy_dir(&fixture_path(), tmp.path());
+    tmp
+}
+
+/// [`pkg_copy`] with the fixture's three-line `sw.js.tmpl` stub swapped for the
+/// **shipped** template. Tests that assert on real template content have to
+/// render the thing that actually reaches a browser.
+fn production_pkg_copy() -> tempfile::TempDir {
+    let tmp = pkg_copy();
+    let prod_tmpl = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sw.js.tmpl"));
+    fs::write(tmp.path().join("sw.js.tmpl"), prod_tmpl).unwrap();
+    tmp
 }
 
 #[test]
 fn exact_bypass_renders_into_sw() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
+    let tmp = pkg_copy();
 
     let app = AppConfig {
         extra_bypass_exact: vec!["/".to_string(), "/index.html".to_string()],
-        ..default_app()
+        ..AppConfig::default()
     };
     run(tmp.path(), tmp.path(), app).expect("bundler ok");
 
@@ -45,9 +50,8 @@ fn exact_bypass_renders_into_sw() {
 
 #[test]
 fn exact_bypass_empty_leaves_sw_unchanged() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
-    run(tmp.path(), tmp.path(), default_app()).expect("bundler ok");
+    let tmp = pkg_copy();
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
     assert!(!sw.contains("__EXTRA_BYPASS_EXACT__"));
     assert!(!sw.contains("=== '/'"));
@@ -55,10 +59,9 @@ fn exact_bypass_empty_leaves_sw_unchanged() {
 
 #[test]
 fn end_to_end_renames_rewrites_and_templates() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
+    let tmp = pkg_copy();
 
-    run(tmp.path(), tmp.path(), default_app()).expect("bundler ok");
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
 
     let manifest_body = fs::read_to_string(tmp.path().join("asset-manifest.json")).unwrap();
     assert!(manifest_body.contains("\"buildId\""));
@@ -97,12 +100,10 @@ fn end_to_end_renames_rewrites_and_templates() {
 
 #[test]
 fn deterministic_across_runs() {
-    let tmp1 = tempfile::tempdir().unwrap();
-    let tmp2 = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp1.path());
-    copy_dir(&fixture_path(), tmp2.path());
-    impresspress_bundle::bundle::run(tmp1.path(), tmp1.path(), default_app()).unwrap();
-    impresspress_bundle::bundle::run(tmp2.path(), tmp2.path(), default_app()).unwrap();
+    let tmp1 = pkg_copy();
+    let tmp2 = pkg_copy();
+    impresspress_bundle::bundle::run(tmp1.path(), tmp1.path(), AppConfig::default()).unwrap();
+    impresspress_bundle::bundle::run(tmp2.path(), tmp2.path(), AppConfig::default()).unwrap();
 
     let m1 = fs::read_to_string(tmp1.path().join("asset-manifest.json")).unwrap();
     let m2 = fs::read_to_string(tmp2.path().join("asset-manifest.json")).unwrap();
@@ -113,15 +114,10 @@ fn deterministic_across_runs() {
 
 #[test]
 fn empty_exact_leaves_production_sw_bypass_unchanged() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
+    let tmp = production_pkg_copy();
 
-    // Overwrite the fixture stub with the real production template.
-    let prod_tmpl = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sw.js.tmpl"));
-    fs::write(tmp.path().join("sw.js.tmpl"), prod_tmpl).unwrap();
-
-    // default_app has both extra_bypass_prefix and extra_bypass_exact empty.
-    run(tmp.path(), tmp.path(), default_app()).expect("bundler ok");
+    // AppConfig::default() has both extra_bypass_prefix and extra_bypass_exact empty.
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
 
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
 
@@ -145,6 +141,40 @@ fn empty_exact_leaves_production_sw_bypass_unchanged() {
     assert!(
         sw.contains("startsWith('/sql-')) {"),
         "production bypass closing token changed; sw.js = {sw}"
+    );
+}
+
+#[test]
+fn sw_passes_the_dev_flag_to_initialize() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(
+        sw.contains("initialize({ dev: true })"),
+        "sw.js did not receive the dev flag; sw.js = {sw}"
+    );
+}
+
+#[test]
+fn sw_defaults_the_dev_flag_to_false() {
+    let tmp = production_pkg_copy();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    // The sandbox is off unless a bundle asks for it: an app that never sets
+    // `[dev] enabled` must ship a service worker that boots the runtime with
+    // the flag explicitly false, not merely absent.
+    assert!(sw.contains("initialize({ dev: false })"), "sw.js = {sw}");
+    assert!(
+        !sw.contains("__DEV_ENABLED__"),
+        "placeholder not substituted in sw.js"
     );
 }
 
