@@ -1,0 +1,494 @@
+//! Typed request/response contracts for the admin JSON API.
+//!
+//! These did not exist before this module. Every admin handler returned the
+//! database layer's untyped shapes directly — [`RecordList`] (a `{records:
+//! [{id, data: {column → value}}], total_count, page, page_size}` envelope) or
+//! a bare `HashMap<String, serde_json::Value>` — so the block declared no
+//! schemas at all and its JSON API was invisible in `/openapi.json`.
+//!
+//! Two consequences of that, both closed here:
+//!
+//! * **The response was whatever the table happened to hold.**
+//!   `GET /b/admin/api/users` echoed every column of `wafer_run__auth__users`,
+//!   including `verification_token` — the sha256 of a user's email-verification
+//!   token. The views below are *closed* field lists built column by column, so
+//!   a column added to a table is never published by accident.
+//! * **The JSON types were backend-dependent.** `users.email_verified` /
+//!   `users.disabled` are `INTEGER` on SQLite/D1 but `BOOLEAN` on Postgres, and
+//!   `roles.permissions` is a JSON-encoded `TEXT` column that the SQLite backend
+//!   sniffs back into an array while Postgres/D1 hand back the raw string. A
+//!   schema could not have been true for all three. Every field below is
+//!   normalized through [`RecordExt`] or [`string_list_field`], so it now is.
+//!
+//! The `{records, total_count, page, page_size}` envelope is preserved exactly:
+//! only the per-row shape changes, from `{id, data: {…}}` to the flat view.
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+use wafer_core::clients::database::{Record, RecordList};
+use wafer_run::Message;
+
+use crate::util::RecordExt;
+
+// ---------------------------------------------------------------------------
+// Record → view helpers
+// ---------------------------------------------------------------------------
+
+/// A nullable `TEXT` column as `Option<String>`: a SQL `NULL` (JSON `null`), an
+/// absent key, and a non-string value all read as `None`.
+///
+/// [`RecordExt::str_field`] collapses all three onto `""`, which would make a
+/// non-nullable `"string"` schema look correct while quietly erasing the
+/// difference between "no avatar" and "empty avatar URL".
+fn opt_str_field(record: &Record, key: &str) -> Option<String> {
+    match record.data.get(key) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// A JSON-array-of-strings column as `Vec<String>`, whichever way the backend
+/// returned it.
+///
+/// `roles.permissions` is declared `TEXT NOT NULL DEFAULT '[]'` and written as a
+/// JSON array. The SQLite backend sniffs text that looks like JSON and decodes
+/// it (`row_to_record`), so it comes back as a real array; the Postgres and D1
+/// backends do no such sniffing and hand back the literal string. Normalizing
+/// here is what lets the schema declare `array of string` truthfully on all
+/// three. A value that is neither reads as empty rather than erroring — the
+/// column is advisory metadata, not an authorization input.
+fn string_list_field(record: &Record, key: &str) -> Vec<String> {
+    match record.data.get(key) {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Some(serde_json::Value::String(s)) => {
+            serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /b/admin/api/users
+// ---------------------------------------------------------------------------
+
+// Built column by column from `wafer_run__auth__users`. Three of that table's
+// columns are deliberately NOT published, and the reasons live here in a plain
+// comment rather than in the doc comment below: a `///` line is published as
+// the schema's `description`, and the public contract has no reason to name
+// the columns it withholds.
+//
+// * `verification_token` — `sha256_hex` of the user's email-verification
+//   token. Credential material; it has no admin-UI use, and the untyped
+//   handler only ever emitted it because it echoed the whole row.
+// * `last_verification_sent` — bookkeeping for the verification-email
+//   throttle, meaningful only to the signup flow.
+// * `auth_version` — the internal JWT-invalidation counter
+//   (`blocks::auth::bump_auth_version`); an implementation detail of token
+//   revocation, not an account attribute.
+//
+// A password hash was never among them: credentials live in
+// `wafer_run__auth__local_credentials`, a different table this endpoint does
+// not read. The `record.data.remove("password_hash")` the old handler ran was
+// a no-op against a column that is not on this table.
+/// A user account as published by the admin API.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminUserView {
+    /// Stable user identifier.
+    pub id: String,
+    /// Login email address.
+    pub email: String,
+    /// Display name shown in the UI.
+    pub display_name: String,
+    /// Full name, when the user supplied one.
+    pub name: Option<String>,
+    /// Avatar image URL, when set.
+    pub avatar_url: Option<String>,
+    /// Legacy single-role column on the user row (`"user"` by default).
+    /// Authorization uses `roles`; this field is retained because the column is
+    /// still written by the signup path.
+    pub role: String,
+    /// Role names assigned to this user in `impresspress__admin__user_roles`.
+    pub roles: Vec<String>,
+    /// Whether the email address has been verified.
+    pub email_verified: bool,
+    /// Whether the account is disabled (blocked from signing in).
+    pub disabled: bool,
+    /// RFC 3339 timestamp of the last successful sign-in, if any.
+    pub last_login_at: Option<String>,
+    /// RFC 3339 creation timestamp.
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    pub updated_at: String,
+    /// RFC 3339 soft-delete timestamp. Always `null` in the list response,
+    /// which filters on `deleted_at IS NULL`.
+    pub deleted_at: Option<String>,
+}
+
+impl AdminUserView {
+    /// Project a `wafer_run__auth__users` row plus its resolved role names.
+    pub fn from_record(record: &Record, roles: Vec<String>) -> Self {
+        Self {
+            id: record.id.clone(),
+            email: record.str_field("email").to_string(),
+            display_name: record.str_field("display_name").to_string(),
+            name: opt_str_field(record, "name"),
+            avatar_url: opt_str_field(record, "avatar_url"),
+            role: record.str_field("role").to_string(),
+            roles,
+            email_verified: record.bool_field("email_verified"),
+            disabled: record.bool_field("disabled"),
+            last_login_at: opt_str_field(record, "last_login_at"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+            deleted_at: opt_str_field(record, "deleted_at"),
+        }
+    }
+}
+
+/// Query parameters accepted by `GET /b/admin/api/users`.
+///
+/// Built by [`Self::from_message`], which is the handler's only source for
+/// these values — the type is the parser, not a parallel description of one.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct AdminUserListQuery {
+    /// 1-based page number. Values below 1 clamp to 1.
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// Rows per page, capped at 100.
+    #[serde(default = "default_user_page_size")]
+    pub page_size: u32,
+    /// Case-insensitive `LIKE '%…%'` filter on the email address.
+    pub search: Option<String>,
+}
+
+impl AdminUserListQuery {
+    /// Resolve the query string on `msg`, applying the same defaults and clamps
+    /// the handler applied inline before this type existed.
+    pub fn from_message(msg: &Message) -> Self {
+        let (page, page_size, _) = msg.pagination_params(DEFAULT_USER_PAGE_SIZE as usize);
+        Self {
+            page: page as u32,
+            page_size: page_size as u32,
+            search: non_empty(msg.query("search")),
+        }
+    }
+}
+
+/// Response body of `GET /b/admin/api/users`.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct AdminUserListResponse {
+    /// Users on this page, newest first.
+    pub records: Vec<AdminUserView>,
+    /// Total users matching the filter, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl AdminUserListResponse {
+    /// Project a `RecordList` of user rows plus the bulk-fetched
+    /// `user_id → [role]` map.
+    pub fn from_record_list(
+        list: &RecordList,
+        roles_by_user: &HashMap<String, Vec<String>>,
+    ) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .map(|record| {
+                    let roles = roles_by_user.get(&record.id).cloned().unwrap_or_default();
+                    AdminUserView::from_record(record, roles)
+                })
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /b/admin/api/iam/roles
+// ---------------------------------------------------------------------------
+
+/// A role definition as published by the admin API.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminRoleView {
+    /// Stable role identifier.
+    pub id: String,
+    /// Unique role name (`"admin"`, `"user"`, …). This is the value stored in
+    /// `user_roles.role` and checked by the auth layer.
+    pub name: String,
+    /// Human-readable description shown in the IAM UI.
+    pub description: String,
+    /// Permission names attached to the role. Advisory metadata for the IAM
+    /// UI — WRAP grants, not this list, are what the runtime enforces.
+    pub permissions: Vec<String>,
+    /// Whether this is a built-in role. System roles cannot be renamed or
+    /// deleted.
+    pub is_system: bool,
+    /// RFC 3339 creation timestamp.
+    pub created_at: String,
+    /// RFC 3339 timestamp of the last modification.
+    pub updated_at: String,
+}
+
+impl AdminRoleView {
+    /// Project an `impresspress__admin__roles` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.str_field("name").to_string(),
+            description: record.str_field("description").to_string(),
+            permissions: string_list_field(record, "permissions"),
+            is_system: record.bool_field("is_system"),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// Response body of `GET /b/admin/api/iam/roles`.
+///
+/// The endpoint takes no query parameters: it returns every role, sorted by
+/// name, up to the handler's fixed 1000-row ceiling.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct AdminRoleListResponse {
+    /// Roles, sorted by name ascending.
+    pub records: Vec<AdminRoleView>,
+    /// Total roles defined.
+    pub total_count: i64,
+    /// 1-based index of this page. Always 1 — the handler does not paginate.
+    pub page: i64,
+    /// Rows per page. Always the handler's fixed 1000-row ceiling.
+    pub page_size: i64,
+}
+
+impl AdminRoleListResponse {
+    /// Project a `RecordList` of role rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .map(AdminRoleView::from_record)
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+/// `POST /b/admin/api/iam/roles` request body.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateRoleRequest {
+    /// Unique role name. This is the value stored in `user_roles.role` and
+    /// checked by the auth layer.
+    pub name: String,
+    /// Human-readable description shown in the IAM UI. Empty when omitted.
+    pub description: Option<String>,
+    /// Permission names to attach. Advisory metadata for the IAM UI — WRAP
+    /// grants, not this list, are what the runtime enforces. None when
+    /// omitted.
+    pub permissions: Option<Vec<String>>,
+}
+
+/// `PATCH /b/admin/api/iam/roles/{id}` request body. Every field is optional
+/// and only the ones present are applied. `name` is refused on a system role:
+/// renaming `admin` would break auth.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateRoleRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub permissions: Option<Vec<String>>,
+}
+
+/// `DELETE /b/admin/api/iam/roles/{id}` response body.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminRoleDeleteResponse {
+    /// Always `true`: a delete that did not happen is an error response.
+    pub deleted: bool,
+}
+
+// ---------------------------------------------------------------------------
+// GET /b/admin/api/settings
+// ---------------------------------------------------------------------------
+
+// Masking, in full, so a reviewer does not have to reconstruct it from three
+// files. Before a value reaches the map, the handler asks
+// `crate::util::is_sensitive_key(key, row.sensitive)`, which is true when
+// either the row's `sensitive` column is `1` or the key ends in `_SECRET` /
+// `_KEY`; a true answer substitutes `crate::util::MASKED_VALUE` ("********")
+// for the stored value. The `sensitive` column is not hand-maintained — it is
+// seeded from each declared `ConfigVar`'s `InputType::Password`
+// (`settings::seed_defaults`), which is what covers password-shaped keys that
+// carry neither suffix. The masked string is a fixed width, so it reveals
+// nothing about the real value's length either.
+//
+// The residual gap is an *ad hoc* variable, created through the admin UI with
+// a secret-ish name and the `sensitive` checkbox left clear: it matches neither
+// half of the rule and its value is published. That is a property of the
+// create form, not of this endpoint, and is unchanged by typing the response.
+/// Response body of `GET /b/admin/api/settings`: every configuration variable
+/// as a flat `key → value` map.
+///
+/// **Sensitive values are never present.** A variable is treated as sensitive
+/// when it is flagged sensitive in the database or its key ends in `_SECRET` or
+/// `_KEY`, and its value is replaced with `"********"` before the response is
+/// built. Reading this endpoint cannot recover a secret, nor its length.
+///
+/// Values are typed as `any` rather than `string` because the stored column is
+/// text that the SQLite and D1 backends decode back into JSON when it looks
+/// like an object or an array: a variable holding `["a","b"]` reads back as an
+/// array, one holding `on` reads back as a string.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct AdminSettingsResponse(pub BTreeMap<String, serde_json::Value>);
+
+// ---------------------------------------------------------------------------
+// GET /b/admin/api/logs
+// ---------------------------------------------------------------------------
+
+/// One audit-log entry: an admin-initiated mutation, recorded whenever an
+/// admin changes a user, a role, or a configuration variable.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminAuditLogView {
+    /// Stable entry identifier.
+    pub id: String,
+    /// Id of the admin who performed the action. Empty when the action had no
+    /// authenticated actor.
+    pub user_id: String,
+    /// Action name (`"user.delete"`, `"role.create"`, …).
+    pub action: String,
+    /// Target the action was applied to.
+    pub resource: String,
+    /// Client IP the action came from, as seen by the request pipeline. Empty
+    /// when the pipeline could not determine one.
+    pub ip_address: String,
+    /// RFC 3339 timestamp the action was recorded at.
+    pub created_at: String,
+    /// RFC 3339 write timestamp. Audit rows are never updated, so this always
+    /// equals `created_at`.
+    pub updated_at: String,
+}
+
+impl AdminAuditLogView {
+    /// Project an `impresspress__admin__audit_logs` row.
+    pub fn from_record(record: &Record) -> Self {
+        Self {
+            id: record.id.clone(),
+            user_id: record.str_field("user_id").to_string(),
+            action: record.str_field("action").to_string(),
+            resource: record.str_field("resource").to_string(),
+            ip_address: record.str_field("ip_address").to_string(),
+            created_at: record.str_field("created_at").to_string(),
+            updated_at: record.str_field("updated_at").to_string(),
+        }
+    }
+}
+
+/// Query parameters accepted by `GET /b/admin/api/logs`.
+///
+/// Built by [`Self::from_message`], which is the handler's only source for
+/// these values.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct AdminAuditLogListQuery {
+    /// 1-based page number. Values below 1 clamp to 1.
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// Rows per page, capped at 100.
+    #[serde(default = "default_log_page_size")]
+    pub page_size: u32,
+    /// Exact-match filter on the acting admin's user id.
+    pub user_id: Option<String>,
+    /// Exact-match filter on the action name.
+    pub action: Option<String>,
+    /// `LIKE '%…%'` filter on the affected resource.
+    pub resource: Option<String>,
+}
+
+impl AdminAuditLogListQuery {
+    /// Resolve the query string on `msg`, applying the same defaults and clamps
+    /// the handler applied inline before this type existed.
+    pub fn from_message(msg: &Message) -> Self {
+        let (page, page_size, _) = msg.pagination_params(DEFAULT_LOG_PAGE_SIZE as usize);
+        Self {
+            page: page as u32,
+            page_size: page_size as u32,
+            user_id: non_empty(msg.query("user_id")),
+            action: non_empty(msg.query("action")),
+            resource: non_empty(msg.query("resource")),
+        }
+    }
+}
+
+/// Response body of `GET /b/admin/api/logs`.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct AdminAuditLogListResponse {
+    /// Audit entries on this page, newest first.
+    pub records: Vec<AdminAuditLogView>,
+    /// Total entries matching the filters, across all pages.
+    pub total_count: i64,
+    /// 1-based index of this page.
+    pub page: i64,
+    /// Rows per page used to compute `page`.
+    pub page_size: i64,
+}
+
+impl AdminAuditLogListResponse {
+    /// Project a `RecordList` of audit-log rows.
+    pub fn from_record_list(list: &RecordList) -> Self {
+        Self {
+            records: list
+                .records
+                .iter()
+                .map(AdminAuditLogView::from_record)
+                .collect(),
+            total_count: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared query-param plumbing
+// ---------------------------------------------------------------------------
+
+/// Default page size for `GET /b/admin/api/users`.
+const DEFAULT_USER_PAGE_SIZE: u32 = 20;
+
+/// Default page size for `GET /b/admin/api/logs`.
+const DEFAULT_LOG_PAGE_SIZE: u32 = 50;
+
+/// `?page` default, shared by both paginated endpoints.
+fn default_page() -> u32 {
+    1
+}
+
+fn default_user_page_size() -> u32 {
+    DEFAULT_USER_PAGE_SIZE
+}
+
+fn default_log_page_size() -> u32 {
+    DEFAULT_LOG_PAGE_SIZE
+}
+
+/// An absent query parameter and an empty one mean the same thing to every
+/// admin filter (`msg.query` returns `""` for both), so collapse them onto
+/// `None` rather than letting `Some("")` reach a `LIKE '%%'`.
+fn non_empty(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}

@@ -2,6 +2,7 @@ use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
+use super::contracts::{AdminAuditLogListQuery, AdminAuditLogListResponse};
 use crate::http::{err_internal, err_not_found, ok_json};
 
 /// Audit log entries (admin-initiated mutations).
@@ -29,27 +30,24 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, path: &str) -> OutputStrea
 }
 
 async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let (page, page_size, _) = msg.pagination_params(50);
+    let query = AdminAuditLogListQuery::from_message(msg);
 
     let mut filters = Vec::new();
-    let user_id = msg.query("user_id").to_string();
-    if !user_id.is_empty() {
+    if let Some(user_id) = query.user_id {
         filters.push(Filter {
             field: "user_id".to_string(),
             operator: FilterOp::Equal,
             value: serde_json::Value::String(user_id),
         });
     }
-    let action_filter = msg.query("action").to_string();
-    if !action_filter.is_empty() {
+    if let Some(action_filter) = query.action {
         filters.push(Filter {
             field: "action".to_string(),
             operator: FilterOp::Equal,
             value: serde_json::Value::String(action_filter),
         });
     }
-    let resource = msg.query("resource").to_string();
-    if !resource.is_empty() {
+    if let Some(resource) = query.resource {
         filters.push(Filter {
             field: "resource".to_string(),
             operator: FilterOp::Like,
@@ -65,14 +63,14 @@ async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match db::paginated_list(
         ctx,
         AUDIT_LOGS_TABLE,
-        page as i64,
-        page_size as i64,
+        i64::from(query.page),
+        i64::from(query.page_size),
         filters,
         sort,
     )
     .await
     {
-        Ok(result) => ok_json(&result),
+        Ok(result) => ok_json(&AdminAuditLogListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -140,5 +138,82 @@ pub async fn audit_log(
 
     if let Err(e) = db::create(ctx, AUDIT_LOGS_TABLE, data).await {
         tracing::warn!(action, resource, "audit_log write failed: {}", e.message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{admin_msg, output_json, TestContext};
+
+    /// The audit-log list publishes exactly `AdminAuditLogView`'s fields, and
+    /// the `{records, total_count, page, page_size}` envelope the untyped
+    /// `RecordList` response already had.
+    #[tokio::test]
+    async fn list_publishes_exactly_the_contract_fields() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        audit_log(&ctx, "admin-1", "user.delete", "users/u-9", "203.0.113.7").await;
+
+        let body =
+            output_json(handle_list(&ctx, &admin_msg("retrieve", "/admin/logs")).await).await;
+
+        let row = body["records"][0]
+            .as_object()
+            .expect("one audit entry on the wire");
+        let mut got: Vec<&str> = row.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "action",
+                "created_at",
+                "id",
+                "ip_address",
+                "resource",
+                "updated_at",
+                "user_id"
+            ],
+            "the wire field set must equal AdminAuditLogView's"
+        );
+
+        assert_eq!(row["action"], serde_json::json!("user.delete"));
+        assert_eq!(row["resource"], serde_json::json!("users/u-9"));
+        assert_eq!(body["total_count"], serde_json::json!(1));
+        assert_eq!(body["page"], serde_json::json!(1));
+        assert_eq!(body["page_size"], serde_json::json!(50));
+    }
+
+    /// `?action=` filters, and the filter reaches the query through
+    /// `AdminAuditLogListQuery` — the type the published parameter schema is
+    /// derived from.
+    #[tokio::test]
+    async fn list_applies_the_declared_query_filters() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        audit_log(&ctx, "admin-1", "user.delete", "users/u-9", "203.0.113.7").await;
+        audit_log(
+            &ctx,
+            "admin-1",
+            "role.create",
+            "roles/editor",
+            "203.0.113.7",
+        )
+        .await;
+
+        let mut msg = admin_msg("retrieve", "/admin/logs");
+        msg.set_meta("req.query.action", "role.create".to_string());
+
+        let body = output_json(handle_list(&ctx, &msg).await).await;
+
+        assert_eq!(body["total_count"], serde_json::json!(1));
+        assert_eq!(
+            body["records"][0]["action"],
+            serde_json::json!("role.create")
+        );
     }
 }

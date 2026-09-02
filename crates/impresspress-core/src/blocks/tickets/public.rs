@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 
 use maud::{html, Markup};
-use serde::Deserialize;
 use wafer_core::clients::config as config_client;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     abuse::{self, AbuseDecision},
     config::{self, SecurityReadiness},
+    contracts::{PublicSubmissionRequest, SubmissionAck},
     models::{ActorType, CreateTicketInput, TicketSource},
     repo, service, turnstile,
 };
@@ -21,30 +21,6 @@ use crate::{
 
 const MAX_BODY_BYTES: usize = 16 * 1_024;
 const TURNSTILE_SCRIPT: &str = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonSubmission {
-    type_id: String,
-    subject: String,
-    description: String,
-    #[serde(default)]
-    source_path: String,
-    #[serde(default)]
-    subject_type: String,
-    #[serde(default)]
-    subject_id: String,
-    #[serde(default)]
-    evidence_url: String,
-    #[serde(default)]
-    reporter_email: String,
-    #[serde(default)]
-    reporter_wants_reply: bool,
-    form_token: String,
-    turnstile_token: String,
-    #[serde(default)]
-    website: String,
-}
 
 struct Submission {
     ticket: CreateTicketInput,
@@ -478,7 +454,7 @@ fn parse_submission(content_type: &str, raw: &[u8]) -> Result<Submission, String
         .to_ascii_lowercase()
         .starts_with("application/json")
     {
-        let value: JsonSubmission =
+        let value: PublicSubmissionRequest =
             serde_json::from_slice(raw).map_err(|_| "Invalid JSON submission".to_string())?;
         return Ok(Submission {
             ticket: CreateTicketInput {
@@ -592,14 +568,9 @@ fn success_response(msg: &Message, reference: &str) -> OutputStream {
         .to_ascii_lowercase()
         .contains("application/json")
     {
-        let body = serde_json::json!({
-            "reference": reference,
-            "status": "received",
-            "message": "Your report has been received",
-        });
         return public_headers(ResponseBuilder::new())
             .status(201)
-            .json(&body);
+            .json(&SubmissionAck::received(reference));
     }
     let location = if reference.is_empty() {
         "/b/tickets/submitted".to_string()

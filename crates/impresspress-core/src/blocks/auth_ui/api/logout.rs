@@ -3,12 +3,15 @@
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::{
-        helpers::build_auth_cookie,
-        repo::{
-            jwt_blocklist::{self, NewBlocklistEntry},
-            tokens,
+    blocks::{
+        auth::{
+            helpers::build_auth_cookie,
+            repo::{
+                jwt_blocklist::{self, NewBlocklistEntry},
+                tokens,
+            },
         },
+        auth_ui::contracts::LogoutResponse,
     },
     crypto::{META_AUTH_EXP, META_AUTH_JTI},
     http::{err_internal, ResponseBuilder},
@@ -89,7 +92,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         .set_cookie(&cookie)
         .status(303)
         .set_header("Location", "/b/auth/login")
-        .json(&serde_json::json!({"message": "Logged out successfully"}))
+        .json(&LogoutResponse {
+            message: "Logged out successfully".to_string(),
+        })
 }
 
 #[cfg(test)]

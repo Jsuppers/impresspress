@@ -20,18 +20,15 @@ use crate::{
             helpers::{ensure_admin_role, expected_issuer, issue_tokens_and_cookie},
             repo::{tokens, users},
         },
+        auth_ui::contracts::{RefreshRequest, RefreshResponse, TokenType},
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ResponseBuilder},
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    #[derive(serde::Deserialize)]
-    struct RefreshReq {
-        refresh_token: String,
-    }
     let raw = input.collect_to_bytes().await;
-    let body: RefreshReq = match serde_json::from_slice(&raw) {
+    let body: RefreshRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -169,10 +166,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     ResponseBuilder::new()
         .set_cookie(&issued.cookie)
-        .json(&serde_json::json!({
-            "access_token": issued.access_token,
-            "refresh_token": issued.refresh_token,
-            "token_type": "Bearer",
-            "expires_in": issued.access_lifetime
-        }))
+        .json(&RefreshResponse {
+            access_token: issued.access_token,
+            refresh_token: issued.refresh_token,
+            token_type: TokenType::Bearer,
+            expires_in: issued.access_lifetime,
+        })
 }
