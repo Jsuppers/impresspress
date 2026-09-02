@@ -190,10 +190,21 @@ pub async fn latest_valid_for_artifact(
                     value: serde_json::json!(BuildStatus::Valid.as_str()),
                 },
             ],
-            sort: vec![SortField {
-                field: "created_at".into(),
-                desc: true,
-            }],
+            // With `limit: 1` the tiebreaker is not cosmetic: two valid builds
+            // of one artifact stamped in the same millisecond would otherwise
+            // make "the latest" an arbitrary choice between them, and the
+            // duplicate-agent-tool rule reads the `BlockInfo` off whichever
+            // row it lands on.
+            sort: vec![
+                SortField {
+                    field: "created_at".into(),
+                    desc: true,
+                },
+                SortField {
+                    field: "id".into(),
+                    desc: true,
+                },
+            ],
             limit: 1,
             skip_count: true,
             ..Default::default()
@@ -204,15 +215,26 @@ pub async fn latest_valid_for_artifact(
 }
 
 /// The `limit` newest builds, newest first.
+///
+/// `id` breaks a `created_at` tie, for the reason
+/// [`super::generations::list_recent`] states: the timestamp is
+/// millisecond-resolution on wasm32, and two rows sharing one would otherwise
+/// come back in whatever order the backend chose.
 pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<BuildRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
-            sort: vec![SortField {
-                field: "created_at".into(),
-                desc: true,
-            }],
+            sort: vec![
+                SortField {
+                    field: "created_at".into(),
+                    desc: true,
+                },
+                SortField {
+                    field: "id".into(),
+                    desc: true,
+                },
+            ],
             limit: limit.clamp(1, MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()

@@ -236,15 +236,31 @@ pub async fn set_status(
 }
 
 /// The `limit` newest generations, newest first.
+///
+/// `id` is the tiebreaker, and it is not cosmetic. `created_at` is stamped
+/// from `chrono::Utc::now()`, which on wasm32 resolves to whole milliseconds —
+/// and an agent's activations arrive in bursts, so two generations minted in
+/// one millisecond is an ordinary event rather than a race. Without a second
+/// key their order is whatever the backend happens to return, which decides
+/// what the ledger view shows first, which of them a rollback offers, and —
+/// through [`mark_superseded_before`] — which one falls outside the retention
+/// window. `id` is a v4 uuid, so the order it imposes is arbitrary; being
+/// arbitrary and *stable* is the whole requirement.
 pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<GenerationRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
-            sort: vec![SortField {
-                field: "created_at".into(),
-                desc: true,
-            }],
+            sort: vec![
+                SortField {
+                    field: "created_at".into(),
+                    desc: true,
+                },
+                SortField {
+                    field: "id".into(),
+                    desc: true,
+                },
+            ],
             limit: limit.clamp(1, MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()
@@ -352,6 +368,65 @@ mod tests {
             id: "g1".to_string(),
             data,
         }
+    }
+
+    /// `created_at` is millisecond-resolution on wasm32 and an agent's
+    /// activations arrive in bursts, so a tie is ordinary. The order the
+    /// ledger view shows, the set a rollback offers and the retention boundary
+    /// all read this list, so a tie must resolve the same way every time.
+    ///
+    /// Written through `db::create` rather than `insert` because `insert`
+    /// stamps `created_at` itself — a tie cannot be produced through the API
+    /// that is being defended.
+    #[tokio::test]
+    async fn generations_minted_in_the_same_millisecond_have_a_stable_order() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let minted_at = "2026-09-03T00:00:00.000Z";
+        for id in ["b-second", "a-first", "c-third"] {
+            db::create(
+                &ctx,
+                TABLE,
+                crate::util::json_map(serde_json::json!({
+                    "id": id,
+                    "parent_id": serde_json::Value::Null,
+                    "status": GenerationStatus::Active.as_str(),
+                    "cause": GenerationCause::SiteWrite.as_str(),
+                    "site_manifest_json": SITE_MANIFEST,
+                    "block_manifest_json": BLOCK_MANIFEST,
+                    "manifest_sha256": "cc",
+                    "created_at": minted_at,
+                    "activated_at": serde_json::Value::Null,
+                    "failure_message": serde_json::Value::Null,
+                })),
+            )
+            .await
+            .expect("create");
+        }
+
+        let ids: Vec<String> = list_recent(&ctx, 10)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "c-third".to_string(),
+                "b-second".to_string(),
+                "a-first".to_string()
+            ],
+            "a `created_at` tie is broken by id, descending"
+        );
+        // And it is an order, not a coincidence: reading again answers the
+        // same thing.
+        let again: Vec<String> = list_recent(&ctx, 10)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(again, ids);
     }
 
     #[tokio::test]

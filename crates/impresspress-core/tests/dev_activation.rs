@@ -288,6 +288,74 @@ async fn rollback_republishes_an_earlier_generation_as_a_new_one() {
     assert_eq!(read["sha256"], json!(sha1));
 }
 
+/// A rollback rewrites the workspace as well as publishing, and both have to
+/// happen under one queue lease.
+///
+/// The window this closes: with the adoption outside the queue, a site write
+/// admitted while the rollback was in flight dequeued *between* the rollback's
+/// publish and its workspace rewrite. It composed its manifest from the
+/// workspace the rollback had not yet touched, republished the pre-rollback
+/// site over the rolled-back one, and the adoption then rewrote the workspace
+/// to the rollback's — leaving the published folder and the workspace
+/// disagreeing, with nothing left to reconcile them.
+#[tokio::test]
+async fn a_site_write_racing_a_rollback_leaves_the_workspace_and_the_site_agreeing() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let shared = ctx.dev_shared();
+
+    // g1: v1 and no blocks — the rollback target.
+    let g1 = write_file(&ctx, "site/index.html", "v1", None).await;
+    let id1 = g1["generation"]["id"].as_str().expect("id").to_string();
+    // A block, so rolling back to g1 changes the block set and therefore
+    // rebuilds — which is the one place the fixture can hold the queue open.
+    activation::request(
+        &ctx,
+        &shared,
+        GenerationCause::BlockCompile,
+        compile_of(&ctx, &["hello"]).await,
+    )
+    .await
+    .expect("the block activates");
+    // v2, so the workspace and the rollback target genuinely differ.
+    write_file(&ctx, "site/index.html", "v2", Some(&sha_of("v1"))).await;
+
+    let rollback_path = format!("/b/dev/api/generations/{id1}/rollback");
+    let v2 = sha_of("v2");
+    let release = control.gate_next_rebuild();
+    let (rollback, write, ()) = tokio::join!(
+        dev_post(&ctx, &rollback_path, json!({})),
+        write_file(&ctx, "site/index.html", "v3", Some(&v2)),
+        async {
+            let _ = release.send(());
+        },
+    );
+    let rollback = output_json(rollback).await;
+    assert_eq!(rollback["generation"]["cause"], "rollback", "{rollback}");
+    assert!(write["generation"].is_object(), "{write}");
+
+    // The last intent to dequeue was the site write, and it composed its
+    // manifest from the workspace the rollback had already adopted — so the
+    // two agree, and they agree on the rolled-back content.
+    let published = served(&ctx, "index.html").await;
+    assert_eq!(published.as_deref(), Some(&b"v1"[..]));
+    let read = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "site/index.html"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(read["content"], "v1", "{read}");
+    assert_eq!(read["sha256"], json!(sha_of("v1")));
+
+    // Two rebuilds — the compile and the rollback. A site-only publish never
+    // rebuilds, whichever generation it is composed against.
+    assert_eq!(control.rebuilds().len(), 2);
+}
+
 #[tokio::test]
 async fn a_failed_runtime_rebuild_leaves_the_previous_generation_active() {
     let control = FakeControl::new();

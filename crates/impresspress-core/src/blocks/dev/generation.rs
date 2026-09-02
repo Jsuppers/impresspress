@@ -127,7 +127,13 @@ pub fn manifest_sha256(manifest: &GenerationManifest) -> Result<String, WaferErr
 /// an insertion-ordered `IndexMap`, and every stored `manifest_sha256` would
 /// stop matching the manifest it was taken over. Re-inserting in sorted order
 /// keeps the bytes a function of the data under either backing map.
-fn canonicalize(value: Value) -> Value {
+///
+/// `pub(super)` because [`super::repo::json_text`] canonicalizes the same
+/// bytes on the way back out of the database. "Canonical JSON" is one contract
+/// — the one `manifest_sha256` is taken over — so it has one implementation;
+/// two of them differing in robustness is a hash check that passes on the way
+/// in and fails on the way out.
+pub(super) fn canonicalize(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let sorted: BTreeMap<String, Value> = map

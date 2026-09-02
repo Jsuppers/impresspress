@@ -454,6 +454,18 @@ async fn activate(
     cause: GenerationCause,
     intent: ActivationIntent,
 ) -> Result<ActivationOutcome, ActivationError> {
+    // A rollback replaces the workspace's `site/` half as well as publishing
+    // it, and the two have to happen under the same queue lease. The workspace
+    // — not the ledger — is what the next site write composes its manifest
+    // from, so a rollback that published an old site and left the workspace
+    // holding the new one is undone by the very next keystroke. Doing it
+    // outside the queue is not enough: a site write that dequeued in the gap
+    // would republish the pre-rollback site from the workspace the rollback
+    // had not rewritten yet, and the published folder and the workspace would
+    // then disagree with nothing left to reconcile them.
+    //
+    // Read here rather than after `compose`, which consumes the intent.
+    let adopts_site = matches!(intent, ActivationIntent::Rollback { .. });
     let state = repo::runtime_state::read(ctx)
         .await
         .map_err(storage_error)?;
@@ -483,7 +495,62 @@ async fn activate(
     .await
     .map_err(storage_error)?;
 
-    activate_staged(ctx, shared, &row, &manifest, previous.as_ref(), &state).await
+    let outcome = activate_staged(ctx, shared, &row, &manifest, previous.as_ref(), &state).await?;
+    // Only on success: a rollback that never went live must not leave the
+    // workspace pointing at content the published site does not have. The
+    // reverse order would rewrite the workspace on every refused rollback —
+    // including the ordinary case of a target whose blobs have been collected.
+    if adopts_site {
+        adopt_site(ctx, shared, &manifest.site)
+            .await
+            .map_err(storage_error)?;
+    }
+    Ok(outcome)
+}
+
+/// Replace the workspace's `site/` half with `site`, leaving `blocks/` alone.
+///
+/// The blob counters are untouched on purpose: every entry here names content
+/// the store already holds (a generation cannot reference a blob that was
+/// never written), so nothing has been stored and nothing has been reclaimed.
+/// Charging for it would make a rollback look like a fresh upload of the whole
+/// site and eat the workspace's quota for content it already paid for.
+async fn adopt_site(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+    site: &SiteManifest,
+) -> Result<(), WaferError> {
+    // Under the same lock every file mutation takes: this is a
+    // read-modify-write of the whole manifest, and a concurrent write that
+    // loaded before it and saved after it would resurrect the site half this
+    // is replacing.
+    //
+    // Deadlock-free because the lock is *only* ever held around a
+    // read-modify-write of `workspace.json`: `files.rs` drops it before it
+    // asks for an activation, so nothing holding it is ever waiting on this
+    // queue.
+    let _serialized = shared.workspace.lock().await;
+    let mut ws = workspace::load(ctx).await?;
+    let stale: Vec<String> = ws
+        .files
+        .keys()
+        .filter(|path| path.starts_with(workspace::SITE_PREFIX))
+        .cloned()
+        .collect();
+    for path in stale {
+        ws.remove(&path);
+    }
+    for entry in &site.files {
+        // Through `Workspace::insert` — the only writer of `files` — so the
+        // map key and `FileEntry::path` cannot drift apart, and the content
+        // type is derived from the path exactly as a write would derive it.
+        ws.insert(
+            &format!("{}{}", workspace::SITE_PREFIX, entry.path),
+            entry.sha256.clone(),
+            entry.size,
+        );
+    }
+    workspace::save(ctx, &ws).await
 }
 
 /// Drive an already-staged generation to live.
@@ -979,9 +1046,69 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        blocks::dev::{
+            test_support::FakeControl,
+            workspace::{FileEntry, Workspace},
+        },
+        test_support::TestContext,
+    };
 
     fn site_only() -> ActivationIntent {
         ActivationIntent::SiteOnly
+    }
+
+    fn entry(path: &str, sha: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            sha256: sha.to_string(),
+            size: 4,
+            content_type: "text/html; charset=utf-8".to_string(),
+        }
+    }
+
+    /// Adopting a site manifest replaces the whole `site/` half and leaves
+    /// `blocks/` alone — a rollback is a site+block republish, not a workspace
+    /// wipe.
+    #[tokio::test]
+    async fn adopting_a_site_replaces_only_the_site_half() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let mut ws = Workspace::default();
+        ws.insert("site/index.html", "new".to_string(), 4);
+        ws.insert("site/added-later.css", "css".to_string(), 4);
+        ws.insert("blocks/hello/src/lib.rs", "rs".to_string(), 4);
+        ws.record_blob_stored(4);
+        ws.record_blob_stored(4);
+        ws.record_blob_stored(4);
+        workspace::save(&ctx, &ws).await.expect("save");
+
+        adopt_site(
+            &ctx,
+            &super::super::DevShared::new(FakeControl::new()),
+            &SiteManifest {
+                files: vec![entry("index.html", "old")],
+            },
+        )
+        .await
+        .expect("adopt");
+
+        let after = workspace::load(&ctx).await.expect("load");
+        assert_eq!(
+            after.files.keys().collect::<Vec<_>>(),
+            vec!["blocks/hello/src/lib.rs", "site/index.html"],
+            "a path the target generation did not have must be dropped"
+        );
+        assert_eq!(after.get("site/index.html").expect("entry").sha256, "old");
+        // Nothing was stored and nothing was reclaimed: the target's blobs
+        // were already paid for.
+        assert_eq!(after.blob_bytes, ws.blob_bytes);
+        assert_eq!(after.blob_count, ws.blob_count);
+        // And the projection round-trips: what was adopted is what a site
+        // manifest reads back.
+        assert_eq!(
+            workspace::site_manifest(&after),
+            vec![entry("index.html", "old")]
+        );
     }
 
     fn block_set(marker: &str) -> ActivationIntent {

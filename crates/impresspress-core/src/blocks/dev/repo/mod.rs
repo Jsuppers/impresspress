@@ -39,9 +39,8 @@ pub(crate) fn now() -> String {
 ///   literal string. `RecordExt::str_field` collapses the decoded case to
 ///   `""`, which would silently lose a whole manifest on SQLite while working
 ///   on Postgres.
-/// * Re-encoding the decoded value (`serde_json` orders object keys, having
-///   no `preserve_order`) yields canonical JSON, whereas the Postgres literal
-///   is whatever was stored. Left alone, the *same row* would read back
+/// * Re-encoding the decoded value yields canonical JSON, whereas the Postgres
+///   literal is whatever was stored. Left alone, the *same row* would read back
 ///   differently per backend — and since `manifest_sha256` is a hash over the
 ///   canonical manifest (design §11.3), that difference would make hash
 ///   verification pass on one backend and fail on another.
@@ -51,15 +50,25 @@ pub(crate) fn now() -> String {
 /// backend rather than on some of them — which is the correct outcome, and a
 /// loud one.
 ///
+/// The normalization is [`super::generation::canonicalize`] — the *same*
+/// function [`super::generation::canonical_text`] writes with, not a second
+/// implementation that happens to agree. Re-encoding through `serde_json`
+/// alone would agree only while `Map` is `BTreeMap`-backed, and
+/// `serde_json/preserve_order` is a feature any dependency in the graph can
+/// turn on for everyone: the writer is already defended against that, and the
+/// reader has to be defended by the same code rather than by a test noticing.
+///
 /// Text that does not parse as JSON is returned unchanged; the caller that
 /// asked for it is the one that knows whether that is a problem.
 pub(crate) fn json_text(record: &wafer_core::clients::database::Record, key: &str) -> String {
+    let canonical = |value: serde_json::Value| super::generation::canonicalize(value).to_string();
     match record.data.get(key) {
         // Postgres / D1: the literal column text.
-        Some(serde_json::Value::String(text)) => serde_json::from_str::<serde_json::Value>(text)
-            .map_or_else(|_| text.clone(), |value| value.to_string()),
+        Some(serde_json::Value::String(text)) => {
+            serde_json::from_str::<serde_json::Value>(text).map_or_else(|_| text.clone(), canonical)
+        }
         // SQLite / D1-with-sniffing: already decoded.
-        Some(value) => value.to_string(),
+        Some(value) => canonical(value.clone()),
         None => String::new(),
     }
 }

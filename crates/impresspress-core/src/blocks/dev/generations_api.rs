@@ -12,7 +12,9 @@
 //! The workspace follows, because it has to. The workspace — not the ledger —
 //! is what the next site write builds its manifest from, so a rollback that
 //! republished the old site and left the workspace holding the new one would
-//! be silently undone by the very next keystroke.
+//! be silently undone by the very next keystroke. That adoption happens inside
+//! the activation queue, under the same lease as the publish
+//! (`activation::activate`), so no site write can dequeue between the two.
 
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
@@ -20,11 +22,9 @@ use super::{
     activation::{self, ActivationIntent},
     contracts::{
         ActivationResponse, GenerationDetail, GenerationListQuery, GenerationListResponse,
-        SiteManifest,
     },
     generation, no_store, no_store_error,
     repo::{self, generations::GenerationCause},
-    workspace::{self, SITE_PREFIX},
     DevShared,
 };
 use crate::http::err_internal;
@@ -114,23 +114,14 @@ pub async fn handle_rollback(ctx: &dyn Context, shared: &DevShared, msg: &Messag
     // ran would compose its own set from a snapshot the rollback has already
     // replaced, and would put the rolled-back block straight back.
     //
-    // The lock spans the workspace adoption too: a rollback that published an
-    // old site but was overtaken before it could write the workspace would
-    // leave the two disagreeing, and the next site write would silently undo
-    // it.
+    // The workspace adoption is *not* here: it happens inside the queue, as
+    // part of applying the `Rollback` intent, so that it and the publish land
+    // under one lease. See `activation::activate`.
     let _compiling = shared.compile.lock().await;
     let outcome = match activation::request(ctx, shared, GenerationCause::Rollback, intent).await {
         Ok(outcome) => outcome,
         Err(e) => return e.into_response(),
     };
-
-    // Only now: a rollback that never went live must not leave the workspace
-    // pointing at content the published site does not have. The reverse order
-    // would rewrite the workspace on every refused rollback — including the
-    // ordinary case of a target whose blobs have been collected.
-    if let Err(e) = adopt_site(ctx, shared, &target.site).await {
-        return err_internal("dev workspace rollback", e);
-    }
 
     no_store().json(&ActivationResponse {
         generation: outcome.generation,
@@ -138,113 +129,8 @@ pub async fn handle_rollback(ctx: &dyn Context, shared: &DevShared, msg: &Messag
     })
 }
 
-/// Replace the workspace's `site/` half with `site`, leaving `blocks/` alone.
-///
-/// The blob counters are untouched on purpose: every entry here names content
-/// the store already holds (a generation cannot reference a blob that was
-/// never written), so nothing has been stored and nothing has been reclaimed.
-/// Charging for it would make a rollback look like a fresh upload of the whole
-/// site and eat the workspace's quota for content it already paid for.
-async fn adopt_site(
-    ctx: &dyn Context,
-    shared: &DevShared,
-    site: &SiteManifest,
-) -> Result<(), WaferError> {
-    // Under the same lock every file mutation takes: this is a
-    // read-modify-write of the whole manifest, and a concurrent write that
-    // loaded before it and saved after it would resurrect the site half this
-    // is replacing.
-    let _serialized = shared.workspace.lock().await;
-    let mut ws = workspace::load(ctx).await?;
-    let stale: Vec<String> = ws
-        .files
-        .keys()
-        .filter(|path| path.starts_with(SITE_PREFIX))
-        .cloned()
-        .collect();
-    for path in stale {
-        ws.remove(&path);
-    }
-    for entry in &site.files {
-        // Through `Workspace::insert` — the only writer of `files` — so the
-        // map key and `FileEntry::path` cannot drift apart, and the content
-        // type is derived from the path exactly as a write would derive it.
-        ws.insert(
-            &format!("{SITE_PREFIX}{}", entry.path),
-            entry.sha256.clone(),
-            entry.size,
-        );
-    }
-    workspace::save(ctx, &ws).await
-}
-
 /// The `{id}` the route bound, or `None` when it is empty.
 fn generation_id(msg: &Message) -> Option<String> {
     let id = msg.var("id");
     (!id.is_empty()).then(|| id.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        blocks::dev::{
-            test_support::FakeControl,
-            workspace::{FileEntry, Workspace},
-        },
-        test_support::TestContext,
-    };
-
-    fn entry(path: &str, sha: &str) -> FileEntry {
-        FileEntry {
-            path: path.to_string(),
-            sha256: sha.to_string(),
-            size: 4,
-            content_type: "text/html; charset=utf-8".to_string(),
-        }
-    }
-
-    /// Adopting a site manifest replaces the whole `site/` half and leaves
-    /// `blocks/` alone — a rollback is a site+block republish, not a workspace
-    /// wipe.
-    #[tokio::test]
-    async fn adopting_a_site_replaces_only_the_site_half() {
-        let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let mut ws = Workspace::default();
-        ws.insert("site/index.html", "new".to_string(), 4);
-        ws.insert("site/added-later.css", "css".to_string(), 4);
-        ws.insert("blocks/hello/src/lib.rs", "rs".to_string(), 4);
-        ws.record_blob_stored(4);
-        ws.record_blob_stored(4);
-        ws.record_blob_stored(4);
-        workspace::save(&ctx, &ws).await.expect("save");
-
-        adopt_site(
-            &ctx,
-            &DevShared::new(FakeControl::new()),
-            &SiteManifest {
-                files: vec![entry("index.html", "old")],
-            },
-        )
-        .await
-        .expect("adopt");
-
-        let after = workspace::load(&ctx).await.expect("load");
-        assert_eq!(
-            after.files.keys().collect::<Vec<_>>(),
-            vec!["blocks/hello/src/lib.rs", "site/index.html"],
-            "a path the target generation did not have must be dropped"
-        );
-        assert_eq!(after.get("site/index.html").expect("entry").sha256, "old");
-        // Nothing was stored and nothing was reclaimed: the target's blobs
-        // were already paid for.
-        assert_eq!(after.blob_bytes, ws.blob_bytes);
-        assert_eq!(after.blob_count, ws.blob_count);
-        // And the projection round-trips: what was adopted is what a site
-        // manifest reads back.
-        assert_eq!(
-            workspace::site_manifest(&after),
-            vec![entry("index.html", "old")]
-        );
-    }
 }

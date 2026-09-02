@@ -124,6 +124,16 @@ pub async fn request_to_message(
     // the policy then fails closed exactly as it did before this ran.
     if let Some(location) = worker_location() {
         if !saw_host {
+            // Defence in depth, and **not the live path**. `host` only matters
+            // to `csrf::enforce_origin_policy`'s `origin`/`referer` fallback,
+            // and that fallback is unreachable whenever this block runs at
+            // all: the `sec-fetch-site` synthesized just below is
+            // unconditional inside this `if`, and the policy reads
+            // `sec-fetch-site` *first* and returns on it. So a future reader
+            // should not assume the fallback is exercised by any test here —
+            // it is what would carry the policy if the `Sec-Fetch-Site` arm
+            // were ever removed, or if a client sent a `host` header of its
+            // own that this branch then declines to overwrite.
             header_pairs.push(("host".to_string(), location.host));
         }
         if !saw_fetch_site {
