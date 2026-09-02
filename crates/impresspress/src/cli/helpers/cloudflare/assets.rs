@@ -5,9 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-
 use impresspress_core::{routing::STATIC_PREFIX, ui::assets as ui_assets};
+use serde::{Deserialize, Serialize};
 
 /// Source dirs (relative to repo_root) to mirror into out_dir/assets/.
 const ASSET_DIRS: &[&str] = &["dist", "content", "public"];

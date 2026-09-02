@@ -9,9 +9,7 @@ use crate::{
     blocks::auth::repo::users,
     http::{err_bad_request, err_internal, ok_json},
     ui,
-    ui::components::auth_panel,
-    ui::icons,
-    ui::templates::auth_split,
+    ui::{components::auth_panel, icons, templates::auth_split},
     util::{hex_encode, sha256_hex},
 };
 

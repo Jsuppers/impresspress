@@ -668,9 +668,7 @@ mod tests {
             // starts_with(prefix)`, so they asserted against a private copy
             // of the logic and would keep passing while the real matcher
             // diverged from them.
-            let matched = ROUTES
-                .iter()
-                .find(|r| route_prefix_matches(r.prefix, path));
+            let matched = ROUTES.iter().find(|r| route_prefix_matches(r.prefix, path));
             assert!(matched.is_some(), "path {path} should match a route");
             assert_eq!(
                 matched.unwrap().block,
@@ -691,9 +689,7 @@ mod tests {
             ("/b/storage", "impresspress/files"),
             ("/b/admin", "impresspress/admin"),
         ] {
-            let matched = ROUTES
-                .iter()
-                .find(|r| route_prefix_matches(r.prefix, path));
+            let matched = ROUTES.iter().find(|r| route_prefix_matches(r.prefix, path));
             assert!(matched.is_some(), "bare path {path} should match a route");
             assert_eq!(matched.unwrap().block, expected_block, "for {path}");
         }
@@ -727,9 +723,7 @@ mod tests {
             "/debug/time",
         ];
         for path in unmatched {
-            let matched = ROUTES
-                .iter()
-                .find(|r| route_prefix_matches(r.prefix, path));
+            let matched = ROUTES.iter().find(|r| route_prefix_matches(r.prefix, path));
             assert!(matched.is_none(), "path {path} should NOT match any route");
         }
     }

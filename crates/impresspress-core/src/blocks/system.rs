@@ -10,7 +10,9 @@ use crate::{
 /// scanning, so no ordering hazard between `itim-latin-` and `itim-latin-ext-`.
 #[cfg(feature = "embed-assets")]
 pub(crate) fn static_asset(filename: &str) -> Option<(&'static [u8], &'static str)> {
-    let e = crate::ui::assets::ASSETS.iter().find(|e| e.filename == filename)?;
+    let e = crate::ui::assets::ASSETS
+        .iter()
+        .find(|e| e.filename == filename)?;
     Some((crate::ui::assets::bytes(e.logical)?, e.content_type))
 }
 

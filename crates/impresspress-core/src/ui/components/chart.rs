@@ -65,7 +65,11 @@ pub fn sparkline(series: &[i64], color_var: &str) -> Markup {
     // a flat line means "no change", so it belongs at the vertical centre
     // of the 24-tall viewBox (y = 12.0), not at y = 24.0.
     let flat = max == min;
-    let step = if series.len() > 1 { 100.0 / (series.len() - 1) as f64 } else { 0.0 };
+    let step = if series.len() > 1 {
+        100.0 / (series.len() - 1) as f64
+    } else {
+        0.0
+    };
     let points = series
         .iter()
         .enumerate()
@@ -131,11 +135,25 @@ pub fn line_chart_card(
             }
         })
         .collect();
-    let step = if data.len() > 1 { 100.0 / (data.len() - 1) as f64 } else { 0.0 };
-    let pts = |f: &dyn Fn(usize, i64) -> String| {
-        data.iter().enumerate().map(|(i, (_, v))| f(i, *v)).collect::<Vec<_>>().join(" ")
+    let step = if data.len() > 1 {
+        100.0 / (data.len() - 1) as f64
+    } else {
+        0.0
     };
-    let line = pts(&|i, v| format!("{:.2},{:.2}", i as f64 * step, 60.0 - (v as f64 / max as f64) * 60.0));
+    let pts = |f: &dyn Fn(usize, i64) -> String| {
+        data.iter()
+            .enumerate()
+            .map(|(i, (_, v))| f(i, *v))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let line = pts(&|i, v| {
+        format!(
+            "{:.2},{:.2}",
+            i as f64 * step,
+            60.0 - (v as f64 / max as f64) * 60.0
+        )
+    });
     let area = format!("0,60 {line} 100,60");
     let fmt_short = |s: &str| -> String {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -216,8 +234,18 @@ mod tests {
             m.contains(r#"aria-hidden="true""#),
             "sparkline duplicates the value beside it"
         );
-        let pts = m.split("points=\"").nth(1).unwrap().split('"').next().unwrap();
-        assert_eq!(pts.split_whitespace().count(), 3, "one point per sample: {pts}");
+        let pts = m
+            .split("points=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(
+            pts.split_whitespace().count(),
+            3,
+            "one point per sample: {pts}"
+        );
     }
 
     #[test]
@@ -233,16 +261,28 @@ mod tests {
         // (y = 24.0) would misleadingly read as "zero" / "lowest" instead.
         // It must sit at the viewBox's vertical midpoint, y = 12.0.
         let m = super::sparkline(&[4, 4, 4], "var(--primary-color)").into_string();
-        let pts = m.split("points=\"").nth(1).unwrap().split('"').next().unwrap();
+        let pts = m
+            .split("points=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
         for point in pts.split_whitespace() {
             let y = point.split(',').nth(1).unwrap();
-            assert_eq!(y, "12.00", "flat series must sit at the centre, not an edge: {pts}");
+            assert_eq!(
+                y, "12.00",
+                "flat series must sit at the centre, not an edge: {pts}"
+            );
         }
     }
 
     #[test]
     fn sparkline_empty_series_renders_nothing() {
-        assert_eq!(super::sparkline(&[], "var(--primary-color)").into_string(), "");
+        assert_eq!(
+            super::sparkline(&[], "var(--primary-color)").into_string(),
+            ""
+        );
     }
 
     #[test]
@@ -258,7 +298,10 @@ mod tests {
         .into_string();
         assert!(m.contains("chart__gridline"), "gridlines missing");
         assert!(m.contains("chart__ytick"), "y-axis ticks missing");
-        assert!(m.contains("Aug 1") && m.contains("Aug 2"), "x range labels missing");
+        assert!(
+            m.contains("Aug 1") && m.contains("Aug 2"),
+            "x range labels missing"
+        );
         assert!(m.contains("chart__dot"), "endpoint dot missing");
     }
 

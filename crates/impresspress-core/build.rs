@@ -37,21 +37,65 @@ const CSS_ORDER: &[&str] = &[
 
 /// Single-file assets: (relative path under src/ui, logical key, content type).
 const FILE_ASSETS: &[(&str, &str, &str)] = &[
-    ("assets/htmx.min.js", "htmx.min.js", "application/javascript; charset=utf-8"),
-    ("assets/webmcp.js", "webmcp.js", "application/javascript; charset=utf-8"),
-    ("assets/marked.min.js", "marked.min.js", "application/javascript; charset=utf-8"),
-    ("assets/purify.min.js", "purify.min.js", "application/javascript; charset=utf-8"),
-    ("assets/llm-chat.js", "llm-chat.js", "application/javascript; charset=utf-8"),
-    ("assets/files-browser.js", "files-browser.js", "application/javascript; charset=utf-8"),
-    ("assets/fonts/itim-latin.woff2", "itim-latin.woff2", "font/woff2"),
-    ("assets/fonts/itim-latin-ext.woff2", "itim-latin-ext.woff2", "font/woff2"),
-    ("assets/impresspress-logo.png", "impresspress-logo.png", "image/png"),
-    ("assets/impresspress-logo-2x.png", "impresspress-logo-2x.png", "image/png"),
+    (
+        "assets/htmx.min.js",
+        "htmx.min.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "assets/webmcp.js",
+        "webmcp.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "assets/marked.min.js",
+        "marked.min.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "assets/purify.min.js",
+        "purify.min.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "assets/llm-chat.js",
+        "llm-chat.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "assets/files-browser.js",
+        "files-browser.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "assets/fonts/itim-latin.woff2",
+        "itim-latin.woff2",
+        "font/woff2",
+    ),
+    (
+        "assets/fonts/itim-latin-ext.woff2",
+        "itim-latin-ext.woff2",
+        "font/woff2",
+    ),
+    (
+        "assets/impresspress-logo.png",
+        "impresspress-logo.png",
+        "image/png",
+    ),
+    (
+        "assets/impresspress-logo-2x.png",
+        "impresspress-logo-2x.png",
+        "image/png",
+    ),
     ("assets/favicon.ico", "favicon.ico", "image/x-icon"),
 ];
 
 fn short_hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().take(4).map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `foo.css` + `a1b2c3d4` -> `foo-a1b2c3d4.css`
@@ -72,8 +116,8 @@ fn main() {
     for (rel, logical, ct) in FILE_ASSETS {
         let path = ui.join(rel);
         println!("cargo:rerun-if-changed={}", path.display());
-        let bytes = fs::read(&path)
-            .unwrap_or_else(|e| panic!("missing asset {}: {e}", path.display()));
+        let bytes =
+            fs::read(&path).unwrap_or_else(|e| panic!("missing asset {}: {e}", path.display()));
         let name = hashed_name(logical, &short_hash(&bytes));
         if logical.ends_with(".woff2") {
             font_names.push((logical.to_string(), name.clone()));
@@ -100,7 +144,12 @@ fn main() {
     assert!(!css.contains("__ITIM"), "stale placeholder left in bundle");
 
     let css_name = hashed_name("app.css", &short_hash(css.as_bytes()));
-    entries.push(("app.css".into(), css_name, "text/css; charset=utf-8".into(), css.len()));
+    entries.push((
+        "app.css".into(),
+        css_name,
+        "text/css; charset=utf-8".into(),
+        css.len(),
+    ));
     fs::write(out.join("app.css"), &css).expect("write app.css");
 
     // --- manifest ---------------------------------------------------------

@@ -345,7 +345,10 @@ mod tests {
 
     async fn ctx_with_userportal() -> TestContext {
         let mut ctx = TestContext::with_userportal().await;
-        ctx.register_block("impresspress/userportal", std::sync::Arc::new(UserPortalBlock::new()));
+        ctx.register_block(
+            "impresspress/userportal",
+            std::sync::Arc::new(UserPortalBlock::new()),
+        );
         ctx
     }
 

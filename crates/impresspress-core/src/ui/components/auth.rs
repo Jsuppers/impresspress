@@ -237,7 +237,10 @@ mod tests {
         // this assertion itself doesn't trip the
         // `pages_carry_no_static_inline_styles` guard it's enforcing.
         let style_attr = format!("{}{}", "style", "=");
-        assert!(!m.contains(&style_attr), "alert must not carry inline styles");
+        assert!(
+            !m.contains(&style_attr),
+            "alert must not carry inline styles"
+        );
     }
 
     #[test]

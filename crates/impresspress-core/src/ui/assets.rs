@@ -78,7 +78,11 @@ pub fn base_url() -> &'static str {
         match resolved {
             Some(v) if !v.trim().is_empty() => {
                 let v = v.trim().to_string();
-                if v.ends_with('/') { v } else { format!("{v}/") }
+                if v.ends_with('/') {
+                    v
+                } else {
+                    format!("{v}/")
+                }
             }
             _ => STATIC_PREFIX.to_string(),
         }
@@ -612,7 +616,11 @@ mod tests {
         let h = hex.trim_start_matches('#');
         let ch = |i| {
             let c = u8::from_str_radix(&h[i..i + 2], 16).unwrap() as f64 / 255.0;
-            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
         };
         0.2126 * ch(0) + 0.7152 * ch(2) + 0.0722 * ch(4)
     }
@@ -688,7 +696,10 @@ mod tests {
             ("--navy-700", "#172136"),
             ("--sidebar-text-muted", "#94a3b8"),
         ] {
-            assert!(s.contains(&format!("{name}: {value}")), "missing {name}: {value}");
+            assert!(
+                s.contains(&format!("{name}: {value}")),
+                "missing {name}: {value}"
+            );
         }
     }
 
@@ -696,11 +707,26 @@ mod tests {
     #[test]
     fn ui_font_stack_is_system_and_itim_is_wordmark_only() {
         let s = super::css();
-        assert!(s.contains("--font-ui: system-ui"), "UI face must be the system stack");
-        assert!(s.contains(".brand__wordmark"), "Itim must be scoped to the wordmark");
+        assert!(
+            s.contains("--font-ui: system-ui"),
+            "UI face must be the system stack"
+        );
+        assert!(
+            s.contains(".brand__wordmark"),
+            "Itim must be scoped to the wordmark"
+        );
         // The body must not name Itim any more.
-        let body_rule = s.split("body {").nth(1).expect("body rule").split('}').next().unwrap();
-        assert!(!body_rule.contains("Itim"), "Itim must not be the body face");
+        let body_rule = s
+            .split("body {")
+            .nth(1)
+            .expect("body rule")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !body_rule.contains("Itim"),
+            "Itim must not be the body face"
+        );
     }
 
     /// Strips every `/* ... */` block comment from `s`. Shared by
@@ -863,7 +889,12 @@ mod tests {
         match h.len() {
             3 => {
                 let mut cs = h.chars();
-                Some((double(cs.next()?)?, double(cs.next()?)?, double(cs.next()?)?, 255))
+                Some((
+                    double(cs.next()?)?,
+                    double(cs.next()?)?,
+                    double(cs.next()?)?,
+                    255,
+                ))
             }
             4 => {
                 let mut cs = h.chars();
@@ -874,7 +905,12 @@ mod tests {
                     double(cs.next()?)?,
                 ))
             }
-            6 => Some((hex_byte(&h[0..2])?, hex_byte(&h[2..4])?, hex_byte(&h[4..6])?, 255)),
+            6 => Some((
+                hex_byte(&h[0..2])?,
+                hex_byte(&h[2..4])?,
+                hex_byte(&h[4..6])?,
+                255,
+            )),
             8 => Some((
                 hex_byte(&h[0..2])?,
                 hex_byte(&h[2..4])?,
@@ -894,7 +930,11 @@ mod tests {
     /// this bundle today, checked by grep while writing this) -- callers
     /// treat `None` as "can't verify this rule" and skip it rather than
     /// assuming compliance.
-    fn resolve_color(value: &str, tokens: &std::collections::HashMap<String, String>, depth: u8) -> Option<Rgba> {
+    fn resolve_color(
+        value: &str,
+        tokens: &std::collections::HashMap<String, String>,
+        depth: u8,
+    ) -> Option<Rgba> {
         if depth > 12 {
             return None;
         }
@@ -953,7 +993,9 @@ mod tests {
             };
             let rgba1 = resolve_color(&c1, tokens, depth + 1)?;
             let rgba2 = resolve_color(&c2, tokens, depth + 1)?;
-            let mix = |a: u8, b: u8| -> u8 { ((a as f64 * w1 / 100.0) + (b as f64 * w2 / 100.0)).round() as u8 };
+            let mix = |a: u8, b: u8| -> u8 {
+                ((a as f64 * w1 / 100.0) + (b as f64 * w2 / 100.0)).round() as u8
+            };
             return Some((
                 mix(rgba1.0, rgba2.0),
                 mix(rgba1.1, rgba2.1),
@@ -1298,10 +1340,16 @@ mod tests {
             assert!(e.len > 0, "{key} has zero length");
             // `app.css` -> `app-a1b2c3d4.css`: stem, dash, 8 hex chars, extension.
             let stem = key.split_once('.').unwrap().0;
-            let rest = e.filename.strip_prefix(stem).expect("filename keeps its stem");
+            let rest = e
+                .filename
+                .strip_prefix(stem)
+                .expect("filename keeps its stem");
             let hash = &rest[1..9];
             assert_eq!(hash.len(), 8);
-            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{key}: {hash} not hex");
+            assert!(
+                hash.chars().all(|c| c.is_ascii_hexdigit()),
+                "{key}: {hash} not hex"
+            );
         }
     }
 
@@ -1318,8 +1366,17 @@ mod tests {
         let shell = s.find(".shell").expect("shell layout missing");
         assert!(tokens < button, "tokens must precede components");
         assert!(button < shell, "components must precede layouts");
-        for marker in [".card", ".data-table", ".badge", ".modal", ".toast",
-                       ".palette", ".stat-", ".charts-css", ".auth-split"] {
+        for marker in [
+            ".card",
+            ".data-table",
+            ".badge",
+            ".modal",
+            ".toast",
+            ".palette",
+            ".stat-",
+            ".charts-css",
+            ".auth-split",
+        ] {
             assert!(s.contains(marker), "missing layer marker: {marker}");
         }
     }
@@ -1357,8 +1414,14 @@ mod tests {
     fn cdn_base_template_is_versioned_and_slash_terminated() {
         let t = super::DEFAULT_CDN_BASE_TEMPLATE;
         assert!(t.starts_with("https://cdn.impresspress.org/ui/v"));
-        assert!(t.ends_with('/'), "base must end in / so joins are plain concatenation");
-        assert!(t.contains(env!("CARGO_PKG_VERSION")), "base must pin the crate version");
+        assert!(
+            t.ends_with('/'),
+            "base must end in / so joins are plain concatenation"
+        );
+        assert!(
+            t.contains(env!("CARGO_PKG_VERSION")),
+            "base must pin the crate version"
+        );
     }
 
     #[cfg(feature = "embed-assets")]
@@ -1370,14 +1433,29 @@ mod tests {
         // asset that IS compiled in must match its manifest length...
         for e in super::ASSETS {
             if let Some(b) = super::bytes(e.logical) {
-                assert_eq!(b.len(), e.len, "{} length disagrees with manifest", e.logical);
+                assert_eq!(
+                    b.len(),
+                    e.len,
+                    "{} length disagrees with manifest",
+                    e.logical
+                );
             }
         }
         // ...and the assets that are never feature-gated must always be there.
-        for logical in ["app.css", "htmx.min.js", "webmcp.js", "favicon.ico",
-                        "itim-latin.woff2", "itim-latin-ext.woff2",
-                        "impresspress-logo.png", "impresspress-logo-2x.png"] {
-            assert!(super::bytes(logical).is_some(), "core asset missing: {logical}");
+        for logical in [
+            "app.css",
+            "htmx.min.js",
+            "webmcp.js",
+            "favicon.ico",
+            "itim-latin.woff2",
+            "itim-latin-ext.woff2",
+            "impresspress-logo.png",
+            "impresspress-logo-2x.png",
+        ] {
+            assert!(
+                super::bytes(logical).is_some(),
+                "core asset missing: {logical}"
+            );
         }
     }
 
@@ -1401,7 +1479,10 @@ mod tests {
     #[test]
     fn no_embed_build_has_no_asset_bytes_only_the_manifest() {
         assert!(!cfg!(feature = "embed-assets"));
-        assert!(!super::ASSETS.is_empty(), "build.rs still populates the manifest without embed-assets");
+        assert!(
+            !super::ASSETS.is_empty(),
+            "build.rs still populates the manifest without embed-assets"
+        );
         for e in super::ASSETS {
             // The filename carries its own content hash (baked in by
             // build.rs from the source file's bytes, at *build* time -- this
@@ -1409,7 +1490,11 @@ mod tests {
             // those bytes are additionally compiled into the *runtime*
             // binary). `url()` must still resolve it correctly.
             let u = super::url(e.logical);
-            assert!(u.ends_with(e.filename), "{}: url {u} does not end in its own filename", e.logical);
+            assert!(
+                u.ends_with(e.filename),
+                "{}: url {u} does not end in its own filename",
+                e.logical
+            );
         }
     }
 
@@ -1419,9 +1504,15 @@ mod tests {
         let css = super::css();
         for key in ["itim-latin.woff2", "itim-latin-ext.woff2"] {
             let e = super::ASSETS.iter().find(|e| e.logical == key).unwrap();
-            assert!(css.contains(&format!("url('{}')", e.filename)), "{key} url not rewritten");
+            assert!(
+                css.contains(&format!("url('{}')", e.filename)),
+                "{key} url not rewritten"
+            );
         }
         assert!(!css.contains("__ITIM_LATIN_URL__"), "placeholder survived");
-        assert!(!css.contains("/b/static/"), "font url must be relative, not absolute");
+        assert!(
+            !css.contains("/b/static/"),
+            "font url must be relative, not absolute"
+        );
     }
 }

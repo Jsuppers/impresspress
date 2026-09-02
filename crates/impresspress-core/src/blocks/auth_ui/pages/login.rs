@@ -256,7 +256,8 @@ mod tests {
         let html = output_html(handle(&ctx, &msg).await).await;
 
         assert_eq!(
-            html.matches("The backend that lifts its own weight.").count(),
+            html.matches("The backend that lifts its own weight.")
+                .count(),
             1,
             "headline must appear exactly once: {html}"
         );

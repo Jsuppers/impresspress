@@ -830,8 +830,8 @@ mod tests {
                     }
                     if pending_cfg_test && trimmed.starts_with("mod ") && line.contains('{') {
                         pending_cfg_test = false;
-                        let depth = line.matches('{').count() as i32
-                            - line.matches('}').count() as i32;
+                        let depth =
+                            line.matches('{').count() as i32 - line.matches('}').count() as i32;
                         if depth > 0 {
                             test_mod_depth = Some(depth);
                         }
@@ -1063,8 +1063,9 @@ mod tests {
                         let prop_start = search_from + rel + ".style.".len();
                         let rest = &line[prop_start..];
                         // Property name: identifier chars only.
-                        let prop_len =
-                            rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
+                        let prop_len = rest
+                            .find(|c: char| !c.is_alphanumeric())
+                            .unwrap_or(rest.len());
                         let after_prop = rest[prop_len..].trim_start();
                         // An assignment is a single `=` not immediately
                         // followed (or, since we trimmed whitespace-only
@@ -1352,13 +1353,15 @@ mod tests {
         let mut i = 0;
         while i < masked.len() {
             if masked[i] == '.' {
-                let boundary_ok = i == 0
-                    || matches!(masked[i - 1], ' ' | '\t' | '\n' | '\r' | '{' | '}' | ';');
+                let boundary_ok =
+                    i == 0 || matches!(masked[i - 1], ' ' | '\t' | '\n' | '\r' | '{' | '}' | ';');
                 if boundary_ok && masked.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
                     let start = i + 1;
                     let mut j = start;
                     while j < masked.len()
-                        && (masked[j].is_ascii_alphanumeric() || masked[j] == '_' || masked[j] == '-')
+                        && (masked[j].is_ascii_alphanumeric()
+                            || masked[j] == '_'
+                            || masked[j] == '-')
                     {
                         j += 1;
                     }
@@ -1551,7 +1554,8 @@ mod tests {
         let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
         while i < chars.len() {
-            if chars[i] == '.' && matches!(chars.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == '_')
+            if chars[i] == '.'
+                && matches!(chars.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == '_')
             {
                 let start = i + 1;
                 let mut j = start;
@@ -1768,7 +1772,10 @@ mod tests {
         // it -- delete it and let the main assertion above re-verify the
         // usage for real).
         let mut stale = Vec::new();
-        for name in NO_STYLESHEET_RULE_NEEDED.iter().chain(KNOWN_PRE_EXISTING_GAPS.iter()) {
+        for name in NO_STYLESHEET_RULE_NEEDED
+            .iter()
+            .chain(KNOWN_PRE_EXISTING_GAPS.iter())
+        {
             let still_used = used.contains_key(*name);
             let still_undefined = !defined.contains(*name);
             if !(still_used && still_undefined) {

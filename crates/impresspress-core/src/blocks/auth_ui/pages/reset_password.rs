@@ -4,7 +4,10 @@
 use maud::{html, PreEscaped};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use crate::{ui, ui::components::auth_panel, ui::icons, ui::templates::auth_split};
+use crate::{
+    ui,
+    ui::{components::auth_panel, icons, templates::auth_split},
+};
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let logo_url = ctx

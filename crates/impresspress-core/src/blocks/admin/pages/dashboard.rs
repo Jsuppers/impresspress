@@ -363,25 +363,37 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
             label: "Total Users",
             value: &user_count_str,
             icon: icons::users(),
-            spark: Some(components::sparkline(&new_users_series, "var(--primary-color)")),
+            spark: Some(components::sparkline(
+                &new_users_series,
+                "var(--primary-color)",
+            )),
         },
         StatTile {
             label: "New Today",
             value: &new_users_str,
             icon: icons::user_plus(),
-            spark: Some(components::sparkline(&new_users_series, "var(--primary-color)")),
+            spark: Some(components::sparkline(
+                &new_users_series,
+                "var(--primary-color)",
+            )),
         },
         StatTile {
             label: "Requests Today",
             value: &requests_str,
             icon: icons::file_text(),
-            spark: Some(components::sparkline(&requests_series, "var(--accent-warning)")),
+            spark: Some(components::sparkline(
+                &requests_series,
+                "var(--accent-warning)",
+            )),
         },
         StatTile {
             label: "Errors Today",
             value: &errors_str,
             icon: icons::triangle_alert(),
-            spark: Some(components::sparkline(&errors_series, "var(--accent-danger)")),
+            spark: Some(components::sparkline(
+                &errors_series,
+                "var(--accent-danger)",
+            )),
         },
         StatTile {
             label: "Avg Response",
@@ -523,16 +535,23 @@ mod tests {
     #[test]
     fn dashboard_renders_stats_before_charts() {
         let m = crate::ui::templates::dashboard_page(
-            crate::ui::templates::PageHeader { title: "Dashboard", subtitle: None, primary_action: None },
+            crate::ui::templates::PageHeader {
+                title: "Dashboard",
+                subtitle: None,
+                primary_action: None,
+            },
             vec![crate::ui::templates::StatTile {
-                label: "TOTAL USERS", value: "1",
-                icon: maud::html! { span .probe-icon {} }, spark: None,
+                label: "TOTAL USERS",
+                value: "1",
+                icon: maud::html! { span .probe-icon {} },
+                spark: None,
             }],
             maud::html! { div .probe-primary {} },
             maud::html! {},
             None,
             None,
-        ).into_string();
+        )
+        .into_string();
         let stats = m.find("stats-grid").expect("stats grid missing");
         let charts = m.find("dashboard-grid").expect("charts grid missing");
         assert!(stats < charts, "stat tiles must precede the charts row");
