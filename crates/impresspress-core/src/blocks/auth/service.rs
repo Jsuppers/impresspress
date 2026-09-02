@@ -455,7 +455,7 @@ mod tests {
     //! that `grants()` returns the expected consumer set.
     use std::sync::Arc;
 
-    use wafer_core::{clients::database as db, interfaces::auth::service::AuthService as _};
+    use wafer_core::clients::database as db;
 
     use super::*;
     use crate::test_support::TestContext;
