@@ -65,11 +65,22 @@
 	--sidebar-width: 240px;
 	--sidebar-collapsed-width: 72px;
 
-	--spacing-xs: 0.25rem;
-	--spacing-sm: 0.5rem;
-	--spacing-md: 1rem;
-	--spacing-lg: 1.5rem;
-	--spacing-xl: 2rem;
+	/* Numeric 4px scale -- --space-N is N * 4px. Replaces the old
+	   --spacing-xs/sm/md/lg/xl + --space-2xl t-shirt names: a t-shirt scale
+	   can't express gaps that fall between existing steps (12px, 20px)
+	   without inventing awkward names like --spacing-sm-md, and two
+	   coexisting spacing systems was the actual bug this fixes. Every
+	   former --spacing-*/--space-2xl consumer has been migrated to the
+	   matching step below -- there is no alias, so a stray old name now
+	   fails to resolve instead of silently reintroducing the drift. */
+	--space-1: 0.25rem;  /*  4px */
+	--space-2: 0.5rem;   /*  8px */
+	--space-3: 0.75rem;  /* 12px */
+	--space-4: 1rem;     /* 16px */
+	--space-5: 1.25rem;  /* 20px */
+	--space-6: 1.5rem;   /* 24px */
+	--space-8: 2rem;     /* 32px */
+	--space-12: 3rem;    /* 48px */
 
 	--radius-sm: 4px;
 	--radius-md: 8px;
@@ -95,9 +106,6 @@
 	--text-lg: 1.125rem;   /* 18px — section headings */
 	--text-xl: 1.375rem;   /* 22px — page titles */
 	--text-2xl: 1.75rem;   /* 28px — dashboard hero numbers */
-
-	/* Page gutter, sits above existing --spacing-xl */
-	--space-2xl: 3rem;
 
 	/* Layered surfaces — same values the codebase already uses ad-hoc */
 	--surface-1: #ffffff;

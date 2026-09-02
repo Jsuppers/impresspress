@@ -1,13 +1,13 @@
 /* ===== Auth form heading (e.g. "Welcome back") ===== */
-.auth-form__title { font-size: var(--text-2xl); font-weight: 700; margin: 0 0 var(--spacing-xs); color: var(--text-primary); }
-.auth-form__subtitle { font-size: var(--text-base); color: var(--text-secondary); margin: 0 0 var(--spacing-lg); }
+.auth-form__title { font-size: var(--text-2xl); font-weight: 700; margin: 0 0 var(--space-1); color: var(--text-primary); }
+.auth-form__subtitle { font-size: var(--text-base); color: var(--text-secondary); margin: 0 0 var(--space-6); }
 
 /* ===== Alert (auth pages: #error / #info) ===== */
 .alert {
-	display: flex; align-items: center; gap: var(--spacing-sm);
-	padding: var(--spacing-sm) var(--spacing-md);
+	display: flex; align-items: center; gap: var(--space-2);
+	padding: var(--space-2) var(--space-4);
 	border-radius: var(--radius-md);
-	margin-bottom: var(--spacing-md);
+	margin-bottom: var(--space-4);
 	font-size: var(--text-sm);
 }
 
@@ -24,12 +24,12 @@
 /* ===== OAuth ===== */
 .oauth-buttons {
 	display: flex; flex-direction: column;
-	gap: var(--spacing-sm); margin-bottom: var(--spacing-md);
+	gap: var(--space-2); margin-bottom: var(--space-4);
 }
 
 .btn-oauth {
-	width: 100%; gap: var(--spacing-sm);
-	padding: 0.625rem 1rem;
+	width: 100%; gap: var(--space-2);
+	padding: var(--space-3) var(--space-4);
 	background: #000; color: #fff;
 	border: 1px solid #000; border-radius: var(--radius-md);
 	font-weight: 500; font-size: 0.95rem;
@@ -39,8 +39,8 @@
 .btn-oauth:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .auth-divider {
-	display: flex; align-items: center; gap: var(--spacing-sm);
-	margin: var(--spacing-sm) 0 var(--spacing-md);
+	display: flex; align-items: center; gap: var(--space-2);
+	margin: var(--space-2) 0 var(--space-4);
 	color: var(--text-muted); font-size: var(--text-xs);
 }
 
@@ -50,4 +50,4 @@
 }
 
 /* ===== Auth form row actions (e.g. "Forgot password?") ===== */
-.auth-actions { text-align: right; margin-bottom: var(--spacing-md); }
+.auth-actions { text-align: right; margin-bottom: var(--space-4); }

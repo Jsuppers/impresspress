@@ -598,7 +598,7 @@ mod tests {
         for tok in [
             "--text-base",
             "--text-2xl",
-            "--space-2xl",
+            "--space-12",
             "--surface-1",
             "--primary-button",
             "--focus-ring",
