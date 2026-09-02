@@ -5243,3 +5243,155 @@ async fn payment_link_webhook_reconciles_exact_order_and_rejects_tampering() {
         );
     }
 }
+
+/// Soft delete touches nothing in Stripe, so a deleted product's Payment
+/// Links stay live in the connected account and stay payable. Reconciliation
+/// used to read the product through the live-only `repo::products::get`, so
+/// the delivery for a session paid through such a link answered `NotFound`,
+/// `fail_webhook!` turned that into an error, and Stripe retried it forever:
+/// money captured, no purchase row, no line items, and a buyer's order-status
+/// page that never resolves. The reconciliation reads past the filter for the
+/// same reason `archive_offer_catalog` does — its subject is a payment that
+/// has already happened, and the row is read for the buyer's own receipt.
+#[tokio::test]
+async fn a_paid_link_for_a_soft_deleted_product_still_reconciles_into_an_order() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let product_id = "product_deleted_but_payable";
+    seed(
+        &ctx,
+        repo::products::TABLE,
+        product_id,
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Field guide")),
+            ("slug".to_string(), serde_json::json!(product_id)),
+            ("status".to_string(), serde_json::json!("active")),
+            ("approval_status".to_string(), serde_json::json!("approved")),
+            ("owner_kind".to_string(), serde_json::json!("platform")),
+        ]),
+    )
+    .await;
+    let definition: OfferDefinitionRequest = serde_json::from_value(serde_json::json!({
+        "name": "One-off purchase",
+        "mode": "payment",
+        "currency": "nzd",
+        "pricing_model": "fixed",
+        "usage_type": "licensed",
+        "billing_scheme": "per_unit",
+        "tax_behavior": "exclusive",
+        "components": [{
+            "key": "guide",
+            "label": "Field guide",
+            "required": true,
+            "amount": {"type": "fixed", "unit_amount_minor": 4900}
+        }]
+    }))
+    .unwrap();
+    let offer = repo::offers::create(&ctx, product_id, "admin_1", &definition)
+        .await
+        .unwrap();
+    let offer_id = offer.offer.id;
+    repo::offers::publish(&ctx, product_id, &offer_id)
+        .await
+        .unwrap();
+    let managed = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: Default::default(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let pending_link = repo::payment_links::create_pending(
+        &ctx,
+        &offer_id,
+        "",
+        "",
+        "",
+        false,
+        "deleted-product-link-config",
+        &preview,
+        0,
+    )
+    .await
+    .unwrap();
+    let link_id = pending_link.managed.id;
+    repo::payment_links::mark_synced(
+        &ctx,
+        &link_id,
+        "plink_deleted",
+        "https://buy.stripe.com/deleted",
+    )
+    .await
+    .unwrap();
+
+    // The product is deleted locally. Its Payment Link is untouched in
+    // Stripe, so a customer can still pay through it.
+    repo::products::soft_delete(&ctx, product_id)
+        .await
+        .expect("soft delete");
+
+    let event = serde_json::json!({
+        "id": "evt_deleted_product_link",
+        "type": "checkout.session.completed",
+        "livemode": false,
+        "data": {
+            "object": {
+                "id": "cs_deleted_product_link",
+                "payment_link": "plink_deleted",
+                "mode": "payment",
+                "payment_status": "paid",
+                "metadata": {
+                    "impresspress_payment_link_id": link_id,
+                    "offer_id": offer_id,
+                    "offer_version": "1"
+                },
+                "currency": "nzd",
+                "amount_subtotal": 4900,
+                "amount_total": 4900,
+                "total_details": {
+                    "amount_discount": 0,
+                    "amount_tax": 0,
+                    "amount_shipping": 0
+                },
+                "customer_details": {"email": "buyer@example.com"},
+                "customer": "cus_deleted",
+                "payment_intent": "pi_deleted",
+                "livemode": false
+            }
+        }
+    });
+
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let body = output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await;
+    assert_eq!(body["received"], true, "the delivery must not fail: {body}");
+
+    let order = repo::purchases::find_by_session(&ctx, "cs_deleted_product_link")
+        .await
+        .unwrap()
+        .expect("the captured payment must have produced an order");
+    assert_eq!(order.data["status"], "completed");
+    assert_eq!(order.data["total_cents"], 4900);
+    assert_eq!(order.data["buyer_email"], "buyer@example.com");
+
+    let items = repo::purchases::list_line_items(&ctx, &order.id)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1, "the order must carry its line item");
+    assert_eq!(
+        RecordExt::str_field(&items[0], "product_id"),
+        product_id,
+        "the line item still points at the soft-deleted product row, which is \
+         why the row has to stay"
+    );
+
+    // And the product is still deleted — reconciling a payment must not
+    // resurrect a listing into the public catalog.
+    assert!(repo::products::get(&ctx, product_id).await.is_err());
+}

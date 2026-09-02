@@ -2680,7 +2680,15 @@ async fn reconcile_payment_link_session(
             "Payment Link Checkout Session payment is not complete",
         ));
     }
-    let product = repo::products::get(ctx, &offer.product_id).await?;
+    // Reads past the soft-delete filter on purpose. Soft delete touches
+    // nothing in Stripe, so a deleted product's Payment Links stay live in
+    // the connected account and stay payable; the money in this session has
+    // already been captured. A live-only read answered `NotFound` here, the
+    // caller's `fail_webhook!` turned that into an error, and Stripe retried
+    // the delivery forever — the customer charged, no purchase row, no line
+    // items, and an order-status page that never resolved. The row is read
+    // for the product name on the buyer's own receipt.
+    let product = repo::products::get_including_deleted(ctx, &offer.product_id).await?;
     pricing.amounts.discount_minor = discount;
     pricing.amounts.tax_minor = tax;
     pricing.amounts.shipping_minor = shipping;
