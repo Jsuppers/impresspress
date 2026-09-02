@@ -359,37 +359,7 @@ pub fn validate_static(
     }
 
     // --- Routes -----------------------------------------------------------
-    // The block serves exactly one prefix, derived from its name. So this
-    // rule is what a malformed name turns into once it reaches the router:
-    // `name-format` says the name is illegal, this says the route it would
-    // produce is unsafe to match by prefix.
-    if !is_normalized_prefix(&prefix) {
-        found.push(Diagnostic::error(
-            ROUTE_PREFIX_CODE,
-            format!("{prefix:?} is not a normalized route prefix"),
-        ));
-    }
-    for builtin in builtin_routes {
-        if prefixes_overlap(&prefix, builtin) {
-            found.push(Diagnostic::error(
-                ROUTE_COLLISION,
-                format!("{prefix:?} collides with the built-in route {builtin:?}"),
-            ));
-        }
-    }
-    for other in active {
-        for route in &other.routes {
-            if prefixes_overlap(&prefix, &route.prefix) {
-                found.push(Diagnostic::error(
-                    ROUTE_COLLISION,
-                    format!(
-                        "{prefix:?} collides with {:?}, served by {:?}",
-                        route.prefix, other.name
-                    ),
-                ));
-            }
-        }
-    }
+    check_route_prefix(&prefix, builtin_routes, active, &mut found);
 
     // --- Endpoints --------------------------------------------------------
     for endpoint in &info.endpoints {
@@ -456,7 +426,7 @@ pub fn validate_static(
         .capabilities
         .clone()
         .unwrap_or_else(BlockCapabilities::none);
-    check_capabilities(name, info, &capabilities, &mut found);
+    check_capabilities(name, Some(&info.requires), &capabilities, &mut found);
 
     if !found.is_empty() {
         return Err(found);
@@ -490,6 +460,128 @@ pub fn validate_static(
     })
 }
 
+/// Check every rule that can be decided from an **accepted**
+/// [`DynamicBlockSpec`] alone — no `BlockInfo`, no
+/// [`super::control::RuntimeControl`], no artifact.
+///
+/// [`validate_static`] is the staging path's entry point and needs the guest's
+/// own `BlockInfo`, which only a runtime can produce. The seed importer
+/// (design §10.2) has no runtime: it is handed specs another instance already
+/// accepted, over a `/seed/` prefix the service worker deliberately *bypasses*
+/// — so the bytes are whatever the static host serves. Spec §13's
+/// deny-by-default capabilities have to hold on that entry point too, and this
+/// is the subset of the rules that can be applied there.
+///
+/// The rule *bodies* are [`validate_static`]'s own — [`check_route_prefix`]
+/// and [`check_capabilities`], called with the same arguments — so the two
+/// entry points cannot come to different conclusions about the same guest.
+/// What is missing is exactly what needs the guest's report: the
+/// name-mismatch, endpoint-inside-routes and duplicate-agent-tool rules all
+/// read `BlockInfo`, and `callable_blocks`/`requires` cannot be compared with
+/// only one of the pair in hand (the entries are still checked against
+/// [`ALLOWED_CALLABLE_BLOCKS`]).
+///
+/// * `spec` — the block being admitted.
+/// * `builtin_routes` — every prefix the router already owns; see
+///   [`builtin_route_prefixes`].
+/// * `others` — the other blocks in the same set, this one excluded.
+pub fn validate_spec(
+    spec: &DynamicBlockSpec,
+    builtin_routes: &[&str],
+    others: &[DynamicBlockSpec],
+) -> Result<(), Vec<Diagnostic>> {
+    let mut found = Vec::new();
+    let name = spec.name.strip_prefix("site/").unwrap_or(&spec.name);
+
+    // --- Identity ---------------------------------------------------------
+    if !paths::block_name_is_valid(name) {
+        found.push(name_format_diagnostic(name));
+    }
+    if let Some(reserved) = RESERVED_NAME_PREFIXES
+        .iter()
+        .find(|reserved| spec.name.starts_with(**reserved))
+    {
+        found.push(Diagnostic::error(
+            NAME_RESERVED,
+            format!(
+                "the block is registered as {:?}; {reserved:?} is reserved for built-in blocks",
+                spec.name
+            ),
+        ));
+    }
+
+    // --- Routes -----------------------------------------------------------
+    // A guest serves exactly the one prefix its name produces
+    // ([`validate_static`] builds the accepted spec that way), so a spec
+    // carrying any other prefix was not produced by these rules — it is a
+    // route claim, and it is refused as one.
+    let prefix = format!("/b/{name}/");
+    check_route_prefix(&prefix, builtin_routes, others, &mut found);
+    for route in &spec.routes {
+        if route.prefix != prefix {
+            found.push(Diagnostic::error(
+                ROUTE_PREFIX_CODE,
+                format!(
+                    "the block claims the route {:?}; a block named {name:?} serves {prefix:?} \
+                     and nothing else",
+                    route.prefix
+                ),
+            ));
+        }
+    }
+
+    // --- Capabilities -----------------------------------------------------
+    check_capabilities(name, None, &spec.capabilities, &mut found);
+
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(found)
+    }
+}
+
+/// The route rules for one block's prefix: normalized, and colliding with
+/// neither a built-in route nor another block's.
+///
+/// The block serves exactly one prefix, derived from its name. So the first
+/// rule is what a malformed name turns into once it reaches the router:
+/// `name-format` says the name is illegal, `route-prefix` says the route it
+/// would produce is unsafe to match by prefix.
+fn check_route_prefix(
+    prefix: &str,
+    builtin_routes: &[&str],
+    others: &[DynamicBlockSpec],
+    found: &mut Vec<Diagnostic>,
+) {
+    if !is_normalized_prefix(prefix) {
+        found.push(Diagnostic::error(
+            ROUTE_PREFIX_CODE,
+            format!("{prefix:?} is not a normalized route prefix"),
+        ));
+    }
+    for builtin in builtin_routes {
+        if prefixes_overlap(prefix, builtin) {
+            found.push(Diagnostic::error(
+                ROUTE_COLLISION,
+                format!("{prefix:?} collides with the built-in route {builtin:?}"),
+            ));
+        }
+    }
+    for other in others {
+        for route in &other.routes {
+            if prefixes_overlap(prefix, &route.prefix) {
+                found.push(Diagnostic::error(
+                    ROUTE_COLLISION,
+                    format!(
+                        "{prefix:?} collides with {:?}, served by {:?}",
+                        route.prefix, other.name
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// The §6.5 capability rules.
 ///
 /// Every one of them is "the guest may only name things inside its own
@@ -498,9 +590,15 @@ pub fn validate_static(
 /// default and always passes, `Any` never does — an unrestricted capability
 /// is by definition outside any namespace — and `Only` is checked entry by
 /// entry.
+///
+/// `requires` is the guest's own `BlockInfo::requires`, or `None` for a caller
+/// that has no `BlockInfo` to read it from ([`validate_spec`]). It gates only
+/// the `callable_blocks`/`requires` agreement rule: with one half of the pair
+/// missing there is nothing to compare, and inventing an empty set for the
+/// other half would refuse every guest that legitimately uses a service.
 fn check_capabilities(
     name: &str,
-    info: &BlockInfo,
+    requires: Option<&[String]>,
     capabilities: &BlockCapabilities,
     found: &mut Vec<Diagnostic>,
 ) {
@@ -632,17 +730,21 @@ fn check_capabilities(
     // dependency view and the capability the runtime enforces cannot describe
     // different blocks.
     let allowed: BTreeSet<&str> = ALLOWED_CALLABLE_BLOCKS.iter().copied().collect();
-    let required: BTreeSet<&str> = info.requires.iter().map(String::as_str).collect();
-    match callable_blocks {
-        Allowlist::None => compare_requires(&BTreeSet::new(), &required, found),
-        Allowlist::Any => found.push(Diagnostic::error(
-            CAP_CALLABLE,
-            format!(
-                "`callable_blocks` must name exactly the services the guest uses; \
-                 allowed: {}",
-                ALLOWED_CALLABLE_BLOCKS.join(", ")
-            ),
-        )),
+    // `None` for `Any`: an unrestricted set names no services, so there is
+    // nothing to compare `requires` against once it has been refused.
+    let declared: Option<BTreeSet<&str>> = match callable_blocks {
+        Allowlist::None => Some(BTreeSet::new()),
+        Allowlist::Any => {
+            found.push(Diagnostic::error(
+                CAP_CALLABLE,
+                format!(
+                    "`callable_blocks` must name exactly the services the guest uses; \
+                     allowed: {}",
+                    ALLOWED_CALLABLE_BLOCKS.join(", ")
+                ),
+            ));
+            None
+        }
         Allowlist::Only(entries) => {
             let declared: BTreeSet<&str> = entries.iter().map(String::as_str).collect();
             for entry in declared.difference(&allowed) {
@@ -654,8 +756,12 @@ fn check_capabilities(
                     ),
                 ));
             }
-            compare_requires(&declared, &required, found);
+            Some(declared)
         }
+    };
+    if let (Some(declared), Some(requires)) = (declared, requires) {
+        let required: BTreeSet<&str> = requires.iter().map(String::as_str).collect();
+        compare_requires(&declared, &required, found);
     }
 }
 

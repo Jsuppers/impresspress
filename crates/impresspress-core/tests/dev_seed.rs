@@ -9,7 +9,7 @@
 //! contract backed by a `BTreeMap`.
 #![cfg(feature = "block-dev")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use impresspress_core::{
     blocks::dev::{
@@ -24,6 +24,7 @@ use impresspress_core::{
     },
     test_support::TestContext,
 };
+use wafer_block::{Allowlist, BlockCapabilities};
 
 // ---------------------------------------------------------------------------
 // The fetch seam
@@ -449,6 +450,89 @@ async fn a_block_name_that_cannot_be_registered_is_refused() {
         error.contains("site/my_shop") && error.contains("cannot be registered"),
         "{error}"
     );
+    assert!(error.contains("name-format"), "{error}");
+}
+
+/// A seed's capabilities are granted verbatim by `load_guest`, so §6.5 has to
+/// hold on this entry point exactly as it does on staging. `/seed/` is a
+/// service-worker *bypass* prefix and §10.1 makes exports deliberately
+/// re-importable, so the bundle is not necessarily one this instance wrote.
+#[tokio::test]
+async fn a_seeded_block_reaching_outside_its_namespace_is_refused() {
+    for (label, capabilities, code) in [
+        (
+            "a collection in someone else's namespace",
+            BlockCapabilities {
+                collections: Allowlist::Only(BTreeSet::from([
+                    "impresspress__auth__users".to_string()
+                ])),
+                ..BlockCapabilities::none()
+            },
+            "cap-collection",
+        ),
+        (
+            "raw SQL",
+            BlockCapabilities {
+                raw_sql: true,
+                ..BlockCapabilities::none()
+            },
+            "cap-raw-sql",
+        ),
+        (
+            "an unrestricted storage allowlist",
+            BlockCapabilities {
+                storage_folders: Allowlist::Any,
+                ..BlockCapabilities::none()
+            },
+            "cap-folder",
+        ),
+        (
+            "network access",
+            BlockCapabilities {
+                network: Allowlist::Only(BTreeSet::from(["evil.example".to_string()])),
+                ..BlockCapabilities::none()
+            },
+            "cap-network",
+        ),
+    ] {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let mut manifest = manifest();
+        manifest.blocks[0].spec.capabilities = capabilities;
+
+        let Err(error) = seed::import(&ctx, &manifest, &bundle()).await else {
+            panic!("{label} must refuse the import");
+        };
+        assert!(error.contains("site/hello"), "{label}: {error}");
+        assert!(error.contains(code), "{label}: {error}");
+
+        // Refused before anything was fetched: the workspace must not carry
+        // half a bundle whose block was never going to be admitted.
+        assert!(
+            workspace::load(&ctx)
+                .await
+                .expect("workspace")
+                .files
+                .is_empty(),
+            "{label}: nothing may be stored by a refused import"
+        );
+    }
+}
+
+/// The route half of the same gate: a seeded spec may not claim a prefix its
+/// name does not produce, and two seeded blocks may not claim one prefix.
+#[tokio::test]
+async fn a_seeded_block_claiming_someone_elses_route_is_refused() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let mut manifest = manifest();
+    manifest.blocks[0].spec.routes = vec![DynamicRoute {
+        prefix: "/admin/".to_string(),
+        access: RouteAccessKind::Public,
+    }];
+
+    let error = seed::import(&ctx, &manifest, &bundle())
+        .await
+        .expect_err("a route claim outside the block's own prefix must refuse the import");
+    assert!(error.contains("route-prefix"), "{error}");
 }
 
 /// Two paths carrying the same asset cost one blob and are charged once — the

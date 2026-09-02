@@ -28,14 +28,27 @@
 //! produce: a manifest naming `site/../../elsewhere`, or claiming a hash it
 //! does not have, is refused with a message that names the path.
 //!
+//! Every seeded block's **spec** is re-checked against the rules that do not
+//! need a runtime — [`validation::validate_spec`]: its name, its route prefix
+//! against the built-ins and against the rest of the bundle, and every §6.5
+//! capability rule. A seed is loaded with exactly the capabilities its
+//! manifest declares, so without this a bundle asking for `raw_sql` or a
+//! collection outside its own namespace would be granted it verbatim, and
+//! §10.1 makes exports deliberately re-importable by someone who did not
+//! write them.
+//!
 //! # What is *not* verified
 //!
 //! The guests are not re-inspected or re-probed. A seeded block was validated
 //! when it was staged in the instance that exported it, and the importer has
 //! no [`super::control::RuntimeControl`] handle of its own; the activation the
 //! caller then requests still refuses a manifest whose artifact is not stored.
-//! Re-running the static rules over a seed is a Plan 4 question, recorded in
-//! that task's report rather than half-answered here.
+//! So the rules that read the guest's own `BlockInfo` — that it calls itself
+//! `site/<name>`, that its endpoints fall inside its routes, that its agent
+//! tool names are unclaimed, and that `callable_blocks` equals `requires` —
+//! are not applied: nothing here can ask the guest what it reports. Running
+//! them means executing the artifact, which is [`super::control`]'s job and
+//! Plan 4's question.
 
 use serde::{Deserialize, Serialize};
 use wafer_run::context::Context;
@@ -229,6 +242,34 @@ pub async fn import(
         ));
     }
 
+    // Every spec, before a single byte is fetched. Two reasons for the
+    // ordering: a bundle whose second block is refused must not have left the
+    // first one's artifact in the store, and the rules that read the rest of
+    // the set need the whole set in hand. `validate_spec` is also what refuses
+    // an unregisterable name, which everything below derives a URL and a
+    // workspace directory from.
+    let specs: Vec<DynamicBlockSpec> = manifest.blocks.iter().map(|b| b.spec.clone()).collect();
+    let builtin_routes = validation::builtin_route_prefixes();
+    for (index, spec) in specs.iter().enumerate() {
+        let others: Vec<DynamicBlockSpec> = specs
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, spec)| spec.clone())
+            .collect();
+        if let Err(found) = validation::validate_spec(spec, &builtin_routes, &others) {
+            return Err(format!(
+                "the seed bundle's block {:?} cannot be registered: {}",
+                spec.name,
+                found
+                    .iter()
+                    .map(|d| format!("{} [{}]", d.message, d.code))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+    }
+
     let mut ws = Workspace::default();
     for entry in &manifest.site {
         let workspace_path = format!("{}{}", workspace::SITE_PREFIX, entry.path);
@@ -238,12 +279,6 @@ pub async fn import(
 
     for block in &manifest.blocks {
         let name = short_name(&block.spec.name);
-        if !paths::block_name_is_valid(name) {
-            return Err(format!(
-                "the seed bundle carries a block named {:?}, which cannot be registered",
-                block.spec.name
-            ));
-        }
         // The artifact is content-addressed by the spec itself, so the spec's
         // own `artifact_sha256` is the check — there is no second declaration
         // of it to disagree with.
