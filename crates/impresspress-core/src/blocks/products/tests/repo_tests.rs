@@ -296,9 +296,12 @@ async fn subscription_for_user_projects_curated_columns_without_leaking_ids() {
         .await
         .expect("no repository error")
         .expect("subscription exists");
-    let map = out
+    // The repo returns the typed `SubscriptionView`; the assertions below are
+    // about what it puts on the wire, so check its serialized form.
+    let value = serde_json::to_value(&out).expect("SubscriptionView serializes");
+    let map = value
         .as_object()
-        .expect("subscription_for_user returns a JSON object");
+        .expect("subscription_for_user serializes as a JSON object");
 
     for col in [
         "id",

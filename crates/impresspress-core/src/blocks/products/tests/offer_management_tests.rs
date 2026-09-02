@@ -618,11 +618,11 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
     );
     let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(created["data"]["status"], "draft");
-    assert_eq!(created["data"]["approval_status"], "draft");
-    assert_eq!(created["data"]["owner_kind"], "user");
-    assert_eq!(created["data"]["owner_id"], "seller_a");
-    assert_eq!(created["data"]["created_by"], "seller_a");
+    assert_eq!(created["status"], "draft");
+    assert_eq!(created["approval_status"], "draft");
+    assert_eq!(created["owner_kind"], "user");
+    assert_eq!(created["owner_id"], "seller_a");
+    assert_eq!(created["created_by"], "seller_a");
 
     // Same on the update side: the publication request is refused whole, so
     // the product does not enter review as a side effect of a body that also
@@ -654,11 +654,11 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
         json!({"status": "active"}),
     );
     let submitted = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(submitted["data"]["status"], "pending_review");
-    assert_eq!(submitted["data"]["approval_status"], "pending");
-    assert_eq!(submitted["data"]["owner_id"], "seller_a");
-    assert_eq!(submitted["data"]["created_by"], "seller_a");
-    assert!(submitted["data"]["submitted_at"].as_str().is_some());
+    assert_eq!(submitted["status"], "pending_review");
+    assert_eq!(submitted["approval_status"], "pending");
+    assert_eq!(submitted["owner_id"], "seller_a");
+    assert_eq!(submitted["created_by"], "seller_a");
+    assert!(submitted["submitted_at"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -678,7 +678,7 @@ async fn seller_product_can_publish_directly_when_moderation_is_disabled() {
     );
     let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(created["data"]["approval_status"], "approved");
+    assert_eq!(created["approval_status"], "approved");
 
     let (msg, input) = update_msg(
         &format!("/b/products/products/{product_id}"),
@@ -686,9 +686,9 @@ async fn seller_product_can_publish_directly_when_moderation_is_disabled() {
         json!({"status": "active"}),
     );
     let published = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(published["data"]["status"], "active");
-    assert_eq!(published["data"]["approval_status"], "approved");
-    assert!(published["data"]["published_at"].as_str().is_some());
+    assert_eq!(published["status"], "active");
+    assert_eq!(published["approval_status"], "approved");
+    assert!(published["published_at"].as_str().is_some());
 }
 
 #[test]

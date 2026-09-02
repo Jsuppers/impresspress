@@ -16,8 +16,9 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError
 use super::{
     contracts::{
         AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, ManagedOffer,
-        ManagedPaymentLink, Offer, OfferMode, OfferStatus, PaymentLinkCreateRequest,
-        PricingPreviewRequest, WebhookAck, WebhookEventList, WebhookEventSummary,
+        ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus, PaymentLinkCreateRequest,
+        PricingPreviewRequest, ReconciliationStatus, WebhookAck, WebhookEventList,
+        WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
 };
@@ -1276,7 +1277,7 @@ async fn handle_offer_checkout(
         ),
         (
             "reconciliation_status".to_string(),
-            serde_json::json!("awaiting_payment"),
+            serde_json::json!(ReconciliationStatus::AwaitingPayment),
         ),
         (
             "updated_at".to_string(),
@@ -2520,7 +2521,8 @@ async fn reconcile_payment_link_session(
     // identity/amount cross-check still runs; only creation is skipped).
     let mut resumed_order = None;
     if let Some(existing) = repo::purchases::find_by_session(ctx, session_id).await? {
-        if matches!(existing.str_field("status"), "pending" | "checkout_started") {
+        let status = OrderStatus::from_record(&existing)?;
+        if status.awaits_completion() {
             resumed_order = Some(existing);
         } else {
             // The order already completed. Backfill the idempotent
@@ -2530,7 +2532,7 @@ async fn reconcile_payment_link_session(
                 .get("subscription")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            if !subscription.is_empty() && existing.str_field("status") == "completed" {
+            if !subscription.is_empty() && status == OrderStatus::Completed {
                 repo::subscription_items::snapshot_from_purchase(ctx, &existing.id, subscription)
                     .await?;
             }
@@ -3227,7 +3229,13 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     // subscription without its item snapshot forever.
                     let snapshot_due = rows == 1
                         || match repo::purchases::get(ctx, purchase_id).await {
-                            Ok(purchase) => purchase.str_field("status") == "completed",
+                            Ok(purchase) => match OrderStatus::from_record(&purchase) {
+                                Ok(status) => status == OrderStatus::Completed,
+                                Err(error) => fail_webhook!(
+                                    err_internal("Purchase row is outside the contract", error),
+                                    "subscription snapshot purchase state is outside the contract"
+                                ),
+                            },
                             Err(error) => fail_webhook!(
                                 err_internal(
                                     "Failed to load purchase for subscription snapshot",

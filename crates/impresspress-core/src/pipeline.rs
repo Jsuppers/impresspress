@@ -723,17 +723,19 @@ mod discovery_tests {
             !catalog.is_null(),
             "catalog list must appear in /openapi.json: {body}"
         );
+        let catalog_props = &catalog["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["records"]["items"]["properties"];
         assert_eq!(
-            catalog["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
-                ["records"]["items"]["properties"]["data"]["properties"]["stock"]["type"],
-            "integer",
-            "catalog response schema must match the real products row shape: {catalog}"
+            catalog_props["stock"]["type"], "integer",
+            "catalog rows are flat `CatalogProductView`s: {catalog}"
         );
-        // The product object schema must cover the original row plus every
-        // commerce-v2 column — `SELECT *` means all of them land in real
-        // catalog and builder responses.
-        let product_props = &catalog["responses"]["200"]["content"]["application/json"]["schema"]
-            ["properties"]["records"]["items"]["properties"]["data"]["properties"];
+        // The admin row is every column of the products table; the public
+        // catalog row is the same table minus the ownership, moderation and
+        // provider columns, which `CatalogProductView` withholds by not
+        // naming them.
+        let product_props = &paths["/b/products/api/admin/products"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["records"]["items"]
+            ["properties"];
         for field in [
             "group_template_id",
             "product_template_id",
@@ -753,6 +755,22 @@ mod discovery_tests {
             assert!(
                 !product_props[field].is_null(),
                 "product schema is missing real column `{field}`: {product_props}"
+            );
+        }
+        for field in [
+            "created_by",
+            "owner_kind",
+            "owner_id",
+            "seller_account_id",
+            "approval_status",
+            "stripe_product_id",
+            "current_version",
+            "submitted_at",
+            "deleted_at",
+        ] {
+            assert!(
+                catalog_props[field].is_null(),
+                "the public catalog must not publish `{field}`: {catalog_props}"
             );
         }
 
@@ -946,9 +964,11 @@ mod discovery_tests {
                 && stripe_status["publishable_key"].is_null(),
             "Stripe health discovery must never expose credential values: {stripe_status}"
         );
+        // Order rows are flat `contracts::*View`s; the `{id, data}` record
+        // envelope is gone from the detail's `purchase` and `disputes`.
         let order_dispute = &paths["/b/products/api/admin/purchases/{id}"]["get"]["responses"]
             ["200"]["content"]["application/json"]["schema"]["properties"]["disputes"]["items"]
-            ["properties"]["data"]["properties"];
+            ["properties"];
         assert_eq!(order_dispute["amount_minor"]["type"], "integer");
         assert!(
             order_dispute["status"]["enum"]
@@ -958,7 +978,12 @@ mod discovery_tests {
         );
         let order_payment = &paths["/b/products/api/admin/purchases/{id}"]["get"]["responses"]
             ["200"]["content"]["application/json"]["schema"]["properties"]["purchase"]
-            ["properties"]["data"]["properties"];
+            ["properties"];
+        assert!(
+            order_payment["receipt_token_hash"].is_null()
+                && order_payment["receipt_token_expires_at"].is_null(),
+            "the guest receipt digest is never published on an order row: {order_payment}"
+        );
         assert_eq!(
             order_payment["payment_intent_event_created"]["type"],
             "integer"
@@ -990,12 +1015,17 @@ mod discovery_tests {
                 serde_json::json!(["name"]),
                 "product creation must document its required name: {collection}"
             );
+            // The row is `contracts::ProductView`, flat: the `{id, data}`
+            // record envelope the untyped handlers echoed is gone.
+            let row = &collection["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["records"]["items"];
             assert_eq!(
-                collection["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-                    ["properties"]["records"]["items"]["properties"]["data"]["properties"]
-                    ["approval_status"]["type"],
-                "string",
+                row["properties"]["approval_status"]["type"], "string",
                 "builder product lists must use the commerce-v2 row contract: {collection}"
+            );
+            assert!(
+                row["properties"]["data"].is_null(),
+                "builder product rows are flat views, not {{id, data}} records: {collection}"
             );
 
             let duplicate = &paths[&format!("{prefix}/{{id}}/duplicate")]["post"];
@@ -1037,6 +1067,9 @@ mod discovery_tests {
             );
         }
 
+        // The envelope is `{records, total_count, page, page_size}` and the
+        // handler always emits all four; the hand-written schema understated
+        // `required`.
         for path in [
             "/b/products/api/admin/groups",
             "/b/products/api/admin/types",
@@ -1044,8 +1077,8 @@ mod discovery_tests {
             assert_eq!(
                 paths[path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
                     ["required"],
-                serde_json::json!(["records", "total_count"]),
-                "admin builder list must document RecordList: {}",
+                serde_json::json!(["records", "total_count", "page", "page_size"]),
+                "admin builder list must document its envelope: {}",
                 paths[path]["get"]
             );
         }
@@ -1451,6 +1484,82 @@ mod discovery_tests {
             "the fields a guest can always read drifted from what ui/assets/webmcp.js and \
              the storefront rely on: {tool}"
         );
+    }
+
+    /// `list_my_purchases` is the other WebMCP tool whose output is a products
+    /// contract, and the one whose shape changed when the order rows were
+    /// typed: flat `PurchaseView` rows under `records`, with the guest receipt
+    /// digest (`receipt_token_hash`, `receipt_token_expires_at`) withheld.
+    /// Same pin as for `get_order_status`: the manifest's `outputSchema` is
+    /// the `/openapi.json` projection of `GET /b/products/purchases` minus the
+    /// root `title`, and no property name published under it starts with
+    /// `receipt_token`.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_list_my_purchases_to_the_typed_order_rows() {
+        let ctx = TestContext::with_auth().await;
+        let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "list_my_purchases")
+            .unwrap_or_else(|| {
+                panic!("list_my_purchases must be published to an authenticated caller: {body}")
+            });
+
+        let openapi = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
+        let mut expected = openapi["paths"]["/b/products/purchases"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]
+            .clone();
+        let expected_obj = expected
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("the endpoint's response schema must be in /openapi.json"));
+        expected_obj.remove("title");
+
+        assert_eq!(
+            tool["outputSchema"], expected,
+            "outputSchema must be the /openapi.json projection of the same declaration, \
+             minus the root title: {tool}"
+        );
+
+        let published = property_names(&tool["outputSchema"]);
+        assert!(
+            published.contains(&"refunded_total_cents".to_string()),
+            "the walk must reach the order row's properties: {published:?}"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|name| name.starts_with("receipt_token")),
+            "the guest receipt digest must not be published to an agent: {published:?}"
+        );
+    }
+
+    /// Every `properties` key anywhere under `schema`: the names a consumer
+    /// of the schema can read, at any depth.
+    fn property_names(schema: &serde_json::Value) -> Vec<String> {
+        fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                        out.extend(props.keys().cloned());
+                    }
+                    for value in map.values() {
+                        walk(value, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(schema, &mut out);
+        out
     }
 
     #[tokio::test]

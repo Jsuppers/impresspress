@@ -18,7 +18,7 @@
 //!   `roles.permissions` is a JSON-encoded `TEXT` column that the SQLite backend
 //!   sniffs back into an array while Postgres/D1 hand back the raw string. A
 //!   schema could not have been true for all three. Every field below is
-//!   normalized through [`RecordExt`] or [`string_list_field`], so it now is.
+//!   normalized through [`RecordExt`], so it now is.
 //!
 //! The `{records, total_count, page, page_size}` envelope is preserved exactly:
 //! only the per-row shape changes, from `{id, data: {…}}` to the flat view.
@@ -30,46 +30,6 @@ use wafer_core::clients::database::{Record, RecordList};
 use wafer_run::Message;
 
 use crate::util::RecordExt;
-
-// ---------------------------------------------------------------------------
-// Record → view helpers
-// ---------------------------------------------------------------------------
-
-/// A nullable `TEXT` column as `Option<String>`: a SQL `NULL` (JSON `null`), an
-/// absent key, and a non-string value all read as `None`.
-///
-/// [`RecordExt::str_field`] collapses all three onto `""`, which would make a
-/// non-nullable `"string"` schema look correct while quietly erasing the
-/// difference between "no avatar" and "empty avatar URL".
-fn opt_str_field(record: &Record, key: &str) -> Option<String> {
-    match record.data.get(key) {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-/// A JSON-array-of-strings column as `Vec<String>`, whichever way the backend
-/// returned it.
-///
-/// `roles.permissions` is declared `TEXT NOT NULL DEFAULT '[]'` and written as a
-/// JSON array. The SQLite backend sniffs text that looks like JSON and decodes
-/// it (`row_to_record`), so it comes back as a real array; the Postgres and D1
-/// backends do no such sniffing and hand back the literal string. Normalizing
-/// here is what lets the schema declare `array of string` truthfully on all
-/// three. A value that is neither reads as empty rather than erroring — the
-/// column is advisory metadata, not an authorization input.
-fn string_list_field(record: &Record, key: &str) -> Vec<String> {
-    match record.data.get(key) {
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        Some(serde_json::Value::String(s)) => {
-            serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
-        }
-        _ => Vec::new(),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // GET /b/admin/api/users
@@ -135,16 +95,16 @@ impl AdminUserView {
             id: record.id.clone(),
             email: record.str_field("email").to_string(),
             display_name: record.str_field("display_name").to_string(),
-            name: opt_str_field(record, "name"),
-            avatar_url: opt_str_field(record, "avatar_url"),
+            name: record.opt_str_field("name"),
+            avatar_url: record.opt_str_field("avatar_url"),
             role: record.str_field("role").to_string(),
             roles,
             email_verified: record.bool_field("email_verified"),
             disabled: record.bool_field("disabled"),
-            last_login_at: opt_str_field(record, "last_login_at"),
+            last_login_at: record.opt_str_field("last_login_at"),
             created_at: record.str_field("created_at").to_string(),
             updated_at: record.str_field("updated_at").to_string(),
-            deleted_at: opt_str_field(record, "deleted_at"),
+            deleted_at: record.opt_str_field("deleted_at"),
         }
     }
 }
@@ -247,7 +207,7 @@ impl AdminRoleView {
             id: record.id.clone(),
             name: record.str_field("name").to_string(),
             description: record.str_field("description").to_string(),
-            permissions: string_list_field(record, "permissions"),
+            permissions: record.string_list_field("permissions"),
             is_system: record.bool_field("is_system"),
             created_at: record.str_field("created_at").to_string(),
             updated_at: record.str_field("updated_at").to_string(),

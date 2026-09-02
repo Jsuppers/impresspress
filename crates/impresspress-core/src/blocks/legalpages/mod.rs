@@ -262,7 +262,7 @@ impl LegalPagesBlock {
 
     async fn handle_admin_list(&self, ctx: &dyn Context, msg: &Message) -> OutputStream {
         // Not a pure-CRUD list: it sorts by `updated_at` desc (editors expect
-        // most-recently-touched first), whereas `crud::crud_list` is fixed to
+        // most-recently-touched first), whereas `crud::list_page` defaults to
         // `created_at` desc. Kept inline rather than widening the shared
         // helper's signature — `blocks::crud` is owned by the products package.
         let (_, page_size, offset) = msg.pagination_params(20);

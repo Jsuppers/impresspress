@@ -9,7 +9,7 @@ use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::products::{
-        contracts::{OfferStatus, SellerAccountList},
+        contracts::{AdminSellerDetail, OfferStatus, ProductView, SellerAccountList},
         repo, stripe,
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
@@ -90,7 +90,10 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(products) => products,
         Err(error) => return err_internal("Could not list seller products", error),
     };
-    ok_json(&serde_json::json!({"seller": seller, "products": products}))
+    ok_json(&AdminSellerDetail {
+        seller,
+        products: products.iter().map(ProductView::from_record).collect(),
+    })
 }
 
 async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> OutputStream {
@@ -109,13 +112,13 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
         && product.str_field("approval_status") == "approved"
         && product.str_field("status") == "active"
     {
-        return ok_json(&product);
+        return ok_json(&ProductView::from_record(&product));
     }
     if !approve
         && product.str_field("approval_status") == "rejected"
         && product.str_field("status") == "draft"
     {
-        return ok_json(&product);
+        return ok_json(&ProductView::from_record(&product));
     }
     if product.str_field("approval_status") != "pending"
         || product.str_field("status") != "pending_review"
@@ -151,7 +154,7 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     // reach, so the write itself has to test liveness — and `NotFound` is the
     // same answer the `get` would have given a moment earlier.
     match repo::products::update_live(ctx, id, data).await {
-        Ok(product) => ok_json(&product),
+        Ok(product) => ok_json(&ProductView::from_record(&product)),
         // The shared mapper, so this site cannot drift back to answering 500
         // for a repository refusal that names what the caller must change.
         Err(error) => super::write_error(error, "Could not moderate product"),
