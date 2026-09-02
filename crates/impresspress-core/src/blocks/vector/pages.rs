@@ -41,16 +41,18 @@ use wafer_block::{
 use wafer_core::{
     clients::{
         database as db,
-        vector::{
-            self as vclient, DistanceMetric, MetadataFilter, SearchMode, VectorEntry,
-            VectorIndexConfig,
-        },
+        vector::{self as vclient, MetadataFilter, SearchMode, VectorEntry, VectorIndexConfig},
     },
     interfaces::vector::{get_model, DEFAULT_MODEL},
 };
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use super::{
+    contracts::{
+        self, AckResponse, CreateIndexRequest, CreateIndexResponse, EmbedRequest, EmbedResponse,
+        IndexListResponse, IndexStatsResponse, IndexStatsView, IngestRequest, IngestResponse,
+        QueryRequest, QueryResponse, UpsertRequest, VectorMatchView,
+    },
     ingestion::{self, DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_RATIO},
     service::{self, REGISTRY_TABLE, TABLE_PREFIX},
 };
@@ -92,17 +94,21 @@ fn err_vector_backend_unavailable() -> OutputStream {
 // POST /b/vector/api/indexes — create an index
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct CreateIndexBody {
-    name: String,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    dimensions: Option<u32>,
-    #[serde(default)]
-    metric: Option<DistanceMetric>,
-    #[serde(default)]
-    keyword_search: bool,
+/// Parse the create-index body as JSON or as the admin modal's URL-encoded
+/// form. Sniffed the same way `util::parse_body_value` sniffed before the
+/// contract type existed — a leading `{` is JSON — so a JSON body sent
+/// without a content-type header keeps working. The JSON path deserializes
+/// the contract directly and gets no coercions, which is what the published
+/// schema says; the form path goes through [`CreateIndexRequest::from_form`]
+/// for the ones a form needs (`keyword_search=on`, numbers as strings).
+fn parse_create_index_body(raw: &[u8]) -> Result<CreateIndexRequest, String> {
+    let first = raw.iter().find(|b| !b.is_ascii_whitespace());
+    if first == Some(&b'{') {
+        return serde_json::from_slice(raw).map_err(|e| format!("Invalid body: {e}"));
+    }
+    Ok(CreateIndexRequest::from_form(
+        &crate::util::parse_form_body(raw),
+    ))
 }
 
 pub(super) async fn create_index(
@@ -114,37 +120,9 @@ pub(super) async fn create_index(
         return err_vector_backend_unavailable();
     }
     let raw = input.collect_to_bytes().await;
-    // Accept either JSON (programmatic clients) or URL-encoded form
-    // (htmx modal). Parse via the shared helper, then map fields explicitly
-    // — `keyword_search` is a checkbox, which arrives as the string "on"
-    // when checked and absent otherwise.
-    let parsed = crate::util::parse_body_value(&raw);
-    let body = CreateIndexBody {
-        name: parsed
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        model: parsed
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from),
-        dimensions: parsed
-            .get("dimensions")
-            .and_then(crate::util::json_as_u64)
-            .and_then(|n| u32::try_from(n).ok()),
-        metric: parsed
-            .get("metric")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok()),
-        keyword_search: matches!(
-            parsed.get("keyword_search"),
-            Some(serde_json::Value::Bool(true)) | Some(serde_json::Value::String(_))
-        ) && parsed.get("keyword_search").is_some_and(|v| {
-            v.as_bool().unwrap_or(false)
-                || matches!(v.as_str().unwrap_or(""), "on" | "true" | "1" | "yes")
-        }),
+    let body = match parse_create_index_body(&raw) {
+        Ok(b) => b,
+        Err(e) => return err_bad_request(&e),
     };
 
     if body.name.is_empty() {
@@ -174,7 +152,10 @@ pub(super) async fn create_index(
         name: service::prefixed_index_name(&body.name),
         model: model.id.to_string(),
         dimensions: model.dimensions,
-        metric: body.metric.unwrap_or(DistanceMetric::Cosine),
+        metric: body
+            .metric
+            .unwrap_or(contracts::DistanceMetric::Cosine)
+            .into(),
         keyword_search: body.keyword_search,
     };
 
@@ -232,13 +213,13 @@ pub(super) async fn create_index(
                 "text/html; charset=utf-8",
             );
     }
-    ok_json(&serde_json::json!({
-        "name": body.name,
-        "model": cfg.model,
-        "dimensions": cfg.dimensions,
-        "metric": cfg.metric,
-        "keyword_search": cfg.keyword_search,
-    }))
+    ok_json(&CreateIndexResponse {
+        name: body.name,
+        model: cfg.model,
+        dimensions: cfg.dimensions,
+        metric: cfg.metric.into(),
+        keyword_search: cfg.keyword_search,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +232,12 @@ pub(super) async fn list_indexes(ctx: &dyn Context) -> OutputStream {
     // ever list should see "nothing here" rather than an error, since an
     // empty result is already a legitimate response shape for this endpoint.
     if !service::vector_backend_available(ctx) {
-        return ok_json(&serde_json::json!({ "indexes": Vec::<String>::new() }));
+        return ok_json(&IndexListResponse {
+            indexes: Vec::new(),
+        });
     }
     match discover_indexes(ctx).await {
-        Ok(indexes) => ok_json(&serde_json::json!({ "indexes": indexes })),
+        Ok(indexes) => ok_json(&IndexListResponse { indexes }),
         Err(e) => err_internal("list indexes failed", e),
     }
 }
@@ -314,7 +297,7 @@ pub(super) async fn delete_index(ctx: &dyn Context, msg: &Message) -> OutputStre
                 }],
             )
             .await;
-            ok_json(&serde_json::json!({ "ok": true }))
+            ok_json(&AckResponse { ok: true })
         }
         Err(e) if e.code == ErrorCode::NotFound => {
             err_not_found(&format!("index not found: {name}"))
@@ -327,18 +310,12 @@ pub(super) async fn delete_index(ctx: &dyn Context, msg: &Message) -> OutputStre
 // POST /b/vector/api/upsert — upsert pre-computed vectors
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct UpsertBody {
-    index: String,
-    entries: Vec<VectorEntry>,
-}
-
 pub(super) async fn upsert(ctx: &dyn Context, input: InputStream) -> OutputStream {
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
     let raw = input.collect_to_bytes().await;
-    let body: UpsertBody = match serde_json::from_slice(&raw) {
+    let body: UpsertRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -351,8 +328,9 @@ pub(super) async fn upsert(ctx: &dyn Context, input: InputStream) -> OutputStrea
     }
 
     let prefixed = service::prefixed_index_name(&body.index);
-    match vclient::upsert(ctx, &prefixed, body.entries).await {
-        Ok(()) => ok_json(&serde_json::json!({ "ok": true })),
+    let entries: Vec<VectorEntry> = body.entries.into_iter().map(VectorEntry::from).collect();
+    match vclient::upsert(ctx, &prefixed, entries).await {
+        Ok(()) => ok_json(&AckResponse { ok: true }),
         Err(e) if e.code == ErrorCode::NotFound => {
             err_not_found(&format!("index not found: {}", body.index))
         }
@@ -382,7 +360,7 @@ pub(super) async fn delete_single(ctx: &dyn Context, msg: &Message) -> OutputStr
 
     let prefixed = service::prefixed_index_name(index);
     match vclient::delete(ctx, &prefixed, vec![id.to_string()]).await {
-        Ok(()) => ok_json(&serde_json::json!({ "ok": true })),
+        Ok(()) => ok_json(&AckResponse { ok: true }),
         Err(e) if e.code == ErrorCode::NotFound => {
             err_not_found(&format!("index not found: {index}"))
         }
@@ -417,49 +395,31 @@ pub(super) async fn stats(ctx: &dyn Context) -> OutputStream {
     // `list_indexes` above — `stats` is a per-index-count listing, not a
     // write/query op, so an absent backend just means zero indexes to count.
     if !service::vector_backend_available(ctx) {
-        return ok_json(&serde_json::json!({ "indexes": Vec::<serde_json::Value>::new() }));
+        return ok_json(&IndexStatsResponse {
+            indexes: Vec::new(),
+        });
     }
     let indexes = match discover_indexes(ctx).await {
         Ok(v) => v,
         Err(e) => return err_internal("stats failed", e),
     };
 
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(indexes.len());
+    let mut out: Vec<IndexStatsView> = Vec::with_capacity(indexes.len());
     for name in indexes {
         let prefixed = service::prefixed_index_name(&name);
         // If count fails for a single index (e.g. table was dropped between
         // discovery and count), fall back to 0 and keep going — stats should
         // not 500 on a transient partial-state issue.
         let count = vclient::count(ctx, &prefixed).await.unwrap_or(0);
-        out.push(serde_json::json!({
-            "name": name,
-            "count": count,
-        }));
+        out.push(IndexStatsView { name, count });
     }
 
-    ok_json(&serde_json::json!({ "indexes": out }))
+    ok_json(&IndexStatsResponse { indexes: out })
 }
 
 // ---------------------------------------------------------------------------
 // POST /b/vector/api/query — search vectors
 // ---------------------------------------------------------------------------
-
-#[derive(serde::Deserialize)]
-struct QueryBody {
-    index: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    vector: Option<Vec<f32>>,
-    #[serde(default)]
-    top_k: Option<usize>,
-    #[serde(default)]
-    filter: Option<MetadataFilter>,
-    #[serde(default)]
-    mode: Option<SearchMode>,
-    #[serde(default)]
-    keyword_query: Option<String>,
-}
 
 const DEFAULT_TOP_K: usize = 10;
 
@@ -468,7 +428,7 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
         return err_vector_backend_unavailable();
     }
     let raw = input.collect_to_bytes().await;
-    let mut body: QueryBody = match serde_json::from_slice(&raw) {
+    let mut body: QueryRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -493,11 +453,14 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
     // Default mode reflects the index's declared capabilities. An index
     // created with keyword_search=true gets Hybrid by default; everyone
     // else gets plain Vector.
-    let mode = body.mode.unwrap_or(if keyword_search {
-        SearchMode::Hybrid
-    } else {
-        SearchMode::Vector
-    });
+    let mode = body
+        .mode
+        .map(SearchMode::from)
+        .unwrap_or(if keyword_search {
+            SearchMode::Hybrid
+        } else {
+            SearchMode::Vector
+        });
 
     // Resolve the query vector. If the caller provided a vector directly
     // we use it; otherwise we embed `text` through the model the index
@@ -535,13 +498,15 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
         &prefixed,
         vector,
         top_k,
-        body.filter,
+        body.filter.map(MetadataFilter::from),
         mode,
         keyword_query,
     )
     .await
     {
-        Ok(matches) => ok_json(&serde_json::json!({ "matches": matches })),
+        Ok(matches) => ok_json(&QueryResponse {
+            matches: matches.into_iter().map(VectorMatchView::from).collect(),
+        }),
         Err(e) if e.code == ErrorCode::NotFound => {
             err_not_found(&format!("index not found: {}", body.index))
         }
@@ -631,25 +596,6 @@ fn embedding_block_for_model(_model_id: &str) -> &'static str {
 // POST /b/vector/api/ingest — chunk + (optionally add context) + embed + upsert
 // ---------------------------------------------------------------------------
 
-/// Request body for ingest. Shape matches the plan; only `index`,
-/// `document_id`, and `text` are required — `metadata` and `contextual` are
-/// optional and default to "no metadata" / "no context summary".
-#[derive(serde::Deserialize)]
-struct IngestBody {
-    index: String,
-    document_id: String,
-    text: String,
-    #[serde(default)]
-    metadata: Option<serde_json::Value>,
-    #[serde(default)]
-    contextual: bool,
-}
-
-#[derive(serde::Serialize)]
-struct IngestResponse {
-    chunks_created: usize,
-}
-
 /// Handle `POST /b/vector/api/ingest`.
 ///
 /// Flow: prefix the index, look up the embedding model, clear any prior
@@ -661,7 +607,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
         return err_vector_backend_unavailable();
     }
     let raw = input.collect_to_bytes().await;
-    let body: IngestBody = match serde_json::from_slice(&raw) {
+    let body: IngestRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -801,22 +747,6 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
 // POST /b/vector/api/embed — generate embeddings for raw text
 // ---------------------------------------------------------------------------
 
-/// Request body for embed. `model` is optional — missing defaults to
-/// `DEFAULT_MODEL` (the catalog default).
-#[derive(serde::Deserialize)]
-struct EmbedBody {
-    #[serde(default)]
-    model: Option<String>,
-    texts: Vec<String>,
-}
-
-#[derive(serde::Serialize)]
-struct EmbedResponse {
-    model: String,
-    dimensions: u32,
-    vectors: Vec<Vec<f32>>,
-}
-
 /// Handle `POST /b/vector/api/embed`.
 ///
 /// Thin shim over `vclient::embed` — we look up which block serves the
@@ -824,7 +754,7 @@ struct EmbedResponse {
 /// (the embedding block returns an empty vector list).
 pub(super) async fn embed(ctx: &dyn Context, input: InputStream) -> OutputStream {
     let raw = input.collect_to_bytes().await;
-    let body: EmbedBody = match serde_json::from_slice(&raw) {
+    let body: EmbedRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -855,7 +785,7 @@ mod ingest_cleanup_tests {
     use wafer_run::{Block as RunBlock, BlockCategory, BlockInfo, LifecycleEvent};
 
     use super::*;
-    use crate::test_support::{output_is_error, output_status, TestContext};
+    use crate::test_support::{output_is_error, output_json, TestContext};
 
     /// Stub `wafer-run/vector` block that answers `vector.list_ids` with a
     /// caller-supplied error and errors loudly on anything else.
@@ -995,10 +925,358 @@ mod ingest_cleanup_tests {
         .await;
 
         assert_eq!(
-            output_status(out).await,
-            200,
+            output_json(out).await,
+            serde_json::json!({ "chunks_created": 0 }),
             "a genuine NotFound from list_ids must still be tolerated as \
-             'no prior chunks', not treated as fatal"
+             'no prior chunks', not treated as fatal - and the zero-chunk reply \
+             is the contract's one field"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the JSON shapes the published schemas are derived from.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contract_tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use wafer_block::wire::vector::VectorMatch;
+    use wafer_run::streams::output::TerminalNotResponse;
+
+    use super::*;
+    use crate::{
+        blocks::vector::test_support::{StubEmbeddingBlock, StubVectorBlock},
+        test_support::{auth_msg, output_is_error, output_json, TestContext},
+    };
+
+    fn json_input(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(serde_json::to_vec(&value).expect("serialize body"))
+    }
+
+    fn form_input(body: &str) -> InputStream {
+        InputStream::from_bytes(body.as_bytes().to_vec())
+    }
+
+    fn create_msg() -> Message {
+        auth_msg("create", "/b/vector/api/indexes", "user-1")
+    }
+
+    async fn ctx_with(stub: StubVectorBlock) -> TestContext {
+        let mut ctx = TestContext::with_vector().await;
+        ctx.register_block("wafer-run/vector", Arc::new(stub));
+        ctx
+    }
+
+    /// Registry row for `prefixed`, so `load_index_metadata` resolves the
+    /// model from the DB and the stub never has to answer `describe_index`.
+    async fn seed_registry_row(ctx: &dyn Context, prefixed: &str) {
+        db::upsert(
+            ctx,
+            REGISTRY_TABLE,
+            vec![
+                ("prefixed_name".to_string(), serde_json::json!(prefixed)),
+                ("model".to_string(), serde_json::json!(DEFAULT_MODEL)),
+                ("dimensions".to_string(), serde_json::json!(1024)),
+                ("keyword_search".to_string(), serde_json::json!(0)),
+            ],
+            vec!["prefixed_name".to_string()],
+            OnConflict::SetColumns(vec![
+                "model".to_string(),
+                "dimensions".to_string(),
+                "keyword_search".to_string(),
+            ]),
+        )
+        .await
+        .expect("seed registry row");
+    }
+
+    /// JSON callers get the typed contract: a numeric string is not a
+    /// number and a checkbox string is not a boolean. The untyped handler
+    /// coerced both, so a client that had drifted onto form-shaped JSON was
+    /// silently accepted.
+    ///
+    /// The message is asserted, not just the code: `"1024"` happens to be
+    /// the catalog default's dimensionality, so a coercing handler would
+    /// still 400 on a later check for any other number, and the test would
+    /// pass for the wrong reason.
+    #[tokio::test]
+    async fn create_index_json_refuses_string_typed_fields() {
+        for (body, expected) in [
+            (
+                serde_json::json!({ "name": "docs", "dimensions": "1024" }),
+                r#"invalid type: string "1024", expected u32"#,
+            ),
+            (
+                serde_json::json!({ "name": "docs", "keyword_search": "on" }),
+                r#"invalid type: string "on", expected a boolean"#,
+            ),
+        ] {
+            let ctx = ctx_with(StubVectorBlock::default()).await;
+
+            let out = create_index(&ctx, &create_msg(), json_input(body.clone())).await;
+
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::InvalidArgument, "{body}");
+                    assert!(
+                        e.message.starts_with("Invalid body: ") && e.message.contains(expected),
+                        "{body}: the refusal must come from the typed contract, got: {}",
+                        e.message
+                    );
+                }
+                other => panic!("{body}: expected InvalidArgument, got {other:?}"),
+            }
+        }
+    }
+
+    /// `metric` is the backend's `DistanceMetric` enum: a value outside it is
+    /// refused rather than silently falling back to cosine.
+    #[tokio::test]
+    async fn create_index_json_refuses_an_unknown_metric() {
+        let ctx = ctx_with(StubVectorBlock::default()).await;
+
+        let out = create_index(
+            &ctx,
+            &create_msg(),
+            json_input(serde_json::json!({ "name": "docs", "metric": "manhattan" })),
+        )
+        .await;
+
+        assert!(output_is_error(out, "InvalidArgument").await);
+    }
+
+    #[tokio::test]
+    async fn create_index_json_publishes_exactly_the_contract_fields() {
+        let ctx = ctx_with(StubVectorBlock::default()).await;
+
+        let body = output_json(
+            create_index(
+                &ctx,
+                &create_msg(),
+                json_input(serde_json::json!({
+                    "name": "docs",
+                    "model": "multilingual-e5-small",
+                    "dimensions": 384,
+                    "metric": "euclidean",
+                    "keyword_search": true,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "name": "docs",
+                "model": "multilingual-e5-small",
+                "dimensions": 384,
+                "metric": "euclidean",
+                "keyword_search": true,
+            })
+        );
+    }
+
+    /// The admin modal posts a URL-encoded form: the checkbox arrives as
+    /// `on` (and only when ticked), the model as an empty string. That path
+    /// keeps its coercions and lands on the same contract as JSON.
+    #[tokio::test]
+    async fn create_index_form_path_coerces_the_checkbox_and_defaults() {
+        let ctx = ctx_with(StubVectorBlock::default()).await;
+        let default_dims = get_model(DEFAULT_MODEL)
+            .expect("catalog default")
+            .dimensions;
+
+        let body = output_json(
+            create_index(
+                &ctx,
+                &create_msg(),
+                form_input("name=docs&model=&keyword_search=on"),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "name": "docs",
+                "model": DEFAULT_MODEL,
+                "dimensions": default_dims,
+                "metric": "cosine",
+                "keyword_search": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn list_and_stats_publish_the_index_views() {
+        let ctx = ctx_with(StubVectorBlock {
+            indexes: vec![
+                service::prefixed_index_name("docs"),
+                service::prefixed_index_name("notes"),
+            ],
+            counts: HashMap::from([(service::prefixed_index_name("docs"), 3)]),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(
+            output_json(list_indexes(&ctx).await).await,
+            serde_json::json!({ "indexes": ["docs", "notes"] })
+        );
+        assert_eq!(
+            output_json(stats(&ctx).await).await,
+            serde_json::json!({
+                "indexes": [
+                    { "name": "docs", "count": 3 },
+                    { "name": "notes", "count": 0 },
+                ]
+            })
+        );
+    }
+
+    /// A hit is id + score + the stored metadata, which is absent (not
+    /// `null`) when the entry stored none.
+    #[tokio::test]
+    async fn query_publishes_the_match_view() {
+        let ctx = ctx_with(StubVectorBlock {
+            matches: vec![
+                VectorMatch {
+                    id: "a".into(),
+                    score: 0.75,
+                    metadata: Some(serde_json::json!({ "k": "v" })),
+                },
+                VectorMatch {
+                    id: "b".into(),
+                    score: 0.5,
+                    metadata: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .await;
+        seed_registry_row(&ctx, &service::prefixed_index_name("docs")).await;
+
+        let body = output_json(
+            query(
+                &ctx,
+                json_input(serde_json::json!({ "index": "docs", "vector": [0.1, 0.2, 0.3] })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "matches": [
+                    { "id": "a", "score": 0.75, "metadata": { "k": "v" } },
+                    { "id": "b", "score": 0.5 },
+                ]
+            })
+        );
+    }
+
+    /// Both `vector` and `text` is a legitimate call — in hybrid mode `text`
+    /// feeds the keyword half — and in vector mode the vector is used as is.
+    /// No embedding block is registered here, so had the handler tried to
+    /// embed `text` the call would have failed with a 500 ("embed failed");
+    /// the 200 is the proof that it did not.
+    #[tokio::test]
+    async fn query_with_both_vector_and_text_uses_the_vector_without_embedding() {
+        let ctx = ctx_with(StubVectorBlock {
+            matches: vec![VectorMatch {
+                id: "a".into(),
+                score: 0.75,
+                metadata: None,
+            }],
+            ..Default::default()
+        })
+        .await;
+        seed_registry_row(&ctx, &service::prefixed_index_name("docs")).await;
+
+        let body = output_json(
+            query(
+                &ctx,
+                json_input(serde_json::json!({
+                    "index": "docs",
+                    "vector": [0.1, 0.2, 0.3],
+                    "text": "hello",
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({ "matches": [{ "id": "a", "score": 0.75 }] })
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_and_deletes_acknowledge() {
+        let ctx = ctx_with(StubVectorBlock::default()).await;
+
+        assert_eq!(
+            output_json(
+                upsert(
+                    &ctx,
+                    json_input(serde_json::json!({
+                        "index": "docs",
+                        "entries": [{ "id": "a", "vector": [0.1, 0.2] }],
+                    })),
+                )
+                .await
+            )
+            .await,
+            serde_json::json!({ "ok": true })
+        );
+        assert_eq!(
+            output_json(
+                delete_index(
+                    &ctx,
+                    &auth_msg("delete", "/b/vector/api/indexes/docs", "user-1")
+                )
+                .await
+            )
+            .await,
+            serde_json::json!({ "ok": true })
+        );
+        assert_eq!(
+            output_json(
+                delete_single(&ctx, &auth_msg("delete", "/b/vector/api/docs/a", "user-1")).await
+            )
+            .await,
+            serde_json::json!({ "ok": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_publishes_exactly_the_contract_fields() {
+        let mut ctx = TestContext::with_vector().await;
+        ctx.register_block(
+            "impresspress/fastembed",
+            Arc::new(StubEmbeddingBlock {
+                model: "bge-m3",
+                dimensions: 3,
+            }),
+        );
+
+        let body =
+            output_json(embed(&ctx, json_input(serde_json::json!({ "texts": ["a", "b"] }))).await)
+                .await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "bge-m3",
+                "dimensions": 3,
+                "vectors": [[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]],
+            })
         );
     }
 }

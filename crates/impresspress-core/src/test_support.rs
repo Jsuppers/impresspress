@@ -255,6 +255,24 @@ impl TestContext {
         ctx
     }
 
+    /// Build a `TestContext` with admin + llm migrations applied.
+    ///
+    /// Admin first so the `impresspress__admin__block_settings` tracking
+    /// table exists before llm's `apply_if_blessed` upserts its row (the
+    /// production ordering). llm's schema does not depend on auth, so auth
+    /// migrations are skipped.
+    #[cfg(feature = "block-llm")]
+    pub async fn with_llm() -> Self {
+        let ctx = Self::with_admin().await;
+        ctx.apply_block_migrations(
+            "impresspress/llm",
+            crate::blocks::llm::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::llm::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        ctx
+    }
+
     /// Build a `TestContext` with admin + products migrations applied.
     ///
     /// Admin migrations run first so the `impresspress__admin__block_settings`
@@ -1177,7 +1195,9 @@ pub async fn output_is_error(out: OutputStream, code: &str) -> bool {
     feature = "block-files",
     feature = "block-messages",
     feature = "block-products",
-    feature = "block-tickets"
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
 ))]
 pub fn real_block_infos() -> Vec<BlockInfo> {
     vec![
@@ -1187,6 +1207,14 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
         crate::blocks::admin::AdminBlock::new().info(),
         crate::blocks::messages::MessagesBlock::new().info(),
         crate::blocks::tickets::TicketsBlock::new().info(),
+        // `info()` is declarative; the provider-admin handle it is built
+        // with never runs here, so the no-op one suffices (same as
+        // `blocks::feature_block_infos`).
+        crate::blocks::llm::LlmBlock::new(Arc::new(
+            crate::blocks::llm::provider_admin::NoopProviderAdmin,
+        ))
+        .info(),
+        crate::blocks::vector::VectorBlock::new().info(),
     ]
 }
 
@@ -1240,7 +1268,9 @@ pub fn bearer_for_roles(roles: &[&str]) -> String {
     feature = "block-files",
     feature = "block-messages",
     feature = "block-products",
-    feature = "block-tickets"
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
 ))]
 pub async fn discovery_json_as(
     ctx: &TestContext,
@@ -1282,7 +1312,9 @@ pub async fn discovery_json_as(
     feature = "block-files",
     feature = "block-messages",
     feature = "block-products",
-    feature = "block-tickets"
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
 ))]
 pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
     discovery_json_as(ctx, path, host, Some(&["admin"])).await
@@ -1295,7 +1327,9 @@ pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_
     feature = "block-files",
     feature = "block-messages",
     feature = "block-products",
-    feature = "block-tickets"
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
 ))]
 pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
     discovery_json(ctx, "/openapi.json", "impresspress.example.com").await
