@@ -36,7 +36,9 @@ Migration `020_normalize_blank_deleted_at` repairs those rows back to NULL.
 **Upgrade with `--run-migrations`.** Without it the code half lands alone and
 any affected product drops out of the catalog and the storefront with no admin
 action; the only signal is the generic `schema drift; redeploy with
---run-migrations to apply` warning each boot logs for the products block.
+--run-migrations to apply` warning each boot logs for the products block. There
+is no in-UI way to bring such a product back — see *deleting a product has no
+undo in the UI yet* below for the statement that does it.
 
 ### Products API: internally-owned columns are now refused, not dropped
 
@@ -58,25 +60,55 @@ The admin and seller UIs send only caller-owned fields and are unaffected. An
 API client that round-trips a whole product record back into a `PATCH` must
 now send only the fields it is changing.
 
-### Products: restoring a deleted product whose slug was taken
+### Products: deleting a product has no undo in the UI yet
 
-020 deliberately skips a row whose slug a live product of the same owner
-already holds. Repairing it would violate migration 005's partial unique slug
-index and abort the migration, which is unrecoverable in place: the hash never
-gets stamped, so every later boot retries and re-fails, and on Cloudflare that
-is a 500 on every request. A skipped row keeps its current half-state and stays
-listed in the admin *deleted products* view, where **Restore** is the remedy —
-it reports the slug conflict in plain language instead of failing opaquely. To
-find them:
+Deleting a product is now a soft delete: the row stays, with every
+`line_items` / `offers` / `product_versions` / `entitlements` reference to it
+intact, and only `deleted_at` changes. That is the point of the change — the
+hard delete it replaces orphaned a completed order's line items.
+
+There is not yet any UI that reaches a soft-deleted product. The admin
+*Deleted* view and its **Restore** button are a follow-up. Until they land,
+undoing a delete is an operator statement against the database (admin →
+Database → SQL, or the D1 / Postgres console):
+
+```sql
+-- find it
+SELECT id, name, owner_kind, owner_id, slug, deleted_at
+FROM impresspress__products__products
+WHERE deleted_at IS NOT NULL;
+
+-- bring it back
+UPDATE impresspress__products__products
+SET deleted_at = NULL, updated_at = '2026-01-01T00:00:00Z'   -- use the current time
+WHERE id = '<product id>';
+```
+
+Two things to know before running that `UPDATE`:
+
+- Soft delete **frees the product's slug** — migration 005's unique index is
+  partial on `deleted_at IS NULL` — so if another product of the same
+  `(owner_kind, owner_id)` has claimed the slug since, the `UPDATE` violates
+  that index. Rename whichever product should not hold the slug first.
+- It is an **administrator** operation. A seller who deletes their own
+  product cannot undo it themselves and has to ask an administrator until the
+  restore endpoint ships.
+
+The same statement is the remedy for a row migration 020 deliberately skipped.
+020 leaves alone any `deleted_at = ''` row whose slug a live product of the
+same owner already holds, because repairing it would violate that same index
+and abort the migration — which is unrecoverable in place: the hash never gets
+stamped, so every later boot retries and re-fails, and on Cloudflare that is a
+500 on every request. Find the skipped rows with:
 
 ```sql
 SELECT id, owner_kind, owner_id, slug
 FROM impresspress__products__products WHERE deleted_at = '';
 ```
 
-Rename whichever product should not hold the slug, then restore. Re-running 020
-is *not* the remedy: once applied, its hash is stamped and the migration
-short-circuits for good.
+Rename whichever product should not hold the slug, then clear `deleted_at` as
+above. Re-running 020 is *not* the remedy: once applied, its hash is stamped
+and the migration short-circuits for good.
 
 ## Pre-Release Checklist
 

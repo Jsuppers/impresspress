@@ -338,29 +338,10 @@ impl TestContext {
     /// read/repository function surfaces — rather than swallows — a genuine
     /// read failure instead of collapsing it into the same "not found" /
     /// zero-valued result it uses for a legitimate absence.
-    pub fn break_reads(self) -> Self {
-        self.with_failing_reads(true)
-    }
-
-    /// Like [`Self::break_reads`], but single-row `get` still delegates to the
-    /// real data: only the multi-row reads (`list`/`count`/`sum`/`aggregate`/
-    /// `query_raw`) fail.
-    ///
-    /// This is the shape a "load one record, then query for related rows"
-    /// handler actually faces when the database wobbles — the single-row read
-    /// lands and the follow-up query is the one that fails.
-    /// [`Self::break_reads`] cannot reach that branch at all, because it fails
-    /// the first read and the handler never gets as far as the query under
-    /// test.
-    pub fn break_list_reads(self) -> Self {
-        self.with_failing_reads(false)
-    }
-
-    fn with_failing_reads(mut self, fail_get: bool) -> Self {
+    pub fn break_reads(mut self) -> Self {
         let broken: Arc<dyn wafer_core::interfaces::database::service::DatabaseService> =
             Arc::new(FailingReadsDb {
                 inner: self.db_service.clone(),
-                fail_get,
             });
         self.db_service = broken.clone();
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
@@ -370,32 +351,24 @@ impl TestContext {
     }
 }
 
-/// `DatabaseService` decorator used by [`TestContext::break_reads`] and
-/// [`TestContext::break_list_reads`]. Every read method fails with
-/// [`DatabaseError::Internal`]; every mutating/schema method delegates to
-/// `inner` unchanged.
+/// `DatabaseService` decorator used by [`TestContext::break_reads`]. Every
+/// read method fails with [`DatabaseError::Internal`]; every mutating/schema
+/// method delegates to `inner` unchanged.
 struct FailingReadsDb {
     inner: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
-    /// `false` exempts single-row `get` from the failure, so a test can fail
-    /// a *listing* while a by-id read still succeeds — see
-    /// [`TestContext::break_list_reads`].
-    fail_get: bool,
 }
 
 #[async_trait::async_trait]
 impl wafer_core::interfaces::database::service::DatabaseService for FailingReadsDb {
     async fn get(
         &self,
-        collection: &str,
-        id: &str,
+        _collection: &str,
+        _id: &str,
     ) -> Result<
         wafer_core::interfaces::database::service::Record,
         wafer_core::interfaces::database::service::DatabaseError,
     > {
-        if self.fail_get {
-            return Err(simulated_read_failure());
-        }
-        self.inner.get(collection, id).await
+        Err(simulated_read_failure())
     }
 
     async fn list(

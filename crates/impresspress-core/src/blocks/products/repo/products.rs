@@ -14,6 +14,32 @@
 //! other call-site policy: authz, logging, Stripe-retry) stays at the call
 //! site, per the convention documented just above `mod products;` in
 //! `repo/mod.rs`.
+//!
+//! # Undoing a delete, until the restore UI ships
+//!
+//! There is deliberately no `restore` here yet, and no UI that reaches a
+//! soft-deleted product: the admin Deleted view and its Restore endpoint are
+//! a follow-up. Soft delete is therefore, for now, a one-way door *in the
+//! product UI* — but not in the data, which is the whole difference from the
+//! hard delete it replaced. The row is still there, with every `line_items` /
+//! `offers` / `product_versions` / `entitlements` reference intact; only
+//! `deleted_at` changed. Recovery is one operator statement against the
+//! database (admin → Database → SQL, or the D1/Postgres console):
+//!
+//! ```sql
+//! UPDATE impresspress__products__products
+//! SET deleted_at = NULL, updated_at = <now, RFC3339>
+//! WHERE id = '<product id>';
+//! ```
+//!
+//! Two things to know before running it. First, soft delete FREES the
+//! product's slug — migration 005's unique index is partial on
+//! `deleted_at IS NULL` — so if another product of the same
+//! `(owner_kind, owner_id)` has claimed that `slug` since, the `UPDATE`
+//! violates the index; rename whichever product should not hold the slug
+//! first. Second, this is an admin-only operation: a seller who deletes
+//! their own product has no way to undo it themselves and has to ask an
+//! administrator until the restore endpoint lands.
 
 use std::collections::HashMap;
 
@@ -30,30 +56,21 @@ pub(crate) const TABLE: &str = "impresspress__products__products";
 //   * an RFC3339 stamp — the instant it was soft-deleted.
 //
 // It is never the empty string, and never any other non-timestamp text. The
-// only writers are `soft_delete` (a fresh `now_rfc3339()`) and `restore`
-// (`Value::Null`); every handler that forwards a caller-supplied body refuses
-// a body naming the field (`handlers::product::UNSETTABLE_FIELDS`), which
+// only writer is `soft_delete` (a fresh `now_rfc3339()`); every handler that
+// forwards a caller-supplied body refuses a body naming the field
+// (`handlers::product::UNSETTABLE_FIELDS`), which
 // `no_handler_path_can_write_an_empty_deleted_at` in
 // `tests/seller_governance_tests.rs` pins end-to-end across all four
-// create/update handlers. The invariant matters because `''` would otherwise be a
-// third state: SQL (and so `live_filter`, `list_deleted`, and migration
-// 005's partial unique slug index) reads it as deleted, while any
-// string-emptiness check reads it as live.
+// create/update handlers. The invariant matters because `''` would otherwise
+// be a third state: SQL (and so `live_filter` and migration 005's partial
+// unique slug index) reads it as deleted, while any string-emptiness check
+// reads it as live.
 /// `deleted_at IS NULL` — the predicate that distinguishes a live product
 /// from a soft-deleted one.
 pub(crate) fn live_filter() -> Filter {
     Filter {
         field: "deleted_at".to_string(),
         operator: FilterOp::IsNull,
-        value: Value::Null,
-    }
-}
-
-/// `deleted_at IS NOT NULL` — [`live_filter`]'s exact complement.
-fn deleted_filter() -> Filter {
-    Filter {
-        field: "deleted_at".to_string(),
-        operator: FilterOp::IsNotNull,
         value: Value::Null,
     }
 }
@@ -88,49 +105,6 @@ pub(crate) async fn list_page(
     db::paginated_list(ctx, TABLE, page, page_size, filters, sort).await
 }
 
-/// Fetch one soft-deleted product. A live (or missing) row answers
-/// `NotFound` — the mirror image of [`get`].
-///
-/// Shares [`list_deleted`]'s named exception to this module's live-only
-/// rule, and exists for the same reason: `restore` re-claims the row's slug
-/// against the partial unique index from migration 005, so when that write
-/// fails its caller has to be able to read the slug of a row that `get`
-/// cannot see, in order to say which slug collided instead of surfacing the
-/// index violation as a 500. A failed restore leaves the row deleted, which
-/// is exactly why this read still finds it.
-pub(crate) async fn get_deleted(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
-    let record = db::get(ctx, TABLE, id).await?;
-    if !is_deleted(&record) {
-        return Err(WaferError::new(ErrorCode::NotFound, "Product not deleted"));
-    }
-    Ok(record)
-}
-
-/// List one page of soft-deleted products. `filters` narrows the deleted
-/// set; it cannot widen it — same append-only contract as `list_page`.
-///
-/// This is the one deliberate, named exception to this module's live-only
-/// rule: every other read here is unreachable for a soft-deleted row by
-/// design, which is exactly why an admin needs one door that finds them —
-/// otherwise a deleted product could never be located in order to restore
-/// it, making soft delete permanent in practice.
-pub(crate) async fn list_deleted(
-    ctx: &dyn Context,
-    page: i64,
-    page_size: i64,
-    mut filters: Vec<Filter>,
-    sort: Option<Vec<SortField>>,
-) -> Result<RecordList, WaferError> {
-    filters.push(deleted_filter());
-    let sort = sort.unwrap_or_else(|| {
-        vec![SortField {
-            field: "created_at".to_string(),
-            desc: true,
-        }]
-    });
-    db::paginated_list(ctx, TABLE, page, page_size, filters, sort).await
-}
-
 /// Count live products matching `filters`.
 pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, WaferError> {
     let mut all = filters.to_vec();
@@ -153,9 +127,9 @@ pub(crate) async fn list_all(
 /// List every product matching `filters` *regardless of soft-delete state*,
 /// unpaged.
 ///
-/// The second deliberate, named exception to this module's live-only rule,
-/// alongside [`list_deleted`]/[`get_deleted`] — and the only one that spans
-/// both sets at once.
+/// One of this module's two deliberate, named exceptions to its live-only
+/// rule (the other is [`get_including_deleted`]) — and the only read that
+/// spans the live and deleted sets at once.
 ///
 /// It exists for seller suspension. Suspending a seller is a lifecycle and
 /// fraud operation, so it must cover every row that seller owns: soft delete
@@ -177,8 +151,8 @@ pub(crate) async fn list_all_including_deleted(
 
 /// Fetch one product regardless of soft-delete state.
 ///
-/// Third and last named exception on the read side, for the same reason as
-/// [`list_all_including_deleted`] and reached from it: archiving a product's
+/// The second and last named exception on the read side, for the same reason
+/// as [`list_all_including_deleted`] and reached from it: archiving a product's
 /// Stripe catalog needs the row's `owner_kind`/`owner_id` (to address the
 /// connected account) and its `stripe_product_id`, and has to keep working
 /// once the product is soft-deleted — that is precisely when its catalog most
@@ -327,12 +301,12 @@ pub(crate) async fn purge(ctx: &dyn Context, id: &str) -> Result<(), WaferError>
 /// from migration 005 is partial on `deleted_at IS NULL`.
 ///
 /// A filtered write for the same reason as [`update_live`], and not a `get`
-/// followed by an unconditional `update`: between those two statements a
-/// concurrent `restore` fits, and the unconditional write then stamps
-/// `deleted_at` back on top of a row the restore had just brought live —
-/// answering 200 to both callers, one of whom was told their restore
-/// succeeded. Two concurrent deletes race the same way, the second rewriting
-/// the first's stamp and moving the row in the `deleted_at desc` view.
+/// followed by an unconditional `update`: two concurrent deletes fit between
+/// those two statements, and the second then rewrites the first's stamp, so
+/// the recorded deletion instant is whichever request happened to finish
+/// last. The same window is what a future restore endpoint would race — a
+/// restore committing between the read and the write would be silently
+/// undone by an unconditional stamp, with both callers told they succeeded.
 ///
 /// Deleting an already soft-deleted (or missing) row matches zero rows and
 /// answers `NotFound`, matching every other read in this module: a caller
@@ -349,26 +323,6 @@ pub(crate) async fn soft_delete(ctx: &dyn Context, id: &str) -> Result<(), Wafer
         return Err(WaferError::new(ErrorCode::NotFound, "Product not found"));
     }
     Ok(())
-}
-
-/// Clear `deleted_at`, bringing a soft-deleted product back.
-///
-/// A filtered update rather than `get` + `update`: `get` refuses to find a
-/// soft-deleted row by design, but restoring one is the one operation in this
-/// module that must act on exactly that row.
-///
-/// The filter is `deleted_at IS NOT NULL`, so restoring a product that was
-/// never deleted matches zero rows and issues no write at all.
-/// `DbExec::update` stamps a fresh `updated_at` on every write, and the admin
-/// product list sorts on the timestamps — an operation that changed nothing
-/// must not reorder it.
-pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
-    let data = HashMap::from([("deleted_at".to_string(), Value::Null)]);
-    // Zero rows affected means either "already live" (a no-op) or "no such
-    // product". `db::get` below tells those apart, answering `NotFound` only
-    // for the second — the same two responses this function has always given.
-    db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), deleted_filter()], data).await?;
-    db::get(ctx, TABLE, id).await
 }
 
 // The single definition of "deleted" for one already-loaded row, and the
@@ -435,45 +389,12 @@ mod tests {
         assert_eq!(ids, vec!["live"]);
     }
 
-    #[tokio::test]
-    async fn list_deleted_returns_only_soft_deleted_rows() {
-        let ctx = TestContext::with_products().await;
-        seed(&ctx, "live", None).await;
-        seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
-        let list = list_deleted(&ctx, 1, 50, vec![], None)
-            .await
-            .expect("list_deleted");
-        let ids: Vec<&str> = list.records.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["gone"]);
-    }
-
-    // Mirrors `caller_filters_are_added_to_the_soft_delete_filter` for the
-    // inverse predicate: a caller filter that matches a live row must not
-    // let that live row leak into the deleted view.
-    #[tokio::test]
-    async fn list_deleted_caller_filters_do_not_admit_live_rows() {
-        let ctx = TestContext::with_products().await;
-        seed(&ctx, "live", None).await;
-        let status_active = Filter {
-            field: "status".to_string(),
-            operator: FilterOp::Equal,
-            value: json!("active"),
-        };
-        let list = list_deleted(&ctx, 1, 50, vec![status_active], None)
-            .await
-            .expect("list_deleted");
-        assert!(
-            list.records.is_empty(),
-            "a live active row must not appear in the deleted view"
-        );
-    }
-
     // `live_filter()` (`deleted_at IS NULL`) is the predicate every list and
-    // count read hands to SQL, so the per-record check `get`/`get_deleted`
-    // apply has to be the same predicate — otherwise "live" means one thing
-    // to a single-row read and another to a listing. An empty-string
-    // `deleted_at` is precisely where the two can disagree: SQL says
-    // `'' IS NOT NULL`, while a string-emptiness check says "live".
+    // count read hands to SQL, so the per-record check `get` applies has to
+    // be the same predicate — otherwise "live" means one thing to a
+    // single-row read and another to a listing. An empty-string `deleted_at`
+    // is precisely where the two can disagree: SQL says `'' IS NOT NULL`,
+    // while a string-emptiness check says "live".
     #[tokio::test]
     async fn an_empty_deleted_at_reads_the_same_way_through_every_door() {
         let ctx = TestContext::with_products().await;
@@ -488,17 +409,6 @@ mod tests {
         assert_eq!(
             get_says_live, list_says_live,
             "`get` and `list_page` must classify the same row the same way"
-        );
-
-        let get_deleted_resolves = get_deleted(&ctx, "blank").await.is_ok();
-        let list_deleted_shows_it = !list_deleted(&ctx, 1, 50, vec![], None)
-            .await
-            .expect("list_deleted")
-            .records
-            .is_empty();
-        assert_eq!(
-            get_deleted_resolves, list_deleted_shows_it,
-            "`get_deleted` and `list_deleted` must classify the same row the same way"
         );
 
         // And the shared answer is SQL's: `'' IS NOT NULL`, so the row is
@@ -635,11 +545,11 @@ mod tests {
     }
 
     /// `soft_delete` used to `get` and then write unconditionally, which is
-    /// the read-then-write race `update_live` exists to eliminate: between
-    /// the two statements a concurrent `restore` commits and answers 200 with
-    /// a live record, and the unconditional write then stamps `deleted_at`
-    /// back on top of it — the restoring admin is told it worked and the
-    /// product is gone, with no error anywhere.
+    /// the read-then-write race `update_live` exists to eliminate: a second
+    /// delete commits between the two statements and the unconditional write
+    /// then stamps `deleted_at` on top of it, so the recorded instant is
+    /// whichever request finished last rather than the one that deleted the
+    /// row.
     ///
     /// The liveness test has to be the write's own `WHERE`, so `soft_delete`
     /// must issue no read at all. Proven by failing every `database.get`
@@ -667,7 +577,9 @@ mod tests {
 
     /// The other half of the same race: a second delete must match zero rows
     /// and write nothing, rather than re-stamping `deleted_at` and moving the
-    /// row in the admin deleted view's `deleted_at desc` ordering.
+    /// row: the stamp records when the product was deleted, and a second
+    /// delete rewriting it would move that instant to whenever the redundant
+    /// request happened to arrive.
     #[tokio::test]
     async fn a_second_soft_delete_is_not_found_and_leaves_the_stamp_alone() {
         let ctx = TestContext::with_products().await;
@@ -736,49 +648,5 @@ mod tests {
         )
         .await
         .expect("the freed slug must not conflict");
-    }
-
-    /// Restoring a product that was never deleted changes nothing, so it
-    /// must not stamp a fresh `updated_at`: `DbExec::update` moves the
-    /// column on every write, and the admin product list sorts on the
-    /// timestamps. A no-op has no business reordering it.
-    #[tokio::test]
-    async fn restoring_a_live_product_does_not_stamp_a_new_updated_at() {
-        let ctx = TestContext::with_products().await;
-        seed(&ctx, "live", None).await;
-        let before = db::get(&ctx, TABLE, "live")
-            .await
-            .expect("seeded")
-            .str_field("updated_at")
-            .to_string();
-
-        // Same reason as `update_stamps_a_new_updated_at`: make the
-        // "unchanged" assertion robust against coarse clock resolution
-        // instead of relying on two `Utc::now()` calls differing.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-
-        restore(&ctx, "live")
-            .await
-            .expect("restoring a live row is a no-op");
-
-        assert_eq!(
-            db::get(&ctx, TABLE, "live")
-                .await
-                .expect("still there")
-                .str_field("updated_at"),
-            before,
-            "a restore that restored nothing must not move updated_at"
-        );
-    }
-
-    #[tokio::test]
-    async fn restore_brings_a_deleted_product_back() {
-        let ctx = TestContext::with_products().await;
-        seed(&ctx, "oops", None).await;
-        soft_delete(&ctx, "oops").await.expect("delete");
-
-        restore(&ctx, "oops").await.expect("restore");
-
-        assert!(get(&ctx, "oops").await.is_ok());
     }
 }

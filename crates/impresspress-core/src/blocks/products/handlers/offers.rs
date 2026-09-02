@@ -21,31 +21,6 @@ pub(super) enum OfferAccess {
     Owner,
 }
 
-/// Whether an offer operation requires its product to still be live.
-///
-/// The default for anything reachable from a UI is [`Live`](Self::Live): a
-/// soft-deleted product answers 404 everywhere, and restore is the door back
-/// in. [`LiveOrDeleted`](Self::LiveOrDeleted) is the deliberate exception for
-/// the operations that *close* a money surface, and the reads that enumerate
-/// what there is to close.
-///
-/// It exists because soft delete touches nothing in Stripe. A deleted
-/// product's Prices and Payment Links stay live in the connected account and
-/// keep taking money, and the delete handler archives none of them — so an
-/// admin or owner has to be able to shut that surface down *without* first
-/// restoring the listing to the public catalog. Refusing to let them was not
-/// a safe default; it was a money-taking surface with no off switch.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProductState {
-    /// The product must still be live. Everything that creates, edits,
-    /// publishes, duplicates, syncs, or opens a new money surface.
-    Live,
-    /// The product may be soft-deleted. Only for operations that exclusively
-    /// remove things from the live Stripe catalog, and the listings that name
-    /// them.
-    LiveOrDeleted,
-}
-
 pub(super) fn product_id(msg: &Message) -> &str {
     msg.var("product_id")
 }
@@ -58,17 +33,14 @@ pub(super) async fn verify_product(
     ctx: &dyn Context,
     msg: &Message,
     access: OfferAccess,
-    state: ProductState,
 ) -> Result<Record, OutputStream> {
     let product_id = product_id(msg);
     if product_id.is_empty() {
         return Err(err_bad_request("Missing product ID"));
     }
-    let loaded = match state {
-        ProductState::Live => products::get(ctx, product_id).await,
-        ProductState::LiveOrDeleted => products::get_including_deleted(ctx, product_id).await,
-    };
-    let product = match loaded {
+    // `repo::products::get` carries the soft-delete filter, so a deleted
+    // product answers `NotFound` here exactly as it does everywhere else.
+    let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == ErrorCode::NotFound => {
             return Err(err_not_found("Product not found"));
@@ -108,11 +80,7 @@ pub(super) async fn handle_list(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    // Widened: this is how an admin or owner finds the offers of a product
-    // they have deleted in order to archive them. A pure read, scoped to the
-    // caller's own product (or an admin's), that adds nothing to the money
-    // surface it exists to close.
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::LiveOrDeleted).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     match offers::list_for_product(ctx, product_id(msg)).await {
@@ -126,7 +94,7 @@ pub(super) async fn handle_get(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::Live).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     if offer_id(msg).is_empty() {
@@ -148,7 +116,7 @@ pub(super) async fn handle_preview(
     input: InputStream,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::Live).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     let route_offer_id = offer_id(msg);
@@ -184,7 +152,7 @@ pub(super) async fn handle_create(
     input: InputStream,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::Live).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     let definition = match definition(input).await {
@@ -208,7 +176,7 @@ pub(super) async fn handle_update(
     input: InputStream,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::Live).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     if offer_id(msg).is_empty() {
@@ -234,7 +202,7 @@ pub(super) async fn handle_publish(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    let product = match verify_product(ctx, msg, access, ProductState::Live).await {
+    let product = match verify_product(ctx, msg, access).await {
         Ok(product) => product,
         Err(response) => return response,
     };
@@ -264,7 +232,7 @@ pub(super) async fn handle_sync(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::Live).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     if offer_id(msg).is_empty() {
@@ -281,7 +249,7 @@ pub(super) async fn handle_duplicate(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::Live).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     if offer_id(msg).is_empty() {
@@ -298,12 +266,7 @@ pub(super) async fn handle_archive(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    // Widened: archival is the off switch. `archive_offer_catalog`
-    // deactivates every active Payment Link on the offer and takes its Prices
-    // out of the live Stripe catalog — it only ever removes, so it can never
-    // expose a deleted product to anyone, and it is exactly what a deleted
-    // product most needs.
-    if let Err(response) = verify_product(ctx, msg, access, ProductState::LiveOrDeleted).await {
+    if let Err(response) = verify_product(ctx, msg, access).await {
         return response;
     }
     if offer_id(msg).is_empty() {

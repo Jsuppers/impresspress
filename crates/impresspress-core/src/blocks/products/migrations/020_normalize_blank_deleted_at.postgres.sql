@@ -47,20 +47,22 @@
 --
 -- What an operator does about a skipped row
 -- -----------------------------------------
--- A migration cannot log, so a skipped row surfaces two other ways. It stays
--- in the admin "deleted products" view (`is_deleted` is true for it), where
--- the existing Restore button is the remedy: restore performs the same
--- `deleted_at = NULL` write one row at a time and answers a taken slug with
--- "Another product already uses the slug ..." rather than an opaque error.
--- And the whole set can be listed directly, e.g. from the admin SQL
+-- A migration cannot log, and no UI reaches a soft-deleted product yet (the
+-- admin "Deleted" view and its Restore button are a follow-up), so a skipped
+-- row has to be found and repaired directly, e.g. from the admin SQL
 -- explorer:
 --
 --   SELECT id, owner_kind, owner_id, slug
 --   FROM impresspress__products__products WHERE deleted_at = '';
 --
--- Rename whichever product should not hold the slug, then Restore. Re-running
--- this migration is not the remedy: once applied its hash is stamped and
--- `apply_if_blessed` short-circuits for good.
+-- Rename whichever product should not hold the slug, then clear the column on
+-- that one row:
+--
+--   UPDATE impresspress__products__products
+--   SET deleted_at = NULL WHERE id = '<product id>';
+--
+-- Re-running this migration is not the remedy: once applied its hash is
+-- stamped and `apply_if_blessed` short-circuits for good.
 --
 -- RELEASE.md's "Upgrade Notes" carries the operator-facing version of all of
 -- this, including the reason an existing deployment must be upgraded with

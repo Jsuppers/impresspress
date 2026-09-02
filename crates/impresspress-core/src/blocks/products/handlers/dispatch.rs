@@ -39,7 +39,6 @@ pub(crate) enum AdminRoute {
     DuplicateProduct,
     ApproveProduct,
     RejectProduct,
-    RestoreProduct,
     ListOffers,
     GetOffer,
     PreviewManagedOffer,
@@ -123,11 +122,6 @@ pub(in crate::blocks::products) const ADMIN_ROUTES: &[EndpointRoute<AdminRoute>]
         HttpMethod::Post,
         "/admin/b/products/products/{id}/reject",
         AdminRoute::RejectProduct,
-    ),
-    EndpointRoute::new(
-        HttpMethod::Post,
-        "/admin/b/products/products/{id}/restore",
-        AdminRoute::RestoreProduct,
     ),
     EndpointRoute::new(
         HttpMethod::Get,
@@ -725,7 +719,6 @@ pub async fn handle_admin(
         AdminRoute::DuplicateProduct => product::handle_duplicate_product(ctx, msg).await,
         AdminRoute::ApproveProduct => sellers::approve_product(ctx, msg).await,
         AdminRoute::RejectProduct => sellers::reject_product(ctx, msg).await,
-        AdminRoute::RestoreProduct => product::handle_restore_product(ctx, msg).await,
         AdminRoute::ListOffers => offers::handle_list(ctx, msg, offers::OfferAccess::Admin).await,
         AdminRoute::GetOffer => offers::handle_get(ctx, msg, offers::OfferAccess::Admin).await,
         AdminRoute::PreviewManagedOffer => {

@@ -11,8 +11,7 @@ use super::{default_template_id, seller_policy, GROUPS_TABLE, PRODUCT_TEMPLATES_
 use crate::{
     blocks::products::repo::{self, offers as offer_repo},
     http::{
-        err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
-        err_unauthorized, ok_json,
+        err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
     },
     util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
@@ -21,8 +20,8 @@ use crate::{
 // moderation state, the lifecycle stamps, and the Stripe/versioning linkage.
 // None of them is a caller-supplied value on any tier or verb — each has a
 // dedicated writer that maintains its invariants (`approve_product`/
-// `reject_product`/`suspend` for `approval_status`, the delete/restore
-// endpoints for `deleted_at`, the Stripe sync for `stripe_product_id`, the
+// `reject_product`/`suspend` for `approval_status`, the delete endpoints for
+// `deleted_at`, the Stripe sync for `stripe_product_id`, the
 // publish flow for `submitted_at`/`published_at`, seller onboarding for
 // `owner_*`/`seller_account_id`, versioning for `current_version`, and the
 // database layer's own UUID synthesis for `id`). A generic create or PATCH
@@ -276,14 +275,16 @@ pub(super) async fn handle_update_product(
         return response;
     }
     stamp_updated(&mut data);
-    // A soft-deleted product must go through `restore` before it is editable
-    // again, so the generic PATCH refuses one outright rather than silently
-    // applying unrelated field changes to a dead row. The liveness test is
-    // the write's own `WHERE`, not a `get` before it: a separate read leaves
-    // a window in which a concurrent delete commits and the PATCH then writes
-    // to the dead row and answers 200 — precisely the outcome this guard
-    // exists to prevent. `NotFound` matches the response every other admin
-    // product endpoint gives for a soft-deleted row.
+    // A soft-deleted product is not editable: the generic PATCH refuses one
+    // outright rather than silently applying unrelated field changes to a
+    // dead row. Until the restore endpoint ships, clearing `deleted_at` is an
+    // operator statement against the database — see the recovery note at the
+    // top of `repo::products`. The liveness test is the write's own `WHERE`,
+    // not a `get` before it: a separate read leaves a window in which a
+    // concurrent delete commits and the PATCH then writes to the dead row and
+    // answers 200 — precisely the outcome this guard exists to prevent.
+    // `NotFound` matches the response every other admin product endpoint
+    // gives for a soft-deleted row.
     match repo::products::update_live(ctx, id, data).await {
         Ok(record) => ok_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
@@ -300,110 +301,6 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
-    }
-}
-
-/// Restore a soft-deleted product — the door back out of `soft_delete`,
-/// without which a deleted product would be unreachable by any UI.
-///
-/// `POST /b/products/api/admin/products/{id}/restore`, declared
-/// `AuthLevel::Admin` and dispatched from `ADMIN_ROUTES`, so the one wire
-/// path that reaches this handler is the one its declaration matches.
-/// It previously sat on `USER_ROUTES` (declared under `/b/products/api/`,
-/// dispatched from the user table). `ProductsBlock::handle` also enters
-/// `handle_user` with the RAW path, so the same handler answered at
-/// `/b/products/products/{id}/restore` — a spelling matching no declaration
-/// at all, and so resolving to the `Authenticated` fallback. That was a live
-/// privilege escalation: any logged-in user could resurrect any soft-deleted
-/// product. An Admin-tier route must not live on the user dispatch table for
-/// exactly that reason, and
-/// `dispatch_tables_are_backed_by_declared_endpoints` now fails the build if
-/// one does.
-pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
-    // Soft delete FREES the product's slug — migration 005's unique index is
-    // partial on `deleted_at IS NULL` — and nothing stops a product created
-    // afterwards from claiming it. Restoring the original then violates that
-    // index's `(owner_kind, owner_id, slug)` key, which arrives here as a
-    // generic database failure and would go out as an opaque 500. The
-    // Deleted view's Restore button only reloads on success, so that 500 is
-    // invisible: the one door out of soft delete would appear to do nothing
-    // at all. Name the collision instead, so an admin can free the slug and
-    // retry.
-    //
-    // The write is what asks the question. This used to be a pre-check
-    // *before* `restore`, which left the answer stale by exactly the gap
-    // between the two statements — a slug claimed inside that gap produced
-    // the same opaque 500 the check existed to prevent. Reading the collision
-    // off the failed write cannot be raced: the write either landed, in which
-    // case there was no collision, or it did not, in which case the row is
-    // still deleted and still there to be probed. It also drops two reads
-    // from every successful restore, which is the common case.
-    match repo::products::restore(ctx, id).await {
-        Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => match restore_slug_conflict(ctx, id).await {
-            Some(slug) => err_conflict(&format!(
-                "Another product already uses the slug \"{slug}\". Rename or delete that \
-                 product, then restore this one."
-            )),
-            // Not a slug collision, or the probe could not tell. Either way
-            // the original write error is the one worth recording, against a
-            // correlation id the admin can quote.
-            None => err_internal("Database error", e),
-        },
-    }
-}
-
-/// The slug a failed [`handle_restore_product`] write collided on, or `None`
-/// when the failure was something else — or when the probe itself could not
-/// run, since "could not tell" must not be reported as a conflict.
-///
-/// Safe to call only after the write failed: the row is then still
-/// soft-deleted, so `get_deleted` can still read the slug it was trying to
-/// re-claim.
-async fn restore_slug_conflict(ctx: &dyn Context, id: &str) -> Option<String> {
-    let deleted = repo::products::get_deleted(ctx, id).await.ok()?;
-    colliding_slug(ctx, &deleted).await.ok().flatten()
-}
-
-/// The slug `deleted` would re-claim on restore, when a LIVE product of the
-/// same owner already holds it — `Ok(None)` when the restore is clear to go.
-///
-/// Keyed on `(owner_kind, owner_id, slug)` because that is the unique index's
-/// own key. An empty slug never collides: the index is also partial on
-/// `slug <> ''`, so any number of rows may carry one.
-///
-/// A read failure is returned, not folded into `Ok(None)`: "no collision" and
-/// "could not tell" are different answers, and only the caller knows what to
-/// do with the second one.
-async fn colliding_slug(
-    ctx: &dyn Context,
-    deleted: &db::Record,
-) -> Result<Option<String>, wafer_run::WaferError> {
-    let slug = deleted.str_field("slug");
-    if slug.is_empty() {
-        return Ok(None);
-    }
-    let filters = vec![
-        eq_filter("owner_kind", deleted.str_field("owner_kind")),
-        eq_filter("owner_id", deleted.str_field("owner_id")),
-        eq_filter("slug", slug),
-    ];
-    // `list_all` appends the live-only filter, so a second soft-deleted row
-    // sharing the slug is correctly not a collision.
-    let live = repo::products::list_all(ctx, filters).await?;
-    Ok((!live.is_empty()).then(|| slug.to_string()))
-}
-
-fn eq_filter(field: &str, value: &str) -> Filter {
-    Filter {
-        field: field.to_string(),
-        operator: FilterOp::Equal,
-        value: serde_json::Value::String(value.to_string()),
     }
 }
 
