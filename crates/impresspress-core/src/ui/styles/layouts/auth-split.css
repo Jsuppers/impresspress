@@ -28,8 +28,14 @@
 	color: var(--text-secondary); font-size: 0.875rem; margin: 0;
 }
 
+/* #dc2626 was only 3.95:1 on this box's #fee2e2 background (computed) --
+   below the 4.5:1 AA floor. `--accent-danger-text` (#b91c1c, 5.30:1 on
+   #fee2e2, computed) replaces it -- the same token this file's
+   `.auth-status__icon--dynamic` failure state and every other danger-text
+   surface already use, so this stops being the one danger-text site with
+   its own untokenized (and non-compliant) literal. */
 .login-error {
-	background: #fee2e2; color: #dc2626;
+	background: #fee2e2; color: var(--accent-danger-text);
 	padding: 0.75rem 1rem; border-radius: 8px;
 	margin-bottom: 1.5rem; font-size: 0.875rem;
 	display: flex; align-items: center; gap: 0.5rem;
@@ -40,11 +46,16 @@
    deliberately: the element starts `hidden` (native attribute, see
    base.css's `[hidden]` rule) and the shown state is the default block
    flow — the same shape the `#success` div had when it carried an inline
-   `display:block`. #ecfdf5/#a7f3d0/#059669 have no matching design token;
-   carried over unchanged from the original inline styles. */
+   `display:block`. #ecfdf5/#a7f3d0 have no matching design token; carried
+   over unchanged from the original inline styles. #059669 was only 3.58:1
+   on #ecfdf5 (computed) -- below the 4.5:1 AA floor. #166534 (6.77:1 on
+   #ecfdf5, computed) replaces it -- same literal already used two rules
+   down by `.change-password-success-text` (and by `.badge--tone-green`'s
+   text in components/badge.css), so this box's own text now clears AA
+   too instead of being the one sibling left failing. */
 .login-success {
 	background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px;
-	padding: 0.75rem; margin-bottom: 1rem; font-size: 0.813rem; color: #059669;
+	padding: 0.75rem; margin-bottom: 1rem; font-size: 0.813rem; color: #166534;
 }
 /* change-password's success box: same box, centered content, larger padding,
    and its own message styling (child overrides the box's font-size/color,
