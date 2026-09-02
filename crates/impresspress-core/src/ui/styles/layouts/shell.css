@@ -132,6 +132,12 @@
 .sidebar__group-label {
 	font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.06em;
 	color: var(--sidebar-text-muted); padding: var(--space-2) var(--space-2) var(--space-1);
+	/* Clipped at every width, not just when collapsed. These are single words
+	   ("COMMUNICATION"), so they cannot wrap -- they overflow instead, and
+	   `.sidebar__groups` is overflow-x: auto, so mid-collapse the rail grew a
+	   horizontal scrollbar that flashed for the length of the animation
+	   (measured: overflowing at every width below 130px). */
+	white-space: nowrap; overflow: hidden;
 }
 .sidebar__nav { list-style: none; padding: 0; margin: 0; }
 .sidebar__nav-item {
@@ -145,6 +151,21 @@
 	   the last icon 11.5px out of place on collapse. line-height: 1 makes
 	   the icon the tallest child in both states. */
 	line-height: 1;
+	/* The label must never wrap, at ANY width -- not just at the two end
+	   widths. `.sidebar__nav-label` is only hidden once `.collapsed` lands,
+	   so throughout the 0.3s width animation the labels are still laid out
+	   in a rail that is narrowing continuously. "Vector indexes" is the one
+	   label with a space in it, so it is the one that can wrap: measured, it
+	   went to two lines somewhere between 150px and 130px, taking its row
+	   from 32px to 44px and sliding every icon below it 12px down mid-flight
+	   before they snapped back at the end. Both end states were stable,
+	   which is exactly why measuring only those two missed it.
+
+	   nowrap keeps the row one line tall at every intermediate width;
+	   overflow: hidden clips the part that no longer fits (rather than
+	   letting it spill and put a scrollbar across `.sidebar__groups`, which
+	   is overflow-x: auto). */
+	white-space: nowrap; overflow: hidden;
 }
 .sidebar__nav-item:hover { background: var(--navy-700); color: #ffffff; }
 .sidebar__nav-item.is-active {
@@ -152,7 +173,10 @@
 	box-shadow: inset 3px 0 0 0 var(--primary-color);
 	color: #ffffff; font-weight: 500;
 }
-.sidebar__nav-icon { display: inline-flex; width: 16px; height: 16px; }
+/* flex-shrink: 0 so the icon keeps its 16px as the rail narrows and the
+   label competes for space -- without it the icon is squeezed mid-animation
+   and the mark visibly changes size while collapsing. */
+.sidebar__nav-icon { display: inline-flex; width: 16px; height: 16px; flex-shrink: 0; }
 .sidebar__brand {
 	display: flex; align-items: center; justify-content: flex-start;
 	gap: var(--space-2);
@@ -226,13 +250,11 @@
 .sidebar.collapsed .sidebar__brand-name,
 .sidebar.collapsed .sidebar__nav-label,
 .sidebar.collapsed .sidebar__user-text { display: none; }
-/* `overflow: hidden` as well: the label keeps its box, but its TEXT is not
-   constrained by it -- a single long word ("COMMUNICATION", 117px) cannot
-   wrap inside the 56px box, so it spilled and pushed
-   `.sidebar__groups` (overflow-x: auto) to 125px of scroll width, putting a
-   horizontal scrollbar across the bottom of the collapsed rail. Clipping the
-   invisible label removes the overflow at source. */
-.sidebar.collapsed .sidebar__group-label { visibility: hidden; overflow: hidden; }
+/* Only visibility here -- the clipping that keeps this label from spilling
+   out of the narrow rail now lives on the base rule above, because the
+   overflow happens throughout the collapse animation, before this class
+   lands. */
+.sidebar.collapsed .sidebar__group-label { visibility: hidden; }
 /* .sidebar__brand-icon has no collapsed override -- it's `display: block` by
    default now (shown in both states), so collapsing only needs to hide the
    name/labels above. */
