@@ -12,7 +12,6 @@ use crate::{
         stripe,
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthorized, ok_json},
-    util::RecordExt,
 };
 
 #[derive(Clone, Copy)]
@@ -52,9 +51,9 @@ pub(super) async fn verify_product(
         if user_id.is_empty() {
             return Err(err_unauthorized("Not authenticated"));
         }
-        let owner_id = product.str_field("owner_id");
-        let created_by = product.str_field("created_by");
-        if owner_id != user_id && created_by != user_id {
+        // The shared rule, so the offer routes and the product CRUD routes
+        // cannot disagree about who owns the same row again.
+        if !super::is_owned_by(&product, user_id) {
             return Err(err_not_found("Product not found"));
         }
     }

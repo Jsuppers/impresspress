@@ -3256,3 +3256,102 @@ async fn checkout_404s_for_a_product_deleted_between_its_two_reads() {
         "a product deleted mid-request must read as a missing offer, not a server error"
     );
 }
+
+/// One product, one caller, three answers. `owner_id = user_1` with
+/// `created_by = admin_1` is the shape an administrator creating a listing
+/// on a seller's behalf leaves behind, and it split the seller's own product
+/// apart: `pages::product_manager` rendered it, `offers::verify_product`
+/// accepted every offer and Payment Link route on it (both testing
+/// `owner_id` OR `created_by`), while `verify_product_owner` — the single
+/// door for GET/PATCH/DELETE/duplicate on the same product — compared
+/// `created_by` alone and answered 404.
+///
+/// The half that was open is the more dangerous one: creating an offer and
+/// opening a Payment Link is how money starts moving. So the doors agree on
+/// the wider rule, from ONE predicate rather than three copies of it: a
+/// caller may act on a product they own or created.
+#[tokio::test]
+async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhere() {
+    let ctx = user_products_ctx().await;
+
+    let mut assigned = HashMap::new();
+    assigned.insert("name".to_string(), serde_json::json!("Assigned"));
+    assigned.insert("status".to_string(), serde_json::json!("draft"));
+    assigned.insert("owner_kind".to_string(), serde_json::json!("user"));
+    assigned.insert("owner_id".to_string(), serde_json::json!("user_1"));
+    assigned.insert("created_by".to_string(), serde_json::json!("admin_1"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "assigned",
+        assigned,
+    )
+    .await;
+
+    // The two doors that already accepted this caller — the positive
+    // controls the CRUD door has to match, not the other way round.
+    let html = output_to_html(
+        super::super::pages::product_manager(
+            &ctx,
+            &crate::test_support::auth_msg("read", "/b/products/products/assigned", "user_1"),
+            "assigned",
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        html.contains("Assigned"),
+        "the owner's product page already renders for them: {html}"
+    );
+
+    let (msg, input) = get_msg("/b/products/products/assigned/offers", "user_1");
+    let listed = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(
+        listed["offers"].is_array(),
+        "the owner's offer routes already accept them: {listed}"
+    );
+
+    // GET
+    let (msg, input) = get_msg("/b/products/products/assigned", "user_1");
+    let fetched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(
+        fetched["id"], "assigned",
+        "the owner must be able to read the product their own page renders: {fetched}"
+    );
+
+    // PATCH
+    let (msg, input) = update_msg(
+        "/b/products/products/assigned",
+        "user_1",
+        serde_json::json!({ "name": "Renamed" }),
+    );
+    let patched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(
+        patched["data"]["name"], "Renamed",
+        "the owner must be able to edit it: {patched}"
+    );
+
+    // DELETE
+    let (msg, input) = delete_msg("/b/products/products/assigned", "user_1");
+    let deleted = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(
+        deleted["deleted"], true,
+        "the owner must be able to delete it: {deleted}"
+    );
+
+    // And the rule is still a rule: a third party is neither owner nor
+    // creator and gets the same 404 from every one of those doors.
+    let (msg, input) = get_msg("/b/products/products/assigned", "user_2");
+    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    let (msg, input) = get_msg("/b/products/products/assigned/offers", "user_2");
+    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    let stranger = super::super::pages::product_manager(
+        &ctx,
+        &crate::test_support::auth_msg("read", "/b/products/products/assigned", "user_2"),
+        "assigned",
+        false,
+    )
+    .await;
+    assert!(output_is_error(stranger, ErrorCode::NotFound).await);
+}

@@ -1890,14 +1890,10 @@ pub async fn product_manager(
         }
         Err(error) => return crate::http::err_internal("Could not load product", error),
     };
-    if !admin {
-        let user_id = msg.user_id();
-        if user_id.is_empty()
-            || (product.str_field("owner_id") != user_id
-                && product.str_field("created_by") != user_id)
-        {
-            return crate::http::err_not_found("Product not found");
-        }
+    if !admin && !super::handlers::is_owned_by(&product, msg.user_id()) {
+        // The shared rule again — this page and the API that backs its
+        // buttons must not disagree about who owns the product.
+        return crate::http::err_not_found("Product not found");
     }
     let offers = match repo::offers::list_for_product(ctx, product_id).await {
         Ok(offers) => offers,

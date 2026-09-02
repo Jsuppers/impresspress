@@ -93,6 +93,39 @@ fn reject_unsettable_fields(data: &HashMap<String, serde_json::Value>) -> Result
     )))
 }
 
+/// Whether `user_id` may act on `product` through a user-facing (non-admin)
+/// product route.
+///
+/// The single definition of that rule, deliberately: it used to be written
+/// out at three separate doors onto the same product and one of them said
+/// something different. `verify_product_owner` compared `created_by` alone,
+/// while `offers::verify_product` and `pages::product_manager` accepted
+/// `owner_id` OR `created_by` — so a product with `owner_id = user_1` and
+/// `created_by = admin_1` (what an administrator creating a listing on a
+/// seller's behalf leaves behind) rendered on the seller's own page and
+/// accepted every offer and Payment Link route on it, while GET, PATCH,
+/// DELETE and duplicate all answered 404 for the same caller on the same row.
+///
+/// They agree on the wider rule rather than the narrower one. The routes that
+/// were already open are the ones that open a money surface — creating an
+/// offer, opening a Payment Link — so narrowing to `created_by` would have
+/// stranded a seller with a live money surface they could not read, edit or
+/// shut down. `owner_id` is also the field the rest of the system treats as
+/// authoritative for ownership: seller suspension and moderation scope on it,
+/// and checkout routes the charge to `owner_id`'s connected account.
+///
+/// An empty `user_id` is never an owner — an unauthenticated caller must not
+/// match a row whose `owner_id`/`created_by` happens to be blank, which is
+/// exactly what every platform-owned product carries.
+pub(in crate::blocks::products) fn is_owned_by(
+    product: &wafer_core::clients::database::Record,
+    user_id: &str,
+) -> bool {
+    !user_id.is_empty()
+        && (field_as_string(product, "owner_id") == user_id
+            || field_as_string(product, "created_by") == user_id)
+}
+
 /// Map a `repo::products` write failure onto a response.
 ///
 /// `NotFound` is the 404 every product endpoint gives for a row that is
@@ -178,13 +211,13 @@ fn product_filters(msg: &Message) -> Vec<Filter> {
     filters
 }
 
-/// Fetch a product and verify `created_by == user_id`, routing the lookup
-/// through `repo::products::get` so a soft-deleted product answers 404 the
-/// same as one that never existed — the generic `crud::verify_owner` reads
-/// its collection raw and would let an owner keep fetching/editing a
-/// soft-deleted row. Mirrors `crud::verify_owner`'s response shape: 401
-/// unauthenticated, 404 for both "missing" and "not yours" (existence must
-/// not leak to a non-owner).
+/// Fetch a product and verify the caller may act on it ([`is_owned_by`]),
+/// routing the lookup through `repo::products::get` so a soft-deleted product
+/// answers 404 the same as one that never existed — the generic
+/// `crud::verify_owner` reads its collection raw and would let an owner keep
+/// fetching/editing a soft-deleted row. Mirrors `crud::verify_owner`'s
+/// response shape: 401 unauthenticated, 404 for both "missing" and "not
+/// yours" (existence must not leak to a non-owner).
 async fn verify_product_owner(
     ctx: &dyn Context,
     id: &str,
@@ -195,7 +228,7 @@ async fn verify_product_owner(
     }
     match repo::products::get(ctx, id).await {
         Ok(record) => {
-            if field_as_string(&record, "created_by") != user_id {
+            if !is_owned_by(&record, user_id) {
                 return Err(err_not_found("Product not found"));
             }
             Ok(record)
