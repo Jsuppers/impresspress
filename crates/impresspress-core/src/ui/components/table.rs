@@ -66,7 +66,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::components::empty_state;
+    use crate::ui::{components::empty_state, icons};
 
     #[test]
     fn data_table_empty_renders_empty_slot() {
@@ -75,7 +75,7 @@ mod tests {
             width: None,
         }];
         let empty = empty_state(
-            maud::html! { "📭" },
+            icons::inbox(),
             "No users",
             "Invite someone to get started.",
             None,

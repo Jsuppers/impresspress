@@ -92,6 +92,11 @@
 /* Caller-declared per-column width (ui/components/table.rs's `TableCol`) --
    a genuine runtime value, handed to CSS as `--col-width`. */
 .data-table__col-w { width: var(--col-width); }
+/* Folder row name link (blocks/files/pages_user/objects.rs): the folder
+   icon (`icons::folder()`, 18x18) sits inline before the folder name --
+   flex + gap keeps it baseline-aligned with the text instead of the
+   default inline SVG's slight descender offset. */
+.row--folder__link { display: inline-flex; align-items: center; gap: 0.375rem; }
 
 /* ===== Empty state ===== */
 .empty { text-align: center; padding: var(--spacing-xl) var(--spacing-md); color: var(--text-secondary); }

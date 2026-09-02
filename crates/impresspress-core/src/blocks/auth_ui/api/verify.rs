@@ -10,6 +10,7 @@ use crate::{
     http::{err_bad_request, err_internal, ok_json},
     ui,
     ui::components::auth_panel,
+    ui::icons,
     ui::templates::auth_split,
     util::{hex_encode, sha256_hex},
 };
@@ -186,8 +187,8 @@ fn html_respond(
             html! {
                 div .login-container {
                     div .auth-status {
-                        div .auth-status__icon .auth-status__icon--dynamic style={"--icon-color:" (color) ";--icon-bg:" (color) "15"} {
-                            @if success { "✓" } @else { "✗" }
+                        div .auth-status__icon .auth-status__icon--dynamic aria-hidden="true" style={"--icon-color:" (color) ";--icon-bg:" (color) "15"} {
+                            @if success { (icons::check()) } @else { (icons::x()) }
                         }
                         h2 .auth-status__title { (title) }
                         p .auth-status__message { (message) }

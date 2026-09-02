@@ -113,6 +113,11 @@
 	display: flex; align-items: center; justify-content: center;
 	margin: 0 auto 1rem; font-size: 1.5rem;
 }
+/* The status glyph is now an inline `icons::check()`/`icons::x()` SVG (18x18
+   by default) rather than a text character -- sized up to read clearly in
+   the 48px badge, matching the `.db-table-group__icon svg` override
+   precedent for an icon inside an oversized badge. */
+.auth-status__icon svg { width: 24px; height: 24px; }
 .auth-status__icon--dynamic { background: var(--icon-bg); color: var(--icon-color); }
 /* #ecfdf5 has no matching token; --accent-success (#10b981) does match the
    original literal and is used in place of it. */

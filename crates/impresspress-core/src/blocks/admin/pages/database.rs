@@ -241,8 +241,8 @@ async fn schema_panel(ctx: &dyn Context, table: Option<&str>) -> Markup {
                                 tr {
                                     td .font-medium { (c.name) }
                                     td .text-muted { (c.ty) }
-                                    td { @if c.notnull { "✓" }  }
-                                    td { @if c.pk { "✓" }  }
+                                    td { @if c.notnull { span aria-label="Yes" { (icons::check()) } } }
+                                    td { @if c.pk { span aria-label="Yes" { (icons::check()) } } }
                                     td .text-muted .text-sm { (c.default_value.as_deref().unwrap_or("")) }
                                 }
                             }

@@ -7,7 +7,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use crate::{
     blocks::files::repo,
     ui::{
-        self,
+        self, icons,
         shell::Crumb,
         templates::{list_page, PageHeader},
     },
@@ -110,8 +110,9 @@ pub fn render_objects_table(
                     tr .row--folder {
                         td {} // bulk-select disabled on folders
                         td data-label="Name" {
-                            a href={"/b/storage/" (url_path_encode(bucket)) "/" (url_encode_prefix(current_prefix)) (url_path_encode(folder)) "/"} {
-                                "📁 " (folder)
+                            a .row--folder__link href={"/b/storage/" (url_path_encode(bucket)) "/" (url_encode_prefix(current_prefix)) (url_path_encode(folder)) "/"} {
+                                span aria-hidden="true" { (icons::folder()) }
+                                (folder)
                             }
                         }
                         td data-label="Size" { "—" }
@@ -424,7 +425,7 @@ mod tests {
             files: vec![&f1],
         };
         let html = render_objects_table("photos", "", &listing).into_string();
-        // folder row with "📁" icon + link into the prefix
+        // folder row with folder icon (icons::folder()) + link into the prefix
         assert!(html.contains("nested"), "folder name missing: {html}");
         assert!(
             html.contains(r#"href="/b/storage/photos/nested/""#),
@@ -587,8 +588,16 @@ mod integration_tests {
 
         assert!(body.contains(">a.png<"), "root file missing: {body}");
         assert!(
-            body.contains("📁 nested"),
+            body.contains("row--folder__link") && body.contains("nested"),
             "synthesized folder missing: {body}"
+        );
+        // Folder rows render distinctly via the Lucide folder icon (no
+        // longer a raw emoji character) -- pin the icon's SVG path so a
+        // future regression to plain text (or a different icon) shows up
+        // here.
+        assert!(
+            body.contains(r#"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9"#),
+            "folder icon svg missing: {body}"
         );
         // Breadcrumb has only the bucket segment, no prefix segments.
         assert!(

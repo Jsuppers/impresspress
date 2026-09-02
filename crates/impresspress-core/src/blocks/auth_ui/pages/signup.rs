@@ -42,7 +42,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     div #error .login-error hidden {}
 
                     div #success .auth-status hidden {
-                        div .auth-status__icon .auth-status__icon--success { "✓" }
+                        div .auth-status__icon .auth-status__icon--success aria-hidden="true" { (ui::icons::check()) }
                         h2 .auth-status__title { "Check your email" }
                         p #verify-msg .auth-status__message {}
                         a #back-to-signin .login-button .auth-status__action href={"/b/auth/login" (redirect_qs)} {
