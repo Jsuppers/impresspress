@@ -20,7 +20,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let orgs_list = orgs::list_for_user(ctx, &user_id).await.unwrap_or_default();
     let body = html! {
-        p .text-muted style="margin:0 0 1rem;font-size:0.875rem" {
+        p .text-muted .m-0 .mb-4 .text-sm {
             "Orgs you've claimed via GitHub, Google, or Microsoft sign-in."
         }
         (render_orgs_body(&orgs_list))
@@ -45,7 +45,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
 fn render_orgs_body(orgs: &[orgs::OrgRow]) -> Markup {
     if orgs.is_empty() {
         return html! {
-            p .text-muted style="margin:0" {
+            p .text-muted .m-0 {
                 "No claimed organizations. Sign in with GitHub, Google, or Microsoft to claim one."
             }
         };

@@ -136,8 +136,7 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
                                 code #new-api-key style="flex:1 1 auto; padding: var(--spacing-sm); background: var(--bg-secondary); border-radius: var(--radius-md); font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; user-select: all" {
                                     (key_for_display)
                                 }
-                                button type="button" .btn .btn-secondary .btn-sm
-                                    style="flex: 0 0 auto"
+                                button type="button" .btn .btn-secondary .btn-sm .flex-none
                                     onclick=(copy_js)
                                 { "Copy" }
                             }
