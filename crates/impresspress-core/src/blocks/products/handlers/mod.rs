@@ -40,12 +40,9 @@ pub(in crate::blocks::products) use dispatch::user_products_enabled;
 pub use dispatch::{handle_admin, handle_user};
 #[cfg(test)]
 pub(in crate::blocks::products) use dispatch::{ADMIN_ROUTES, USER_ROUTES};
-pub(in crate::blocks::products) use product::name_like_filter;
+pub(in crate::blocks::products) use product::{is_owned_by, name_like_filter, write_error};
 use wafer_core::clients::database as db;
 use wafer_run::context::Context;
-
-/// Products catalog table — one row per product offering.
-pub(crate) const PRODUCTS_TABLE: &str = "impresspress__products__products";
 
 /// Product groups (categories / bundles) table.
 pub(crate) const GROUPS_TABLE: &str = "impresspress__products__groups";

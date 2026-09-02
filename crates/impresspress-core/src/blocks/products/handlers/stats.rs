@@ -4,7 +4,7 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{GROUPS_TABLE, PRODUCTS_TABLE};
+use super::GROUPS_TABLE;
 use crate::{
     blocks::products::{
         contracts::{AdminStats, SellerStats},
@@ -25,8 +25,8 @@ pub(super) async fn handle_stats(ctx: &dyn Context, _msg: &Message) -> OutputStr
     // (not `tokio::join!`) because tokio is an optional dep in
     // impresspress-core's Cargo.toml — futures 0.3 is unconditional.
     let (total_products, active_products, total_purchases, analytics, total_groups) = futures::join!(
-        db::count(ctx, PRODUCTS_TABLE, &[]),
-        db::count(ctx, PRODUCTS_TABLE, &active_filter),
+        repo::products::count(ctx, &[]),
+        repo::products::count(ctx, &active_filter),
         repo::purchases::count_all(ctx),
         repo::purchases::commerce_analytics(ctx, None),
         db::count(ctx, GROUPS_TABLE, &[]),
