@@ -18,6 +18,9 @@ input, textarea, select, [contenteditable="true"] {
 	-webkit-user-select: text !important;
 	user-select: text !important;
 }
+/* Native disclosure triangle: the browser doesn't set a pointer cursor by
+ * default even though the whole element is clickable. */
+summary { cursor: pointer; }
 
 /* ===== Keyboard focus ===== */
 /* Keyboard-focus ring — low specificity so component rules can refine it. */

@@ -11,6 +11,7 @@
 .badge-warning { background: #f59e0b19; color: var(--accent-warning); }
 .badge-info { background: var(--accent-info-bg); color: var(--accent-info); }
 .badge-secondary { background: #e2e8f0; color: #334155; }
+.badge--center { justify-content: center; }
 
 /* ===== Avatar ===== */
 .avatar { display: inline-flex; align-items: center; justify-content: center; border-radius: var(--radius-full); background: var(--primary-button); color: #fff; font-weight: 600; }

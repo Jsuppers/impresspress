@@ -40,6 +40,12 @@
 .card__subtitle { margin: 0; font-size: var(--text-xs); color: var(--text-muted); }
 .card__actions { margin-left: auto; display: flex; gap: var(--spacing-sm); }
 .card__body { padding: var(--spacing-lg); }
+/* Card nested inside a container that already draws a border/shadow (e.g. a
+ * `<details>` disclosure) — drop the card's own so they don't double up. */
+.card--flat { border: 0; box-shadow: none; }
+/* Draws attention to a card needing action (e.g. a Stripe restriction). */
+.card--warning { border-color: var(--accent-warning); }
+.card__head--end { align-items: flex-end; flex-wrap: wrap; }
 
 /* ===== Portal dashboard (Phase 4 PR-1) ===== */
 .dashboard-apps-card .card__body { padding: var(--spacing-md); }

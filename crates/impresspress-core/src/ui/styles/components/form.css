@@ -155,18 +155,79 @@
 .text-xs { font-size: 0.75rem; }
 .font-medium { font-weight: 500; }
 .font-semibold { font-weight: 600; }
+/* Margin/gap scale follows the same 0.25rem step as the existing mt-1/mt-2/
+ * mt-4 and gap-2/gap-4 utilities below (n * 0.25rem). */
+.m-0 { margin: 0; }
+.mt-0 { margin-top: 0; }
 .mt-1 { margin-top: 0.25rem; }
 .mt-2 { margin-top: 0.5rem; }
+.mt-3 { margin-top: 0.75rem; }
 .mt-4 { margin-top: 1rem; }
+.mt-5 { margin-top: 1.25rem; }
+.mt-6 { margin-top: 1.5rem; }
+.mb-1 { margin-bottom: 0.25rem; }
 .mb-2 { margin-bottom: 0.5rem; }
+.mb-3 { margin-bottom: 0.75rem; }
 .mb-4 { margin-bottom: 1rem; }
+.my-1 { margin: 0.25rem 0; }
+.my-3 { margin: 0.75rem 0; }
+/* A muted description paragraph directly under a heading — the products
+ * admin pages' most common inline style before this pass (15 sites). */
+.text-subtitle { margin: 0.25rem 0 0; }
 .flex { display: flex; }
 .flex-1 { flex: 1; }
+.flex-wrap { flex-wrap: wrap; }
 .items-center { align-items: center; }
+.items-start { align-items: flex-start; }
+.items-end { align-items: flex-end; }
 .justify-between { justify-content: space-between; }
 .gap-2 { gap: 0.5rem; }
+.gap-3 { gap: 0.75rem; }
 .gap-4 { gap: 1rem; }
 .hidden { display: none; }
+.d-block { display: block; }
+.min-h-10 { min-height: 2.5rem; }
+.col-span-full { grid-column: 1 / -1; }
+.form-group--narrow { max-width: 620px; }
+.fieldset-reset { border: 0; padding: 0; margin: 0; }
+.list-compact { margin: 0.5rem 0; padding-left: 1.25rem; }
+
+/* Compound override: `details.products-advanced` (a page-local component
+ * class defined in `blocks/products/pages.rs`'s own `<style>` block, which
+ * this task does not migrate — see task-12a report) sets its own
+ * `margin-top: 1rem`. Because that rule ships in a `<style>` tag rendered
+ * inside `<body>`, it sits later in the cascade than this stylesheet and
+ * would beat a plain `.mt-0` on specificity-tie source order. Pairing the
+ * class here with `.products-advanced` raises specificity so the override
+ * is unconditional rather than order-dependent. */
+.products-advanced.mt-0 { margin-top: 0; }
+
+/* ===== Auto-fit grids =====
+ * Named by their `minmax()` pixel floor so call sites read the same value
+ * they select; combine with `.gap-*` and `.mt-*` for spacing. */
+.grid { display: grid; }
+.grid-auto-150 { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.grid-auto-180 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.grid-auto-220 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.grid-auto-240 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.grid-auto-260 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.grid-auto-280 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.grid-auto-320 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+/* Two fixed, unequally-weighted columns — the shipping origin/destination
+ * row is the only user of this shape. */
+.grid-shipping { grid-template-columns: minmax(180px, 1fr) minmax(280px, 2fr); }
+
+/* ===== Disclosure (details/summary) =====
+ * `summary { cursor: pointer }` lives in base.css as a global element
+ * default; these cover the spacing/weight variants around it. */
+.details-block { margin-top: 1rem; }
+.details-block--tight { margin: 0.75rem 0; }
+.details-block--spaced { margin: 0.5rem 0 1rem; }
+.details-block--divider { border-top: 1px solid var(--border-color); margin-top: 1.25rem; padding-top: 1.25rem; }
+.summary-strong { font-weight: 600; }
+/* A compact heading inside a details body — smaller than the page's h2
+ * default and flush with the content above it. */
+.details-heading { font-size: 1rem; margin-top: 0; }
 
 @media (max-width: 720px) {
 	/* Forms: two-column form rows stack on narrow screens. */
