@@ -185,13 +185,13 @@ fn html_respond(
             auth_panel(&config, Some("Verify your email.")),
             html! {
                 div .login-container {
-                    div style="text-align:center" {
-                        div style={"width:48px;height:48px;background:" (color) "15;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:" (color)} {
+                    div .auth-status {
+                        div .auth-status__icon .auth-status__icon--dynamic style={"--icon-color:" (color) ";--icon-bg:" (color) "15"} {
                             @if success { "✓" } @else { "✗" }
                         }
-                        h2 style="font-size:1.25rem;font-weight:700;margin:0 0 .5rem" { (title) }
-                        p .login-subtitle style="line-height:1.6;margin:0 0 1.5rem" { (message) }
-                        a .login-button href="/b/auth/login" style="display:inline-block;width:auto;padding:.625rem 1.25rem;text-decoration:none" {
+                        h2 .auth-status__title { (title) }
+                        p .auth-status__message { (message) }
+                        a .login-button .auth-status__action href="/b/auth/login" {
                             "Go to Sign In"
                         }
                     }
