@@ -764,6 +764,43 @@ mod tests {
     /// cleared, destroying the invariant that a cleared file stays clear.
     #[test]
     fn pages_carry_no_page_local_style_drift() {
+        // Scopes the dynamic-value check (below) to the assigned expression
+        // only, not the rest of the physical line. This codebase's JS is
+        // written as single minified lines, so a `{` from an unrelated
+        // later callback/object literal in the same statement chain (e.g.
+        // `.forEach(function(x){...})`, `JSON.stringify(y||{})`) must not
+        // suppress a real offender -- exactly the false negative that let
+        // two `row.style.cssText='...'` sites in `productManagerLoadPresets`/
+        // `productManagerLoadLinks` survive an earlier version of this
+        // guard undetected. A quoted string literal (the common case for a
+        // style value) is scoped to its own contents; an unquoted
+        // expression (e.g. a ternary of two literals) is scoped to the next
+        // top-level `;` that ends the statement.
+        fn assigned_expr(value: &str) -> &str {
+            if let Some(quote @ ('\'' | '"')) = value.chars().next() {
+                let rest = &value[1..];
+                let mut escaped = false;
+                for (i, c) in rest.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if c == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if c == quote {
+                        return &rest[..i];
+                    }
+                }
+                return rest;
+            }
+            match value.find(';') {
+                Some(end) => &value[..end],
+                None => value,
+            }
+        }
+
         let roots = [
             concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
@@ -819,9 +856,13 @@ mod tests {
                         // 'none'`) is excluded.
                         if let Some(stripped) = after_prop.strip_prefix('=') {
                             if !stripped.starts_with('=') {
+                                let value = stripped.trim_start();
                                 // Dynamic case: a Rust `format!` placeholder
-                                // threaded into this JS on the same line.
-                                if !stripped.contains('{') {
+                                // threaded into this JS, inside the assigned
+                                // expression itself (see `assigned_expr`
+                                // above for why this isn't just "the rest of
+                                // the line").
+                                if !assigned_expr(value).contains('{') {
                                     style_assignment_offenders.push(loc());
                                 }
                             }
