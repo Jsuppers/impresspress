@@ -520,7 +520,7 @@
                   "records": {
                     "description": "Products on this page, newest first.",
                     "items": {
-                      "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                      "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                       "properties": {
                         "approval_status": {
                           "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -886,7 +886,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -1157,7 +1157,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -1516,7 +1516,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -1742,7 +1742,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -2091,7 +2091,7 @@
                     "type": "array"
                   },
                   "product": {
-                    "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                    "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                     "properties": {
                       "approval_status": {
                         "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -2324,7 +2324,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -2531,6 +2531,233 @@
         "products",
         "admin",
         "moderation"
+      ]
+    }
+  },
+  "/b/products/api/admin/products/{id}/restore": {
+    "post": {
+      "description": "Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
+                "properties": {
+                  "approval_status": {
+                    "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+                    "enum": [
+                      "draft",
+                      "pending",
+                      "approved",
+                      "rejected",
+                      "suspended"
+                    ],
+                    "type": "string"
+                  },
+                  "category": {
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "RFC 3339 creation timestamp.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "created_by": {
+                    "description": "Id of the user who created the row.",
+                    "type": "string"
+                  },
+                  "currency": {
+                    "description": "ISO 4217 presentment currency.",
+                    "type": "string"
+                  },
+                  "current_version": {
+                    "description": "Version counter of the product's immutable offer definitions.",
+                    "format": "int64",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "deleted_at": {
+                    "description": "RFC 3339 soft-delete timestamp, or `null` unless the product has been\nsoft-deleted.",
+                    "format": "date-time",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "fulfillment_kind": {
+                    "description": "How a purchase is fulfilled.",
+                    "enum": [
+                      "none",
+                      "manual",
+                      "download",
+                      "entitlement",
+                      "webhook"
+                    ],
+                    "type": "string"
+                  },
+                  "group_id": {
+                    "description": "Group the product is listed under, or empty.",
+                    "type": "string"
+                  },
+                  "group_template_id": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "description": "Stable product identifier.",
+                    "type": "string"
+                  },
+                  "image_url": {
+                    "type": "string"
+                  },
+                  "metadata": {
+                    "additionalProperties": true,
+                    "description": "Free-form key/value metadata attached by the product builder.",
+                    "type": "object"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "owner_id": {
+                    "description": "Owning seller's user id; empty for platform products.",
+                    "type": "string"
+                  },
+                  "owner_kind": {
+                    "description": "`platform` for an administrator-owned product, `user` for a seller's.",
+                    "enum": [
+                      "platform",
+                      "user"
+                    ],
+                    "type": "string"
+                  },
+                  "product_template_id": {
+                    "description": "Product builder template this product was created from.",
+                    "type": "string"
+                  },
+                  "published_at": {
+                    "description": "RFC 3339 timestamp the product last became active, or `null`.",
+                    "format": "date-time",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requires": {
+                    "description": "Id of a product the buyer must already own before checkout, or empty.",
+                    "type": "string"
+                  },
+                  "seller_account_id": {
+                    "description": "Seller account the product sells through; empty for platform products.",
+                    "type": "string"
+                  },
+                  "slug": {
+                    "description": "URL slug, unique per owner among non-deleted products. Empty when the\nproduct has none.",
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "Publication state: `draft`, `pending_review` (seller product awaiting\nmoderation), `active` (in the public catalog) or `archived`.",
+                    "enum": [
+                      "draft",
+                      "pending_review",
+                      "active",
+                      "archived"
+                    ],
+                    "type": "string"
+                  },
+                  "stock": {
+                    "description": "Units in stock; `0` when inventory is not tracked.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "stripe_product_id": {
+                    "description": "Stripe Product id once the catalog has been synchronized, or empty.",
+                    "type": "string"
+                  },
+                  "submitted_at": {
+                    "description": "RFC 3339 timestamp the seller last submitted the product for\nmoderation, or `null`.",
+                    "format": "date-time",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "type_id": {
+                    "description": "Product type (taxonomy) id, or empty.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "description": "RFC 3339 timestamp of the last modification.",
+                    "format": "date-time",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "description",
+                  "slug",
+                  "currency",
+                  "status",
+                  "category",
+                  "tags",
+                  "metadata",
+                  "image_url",
+                  "stock",
+                  "group_id",
+                  "type_id",
+                  "group_template_id",
+                  "product_template_id",
+                  "requires",
+                  "created_by",
+                  "owner_kind",
+                  "owner_id",
+                  "seller_account_id",
+                  "approval_status",
+                  "fulfillment_kind",
+                  "stripe_product_id",
+                  "current_version",
+                  "submitted_at",
+                  "published_at",
+                  "deleted_at",
+                  "created_at",
+                  "updated_at"
+                ],
+                "title": "ProductView",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Restore a soft-deleted product",
+      "tags": [
+        "products",
+        "admin"
       ]
     }
   },
@@ -6635,7 +6862,7 @@
                   "products": {
                     "description": "Every product owned by the seller's user, in any publication state.",
                     "items": {
-                      "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                      "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                       "properties": {
                         "approval_status": {
                           "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -8119,7 +8346,7 @@
                   "records": {
                     "description": "Products on this page, newest first.",
                     "items": {
-                      "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                      "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                       "properties": {
                         "approval_status": {
                           "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -8485,7 +8712,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -8756,7 +8983,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -9115,7 +9342,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                 "properties": {
                   "approval_status": {
                     "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -9463,7 +9690,7 @@
                     "type": "array"
                   },
                   "product": {
-                    "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                    "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                     "properties": {
                       "approval_status": {
                         "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
@@ -15001,7 +15228,7 @@
                   "records": {
                     "description": "Products on this page, newest first.",
                     "items": {
-                      "description": "A product row as published to its owner and to administrators: every\ncolumn of `impresspress__products__products`.",
+                      "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                       "properties": {
                         "approval_status": {
                           "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",

@@ -67,10 +67,24 @@ fn key_column(table: CachedTable) -> &'static str {
 /// Build the canonical "load all rows for one block" [`ListOptions`] that
 /// [`read_key`] recognizes as cacheable.
 ///
-/// Single source of truth for the cached query shape: callers that want a
-/// KV-cached per-block read (the `D1ConfigSource`, the Cloudflare auto-gen
-/// secret seeder) construct their `ListOptions` here instead of open-coding
-/// the shape, so they can't silently drift out of cache coverage.
+/// Single source of truth for the cached per-block query shape: a caller that
+/// wants a KV-cached per-block read constructs its `ListOptions` here instead
+/// of open-coding the shape, so it can't silently drift out of cache coverage.
+///
+/// NO PRODUCTION CALLER TODAY. `D1ConfigSource` was the only one; it now reads
+/// the variables table once via [`full_table_list_opts`] and groups in memory,
+/// because one query per block meant one KV read per block on every cold
+/// hydration. With no caller issuing that shape, [`read_key`] never matches a
+/// variables read, so `cfg:v1:variables:*` keys are no longer written EITHER —
+/// any left over from before expire on their 24h TTL. Writes still emit an
+/// invalidating `delete` per variables row (see [`invalidate_keys`]),
+/// which now targets keys that cannot exist; that is deliberate belt-and-braces
+/// for a future cached per-block reader rather than an oversight, but it does
+/// spend a KV write op per row and is worth revisiting if the write budget
+/// tightens.
+/// This constructor stays because the per-block shape is still what
+/// [`read_key`] recognizes and [`write_key`] invalidates against, and the
+/// round-trip test pins the two together.
 pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
     ListOptions {
         filters: vec![Filter {
@@ -78,6 +92,28 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
             operator: FilterOp::Equal,
             value: serde_json::Value::String(value.to_string()),
         }],
+        limit: FULL_LIMIT_THRESHOLD,
+        offset: 0,
+        skip_count: true,
+        ..Default::default()
+    }
+}
+
+/// Build the canonical "load every row in the table" [`ListOptions`].
+///
+/// Two callers with deliberately different outcomes, both served by this one
+/// constructor so the shape cannot drift between them:
+///
+/// - [`crate::features::load_block_settings`]'s full-table read — recognized
+///   by [`read_key`] and cached under the `__all__` sentinel;
+/// - `D1ConfigSource`'s single variables snapshot — deliberately NOT cached
+///   (see `read_key`'s zero-filter arm, and the test that pins it). One
+///   uncached D1 query replaces one KV read per configured block, which on a
+///   22-block deployment is 22 KV reads traded for a single indexed query
+///   against a table of a few dozen rows.
+pub fn full_table_list_opts() -> ListOptions {
+    ListOptions {
+        filters: Vec::new(),
         limit: FULL_LIMIT_THRESHOLD,
         offset: 0,
         skip_count: true,
@@ -457,6 +493,31 @@ mod tests {
         // Variables is always read per-block; a filterless variables list is
         // not a recognized cache shape.
         assert_eq!(read_key(CachedTable::Variables, &full_table_opts()), None);
+    }
+
+    /// The shape `D1ConfigSource` actually issues for its one-query snapshot
+    /// must stay uncacheable, and that is load-bearing rather than incidental.
+    ///
+    /// Caching it would need an invalidation story this module does not have:
+    /// [`write_key`] derives per-block keys from the written row, so a
+    /// variables write would leave an `__all__` entry serving pre-write config
+    /// for its whole 24h TTL. It is also what keeps sensitive rows out of KV —
+    /// an unfiltered read returns every row, secrets included, and the
+    /// `list()` wrapper only reaches its sensitive-row guard for shapes it
+    /// caches. If a future change makes this cacheable, both problems have to
+    /// be solved first; this test is the tripwire.
+    #[test]
+    fn the_config_source_snapshot_shape_is_deliberately_uncacheable() {
+        assert_eq!(
+            read_key(CachedTable::Variables, &full_table_list_opts()),
+            None
+        );
+        // The same constructor IS the recognized block_settings full-table
+        // read, so the shape itself is right — only variables opts out.
+        assert_eq!(
+            read_key(CachedTable::BlockSettings, &full_table_list_opts()),
+            Some("cfg:v1:block_settings:__all__".to_string())
+        );
     }
 
     #[test]
