@@ -516,15 +516,14 @@ mod tests {
             .unwrap();
 
         let target = ImpresspressBuilder::new();
-        let error = match target.apply_prepared_plan(
+        let Err(error) = target.apply_prepared_plan(
             &plan,
             "example",
             &hash('b'),
             &lock,
             &PreparedReleaseAssets::absent(),
-        ) {
-            Ok(_) => panic!("route drift should fail plan import"),
-            Err(error) => error,
+        ) else {
+            panic!("route drift should fail plan import");
         };
         assert!(matches!(error, PreparedPlanError::StructureMismatch(_)));
     }
@@ -610,7 +609,7 @@ mod tests {
         );
 
         let matching = ImpresspressBuilder::new()
-            .final_block_config("wafer-run/router", config.clone())
+            .final_block_config("wafer-run/router", config)
             .apply_prepared_plan(
                 &plan,
                 "example",

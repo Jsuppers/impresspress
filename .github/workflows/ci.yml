@@ -116,6 +116,15 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
 
+      # `block-dev` is deliberately absent from `default` (the dev sandbox's
+      # control plane must not exist in a normal bundle), so the workspace
+      # clippy above compiles none of it — not the block, and not the ~4 200
+      # lines of `#![cfg(feature = "block-dev")]` integration tests that pin
+      # its rules. `--all-targets` is what reaches those, and `test-support`
+      # is what lets them link `FakeControl`.
+      - name: Clippy (block-dev)
+        run: cargo clippy --locked -p impresspress-core --features block-dev,test-support --all-targets -- -D warnings
+
   test:
     name: Tests
     needs: build-wasm
@@ -155,6 +164,14 @@ jobs:
       # separate job on here.
       - name: Run tests
         run: cargo test --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
+
+      # The other half of the `block-dev` gap: `--workspace` above skips every
+      # `dev_*.rs` integration test, because all five are `#![cfg]`-gated on a
+      # feature nothing turns on. `wasm` is load-bearing rather than
+      # incidental — `tests/lockfile_e2e.rs` needs wafer-run built with wasmi,
+      # and `-p impresspress-core --features block-dev` alone leaves it red.
+      - name: Run the block-dev suite
+        run: cargo test --locked -p impresspress-core --features block-dev,wasm
 
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
@@ -516,7 +533,9 @@ jobs:
   # the runtime rebuild, `replace_wafer`, boot convergence, seed-on-boot —
   # exists only inside a service worker, so no host test can run a line of it;
   # this job is where it runs. It is also the only place the `browser-devtools`
-  # and `block-dev` feature sets are compiled at all.
+  # feature set is compiled at all — `block-dev` itself is covered by the
+  # `Clippy (block-dev)` and `Run the block-dev suite` steps above, which lint
+  # and run `impresspress-core`'s half on the host.
   e2e-dev-sandbox:
     name: E2E dev sandbox (browser WASM + wasmi guest)
     needs: build-wasm

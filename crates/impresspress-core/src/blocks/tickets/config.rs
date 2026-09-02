@@ -163,7 +163,8 @@ impl SecurityReadiness {
         ];
         let reasons = checks
             .into_iter()
-            .filter_map(|(ok, reason)| (!ok).then(|| reason.to_string()))
+            .filter(|(ok, _)| !ok)
+            .map(|(_, reason)| reason.to_string())
             .collect::<Vec<_>>();
         Self {
             ready: reasons.is_empty(),
