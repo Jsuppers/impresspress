@@ -90,7 +90,13 @@
 	--border-light: #f1f5f9;
 
 	--sidebar-width: 240px;
-	--sidebar-collapsed-width: 72px;
+	/* 64, not 72: the collapsed rail's centre line has to be the same axis
+	   everything already sits on when expanded, or collapsing slides the
+	   icons sideways onto a new one. The brand mark fixes that axis at 32px
+	   (16px of `.sidebar__brand` padding + half of the 32px mark), so the
+	   rail is 2x32. The nav icons are then sized and padded to land their
+	   centres on 32 too -- see `.sidebar__nav-icon` in layouts/shell.css. */
+	--sidebar-collapsed-width: 64px;
 
 	/* Numeric 4px scale -- --space-N is N * 4px. Replaces the old
 	   --spacing-xs/sm/md/lg/xl + --space-2xl t-shirt names: a t-shirt scale

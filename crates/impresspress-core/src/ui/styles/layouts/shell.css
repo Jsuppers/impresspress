@@ -142,14 +142,14 @@
 .sidebar__nav { list-style: none; padding: 0; margin: 0; }
 .sidebar__nav-item {
 	display: flex; align-items: center; gap: var(--space-2);
-	padding: var(--space-2) var(--space-2); border-radius: var(--radius-md);
+	padding: var(--space-2) var(--space-3); border-radius: var(--radius-md);
 	color: #ffffff; text-decoration: none; font-size: var(--text-sm);
 	/* Row height must come from the 16px icon, not the label's text line.
 	   At the default line-height the 14px label boxes to 17px and wins, so
 	   the row was 33px expanded and 32px collapsed (where the label is
 	   hidden) -- a 1px difference that accumulated down the list, leaving
 	   the last icon 11.5px out of place on collapse. line-height: 1 makes
-	   the icon the tallest child in both states. */
+	   the icon cell (24px) the tallest child in both states. */
 	line-height: 1;
 	/* The label must never wrap, at ANY width -- not just at the two end
 	   widths. `.sidebar__nav-label` is only hidden once `.collapsed` lands,
@@ -173,10 +173,32 @@
 	box-shadow: inset 3px 0 0 0 var(--primary-color);
 	color: #ffffff; font-weight: 500;
 }
-/* flex-shrink: 0 so the icon keeps its 16px as the rail narrows and the
-   label competes for space -- without it the icon is squeezed mid-animation
-   and the mark visibly changes size while collapsing. */
-.sidebar__nav-icon { display: inline-flex; width: 16px; height: 16px; flex-shrink: 0; }
+/* A 24px alignment CELL holding a 20px glyph.
+ *
+ * The cell size is what centres the row, so it is chosen by arithmetic: the
+ * icon's centre when expanded is
+ *     8px  (.sidebar__groups padding)
+ *   + 12px (.sidebar__nav-item horizontal padding, --space-3)
+ *   + 12px (half the cell)
+ *   = 32px
+ * which is exactly the brand mark's centre and exactly half the 64px
+ * collapsed rail. So all three -- logo, nav icons, and the rail itself --
+ * share one centre line, the icons are centred when collapsed, and nothing
+ * moves horizontally on the way there. (Before: the rail was 72px wide with
+ * its centre at 36, the logo centred on 32 and the icons on 24 -- three
+ * different axes, which is what made the collapsed rail look off-centre.)
+ *
+ * The glyph is 20px rather than the full 24 so it reads a little larger than
+ * the old 16px without the row becoming heavy; it centres inside the cell, so
+ * its visual centre is the cell's centre either way.
+ *
+ * flex-shrink: 0 keeps the cell at 24px as the rail narrows and the label
+ * competes for space -- without it the mark visibly shrinks mid-animation. */
+.sidebar__nav-icon {
+	display: inline-flex; align-items: center; justify-content: center;
+	width: 24px; height: 24px; flex-shrink: 0;
+}
+.sidebar__nav-icon svg { width: 20px; height: 20px; }
 .sidebar__brand {
 	display: flex; align-items: center; justify-content: flex-start;
 	gap: var(--space-2);
