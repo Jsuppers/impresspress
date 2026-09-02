@@ -232,9 +232,10 @@ pub const ROUTES: &[Route] = &[
         RouteAccess::Admin,
         "impresspress/admin",
     ),
-    // Admin — SSR pages + API under /b/admin/
+    // Admin — SSR pages + API under /b/admin/. The bare `/b/admin` form used
+    // to need its own duplicate entry here; `route_prefix_matches` now covers
+    // it (and every other slash-suffixed prefix) generically.
     Route::new("/b/admin/", RouteAccess::Admin, "impresspress/admin"),
-    Route::new("/b/admin", RouteAccess::Admin, "impresspress/admin"),
     // Feature blocks — SSR + API under /b/{block}/
     Route::new("/b/storage/", RouteAccess::Public, "impresspress/files"),
     Route::new(
@@ -511,6 +512,23 @@ fn check_access(access: RouteAccess, msg: &Message) -> Option<OutputStream> {
 /// Checks feature flags and admin role. Dispatches via `ctx.call_block` — all
 /// impresspress blocks are registered in the Wafer registry at boot (zero-arg
 /// blocks via `register_static_block!`, LlmBlock via `register_llm()`).
+/// Whether `path` belongs to the route registered under `prefix`.
+///
+/// Exact match, or prefix match, or -- the third arm -- the bare form of a
+/// prefix that was registered WITH a trailing slash. Without that arm,
+/// `/b/vector` 404'd while `/b/vector/` served the page, because
+/// `"/b/vector".starts_with("/b/vector/")` is false. The same held for
+/// `/b/storage` and `/b/auth`; `/b/admin` escaped it only because the table
+/// carried a hand-written second entry for the bare form, which this arm now
+/// makes unnecessary (that duplicate is removed).
+///
+/// The arm is deliberately narrow: it fires only when the path is exactly the
+/// prefix minus its trailing slash, so it can never pull in a sibling like
+/// `/b/vectors`.
+fn route_prefix_matches(prefix: &str, path: &str) -> bool {
+    path == prefix || path.starts_with(prefix) || prefix.strip_suffix('/') == Some(path)
+}
+
 pub async fn route_to_block(
     ctx: &dyn Context,
     msg: Message,
@@ -539,8 +557,7 @@ pub async fn route_to_block(
     }
 
     for route in ROUTES {
-        let matches = path == route.prefix || path.starts_with(route.prefix);
-        if !matches {
+        if !route_prefix_matches(route.prefix, &path) {
             continue;
         }
 
@@ -646,9 +663,14 @@ mod tests {
         ];
 
         for (path, expected_block) in cases {
+            // Calls the router's own matcher rather than restating it: both
+            // of these tests used to inline `path == prefix ||
+            // starts_with(prefix)`, so they asserted against a private copy
+            // of the logic and would keep passing while the real matcher
+            // diverged from them.
             let matched = ROUTES
                 .iter()
-                .find(|r| path == r.prefix || path.starts_with(r.prefix));
+                .find(|r| route_prefix_matches(r.prefix, path));
             assert!(matched.is_some(), "path {path} should match a route");
             assert_eq!(
                 matched.unwrap().block,
@@ -656,6 +678,37 @@ mod tests {
                 "path {path} should route to {expected_block}"
             );
         }
+    }
+
+    #[test]
+    fn bare_form_of_a_slash_suffixed_prefix_still_routes() {
+        // `/b/vector` 404'd while `/b/vector/` worked, because the table
+        // registers the prefix WITH a slash and `"/b/vector"
+        // .starts_with("/b/vector/")` is false. `/b/storage` and `/b/auth`
+        // had the same hole; `/b/admin` escaped it only via a duplicate entry.
+        for (path, expected_block) in [
+            ("/b/vector", "impresspress/vector"),
+            ("/b/storage", "impresspress/files"),
+            ("/b/admin", "impresspress/admin"),
+        ] {
+            let matched = ROUTES
+                .iter()
+                .find(|r| route_prefix_matches(r.prefix, path));
+            assert!(matched.is_some(), "bare path {path} should match a route");
+            assert_eq!(matched.unwrap().block, expected_block, "for {path}");
+        }
+    }
+
+    #[test]
+    fn slash_tolerance_does_not_match_a_sibling_prefix() {
+        // The bare-form arm must fire only on an exact prefix-minus-slash,
+        // never on a longer name that merely shares the stem.
+        assert!(route_prefix_matches("/b/vector/", "/b/vector"));
+        assert!(!route_prefix_matches("/b/vector/", "/b/vectors"));
+        assert!(!route_prefix_matches("/b/vector/", "/b/vect"));
+        assert!(!route_prefix_matches("/b/vector/", "/b/vectorial/x"));
+        // And it must not turn a non-prefix into a match.
+        assert!(!route_prefix_matches("/b/admin/", "/b/other"));
     }
 
     #[test]
@@ -676,7 +729,7 @@ mod tests {
         for path in unmatched {
             let matched = ROUTES
                 .iter()
-                .find(|r| path == r.prefix || path.starts_with(r.prefix));
+                .find(|r| route_prefix_matches(r.prefix, path));
             assert!(matched.is_none(), "path {path} should NOT match any route");
         }
     }

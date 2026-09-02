@@ -24,6 +24,10 @@ pub fn palette(entries: Vec<PaletteEntry>) -> Markup {
             div .palette__panel {
                 input #cmdk-input .palette__input type="text"
                     placeholder="Type to search…"
+                    // Placeholder-only leaves the field with no accessible
+                    // name once it has a value; this is the palette's only
+                    // control, so it needs one of its own.
+                    aria-label="Search commands and pages"
                     autocomplete="off"
                     aria-controls="cmdk-list" {}
                 ul #cmdk-list .palette__list role="listbox" {

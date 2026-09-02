@@ -65,13 +65,13 @@ pub(super) async fn providers_page(
         // Add-provider form. Posts JSON via htmx json-enc so the existing
         // `POST /b/llm/api/providers` handler accepts the body without any
         // form-urlencoded translation layer.
-        div .card .mb-6 .p-5 {
+        div .card .mb-6 {
             h3 .card-title .mb-3 { "Add provider" }
             (add_provider_form())
         }
 
         // Providers table. Rendered by a pure helper for testability.
-        div .card .p-0 {
+        div .card .card--flush {
             (render_providers_table(&configs))
         }
     };
@@ -155,9 +155,9 @@ fn add_provider_form() -> Markup {
                     }
                 }
                 div .form-group .col-span-full {
-                    label .flex .items-center .gap-2 .cursor-pointer {
+                    label .form-checkbox {
                         input type="checkbox" name="enabled" id="new-enabled" checked value="true";
-                        " Enabled"
+                        "Enabled"
                     }
                 }
             }
@@ -349,7 +349,7 @@ fn render_models_table(models: &[ModelInfo]) -> Markup {
                 }
             }
         } @else {
-            div .card .p-0 {
+            div .card .card--flush {
                 div .table-container {
                     table .table {
                         thead {

@@ -53,7 +53,7 @@ pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStrea
         ))
 
         // Add button form
-        div .card .p-5 .mb-6 {
+        div .card .mb-6 {
             h3 .text-16 .m-0 .mb-4 { "Add Button" }
             form
                 hx-post="/b/userportal/admin/buttons"

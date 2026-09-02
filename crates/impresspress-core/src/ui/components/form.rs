@@ -36,6 +36,12 @@ pub fn search_input_with_value(
                 type="search"
                 name=(name)
                 placeholder=(placeholder)
+                // A placeholder is not an accessible name -- screen readers
+                // may ignore it, and it vanishes once the field has a value.
+                // The placeholder text already reads as a label ("Search by
+                // email or user ID..."), so it is reused verbatim rather
+                // than inventing a second wording to keep in sync.
+                aria-label=(placeholder)
                 value=(current_value)
                 hx-get=(hx_get)
                 hx-trigger="input changed delay:300ms, search"

@@ -411,8 +411,12 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             }
             div .form-row {
                 div .form-group {
-                    label .form-label { "Default Provider" }
-                    input
+                    // `for`/`id` pair: both fields showed a visible
+                    // `.form-label` but never associated it, so the accessible
+                    // name was empty and a screen reader announced only the
+                    // value.
+                    label .form-label for="llm-default-provider" { "Default Provider" }
+                    input #llm-default-provider
                         .form-input .form-input--readonly
                         type="text"
                         value=(default_provider)
@@ -423,8 +427,8 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     }
                 }
                 div .form-group {
-                    label .form-label { "Default Model" }
-                    input
+                    label .form-label for="llm-default-model" { "Default Model" }
+                    input #llm-default-model
                         .form-input .form-input--readonly
                         type="text"
                         value=(default_model)
