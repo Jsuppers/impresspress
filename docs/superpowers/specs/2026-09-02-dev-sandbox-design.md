@@ -96,7 +96,8 @@ the seed mechanism of §10. It says what dev.impresspress.org is ("a workspace
 for building websites with a WebMCP-capable browser agent"), tells the human to
 open it in such a browser, shows the local admin credentials and why they are
 safe to publish (per-instance, browser-local), and links **Open workspace →
-`/b/auth/login?next=/b/dev`**.
+`/b/auth/login?redirect=/b/dev`** (the login page's redirect parameter is
+`redirect`, validated by `is_safe_local_redirect`).
 
 When the agent builds the visitor's site, it replaces this page. That is the
 intended lifecycle; the welcome page is just the first generation.
@@ -753,7 +754,58 @@ Facts assumed here that a plan must confirm before building on them:
 - Whether the producer's schema builders needed for §14.4 are reachable
   without duplicating `self_contained_schema`.
 
-## 20. Definition of done
+## 20. Amendments from plan research (2026-09-02)
+
+Facts found while writing the implementation plans that change details
+above. Each is applied in the plans; the sections above are left as approved
+and read together with this list.
+
+1. **§3.5 / §6.3 — host-call codec is an explicit guest export, not the ABI
+   version.** The existing v1-JSON test guests (`dispatch_guest`,
+   `service_client_guest`, `attachment_dispatch`, `hostile_db_guest`) send
+   MessagePack host-call payloads through the wafer-sdk while negotiating ABI
+   v1, so keying the transcoder on `AbiCodec::V1Json` would break them. A
+   guest opts in by exporting `__wafer_host_codec() -> i32` returning `1`
+   (JSON); an absent export or `2` keeps MessagePack. `wafer_guest.rs`
+   exports it; nothing else does. `stream_attach` is refused only for
+   JSON-codec guests.
+2. **§6.4 / §14.2 — schema ops mirror the trait that already exists.**
+   `DatabaseService` already has `ensure_schema_table(&Table)`,
+   `schema_add_column`, `schema_drop_table` and `schema_table_exists`, each
+   owning its backend dialect. The wire ops are therefore
+   `database.ensure_table` (the `TableDef` carries `indexes`, so there is no
+   separate `create_index`), `database.add_column`, `database.drop_table`
+   and `database.table_exists`. Authorization is two checks, both required:
+   `(table, Db, write)` — WRAP namespace/grant plus `allows_collection` — and
+   the existing `__ddl__` sentinel, which is what `caps.ddl` gates.
+3. **§14 — a fifth producer item: framing.** `wafer-run/security-headers`
+   emits `frame-ancestors 'none'` in a non-removable baseline and
+   `X-Frame-Options: DENY` unconditionally, so the live-site iframe in §3.2
+   is blocked today. The block gains a `frame_ancestors` config (`none`,
+   the default, or `self`) that drives both headers. The sandbox sets
+   `self`; nothing else changes. The sandbox CSP also adds
+   `worker-src 'self' blob:` for the compiler worker (`merge_csp` passes
+   `worker-src` through and strips `blob:` only from `script-src`).
+4. **§15 — no R2.** Rubrc's own publish pipeline composes the four compiler
+   modules into one `vfs.core-<hash>.wasm`, brotli-compresses it and splits
+   it into 24 MiB parts with a JSON manifest, precisely to fit Cloudflare's
+   25 MiB static-file cap. The sandbox packages those parts under
+   `/__impresspress_dev/compiler/<version>/` as ordinary static assets.
+5. **§14.4 — where `$defs` retention lives.** The producer side
+   (`wafer-block`'s `self_contained_schema`) already keeps `$defs`; it is the
+   consumer-side `inline_refs` in `wafer-core::discovery` that strips the
+   table and refuses cycles. The change is there: keep reached definitions
+   under the tool schema's `$defs`, rebase root `#` cycles to a named
+   definition, hoist per-source tables into the merged input schema, and
+   hoist into `components/schemas` for OpenAPI. The selected projection is
+   `generate_webmcp_selected`, implemented by cloning the selected endpoints
+   with a synthesized `AgentTool` and running `generate_webmcp_report`
+   unchanged.
+6. **§6.6 — the browser CSP** must carry `worker-src 'self' blob:` and
+   `frame-src 'self'` for `/b/dev`; `'unsafe-eval'` in the current constant is
+   already stripped by the block and `'wasm-unsafe-eval'` survives.
+
+## 21. Definition of done
 
 - `browser-devtools` is off by default and absent from a normal bundle; the
   exported bundle has it off.
