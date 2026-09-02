@@ -1587,7 +1587,26 @@ git commit -m "feat(web): wasmi-backed RuntimeControl, boot convergence and seed
 - Modify: `crates/impresspress-web/package.json` (`"e2e:dev": …`)
 
 **Interfaces:**
-- Consumes: a `pkg-dev/` build — `wasm-pack build --target web --release --out-dir pkg-dev -- --features browser-devtools`, bundled with `dev_enabled: true` (the CLI path: a throwaway `impresspress.toml` with `[dev] enabled = true` next to the crate, or call `impresspress_bundle::bundle::run` from a tiny test helper binary — pick the CLI: `cd crates/impresspress-web && impresspress build --target web --release` with `IMPRESSPRESS_WEB_FEATURES=browser-devtools` if `embed_web.rs` gains that env passthrough; add it, it is two lines).
+- Consumes: a dev bundle built through the **sealed** web flow with the wasm/JS overrides `sealed_web.rs` already honours (`helpers/wasm.rs:10-26`): build the feature-on pkg once, then bundle it with a throwaway `impresspress.toml` that turns the flag on:
+
+```bash
+(cd crates/impresspress-web && wasm-pack build --target web --release --out-dir pkg-dev -- --features browser-devtools)
+mkdir -p "$SCRATCH/dev-bundle" && cd "$SCRATCH/dev-bundle"
+cat > impresspress.toml <<'TOML'
+[app]
+name = "dev-sandbox-e2e"
+title = "Dev sandbox e2e"
+boot_redirect = "/"
+[dev]
+enabled = true
+TOML
+IMPRESSPRESS_WEB_WASM="$REPO/crates/impresspress-web/pkg-dev/impresspress_web_bg.wasm" \
+IMPRESSPRESS_WEB_JS="$REPO/crates/impresspress-web/pkg-dev/impresspress_web.js" \
+impresspress build --target web --release          # sealed mode: no Cargo.toml here → dist/
+cp -r "$REPO/crates/impresspress-web/tests/e2e/fixtures/dev-sandbox-seed/seed" dist/
+python3 -m http.server 8082 -d dist
+```
+  (Plan 2 turns this into `examples/dev-sandbox/`.)
 - Consumes: the proof guest wasm, built in CI with `cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml`.
 
 - [ ] **Step 1: Write the spec**
@@ -1678,7 +1697,7 @@ The INFO patch keeps the byte length identical (three trailing spaces) so the pa
 
 - [ ] **Step 2: CI job**
 
-Copy `e2e-smoke` (:445-506) as `e2e-dev-sandbox`: install `wasm32-wasip1`, build the proof guest, build `pkg-dev` with `--features browser-devtools`, bundle with the dev flag, copy the seed fixture beside it, serve on 8082 with `python3 -m http.server`, run `npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts` with `TEST_PORT=8082 PROOF_GUEST_WASM=…`. `rust-cache` `prefix-key: e2e-dev`.
+Copy `e2e-smoke` (:445-506) as `e2e-dev-sandbox`: install `wasm32-wasip1`, build the proof guest, build the CLI (`cargo install --path crates/impresspress --locked --debug --root out`, as `e2e-build` does), run the bundle recipe above, serve on 8082 with `python3 -m http.server`, run `npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts` with `TEST_PORT=8082 PROOF_GUEST_WASM=…`. `rust-cache` `prefix-key: e2e-dev`.
 
 - [ ] **Step 3: Run locally**
 
