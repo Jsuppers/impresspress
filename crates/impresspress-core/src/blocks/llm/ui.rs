@@ -201,7 +201,7 @@ document.currentScript.closest('form').addEventListener('htmx:configRequest', fu
 fn render_providers_table(configs: &[(String, ProviderConfig)]) -> Markup {
     html! {
         @if configs.is_empty() {
-            div .text-center .text-muted .p-8 {
+            div .empty-state {
                 "No providers configured yet. Use the form above to add one."
             }
         } @else {
@@ -344,7 +344,7 @@ fn render_models_table(models: &[ModelInfo]) -> Markup {
     html! {
         @if models.is_empty() {
             div .card {
-                div .text-center .text-muted .p-8 {
+                div .empty-state {
                     "No models available. Configure a provider and run \"Discover models\" to populate this list."
                 }
             }

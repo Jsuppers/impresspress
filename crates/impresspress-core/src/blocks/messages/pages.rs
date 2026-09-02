@@ -79,7 +79,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     let content = html! {
         section .card .messages-new {
             header .card__head {
-                h3 .card__title { "New context" }
+                h2 .card__title { "New context" }
             }
             div .card__body {
                 form .messages-new__form

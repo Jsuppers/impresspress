@@ -127,7 +127,7 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
                     }";
                 let markup = maud::html! {
                     div .card .api-key-card {
-                        div .card__head { h3 .card__title { "Key created — save it now" } }
+                        div .card__head { h2 .card__title { "Key created — save it now" } }
                         div .card__body {
                             p .api-key-copy-hint .text-13 {
                                 "This is the only time the full key will be shown. Copy it now."

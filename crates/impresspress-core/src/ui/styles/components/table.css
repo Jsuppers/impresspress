@@ -49,23 +49,24 @@
 }
 
 /* Empty State */
+/* The bare-text empty state, for a list that just needs one line ("No
+   buckets", "No active shares"). Its richer sibling -- `.empty` below, built
+   by `ui::components::empty_state()` with an icon, title and body -- is the
+   one to reach for when the message needs more than a sentence.
+
+   Padding was `--space-12 --space-6` (48/24) against `.empty`'s 32/16, so
+   moving between two pages showing conceptually the same "nothing here"
+   message changed the amount of breathing room. They share one rhythm now;
+   32/16 is the majority (`.empty` has 32 call sites to this class's 10) and
+   the tighter of the two, which suits a single line of text.
+
+   `.empty-state-icon`/`-title`/`-description` used to live here as this
+   class's own icon/title/body subclasses. They had zero call sites in either
+   tree -- `.empty__icon`/`__title`/`__body` superseded them -- so they are
+   deleted rather than restyled. */
 .empty-state {
-	text-align: center; padding: var(--space-12) var(--space-6);
-	color: var(--text-muted);
-}
-
-.empty-state-icon {
-	margin-bottom: var(--space-4); opacity: 0.5;
-}
-
-.empty-state-title {
-	font-size: 1.125rem; font-weight: 600;
-	color: var(--text-primary); margin-bottom: var(--space-2);
-}
-
-.empty-state-description {
-	font-size: 0.875rem; color: var(--text-secondary);
-	margin-bottom: var(--space-6);
+	text-align: center; padding: var(--space-8) var(--space-4);
+	color: var(--text-secondary);
 }
 
 /* ===== Data table ===== */
@@ -100,7 +101,13 @@
 
 /* ===== Empty state ===== */
 .empty { text-align: center; padding: var(--space-8) var(--space-4); color: var(--text-secondary); }
-.empty__icon { font-size: 2.4rem; color: var(--text-muted); margin-bottom: var(--space-4); }
+/* `font-size: 2.4rem` used to size a text/emoji glyph here. Every call site
+   passes an `ui::icons::*` SVG (`empty_state(icons::package(), ...)`), and an
+   SVG ignores font-size -- so the intended ~38px mark had been rendering at
+   the icon set's 18px default on all 32 of them. The size is restated as
+   explicit width/height on the svg. */
+.empty__icon { color: var(--text-muted); margin-bottom: var(--space-4); line-height: 0; }
+.empty__icon svg { width: 38px; height: 38px; }
 .empty__title { font-size: var(--text-lg); font-weight: 500; color: var(--text-primary); margin: 0 0 var(--space-2); }
 .empty__body { font-size: var(--text-base); margin: 0 0 var(--space-4); }
 

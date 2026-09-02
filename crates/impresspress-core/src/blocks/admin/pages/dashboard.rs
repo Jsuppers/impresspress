@@ -394,7 +394,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let recent_users_card = html! {
         section .card {
             header .card__head {
-                h3 .card__title { "Recent Users" }
+                h2 .card__title { "Recent Users" }
                 a .btn .btn-ghost .btn-sm href="/b/admin/users" { "View all" }
             }
             div .card__body {
@@ -423,7 +423,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let recent_errors_card = html! {
         section .card {
             header .card__head {
-                h3 .card__title { "Recent Errors" }
+                h2 .card__title { "Recent Errors" }
                 a .btn .btn-ghost .btn-sm .card__actions href="/b/admin/logs?status=ERROR" { "View all" }
             }
             div .card__body {

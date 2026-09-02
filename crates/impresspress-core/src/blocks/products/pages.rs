@@ -39,7 +39,7 @@ fn analytics_section(analytics: &[CommerceAnalytics], title: &str, seller_view: 
                     article .card .mt-4 {
                         header .card__head {
                             div {
-                                h3 .card__title { (currency.currency) }
+                                h2 .card__title { (currency.currency) }
                                 p .text-muted .text-sm .text-subtitle { (currency.paid_order_count) " paid of " (currency.order_count) " checkout records" }
                             }
                             (components::status_badge(&currency.currency))
@@ -644,7 +644,7 @@ pub async fn deleted_product_close(
             article .card .mt-4 {
                 header .card__head {
                     div .products-status-stack {
-                        h3 .card__title .m-0 { (offer.offer.name) }
+                        h2 .card__title .m-0 { (offer.offer.name) }
                         (components::status_badge(offer_status_label(offer.status)))
                     }
                     div .products-actions {
@@ -882,7 +882,7 @@ pub async fn admin_seller_detail(
         section .card {
             header .card__head {
                 div {
-                    h3 .card__title { "Seller account" }
+                    h2 .card__title { "Seller account" }
                     p .text-muted .text-sm .text-subtitle { "Stripe verification and selling access" }
                 }
                 div .flex .gap-2 .items-center .flex-wrap {
@@ -1063,7 +1063,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             section .card data-wizard-step="1" {
                 header .card__head {
                     div {
-                        h3 .card__title { "What are you selling?" }
+                        h2 .card__title { "What are you selling?" }
                         p .text-muted .text-sm .text-subtitle { "Choose the closest match. You can change every detail before saving." }
                     }
                 }
@@ -1087,7 +1087,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             }
 
             section .card data-wizard-step="2" hidden {
-                header .card__head { h3 .card__title { "Product details" } }
+                header .card__head { h2 .card__title { "Product details" } }
                 div .card__body {
                     div .form-group {
                         label .form-label .required for="wizard-name" { "Product name" }
@@ -1134,7 +1134,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             section .card data-wizard-step="3" hidden {
                 header .card__head {
                     div {
-                        h3 .card__title { "Pricing" }
+                        h2 .card__title { "Pricing" }
                         p .text-muted .text-sm .text-subtitle { "Set the amount customers will see at checkout." }
                     }
                 }
@@ -1218,7 +1218,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             }
 
             section .card data-wizard-step="4" hidden {
-                header .card__head { h3 .card__title { "Checkout options" } }
+                header .card__head { h2 .card__title { "Checkout options" } }
                 div .card__body {
                     div .products-choice-grid {
                         @for (id, label, help, checked) in [
@@ -1266,7 +1266,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             }
 
             section .card data-wizard-step="5" hidden {
-                header .card__head { h3 .card__title { "Review" } }
+                header .card__head { h2 .card__title { "Review" } }
                 div .card__body {
                     div #wizard-review aria-live="polite" {}
                     @if !admin {
@@ -1926,7 +1926,7 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
             header .card__head {
                 div {
                     div .flex .items-center .gap-2 .flex-wrap {
-                        h3 .card__title { (offer.name) }
+                        h2 .card__title { (offer.name) }
                         (components::status_badge(&status))
                         span .badge .badge-secondary { "v" (offer.version) }
                     }
@@ -2144,7 +2144,7 @@ pub async fn product_manager(
             header .card__head {
                 div {
                     div .products-status-stack {
-                        h3 .card__title { "Product details" }
+                        h2 .card__title { "Product details" }
                         (components::status_badge(status))
                         @if product.str_field("owner_kind") == "user" { span .badge .badge-secondary { "Review: " (approval) } }
                     }
@@ -2541,7 +2541,7 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
         section .card {
             header .card__head {
                 div {
-                    h3 .card__title { "Connection" }
+                    h2 .card__title { "Connection" }
                     p .text-muted .text-sm .text-subtitle { (summary) }
                 }
                 span #stripe-state .badge .(badge_class) { (state_label) }
@@ -2764,7 +2764,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (stripe_connection_card(&status))
         div .grid .grid-auto-320 .gap-4 .mt-4 {
             section .card {
-                header .card__head { h3 .card__title { "Go-live checklist" } }
+                header .card__head { h2 .card__title { "Go-live checklist" } }
                 div .card__body {
                     ul .products-checklist {
                         (setup_check("Secret key", status.configured, "Stored server-side and never rendered back into this page."))
@@ -2776,7 +2776,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 }
             }
             section .card {
-                header .card__head { h3 .card__title { "Webhook destination" } }
+                header .card__head { h2 .card__title { "Webhook destination" } }
                 div .card__body {
                     p .text-muted .text-sm { "Register this HTTPS route as a Stripe webhook destination:" }
                     code .products-code-block { "/b/products/webhooks" }
@@ -2808,7 +2808,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
             section #stripe-webhook-operations .card .card--flat {
             header .card__head .card__head--end {
                 div {
-                    h3 .card__title { "Webhook delivery health" }
+                    h2 .card__title { "Webhook delivery health" }
                     p .text-muted .text-sm .text-subtitle {
                         "Review failed Stripe notifications and replay one after the underlying problem is fixed."
                     }
@@ -2840,7 +2840,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
             section #stripe-provider-operations .card .card--flat {
             header .card__head .card__head--end {
                 div {
-                    h3 .card__title { "Provider reconciliation" }
+                    h2 .card__title { "Provider reconciliation" }
                     p .text-muted .text-sm .text-subtitle {
                         "Retry incomplete Stripe updates and review any operation that could not recover automatically."
                     }
@@ -2911,7 +2911,7 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
         section .card {
             header .card__head {
                 div {
-                    h3 .card__title { "Stripe seller account" }
+                    h2 .card__title { "Stripe seller account" }
                     p .text-muted .text-sm .text-subtitle {
                         "Stripe hosts identity verification, payouts, and the Express dashboard."
                     }
@@ -3086,7 +3086,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
         section .card .mt-4 {
             header .card__head {
                 div {
-                    h3 .card__title { "Purchases and subscriptions" }
+                    h2 .card__title { "Purchases and subscriptions" }
                     p .text-muted .text-sm .text-subtitle {
                         "Review orders here. Stripe's secure Billing Portal handles saved payment methods, invoices, and subscription changes."
                     }

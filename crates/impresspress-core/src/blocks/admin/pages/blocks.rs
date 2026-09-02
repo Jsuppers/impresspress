@@ -171,7 +171,7 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             hx-swap="innerHTML"
                         {
                             div .block-card__head {
-                                h3 .block-card__title { (block.name) }
+                                h2 .block-card__title { (block.name) }
                                 @if is_enabled {
                                     span .block-card__check title="Enabled" { (ui::icons::check()) }
                                 } @else {
@@ -492,7 +492,7 @@ fn custom_tab_content() -> maud::Markup {
         div .custom-tab {
             section .card {
                 header .card__head {
-                    h3 .card__title { (icons::package()) " Custom Blocks" }
+                    h2 .card__title { (icons::package()) " Custom Blocks" }
                 }
                 div .card__body {
                     p .custom-tab__hint {

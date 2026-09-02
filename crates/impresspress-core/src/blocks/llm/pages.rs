@@ -442,7 +442,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         div .card {
             h3 .card-title .mb-4 { "Per-Thread Overrides" }
             @if overrides.is_empty() {
-                div .text-center .text-muted .p-6 {
+                div .empty-state {
                     "No thread overrides configured."
                 }
             } @else {
