@@ -1808,6 +1808,40 @@ git commit -m "feat(ui): design pass across list/detail/form/tabbed/status templ
 
 ---
 
+### Task 15: Close the AA text-contrast gap
+
+**Added after 12d**, when a review recomputed contrast across the shared components and found the accessibility guard has a **directional blind spot**.
+
+Contrast is symmetric. `--primary-color` (`#fd3534`) against white is **3.66:1** whether it is white text on a red background *or* red text on a white background — the same failure, reversed. The guard added in Task 12a, `no_new_white_text_on_primary_color_background`, only scans for `background: var(--primary-color)` paired with `color: white` **in the same rule**. It cannot see `color: var(--primary-color)` on a light background, which is exactly how these components are written.
+
+`brand_tokens_meet_wcag_aa` does not catch it either — it asserts token *values* in isolation, which was already the flaw that let every primary button fail AA back in Task 7.
+
+**Confirmed failing sites** (recomputed: `--primary-color` on white = 3.66:1, `--accent-danger` `#ef4444` on white/tint ≈ 3.76:1; the 4.5:1 gate is a stated Global Constraint of this plan):
+
+| Site | Token used as text |
+|---|---|
+| `table.css:105` `.pagination__prev` / `.pagination__next` | `--primary-color` |
+| `nav.css:47` `.tab.active` | `--primary-color` |
+| `shell.css:242` `.topbar__crumbs a:hover` | `--primary-color` |
+| `auth-split.css:132` `.signup-link a` | `--primary-color` |
+| `form.css:170` `.text-danger` | `--accent-danger` |
+| `badge.css:10` `.badge-danger` | `--accent-danger` |
+| `auth.css:14` `.alert--error` | `--accent-danger` |
+| `shell.css:109` `.profile-menu-item-danger` | `--accent-danger` |
+
+Plus the two pre-existing pairs found during 12c: `#e02523` on `#fff1e6` (4.26:1 at 11px) and `#16a34a` on `#ecfdf5` (3.13:1).
+
+**Do this:**
+
+- [ ] **Add an accessible danger token.** `--accent-danger` (`#ef4444`) stays for *non-text* use — icons, borders, chart marks, which need only 3:1. Add a darker sibling (e.g. `--accent-danger-text`) that clears 4.5:1 on white, mirroring how `--primary-button` (`#d92320`, **4.99:1**) already relates to `--primary-color`. Verify the value by calculation, not by eye.
+- [ ] **Move the text sites onto the accessible tokens** — `--primary-button` for the `--primary-color` rows, the new token for the `--accent-danger` rows. Do not change non-text uses.
+- [ ] **Extend the guard to catch this direction.** A rule declaring `color: var(--primary-color)` (or `--accent-danger`) without a dark `background` in the same rule is a violation. Keep the existing white-on-red check — this is a second assertion, not a replacement.
+- [ ] **Verify the new guard fails before the fixes and passes after.** A guard that never saw red proves less.
+
+Chart marks, borders and icons are non-text and need 3:1, not 4.5:1 — do not "fix" those; over-darkening them would flatten the palette for no accessibility gain.
+
+---
+
 ## Phase 4 — CDN and baselines
 
 ### Task 13: CDN worker (site repo)
