@@ -2,12 +2,10 @@
 //! and `/b/products/catalog/{id}` (single active product), both unauthenticated.
 
 use wafer_block::db::{Filter, FilterOp, SortField};
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
-use super::PRODUCTS_TABLE;
 use crate::{
-    blocks::crud,
+    blocks::products::repo,
     http::{err_bad_request, err_internal, err_not_found, ok_json},
     util::RecordExt,
 };
@@ -22,7 +20,11 @@ pub(super) async fn handle_catalog(ctx: &dyn Context, msg: &Message) -> OutputSt
         field: "name".to_string(),
         desc: false,
     }];
-    crud::crud_list(ctx, msg, PRODUCTS_TABLE, filters, Some(sort)).await
+    let (page, page_size, _) = msg.pagination_params(20);
+    match repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await {
+        Ok(result) => ok_json(&result),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 pub(super) async fn handle_get_product_public(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -40,7 +42,7 @@ pub(super) async fn handle_get_product_public(ctx: &dyn Context, msg: &Message) 
         return err_bad_request("Missing product ID");
     }
 
-    match db::get(ctx, PRODUCTS_TABLE, id).await {
+    match repo::products::get(ctx, id).await {
         Ok(record) => {
             let status = record.str_field("status");
             if status != "active" {

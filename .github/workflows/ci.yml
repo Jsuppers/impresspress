@@ -609,6 +609,23 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE table_name = 'impresspress__products__purchases' AND column_name IN ('shipping_cents','subscription_event_created','provider_payment_status','payment_intent_event_created')")" -eq 4
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE (table_name, column_name) IN (('impresspress__products__refunds','stripe_event_created'),('impresspress__products__seller_accounts','stripe_event_created'),('impresspress__products__provider_operations','processing_owner'))")" -eq 3
 
+      # 020 repairs historical `deleted_at = ''` rows. Those rows sit OUTSIDE
+      # 005's partial unique slug index (`slug <> '' AND deleted_at IS NULL`),
+      # so while one existed another product was free to take its slug —
+      # and the repair pulls it back into the index against that slug. A
+      # unique violation there aborts the whole migration (only a duplicate
+      # ADD COLUMN is tolerated), leaving the hash unstamped so every later
+      # boot re-runs and re-fails; on Cloudflare that is a 500 per request.
+      # `slug_collision_cannot_fail_020` pins the guard on SQLite — this pins
+      # the same behaviour on real PostgreSQL. 020 already ran above against
+      # an empty table and is re-runnable.
+      - name: Migration 020 tolerates a slug collision
+        run: |
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__products__products (id, name, slug, deleted_at, created_at, updated_at) VALUES ('blank_jacket', 'bj', 'jacket', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('live_jacket', 'lj', 'jacket', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_hat_a', 'ba', 'hat', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_hat_b', 'bb', 'hat', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_scarf', 'bs', 'scarf', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_noslug', 'bn', '', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('live_noslug', 'ln', '', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+          psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/products/migrations/020_normalize_blank_deleted_at.postgres.sql
+          test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at IS NULL")" = "blank_noslug,blank_scarf,live_jacket,live_noslug"
+          test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at = ''")" = "blank_hat_a,blank_hat_b,blank_jacket"
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
