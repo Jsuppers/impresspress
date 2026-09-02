@@ -808,10 +808,10 @@ pub const TABLE: &str = "impresspress__dev__runtime_state";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ActivationPhase { Idle, Validating, BuildingRuntime, Publishing, Failed }
+pub enum ActivationPhase { Idle, Validating, BuildingRuntime, Publishing, Active, Failed }   // `Active` appears only in progress lists; the journal rests at `Idle`
 
 impl ActivationPhase {
-    pub fn as_str(self) -> &'static str { /* idle | validating | building_runtime | publishing | failed */ }
+    pub fn as_str(self) -> &'static str { /* idle | validating | building_runtime | publishing | active | failed */ }
     pub fn parse(s: &str) -> Option<Self> { /* inverse */ }
 }
 

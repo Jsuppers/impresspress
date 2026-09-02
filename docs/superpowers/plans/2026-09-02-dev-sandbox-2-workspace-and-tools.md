@@ -622,7 +622,7 @@ const SHOP_PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>Ceram
 <body><h1>Ceramics</h1><ul id="products"></ul>
 <script>
 fetch('/b/products/catalog').then(r => r.json()).then(page => {
-  for (const p of page.items) {
+  for (const p of page.items) {   // use the list field name `ProductListResponse`/the catalog view actually publishes (read products/contracts.rs) — the test must not guess
     const li = document.createElement('li');
     li.innerHTML = '<h2>' + p.name + '</h2><impresspress-product product-id="' + p.id + '"></impresspress-product>';
     document.getElementById('products').appendChild(li);
