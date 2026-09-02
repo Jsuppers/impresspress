@@ -13,9 +13,9 @@
 -- going offline with no admin action and nothing in the logs to explain it.
 --
 -- The state was reachable historically. Until the product handlers began
--- stripping `INTERNAL_FIELDS`, all four create/update paths forwarded the
--- request body verbatim, so any client sending `"deleted_at": ""` produced
--- exactly such a row.
+-- refusing a body that names an `UNSETTABLE_FIELDS` column, all four
+-- create/update paths forwarded the request body verbatim, so any client
+-- sending `"deleted_at": ""` produced exactly such a row.
 --
 -- Why the repair is guarded
 -- -------------------------

@@ -359,9 +359,9 @@ mod strict_upgrade_tests {
     }
 
     /// `deleted_at` is NULL-or-timestamp by invariant, but `''` was reachable
-    /// historically: until the product handlers began stripping
-    /// `INTERNAL_FIELDS`, all four create/update paths forwarded the request
-    /// body verbatim. Once `is_deleted` became the exact per-record twin of
+    /// historically: until the product handlers began refusing a body that
+    /// names an `UNSETTABLE_FIELDS` column, all four create/update paths
+    /// forwarded the request body verbatim. Once `is_deleted` became the exact per-record twin of
     /// `live_filter`'s `deleted_at IS NULL`, such a row reads as DELETED
     /// everywhere — out of the public catalog, the admin list and the seller
     /// cap, with no admin action and nothing logged. 020 repairs those rows.

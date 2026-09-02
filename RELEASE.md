@@ -28,15 +28,37 @@ the per-seller product cap.
 Earlier releases disagreed with themselves about `''`: the customer-facing
 paths tested `!is_null && != ""`, so an empty string meant *live*, while the
 list reads used `deleted_at IS NULL`. And `''` was reachable — until the
-product handlers began stripping internal fields, every create/update path
-forwarded the request body verbatim, so a client sending `"deleted_at": ""`
-produced such a row.
+product handlers began refusing bodies that name an internally-owned column,
+every create/update path forwarded the request body verbatim, so a client
+sending `"deleted_at": ""` produced such a row.
 
 Migration `020_normalize_blank_deleted_at` repairs those rows back to NULL.
 **Upgrade with `--run-migrations`.** Without it the code half lands alone and
 any affected product drops out of the catalog and the storefront with no admin
 action; the only signal is the generic `schema drift; redeploy with
 --run-migrations to apply` warning each boot logs for the products block.
+
+### Products API: internally-owned columns are now refused, not dropped
+
+The four product create/update endpoints (`POST`/`PATCH` under
+`/b/products/api/admin/products` and `/b/products/api/products`) used to drop
+`id`, `owner_kind`, `owner_id`, `created_by`, `seller_account_id`,
+`approval_status`, `stripe_product_id`, `current_version`, `submitted_at`,
+`published_at` and `deleted_at` from a request body and answer 200. They now
+answer **400** naming the offending fields, so a client is told which part of
+its write was not accepted instead of receiving a success for a write that
+was half discarded.
+
+`id` is new to that list, and its omission was the reason for the change: a
+`PATCH` body carrying one rewrote the product's primary key and orphaned
+every `line_items` / `offers` / `product_versions` / `entitlements` row
+pointing at it, while answering "Product not found".
+
+The admin and seller UIs send only caller-owned fields and are unaffected. An
+API client that round-trips a whole product record back into a `PATCH` must
+now send only the fields it is changing.
+
+### Products: restoring a deleted product whose slug was taken
 
 020 deliberately skips a row whose slug a live product of the same owner
 already holds. Repairing it would violate migration 005's partial unique slug

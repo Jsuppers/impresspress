@@ -276,12 +276,14 @@ fn id_filter(id: &str) -> Filter {
 
 /// Update one product *if it is still live*, in a single round trip.
 ///
-/// [`update`] is unconditional, so a caller wanting "only while it is live"
-/// would have to [`get`] first — and the gap between that read and the write
-/// is a window a concurrent delete fits through, after which the write lands
-/// on an already-deleted row and reports success. Making `deleted_at IS NULL`
-/// part of the write's own `WHERE` closes it: the row's state at write time
-/// is what decides, and zero rows affected is `NotFound`.
+/// The default write, and what every handler-reachable update wants.
+/// [`update_including_deleted`] is unconditional, so a caller wanting "only
+/// while it is live" would have to [`get`] first — and the gap between that
+/// read and the write is a window a concurrent delete fits through, after
+/// which the write lands on an already-deleted row and reports success.
+/// Making `deleted_at IS NULL` part of the write's own `WHERE` closes it: the
+/// row's state at write time is what decides, and zero rows affected is
+/// `NotFound`.
 pub(crate) async fn update_live(
     ctx: &dyn Context,
     id: &str,

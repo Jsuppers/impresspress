@@ -171,3 +171,111 @@ fn only_the_allowlist_names_the_products_table_via_the_const() {
          filter for a caller who does not also remember `live_filter()`: {offenders:?}"
     );
 }
+
+/// The three scans above prove that nothing *names the products table*
+/// outside `repo::products`. They say nothing about which of that module's
+/// own functions a call site picks — and on the write side the choice is the
+/// whole correctness question.
+///
+/// `update_live`, `soft_delete` and `restore` each carry their soft-delete
+/// predicate in the write's own `WHERE`, so they cannot land on a row whose
+/// state changed since the caller last looked. Two functions deliberately do
+/// not: `update_including_deleted` writes with no liveness filter at all, and
+/// `purge` hard-deletes the row. Both are `pub(crate)`, both compile cleanly
+/// from anywhere in the block, and nothing in the type system distinguishes
+/// the handful of deliberate uses from an accidental one — a new handler
+/// reaching for `update_including_deleted` writes straight through a
+/// soft-deleted product and every other gate in this file still passes.
+///
+/// So they are distinguished by name, and each call site is listed here with
+/// its justification. This is the write-side twin of
+/// `only_the_allowlist_names_the_products_table_via_the_const`.
+///
+/// What it does NOT cover, for the same reasons stated at the top of this
+/// file: other crates, non-Rust sources, and whether a listed file's uses are
+/// still the ones justified below. It also cannot see a caller that reaches
+/// these functions through an alias or a re-export — `use
+/// repo::products::purge as p;` defeats a source scan, as it defeats the two
+/// above it.
+const WRITE_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
+    (
+        // No liveness filter: writes to a soft-deleted row and reports
+        // success.
+        "products::update_including_deleted",
+        &[
+            // this file: needs the identifier in order to scan for it
+            "blocks/products/tests/repo_door_test.rs",
+            // seller suspension. `seller_every_product` reads through
+            // `list_all_including_deleted` on purpose — suspension is a fraud
+            // control and has to cover every row the seller owns, because
+            // soft delete takes nothing down in Stripe — so filtering the
+            // write on liveness would silently exempt exactly those rows.
+            "blocks/products/handlers/sellers.rs",
+            // the `stripe_product_id` write-back after the Stripe Product has
+            // already been created. Refusing to record it because the product
+            // was deleted mid-sync leaves that Stripe object orphaned, and it
+            // is precisely the id `archive_offer_catalog` later needs to take
+            // it down.
+            "blocks/products/stripe.rs",
+        ],
+    ),
+    (
+        // Hard delete. Orphans every `product_id` reference to the row, which
+        // is the bug soft delete exists to fix.
+        "products::purge",
+        &[
+            // this file: needs the identifier in order to scan for it
+            "blocks/products/tests/repo_door_test.rs",
+            // rolling back a product that failed part-way through creation
+            // and was never visible to anyone, so it has no references to
+            // orphan. Not the delete a user's action reaches — that is
+            // `soft_delete`.
+            "blocks/products/handlers/product.rs",
+        ],
+    ),
+];
+
+#[test]
+fn write_side_escape_hatches_are_allowlisted() {
+    let sources = crate_sources();
+    for (ident, allowlist) in WRITE_ESCAPE_HATCHES {
+        let offenders: Vec<&String> = sources
+            .iter()
+            .filter(|(path, _)| !matches_allowlist(path, allowlist))
+            .filter(|(_, src)| src.contains(ident))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these files call `{ident}`, which writes past the soft-delete \
+             filter, without being justified in WRITE_ESCAPE_HATCHES. Use the \
+             filtered write (`update_live` / `soft_delete`) unless the \
+             unfiltered one is genuinely what the operation means, and say why \
+             here if it is: {offenders:?}"
+        );
+    }
+}
+
+/// An allowlist entry naming a file that no longer calls the function is a
+/// dead exemption: it silently pre-approves whatever that file does next.
+/// Every entry must still be a real call site (this file excepted — it holds
+/// the identifiers only in order to scan for them).
+#[test]
+fn no_write_escape_hatch_allowlist_entry_is_dead() {
+    let sources = crate_sources();
+    for (ident, allowlist) in WRITE_ESCAPE_HATCHES {
+        for entry in *allowlist {
+            if *entry == "blocks/products/tests/repo_door_test.rs" {
+                continue;
+            }
+            let uses = sources
+                .iter()
+                .any(|(path, src)| path == entry && src.contains(ident));
+            assert!(
+                uses,
+                "`{entry}` is allowlisted for `{ident}` but no longer calls it; \
+                 drop the entry rather than leaving a standing exemption"
+            );
+        }
+    }
+}
