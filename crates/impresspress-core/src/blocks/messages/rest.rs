@@ -6,7 +6,10 @@
 
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::service::{self, ListContextsParams, ListEntriesParams};
+use super::{
+    contracts::{AddEntryRequest, CreateContextRequest, UpdateContextRequest},
+    service::{self, ListContextsParams, ListEntriesParams},
+};
 use crate::{
     blocks::crud,
     http::{err_bad_request, err_internal, err_not_found, ok_json},
@@ -51,21 +54,8 @@ pub async fn list_contexts(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 // create_context takes &Message to read the authenticated owner.
 pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    #[derive(serde::Deserialize)]
-    struct Body {
-        #[serde(rename = "type")]
-        context_type: String,
-        #[serde(default)]
-        title: String,
-        #[serde(default)]
-        sender_id: String,
-        #[serde(default)]
-        recipient_id: String,
-        parent_id: Option<String>,
-        metadata: Option<serde_json::Value>,
-    }
     let raw = input.collect_to_bytes().await;
-    let body: Body = match serde_json::from_slice(&raw) {
+    let body: CreateContextRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -118,12 +108,11 @@ pub async fn update_context(ctx: &dyn Context, msg: &Message, input: InputStream
         return resp;
     }
     let raw = input.collect_to_bytes().await;
-    let body: std::collections::HashMap<String, serde_json::Value> =
-        match serde_json::from_slice(&raw) {
-            Ok(b) => b,
-            Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
-        };
-    match service::update_context(ctx, &id, body).await {
+    let body: UpdateContextRequest = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
+    match service::update_context(ctx, &id, body.status, body.title, body.metadata).await {
         Ok(record) => ok_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Context not found"),
         Err(e) => err_internal("Database error", e),
@@ -205,24 +194,8 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
     {
         return resp;
     }
-    #[derive(serde::Deserialize)]
-    struct Body {
-        #[serde(default = "default_kind")]
-        kind: String,
-        #[serde(default)]
-        role: String,
-        #[serde(default)]
-        sender_id: String,
-        #[serde(default)]
-        content: String,
-        content_type: Option<String>,
-        metadata: Option<serde_json::Value>,
-    }
-    fn default_kind() -> String {
-        "message".to_string()
-    }
     let raw = input.collect_to_bytes().await;
-    let body: Body = match serde_json::from_slice(&raw) {
+    let body: AddEntryRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };

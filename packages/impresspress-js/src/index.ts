@@ -43,6 +43,12 @@ export type {
   UploadFileOptions,
 } from './services/storage.service';
 
+export type {
+  IAMRoleListResponse,
+  CreateRoleRequest,
+  UpdateRoleRequest,
+} from './services/iam.service';
+
 // Default export
 import { ImpresspressClient as Client } from './client';
 export default Client;

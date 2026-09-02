@@ -16,11 +16,11 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError
 use super::{
     contracts::{
         AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, ManagedOffer,
-        ManagedPaymentLink, Offer, OfferMode, OfferStatus, PaymentLinkCreateRequest,
-        PricingPreviewRequest, WebhookEventList, WebhookEventSummary,
+        ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus, PaymentLinkCreateRequest,
+        PricingPreviewRequest, ReconciliationStatus, WebhookAck, WebhookEventList,
+        WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
-    PRODUCTS_TABLE,
 };
 use crate::{
     http::{
@@ -964,8 +964,17 @@ async fn handle_offer_checkout(
         }
         Err(error) => return err_internal("Could not load offer", error),
     };
-    let product = match db::get(ctx, PRODUCTS_TABLE, &offer.product_id).await {
+    let product = match repo::products::get(ctx, &offer.product_id).await {
         Ok(product) => product,
+        // The same 404 the offer read above gives, and for the same reason:
+        // this read carries the soft-delete filter now, so a delete landing
+        // between the two reads answers `NotFound` — an ordinary outcome, not
+        // a server fault. Mapping it to `err_internal` showed a storefront
+        // buyer a 500 for the very state the neighbouring refusal calls
+        // "Offer not found".
+        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
+            return err_not_found("Offer not found");
+        }
         Err(error) => return err_internal("Could not load offer product", error),
     };
 
@@ -1268,7 +1277,7 @@ async fn handle_offer_checkout(
         ),
         (
             "reconciliation_status".to_string(),
-            serde_json::json!("awaiting_payment"),
+            serde_json::json!(ReconciliationStatus::AwaitingPayment),
         ),
         (
             "updated_at".to_string(),
@@ -1664,9 +1673,14 @@ async fn sync_offer_catalog_inner(
         )
         .await?;
         stripe_product_id = validate_stripe_product(&response, None, livemode)?;
-        db::update(
+        // The unfiltered write on purpose: the Stripe Product above already
+        // exists. Refusing to record its id because the local product was
+        // soft-deleted while the sync was in flight would leave that Stripe
+        // object orphaned in the connected account with nothing pointing at
+        // it — and it is exactly `stripe_product_id` that
+        // `archive_offer_catalog` later needs in order to take it down.
+        repo::products::update_including_deleted(
             ctx,
-            PRODUCTS_TABLE,
             &product.id,
             HashMap::from([(
                 "stripe_product_id".to_string(),
@@ -1855,7 +1869,7 @@ pub(crate) async fn sync_offer_catalog(
             "Stripe catalog synchronization is disabled in the browser runtime",
         ));
     }
-    let product = db::get(ctx, PRODUCTS_TABLE, product_id).await?;
+    let product = repo::products::get(ctx, product_id).await?;
     let managed = repo::offers::get_for_product(ctx, product_id, offer_id).await?;
     repo::offers::mark_syncing(ctx, offer_id).await?;
     match sync_offer_catalog_inner(ctx, &product, managed).await {
@@ -1938,7 +1952,15 @@ pub(crate) async fn archive_offer_catalog(
             "Stripe catalog archival is disabled in the browser runtime",
         ));
     }
-    let product = db::get(ctx, PRODUCTS_TABLE, product_id).await?;
+    // Reads past the soft-delete filter on purpose. Archival takes a
+    // product's Prices out of the live Stripe catalog, and a soft-deleted
+    // product is exactly when that most needs doing: deleting a product
+    // touches nothing in Stripe, so seller suspension has to be able to
+    // archive the catalog of a listing that is already gone locally. The row
+    // is read only for `owner_kind`/`owner_id` (which connected account to
+    // address) and `stripe_product_id`; nothing about a deleted product
+    // reaches a caller, since this path only ever deactivates.
+    let product = repo::products::get_including_deleted(ctx, product_id).await?;
     let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
     let livemode = stripe_client::secret_livemode(&stripe_key).ok_or_else(|| {
         WaferError::new(
@@ -2499,7 +2521,8 @@ async fn reconcile_payment_link_session(
     // identity/amount cross-check still runs; only creation is skipped).
     let mut resumed_order = None;
     if let Some(existing) = repo::purchases::find_by_session(ctx, session_id).await? {
-        if matches!(existing.str_field("status"), "pending" | "checkout_started") {
+        let status = OrderStatus::from_record(&existing)?;
+        if status.awaits_completion() {
             resumed_order = Some(existing);
         } else {
             // The order already completed. Backfill the idempotent
@@ -2509,7 +2532,7 @@ async fn reconcile_payment_link_session(
                 .get("subscription")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            if !subscription.is_empty() && existing.str_field("status") == "completed" {
+            if !subscription.is_empty() && status == OrderStatus::Completed {
                 repo::subscription_items::snapshot_from_purchase(ctx, &existing.id, subscription)
                     .await?;
             }
@@ -2668,7 +2691,15 @@ async fn reconcile_payment_link_session(
             "Payment Link Checkout Session payment is not complete",
         ));
     }
-    let product = db::get(ctx, PRODUCTS_TABLE, &offer.product_id).await?;
+    // Reads past the soft-delete filter on purpose. Soft delete touches
+    // nothing in Stripe, so a deleted product's Payment Links stay live in
+    // the connected account and stay payable; the money in this session has
+    // already been captured. A live-only read answered `NotFound` here, the
+    // caller's `fail_webhook!` turned that into an error, and Stripe retried
+    // the delivery forever — the customer charged, no purchase row, no line
+    // items, and an order-status page that never resolved. The row is read
+    // for the product name on the buyer's own receipt.
+    let product = repo::products::get_including_deleted(ctx, &offer.product_id).await?;
     pricing.amounts.discount_minor = discount;
     pricing.amounts.tax_minor = tax;
     pricing.amounts.shipping_minor = shipping;
@@ -3082,7 +3113,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     event_type = %event_type,
                     "duplicate Stripe webhook event — skipping side effects"
                 );
-                return ok_json(&serde_json::json!({"received": true, "duplicate": true}));
+                return ok_json(&WebhookAck::duplicate());
             }
             Ok(EventRecordState::DeadLetter) => {
                 tracing::error!(
@@ -3090,10 +3121,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     event_type = %event_type,
                     "Stripe webhook event exhausted its retry budget"
                 );
-                return ok_json(&serde_json::json!({
-                    "received": true,
-                    "dead_letter": true
-                }));
+                return ok_json(&WebhookAck::dead_letter());
             }
             Err(e) => return err_internal("Failed to record webhook event", e),
         }
@@ -3201,7 +3229,13 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     // subscription without its item snapshot forever.
                     let snapshot_due = rows == 1
                         || match repo::purchases::get(ctx, purchase_id).await {
-                            Ok(purchase) => purchase.str_field("status") == "completed",
+                            Ok(purchase) => match OrderStatus::from_record(&purchase) {
+                                Ok(status) => status == OrderStatus::Completed,
+                                Err(error) => fail_webhook!(
+                                    err_internal("Purchase row is outside the contract", error),
+                                    "subscription snapshot purchase state is outside the contract"
+                                ),
+                            },
                             Err(error) => fail_webhook!(
                                 err_internal(
                                     "Failed to load purchase for subscription snapshot",
@@ -3722,7 +3756,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                                 );
                             }
                         }
-                        return ok_json(&serde_json::json!({"received": true}));
+                        return ok_json(&WebhookAck::received());
                     }
                     Err(error) => fail_webhook!(
                         err_internal("Failed to load disputed purchase", error),
@@ -4100,7 +4134,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
         }
     }
 
-    ok_json(&serde_json::json!({"received": true}))
+    ok_json(&WebhookAck::received())
 }
 
 /// Fire a webhook for product/billing events.

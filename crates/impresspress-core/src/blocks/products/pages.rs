@@ -13,7 +13,7 @@ use super::{
         SellerFailureSummary, StripeConnectionState, StripeConnectionStatus, VariableDefinition,
         VariableKind,
     },
-    money, repo, stripe_provider, GROUPS_TABLE, PRODUCTS_TABLE, PURCHASES_TABLE,
+    money, repo, stripe_provider, GROUPS_TABLE, PURCHASES_TABLE,
 };
 
 fn display_money(amount_minor: i64, currency: &str) -> String {
@@ -303,7 +303,7 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // false `products_count == 0` also trips `render_overview_empty_state`'s
     // "Add your first product" CTA during a real outage — actively
     // misleading, not just cosmetically wrong.
-    let products_count = match db::count(ctx, PRODUCTS_TABLE, &[]).await {
+    let products_count = match repo::products::count(ctx, &[]).await {
         Ok(n) => n,
         Err(e) => return crate::http::err_internal("Database error", e),
     };
@@ -422,70 +422,174 @@ fn render_overview_empty_state(products_count: i64, user_products_enabled: bool)
 pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
     let search = msg.query("search").to_string();
+    // The default list is live products. `?view=deleted` is the only way to
+    // reach a soft-deleted row from this page — without it, soft delete
+    // would be a one-way door: a deleted product would be unreachable by
+    // any UI and there would be no way back to restore it.
+    let deleted_view = msg.query("view") == "deleted";
+    // Carried through the search box and pagination links below so acting
+    // on either one doesn't silently bounce the admin back to the live view.
+    let base_href = if deleted_view {
+        "/b/products/admin/manage?view=deleted"
+    } else {
+        "/b/products/admin/manage"
+    };
 
-    let mut filters = vec![Filter {
-        field: "deleted_at".into(),
-        operator: FilterOp::IsNull,
-        value: serde_json::Value::Null,
-    }];
+    let mut filters = Vec::new();
     if let Some(search) = super::handlers::name_like_filter(&search) {
         filters.push(search);
     }
 
+    // Each view is ordered by the timestamp its own table shows: the live
+    // list by `created_at`, the deleted list by the `Deleted` column it
+    // renders. Sorting the deleted list by `created_at` would file the
+    // product an admin just deleted under its creation date — for an old
+    // product, the bottom of the list, on the one page whose whole purpose
+    // is undoing a delete that was probably a moment ago.
     let sort = vec![SortField {
-        field: "created_at".into(),
+        field: if deleted_view {
+            "deleted_at".into()
+        } else {
+            "created_at".into()
+        },
         desc: true,
     }];
-    let result = db::paginated_list(
-        ctx,
-        PRODUCTS_TABLE,
-        page as i64,
-        page_size as i64,
-        filters,
-        sort,
-    )
-    .await;
+    // `list_page` appends the live-only filter; `list_deleted` appends the
+    // opposite one. Both append onto this same caller-supplied `filters`,
+    // so the search box narrows either view the same way.
+    let result = if deleted_view {
+        repo::products::list_deleted(ctx, page as i64, page_size as i64, filters, Some(sort)).await
+    } else {
+        repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await
+    };
 
     let new_product_button = html! {
         a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ New Product" }
     };
 
+    let view_tabs = html! {
+        div .products-tabs {
+            (components::tab_navigation(vec![
+                components::Tab {
+                    active: !deleted_view,
+                    href: "/b/products/admin/manage",
+                    label: "Active",
+                    icon: None,
+                },
+                components::Tab {
+                    active: deleted_view,
+                    href: "/b/products/admin/manage?view=deleted",
+                    label: "Deleted",
+                    icon: Some(icons::trash()),
+                },
+            ]))
+        }
+    };
+
     let content = html! {
         (admin_tabs("products"))
-        (components::page_header("Products", Some("Create, publish, and share the things you sell"), Some(new_product_button)))
+        (components::page_header(
+            "Products",
+            Some(if deleted_view {
+                "Restore a product to bring it back into your catalog — a deleted product cannot be edited until it is restored"
+            } else {
+                "Create, publish, and share the things you sell"
+            }),
+            if deleted_view { None } else { Some(new_product_button) },
+        ))
+        (view_tabs)
 
         div .filter-bar {
-            (components::search_input("search", "Search by product name", "/b/products/admin/manage", "#products-content"))
+            (components::search_input("search", "Search by product name", base_href, "#products-content"))
         }
 
         div #products-content {
             @match &result {
                 Ok(list) => {
-                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", record.id)).collect();
-                    @let cols = [
-                        components::TableCol { label: "Name", width: None },
-                        components::TableCol { label: "Availability", width: None },
-                        components::TableCol { label: "Owner", width: None },
-                        components::TableCol { label: "Currency", width: None },
-                        components::TableCol { label: "Updated", width: None },
-                    ];
-                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
-                        let updated = record.str_field("updated_at");
-                        let seller_owned = record.str_field("owner_kind") == "user";
-                        vec![
-                            html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Open to edit pricing and checkout" } } },
-                            html! { div .products-status-stack { (components::status_badge(record.str_field("status"))) @if seller_owned { (components::status_badge(record.str_field("approval_status"))) } } },
-                            html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
-                            html! { span .font-medium { (record.str_field("currency")) } },
-                            html! { span .text-muted .text-sm { (updated.get(..10).unwrap_or("—")) } },
-                        ]
-                    }).collect();
-                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {
-                        (components::empty_state(icons::package(), "No products found", "Try a different search, or create your first product.", Some(html! {
-                            a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
-                        })))
-                    }))
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/admin/manage"))
+                    @if deleted_view {
+                        @let cols = [
+                            components::TableCol { label: "Name", width: None },
+                            components::TableCol { label: "Owner", width: None },
+                            components::TableCol { label: "Currency", width: None },
+                            components::TableCol { label: "Deleted", width: None },
+                            components::TableCol { label: "", width: None },
+                        ];
+                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                            let deleted_at = record.str_field("deleted_at");
+                            let seller_owned = record.str_field("owner_kind") == "user";
+                            // Percent-encoded, like every `encodeURIComponent`
+                            // call in this file's browser-side URLs. A
+                            // product id is not guaranteed URL-safe: the
+                            // database layer synthesizes a UUID only when the
+                            // body omits `id`, and the admin create endpoint
+                            // forwarded the body verbatim until this branch
+                            // began refusing it — so an id holding `/`, `?` or
+                            // `#` exists wherever a seeding client ever chose
+                            // its own keys. Unencoded, such an id splits the
+                            // path and the Restore button posts somewhere
+                            // that matches no route, on the only door out of
+                            // soft delete. maud escapes HTML, not URLs.
+                            let encoded_id = crate::util::url_path_encode(&record.id);
+                            let restore_url =
+                                format!("/b/products/api/admin/products/{encoded_id}/restore");
+                            // Restore is the DANGEROUS half of what an admin
+                            // can do here: it puts an active, approved product
+                            // straight back into the public catalog. Soft
+                            // delete takes nothing down in Stripe, so the row
+                            // also needs the other half — a way to shut the
+                            // product's Prices and Payment Links down without
+                            // relisting it. That is what
+                            // `ProductState::LiveOrDeleted` exists for, and
+                            // until this link nothing reached it.
+                            let close_url =
+                                format!("/b/products/admin/products/{encoded_id}/close");
+                            vec![
+                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
+                                html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
+                                html! { span .font-medium { (record.str_field("currency")) } },
+                                html! { span .text-muted .text-sm { (deleted_at.get(..10).unwrap_or("—")) } },
+                                html! {
+                                    div .products-actions {
+                                        a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
+                                        button .btn .btn--secondary .btn--sm type="button"
+                                            hx-post=(restore_url)
+                                            hx-swap="none"
+                                            hx-on--after-request=(reload_or_toast("Restore failed"))
+                                        { "Restore" }
+                                    }
+                                },
+                            ]
+                        }).collect();
+                        (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
+                            (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
+                        }))
+                    } @else {
+                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&record.id))).collect();
+                        @let cols = [
+                            components::TableCol { label: "Name", width: None },
+                            components::TableCol { label: "Availability", width: None },
+                            components::TableCol { label: "Owner", width: None },
+                            components::TableCol { label: "Currency", width: None },
+                            components::TableCol { label: "Updated", width: None },
+                        ];
+                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                            let updated = record.str_field("updated_at");
+                            let seller_owned = record.str_field("owner_kind") == "user";
+                            vec![
+                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Open to edit pricing and checkout" } } },
+                                html! { div .products-status-stack { (components::status_badge(record.str_field("status"))) @if seller_owned { (components::status_badge(record.str_field("approval_status"))) } } },
+                                html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
+                                html! { span .font-medium { (record.str_field("currency")) } },
+                                html! { span .text-muted .text-sm { (updated.get(..10).unwrap_or("—")) } },
+                            ]
+                        }).collect();
+                        (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {
+                            (components::empty_state(icons::package(), "No products found", "Try a different search, or create your first product.", Some(html! {
+                                a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
+                            })))
+                        }))
+                    }
+                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
                 }
                 Err(e) => { div .login-error { "Error: " (e.message) } }
             }
@@ -499,6 +603,199 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         content,
     )
     .await
+}
+
+/// The `hx-on--after-request` body shared by every one-shot action button on
+/// these pages: reload on success, and on failure raise the message the API
+/// sent on the shared `showToast` channel `ui::assets::toast_js` listens on.
+///
+/// Without the failure half a refused action renders as nothing happening at
+/// all — no reload, no message — which is the worst outcome on a page whose
+/// buttons are the only way to undo a delete or shut a money surface down.
+fn reload_or_toast(failure_label: &str) -> String {
+    format!(
+        "if(event.detail.successful){{location.reload()}}else{{var m='{failure_label}';\
+         try{{m=JSON.parse(event.detail.xhr.responseText).message||m}}catch(err){{}}\
+         document.body.dispatchEvent(new CustomEvent('showToast',{{detail:{{type:'error',message:m}}}}))}}"
+    )
+}
+
+/// Close-only manager for a soft-deleted product: archive its offers,
+/// deactivate its Payment Links, and nothing else.
+///
+/// Soft delete touches nothing in Stripe. A deleted product's Prices and
+/// Payment Links stay live in the connected account and keep taking money,
+/// and the delete handler archives none of them — so
+/// `offers::handle_list`/`handle_archive` and
+/// `payment_links::list_links`/`deactivate_link` read through
+/// `ProductState::LiveOrDeleted` precisely so that surface can be shut down.
+/// This page is what reaches them: [`product_manager`] loads through the live-only
+/// `repo::products::get` and 404s for a deleted product, and the Deleted view
+/// offered only **Restore** — which returns an active, approved product to
+/// the public catalog before anything has been closed. The one affordance on
+/// offer was the dangerous one.
+///
+/// Deliberately NOT a mode of [`product_manager`]: that page's every other
+/// control creates, edits, publishes, syncs, duplicates or opens a new way to
+/// charge, and every one of those is refused for a deleted product by the
+/// `ProductState::Live` gate below it. Rendering them disabled would be a
+/// page that mostly does not work; rendering them live would be an invitation
+/// to do the opposite of what this page is for.
+///
+/// Reads through `repo::products::get_deleted`, so it exists only for a
+/// product that is actually deleted — a live one belongs in
+/// [`product_manager`], which can do everything.
+///
+/// `admin` selects the tier this page is serving, exactly as
+/// [`product_manager`]'s flag does: the admin form is reached from
+/// `/b/products/admin/products/{id}/close` and drives the admin API; the
+/// owner form is reached from `/b/products/my-products/{id}/close`, drives
+/// the seller API, and additionally checks that the caller owns the product.
+///
+/// One page for both, not two, because the seller's need is the sharper one:
+/// a seller who deletes their own product loses every view of it while its
+/// Prices and Payment Links keep taking money in the connected account, and
+/// until this page they had to ask an administrator. The two tiers differ
+/// only in chrome, URLs, and whose products they may open — the closing
+/// operations are identical, and the seller-tier API already permitted every
+/// one of them (`ProductState::LiveOrDeleted` covers `OfferAccess::Owner`).
+pub async fn deleted_product_close(
+    ctx: &dyn Context,
+    msg: &Message,
+    product_id: &str,
+    admin: bool,
+) -> OutputStream {
+    let product = match repo::products::get_deleted(ctx, product_id).await {
+        Ok(product) => product,
+        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
+            return crate::http::err_not_found("Product not found");
+        }
+        Err(error) => return crate::http::err_internal("Could not load product", error),
+    };
+    if !admin && !super::handlers::is_owned_by(&product, msg.user_id()) {
+        // The shared ownership rule, the same one `product_manager` and every
+        // seller API route use — and the ENTIRE authorization boundary on the
+        // owner form, since its declared tier only says "logged in". 404
+        // rather than 403: a non-owner must not learn the product exists.
+        return crate::http::err_not_found("Product not found");
+    }
+    let offers = match repo::offers::list_for_product(ctx, product_id).await {
+        Ok(offers) => offers,
+        Err(error) => return crate::http::err_internal("Could not load product pricing", error),
+    };
+    // One listing per offer rather than a join: `list_links` is the same read
+    // the API exposes, and there are as many of them as the offer list the
+    // admin is about to act on.
+    let mut links = Vec::with_capacity(offers.len());
+    for offer in &offers {
+        match repo::payment_links::list_for_offer(ctx, &offer.offer.id).await {
+            Ok(list) => links.push(list),
+            Err(error) => return crate::http::err_internal("Could not load payment links", error),
+        }
+    }
+
+    let encoded_id = crate::util::url_path_encode(product_id);
+    let api_base = if admin {
+        format!("/b/products/api/admin/products/{encoded_id}")
+    } else {
+        format!("/b/products/api/products/{encoded_id}")
+    };
+    let deleted_href = if admin {
+        "/b/products/admin/manage?view=deleted"
+    } else {
+        "/b/products/my-products?view=deleted"
+    };
+    let seller_enabled = !admin && super::handlers::user_products_enabled(ctx).await;
+    let deleted_at = product.str_field("deleted_at");
+    let content = html! {
+        @if admin {
+            (admin_tabs("products"))
+        } @else {
+            (portal_tabs("selling", seller_enabled))
+            (seller_page_links("products"))
+        }
+        (components::page_header(
+            product.str_field("name"),
+            Some("This product is deleted. Archive its offers and deactivate its payment links so it stops taking money — deleting a product does none of that in Stripe."),
+            Some(html! { a .btn .btn--secondary .btn--sm href=(deleted_href) { "Back to deleted products" } }),
+        ))
+        p .text-muted .text-sm {
+            "Deleted " (deleted_at.get(..10).unwrap_or("—"))
+            ". Restoring it is on the Deleted tab — a restored product returns to your catalog immediately, so close anything that should stop selling first."
+        }
+        p #close-manager-error .login-error role="alert" aria-live="assertive" hidden {}
+
+        @if offers.is_empty() {
+            (components::empty_state(
+                icons::package(),
+                "Nothing left to close",
+                "This product has no offers, so it has no prices or payment links in Stripe.",
+                None,
+            ))
+        }
+        @for (offer, offer_links) in offers.iter().zip(links.iter()) {
+            @let offer_url = format!("{api_base}/offers/{}", crate::util::url_path_encode(&offer.offer.id));
+            article .card style="margin-top:1rem" {
+                header .card__head {
+                    div .products-status-stack {
+                        h3 .card__title style="margin:0" { (offer.offer.name) }
+                        (components::status_badge(offer_status_label(offer.status)))
+                    }
+                    div .products-actions {
+                        @if offer.status != OfferStatus::Archived {
+                            button .btn .btn--secondary .btn--sm type="button"
+                                hx-delete=(offer_url)
+                                hx-swap="none"
+                                hx-on--after-request=(reload_or_toast("Could not archive this offer"))
+                            { "Archive offer" }
+                        }
+                    }
+                }
+                div .card__body {
+                    @if offer_links.is_empty() {
+                        p .text-muted .text-sm style="margin:0" { "No payment links." }
+                    } @else {
+                        ul style="list-style:none;margin:0;padding:0;display:grid;gap:.5rem" {
+                            @for link in offer_links {
+                                @let link_url = format!("{offer_url}/payment-links/{}", crate::util::url_path_encode(&link.id));
+                                li style="display:flex;gap:.75rem;align-items:center;justify-content:space-between;flex-wrap:wrap" {
+                                    span .text-sm style="word-break:break-all" {
+                                        (if link.url.is_empty() { link.id.as_str() } else { link.url.as_str() })
+                                    }
+                                    div style="display:flex;gap:.5rem;align-items:center" {
+                                        (components::status_badge(if link.active { "active" } else { "inactive" }))
+                                        @if link.active {
+                                            button .btn .btn--secondary .btn--sm type="button"
+                                                hx-delete=(link_url)
+                                                hx-swap="none"
+                                                hx-on--after-request=(reload_or_toast("Could not deactivate this payment link"))
+                                            { "Deactivate" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let shell = if admin {
+        ui::Shell::simple("Products", ui::NavKind::Admin, "Products")
+    } else {
+        ui::Shell::simple("My Products", ui::NavKind::Portal, "My Products")
+    };
+    ui::shell_page(ctx, msg, shell, content).await
+}
+
+/// The wire spelling of an [`OfferStatus`], for the status badge.
+fn offer_status_label(status: OfferStatus) -> &'static str {
+    match status {
+        OfferStatus::Draft => "draft",
+        OfferStatus::Active => "active",
+        OfferStatus::Archived => "archived",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -518,9 +815,8 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(sellers) => sellers,
         Err(error) => return crate::http::err_internal("Could not read seller status", error),
     };
-    let seller_products = match db::list_all(
+    let seller_products = match repo::products::list_all(
         ctx,
-        PRODUCTS_TABLE,
         vec![Filter {
             field: "owner_kind".into(),
             operator: FilterOp::Equal,
@@ -568,7 +864,7 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
             @if pending.is_empty() {
                 (components::empty_state(icons::info(), "Queue clear", "No seller listings are waiting for review.", None))
             } @else {
-                @let row_hrefs: Vec<String> = pending.iter().map(|product| format!("/b/products/admin/products/{}", product.id)).collect();
+                @let row_hrefs: Vec<String> = pending.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
                 @let cols = [
                     components::TableCol { label: "Product", width: None },
                     components::TableCol { label: "Seller", width: None },
@@ -637,9 +933,8 @@ pub async fn admin_seller_detail(
         Ok(seller) => seller,
         Err(error) => return crate::http::err_internal("Could not read seller status", error),
     };
-    let products = match db::list_all(
+    let products = match repo::products::list_all(
         ctx,
-        PRODUCTS_TABLE,
         vec![Filter {
             field: "owner_id".into(),
             operator: FilterOp::Equal,
@@ -718,7 +1013,7 @@ pub async fn admin_seller_detail(
             @if products.is_empty() {
                 (components::empty_state(icons::package(), "No products", "This seller has not created any products.", None))
             } @else {
-                @let row_hrefs: Vec<String> = products.iter().map(|product| format!("/b/products/admin/products/{}", product.id)).collect();
+                @let row_hrefs: Vec<String> = products.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
                 @let cols = [
                     components::TableCol { label: "Product", width: None },
                     components::TableCol { label: "Status", width: None },
@@ -1891,28 +2186,19 @@ pub async fn product_manager(
     product_id: &str,
     admin: bool,
 ) -> OutputStream {
-    let product = match db::get(ctx, PRODUCTS_TABLE, product_id).await {
+    // `repo::products::get` already answers `NotFound` for a soft-deleted row,
+    // so the hand-written `deleted_at` check this used to need is gone too.
+    let product = match repo::products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
             return crate::http::err_not_found("Product not found");
         }
         Err(error) => return crate::http::err_internal("Could not load product", error),
     };
-    let deleted = product
-        .data
-        .get("deleted_at")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
-    if deleted {
+    if !admin && !super::handlers::is_owned_by(&product, msg.user_id()) {
+        // The shared rule again — this page and the API that backs its
+        // buttons must not disagree about who owns the product.
         return crate::http::err_not_found("Product not found");
-    }
-    if !admin {
-        let user_id = msg.user_id();
-        if user_id.is_empty()
-            || (product.str_field("owner_id") != user_id
-                && product.str_field("created_by") != user_id)
-        {
-            return crate::http::err_not_found("Product not found");
-        }
     }
     let offers = match repo::offers::list_for_product(ctx, product_id).await {
         Ok(offers) => offers,
@@ -2832,21 +3118,15 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let (product_count, seller_account, fee_basis_points) = if seller_enabled {
-        let count = match db::count(
+        // The soft-delete filter used to be hand-written above;
+        // `repo::products::count` now appends it.
+        let count = match repo::products::count(
             ctx,
-            PRODUCTS_TABLE,
-            &[
-                Filter {
-                    field: "created_by".to_string(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(&user_id),
-                },
-                Filter {
-                    field: "deleted_at".to_string(),
-                    operator: FilterOp::IsNull,
-                    value: serde_json::Value::Null,
-                },
-            ],
+            &[Filter {
+                field: "created_by".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(&user_id),
+            }],
         )
         .await
         {
@@ -3436,61 +3716,145 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
     let (page, page_size, _) = msg.pagination_params(20);
 
-    let filters = vec![
-        Filter {
-            field: "created_by".into(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(user_id),
-        },
-        Filter {
-            field: "deleted_at".into(),
-            operator: FilterOp::IsNull,
-            value: serde_json::Value::Null,
-        },
-    ];
+    // `?view=deleted` is the seller's mirror of the admin Deleted tab, and
+    // for the same reason: this page reads live-only, so a product the seller
+    // deleted was invisible to them everywhere — while its Prices and
+    // Payment Links stayed live in the connected account and went on taking
+    // money. Without this view a seller could not see, restore, close or even
+    // recover the id of their own deleted product.
+    let deleted_view = msg.query("view") == "deleted";
+    // Carried through pagination so paging the deleted list does not silently
+    // bounce back to the live one.
+    let base_href = if deleted_view {
+        "/b/products/my-products?view=deleted"
+    } else {
+        "/b/products/my-products"
+    };
+
+    // The owner filter is the SAME on both views. `list_deleted` narrows the
+    // deleted set exactly as `list_page` narrows the live one — it cannot
+    // widen either — so handing it this filter is what keeps the Deleted tab
+    // the caller's own products rather than every seller's.
+    let filters = vec![Filter {
+        field: "created_by".into(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(user_id),
+    }];
+    // Each view is ordered by the timestamp its own table shows, matching
+    // `manage_products`: sorting the deleted list by `created_at` files the
+    // product the seller just deleted under its creation date, which for an
+    // old product is the bottom of the one page that exists to undo it.
     let sort = vec![SortField {
-        field: "created_at".into(),
+        field: if deleted_view {
+            "deleted_at".into()
+        } else {
+            "created_at".into()
+        },
         desc: true,
     }];
-    let result = db::paginated_list(
-        ctx,
-        PRODUCTS_TABLE,
-        page as i64,
-        page_size as i64,
-        filters,
-        sort,
-    )
-    .await;
+    let result = if deleted_view {
+        repo::products::list_deleted(ctx, page as i64, page_size as i64, filters, Some(sort)).await
+    } else {
+        repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await
+    };
+
+    let view_tabs = html! {
+        div .products-tabs {
+            (components::tab_navigation(vec![
+                components::Tab {
+                    active: !deleted_view,
+                    href: "/b/products/my-products",
+                    label: "Active",
+                    icon: None,
+                },
+                components::Tab {
+                    active: deleted_view,
+                    href: "/b/products/my-products?view=deleted",
+                    label: "Deleted",
+                    icon: Some(icons::trash()),
+                },
+            ]))
+        }
+    };
 
     let content = html! {
         (portal_tabs("selling", seller_enabled))
         (seller_page_links("products"))
         (components::page_header(
             "My Products",
-            Some("Create products and manage their offers, checkout links, and publication status"),
-            Some(html! {
-                a .btn .btn--primary .btn--sm href="/b/products/my-products/new" { "+ New Product" }
+            Some(if deleted_view {
+                "Restore a product to bring it back into your catalog — a deleted product cannot be edited until it is restored"
+            } else {
+                "Create products and manage their offers, checkout links, and publication status"
             }),
+            if deleted_view { None } else { Some(html! {
+                a .btn .btn--primary .btn--sm href="/b/products/my-products/new" { "+ New Product" }
+            }) },
         ))
+        (view_tabs)
 
         div #my-products-content {
             @match &result {
                 Ok(list) => {
-                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-products/{}", record.id)).collect();
-                    @let cols = [
-                        components::TableCol { label: "Name", width: None },
-                        components::TableCol { label: "Status", width: None },
-                        components::TableCol { label: "Currency", width: None },
-                        components::TableCol { label: "Created", width: None },
-                    ];
-                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| vec![
-                        html! { span .font-medium { (r.str_field("name")) } },
-                        components::status_badge(r.str_field("status")),
-                        html! { span .font-medium { (r.str_field("currency")) } },
-                        html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
-                    ]).collect();
-                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No products yet" } }))
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/my-products"))
+                    @if deleted_view {
+                        @let cols = [
+                            components::TableCol { label: "Name", width: None },
+                            components::TableCol { label: "Currency", width: None },
+                            components::TableCol { label: "Deleted", width: None },
+                            components::TableCol { label: "", width: None },
+                        ];
+                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                            // Percent-encoded for the same reason the admin
+                            // Deleted view encodes: a product id is not
+                            // guaranteed URL-safe, and maud escapes HTML, not
+                            // URLs. Unencoded, an id holding `/`, `?` or `#`
+                            // splits the path and both buttons below aim at
+                            // nothing.
+                            let encoded_id = crate::util::url_path_encode(&record.id);
+                            let restore_url = format!("/b/products/api/products/{encoded_id}/restore");
+                            // Restore is the DANGEROUS half: it returns an
+                            // active, approved product to the public catalog
+                            // at once. Soft delete takes nothing down in
+                            // Stripe, so the row needs the other half too — a
+                            // way to shut this product's Prices and Payment
+                            // Links off WITHOUT relisting it.
+                            let close_url = format!("/b/products/my-products/{encoded_id}/close");
+                            vec![
+                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
+                                html! { span .font-medium { (record.str_field("currency")) } },
+                                html! { span .text-muted .text-sm { (record.str_field("deleted_at").get(..10).unwrap_or("—")) } },
+                                html! {
+                                    div .products-actions {
+                                        a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
+                                        button .btn .btn--secondary .btn--sm type="button"
+                                            hx-post=(restore_url)
+                                            hx-swap="none"
+                                            hx-on--after-request=(reload_or_toast("Restore failed"))
+                                        { "Restore" }
+                                    }
+                                },
+                            ]
+                        }).collect();
+                        (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
+                            (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
+                        }))
+                    } @else {
+                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-products/{}", crate::util::url_path_encode(&record.id))).collect();
+                        @let cols = [
+                            components::TableCol { label: "Name", width: None },
+                            components::TableCol { label: "Status", width: None },
+                            components::TableCol { label: "Currency", width: None },
+                            components::TableCol { label: "Created", width: None },
+                        ];
+                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| vec![
+                            html! { span .font-medium { (r.str_field("name")) } },
+                            components::status_badge(r.str_field("status")),
+                            html! { span .font-medium { (r.str_field("currency")) } },
+                            html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
+                        ]).collect();
+                        (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No products yet" } }))
+                    }
+                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
                 }
                 Err(e) => { div .login-error { "Error: " (e.message) } }
             }

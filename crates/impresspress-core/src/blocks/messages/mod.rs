@@ -1,3 +1,4 @@
+mod contracts;
 pub(crate) mod migrations;
 pub mod pages;
 pub mod rest;
@@ -138,6 +139,16 @@ crate::impresspress_feature_block! {
                 .auth(AuthLevel::Admin)
                 .tags(&["ui"]),
             // Contexts
+            //
+            // `query_params_schema` (this endpoint and ListEntries below) and
+            // `path_params_schema` (GetContext) stay hand-written: the
+            // filters come from `msg.query(..)` by name via `non_empty(..)`
+            // (rest.rs), and `id` comes from `path_param(msg, "id", ..)`
+            // (util.rs, with a prefix-strip fallback) — the same
+            // `msg.var(..)`-by-name shape as `files`'s bucket/key params and
+            // `products`'s `id_path_schema`. Nothing here deserializes a
+            // struct, so a type declared only to feed `.query_params::<T>()`
+            // / `.path_params::<T>()` would have no runtime user.
             BlockEndpoint::get("/b/messages/api/contexts")
                 .summary("List contexts")
                 .description("List contexts with optional filters by type, status, sender_id, parent_id")
@@ -153,6 +164,15 @@ crate::impresspress_feature_block! {
                         "page_size": {"type": "integer", "default": 20}
                     }
                 }))
+                // Hand-written, not derived: `service::list_contexts` returns
+                // `wafer_core::clients::database::RecordList`, a raw
+                // `{records: [{id, data: <column map>}], total_count}`
+                // envelope with no contract type behind `data` — same
+                // reasoning already recorded for `products`'s
+                // `record_list_schema`. Typing it means typing the row shape
+                // first (a behaviour change: an unlisted column would start
+                // being dropped from the response), which is out of scope
+                // for a schema migration.
                 .output_schema(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -164,18 +184,7 @@ crate::impresspress_feature_block! {
             BlockEndpoint::post("/b/messages/api/contexts")
                 .summary("Create context")
                 .auth(AuthLevel::Authenticated)
-                .input_schema(serde_json::json!({
-                    "type": "object",
-                    "required": ["type"],
-                    "properties": {
-                        "type": {"type": "string", "description": "Context type: conversation, task, notification, etc."},
-                        "title": {"type": "string", "default": ""},
-                        "sender_id": {"type": "string", "default": ""},
-                        "recipient_id": {"type": "string", "default": ""},
-                        "parent_id": {"type": "string", "description": "Parent context ID for sub-tasks/threads"},
-                        "metadata": {"type": "object", "default": {}}
-                    }
-                }))
+                .input::<contracts::CreateContextRequest>()
                 .tags(&["contexts"]),
             BlockEndpoint::get("/b/messages/api/contexts/{id}")
                 .summary("Get context")
@@ -191,14 +200,7 @@ crate::impresspress_feature_block! {
             BlockEndpoint::patch("/b/messages/api/contexts/{id}")
                 .summary("Update context")
                 .auth(AuthLevel::Authenticated)
-                .input_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "status": {"type": "string"},
-                        "title": {"type": "string"},
-                        "metadata": {"type": "object"}
-                    }
-                }))
+                .input::<contracts::UpdateContextRequest>()
                 .tags(&["contexts"]),
             BlockEndpoint::delete("/b/messages/api/contexts/{id}")
                 .summary("Delete context and its entries")
@@ -221,17 +223,7 @@ crate::impresspress_feature_block! {
             BlockEndpoint::post("/b/messages/api/contexts/{id}/entries")
                 .summary("Add entry to context")
                 .auth(AuthLevel::Authenticated)
-                .input_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "default": "message", "description": "Entry kind: message, artifact, notification, status"},
-                        "role": {"type": "string", "default": "", "description": "Sender role: user, agent, system"},
-                        "sender_id": {"type": "string", "default": ""},
-                        "content": {"type": "string", "default": ""},
-                        "content_type": {"type": "string", "default": "text/plain"},
-                        "metadata": {"type": "object", "default": {}}
-                    }
-                }))
+                .input::<contracts::AddEntryRequest>()
                 .tags(&["entries"]),
             BlockEndpoint::get("/b/messages/api/entries/{id}")
                 .summary("Get entry")

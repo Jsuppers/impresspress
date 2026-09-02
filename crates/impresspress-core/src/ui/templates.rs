@@ -498,6 +498,7 @@ pub fn public_page(opts: PublicPage<'_>, body: Markup) -> Markup {
                 @if let Some(f) = opts.footer {
                     footer .public-page__footer { (f) }
                 }
+                script src=(assets::webmcp_js_url()) defer {}
                 @for src in &opts.config.embedded_scripts {
                     script type="module" src=(src) {}
                 }
@@ -822,6 +823,30 @@ mod tests {
         assert!(s.contains(r#"<main class="public-page">"#));
         assert!(s.contains(r#"class="public-page__card""#));
         assert!(s.contains("Hello"));
+    }
+
+    #[test]
+    fn public_page_includes_the_webmcp_registration_script() {
+        // `public_page` is the anonymous-visitor render path (legal pages,
+        // marketing, the public storefront demo) — the one place a missing
+        // WebMCP tag silently disables tools for exactly the audience that
+        // surface targets. See `layout::tests::every_page_includes_the_webmcp_registration_script`
+        // for the authenticated-chrome equivalent.
+        let cfg = public_site_config();
+        let opts = PublicPage {
+            title: "Hi",
+            config: &cfg,
+            meta_description: None,
+            back_url: None,
+            bg_color: None,
+            accent_color: None,
+            footer: None,
+        };
+        let s = public_page(opts, html! { p { "body" } }).into_string();
+        assert!(
+            s.contains(assets::webmcp_js_url()),
+            "the WebMCP script must be on every public page: {s}"
+        );
     }
 
     #[test]

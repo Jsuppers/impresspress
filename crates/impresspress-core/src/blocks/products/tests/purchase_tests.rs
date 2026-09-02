@@ -70,8 +70,333 @@ async fn get_purchase_own() {
     let body = output_to_json(out).await;
     assert_eq!(body["purchase"]["id"], "pur_own");
     assert_eq!(
-        body["disputes"][0]["data"]["provider_dispute_id"],
+        body["disputes"][0]["provider_dispute_id"],
         "dp_provider_own"
+    );
+}
+
+/// Each tier sees only what belongs to it.
+///
+/// One `PurchaseView` used to serve buyer, seller and admin alike, so the
+/// buyer's own order list — and `list_my_purchases`, the WebMCP tool built on
+/// it — published the platform's economics (`platform_fee_cents`), the
+/// seller's Stripe account, the provider's internal handles and the
+/// reconciliation diagnostics. The same row handed the seller the buyer's
+/// platform user id and Stripe customer id. Products got
+/// `ProductView`/`CatalogProductView` for exactly this reason; orders did not.
+#[tokio::test]
+async fn each_order_tier_publishes_only_its_own_fields() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_tiers",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("buyer_user_id".to_string(), serde_json::json!("user_1")),
+            (
+                "buyer_email".to_string(),
+                serde_json::json!("buyer@example.com"),
+            ),
+            (
+                "seller_account_id".to_string(),
+                serde_json::json!("acct_seller_1"),
+            ),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stripe_1"),
+            ),
+            (
+                "stripe_customer_id".to_string(),
+                serde_json::json!("cus_buyer_1"),
+            ),
+            (
+                "provider_session_id".to_string(),
+                serde_json::json!("cs_test_1"),
+            ),
+            ("platform_fee_cents".to_string(), serde_json::json!(250)),
+            (
+                "reconciliation_error".to_string(),
+                serde_json::json!("internal diagnostic"),
+            ),
+            ("status".to_string(), serde_json::json!("completed")),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+            ("total_cents".to_string(), serde_json::json!(5000)),
+        ]),
+    )
+    .await;
+
+    // Fields the platform and the provider own. A buyer has no use for any of
+    // them, and `list_my_purchases` feeds whatever is here to a page agent.
+    const PLATFORM_ONLY: [&str; 8] = [
+        "platform_fee_cents",
+        "seller_account_id",
+        "stripe_account_id",
+        "stripe_customer_id",
+        "provider_session_id",
+        "stripe_payment_intent_id",
+        "provider_payment_intent_id",
+        "reconciliation_error",
+    ];
+
+    let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    let list = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
+    let row = list["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .find(|r| r["id"] == "pur_tiers")
+        .expect("the seeded order is the caller's own")
+        .clone();
+    for field in PLATFORM_ONLY {
+        assert!(
+            row.get(field).is_none(),
+            "buyer order list must not publish {field}: {:?}",
+            row.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+    }
+    // What the buyer legitimately needs is still there.
+    for field in ["id", "status", "currency", "total_cents", "created_at"] {
+        assert!(
+            row.get(field).is_some(),
+            "buyer order list must still publish {field}"
+        );
+    }
+
+    let (msg, _input) = get_msg("/b/products/purchases/pur_tiers", "user_1");
+    let detail = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    // Pin the parent before asserting what is missing from it. `Value::Null`
+    // answers `None` to every `get`, so an absence loop over a `purchase` key
+    // that had stopped existing — because the response was renamed, flattened
+    // or replaced by an error envelope — would pass while checking nothing.
+    // The list assertions above are self-pinning (they assert presence too);
+    // this one is not, so it says so explicitly.
+    assert!(
+        detail["purchase"].is_object(),
+        "buyer order detail must carry a `purchase` object, or the loop below \
+         asserts nothing: {detail}"
+    );
+    for field in PLATFORM_ONLY {
+        assert!(
+            detail["purchase"].get(field).is_none(),
+            "buyer order detail must not publish {field}"
+        );
+    }
+
+    // The admin tier is the one that legitimately sees the whole row.
+    let (msg, _input) = get_msg("/b/products/api/admin/purchases/pur_tiers", "admin_1");
+    let admin = output_to_json(purchase::handle_get_admin(&ctx, &msg).await).await;
+    for field in PLATFORM_ONLY {
+        assert!(
+            admin["purchase"].get(field).is_some(),
+            "admin order detail must still publish {field}"
+        );
+    }
+}
+
+/// The order list and detail endpoints publish `contracts::PurchaseView`
+/// rows (and `LineItemView` / `RefundView` / `DisputeView` under the detail),
+/// flat, with exactly the types' field sets. Two columns the raw echo used
+/// to hand out are withheld everywhere: `receipt_token_hash`, the sha256 of
+/// the guest receipt capability, together with its expiry, and on refund
+/// rows `idempotency_key` and `response_json`, which the block's own
+/// provider-operation projection already keeps private.
+#[tokio::test]
+async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
+    use crate::blocks::products::contracts::{BuyerOrderDetailResponse, BuyerOrderListResponse};
+
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_typed",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("buyer_user_id".to_string(), serde_json::json!("user_1")),
+            (
+                "buyer_email".to_string(),
+                serde_json::json!("buyer@example.com"),
+            ),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(5000)),
+            ("livemode".to_string(), serde_json::json!(1)),
+            (
+                "subscription_cancel_at_period_end".to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                "metadata".to_string(),
+                serde_json::json!({"offer_id": "offer_1", "offer_version": 2}),
+            ),
+            (
+                "receipt_token_hash".to_string(),
+                serde_json::json!("deadbeef-digest"),
+            ),
+            (
+                "receipt_token_expires_at".to_string(),
+                serde_json::json!("2026-08-01T00:00:00Z"),
+            ),
+            (
+                "payment_at".to_string(),
+                serde_json::json!("2026-07-19T01:02:03Z"),
+            ),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        "impresspress__products__line_items",
+        "li_typed",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("pur_typed")),
+            ("product_id".to_string(), serde_json::json!("prod_1")),
+            ("product_name".to_string(), serde_json::json!("Widget")),
+            ("quantity".to_string(), serde_json::json!(2)),
+            ("total_minor".to_string(), serde_json::json!(5000)),
+            (
+                "input_snapshot".to_string(),
+                serde_json::json!({"size": "large"}),
+            ),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        super::super::repo::refunds::TABLE,
+        "rf_typed",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("pur_typed")),
+            (
+                "payment_intent_id".to_string(),
+                serde_json::json!("pi_typed"),
+            ),
+            (
+                "idempotency_key".to_string(),
+                serde_json::json!("impresspress_refund_pur_typed_full"),
+            ),
+            ("amount_minor".to_string(), serde_json::json!(1000)),
+            (
+                "target_refunded_total_minor".to_string(),
+                serde_json::json!(1000),
+            ),
+            ("currency".to_string(), serde_json::json!("USD")),
+            ("status".to_string(), serde_json::json!("succeeded")),
+            ("note".to_string(), serde_json::json!("goodwill")),
+            (
+                "response_json".to_string(),
+                serde_json::json!("{\"id\":\"re_secret\"}"),
+            ),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        super::super::repo::disputes::TABLE,
+        "dp_typed",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("pur_typed")),
+            (
+                "provider_dispute_id".to_string(),
+                serde_json::json!("dp_provider_typed"),
+            ),
+            (
+                "payment_intent_id".to_string(),
+                serde_json::json!("pi_typed"),
+            ),
+            ("status".to_string(), serde_json::json!("needs_response")),
+            ("amount_minor".to_string(), serde_json::json!(1000)),
+            ("currency".to_string(), serde_json::json!("USD")),
+            ("livemode".to_string(), serde_json::json!(1)),
+        ]),
+    )
+    .await;
+
+    let (msg, _input) = get_msg("/b/products/purchases/pur_typed", "user_1");
+    let body = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    let detail: BuyerOrderDetailResponse =
+        serde_json::from_value(body.clone()).expect("BuyerOrderDetailResponse");
+    assert_eq!(serde_json::to_value(&detail).unwrap(), body);
+    assert_eq!(detail.purchase.id, "pur_typed");
+    assert_eq!(detail.purchase.total_cents, 5000);
+    // `livemode` is withheld from the buyer (see `BuyerOrderView`), so the
+    // INTEGER-reads-as-a-boolean property is pinned on the boolean the buyer
+    // does keep. The seller and admin views still carry `livemode`.
+    assert!(!detail.purchase.subscription_cancel_at_period_end);
+    assert_eq!(
+        detail.purchase.metadata.get("offer_id"),
+        Some(&serde_json::json!("offer_1"))
+    );
+    assert_eq!(
+        detail.purchase.payment_at.as_deref(),
+        Some("2026-07-19T01:02:03Z")
+    );
+    assert_eq!(detail.line_items[0].product_name, "Widget");
+    assert_eq!(detail.line_items[0].quantity, 2);
+    assert_eq!(
+        serde_json::Value::Object(detail.line_items[0].input_snapshot.clone()),
+        serde_json::json!({"size": "large"})
+    );
+    assert_eq!(detail.refunds[0].amount_minor, 1000);
+    assert_eq!(
+        detail.refunds[0].status, "succeeded",
+        "the buyer sees whether their refund landed"
+    );
+    assert_eq!(detail.disputes[0].provider_dispute_id, "dp_provider_typed");
+    assert!(detail.disputes[0].livemode);
+
+    let encoded = body.to_string();
+    for withheld in [
+        "receipt_token_hash",
+        "receipt_token_expires_at",
+        "deadbeef-digest",
+        "idempotency_key",
+        "impresspress_refund_pur_typed_full",
+        "response_json",
+        "re_secret",
+    ] {
+        assert!(
+            !encoded.contains(withheld),
+            "detail leaked {withheld}: {body}"
+        );
+    }
+
+    let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    let list = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
+    let typed: BuyerOrderListResponse =
+        serde_json::from_value(list.clone()).expect("BuyerOrderListResponse");
+    assert_eq!(serde_json::to_value(&typed).unwrap(), list);
+    assert_eq!(typed.records[0].id, "pur_typed");
+    assert_eq!(typed.page_size, 20);
+    let encoded = list.to_string();
+    assert!(
+        !encoded.contains("receipt_token"),
+        "list leaked the digest: {list}"
+    );
+
+    // The admin list is deliberately NOT the same row any more: it is the
+    // whole record, where the buyer's is a projection of it. What must hold
+    // is that they describe the same order and that everything the buyer sees
+    // the admin also sees.
+    let (mut msg, _input) = get_msg("/admin/b/products/purchases", "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let admin_list = output_to_json(purchase::handle_list_admin(&ctx, &msg).await).await;
+    let admin_row = &admin_list["records"][0];
+    let buyer_row = &list["records"][0];
+    assert_eq!(admin_row["id"], buyer_row["id"]);
+    for (key, value) in buyer_row.as_object().expect("buyer row is an object") {
+        assert_eq!(
+            admin_row.get(key),
+            Some(value),
+            "the admin row must agree with the buyer's on {key}"
+        );
+    }
+    assert!(
+        admin_row.get("platform_fee_cents").is_some()
+            && buyer_row.get("platform_fee_cents").is_none(),
+        "and must carry what the buyer's withholds"
     );
 }
 
@@ -179,6 +504,18 @@ async fn manual_partial_refund_retry_is_idempotent() {
     assert_eq!(body["status"], "succeeded");
     assert_eq!(body["amount_minor"], 2000);
     assert_eq!(body["refunded_total_minor"], 2000);
+    // `manual` is the ephemeral result's word for "no provider was asked";
+    // the ledger row itself records the refund as `succeeded` on both state
+    // columns, which is what `RefundView.provider_status` documents.
+    assert_eq!(body["provider_status"], "manual");
+    let (msg, _input) = admin_get_msg("/admin/b/products/purchases/pur_manual_retry");
+    let detail = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    assert_eq!(detail["refunds"].as_array().map(Vec::len), Some(1));
+    assert_eq!(detail["refunds"][0]["status"], "succeeded");
+    assert_eq!(
+        detail["refunds"][0]["provider_status"], "succeeded",
+        "a refund recorded without a provider is `succeeded`, never `manual`: {detail}"
+    );
 
     // A retried delivery of the same request (same idempotency key, e.g.
     // after a timeout) must return the recorded outcome, not deduct again.
@@ -422,4 +759,95 @@ async fn purchase_list_via_user_handler() {
     let out = dispatch_user(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["records"].as_array().unwrap().len(), 1);
+}
+
+/// A stored order state outside the contract is a data-integrity error, and
+/// it is never published as a `200` carrying a value the schema does not
+/// define, nor silently defaulted.
+///
+/// The two surfaces answer differently, on purpose. On a single-order GET the
+/// row *is* the response, so it fails loudly. On a list the row is one of
+/// many, so it is omitted and logged: failing the page meant one legacy,
+/// imported or hand-edited order denied the buyer every order they had.
+#[tokio::test]
+async fn order_rows_outside_the_state_contract_never_reach_the_wire() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_bad_reconciliation",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(1000)),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("half_done"),
+            ),
+        ]),
+    )
+    .await;
+
+    let (msg, _input) = get_msg("/b/products/purchases/pur_bad_reconciliation", "user_1");
+    assert!(
+        output_is_error(purchase::handle_get(&ctx, &msg).await, ErrorCode::Internal).await,
+        "a 200 would publish `half_done`, which the contract does not define"
+    );
+    // A conforming order for the same buyer: without one, "the list is not
+    // empty" would pass vacuously and prove nothing about the skip.
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_good",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(2500)),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+        ]),
+    )
+    .await;
+
+    // The list omits the offending row and still serves the caller's other
+    // orders.
+    let (msg, _input) = get_msg("/b/products/purchases", "user_1");
+    let body = output_to_json(purchase::handle_list_user(&ctx, &msg).await).await;
+    let ids: Vec<&str> = body["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|r| r["id"].as_str().expect("row id"))
+        .collect();
+    assert!(
+        !ids.contains(&"pur_bad_reconciliation"),
+        "the list must not publish a row the contract cannot describe: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"pur_good"),
+        "one unprojectable row must not cost the caller their other orders: {ids:?}"
+    );
+
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_bad_status",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_2")),
+            ("status".to_string(), serde_json::json!("shipped")),
+            ("total_cents".to_string(), serde_json::json!(1000)),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+        ]),
+    )
+    .await;
+    let (msg, _input) = get_msg("/b/products/purchases/pur_bad_status", "user_2");
+    assert!(
+        output_is_error(purchase::handle_get(&ctx, &msg).await, ErrorCode::Internal).await,
+        "a 200 would publish `shipped`, which is not an order state"
+    );
 }

@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 
 use maud::{html, Markup};
-use serde::Deserialize;
 use wafer_core::clients::config as config_client;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     abuse::{self, AbuseDecision},
     config::{self, SecurityReadiness},
+    contracts::{PublicSubmissionRequest, SubmissionAck},
     models::{ActorType, CreateTicketInput, TicketSource},
     repo, service, turnstile,
 };
@@ -21,30 +21,6 @@ use crate::{
 
 const MAX_BODY_BYTES: usize = 16 * 1_024;
 const TURNSTILE_SCRIPT: &str = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonSubmission {
-    type_id: String,
-    subject: String,
-    description: String,
-    #[serde(default)]
-    source_path: String,
-    #[serde(default)]
-    subject_type: String,
-    #[serde(default)]
-    subject_id: String,
-    #[serde(default)]
-    evidence_url: String,
-    #[serde(default)]
-    reporter_email: String,
-    #[serde(default)]
-    reporter_wants_reply: bool,
-    form_token: String,
-    turnstile_token: String,
-    #[serde(default)]
-    website: String,
-}
 
 struct Submission {
     ticket: CreateTicketInput,
@@ -478,8 +454,25 @@ fn parse_submission(content_type: &str, raw: &[u8]) -> Result<Submission, String
         .to_ascii_lowercase()
         .starts_with("application/json")
     {
-        let value: JsonSubmission =
+        let raw_value: serde_json::Value =
             serde_json::from_slice(raw).map_err(|_| "Invalid JSON submission".to_string())?;
+        // The honeypot is read from the raw body, not from the contract —
+        // see `PublicSubmissionRequest`'s derive comment for why it must not
+        // be declared there.
+        //
+        // The trap fires on PRESENCE, not on the value being a string. Reading
+        // it with `as_str` meant `{"website": 12345}` yielded `None` and read
+        // as "not filled"; because the field is deliberately undeclared, the
+        // typed deserialize below tolerates it too, so such a body passed
+        // straight through. A real browser submits either nothing or a string,
+        // so any other JSON type is already a bot.
+        let website = match raw_value.get("website") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(filled)) => filled.clone(),
+            Some(other) => other.to_string(),
+        };
+        let value: PublicSubmissionRequest =
+            serde_json::from_value(raw_value).map_err(|_| "Invalid JSON submission".to_string())?;
         return Ok(Submission {
             ticket: CreateTicketInput {
                 type_id: value.type_id,
@@ -495,7 +488,7 @@ fn parse_submission(content_type: &str, raw: &[u8]) -> Result<Submission, String
             },
             form_token: value.form_token,
             turnstile_token: value.turnstile_token,
-            website: value.website,
+            website,
         });
     }
     let form = crate::util::parse_form_body(raw);
@@ -592,14 +585,9 @@ fn success_response(msg: &Message, reference: &str) -> OutputStream {
         .to_ascii_lowercase()
         .contains("application/json")
     {
-        let body = serde_json::json!({
-            "reference": reference,
-            "status": "received",
-            "message": "Your report has been received",
-        });
         return public_headers(ResponseBuilder::new())
             .status(201)
-            .json(&body);
+            .json(&SubmissionAck::received(reference));
     }
     let location = if reference.is_empty() {
         "/b/tickets/submitted".to_string()
@@ -671,13 +659,80 @@ fn sanitize_reference(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The honeypot works because a bot that fills every field it can see
+    /// also fills `website`. That needs two things of the JSON path: unknown
+    /// keys are tolerated (a `deny_unknown_fields` contract would reject the
+    /// bot's post before the trap could fire), and the trap is read from the
+    /// raw body rather than declared on the contract — declaring it published
+    /// "website — Must be left empty" to every schema-reading caller.
     #[test]
-    fn json_parser_rejects_unknown_fields() {
+    fn json_parser_reads_the_honeypot_without_declaring_it() {
         let raw = br#"{
             "type_id":"type","subject":"valid subject","description":"a sufficiently long description",
-            "form_token":"token","turnstile_token":"challenge","unexpected":"value"
+            "form_token":"token","turnstile_token":"challenge",
+            "website":"http://spam.example","unexpected":"value"
         }"#;
-        assert!(parse_submission("application/json", raw).is_err());
+        let submission =
+            parse_submission("application/json", raw).expect("unknown keys are tolerated");
+        assert_eq!(submission.website, "http://spam.example");
+    }
+
+    /// Reading the trap with `as_str` meant any non-string JSON type fell
+    /// through as "not filled". The contract no longer declares `website`, so
+    /// a typed deserializer no longer rejects those bodies either — the bot
+    /// simply passed. The trap fires on presence, not on being a string.
+    #[test]
+    fn json_parser_catches_a_honeypot_filled_with_a_non_string() {
+        for filled in ["12345", "true", r#"["x"]"#, r#"{"a":1}"#] {
+            let raw = format!(
+                r#"{{
+                "type_id":"type","subject":"valid subject","description":"a sufficiently long description",
+                "form_token":"token","turnstile_token":"challenge",
+                "website":{filled}
+            }}"#
+            );
+            let submission = parse_submission("application/json", raw.as_bytes())
+                .expect("unknown/oddly-typed keys are tolerated");
+            assert!(
+                !submission.website.trim().is_empty(),
+                "a honeypot filled with {filled} must trip the trap"
+            );
+        }
+    }
+
+    /// The other half: an explicitly empty or null `website` is what a real
+    /// browser submits, and must not trip the trap.
+    #[test]
+    fn json_parser_treats_an_empty_or_null_honeypot_as_unfilled() {
+        for unfilled in [r#""""#, "null"] {
+            let raw = format!(
+                r#"{{
+                "type_id":"type","subject":"valid subject","description":"a sufficiently long description",
+                "form_token":"token","turnstile_token":"challenge",
+                "website":{unfilled}
+            }}"#
+            );
+            let submission =
+                parse_submission("application/json", raw.as_bytes()).expect("valid submission");
+            assert!(
+                submission.website.trim().is_empty(),
+                "a honeypot left as {unfilled} must not trip the trap"
+            );
+        }
+    }
+
+    #[test]
+    fn json_parser_treats_an_absent_honeypot_as_empty() {
+        let raw = br#"{
+            "type_id":"type","subject":"valid subject","description":"a sufficiently long description",
+            "form_token":"token","turnstile_token":"challenge"
+        }"#;
+        assert_eq!(
+            parse_submission("application/json", raw)
+                .expect("a body without the honeypot is a normal submission")
+                .website,
+            ""
+        );
     }
 
     #[test]

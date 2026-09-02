@@ -100,7 +100,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -111,7 +111,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -134,7 +134,7 @@ checksum = "0ae92a5119aa49cdbcf6b9f893fe4e1d98b04ccbf82ee0584ad948a44a734dea"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -193,7 +193,7 @@ checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -204,7 +204,7 @@ checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -670,7 +670,7 @@ checksum = "8d7396fd9500589e62e460e987ecb671bad374934e55ec3b5f498cc7a8a8a7b7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1061,7 +1061,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1353,7 +1353,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1364,7 +1364,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
  "darling_core",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1442,7 +1442,7 @@ dependencies = [
  "darling",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1452,7 +1452,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1497,7 +1497,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1508,7 +1508,7 @@ checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1537,6 +1537,12 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ecdsa"
@@ -1613,7 +1619,7 @@ checksum = "44f23cf4b44bfce11a86ace86f8a73ffdec849c9fd00a386a53d278bd9e81fb3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1629,7 +1635,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1877,7 +1883,7 @@ checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2322,7 +2328,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2622,6 +2628,7 @@ dependencies = [
  "pulldown-cmark",
  "reqwest",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2700,6 +2707,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "impresspress-webmcp-demo"
+version = "0.1.0"
+dependencies = [
+ "impresspress-cloudflare",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2742,7 +2758,7 @@ checksum = "c727f80bfa4a6c6e2508d2f05b6f4bfce242030bd88ed15ae5331c5b5d30fba7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2753,7 +2769,7 @@ checksum = "c34819042dc3d3971c46c2190835914dfbe0c3c13f61449b2997f4e9722dfa60"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2888,7 +2904,7 @@ checksum = "32d59e20403c7d08fe62b4376edfe5c7fb2ef1e6b1465379686d0f21c8df444b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3020,7 +3036,7 @@ dependencies = [
  "proc-macro-error",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3132,7 +3148,7 @@ checksum = "e4db6d5580af57bf992f59068d4ea26fd518574ff48d7639b255a36f9de6e7e9"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3229,7 +3245,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3281,7 +3297,7 @@ checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3397,7 +3413,7 @@ checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3635,7 +3651,7 @@ checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3742,7 +3758,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3802,7 +3818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3825,7 +3841,7 @@ dependencies = [
  "itertools",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3880,7 +3896,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3917,7 +3933,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4119,6 +4135,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4309,7 +4345,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4401,6 +4437,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "schemars"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+dependencies = [
+ "chrono",
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -4510,7 +4572,18 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -4684,7 +4757,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4804,7 +4877,7 @@ dependencies = [
  "quote",
  "sqlx-core",
  "sqlx-macros-core",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4827,7 +4900,7 @@ dependencies = [
  "sqlx-mysql",
  "sqlx-postgres",
  "sqlx-sqlite",
- "syn",
+ "syn 2.0.117",
  "tokio",
  "url",
 ]
@@ -5001,6 +5074,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5017,7 +5101,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5051,7 +5135,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5080,7 +5164,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5091,7 +5175,7 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5231,7 +5315,7 @@ checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5435,7 +5519,7 @@ checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5719,7 +5803,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 [[package]]
 name = "wafer-block"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5727,6 +5811,7 @@ dependencies = [
  "getrandom 0.2.17",
  "linkme",
  "rmp-serde",
+ "schemars",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5744,7 +5829,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-cors"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -5756,7 +5841,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-crypto"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "argon2",
  "async-trait",
@@ -5777,7 +5862,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-fastembed"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -5789,7 +5874,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-http-listener"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -5805,7 +5890,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-inspector"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "percent-encoding",
@@ -5813,12 +5898,13 @@ dependencies = [
  "tracing",
  "wafer-block",
  "wafer-block-macro",
+ "wafer-core",
 ]
 
 [[package]]
 name = "wafer-block-local-storage"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -5834,18 +5920,18 @@ dependencies = [
 [[package]]
 name = "wafer-block-macro"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde_json",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
 name = "wafer-block-network"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "futures",
@@ -5864,7 +5950,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-postgres"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -5885,7 +5971,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-readonly-guard"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "wafer-block",
@@ -5895,7 +5981,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-router"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -5907,7 +5993,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-s3"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -5923,7 +6009,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-security-headers"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "wafer-block",
@@ -5933,7 +6019,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-sqlite"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -5955,7 +6041,7 @@ dependencies = [
 [[package]]
 name = "wafer-block-web"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "tracing",
@@ -5967,12 +6053,13 @@ dependencies = [
 [[package]]
 name = "wafer-core"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "chrono",
  "futures",
  "parking_lot",
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5991,7 +6078,7 @@ dependencies = [
 [[package]]
 name = "wafer-flow"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "serde",
  "serde_json",
@@ -6001,7 +6088,7 @@ dependencies = [
 [[package]]
 name = "wafer-net-security"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "reqwest",
  "tokio",
@@ -6011,7 +6098,7 @@ dependencies = [
 [[package]]
 name = "wafer-run"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -6043,7 +6130,7 @@ dependencies = [
 [[package]]
 name = "wafer-schema"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "serde",
  "serde_json",
@@ -6053,7 +6140,7 @@ dependencies = [
 [[package]]
 name = "wafer-sql-utils"
 version = "0.1.0"
-source = "git+https://github.com/wafer-run/wafer-run?rev=46317ec75641d76aa564e1e4f7d835d922459e85#46317ec75641d76aa564e1e4f7d835d922459e85"
+source = "git+https://github.com/wafer-run/wafer-run?rev=61e68a0252324af7a6b233e2d250ec3d0612ca5c#61e68a0252324af7a6b233e2d250ec3d0612ca5c"
 dependencies = [
  "sea-query",
  "serde_json",
@@ -6153,7 +6240,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "wasm-bindgen-shared",
 ]
 
@@ -6196,7 +6283,7 @@ checksum = "e925354648d2a4d1bf205412e36d520a800280622eef4719678d268e5d40e978"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6438,7 +6525,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6468,7 +6555,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6479,7 +6566,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6807,7 +6894,7 @@ dependencies = [
  "heck",
  "indexmap 2.14.0",
  "prettyplease",
- "syn",
+ "syn 2.0.117",
  "wasm-metadata",
  "wit-bindgen-core",
  "wit-component",
@@ -6823,7 +6910,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "wit-bindgen-core",
  "wit-bindgen-rust",
 ]
@@ -6904,7 +6991,7 @@ dependencies = [
  "async-trait",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-macro-support",
@@ -6960,7 +7047,7 @@ checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "synstructure",
 ]
 
@@ -6981,7 +7068,7 @@ checksum = "8fd425244944f4ab65ccff928e7323354c5a018c75838362fdce749dfad2ee1e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7001,7 +7088,7 @@ checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "synstructure",
 ]
 
@@ -7041,7 +7128,7 @@ checksum = "625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]

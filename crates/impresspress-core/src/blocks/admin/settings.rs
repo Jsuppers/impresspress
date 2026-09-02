@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use wafer_core::clients::database as db;
 use wafer_run::{
     context::Context, ConfigVar, ErrorCode, InputStream, InputType, Message, OutputStream,
 };
 
-use super::ops::{self, MASKED_VALUE};
+use super::{
+    contracts::AdminSettingsResponse,
+    ops::{self, MASKED_VALUE},
+};
 use crate::{
     http::{err_bad_request, err_internal, err_not_found, ok_json},
     util::{json_map, RecordExt},
@@ -165,8 +168,11 @@ async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
 async fn handle_list(ctx: &dyn Context) -> OutputStream {
     match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
         Ok(records) => {
-            // Convert to key-value map, masking sensitive values
-            let mut settings = HashMap::new();
+            // Convert to key-value map, masking sensitive values. `BTreeMap`
+            // rather than `HashMap`: the response is a public contract, and a
+            // randomized key order made two identical reads differ byte for
+            // byte.
+            let mut settings = BTreeMap::new();
             for record in &records {
                 let key = record.str_field("key");
                 let is_sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
@@ -183,7 +189,7 @@ async fn handle_list(ctx: &dyn Context) -> OutputStream {
                     settings.insert(key.to_string(), value);
                 }
             }
-            ok_json(&settings)
+            ok_json(&AdminSettingsResponse(settings))
         }
         Err(e) => err_internal("Database error", e),
     }
@@ -294,7 +300,11 @@ async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
         body.value.as_deref().unwrap_or(""),
         body.name.as_deref(),
         body.description.as_deref(),
-        body.sensitive.unwrap_or(false),
+        // Absent means sensitive. A caller that does not say is protected;
+        // one that wants a plain-text variable says `false`. The old `false`
+        // default published any key without a `_SECRET`/`_KEY` suffix in
+        // plain text unless the operator remembered the box.
+        body.sensitive.unwrap_or(true),
     )
     .await
     {
@@ -495,6 +505,73 @@ mod tests {
 
     use super::*;
     use crate::test_support::TestContext;
+
+    /// Seed one `variables` row with an explicit `sensitive` flag.
+    async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
+        let mut data = json_map(serde_json::json!({
+            "key": key,
+            "name": key,
+            "description": "",
+            "value": value,
+            "warning": "",
+            "sensitive": sensitive,
+        }));
+        crate::util::stamp_created(&mut data);
+        db::create(ctx, VARIABLES_TABLE, data)
+            .await
+            .expect("seed variable");
+    }
+
+    /// `GET /b/admin/api/settings` never publishes a secret value.
+    ///
+    /// The endpoint's OpenAPI description promises exactly this, and the
+    /// promise rests on two independent halves of `is_sensitive_key`: the
+    /// row's `sensitive` flag, and the `_SECRET` / `_KEY` suffix convention.
+    /// A key needs only one of them. Nothing tested this before the endpoint
+    /// was documented, which is the worst order to do it in.
+    #[tokio::test]
+    async fn list_masks_every_sensitive_value() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // Not sensitive: no flag, no suffix.
+        seed_var(&ctx, "SITE_NAME", "Acme", 0).await;
+        // Sensitive by suffix alone (SEC-060): the flag is clear.
+        seed_var(&ctx, "STRIPE_SECRET", "sk_live_realsecret", 0).await;
+        seed_var(&ctx, "MAILGUN_API_KEY", "key-realsecret", 0).await;
+        // Sensitive by flag alone: `InputType::Password` vars carry neither
+        // suffix, and `seed_defaults` is what sets their flag.
+        seed_var(&ctx, "BOOTSTRAP_ADMIN_PASSWORD", "hunter2", 1).await;
+
+        let body = crate::test_support::output_json(handle_list(&ctx).await).await;
+
+        assert_eq!(
+            body["SITE_NAME"],
+            serde_json::json!("Acme"),
+            "a non-sensitive value must be published unchanged"
+        );
+        for masked in [
+            "STRIPE_SECRET",
+            "MAILGUN_API_KEY",
+            "BOOTSTRAP_ADMIN_PASSWORD",
+        ] {
+            assert_eq!(
+                body[masked],
+                serde_json::json!(MASKED_VALUE),
+                "{masked} must be masked"
+            );
+        }
+
+        let raw = body.to_string();
+        for secret in ["sk_live_realsecret", "key-realsecret", "hunter2"] {
+            assert!(
+                !raw.contains(secret),
+                "GET /b/admin/api/settings leaked `{secret}`: {raw}"
+            );
+        }
+    }
 
     /// `seed_payload_hash` is independent of input order (sorts by `key`).
     #[test]
@@ -758,5 +835,77 @@ mod tests {
             Some(MASKED_VALUE),
             "a *_SECRET value must be masked even with the sensitive flag unset"
         );
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use wafer_block::db::{Filter, FilterOp};
+    use wafer_core::clients::database as db;
+    use wafer_run::InputStream;
+
+    use super::*;
+    use crate::test_support::{admin_msg, collect_or_panic, TestContext};
+
+    async fn admin_ctx() -> TestContext {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx
+    }
+
+    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> i64 {
+        let rows = db::list_all(
+            ctx,
+            VARIABLES_TABLE,
+            vec![Filter {
+                field: "key".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(key),
+            }],
+        )
+        .await
+        .expect("list variables");
+        rows.first()
+            .unwrap_or_else(|| panic!("{key} was not created"))
+            .i64_field("sensitive")
+    }
+
+    async fn create(ctx: &dyn Context, body: serde_json::Value) {
+        let out = handle_create(
+            ctx,
+            &admin_msg("create", "/admin/settings"),
+            InputStream::from_bytes(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        collect_or_panic(out).await;
+    }
+
+    /// An ad hoc variable created without saying whether it is sensitive is
+    /// stored as sensitive. Masking an innocuous value costs the operator one
+    /// click to undo; publishing a secret in plain text — which is what the
+    /// old `false` default did for any key without a `_SECRET`/`_KEY`
+    /// suffix — cannot be undone.
+    #[tokio::test]
+    async fn create_defaults_to_sensitive_when_the_flag_is_omitted() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "move fast"}),
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_honours_an_explicit_not_sensitive() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "move fast", "sensitive": false}),
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 0);
     }
 }

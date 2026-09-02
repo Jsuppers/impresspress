@@ -6,13 +6,18 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire-protocol variants each `ProviderConfig` may speak.
+// Derives `JsonSchema` because it is published as-is on the provider
+// contracts (`contracts::ProviderView` and the create/update requests):
+// the schema's `enum` is then the same three tokens `parse` accepts, so a
+// caller who reads the schema cannot send an alias the handler refuses.
+/// Wire protocol a configured provider speaks.
 ///
-/// `OpenAi` and `Anthropic` are the providers' native APIs. `OpenAiCompatible`
-/// covers all third-party endpoints implementing OpenAI's `/v1` interface —
-/// Ollama, llama-server, LM Studio, vLLM, LocalAI, KoboldCpp, Azure OpenAI,
-/// Groq, Together, OpenRouter, Mistral API, Anyscale, and so on.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// `open_ai` and `anthropic` are the providers' native APIs.
+/// `open_ai_compatible` covers every third-party endpoint implementing
+/// OpenAI's `/v1` interface — Ollama, llama-server, LM Studio, vLLM, LocalAI,
+/// KoboldCpp, Azure OpenAI, Groq, Together, OpenRouter, Mistral API, Anyscale,
+/// and so on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ProviderProtocol {

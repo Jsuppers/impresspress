@@ -69,20 +69,16 @@ describe("type compatibility between manual and generated types", () => {
     expect(direct.name).toBe("test-bucket");
   });
 
-  it("IAMRole is imported from generated types with its full shape", () => {
+  it("IAMRole is the admin API's role row (AdminRoleView), snake_case", () => {
     const role: IAMRole = {
       id: "321",
       name: "admin",
-      displayName: "Administrator",
       description: "Full system access",
-      type: "system",
-      metadata: {
-        allowedIps: ["192.168.1.1"],
-        disabledFeatures: [],
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      permissions: ["*"],
+      is_system: true,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
     };
-    expect(role.name).toBe("admin");
+    expect(role.is_system).toBe(true);
   });
 });

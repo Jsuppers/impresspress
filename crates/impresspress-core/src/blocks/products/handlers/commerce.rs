@@ -2,22 +2,19 @@
 
 use serde_json::Value;
 use wafer_block_crypto::primitives;
-use wafer_core::clients::{
-    config,
-    database::{self as db, Record},
-};
+use wafer_core::clients::{config, database::Record};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::products::{
         contracts::{
-            FulfillmentKind, GuestOrderStatus, MoneyBreakdown, PricingPreviewRequest,
-            StorefrontConfig, StorefrontOffer, StorefrontProduct, VariableVisibility,
-            COMMERCE_SCHEMA_VERSION,
+            FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus, PricingPreviewRequest,
+            ReconciliationStatus, StorefrontConfig, StorefrontOffer, StorefrontProduct, StripeMode,
+            VariableVisibility, COMMERCE_SCHEMA_VERSION,
         },
         offer_pricing,
-        repo::{offers, payment_links, purchases},
-        stripe_secret_operations_allowed, PRODUCTS_TABLE,
+        repo::{offers, payment_links, products, purchases},
+        stripe_secret_operations_allowed,
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
     util::{sha256_hex, RecordExt},
@@ -25,19 +22,19 @@ use crate::{
 
 const STOREFRONT_WIDGET_JS: &str = include_str!("../assets/storefront.js");
 
-fn validated_publishable_key(value: &str) -> Option<(String, String)> {
+fn validated_publishable_key(value: &str) -> Option<(String, StripeMode)> {
     let value = value.trim();
     let mode = if value.starts_with("pk_test_") {
-        "test"
+        StripeMode::Test
     } else if value.starts_with("pk_live_") {
-        "live"
+        StripeMode::Live
     } else {
         return None;
     };
     if value.len() > 256 || value.len() < 12 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
         return None;
     }
-    Some((value.to_string(), mode.to_string()))
+    Some((value.to_string(), mode))
 }
 
 pub(crate) async fn handle_storefront_config(ctx: &dyn Context) -> OutputStream {
@@ -115,11 +112,17 @@ pub(crate) async fn handle_guest_order_status(ctx: &dyn Context, msg: &Message) 
             Err(error) => return err_internal("Order has invalid currency", error),
         };
     let subscription_status = optional_nonempty(&order, "subscription_status");
+    let state = OrderStatus::from_record(&order)
+        .and_then(|status| Ok((status, ReconciliationStatus::from_record(&order)?)));
+    let (status, reconciliation_status) = match state {
+        Ok(state) => state,
+        Err(error) => return err_internal("Order row is outside the contract", error),
+    };
     let response = GuestOrderStatus {
         schema_version: COMMERCE_SCHEMA_VERSION,
         order_id: order.id.clone(),
-        status: order.str_field("status").to_string(),
-        reconciliation_status: order.str_field("reconciliation_status").to_string(),
+        status,
+        reconciliation_status,
         amounts: MoneyBreakdown {
             currency,
             subtotal_minor: order.i64_field("subtotal_cents"),
@@ -182,20 +185,16 @@ pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) 
     if product_id.is_empty() {
         return err_bad_request("Missing product ID");
     }
-    let product = match db::get(ctx, PRODUCTS_TABLE, product_id).await {
+    let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == ErrorCode::NotFound => {
             return err_not_found("Product not found");
         }
         Err(error) => return err_internal("Could not load product", error),
     };
-    let deleted = product
-        .data
-        .get("deleted_at")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
-    if product.str_field("status") != "active"
-        || product.str_field("approval_status") != "approved"
-        || deleted
+    // `products::get` already answers `NotFound` for a soft-deleted row; only
+    // `status`/`approval_status` are this handler's own rules to enforce.
+    if product.str_field("status") != "active" || product.str_field("approval_status") != "approved"
     {
         return err_not_found("Product not found");
     }

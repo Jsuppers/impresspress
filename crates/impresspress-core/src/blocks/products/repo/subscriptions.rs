@@ -6,7 +6,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::RecordExt;
+use crate::{blocks::products::contracts::SubscriptionView, util::RecordExt};
 
 /// Platform-billing subscription table — one row per user.
 pub(crate) const SUBSCRIPTIONS_TABLE: &str = "impresspress__products__subscriptions";
@@ -535,16 +535,16 @@ pub(crate) async fn active_plan_exists(ctx: &dyn Context, user_id: &str, plan: &
 ///
 /// This is not a grouped aggregate — it's a single-row lookup by `user_id`
 /// with 4 addon columns defaulted from NULL/absent to 0, so it's built on
-/// `db::get_by_field` + a Rust-side coalesce rather than `db::aggregate`
-/// (which can't express an empty-group `COALESCE`). The response is returned
-/// directly to the authenticated user via `handle_subscription`, so the
-/// output is projected down to the same curated column set the old
-/// `select_columns` used — `user_id`/`stripe_customer_id` must not leak.
+/// `db::get_by_field` rather than `db::aggregate` (which can't express an
+/// empty-group `COALESCE`). The response is returned directly to the
+/// authenticated user via `handle_subscription`, so the row is projected
+/// through [`SubscriptionView`], whose closed field list is what keeps
+/// `user_id` / `stripe_customer_id` out of it.
 pub(crate) async fn subscription_for_user(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Option<serde_json::Value>, WaferError> {
-    let record = match db::get_by_field(
+) -> Result<Option<SubscriptionView>, WaferError> {
+    match db::get_by_field(
         ctx,
         SUBSCRIPTIONS_TABLE,
         "user_id",
@@ -552,33 +552,8 @@ pub(crate) async fn subscription_for_user(
     )
     .await
     {
-        Ok(record) => record,
-        Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-
-    let mut out = serde_json::Map::new();
-    for col in [
-        "id",
-        "plan",
-        "status",
-        "stripe_subscription_id",
-        "grace_period_end",
-        "created_at",
-        "updated_at",
-    ] {
-        if let Some(v) = record.data.get(col) {
-            out.insert(col.to_string(), v.clone());
-        }
+        Ok(record) => Ok(Some(SubscriptionView::from_record(&record))),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    for col in [
-        "addon_projects",
-        "addon_requests",
-        "addon_r2_bytes",
-        "addon_d1_bytes",
-    ] {
-        let v = record.data.get(col).and_then(|v| v.as_i64()).unwrap_or(0);
-        out.insert(col.to_string(), serde_json::json!(v));
-    }
-    Ok(Some(serde_json::Value::Object(out)))
 }

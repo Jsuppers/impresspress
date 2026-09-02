@@ -4,9 +4,12 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{GROUPS_TABLE, PRODUCTS_TABLE};
+use super::GROUPS_TABLE;
 use crate::{
-    blocks::products::repo,
+    blocks::products::{
+        contracts::{AdminStats, SellerStats},
+        repo,
+    },
     http::{err_internal, ok_json},
 };
 
@@ -22,8 +25,8 @@ pub(super) async fn handle_stats(ctx: &dyn Context, _msg: &Message) -> OutputStr
     // (not `tokio::join!`) because tokio is an optional dep in
     // impresspress-core's Cargo.toml — futures 0.3 is unconditional.
     let (total_products, active_products, total_purchases, analytics, total_groups) = futures::join!(
-        db::count(ctx, PRODUCTS_TABLE, &[]),
-        db::count(ctx, PRODUCTS_TABLE, &active_filter),
+        repo::products::count(ctx, &[]),
+        repo::products::count(ctx, &active_filter),
         repo::purchases::count_all(ctx),
         repo::purchases::commerce_analytics(ctx, None),
         db::count(ctx, GROUPS_TABLE, &[]),
@@ -55,24 +58,24 @@ pub(super) async fn handle_stats(ctx: &dyn Context, _msg: &Message) -> OutputStr
         Err(e) => return err_internal("Database error", e),
     };
 
-    ok_json(&serde_json::json!({
-        "total_products": total_products,
-        "active_products": active_products,
-        "total_purchases": total_purchases,
-        "currency_analytics": analytics,
-        "total_groups": total_groups
-    }))
+    ok_json(&AdminStats {
+        total_products,
+        active_products,
+        total_purchases,
+        currency_analytics: analytics,
+        total_groups,
+    })
 }
 
 pub(super) async fn handle_seller_stats(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => {
-            return ok_json(&serde_json::json!({
-                "seller_account_id": "",
-                "currency_analytics": [],
-                "recent_failures": []
-            }))
+            return ok_json(&SellerStats {
+                seller_account_id: String::new(),
+                currency_analytics: Vec::new(),
+                recent_failures: Vec::new(),
+            })
         }
         Err(error) => return err_internal("Database error", error),
     };
@@ -81,11 +84,11 @@ pub(super) async fn handle_seller_stats(ctx: &dyn Context, msg: &Message) -> Out
         repo::purchases::recent_seller_failures(ctx, &account.id, 5),
     );
     match (analytics, failures) {
-        (Ok(analytics), Ok(failures)) => ok_json(&serde_json::json!({
-            "seller_account_id": account.id,
-            "currency_analytics": analytics,
-            "recent_failures": failures
-        })),
+        (Ok(analytics), Ok(failures)) => ok_json(&SellerStats {
+            seller_account_id: account.id,
+            currency_analytics: analytics,
+            recent_failures: failures,
+        }),
         (Err(error), _) | (_, Err(error)) => err_internal("Database error", error),
     }
 }
