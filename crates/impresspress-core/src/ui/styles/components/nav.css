@@ -61,7 +61,10 @@
 	padding: var(--spacing-sm) var(--spacing-md);
 	margin-bottom: var(--spacing-md);
 	background: #fff1e6;
-	color: var(--primary-color);
+	/* --primary-color text on this tint is 3.31:1 -- below the 4.5:1 AA floor
+	 * for normal-size text (caught driving account_card_page during the 12d
+	 * design pass; same fix as .form-tabs li.is-active a). */
+	color: var(--primary-button);
 	border: 1px solid #ffd2b5;
 	border-radius: var(--radius-md);
 	text-decoration: none;

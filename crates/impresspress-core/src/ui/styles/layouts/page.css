@@ -57,7 +57,12 @@
 }
 .form-tabs ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 2px; }
 .form-tabs li a { display: block; padding: 0.4rem 0.7rem; border-radius: var(--radius-md); color: var(--text-secondary); text-decoration: none; font-size: var(--text-sm); }
-.form-tabs li.is-active a { background: #fff1e6; color: var(--primary-color); }
+/* --primary-color text on this tint is 3.31:1 -- below the 4.5:1 AA floor
+ * for normal-size text (caught auditing the tabbed/form templates during the
+ * 12d design pass). --primary-button (4.99:1 on white, 4.51:1 on this tint)
+ * is the accessible choice for text, matching the rest of the palette's
+ * text/button split. */
+.form-tabs li.is-active a { background: #fff1e6; color: var(--primary-button); }
 .form-sections { display: flex; flex-direction: column; gap: var(--spacing-xl); }
 .form-section { display: flex; flex-direction: column; gap: var(--spacing-sm); }
 .form-section__title { font-size: var(--text-lg); font-weight: 500; margin: 0; }

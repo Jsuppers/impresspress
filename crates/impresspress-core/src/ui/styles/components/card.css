@@ -573,7 +573,13 @@
 	width: 100%;
 	padding: 0.625rem 1rem;
 	background: var(--bg-primary);
-	color: var(--accent-danger);
+	/* --accent-danger text on white is 3.76:1 -- below the 4.5:1 AA floor
+	 * (caught driving account_card_page during the 12d design pass).
+	 * --accent-danger stays elsewhere (badges, alerts, borders -- none of
+	 * them pair it with white text at normal size); --primary-button
+	 * (4.99:1) is this app's one AA-safe red for text and reused here
+	 * rather than inventing a new token for a single site. */
+	color: var(--primary-button);
 	border: 1px solid var(--border-color);
 	border-radius: var(--radius-md);
 	font-size: 0.95rem;

@@ -15,6 +15,14 @@ html, body {
 	color: var(--text-primary);
 }
 input, textarea, select, [contenteditable="true"] {
+	/* Form controls don't inherit the body's font-family by default -- browsers
+	 * apply their own UA form-control stack instead (most visibly, `textarea`'s
+	 * UA default is `monospace`, which reads as a jarring mismatch next to a
+	 * `.form-input` sibling in the same section -- caught rendering the
+	 * `form_page` template preview during the 12d design pass). `button`
+	 * already sets this itself (see `.btn` in components/button.css); this
+	 * covers every other native form control app-wide. */
+	font-family: inherit;
 	-webkit-user-select: text !important;
 	user-select: text !important;
 }
