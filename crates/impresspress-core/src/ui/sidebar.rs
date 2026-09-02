@@ -59,6 +59,13 @@ pub struct NavGroup {
 /// the `.sidebar__brand` block below). The parameter is kept so this
 /// signature still matches `shell()`'s, which threads the same `SiteConfig`
 /// fields through to every chrome surface.
+///
+/// `.sidebar__brand--text` is unconditional (not toggled on `logo_url`, as
+/// origin/main's equivalent does for its own wordmark-image branch): this
+/// branch never has a second, wordmark-image code path for the CSS modifier
+/// to switch away from, so applying it unconditionally is the same outcome
+/// with one fewer state. `logo_icon_2x_url`/`brand_icon` (the retina pixel-art
+/// icon) are ported from origin/main during the main merge — 2026-09-02.
 pub fn sidebar_grouped(
     groups: &[NavGroup],
     user: Option<&crate::ui::UserInfo>,
@@ -71,9 +78,9 @@ pub fn sidebar_grouped(
 
     html! {
         nav .sidebar aria-label="Primary" {
-            div .sidebar__brand {
+            div .sidebar__brand .sidebar__brand--text {
                 @if !logo_icon_url.is_empty() {
-                    img src=(logo_icon_url) alt="" .sidebar__brand-icon;
+                    (crate::ui::templates::brand_icon(logo_icon_url, "sidebar__brand-icon", 32))
                 }
                 // The navy sidebar always shows the white text wordmark, never
                 // an `<img>` of `logo_url` — that PNG is dark-ink artwork drawn
@@ -222,6 +229,59 @@ mod tests {
         assert!(s.contains("/b/admin/users"));
         assert!(s.contains(r#"aria-current="page""#));
     }
+
+    /// Default branding: no wordmark image, so the brand row is the built-in
+    /// pixel-art icon next to the app name. The icon is a `<picture>`: the
+    /// 32-cell file by default and the 64-cell file from 1.5dppx up, chosen
+    /// by a media query (deterministic — `srcset` width descriptors let the
+    /// browser pick an already-cached larger candidate, which then gets
+    /// nearest-neighbour *down*scaled). `.pixel-art` keeps art-pixels square.
+    #[test]
+    fn brand_without_wordmark_renders_pixel_art_icon_and_app_name() {
+        let s = sidebar_grouped(
+            &[],
+            None,
+            "/",
+            "",
+            &crate::ui::assets::logo_icon_url(),
+            "Impresspress",
+        )
+        .into_string();
+        assert!(s.contains("sidebar__brand--text"), "{s}");
+        assert!(
+            s.contains(&format!(
+                r#"<picture><source media="(min-resolution: 1.5dppx)" srcset="{}"><img class="sidebar__brand-icon pixel-art" src="{}" width="32" height="32" alt=""></picture>"#,
+                crate::ui::assets::logo_icon_2x_url(),
+                crate::ui::assets::logo_icon_url()
+            )),
+            "{s}"
+        );
+        assert!(!s.contains("sizes="), "{s}");
+        assert!(
+            s.contains(r#"<span class="sidebar__brand-name">Impresspress</span>"#),
+            "{s}"
+        );
+    }
+
+    /// A white-labelled icon URL is a smooth logo we know nothing about:
+    /// no nearest-neighbour class, no built-in srcset.
+    #[test]
+    fn custom_icon_url_gets_no_pixel_art_treatment() {
+        let s =
+            sidebar_grouped(&[], None, "/", "", "https://acme.test/mark.png", "Acme").into_string();
+        assert!(s.contains(r#"src="https://acme.test/mark.png""#), "{s}");
+        assert!(!s.contains("pixel-art"), "{s}");
+        assert!(!s.contains("<picture>"), "{s}");
+    }
+
+    // Ported from origin/main's `wordmark_replaces_the_text_lockup` during the
+    // main merge -- 2026-09-02 -- and dropped rather than adapted: main's
+    // test asserted a configured `logo_url` replaces the icon+text lockup
+    // with `<img class="sidebar__brand-wordmark">`. That's exactly the
+    // navy-illegibility bug `grouped_sidebar_with_logo_url_never_renders_
+    // the_wordmark_image` (below) regression-tests against -- the two
+    // assertions are mutually exclusive, and this branch's fix wins (see
+    // the coordinator's ruling in the merge report).
 
     #[test]
     fn grouped_sidebar_with_logo_url_never_renders_the_wordmark_image() {

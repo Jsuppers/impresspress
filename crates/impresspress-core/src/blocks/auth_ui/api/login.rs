@@ -10,7 +10,10 @@ use crate::{
             repo::{local_credentials, users},
             DUMMY_HASH, USERS_TABLE,
         },
-        auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        auth_ui::{
+            contracts::{AuthenticatedUser, LoginRequest, LoginResponse, TokenType},
+            redirect::{default_post_login_redirect, is_safe_local_redirect},
+        },
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ResponseBuilder},
@@ -18,13 +21,8 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    #[derive(serde::Deserialize)]
-    struct LoginReq {
-        email: String,
-        password: String,
-    }
     let raw = input.collect_to_bytes().await;
-    let body: LoginReq = match serde_json::from_slice(&raw) {
+    let body: LoginRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -124,19 +122,19 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     ResponseBuilder::new()
         .set_cookie(&issued.cookie)
-        .json(&serde_json::json!({
-            "access_token": issued.access_token,
-            "refresh_token": issued.refresh_token,
-            "token_type": "Bearer",
-            "expires_in": issued.access_lifetime,
-            "default_redirect": default_redirect,
-            "user": {
-                "id": user.id,
-                "email": email_lower,
-                "roles": roles,
-                "name": user.display_name
-            }
-        }))
+        .json(&LoginResponse {
+            access_token: issued.access_token,
+            refresh_token: issued.refresh_token,
+            token_type: TokenType::Bearer,
+            expires_in: issued.access_lifetime,
+            default_redirect,
+            user: AuthenticatedUser {
+                id: user.id,
+                email: email_lower,
+                roles,
+                name: user.display_name,
+            },
+        })
 }
 
 /// Regression tests for the #1 onboarding bug: every successful login used

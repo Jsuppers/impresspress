@@ -13,6 +13,7 @@ use wafer_run::{
 };
 
 use crate::{
+    endpoint_match,
     features::FeatureConfig,
     http::ResponseBuilder,
     routing::{self, ExtraRoute},
@@ -108,6 +109,31 @@ fn caller_auth_level(msg: &Message) -> AuthLevel {
     AuthLevel::Authenticated
 }
 
+/// Every registered block with its endpoint list narrowed to what `caller`
+/// may invoke, resolved with `routing::effective_access` — the filter the
+/// WebMCP manifest applies, reused so `/openapi.json`, the agent card and the
+/// manifest cannot disagree about who is told an endpoint exists. Blocks are
+/// kept even when nothing in them is visible, so block-level metadata the
+/// documents carry stays stable across tiers.
+fn visible_to_caller(
+    block_infos: &[BlockInfo],
+    caller: AuthLevel,
+    extra_routes: &[ExtraRoute],
+) -> Vec<BlockInfo> {
+    let ceiling = endpoint_match::auth_rank(caller);
+    block_infos
+        .iter()
+        .map(|block| {
+            let mut visible = block.clone();
+            visible.endpoints.retain(|ep| {
+                endpoint_match::auth_rank(routing::effective_access(block, ep, extra_routes))
+                    <= ceiling
+            });
+            visible
+        })
+        .collect()
+}
+
 /// Handle a impresspress request.
 ///
 /// This is the shared entry point that both CF and native adapters call
@@ -144,49 +170,8 @@ pub async fn handle_request(
     block_infos: &[BlockInfo],
     extra_routes: &[ExtraRoute],
 ) -> OutputStream {
-    // 0. Discovery endpoints — public, no auth required
-    let path = msg.path();
-    if path == "/openapi.json" || path == "/.well-known/agent.json" {
-        let is_openapi = path == "/openapi.json";
-        let host = msg.header("host").to_string();
-        let server_url = format!("https://{host}");
-        // The project/display name for the discovery documents (OpenAPI
-        // `info.title` and the agent-card `name`). Previously this was
-        // derived from the `Host` header (`host.split('.').next()`), which
-        // produced garbage for IP-addressed hosts — e.g. `127.0.0.1:8093`
-        // yielded the literal title `"127"`. `WAFER_RUN_SHARED__APP_NAME` is
-        // the existing single-sourced display-name config var (already used
-        // for emails, the login page, and the browser `<title>` — see
-        // `blocks/email.rs`, `ui/mod.rs`), so discovery documents reuse it
-        // instead of inventing a second name knob; it falls back to the
-        // constant `"Impresspress"`, never to the host.
-        let project_name =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await;
-
-        let body = if is_openapi {
-            wafer_core::discovery::generate_openapi(block_infos, &project_name, "", &server_url)
-        } else {
-            wafer_core::discovery::generate_agent_card(block_infos, &project_name, "", &server_url)
-        };
-
-        // [SEC-073] Only emit `Access-Control-Allow-Origin: *` in dev. These
-        // endpoints are intentionally public-discovery (no auth, anyone can
-        // GET them), but advertising `*` to every cross-origin caller in
-        // production lets unauthenticated browser code at any site map the
-        // whole impresspress API surface — useful reconnaissance for a targeted
-        // attack. In prod we just omit the header; non-browser clients
-        // (curl, the agent runtime, server-side fetchers) don't care about
-        // CORS so they still see the body.
-        let environment =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
-        let is_dev = environment.eq_ignore_ascii_case("development");
-
-        let mut resp = ResponseBuilder::new().set_header("Cache-Control", "public, max-age=3600");
-        if is_dev {
-            resp = resp.set_header("Access-Control-Allow-Origin", "*");
-        }
-        return resp.json(&body);
-    }
+    // 0. (Discovery documents moved below step 2 — they are filtered by the
+    //    caller's tier, which is not known here.)
 
     // 1. Strip /api prefix from resource path
     let resource = msg.path().to_string();
@@ -216,9 +201,75 @@ pub async fn handle_request(
     let user_id = msg.user_id().to_string();
     let start_ms = crate::util::now_millis();
 
+    // Discovery documents: `/openapi.json` and the agent card. Placed after
+    // step 2, with the manifest, because they are filtered by the caller's
+    // tier: an endpoint the caller could not invoke is not described to
+    // them. At step 0 `msg.user_id()` is always empty, so a filter there
+    // would hand every caller the anonymous document — silently, since that
+    // is a valid document (`openapi_describes_admin_endpoints_to_an_admin`
+    // pins the placement).
+    //
+    // The route itself stays reachable without credentials: an anonymous
+    // caller gets the Public subset, which is exactly what they can use.
+    if path == "/openapi.json" || path == "/.well-known/agent.json" {
+        let is_openapi = path == "/openapi.json";
+        let host = msg.header("host").to_string();
+        let server_url = format!("https://{host}");
+        // The project/display name for the discovery documents (OpenAPI
+        // `info.title` and the agent-card `name`). Previously this was
+        // derived from the `Host` header (`host.split('.').next()`), which
+        // produced garbage for IP-addressed hosts — e.g. `127.0.0.1:8093`
+        // yielded the literal title `"127"`. `WAFER_RUN_SHARED__APP_NAME` is
+        // the existing single-sourced display-name config var (already used
+        // for emails, the login page, and the browser `<title>` — see
+        // `blocks/email.rs`, `ui/mod.rs`), so discovery documents reuse it
+        // instead of inventing a second name knob; it falls back to the
+        // constant `"Impresspress"`, never to the host.
+        let project_name =
+            config_client::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await;
+
+        // Same ceiling and the same resolver as the manifest below, so the
+        // three projections of one declaration agree on who is told about
+        // it. Two projections with different disclosure rules is the pattern
+        // that produced the `dedupe_hash` leak.
+        let caller = caller_auth_level(&msg);
+        let visible_infos = visible_to_caller(block_infos, caller, extra_routes);
+
+        let body = if is_openapi {
+            wafer_core::discovery::generate_openapi(&visible_infos, &project_name, "", &server_url)
+        } else {
+            wafer_core::discovery::generate_agent_card(
+                &visible_infos,
+                &project_name,
+                "",
+                &server_url,
+            )
+        };
+
+        // [SEC-073] Only emit `Access-Control-Allow-Origin: *` in dev.
+        // Advertising `*` to every cross-origin caller in production lets
+        // unauthenticated browser code at any site map the API surface —
+        // now the Public subset, but still reconnaissance. In prod we just
+        // omit the header; non-browser clients (curl, the agent runtime,
+        // server-side fetchers) don't care about CORS so they still see the
+        // body.
+        let environment =
+            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
+        let is_dev = environment.eq_ignore_ascii_case("development");
+
+        // Per-caller by construction, like the manifest: a shared cache
+        // serving one visitor's document to another would leak the
+        // privileged surface. Was `public, max-age=3600` while the document
+        // was the same for everyone.
+        let mut resp = ResponseBuilder::new().set_header("Cache-Control", "no-store");
+        if is_dev {
+            resp = resp.set_header("Access-Control-Allow-Origin", "*");
+        }
+        return resp.json(&body);
+    }
+
     // WebMCP tool manifest. Placed after step 2 because it needs the resolved
-    // identity — the discovery documents at step 0 are anonymous by design,
-    // this one is not.
+    // identity, like the discovery documents above.
     if path == "/b/webmcp/manifest.json" {
         let caller = caller_auth_level(&msg);
 
@@ -481,46 +532,23 @@ mod discovery_tests {
     //!  2. The core developer-facing auth/storage/products endpoints now
     //!     declare schemas, so `wafer_core::discovery::generate_openapi`
     //!     (which skips any endpoint failing `has_schema()`) includes them.
+    //!
+    //! `real_block_infos()` and `discovery_json()` live in
+    //! `test_support.rs` now — shared with the per-block openapi snapshot
+    //! gate (`tests/openapi_snapshot.rs`) so there is one implementation
+    //! rather than two.
 
-    use wafer_run::{AuthLevel, Block, BlockEndpoint, BlockInfo, InputStream};
+    use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, InputStream};
 
     use super::handle_request;
     use crate::{
-        blocks::{auth_ui::AuthUiBlock, files::FilesBlock, products::ProductsBlock},
         features::{AllEnabled, FeatureConfig},
-        test_support::{anon_msg, collect_or_panic, TestContext},
+        routing,
+        test_support::{
+            anon_msg, bearer_for_roles, collect_or_panic, discovery_json, discovery_json_as,
+            real_block_infos, TestContext, TEST_JWT_SECRET,
+        },
     };
-
-    /// `BlockInfo` for the three blocks this PR added schemas to, fetched
-    /// from the real block structs (not hand-rolled fixtures) so the test
-    /// exercises the actual declarations shipped in `blocks/{auth_ui,files,
-    /// products}/mod.rs`.
-    fn real_block_infos() -> Vec<BlockInfo> {
-        vec![
-            AuthUiBlock::new().info(),
-            FilesBlock::new().info(),
-            ProductsBlock::new().info(),
-        ]
-    }
-
-    async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
-        let mut msg = anon_msg("retrieve", path);
-        msg.set_meta("http.header.host", host);
-        let out = handle_request(
-            ctx,
-            msg,
-            InputStream::from_bytes(Vec::new()),
-            None,
-            "test-jwt-secret",
-            false,
-            &AllEnabled,
-            &real_block_infos(),
-            &[],
-        )
-        .await;
-        let buf = collect_or_panic(out).await;
-        serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
-    }
 
     #[tokio::test]
     async fn openapi_title_falls_back_to_impresspress_not_host_derived_127() {
@@ -597,6 +625,38 @@ mod discovery_tests {
             "me is AuthLevel::Authenticated — must carry bearerAuth security: {me}"
         );
 
+        // PATCH /b/auth/api/me was dispatched in handle() but undeclared, so
+        // it was absent here and from the access-tier table. It now shares
+        // GET's response type, so the two cannot drift.
+        let me_patch = &paths["/b/auth/api/me"]["patch"];
+        assert!(
+            !me_patch.is_null(),
+            "PATCH me must appear in /openapi.json now that it's declared: {body}"
+        );
+        let mut patch_fields: Vec<String> = me_patch["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]
+            .as_object()
+            .expect("PATCH me request schema has properties")
+            .keys()
+            .cloned()
+            .collect();
+        patch_fields.sort();
+        assert_eq!(
+            patch_fields,
+            vec!["avatar_url".to_string(), "name".to_string()],
+            "PATCH me request schema must expose exactly the two user-editable fields: {me_patch}"
+        );
+        assert_eq!(
+            me_patch["responses"]["200"]["content"]["application/json"]["schema"],
+            me["responses"]["200"]["content"]["application/json"]["schema"],
+            "PATCH me must publish the same response schema as GET me: {me_patch}"
+        );
+        assert_eq!(
+            me_patch["security"][0]["bearerAuth"],
+            serde_json::json!([]),
+            "PATCH me is AuthLevel::Authenticated — must carry bearerAuth security: {me_patch}"
+        );
+
         // /b/auth/api/refresh was previously entirely undeclared (dispatched
         // in handle() but absent from .endpoints) — now documented.
         let refresh = &paths["/b/auth/api/refresh"]["post"];
@@ -664,17 +724,19 @@ mod discovery_tests {
             !catalog.is_null(),
             "catalog list must appear in /openapi.json: {body}"
         );
+        let catalog_props = &catalog["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["records"]["items"]["properties"];
         assert_eq!(
-            catalog["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
-                ["records"]["items"]["properties"]["data"]["properties"]["stock"]["type"],
-            "integer",
-            "catalog response schema must match the real products row shape: {catalog}"
+            catalog_props["stock"]["type"], "integer",
+            "catalog rows are flat `CatalogProductView`s: {catalog}"
         );
-        // The product object schema must cover the original row plus every
-        // commerce-v2 column — `SELECT *` means all of them land in real
-        // catalog and builder responses.
-        let product_props = &catalog["responses"]["200"]["content"]["application/json"]["schema"]
-            ["properties"]["records"]["items"]["properties"]["data"]["properties"];
+        // The admin row is every column of the products table; the public
+        // catalog row is the same table minus the ownership, moderation and
+        // provider columns, which `CatalogProductView` withholds by not
+        // naming them.
+        let product_props = &paths["/b/products/api/admin/products"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["records"]["items"]
+            ["properties"];
         for field in [
             "group_template_id",
             "product_template_id",
@@ -694,6 +756,22 @@ mod discovery_tests {
             assert!(
                 !product_props[field].is_null(),
                 "product schema is missing real column `{field}`: {product_props}"
+            );
+        }
+        for field in [
+            "created_by",
+            "owner_kind",
+            "owner_id",
+            "seller_account_id",
+            "approval_status",
+            "stripe_product_id",
+            "current_version",
+            "submitted_at",
+            "deleted_at",
+        ] {
+            assert!(
+                catalog_props[field].is_null(),
+                "the public catalog must not publish `{field}`: {catalog_props}"
             );
         }
 
@@ -758,10 +836,28 @@ mod discovery_tests {
         let checkout_response =
             &checkout["responses"]["200"]["content"]["application/json"]["schema"];
         assert!(
-            checkout_response["properties"]["receipt_token"]["writeOnly"] == true
+            !checkout_response["properties"]["receipt_token"].is_null()
                 && !checkout_response["properties"]["amounts"].is_null(),
             "checkout must document the receipt token and minor-unit amounts: {checkout}"
         );
+        assert!(
+            checkout_response["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&serde_json::json!("receipt_token"))),
+            "the receipt token is what checkout returns, so it is always present: {checkout}"
+        );
+        // `writeOnly` asserts a field is never present in a response. Both of
+        // these are only ever present in a response — the receipt token is
+        // the product of checkout, the client secret is how an embedded
+        // checkout is opened — so the flag was a false statement that a
+        // strict OpenAPI 3.1 client would act on. Sensitivity is stated in
+        // the description instead.
+        for field in ["receipt_token", "client_secret"] {
+            assert!(
+                checkout_response["properties"][field]["writeOnly"].is_null(),
+                "{field} is returned in the response and must not be marked writeOnly: {checkout}"
+            );
+        }
 
         let guest_status = &paths["/b/products/orders/{id}/status"]["get"];
         let guest_props = &guest_status["responses"]["200"]["content"]["application/json"]
@@ -869,9 +965,11 @@ mod discovery_tests {
                 && stripe_status["publishable_key"].is_null(),
             "Stripe health discovery must never expose credential values: {stripe_status}"
         );
+        // Order rows are flat `contracts::*View`s; the `{id, data}` record
+        // envelope is gone from the detail's `purchase` and `disputes`.
         let order_dispute = &paths["/b/products/api/admin/purchases/{id}"]["get"]["responses"]
             ["200"]["content"]["application/json"]["schema"]["properties"]["disputes"]["items"]
-            ["properties"]["data"]["properties"];
+            ["properties"];
         assert_eq!(order_dispute["amount_minor"]["type"], "integer");
         assert!(
             order_dispute["status"]["enum"]
@@ -881,7 +979,12 @@ mod discovery_tests {
         );
         let order_payment = &paths["/b/products/api/admin/purchases/{id}"]["get"]["responses"]
             ["200"]["content"]["application/json"]["schema"]["properties"]["purchase"]
-            ["properties"]["data"]["properties"];
+            ["properties"];
+        assert!(
+            order_payment["receipt_token_hash"].is_null()
+                && order_payment["receipt_token_expires_at"].is_null(),
+            "the guest receipt digest is never published on an order row: {order_payment}"
+        );
         assert_eq!(
             order_payment["payment_intent_event_created"]["type"],
             "integer"
@@ -913,12 +1016,17 @@ mod discovery_tests {
                 serde_json::json!(["name"]),
                 "product creation must document its required name: {collection}"
             );
+            // The row is `contracts::ProductView`, flat: the `{id, data}`
+            // record envelope the untyped handlers echoed is gone.
+            let row = &collection["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["records"]["items"];
             assert_eq!(
-                collection["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-                    ["properties"]["records"]["items"]["properties"]["data"]["properties"]
-                    ["approval_status"]["type"],
-                "string",
+                row["properties"]["approval_status"]["type"], "string",
                 "builder product lists must use the commerce-v2 row contract: {collection}"
+            );
+            assert!(
+                row["properties"]["data"].is_null(),
+                "builder product rows are flat views, not {{id, data}} records: {collection}"
             );
 
             let duplicate = &paths[&format!("{prefix}/{{id}}/duplicate")]["post"];
@@ -960,6 +1068,9 @@ mod discovery_tests {
             );
         }
 
+        // The envelope is `{records, total_count, page, page_size}` and the
+        // handler always emits all four; the hand-written schema understated
+        // `required`.
         for path in [
             "/b/products/api/admin/groups",
             "/b/products/api/admin/types",
@@ -967,8 +1078,8 @@ mod discovery_tests {
             assert_eq!(
                 paths[path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
                     ["required"],
-                serde_json::json!(["records", "total_count"]),
-                "admin builder list must document RecordList: {}",
+                serde_json::json!(["records", "total_count", "page", "page_size"]),
+                "admin builder list must document its envelope: {}",
                 paths[path]["get"]
             );
         }
@@ -1047,32 +1158,8 @@ mod discovery_tests {
         infos: &[BlockInfo],
         features: &dyn FeatureConfig,
     ) -> serde_json::Value {
-        use std::{collections::HashMap, time::Duration};
-
-        use wafer_block_crypto::primitives;
-
-        let secret = "test-jwt-secret";
-        let auth_header = roles.map(|roles| {
-            let derived = primitives::derive_block_key(
-                secret.as_bytes(),
-                crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
-            );
-            let mut claims = HashMap::new();
-            claims.insert("sub".to_string(), serde_json::json!("user-webmcp-1"));
-            claims.insert("type".to_string(), serde_json::json!("access"));
-            // Must match `expected_issuer`'s default
-            // (`crate::blocks::auth::helpers::expected_issuer`) — this
-            // test's `TestContext` has no `WAFER_RUN_SHARED__FRONTEND_URL`
-            // configured.
-            claims.insert(
-                "iss".to_string(),
-                serde_json::json!("http://localhost:5173"),
-            );
-            claims.insert("roles".to_string(), serde_json::json!(roles));
-            let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
-                .expect("test jwt_sign");
-            format!("Bearer {token}")
-        });
+        let secret = TEST_JWT_SECRET;
+        let auth_header = roles.map(bearer_for_roles);
 
         let mut msg = anon_msg("retrieve", "/b/webmcp/manifest.json");
         msg.set_meta("http.header.host", "impresspress.example.com");
@@ -1090,6 +1177,131 @@ mod discovery_tests {
         .await;
         let buf = collect_or_panic(out).await;
         serde_json::from_slice(&buf.body).expect("manifest response is valid JSON")
+    }
+
+    /// `/openapi.json` and the agent card were generated at step 0, before
+    /// auth, so every caller received the complete document — Admin paths
+    /// included. They now mirror the manifest: an endpoint the caller could
+    /// not invoke is not described to them. Two projections of one
+    /// declaration with different disclosure rules was the pattern behind
+    /// the `dedupe_hash` leak; this closes the discovery-side half.
+    #[tokio::test]
+    async fn openapi_omits_endpoints_above_the_callers_tier() {
+        let ctx = TestContext::new().await;
+        let host = "impresspress.example.com";
+
+        let anon = discovery_json_as(&ctx, "/openapi.json", host, None).await;
+        assert!(
+            !anon["paths"]["/b/products/storefront/config"].is_null(),
+            "Public endpoints are described to everyone: {}",
+            anon["paths"]
+        );
+        assert!(
+            anon["paths"]["/b/auth/api/me"].is_null(),
+            "an Authenticated endpoint must not be described to an anonymous caller: {}",
+            anon["paths"]
+        );
+        assert!(
+            anon["paths"]["/b/admin/api/users"].is_null(),
+            "an Admin endpoint must not be described to an anonymous caller: {}",
+            anon["paths"]
+        );
+
+        let user = discovery_json_as(&ctx, "/openapi.json", host, Some(&["user"])).await;
+        assert!(
+            !user["paths"]["/b/auth/api/me"].is_null(),
+            "an authenticated caller sees Authenticated endpoints: {}",
+            user["paths"]
+        );
+        assert!(
+            user["paths"]["/b/admin/api/users"].is_null(),
+            "an authenticated non-admin must not see Admin endpoints: {}",
+            user["paths"]
+        );
+    }
+
+    /// Placement regression. At step 0 `msg.user_id()` is empty, so a filter
+    /// there hands every caller the anonymous document — a valid document,
+    /// invisible to a smoke test. The same trap the manifest route has a
+    /// test for.
+    #[tokio::test]
+    async fn openapi_describes_admin_endpoints_to_an_admin() {
+        // A real bearer, resolved by step 2 — not pre-set meta, which a
+        // step-0 filter would also see. Needs the auth tables.
+        let ctx = TestContext::with_auth().await;
+        let bearer = bearer_for_roles(&["admin"]);
+        let mut msg = anon_msg("retrieve", "/openapi.json");
+        msg.set_meta("http.header.host", "impresspress.example.com");
+        let out = handle_request(
+            &ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            Some(&bearer),
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let admin: serde_json::Value = serde_json::from_slice(&collect_or_panic(out).await.body)
+            .expect("openapi response is valid JSON");
+        assert!(
+            !admin["paths"]["/b/admin/api/users"].is_null(),
+            "an admin must receive the Admin endpoints: {}",
+            admin["paths"]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_card_omits_skills_above_the_callers_tier() {
+        let ctx = TestContext::new().await;
+        let host = "impresspress.example.com";
+        fn skill_ids(card: &serde_json::Value) -> Vec<String> {
+            card["skills"]
+                .as_array()
+                .expect("agent card skills array")
+                .iter()
+                .map(|s| s["id"].as_str().expect("skill id").to_string())
+                .collect()
+        }
+
+        let anon = skill_ids(&discovery_json_as(&ctx, "/.well-known/agent.json", host, None).await);
+        assert!(
+            anon.iter().any(|id| id.contains("storefront")),
+            "Public skills are listed for everyone: {anon:?}"
+        );
+        assert!(
+            !anon.iter().any(|id| id.starts_with("impresspress/admin/")),
+            "an anonymous card must not list an Admin block's skills: {anon:?}"
+        );
+
+        let admin = skill_ids(
+            &discovery_json_as(&ctx, "/.well-known/agent.json", host, Some(&["admin"])).await,
+        );
+        assert!(
+            admin.iter().any(|id| id.starts_with("impresspress/admin/")),
+            "an admin's card lists the Admin block's skills: {admin:?}"
+        );
+    }
+
+    /// Per-caller by construction now, so a shared cache serving one
+    /// visitor's document to another would leak the privileged surface —
+    /// the same reasoning as the manifest's `no-store`.
+    #[tokio::test]
+    async fn discovery_documents_are_not_cacheable() {
+        let ctx = TestContext::new().await;
+        for path in ["/openapi.json", "/.well-known/agent.json"] {
+            let headers = discovery_headers(&ctx, path, "impresspress.example.com").await;
+            let cache_control = headers
+                .get("Cache-Control")
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                cache_control.contains("no-store"),
+                "{path} is per-caller and must not be cached, got: {cache_control:?}"
+            );
+        }
     }
 
     /// Every tool name in a manifest.
@@ -1143,14 +1355,22 @@ mod discovery_tests {
         // An unauthenticated request must see Public tools only. Anything
         // requiring a session is recon surface if its name is published
         // here. `list_my_purchases` is the shipped Authenticated tool;
-        // `admin_only_probe` (fixture) covers the Admin tier, which nothing
-        // shipped declares.
+        // `admin_only_probe` (fixture) is kept alongside the shipped admin
+        // tools so this still covers the Admin tier if admin's own surface
+        // ever goes away.
         let mut infos = real_block_infos();
         infos.push(admin_tool_block());
         let body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
         let names = tool_names(&body);
 
-        for forbidden in ["list_my_purchases", "admin_only_probe"] {
+        for forbidden in [
+            "list_my_purchases",
+            "admin_only_probe",
+            "list_users",
+            "list_roles",
+            "get_site_settings",
+            "list_audit_log",
+        ] {
             assert!(
                 !names.contains(&forbidden),
                 "anonymous manifest must not name the privileged tool {forbidden}: {names:?}"
@@ -1166,6 +1386,7 @@ mod discovery_tests {
 
         for expected in [
             "get_storefront_config",
+            "list_products",
             "get_product",
             "preview_price",
             "start_checkout",
@@ -1216,18 +1437,23 @@ mod discovery_tests {
     }
 
     /// Pins the producer-to-consumer contract for `outputSchema` — the field
-    /// `ui/assets/webmcp.js` now reads to decide whether to pass a schema to
+    /// `ui/assets/webmcp.js` reads to decide whether to pass a schema to
     /// `registerTool` and to populate `structuredContent` from the parsed
     /// response body.
     ///
-    /// `get_order_status` declares a self-contained, object-shaped
-    /// `output_schema` with no `$ref`s, so the producer's projection
-    /// (`wafer_core::discovery::agent_output_schema`) has nothing to inline
-    /// and must publish it unchanged. Asserting the WHOLE object, the same
-    /// way `webmcp_manifest_pins_the_producer_invocation_contract` does for
-    /// `invocation`, is what makes a producer-side rename (`outputSchema` to
-    /// `output_schema`, or a dropped field) fail loudly here instead of
-    /// silently breaking `webmcp.js` at runtime.
+    /// `get_order_status`'s schema is derived from `contracts::GuestOrderStatus`
+    /// (`.output::<T>()`), so the literal is not repeated here — the per-block
+    /// snapshot gate (`tests/openapi_snapshot.rs`) already pins every byte of
+    /// it. What this test pins is what that gate cannot:
+    ///
+    /// 1. The manifest carries the *same* projection of that declaration as
+    ///    `/openapi.json` does, minus the root `title` the producer strips
+    ///    (`wafer_core::discovery::agent_output_schema` inlines refs and drops
+    ///    document-level keys; a self-contained schema comes through otherwise
+    ///    unchanged). A producer-side rename of the field, or a dropped
+    ///    property, fails here rather than silently at runtime.
+    /// 2. The shape `webmcp.js` and the storefront rely on: an object schema
+    ///    whose `required` names the fields a guest can always read.
     #[tokio::test]
     async fn webmcp_manifest_pins_the_producer_output_schema_contract() {
         let ctx = TestContext::new().await;
@@ -1240,40 +1466,163 @@ mod discovery_tests {
             .find(|t| t["name"] == "get_order_status")
             .unwrap_or_else(|| panic!("get_order_status must be published: {body}"));
 
+        let openapi = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
+        let mut expected = openapi["paths"]["/b/products/orders/{id}/status"]["get"]["responses"]
+            ["200"]["content"]["application/json"]["schema"]
+            .clone();
+        let expected_obj = expected
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("the endpoint's response schema must be in /openapi.json"));
+        expected_obj.remove("title");
+
         assert_eq!(
-            tool["outputSchema"],
-            serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["schema_version", "order_id", "status", "reconciliation_status", "amounts", "subscription_cancel_at_period_end"],
-                "properties": {
-                    "schema_version": {"type": "integer"},
-                    "order_id": {"type": "string"},
-                    "status": {"type": "string"},
-                    "reconciliation_status": {"type": "string"},
-                    "amounts": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["currency", "subtotal_minor", "discount_minor", "tax_minor", "shipping_minor", "platform_fee_minor", "total_minor"],
-                        "properties": {
-                            "currency": {"type": "string"},
-                            "subtotal_minor": {"type": "integer"},
-                            "discount_minor": {"type": "integer"},
-                            "tax_minor": {"type": "integer"},
-                            "shipping_minor": {"type": "integer"},
-                            "platform_fee_minor": {"type": "integer"},
-                            "total_minor": {"type": "integer"}
-                        }
-                    },
-                    "subscription_status": {"type": "string"},
-                    "subscription_current_period_end": {"type": "string", "format": "date-time"},
-                    "subscription_cancel_at_period_end": {"type": "boolean"},
-                    "paid_at": {"type": "string", "format": "date-time"},
-                    "refunded_at": {"type": "string", "format": "date-time"}
-                }
-            }),
-            "outputSchema shape drifted from what ui/assets/webmcp.js reads: {tool}"
+            tool["outputSchema"], expected,
+            "outputSchema must be the /openapi.json projection of the same declaration, \
+             minus the root title: {tool}"
         );
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        assert_eq!(
+            tool["outputSchema"]["required"],
+            serde_json::json!([
+                "schema_version",
+                "order_id",
+                "status",
+                "reconciliation_status",
+                "amounts",
+                "subscription_cancel_at_period_end"
+            ]),
+            "the fields a guest can always read drifted from what ui/assets/webmcp.js and \
+             the storefront rely on: {tool}"
+        );
+    }
+
+    /// `list_my_purchases` is the other WebMCP tool whose output is a products
+    /// contract, and the one whose shape changed when the order rows were
+    /// typed: flat `PurchaseView` rows under `records`, with the guest receipt
+    /// digest (`receipt_token_hash`, `receipt_token_expires_at`) withheld.
+    /// Same pin as for `get_order_status`: the manifest's `outputSchema` is
+    /// the `/openapi.json` projection of `GET /b/products/purchases` minus the
+    /// root `title`, and no property name published under it starts with
+    /// `receipt_token`.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_list_my_purchases_to_the_typed_order_rows() {
+        let ctx = TestContext::with_auth().await;
+        let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "list_my_purchases")
+            .unwrap_or_else(|| {
+                panic!("list_my_purchases must be published to an authenticated caller: {body}")
+            });
+
+        let openapi = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
+        let mut expected = openapi["paths"]["/b/products/purchases"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]
+            .clone();
+        let expected_obj = expected
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("the endpoint's response schema must be in /openapi.json"));
+        expected_obj.remove("title");
+
+        assert_eq!(
+            tool["outputSchema"], expected,
+            "outputSchema must be the /openapi.json projection of the same declaration, \
+             minus the root title: {tool}"
+        );
+
+        let published = property_names(&tool["outputSchema"]);
+        assert!(
+            published.contains(&"refunded_total_cents".to_string()),
+            "the walk must reach the order row's properties: {published:?}"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|name| name.starts_with("receipt_token")),
+            "the guest receipt digest must not be published to an agent: {published:?}"
+        );
+    }
+
+    /// `list_products` is the agent's entry point and the only anonymous
+    /// tool that returns a list of rows, so it is the one place an internal
+    /// products column would reach an unauthenticated agent in bulk.
+    ///
+    /// Before the catalog was projected through `CatalogProductView` this
+    /// endpoint echoed the stored row: `owner_id`, `created_by`,
+    /// `seller_account_id`, `owner_kind`, `stripe_product_id`,
+    /// `approval_status`, `submitted_at`, `current_version` and
+    /// `deleted_at` were all public. Annotating it as a tool is only safe
+    /// on top of that projection, and this pins the two together.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_list_products_to_the_public_catalog_view() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "list_products")
+            .unwrap_or_else(|| {
+                panic!("list_products must be published to an anonymous caller: {body}")
+            });
+
+        let published = property_names(&tool["outputSchema"]);
+        assert!(
+            published.contains(&"name".to_string()) && published.contains(&"slug".to_string()),
+            "the walk must reach the catalog row's properties: {published:?}"
+        );
+        assert!(
+            published.contains(&"id".to_string()),
+            "the tool's own description calls it the only way to discover a \
+             product id, so the id must be published: {published:?}"
+        );
+        for withheld in [
+            "owner_id",
+            "created_by",
+            "seller_account_id",
+            "owner_kind",
+            "stripe_product_id",
+            "approval_status",
+            "submitted_at",
+            "current_version",
+            "deleted_at",
+        ] {
+            assert!(
+                !published.contains(&withheld.to_string()),
+                "the public catalog tool must not publish the internal column \
+                 {withheld}: {published:?}"
+            );
+        }
+    }
+
+    /// Every `properties` key anywhere under `schema`: the names a consumer
+    /// of the schema can read, at any depth.
+    fn property_names(schema: &serde_json::Value) -> Vec<String> {
+        fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                        out.extend(props.keys().cloned());
+                    }
+                    for value in map.values() {
+                        walk(value, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(schema, &mut out);
+        out
     }
 
     #[tokio::test]
@@ -1337,6 +1686,104 @@ mod discovery_tests {
             !user_names.contains(&"admin_only_probe"),
             "a logged-in non-admin must NOT receive Admin-level tools: {user_names:?}"
         );
+    }
+
+    /// No Admin-tier tool anywhere is a write.
+    ///
+    /// `admin/mod.rs` has its own copy of this over `AdminBlock`, which is
+    /// where an author annotating an admin endpoint will trip it. This one is
+    /// the backstop: the policy is about the Admin tier, not about one block,
+    /// so a POST tool declared under an admin-access route in any other block
+    /// has to fail somewhere too.
+    #[test]
+    fn no_admin_tier_tool_is_a_write() {
+        for block in real_block_infos() {
+            for ep in &block.endpoints {
+                if !ep.is_agent_tool() {
+                    continue;
+                }
+                if routing::effective_access(&block, ep, &[]) != AuthLevel::Admin {
+                    continue;
+                }
+                assert_eq!(
+                    ep.method,
+                    wafer_run::HttpMethod::Get,
+                    "{} {} is an Admin-tier agent tool and must be a read: a tool's \
+                     execute runs with the visitor's full ambient authority",
+                    block.name,
+                    ep.path
+                );
+            }
+        }
+    }
+
+    /// The same three-tier property as above, but against the tools the
+    /// admin block actually ships rather than the `admin_only_probe`
+    /// fixture.
+    ///
+    /// The design spec calls the Admin tier the thinnest coverage on the
+    /// impresspress side and the level where a filtering mistake is most
+    /// costly: these four tools read the site's user list, its roles, its
+    /// configuration and its audit trail. A fixture cannot catch an admin
+    /// endpoint that was mis-tiered in `admin/mod.rs` — only the real
+    /// `BlockInfo` can.
+    #[tokio::test]
+    async fn shipped_admin_tools_reach_only_admin_callers() {
+        const ADMIN_TOOLS: [&str; 4] = [
+            "list_users",
+            "list_roles",
+            "get_site_settings",
+            "list_audit_log",
+        ];
+
+        let ctx = TestContext::with_auth().await;
+        let infos = real_block_infos();
+
+        let admin_body = webmcp_manifest(&ctx, Some(&["admin"]), &infos, &AllEnabled).await;
+        let as_admin = tool_names(&admin_body);
+        for tool in ADMIN_TOOLS {
+            assert!(
+                as_admin.contains(&tool),
+                "an admin session must receive the shipped admin tool {tool}: {as_admin:?}"
+            );
+
+            // Presence of the name is not enough. The producer drops an
+            // `outputSchema` it cannot vouch for and still publishes the
+            // tool, so a refused schema is invisible to a name check: an
+            // agent gets a tool whose result it cannot interpret.
+            // `AdminSettingsResponse` was exactly this — a free-form map
+            // (`additionalProperties: true`) that the wall refused.
+            let published = admin_body["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .find(|t| t["name"] == tool)
+                .expect("just asserted present");
+            assert_eq!(
+                published["outputSchema"]["type"], "object",
+                "{tool} must publish an object outputSchema, not a dropped or \
+                 non-object one: {published}"
+            );
+        }
+
+        // The two discriminating halves. A logged-in non-admin and an
+        // anonymous visitor must both be told nothing about these names:
+        // publishing them is recon surface, and the manifest is the only
+        // place tool names are handed out.
+        let user_body = webmcp_manifest(&ctx, Some(&[]), &infos, &AllEnabled).await;
+        let anon_body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let as_user = tool_names(&user_body);
+        let as_anon = tool_names(&anon_body);
+        for tool in ADMIN_TOOLS {
+            assert!(
+                !as_user.contains(&tool),
+                "a logged-in non-admin must NOT receive the admin tool {tool}: {as_user:?}"
+            );
+            assert!(
+                !as_anon.contains(&tool),
+                "an anonymous visitor must NOT receive the admin tool {tool}: {as_anon:?}"
+            );
+        }
     }
 
     /// The manifest must not advertise tools from a block the admin

@@ -46,7 +46,7 @@ const FILE_ASSETS: &[(&str, &str, &str)] = &[
     ("assets/fonts/itim-latin.woff2", "itim-latin.woff2", "font/woff2"),
     ("assets/fonts/itim-latin-ext.woff2", "itim-latin-ext.woff2", "font/woff2"),
     ("assets/impresspress-logo.png", "impresspress-logo.png", "image/png"),
-    ("assets/impresspress-logo-long.png", "impresspress-logo-long.png", "image/png"),
+    ("assets/impresspress-logo-2x.png", "impresspress-logo-2x.png", "image/png"),
     ("assets/favicon.ico", "favicon.ico", "image/x-icon"),
 ];
 

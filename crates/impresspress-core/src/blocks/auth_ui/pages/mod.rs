@@ -26,10 +26,12 @@ pub(super) fn site_config(ctx: &dyn Context) -> SiteConfig {
     let auth_logo = ctx
         .config_get("WAFER_RUN_SHARED__AUTH_LOGO_URL")
         .unwrap_or("");
+    // Blank = no wordmark image; the pages render the pixel-art icon and the
+    // app name as text (see `ui::templates::brand_lockup`).
     let logo_url = if auth_logo.is_empty() {
         ctx.config_get("WAFER_RUN_SHARED__LOGO_URL")
-            .map(str::to_string)
-            .unwrap_or_else(ui::assets::logo_long_url)
+            .unwrap_or("")
+            .to_string()
     } else {
         auth_logo.to_string()
     };
@@ -349,7 +351,7 @@ mod tests {
         let cfg = site_config(&ctx);
 
         assert_eq!(cfg.app_name, "Impresspress");
-        assert_eq!(cfg.logo_url, crate::ui::assets::logo_long_url());
+        assert_eq!(cfg.logo_url, "", "no wordmark image by default");
         assert_eq!(cfg.logo_icon_url, crate::ui::assets::logo_icon_url());
         assert_eq!(cfg.favicon_url, crate::ui::assets::favicon_url());
         assert!(cfg.embedded_scripts.is_empty());

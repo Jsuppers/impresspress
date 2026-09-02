@@ -205,6 +205,11 @@
 .products-filter-label { font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin-right: .15rem; }
 .products-checklist { list-style: none; padding: 0; margin: 0; }
 .products-checklist li:last-child { margin-bottom: 0 !important; }
+/* Deleted-product "close manager" (blocks/products/pages.rs) -- ported from
+   origin/main's inline `style="..."` attributes during the main merge,
+   2026-09-02 (the guard `pages_carry_no_static_inline_styles` caught them). */
+.products-payment-link-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; }
+.products-payment-link-url { word-break: break-all; }
 .products-code-block { display: block; width: 100%; padding: .75rem .85rem; border: 1px solid var(--border-color); border-radius: 10px; background: var(--surface-2); overflow-wrap: anywhere; }
 .products-settings-note { margin-bottom: 1rem; }
 body:has(.products-tabs) .filter-bar { margin: 1rem 0; padding: .75rem; border: 1px solid var(--border-color); border-radius: 14px; background: var(--surface-1); }

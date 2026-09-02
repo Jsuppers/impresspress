@@ -7,7 +7,7 @@ use wafer_core::clients::{config, database as db};
 use wafer_run::{context::Context, OutputStream};
 
 use crate::{
-    blocks::products::{money, PRODUCTS_TABLE},
+    blocks::products::{money, repo},
     http::{err_bad_request, err_internal},
     util::RecordExt,
 };
@@ -147,21 +147,15 @@ pub(crate) async fn ensure_product_capacity(
     if limit == 0 {
         return Ok(());
     }
-    let count = db::count(
+    // The soft-delete filter used to be hand-written here; `repo::products::count`
+    // now appends it, so this only supplies the filter that narrows the live set.
+    let count = repo::products::count(
         ctx,
-        PRODUCTS_TABLE,
-        &[
-            Filter {
-                field: "created_by".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(user_id),
-            },
-            Filter {
-                field: "deleted_at".to_string(),
-                operator: FilterOp::IsNull,
-                value: serde_json::Value::Null,
-            },
-        ],
+        &[Filter {
+            field: "created_by".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(user_id),
+        }],
     )
     .await
     .map_err(|error| err_internal("Could not enforce seller product limit", error))?;

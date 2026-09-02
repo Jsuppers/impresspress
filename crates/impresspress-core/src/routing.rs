@@ -1534,6 +1534,106 @@ mod tests {
         assert!(crate::test_support::output_is_error(out, "PermissionDenied").await);
     }
 
+    /// Task 6 fix-round-1 finding: the products block's own `dispatch_admin`
+    /// tests (`handlers::handle_admin`) call the handler directly and never
+    /// go through `route_to_block`/`check_access`, so they prove the
+    /// restore handler's behaviour but not its authorization boundary —
+    /// nothing previously exercised the fact that
+    /// `POST /b/products/api/admin/products/{id}/restore` is
+    /// `AuthLevel::Admin` at the layer that actually enforces it. This test
+    /// drives that real path through the real router with the real
+    /// `ProductsBlock` `BlockInfo` (not a synthetic fixture — a typo'd path,
+    /// method, or `AuthLevel` in `blocks/products/mod.rs`'s declaration must
+    /// fail this test), the same way `pipeline.rs`'s
+    /// `discovery_tests::real_block_infos()` favors the real declaration
+    /// over a hand-rolled one for exactly this reason.
+    ///
+    /// This covers the DECLARED spelling only, which is not the whole
+    /// boundary: `ProductsBlock::handle` reaches its dispatch tables from
+    /// more than one wire path, and a tier proven on one spelling says
+    /// nothing about the others (that gap is how restore shipped reachable
+    /// at `Authenticated` through `/b/products/products/{id}/restore`).
+    /// The companion
+    /// `blocks::products::tests::handler_tests
+    /// ::restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it`
+    /// drives the same router against the REAL block for every spelling; it
+    /// lives there because it needs the products database harness.
+    #[tokio::test]
+    async fn restore_product_endpoint_is_admin_only_end_to_end() {
+        use wafer_run::Block;
+
+        use crate::{
+            blocks::products::ProductsBlock,
+            test_support::{admin_msg, auth_msg, TestContext},
+        };
+
+        // The real wire path — `/api/admin/` intact, exactly what
+        // `route_to_block` sees before `ProductsBlock::handle`'s own
+        // `/b/products/api/admin` -> `/admin/b/products` normalization
+        // (which happens after this gate, not before it).
+        let restore_path = "/b/products/api/admin/products/prod_1/restore";
+        let block_infos = vec![ProductsBlock::new().info()];
+
+        // 1. The endpoint resolves to Admin via the same resolver
+        //    `route_to_block` calls (routing.rs:519-524), against the real
+        //    declared `BlockInfo` — not a hand-rolled stand-in.
+        assert_eq!(
+            declared_access(
+                &block_infos,
+                "impresspress/products",
+                &admin_msg("create", restore_path),
+            ),
+            RouteAccess::Admin,
+            "the restore endpoint must resolve to Admin through declared_access, matching \
+             its `.auth(AuthLevel::Admin)` declaration in blocks/products/mod.rs"
+        );
+
+        let mut ctx = TestContext::new().await;
+        // A dispatch probe, not the real `ProductsBlock` handler: this test
+        // is only about the authorization boundary `route_to_block` enforces
+        // BEFORE `ctx.call_block` ever reaches the block, not about the
+        // restore handler's own behaviour (already covered by
+        // `restore_endpoint_returns_the_product_to_the_catalog` et al.).
+        ctx.register_block(
+            "impresspress/products",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+
+        // 2. A non-admin authenticated caller is rejected — the exact
+        //    boundary `dispatch_user`-based tests cannot see, since they
+        //    call `handlers::handle_user` directly and skip
+        //    `route_to_block`/`check_access` entirely.
+        let denied = route_to_block(
+            &ctx,
+            auth_msg("create", restore_path, "user_1"),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(denied, "PermissionDenied").await,
+            "a non-admin authenticated caller must be denied the restore endpoint"
+        );
+
+        // 3. An admin is admitted through to dispatch.
+        let admitted = route_to_block(
+            &ctx,
+            admin_msg("create", restore_path),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        let buf = admitted
+            .collect_buffered()
+            .await
+            .expect("an admin caller must be admitted to the restore endpoint");
+        assert_eq!(buf.body, b"DISPATCHED");
+    }
+
     #[test]
     fn router_declared_public_routes_precede_their_general_prefix() {
         // Most-specific-first ordering matters for the `starts_with` matcher

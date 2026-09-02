@@ -709,19 +709,25 @@ where
     // returns a plain 404 there so only the deploy endpoint is reachable.
     // Runs AFTER the `/_deploy/init` intercept above, so `impresspress deploy`'s
     // init gate still works on the preview host — that's the whole deploy flow.
-    // Consumers that legitimately serve on workers.dev opt out with the
-    // `IMPRESSPRESS_ALLOW_WORKERS_DEV=1` worker var. `wrangler dev` (localhost) is
-    // unaffected.
-    if host_is_workers_dev(&req)?
-        && env
+    //
+    // Consumers that legitimately serve on workers.dev — no custom domain —
+    // opt in with the `IMPRESSPRESS_ALLOW_WORKERS_DEV=1` worker var. The opt-in
+    // admits the worker's canonical host only; a *version preview* host stays
+    // locked regardless, because `impresspress deploy` proves an unpromoted
+    // candidate is unreachable before it promotes anything
+    // (`smoke_preview_lockdown`), and an opt-in that opened previews would
+    // make the atomic deploy impossible for exactly the consumers it exists
+    // for. `wrangler dev` (localhost) is unaffected.
+    if host_is_workers_dev(&req)? && !deploy_token_authorized(&req, &env) {
+        let allowed = env
             .var(ALLOW_WORKERS_DEV_KEY)
             .ok()
             .map(|v| v.to_string())
             .as_deref()
-            != Some("1")
-        && !deploy_token_authorized(&req, &env)
-    {
-        return worker::Response::error("not found", 404);
+            == Some("1");
+        if !allowed || host_is_version_preview(&req, &env)? {
+            return worker::Response::error("not found", 404);
+        }
     }
 
     // Serve `/b/static/` assets straight from the R2 bucket binding,
@@ -1542,6 +1548,45 @@ fn host_is_workers_dev(req: &worker::Request) -> worker::Result<bool> {
         .unwrap_or(false))
 }
 
+/// `true` when the request's host is a Workers *version preview* host
+/// (`<8 hex>-<worker>.<subdomain>.workers.dev`) for this version: the prefix
+/// is the first eight characters of the version id `CF_VERSION_METADATA`
+/// reports. Without that binding (local `wrangler dev`, a deploy without the
+/// binding) any eight-hex-plus-dash prefix counts — the conservative reading,
+/// since a canonical worker name is not normally eight hex characters and a
+/// dash.
+fn host_is_version_preview(req: &worker::Request, env: &worker::Env) -> worker::Result<bool> {
+    let host = req.url()?.host_str().unwrap_or("").to_ascii_lowercase();
+    // `.filter(|id| !id.is_empty())` matters, and matches what the two other
+    // readers of this binding already do: an empty id is `Some("")`, and
+    // `"".starts_with(prefix)` is false for every prefix, so the host would
+    // be judged NOT a version preview and the lockdown would fail OPEN — the
+    // opposite of the conservative fallback below. Dropping it to `None`
+    // falls back to the hex-prefix pattern, which locks.
+    let version_id = env
+        .get_binding::<worker::WorkerVersionMetadata>(VERSION_METADATA_BINDING)
+        .ok()
+        .map(|metadata| metadata.id())
+        .filter(|id| !id.is_empty());
+    Ok(is_version_preview_host(&host, version_id.as_deref()))
+}
+
+/// The pure half of [`host_is_version_preview`].
+fn is_version_preview_host(host: &str, version_id: Option<&str>) -> bool {
+    // `split` always yields at least one item (including for ""), so this is
+    // total rather than a fallible lookup.
+    let first_label = host.split('.').next().unwrap_or(host);
+    let Some((prefix, _worker)) = first_label.split_once('-') else {
+        return false;
+    };
+    let looks_like_preview_prefix =
+        prefix.len() == 8 && prefix.bytes().all(|b| b.is_ascii_hexdigit());
+    match version_id {
+        Some(id) => looks_like_preview_prefix && id.to_ascii_lowercase().starts_with(prefix),
+        None => looks_like_preview_prefix,
+    }
+}
+
 /// Constant-time deploy-token authorization shared by control-plane endpoints
 /// and the workers.dev preview bypass. The bypass applies to any normal route
 /// only when the exact secret is supplied; unauthenticated preview traffic
@@ -1819,6 +1864,76 @@ mod request_config_tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
+
+    /// The workers.dev opt-in must never open a version preview: the atomic
+    /// deploy proves an unpromoted candidate is unreachable before promoting.
+    #[wasm_bindgen_test]
+    fn version_preview_host_is_recognised_by_its_own_version_prefix() {
+        let id = Some("c89ac716-7f68-437c-8484-640b5b9f2b42");
+        assert!(is_version_preview_host(
+            "c89ac716-impresspress-webmcp-demo.jorissuppers.workers.dev",
+            id
+        ));
+        assert!(!is_version_preview_host(
+            "impresspress-webmcp-demo.jorissuppers.workers.dev",
+            id
+        ));
+        // Another version's preview prefix is not this version's.
+        assert!(!is_version_preview_host(
+            "30fbdf19-impresspress-webmcp-demo.jorissuppers.workers.dev",
+            id
+        ));
+        // A worker whose name happens to start with eight hex characters and
+        // a dash is mistaken for a preview only when no version id is known.
+        assert!(!is_version_preview_host(
+            "deadbeef-shop.example.workers.dev",
+            id
+        ));
+        assert!(is_version_preview_host(
+            "deadbeef-shop.example.workers.dev",
+            None
+        ));
+    }
+
+    /// The lockdown must fail CLOSED when the version id is unusable.
+    ///
+    /// `CF_VERSION_METADATA` can be present and yield an empty id (wrangler
+    /// dev, a hand-written `[version_metadata]` on an unversioned deploy).
+    /// That reaches this function as `Some("")`, and `"".starts_with(prefix)`
+    /// is false for every prefix — so before the `.filter(|id| !id.is_empty())`
+    /// on the caller, an opt-in consumer served the full app anonymously on
+    /// its unpromoted preview URL.
+    #[wasm_bindgen_test]
+    fn an_unusable_version_id_still_locks_the_preview_host() {
+        // What the caller now passes for an empty id.
+        assert!(is_version_preview_host(
+            "c89ac716-impresspress-webmcp-demo.jorissuppers.workers.dev",
+            None
+        ));
+        // And the shape that used to slip through, asserted directly.
+        assert!(
+            !is_version_preview_host(
+                "c89ac716-impresspress-webmcp-demo.jorissuppers.workers.dev",
+                Some("")
+            ),
+            "an empty id cannot match any prefix — the caller must not pass it"
+        );
+        // The canonical host stays open on both.
+        assert!(!is_version_preview_host(
+            "impresspress-webmcp-demo.jorissuppers.workers.dev",
+            None
+        ));
+    }
+
+    /// The function requires a pre-lowercased host — its only caller
+    /// lowercases, and that invariant is invisible from the signature.
+    #[wasm_bindgen_test]
+    fn version_preview_matching_is_case_insensitive_on_the_id() {
+        assert!(is_version_preview_host(
+            "c89ac716-worker.example.workers.dev",
+            Some("C89AC716-7F68-437C-8484-640B5B9F2B42")
+        ));
+    }
 
     #[wasm_bindgen_test]
     fn verified_identity_cache_loads_once_and_invalidates_on_identity_change() {

@@ -156,8 +156,13 @@
 /* Square mark only -- the long dark-ink wordmark PNG was drawn for the old
    white sidebar and is illegible on navy, so the brand row never renders it
    (see `ui::sidebar::sidebar_grouped`). This icon shows in both the
-   expanded (icon + white text) and collapsed (icon only) states. */
-.sidebar__brand-icon { display: block; height: 40px; width: 40px; object-fit: contain; flex-shrink: 0; }
+   expanded (icon + white text) and collapsed (icon only) states.
+   32px -- not 40px -- matches origin/main's sizing (ported during the main
+   merge, 2026-09-02): the built-in mark is real pixel art (32/64 art-pixel
+   renditions rendered via `templates::brand_icon`) and must only ever be
+   drawn at a whole multiple of its native cell size, or the nearest-
+   neighbour scaling in `.pixel-art` (styles/base.css) misaligns. */
+.sidebar__brand-icon { display: block; height: 32px; width: 32px; object-fit: contain; flex-shrink: 0; }
 .sidebar__brand-name { font-size: var(--text-lg); font-weight: 600; color: #ffffff; }
 
 /* Maps to the brief's `.sidebar__footer` rail -- the sidebar has no

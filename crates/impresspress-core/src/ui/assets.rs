@@ -115,11 +115,20 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
         // Square Impresspress mark used as the sidebar/login icon. Bundled
         // locally so the admin renders correctly without internet (the
         // previous default pointed at `https://impresspress.org/images/logo.png`
-        // which 404s offline).
+        // which 404s offline). Real pixel art -- 32x32 art-pixels, generated
+        // by the `site` repo's `npm run images` (`brand/logo-32.png`).
+        // Templates only ever scale it by whole factors (`.pixel-art`), so
+        // its native size is part of the contract (see the tests below).
         "impresspress-logo.png" => include_bytes!("assets/impresspress-logo.png"),
-        // Impresspress wordmark/long logo — used in the sidebar brand and
-        // login splash.
-        "impresspress-logo-long.png" => include_bytes!("assets/impresspress-logo-long.png"),
+        // The same mark at 64x64 art-pixels (`brand/logo-64.png`) -- served
+        // as the `2x` `srcset` candidate so high-DPI screens get one device
+        // pixel per art-pixel instead of a nearest-neighbour blow-up of the
+        // 32-cell mark. There is no raster wordmark: brand text is rendered
+        // as text next to the mark (see `templates::brand_lockup`) -- the
+        // old `impresspress-logo-long.png` wordmark was dark-ink artwork
+        // illegible on the navy chrome and has been removed outright (see
+        // `config_vars::REMOVED_BUILTIN_WORDMARK_URL_PREFIX`).
+        "impresspress-logo-2x.png" => include_bytes!("assets/impresspress-logo-2x.png"),
         // Impresspress favicon — bundled so every deployment ships its own
         // `<link rel="icon">` target without depending on a per-deployment
         // external URL or the implicit browser fallback to `/favicon.ico`
@@ -171,6 +180,12 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
 /// CSS variables (email inline styles). Must match `--primary-color` in
 /// `styles/tokens.css` — the `brand_accent_matches_tokens_css` test pins the
 /// two together so they can't drift.
+///
+/// Kept at this branch's own value (not origin/main's `#f0480f`) — this is
+/// the redesign's chosen accent, already wired through `tokens.css` and the
+/// value-based contrast guard (`text_or_background_in_primary_danger_family_
+/// meets_wcag_aa`); main's value was mid-fix on a documented WCAG-AA
+/// shortfall this branch already resolved differently.
 pub const BRAND_ACCENT_HEX: &str = "#fd3534";
 
 /// Square logo URL with content hash, e.g. `/b/static/impresspress-logo-a1b2c3d4.png`.
@@ -178,9 +193,12 @@ pub fn logo_icon_url() -> String {
     url("impresspress-logo.png")
 }
 
-/// Long/wordmark logo URL with content hash, e.g. `/b/static/impresspress-logo-long-a1b2c3d4.png`.
-pub fn logo_long_url() -> String {
-    url("impresspress-logo-long.png")
+/// 2x square logo URL with content hash, e.g. `/b/static/impresspress-logo-2x-a1b2c3d4.png`.
+/// Retina candidate for [`templates::brand_icon`]'s `<picture>` `srcset` —
+/// one device pixel per art-pixel instead of a nearest-neighbour blow-up of
+/// the 32-cell mark.
+pub fn logo_icon_2x_url() -> String {
+    url("impresspress-logo-2x.png")
 }
 
 /// Favicon URL with content hash, e.g. `/b/static/favicon-a1b2c3d4.ico`.
@@ -491,6 +509,74 @@ mod tests {
             "BRAND_ACCENT_HEX ({}) does not match --primary-color in tokens.css",
             super::BRAND_ACCENT_HEX
         );
+    }
+
+    /// PNG width/height from the IHDR chunk (big-endian u32 at bytes 16/20).
+    #[cfg(feature = "embed-assets")]
+    fn png_size(png: &[u8]) -> (u32, u32) {
+        assert_eq!(&png[1..4], b"PNG", "not a PNG");
+        let be = |i: usize| u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]);
+        (be(16), be(20))
+    }
+
+    // The brand art is real pixel art (generated in the `site` repo's
+    // `brand/` kit) and the templates scale it only by whole factors, so
+    // the native sizes are part of the contract. Ported from origin/main
+    // during the main merge -- 2026-09-02 -- adapted to call `bytes()`
+    // (the manifest's single embed point) rather than main's dedicated
+    // per-asset accessors, which this branch's detachable-assets refactor
+    // superseded.
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn logo_icon_png_is_the_32_cell_mark() {
+        assert_eq!(
+            png_size(super::bytes("impresspress-logo.png").unwrap()),
+            (32, 32)
+        );
+    }
+
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn logo_icon_2x_png_is_the_64_cell_mark() {
+        assert_eq!(
+            png_size(super::bytes("impresspress-logo-2x.png").unwrap()),
+            (64, 64)
+        );
+    }
+
+    #[test]
+    fn logo_icon_2x_url_has_content_hash() {
+        let url = super::logo_icon_2x_url();
+        assert!(url.starts_with("/b/static/impresspress-logo-2x-"), "{url}");
+        assert!(url.ends_with(".png"));
+        let hash = url
+            .trim_start_matches("/b/static/impresspress-logo-2x-")
+            .trim_end_matches(".png");
+        assert_eq!(hash.len(), 8, "expected 8-char short hash, got: {hash}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn favicon_ico_frames_are_16_32_48_at_native_size() {
+        let ico = super::bytes("favicon.ico").unwrap();
+        assert_eq!(u16::from_le_bytes([ico[2], ico[3]]), 1, "ICO type");
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        let sizes: Vec<u8> = (0..count).map(|i| ico[6 + i * 16]).collect();
+        assert_eq!(sizes, vec![16, 32, 48]);
+        for (i, &size) in sizes.iter().enumerate() {
+            let e = 6 + i * 16;
+            let len =
+                u32::from_le_bytes([ico[e + 8], ico[e + 9], ico[e + 10], ico[e + 11]]) as usize;
+            let off =
+                u32::from_le_bytes([ico[e + 12], ico[e + 13], ico[e + 14], ico[e + 15]]) as usize;
+            let frame = &ico[off..off + len];
+            assert_eq!(
+                png_size(frame),
+                (u32::from(size), u32::from(size)),
+                "frame {i} is a 1:1 PNG"
+            );
+        }
     }
 
     #[test]
@@ -1226,7 +1312,7 @@ mod tests {
         // ...and the assets that are never feature-gated must always be there.
         for logical in ["app.css", "htmx.min.js", "webmcp.js", "favicon.ico",
                         "itim-latin.woff2", "itim-latin-ext.woff2",
-                        "impresspress-logo.png", "impresspress-logo-long.png"] {
+                        "impresspress-logo.png", "impresspress-logo-2x.png"] {
             assert!(super::bytes(logical).is_some(), "core asset missing: {logical}");
         }
     }

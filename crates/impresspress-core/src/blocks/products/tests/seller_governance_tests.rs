@@ -5,7 +5,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{AuthLevel, Block, ErrorCode, OutputStream};
 
 use super::{
-    super::{contracts::OfferStatus, repo, ProductsBlock, PRODUCTS_TABLE},
+    super::{contracts::OfferStatus, repo, ProductsBlock},
     harness::{
         admin_create_msg, admin_get_msg, create_msg, ctx_with, dispatch_admin, dispatch_user,
         get_msg, output_is_error, output_to_html, output_to_json, seed, update_msg,
@@ -109,19 +109,19 @@ async fn admin_moderation_approves_rejects_and_resubmits_only_ready_sellers() {
 
     let approved_id = create_seller_product(&test_ctx, "maker_ready", "Approved print").await;
     let pending = submit_product(&test_ctx, "maker_ready", &approved_id).await;
-    assert_eq!(pending["data"]["status"], "pending_review");
-    assert_eq!(pending["data"]["approval_status"], "pending");
+    assert_eq!(pending["status"], "pending_review");
+    assert_eq!(pending["approval_status"], "pending");
 
     let path = format!("/admin/b/products/products/{approved_id}/approve");
     let (msg, input) = admin_create_msg(&path, json!({}));
     let approved = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(approved["data"]["status"], "active");
-    assert_eq!(approved["data"]["approval_status"], "approved");
-    assert!(approved["data"]["published_at"].as_str().is_some());
+    assert_eq!(approved["status"], "active");
+    assert_eq!(approved["approval_status"], "approved");
+    assert!(approved["published_at"].as_str().is_some());
 
     let (msg, input) = admin_create_msg(&path, json!({}));
     let repeated = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(repeated["data"]["status"], "active");
+    assert_eq!(repeated["status"], "active");
 
     let rejected_id = create_seller_product(&test_ctx, "maker_ready", "Needs changes").await;
     submit_product(&test_ctx, "maker_ready", &rejected_id).await;
@@ -130,11 +130,11 @@ async fn admin_moderation_approves_rejects_and_resubmits_only_ready_sellers() {
         json!({}),
     );
     let rejected = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(rejected["data"]["status"], "draft");
-    assert_eq!(rejected["data"]["approval_status"], "rejected");
+    assert_eq!(rejected["status"], "draft");
+    assert_eq!(rejected["approval_status"], "rejected");
     let resubmitted = submit_product(&test_ctx, "maker_ready", &rejected_id).await;
-    assert_eq!(resubmitted["data"]["status"], "pending_review");
-    assert_eq!(resubmitted["data"]["approval_status"], "pending");
+    assert_eq!(resubmitted["status"], "pending_review");
+    assert_eq!(resubmitted["approval_status"], "pending");
 
     seed_seller(&test_ctx, "seller_not_ready", "maker_not_ready", false).await;
     let blocked_id = create_seller_product(&test_ctx, "maker_not_ready", "Blocked print").await;
@@ -150,7 +150,7 @@ async fn admin_moderation_approves_rejects_and_resubmits_only_ready_sellers() {
         )
         .await
     );
-    let unchanged = db::get(&test_ctx, PRODUCTS_TABLE, &blocked_id)
+    let unchanged = db::get(&test_ctx, repo::products::TABLE, &blocked_id)
         .await
         .expect("blocked product");
     assert_eq!(unchanged.data["status"], "pending_review");
@@ -169,7 +169,7 @@ async fn suspension_archives_catalog_blocks_mutations_and_reactivation_stays_dra
     seed_seller(&test_ctx, "seller_governed", "maker_governed", true).await;
     let product_id = create_seller_product(&test_ctx, "maker_governed", "Governed print").await;
     let published = submit_product(&test_ctx, "maker_governed", &product_id).await;
-    assert_eq!(published["data"]["status"], "active");
+    assert_eq!(published["status"], "active");
 
     let offers_path = format!("/b/products/products/{product_id}/offers");
     let (msg, input) = create_msg(&offers_path, "maker_governed", fixed_offer());
@@ -199,7 +199,7 @@ async fn suspension_archives_catalog_blocks_mutations_and_reactivation_stays_dra
             .is_some()
     );
 
-    let product = db::get(&test_ctx, PRODUCTS_TABLE, &product_id)
+    let product = db::get(&test_ctx, repo::products::TABLE, &product_id)
         .await
         .expect("governed product");
     assert_eq!(product.data["status"], "archived");
@@ -253,7 +253,7 @@ async fn suspension_archives_catalog_blocks_mutations_and_reactivation_stays_dra
             .data["suspended_at"]
             .is_null()
     );
-    let product = db::get(&test_ctx, PRODUCTS_TABLE, &product_id)
+    let product = db::get(&test_ctx, repo::products::TABLE, &product_id)
         .await
         .expect("reactivated product");
     assert_eq!(product.data["status"], "draft");
@@ -308,6 +308,61 @@ async fn suspended_seller_cannot_issue_refunds() {
             ErrorCode::PermissionDenied,
         )
         .await
+    );
+}
+
+/// Restoring a product returns an active, approved listing to the public
+/// catalog — a mutation, and exactly the kind a platform suspension exists to
+/// stop. It is the mirror of the delete the same seller could not issue while
+/// suspended, so it belongs on `requires_unsuspended_seller` alongside it;
+/// leaving it off would have let a suspended seller relist while every other
+/// door was shut.
+///
+/// An administrator can still restore on their behalf through
+/// `/b/products/api/admin/products/{id}/restore`, which is not seller-gated.
+#[tokio::test]
+async fn suspended_seller_cannot_restore_their_own_deleted_product() {
+    let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+    seed_seller(&test_ctx, "seller_restore_gate", "maker_restore_gate", true).await;
+    let product_id = create_seller_product(&test_ctx, "maker_restore_gate", "Gated print").await;
+
+    let (msg, input) = create_msg(
+        &format!("/b/products/products/{product_id}/restore"),
+        "maker_restore_gate",
+        json!({}),
+    );
+    // Positive control BEFORE the suspension, so the refusal below is about
+    // the suspension and not about the route, the id, or ownership. The
+    // product is live, so this is the "not deleted" 404, not a permission
+    // error — a different code from the one asserted after suspension.
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::NotFound,
+        )
+        .await,
+        "an unsuspended owner must get past the suspension gate"
+    );
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/sellers/seller_restore_gate/suspend",
+        json!({}),
+    );
+    let suspended = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(suspended["status"], "suspended");
+
+    let (msg, input) = create_msg(
+        &format!("/b/products/products/{product_id}/restore"),
+        "maker_restore_gate",
+        json!({}),
+    );
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::PermissionDenied,
+        )
+        .await,
+        "a suspended seller must not restore a product back into the catalog"
     );
 }
 
@@ -398,7 +453,7 @@ async fn activation_validates_merged_values_not_stale_record() {
     pd.insert("product_template_id".to_string(), json!("simple_product"));
     pd.insert("currency".to_string(), json!("USD"));
     pd.insert("status".to_string(), json!("draft"));
-    seed(&test_ctx, PRODUCTS_TABLE, "prod_legacy_ccy", pd).await;
+    seed(&test_ctx, repo::products::TABLE, "prod_legacy_ccy", pd).await;
 
     let (msg, input) = update_msg(
         "/b/products/products/prod_legacy_ccy",
@@ -406,8 +461,8 @@ async fn activation_validates_merged_values_not_stale_record() {
         json!({"currency": "NZD", "status": "active"}),
     );
     let body = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(body["data"]["currency"], "NZD");
-    assert_eq!(body["data"]["status"], "active");
+    assert_eq!(body["currency"], "NZD");
+    assert_eq!(body["status"], "active");
 
     // Activating while leaving the stale value untouched must still fail.
     let mut pd = HashMap::new();
@@ -416,7 +471,7 @@ async fn activation_validates_merged_values_not_stale_record() {
     pd.insert("product_template_id".to_string(), json!("simple_product"));
     pd.insert("currency".to_string(), json!("USD"));
     pd.insert("status".to_string(), json!("draft"));
-    seed(&test_ctx, PRODUCTS_TABLE, "prod_stale_ccy", pd).await;
+    seed(&test_ctx, repo::products::TABLE, "prod_stale_ccy", pd).await;
 
     let (msg, input) = update_msg(
         "/b/products/products/prod_stale_ccy",
@@ -429,6 +484,191 @@ async fn activation_validates_merged_values_not_stale_record() {
         "{}",
         error.message
     );
+}
+
+/// The per-seller product cap counts through `repo::products::count`, which
+/// is live-only. So a create body that carries `deleted_at` would land a row
+/// the cap cannot see, and the seller would keep their slot free — unbounded
+/// creates against a cap of one. `deleted_at` belongs to the delete/restore
+/// doors, never to a request body, so create must refuse it exactly as both
+/// update handlers do.
+#[tokio::test]
+async fn a_seller_cannot_outrun_the_product_cap_by_supplying_deleted_at() {
+    let test_ctx = ctx_with(&[
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+        ("IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS", "1"),
+    ])
+    .await;
+
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "cap_dodger",
+        json!({
+            "name": "Invisible to the cap",
+            "product_template_id": "simple_product",
+            "currency": "USD",
+            "deleted_at": "2020-01-01T00:00:00Z"
+        }),
+    );
+    let error = terminal_error(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains("deleted_at"),
+        "the refusal must name the field the caller may not set: {}",
+        error.message
+    );
+    assert!(
+        repo::products::list_all_including_deleted(&test_ctx, vec![])
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused create must not land a row at all, visible to the cap or not"
+    );
+
+    // The seller's one slot is used by an ordinary create, so a second create
+    // is refused. It would not be if a `deleted_at` body could land a row the
+    // live-only count cannot see.
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "cap_dodger",
+        json!({
+            "name": "Uses the slot",
+            "product_template_id": "simple_product",
+            "currency": "USD"
+        }),
+    );
+    assert!(
+        output_to_json(dispatch_user(&test_ctx, msg, input).await).await["id"]
+            .as_str()
+            .is_some()
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "cap_dodger",
+        json!({
+            "name": "Over the cap",
+            "product_template_id": "simple_product",
+            "currency": "USD"
+        }),
+    );
+    let error = terminal_error(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains("product limit reached (1)"),
+        "{}",
+        error.message
+    );
+}
+
+/// `deleted_at` carries a column invariant (see `repo::products`): SQL NULL
+/// for a live product, an RFC3339 stamp for a deleted one, never the empty
+/// string. `''` is the value that would split "live" into two disagreeing
+/// answers — SQL reads `'' IS NOT NULL` as deleted, a string-emptiness check
+/// reads it as live. Nothing a caller can send may produce it, on any tier or
+/// verb.
+#[tokio::test]
+async fn no_handler_path_can_write_an_empty_deleted_at() {
+    let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+
+    async fn assert_null(test_ctx: &crate::test_support::TestContext, id: &str, via: &str) {
+        let stored = db::get(test_ctx, repo::products::TABLE, id)
+            .await
+            .unwrap_or_else(|e| panic!("row {id} exists after {via}: {}", e.message));
+        assert!(
+            matches!(stored.data.get("deleted_at"), None | Some(Value::Null)),
+            "{via} wrote deleted_at = {:?}; the column is NULL or a timestamp, never anything else",
+            stored.data.get("deleted_at")
+        );
+    }
+
+    let blank = json!({
+        "name": "Blank stamp",
+        "product_template_id": "simple_product",
+        "currency": "USD",
+        "deleted_at": ""
+    });
+
+    // Two ordinary products for the update paths to aim at. Neither create
+    // body carries `deleted_at`, so both land.
+    let clean = json!({
+        "name": "Clean",
+        "product_template_id": "simple_product",
+        "currency": "USD"
+    });
+    let (msg, input) = admin_create_msg("/admin/b/products/products", clean.clone());
+    let admin_id = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await["id"]
+        .as_str()
+        .expect("admin create")
+        .to_string();
+    let (msg, input) = create_msg("/b/products/products", "blank_seller", clean);
+    let user_id = output_to_json(dispatch_user(&test_ctx, msg, input).await).await["id"]
+        .as_str()
+        .expect("user create")
+        .to_string();
+
+    // All four create/update handlers refuse a body naming `deleted_at`, so
+    // the column keeps its two-value invariant on every one of them.
+    let (msg, input) = admin_create_msg("/admin/b/products/products", blank.clone());
+    assert_eq!(
+        terminal_error(dispatch_admin(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "admin create must refuse a body naming deleted_at"
+    );
+
+    let (msg, input) = update_msg(
+        &format!("/admin/b/products/products/{admin_id}"),
+        "admin_1",
+        json!({"deleted_at": ""}),
+    );
+    let mut msg = msg;
+    msg.set_meta("auth.user_roles", "admin");
+    assert_eq!(
+        terminal_error(dispatch_admin(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "admin update must refuse a body naming deleted_at"
+    );
+    assert_null(&test_ctx, &admin_id, "admin update").await;
+
+    let (msg, input) = create_msg("/b/products/products", "blank_seller", blank);
+    assert_eq!(
+        terminal_error(dispatch_user(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "user create must refuse a body naming deleted_at"
+    );
+
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{user_id}"),
+        "blank_seller",
+        json!({"deleted_at": ""}),
+    );
+    assert_eq!(
+        terminal_error(dispatch_user(&test_ctx, msg, input).await)
+            .await
+            .code,
+        ErrorCode::InvalidArgument,
+        "user update must refuse a body naming deleted_at"
+    );
+    assert_null(&test_ctx, &user_id, "user update").await;
+
+    // And nothing a refused create left behind: only the two clean rows
+    // exist, both with a NULL stamp.
+    let rows = repo::products::list_all_including_deleted(&test_ctx, vec![])
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 2, "a refused create must not land a row");
+    for row in rows {
+        assert!(matches!(
+            row.data.get("deleted_at"),
+            None | Some(Value::Null)
+        ));
+    }
 }
 
 #[tokio::test]

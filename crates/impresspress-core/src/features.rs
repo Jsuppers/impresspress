@@ -332,14 +332,10 @@ type RecordList = wafer_core::interfaces::database::service::RecordList;
 async fn read_block_settings_records(
     db: &std::sync::Arc<DatabaseService>,
 ) -> Result<RecordList, DatabaseError> {
-    use wafer_block::db::ListOptions;
-
-    let opts = ListOptions {
-        offset: 0,
-        limit: 10_000,
-        skip_count: true,
-        ..Default::default()
-    };
+    // Built by `cache_key` rather than open-coded: this shape is what
+    // `read_key` recognizes as the cacheable full-table read, so a local
+    // literal here could drift out of cache coverage silently.
+    let opts = crate::cache_key::full_table_list_opts();
     db.list(crate::admin_schema::BLOCK_SETTINGS_TABLE, &opts)
         .await
         .map_err(|e| {

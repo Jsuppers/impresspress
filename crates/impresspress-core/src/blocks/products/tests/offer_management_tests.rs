@@ -6,8 +6,8 @@ use wafer_run::{AuthLevel, Block, ErrorCode};
 
 use super::{
     super::{
-        contracts::{OfferDefinitionRequest, OfferStatus},
-        repo, ProductsBlock, PRODUCTS_TABLE,
+        contracts::{OfferDefinitionRequest, OfferStatus, PricingPreviewRequest},
+        offer_pricing, repo, ProductsBlock,
     },
     harness::{
         admin_create_msg, admin_get_msg, create_msg, ctx, ctx_with, delete_msg, dispatch_admin,
@@ -72,7 +72,7 @@ fn definition_request(unit_amount_minor: i64) -> OfferDefinitionRequest {
 async fn seed_product(test_ctx: &crate::test_support::TestContext, id: &str, owner_id: &str) {
     seed(
         test_ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         id,
         HashMap::from([
             ("name".to_string(), json!("Print shop")),
@@ -463,7 +463,7 @@ async fn storefront_detail_exposes_only_active_safe_configuration() {
     let test_ctx = ctx().await;
     seed(
         &test_ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         "product_storefront",
         HashMap::from([
             ("name".to_string(), json!("Public print shop")),
@@ -515,7 +515,7 @@ async fn storefront_detail_exposes_only_active_safe_configuration() {
 
     seed(
         &test_ctx,
-        PRODUCTS_TABLE,
+        repo::products::TABLE,
         "pending_storefront",
         HashMap::from([
             ("name".to_string(), json!("Pending")),
@@ -583,6 +583,9 @@ async fn seller_offer_routes_enforce_feature_gate_and_product_ownership() {
 #[tokio::test]
 async fn seller_product_publication_requires_moderation_and_protects_ownership() {
     let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+
+    // A create body reaching for ownership or approval state is refused
+    // outright — no product is created at all.
     let (msg, input) = create_msg(
         "/b/products/products",
         "seller_a",
@@ -593,14 +596,37 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
             "approval_status": "approved"
         }),
     );
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await
+    );
+    assert!(
+        repo::products::list_all(&test_ctx, vec![])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused create must not have landed a row"
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "seller_a",
+        json!({"name": "Seller print", "status": "active"}),
+    );
     let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(created["data"]["status"], "draft");
-    assert_eq!(created["data"]["approval_status"], "draft");
-    assert_eq!(created["data"]["owner_kind"], "user");
-    assert_eq!(created["data"]["owner_id"], "seller_a");
-    assert_eq!(created["data"]["created_by"], "seller_a");
+    assert_eq!(created["status"], "draft");
+    assert_eq!(created["approval_status"], "draft");
+    assert_eq!(created["owner_kind"], "user");
+    assert_eq!(created["owner_id"], "seller_a");
+    assert_eq!(created["created_by"], "seller_a");
 
+    // Same on the update side: the publication request is refused whole, so
+    // the product does not enter review as a side effect of a body that also
+    // tried to re-parent it.
     let (msg, input) = update_msg(
         &format!("/b/products/products/{product_id}"),
         "seller_a",
@@ -611,12 +637,28 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
             "approval_status": "approved"
         }),
     );
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await
+    );
+    let untouched = repo::products::get(&test_ctx, &product_id).await.unwrap();
+    assert_eq!(untouched.str_field("status"), "draft");
+    assert_eq!(untouched.str_field("owner_id"), "seller_a");
+
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{product_id}"),
+        "seller_a",
+        json!({"status": "active"}),
+    );
     let submitted = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(submitted["data"]["status"], "pending_review");
-    assert_eq!(submitted["data"]["approval_status"], "pending");
-    assert_eq!(submitted["data"]["owner_id"], "seller_a");
-    assert_eq!(submitted["data"]["created_by"], "seller_a");
-    assert!(submitted["data"]["submitted_at"].as_str().is_some());
+    assert_eq!(submitted["status"], "pending_review");
+    assert_eq!(submitted["approval_status"], "pending");
+    assert_eq!(submitted["owner_id"], "seller_a");
+    assert_eq!(submitted["created_by"], "seller_a");
+    assert!(submitted["submitted_at"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -636,7 +678,7 @@ async fn seller_product_can_publish_directly_when_moderation_is_disabled() {
     );
     let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(created["data"]["approval_status"], "approved");
+    assert_eq!(created["approval_status"], "approved");
 
     let (msg, input) = update_msg(
         &format!("/b/products/products/{product_id}"),
@@ -644,9 +686,9 @@ async fn seller_product_can_publish_directly_when_moderation_is_disabled() {
         json!({"status": "active"}),
     );
     let published = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(published["data"]["status"], "active");
-    assert_eq!(published["data"]["approval_status"], "approved");
-    assert!(published["data"]["published_at"].as_str().is_some());
+    assert_eq!(published["status"], "active");
+    assert_eq!(published["approval_status"], "approved");
+    assert!(published["published_at"].as_str().is_some());
 }
 
 #[test]
@@ -696,5 +738,236 @@ fn offer_routes_declare_admin_and_seller_auth_tiers() {
         crate::endpoint_match::endpoint_auth(&info.endpoints, "create", "/b/products/checkout"),
         Some(AuthLevel::Public),
         "typed offers support guest checkout from static storefronts"
+    );
+}
+
+// ============================================================
+// A soft-deleted product's money surface must still be closable
+// ============================================================
+
+/// Soft delete touches nothing in Stripe: a deleted product's Prices and
+/// Payment Links stay live in the connected account and keep taking money,
+/// and the delete handler performs no archival of its own. Reading the
+/// product live-only in `verify_product` therefore left no door at all — an
+/// admin could not archive the offers or deactivate the links of a product
+/// they had just deleted, and every payment through a still-live link then
+/// arrived at a reconciliation for a product the catalog no longer showed.
+///
+/// Restoring the product first is not the answer: shutting down a money
+/// surface must not require putting the listing back in the public catalog.
+#[tokio::test]
+async fn an_admin_can_close_a_soft_deleted_products_money_surface() {
+    let test_ctx = ctx().await;
+    seed_product(&test_ctx, "product_gone", "").await;
+    let collection = "/admin/b/products/products/product_gone/offers";
+
+    let (msg, input) = admin_create_msg(collection, offer_definition(25));
+    let created = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let offer_id = created["offer"]["id"].as_str().unwrap().to_string();
+    let (msg, input) = admin_create_msg(&format!("{collection}/{offer_id}/publish"), json!({}));
+    output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+
+    // A Payment Link that has not reached Stripe yet, so deactivating it is
+    // a purely local write and the test needs no Stripe stand-in.
+    let managed = repo::offers::get_managed(&test_ctx, &offer_id)
+        .await
+        .unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: [("pages".to_string(), json!(2))].into_iter().collect(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let link_id = repo::payment_links::create_pending(
+        &test_ctx, &offer_id, "", "", "", false, "close-me", &preview, 0,
+    )
+    .await
+    .unwrap()
+    .managed
+    .id;
+
+    repo::products::soft_delete(&test_ctx, "product_gone")
+        .await
+        .expect("soft delete");
+
+    // Discovery: an admin has to be able to see what there is to close.
+    let (msg, input) = admin_get_msg(collection);
+    let listed = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(
+        listed["offers"].as_array().map(Vec::len),
+        Some(1),
+        "the deleted product's offers must still list: {listed}"
+    );
+    let links_url = format!("{collection}/{offer_id}/payment-links");
+    let (msg, input) = admin_get_msg(&links_url);
+    let links = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(
+        links["payment_links"].as_array().map(Vec::len),
+        Some(1),
+        "the deleted product's Payment Links must still list: {links}"
+    );
+
+    // Closing: deactivate the link, then archive the offer.
+    let (mut msg, input) = delete_msg(&format!("{links_url}/{link_id}"), "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let deactivated = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(
+        deactivated["active"], false,
+        "the Payment Link must deactivate: {deactivated}"
+    );
+
+    let (mut msg, input) = delete_msg(&format!("{collection}/{offer_id}"), "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let archived = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(
+        archived["status"], "archived",
+        "the offer must archive: {archived}"
+    );
+
+    // None of that resurrects the product.
+    assert!(repo::products::get(&test_ctx, "product_gone")
+        .await
+        .is_err());
+}
+
+/// The same for a seller closing down their own deleted product, which is
+/// the tier that actually owns the connected account the links charge into.
+#[tokio::test]
+async fn a_seller_can_close_their_soft_deleted_products_money_surface() {
+    let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+    seed_product(&test_ctx, "seller_gone", "seller_a").await;
+    let collection = "/b/products/products/seller_gone/offers";
+
+    let (msg, input) = create_msg(collection, "seller_a", offer_definition(15));
+    let created = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let offer_id = created["offer"]["id"].as_str().unwrap().to_string();
+    let (msg, input) = create_msg(
+        &format!("{collection}/{offer_id}/publish"),
+        "seller_a",
+        json!({}),
+    );
+    output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+
+    repo::products::soft_delete(&test_ctx, "seller_gone")
+        .await
+        .expect("soft delete");
+
+    let (msg, input) = request_msg("retrieve", collection, "seller_a", json!({}));
+    let listed = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(listed["offers"].as_array().map(Vec::len), Some(1));
+
+    let (msg, input) = delete_msg(&format!("{collection}/{offer_id}"), "seller_a");
+    let archived = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    assert_eq!(archived["status"], "archived", "{archived}");
+
+    // Someone else's deleted product is still nobody else's business.
+    let (msg, input) = delete_msg(&format!("{collection}/{offer_id}"), "seller_b");
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await
+    );
+}
+
+/// The widening is exactly "close what is already open". Anything that
+/// creates, edits, publishes, syncs or opens a new money surface on a deleted
+/// product stays refused — restore is the door for that.
+#[tokio::test]
+async fn a_soft_deleted_product_still_refuses_every_offer_operation_that_opens_something() {
+    let test_ctx = ctx().await;
+    seed_product(&test_ctx, "product_shut", "").await;
+    let collection = "/admin/b/products/products/product_shut/offers";
+
+    let (msg, input) = admin_create_msg(collection, offer_definition(25));
+    let created = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let offer_id = created["offer"]["id"].as_str().unwrap().to_string();
+
+    repo::products::soft_delete(&test_ctx, "product_shut")
+        .await
+        .expect("soft delete");
+
+    // create
+    let (msg, input) = admin_create_msg(collection, offer_definition(30));
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "a new offer on a deleted product"
+    );
+    // publish
+    let (msg, input) = admin_create_msg(&format!("{collection}/{offer_id}/publish"), json!({}));
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "publishing an offer on a deleted product"
+    );
+    // update
+    let (mut msg, input) = update_msg(
+        &format!("{collection}/{offer_id}"),
+        "admin_1",
+        offer_definition(31),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "editing an offer on a deleted product"
+    );
+    // duplicate
+    let (msg, input) = admin_create_msg(&format!("{collection}/{offer_id}/duplicate"), json!({}));
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "duplicating an offer on a deleted product"
+    );
+    // sync to Stripe
+    let (msg, input) = admin_create_msg(&format!("{collection}/{offer_id}/sync"), json!({}));
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "syncing an offer on a deleted product"
+    );
+    // open a NEW Payment Link
+    let (msg, input) = admin_create_msg(
+        &format!("{collection}/{offer_id}/payment-links"),
+        json!({"preset_id": ""}),
+    );
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "a new Payment Link on a deleted product"
+    );
+    // and the offer detail read stays 404, matching the product's own 404
+    let (msg, input) = admin_get_msg(&format!("{collection}/{offer_id}"));
+    assert!(
+        output_is_error(
+            dispatch_admin(&test_ctx, msg, input).await,
+            ErrorCode::NotFound
+        )
+        .await,
+        "reading one offer of a deleted product"
     );
 }

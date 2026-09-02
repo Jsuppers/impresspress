@@ -18,14 +18,47 @@
 	to { opacity: 1; transform: translateY(0); }
 }
 
-/* `.login-logo`, `.logo-image`, `.login-app-name` were retired here --
-   no page renders a per-page logo header any more (the navy
-   `.auth-split__brand` panel is the only place the logo appears; see
-   `components::auth_panel`). `.login-subtitle` survives: it's still used
-   standalone (no `.login-logo` wrapper) by the verify/reset-password
-   result pages. */
+/* `.login-logo` (the per-page auth-card header wrapper) was retired here --
+   no login/signup/reset/verify/bootstrap/change-password page renders a
+   per-page logo header any more (the navy `.auth-split__brand` panel is the
+   only place those pages' logo appears; see `components::auth_panel`).
+   `.login-subtitle` survives on its own (no `.login-logo` wrapper) on the
+   verify/reset-password result pages.
+
+   `.logo-image`/`.login-app-name`/`.login-brand`/`.login-brand__icon`
+   restored/ported from origin/main during the main merge -- 2026-09-02.
+   These are NOT dead: `templates::brand_lockup` (main's helper, shared by
+   every auth card AND `templates::account_card_page` -- the userportal/orgs
+   header) renders exactly these classes, and `WAFER_RUN_SHARED__LOGO_URL`
+   defaults to blank (no bundled wordmark; see `config_vars::LOGO_URL_KEY`),
+   so the blank-fallback branch (`.login-brand` icon + `.login-app-name`
+   text) is account-card pages' default rendering, not an edge case. */
 .login-subtitle {
 	color: var(--text-secondary); font-size: 0.875rem; margin: 0;
+}
+
+/* `brand_lockup`'s configured-wordmark branch (`img .logo-image`) -- used
+   by account-card pages (userportal/orgs) when a deployment sets a custom
+   `WAFER_RUN_SHARED__LOGO_URL`. `components/card.css`'s
+   `.account-card__head .logo-image` narrows `max-width`/`margin-bottom` for
+   that specific context; this is the shared base. */
+.logo-image {
+	height: 48px; width: auto;
+	margin: 0 auto 1rem auto; display: block;
+}
+
+/* `brand_lockup`'s blank-`logo_url` branch (the default): icon + app-name
+   lockup. 64px = the 64-cell pixel-art mark at 1:1 -- must stay a whole
+   multiple of the mark's native cell size or `.pixel-art` (styles/base.css)
+   nearest-neighbour scaling misaligns (same rule as the sidebar icon, see
+   `styles/layouts/shell.css`). */
+.login-brand { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+.login-brand__icon { width: 64px; height: 64px; display: block; }
+.login-brand .login-app-name { margin-bottom: 0; }
+
+.login-app-name {
+	font-size: 1.5rem; font-weight: 700; display: block; margin-bottom: 0.5rem;
+	color: var(--text-primary);
 }
 
 /* #dc2626 was only 3.95:1 on this box's #fee2e2 background (computed) --

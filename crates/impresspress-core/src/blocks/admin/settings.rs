@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use wafer_core::clients::database as db;
 use wafer_run::{
     context::Context, ConfigVar, ErrorCode, InputStream, InputType, Message, OutputStream,
 };
 
-use super::ops::{self, MASKED_VALUE};
+use super::{
+    contracts::{AdminSettingView, AdminSettingsResponse},
+    ops::{self, MASKED_VALUE},
+};
 use crate::{
     http::{err_bad_request, err_internal, err_not_found, ok_json},
     util::{json_map, RecordExt},
@@ -165,12 +168,14 @@ async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
 async fn handle_list(ctx: &dyn Context) -> OutputStream {
     match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
         Ok(records) => {
-            // Convert to key-value map, masking sensitive values
-            let mut settings = HashMap::new();
+            // Collected into a `BTreeMap` first, then flattened: the
+            // response is a public contract, and a randomized key order made
+            // two identical reads differ byte for byte.
+            let mut by_key = BTreeMap::new();
             for record in &records {
                 let key = record.str_field("key");
-                let is_sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
-                let value = if is_sensitive {
+                let sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
+                let value = if sensitive {
                     serde_json::Value::String(MASKED_VALUE.to_string())
                 } else {
                     record
@@ -180,10 +185,19 @@ async fn handle_list(ctx: &dyn Context) -> OutputStream {
                         .unwrap_or(serde_json::Value::Null)
                 };
                 if !key.is_empty() {
-                    settings.insert(key.to_string(), value);
+                    by_key.insert(
+                        key.to_string(),
+                        AdminSettingView {
+                            key: key.to_string(),
+                            value,
+                            sensitive,
+                        },
+                    );
                 }
             }
-            ok_json(&settings)
+            ok_json(&AdminSettingsResponse {
+                settings: by_key.into_values().collect(),
+            })
         }
         Err(e) => err_internal("Database error", e),
     }
@@ -294,7 +308,11 @@ async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
         body.value.as_deref().unwrap_or(""),
         body.name.as_deref(),
         body.description.as_deref(),
-        body.sensitive.unwrap_or(false),
+        // Absent means sensitive. A caller that does not say is protected;
+        // one that wants a plain-text variable says `false`. The old `false`
+        // default published any key without a `_SECRET`/`_KEY` suffix in
+        // plain text unless the operator remembered the box.
+        body.sensitive.unwrap_or(true),
     )
     .await
     {
@@ -414,6 +432,25 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
         match existing.get(&var.key) {
             Some(record) => {
+                // A stored value that still points at the built-in raster
+                // wordmark is a stale pointer *this function wrote*: older
+                // releases seeded `LOGO_URL` with the wordmark's own
+                // content-hashed `/b/static/` URL, and that asset, its
+                // accessor and its route are gone. Left alone it renders a
+                // broken image on every page that shows the brand.
+                //
+                // Repaired here rather than in an admin migration because
+                // migrations are gated (`--run-migrations`, see RELEASE.md)
+                // and a broken logo gives an operator no signal to opt in,
+                // whereas `seed_defaults` runs on every boot's `Init`. It
+                // costs one `starts_with` per boot and is idempotent: once
+                // blank, the prefix no longer matches. Scoped to the built-in
+                // route, so a white-labelled URL is never touched.
+                let stale_builtin_wordmark = var.key == crate::config_vars::LOGO_URL_KEY
+                    && record
+                        .str_field("value")
+                        .starts_with(crate::config_vars::REMOVED_BUILTIN_WORDMARK_URL_PREFIX);
+
                 // Only refresh metadata when at least one declared field
                 // actually differs. Without this guard every isolate cold-start
                 // re-writes every shared config var (~80 vars × cold-starts/day
@@ -422,15 +459,25 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 let same_desc = record.str_field("description") == var.description;
                 let same_warn = record.str_field("warning") == var.warning;
                 let same_sens = record.i64_field("sensitive") == sensitive as i64;
-                if same_name && same_desc && same_warn && same_sens {
+                if same_name && same_desc && same_warn && same_sens && !stale_builtin_wordmark {
                     continue;
                 }
-                let data = json_map(serde_json::json!({
+                let mut fields = serde_json::json!({
                     "name": name,
                     "description": var.description,
                     "warning": var.warning,
                     "sensitive": sensitive,
-                }));
+                });
+                if stale_builtin_wordmark {
+                    tracing::warn!(
+                        key = %var.key,
+                        stale = %record.str_field("value"),
+                        "cleared a persisted URL for the removed built-in wordmark; \
+                         the app name now renders as text beside the brand icon"
+                    );
+                    fields["value"] = serde_json::Value::String(String::new());
+                }
+                let data = json_map(fields);
                 let _ = db::upsert_by_field(
                     ctx,
                     VARIABLES_TABLE,
@@ -495,6 +542,90 @@ mod tests {
 
     use super::*;
     use crate::test_support::TestContext;
+
+    /// Seed one `variables` row with an explicit `sensitive` flag.
+    async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
+        let mut data = json_map(serde_json::json!({
+            "key": key,
+            "name": key,
+            "description": "",
+            "value": value,
+            "warning": "",
+            "sensitive": sensitive,
+        }));
+        crate::util::stamp_created(&mut data);
+        db::create(ctx, VARIABLES_TABLE, data)
+            .await
+            .expect("seed variable");
+    }
+
+    /// `GET /b/admin/api/settings` never publishes a secret value.
+    ///
+    /// The endpoint's OpenAPI description promises exactly this, and the
+    /// promise rests on two independent halves of `is_sensitive_key`: the
+    /// row's `sensitive` flag, and the `_SECRET` / `_KEY` suffix convention.
+    /// A key needs only one of them. Nothing tested this before the endpoint
+    /// was documented, which is the worst order to do it in.
+    #[tokio::test]
+    async fn list_masks_every_sensitive_value() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // Not sensitive: no flag, no suffix.
+        seed_var(&ctx, "SITE_NAME", "Acme", 0).await;
+        // Sensitive by suffix alone (SEC-060): the flag is clear.
+        seed_var(&ctx, "STRIPE_SECRET", "sk_live_realsecret", 0).await;
+        seed_var(&ctx, "MAILGUN_API_KEY", "key-realsecret", 0).await;
+        // Sensitive by flag alone: `InputType::Password` vars carry neither
+        // suffix, and `seed_defaults` is what sets their flag.
+        seed_var(&ctx, "BOOTSTRAP_ADMIN_PASSWORD", "hunter2", 1).await;
+
+        let body = crate::test_support::output_json(handle_list(&ctx).await).await;
+        let by_key: std::collections::HashMap<&str, &serde_json::Value> = body["settings"]
+            .as_array()
+            .expect("settings is an array")
+            .iter()
+            .map(|entry| (entry["key"].as_str().expect("key is a string"), entry))
+            .collect();
+
+        assert_eq!(
+            by_key["SITE_NAME"]["value"],
+            serde_json::json!("Acme"),
+            "a non-sensitive value must be published unchanged"
+        );
+        assert_eq!(
+            by_key["SITE_NAME"]["sensitive"],
+            serde_json::json!(false),
+            "a non-sensitive variable must say so"
+        );
+        for masked in [
+            "STRIPE_SECRET",
+            "MAILGUN_API_KEY",
+            "BOOTSTRAP_ADMIN_PASSWORD",
+        ] {
+            assert_eq!(
+                by_key[masked]["value"],
+                serde_json::json!(MASKED_VALUE),
+                "{masked} must be masked"
+            );
+            assert_eq!(
+                by_key[masked]["sensitive"],
+                serde_json::json!(true),
+                "{masked} must be flagged sensitive, or a reader cannot tell \
+                 the mask from a literal value"
+            );
+        }
+
+        let raw = body.to_string();
+        for secret in ["sk_live_realsecret", "key-realsecret", "hunter2"] {
+            assert!(
+                !raw.contains(secret),
+                "GET /b/admin/api/settings leaked `{secret}`: {raw}"
+            );
+        }
+    }
 
     /// `seed_payload_hash` is independent of input order (sorts by `key`).
     #[test]
@@ -758,5 +889,210 @@ mod tests {
             Some(MASKED_VALUE),
             "a *_SECRET value must be masked even with the sensitive flag unset"
         );
+    }
+
+    /// Read one variable row's `value` column.
+    async fn stored_value(ctx: &dyn Context, key: &str) -> Option<String> {
+        db::list_all(
+            ctx,
+            VARIABLES_TABLE,
+            vec![Filter {
+                field: "key".into(),
+                operator: FilterOp::Equal,
+                value: serde_json::Value::String(key.to_string()),
+            }],
+        )
+        .await
+        .expect("list variables")
+        .first()
+        .map(|r| r.str_field("value").to_string())
+    }
+
+    /// Releases before the pixel-art mark seeded `LOGO_URL` with the built-in
+    /// raster wordmark's content-hashed URL. That asset and its route are
+    /// gone, so a deployment still carrying the seeded value renders a broken
+    /// image on every auth card, sidebar and account card. `seed_defaults`
+    /// must clear it back to blank so the app-name fallback takes over.
+    #[tokio::test]
+    async fn seed_defaults_clears_the_removed_builtin_wordmark_url() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // Exactly what an older release's `seed_defaults` wrote: the route
+        // prefix plus that release's content hash.
+        seed_var(
+            &ctx,
+            crate::config_vars::LOGO_URL_KEY,
+            "/b/static/impresspress-logo-long-1f4c8ab2.png",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, crate::config_vars::LOGO_URL_KEY)
+                .await
+                .as_deref(),
+            Some(""),
+            "a persisted pointer at the removed built-in wordmark must be \
+             cleared so the app-name fallback renders"
+        );
+    }
+
+    /// The repair reaches a *real* upgrade, not just a blank slate.
+    ///
+    /// The seed short-circuits when the stamped `seed_defaults_hash` matches
+    /// the current declared vars, so the repair only ever runs if that gate
+    /// opens. It does: this release changed `LOGO_URL`'s declared default
+    /// *and* its description, both of which feed `seed_payload_hash`, so any
+    /// older release's stamped hash necessarily differs. This pins that —
+    /// stamp a prior release's hash, then assert the stale value is still
+    /// repaired.
+    #[tokio::test]
+    async fn stale_wordmark_is_repaired_through_a_prior_releases_stamped_hash() {
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // A prior release's declared LOGO_URL: the old description, and the
+        // built-in wordmark URL as the default. Its hash is what that release
+        // would have stamped.
+        let mut prior = crate::config_vars::shared_config_vars();
+        let logo = prior
+            .iter_mut()
+            .find(|v| v.key == crate::config_vars::LOGO_URL_KEY)
+            .expect("LOGO_URL must be a declared shared var");
+        logo.description = "Logo shown in header and emails".into();
+        logo.default = "/b/static/impresspress-logo-long-1f4c8ab2.png".into();
+        let prior_hash = seed_payload_hash(&prior);
+
+        ctx.set_config(
+            crate::features::BLOCK_SETTINGS_CONFIG_KEY,
+            &serde_json::json!({
+                ADMIN_BLOCK_NAME: { "enabled": true, "seed_defaults_hash": prior_hash }
+            })
+            .to_string(),
+        );
+        seed_var(
+            &ctx,
+            crate::config_vars::LOGO_URL_KEY,
+            "/b/static/impresspress-logo-long-1f4c8ab2.png",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, crate::config_vars::LOGO_URL_KEY)
+                .await
+                .as_deref(),
+            Some(""),
+            "the hash gate must open on upgrade so the repair runs"
+        );
+    }
+
+    /// The repair above is scoped to the built-in wordmark's own route. An
+    /// operator's white-label logo is their data and must survive untouched.
+    #[tokio::test]
+    async fn seed_defaults_keeps_an_operator_configured_logo_url() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        seed_var(
+            &ctx,
+            crate::config_vars::LOGO_URL_KEY,
+            "https://acme.example/wordmark.png",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, crate::config_vars::LOGO_URL_KEY)
+                .await
+                .as_deref(),
+            Some("https://acme.example/wordmark.png"),
+            "a white-labelled logo URL must not be cleared"
+        );
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use wafer_block::db::{Filter, FilterOp};
+    use wafer_core::clients::database as db;
+    use wafer_run::InputStream;
+
+    use super::*;
+    use crate::test_support::{admin_msg, collect_or_panic, TestContext};
+
+    async fn admin_ctx() -> TestContext {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx
+    }
+
+    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> i64 {
+        let rows = db::list_all(
+            ctx,
+            VARIABLES_TABLE,
+            vec![Filter {
+                field: "key".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(key),
+            }],
+        )
+        .await
+        .expect("list variables");
+        rows.first()
+            .unwrap_or_else(|| panic!("{key} was not created"))
+            .i64_field("sensitive")
+    }
+
+    async fn create(ctx: &dyn Context, body: serde_json::Value) {
+        let out = handle_create(
+            ctx,
+            &admin_msg("create", "/admin/settings"),
+            InputStream::from_bytes(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        collect_or_panic(out).await;
+    }
+
+    /// An ad hoc variable created without saying whether it is sensitive is
+    /// stored as sensitive. Masking an innocuous value costs the operator one
+    /// click to undo; publishing a secret in plain text — which is what the
+    /// old `false` default did for any key without a `_SECRET`/`_KEY`
+    /// suffix — cannot be undone.
+    #[tokio::test]
+    async fn create_defaults_to_sensitive_when_the_flag_is_omitted() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "move fast"}),
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_honours_an_explicit_not_sensitive() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "move fast", "sensitive": false}),
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 0);
     }
 }

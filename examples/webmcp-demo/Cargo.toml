@@ -1,0 +1,27 @@
+[package]
+name = "impresspress-webmcp-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cloudflare Worker consumer that exposes impresspress's storefront as WebMCP tools — the live demo for the WebMCP Challenge"
+publish = false
+
+# A Cloudflare consumer in the shape `impresspress build/deploy --target
+# cloudflare` expects: a cdylib with `#[event(fetch)]` handing every request
+# to `impresspress_cloudflare::run`. The Worker is impresspress plus the
+# products block and nothing else — the same wiring wafer-site uses, minus
+# wafer-site. wasm32-only, so not a default member (see the root manifest).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# The deploy CLI builds with `--no-default-features --features target-cloudflare`.
+target-cloudflare = ["dep:impresspress-cloudflare", "dep:worker", "dep:wasm-bindgen"]
+
+[dependencies]
+# `block-products` is what carries the six WebMCP storefront tools; the
+# always-on core (auth, auth-ui, admin, email, system) needs no feature.
+impresspress-cloudflare = { path = "../../crates/impresspress-cloudflare", optional = true, default-features = false, features = ["block-products"] }
+worker = { workspace = true, optional = true }
+wasm-bindgen = { version = "0.2", optional = true }

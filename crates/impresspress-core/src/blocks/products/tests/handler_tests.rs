@@ -24,9 +24,9 @@ async fn admin_create_product() {
     let out = dispatch_admin(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     assert!(body["id"].as_str().is_some());
-    assert_eq!(body["data"]["name"], "Cloud Hosting");
-    assert_eq!(body["data"]["status"], "draft");
-    assert_eq!(body["data"]["created_by"], "admin_1");
+    assert_eq!(body["name"], "Cloud Hosting");
+    assert_eq!(body["status"], "draft");
+    assert_eq!(body["created_by"], "admin_1");
 }
 
 #[tokio::test]
@@ -74,7 +74,7 @@ async fn admin_get_product() {
     let (get_msg_data, get_input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
     let out = dispatch_admin(&ctx, get_msg_data, get_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "Widget");
+    assert_eq!(body["name"], "Widget");
 }
 
 #[tokio::test]
@@ -104,7 +104,7 @@ async fn admin_update_product() {
     update.set_meta("auth.user_roles", "admin");
     let out = dispatch_admin(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "New Name");
+    assert_eq!(body["name"], "New Name");
 }
 
 #[tokio::test]
@@ -135,6 +135,241 @@ async fn admin_delete_product() {
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
+/// A soft-deleted product must 404 from the admin detail endpoint the same
+/// as one that never existed — `handle_get_product` used to call
+/// `db::get` with the table's old hardcoded constant directly, bypassing
+/// the soft-delete filter entirely.
+#[tokio::test]
+async fn admin_product_detail_404s_for_a_soft_deleted_product() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/admin/b/products/products/gone");
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// `handle_update_product` (the generic admin PATCH) must not be a second
+/// door onto `deleted_at`: an admin sending `{"deleted_at": null}` for a
+/// soft-deleted product must not silently resurrect it — restore is the
+/// only door back in. The refusal now comes from the body check, before the
+/// write's own liveness filter is reached, so it reads as `InvalidArgument`
+/// rather than `NotFound`; either way the row stays deleted.
+#[tokio::test]
+async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Oops" }),
+    );
+    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    soft_delete_product(&ctx, &id).await;
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "deleted_at": null }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "an admin PATCH must not resurrect a soft-deleted product"
+    );
+
+    let err = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect_err("the product must still read as deleted");
+    assert_eq!(err.code, ErrorCode::NotFound);
+}
+
+/// A soft-deleted product must be restored before it is editable again — the
+/// generic admin PATCH must refuse it outright rather than silently applying
+/// unrelated field changes to a dead row.
+#[tokio::test]
+async fn admin_update_product_refuses_a_soft_deleted_product() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Oops" }),
+    );
+    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    soft_delete_product(&ctx, &id).await;
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "name": "New Name" }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "a soft-deleted product must not be editable through the normal admin PATCH"
+    );
+}
+
+/// `deleted_at` is `soft_delete`'s door, not the generic PATCH's: even for a
+/// still-live product (so the liveness guard above doesn't reject the
+/// request outright), an admin PATCH carrying `deleted_at` must not be able
+/// to soft-delete it as a side effect of an otherwise ordinary field update.
+///
+/// The whole request is refused, rather than the field dropped and the rest
+/// applied: a 200 whose body plainly shows `deleted_at` unchanged tells the
+/// caller their write succeeded when part of it was discarded.
+#[tokio::test]
+async fn admin_update_product_refuses_deleted_at_in_the_request_body() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Still Live" }),
+    );
+    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "name": "New Name", "deleted_at": "2026-09-01T00:00:00Z" }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "a PATCH naming deleted_at must be refused, not partly applied"
+    );
+
+    let record = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect("the generic PATCH must not have soft-deleted the product");
+    assert!(crate::util::RecordExt::str_field(&record, "deleted_at").is_empty());
+    assert_eq!(
+        crate::util::RecordExt::str_field(&record, "name"),
+        "Still Live",
+        "a refused request must not apply its other fields either"
+    );
+}
+
+/// The bug this whole plan exists for: `line_items.product_id` is `TEXT NOT
+/// NULL`, so a hard delete of a product that was ever ordered orphaned that
+/// order's line item. Soft delete must leave both rows resolvable.
+#[tokio::test]
+async fn admin_delete_keeps_the_row_and_its_order_history_resolvable() {
+    let ctx = ctx().await;
+
+    let mut sold = HashMap::new();
+    sold.insert("name".to_string(), serde_json::json!("Sold"));
+    sold.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "sold", sold).await;
+
+    let mut order = HashMap::new();
+    order.insert("user_id".to_string(), serde_json::json!("user_1"));
+    order.insert("status".to_string(), serde_json::json!("completed"));
+    seed(&ctx, "impresspress__products__purchases", "order_1", order).await;
+    seed(
+        &ctx,
+        "impresspress__products__line_items",
+        "line_1",
+        HashMap::from([
+            ("purchase_id".to_string(), serde_json::json!("order_1")),
+            ("product_id".to_string(), serde_json::json!("sold")),
+            ("product_name".to_string(), serde_json::json!("Sold")),
+        ]),
+    )
+    .await;
+
+    let (mut del, del_input) = delete_msg("/admin/b/products/products/sold", "admin_1");
+    del.set_meta("auth.user_roles", "admin");
+    let body = output_to_json(dispatch_admin(&ctx, del, del_input).await).await;
+    assert_eq!(body["deleted"], true);
+
+    let row = wafer_core::clients::database::get(&ctx, "impresspress__products__products", "sold")
+        .await
+        .expect("the row must still exist");
+    assert!(
+        !crate::util::RecordExt::str_field(&row, "deleted_at").is_empty(),
+        "deleted_at must be stamped"
+    );
+
+    let line_item =
+        wafer_core::clients::database::get(&ctx, "impresspress__products__line_items", "line_1")
+            .await
+            .expect("the line item must still resolve");
+    assert_eq!(
+        crate::util::RecordExt::str_field(&line_item, "product_id"),
+        "sold"
+    );
+}
+
+/// A deleted product must disappear from the public catalog end-to-end
+/// through the real delete handler, not just when `deleted_at` is stamped
+/// by hand.
+#[tokio::test]
+async fn admin_delete_removes_the_product_from_the_catalog() {
+    let ctx = ctx().await;
+
+    let mut sold = HashMap::new();
+    sold.insert("name".to_string(), serde_json::json!("Sold"));
+    sold.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "sold", sold).await;
+
+    let (mut del, del_input) = delete_msg("/admin/b/products/products/sold", "admin_1");
+    del.set_meta("auth.user_roles", "admin");
+    dispatch_admin(&ctx, del, del_input).await;
+
+    let (msg, input) = get_msg("/b/products/catalog", "");
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(body["records"].as_array().unwrap().is_empty());
+}
+
+/// A soft-deleted product frees its slug, because the unique index added in
+/// migration 005 is partial on `deleted_at IS NULL`.
+#[tokio::test]
+async fn admin_delete_frees_the_products_slug() {
+    let ctx = ctx().await;
+
+    let mut first = HashMap::new();
+    first.insert("name".to_string(), serde_json::json!("First"));
+    first.insert("slug".to_string(), serde_json::json!("jacket"));
+    seed(&ctx, "impresspress__products__products", "first", first).await;
+
+    let (mut del, del_input) = delete_msg("/admin/b/products/products/first", "admin_1");
+    del.set_meta("auth.user_roles", "admin");
+    dispatch_admin(&ctx, del, del_input).await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({
+            "name": "Second",
+            "slug": "jacket"
+        }),
+    );
+    let body = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    assert_eq!(body["slug"], "jacket", "the reused slug must not conflict");
+}
+
 // ============================================================
 // Admin Group CRUD
 // ============================================================
@@ -151,8 +386,8 @@ async fn admin_create_and_list_groups() {
     );
     let out = dispatch_admin(&ctx, create, create_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "Electronics");
-    assert_eq!(body["data"]["user_id"], "admin_1");
+    assert_eq!(body["name"], "Electronics");
+    assert_eq!(body["user_id"], "admin_1");
 
     let (list, list_input) = admin_get_msg("/admin/b/products/groups");
     let list_out = dispatch_admin(&ctx, list, list_input).await;
@@ -556,6 +791,31 @@ async fn admin_stats_repository_failure_surfaces_as_internal_error() {
     );
 }
 
+/// Two counters read the products table with no filter at all (`total_products`
+/// and `active_products`), so a soft-deleted product would still be counted —
+/// both the admin dashboard and this stats endpoint would overstate the
+/// catalog.
+#[tokio::test]
+async fn stats_do_not_count_soft_deleted_products() {
+    let ctx = ctx().await;
+
+    let mut live = HashMap::new();
+    live.insert("name".to_string(), serde_json::json!("Live"));
+    live.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "live", live).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/admin/b/products/stats");
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(body["total_products"].as_i64().unwrap(), 1);
+    assert_eq!(body["active_products"].as_i64().unwrap(), 1);
+}
+
 // ============================================================
 // User Product CRUD — ownership isolation
 // ============================================================
@@ -593,8 +853,8 @@ async fn user_create_product_in_own_group() {
     );
     let out = dispatch_user(&ctx, create_prod, cp_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["name"], "Widget");
-    assert_eq!(body["data"]["created_by"], "user_1");
+    assert_eq!(body["name"], "Widget");
+    assert_eq!(body["created_by"], "user_1");
 }
 
 #[tokio::test]
@@ -702,6 +962,40 @@ async fn user_cannot_delete_other_users_products() {
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
+/// The seller's own-product delete is the path a non-admin actually uses:
+/// leaving it hard-deleting would orphan `line_items.product_id` (`TEXT NOT
+/// NULL`) on exactly the path this task exists to fix.
+#[tokio::test]
+async fn user_delete_own_product_soft_deletes_instead_of_hard_deleting() {
+    let ctx = user_products_ctx().await;
+
+    let (create, create_input) = create_msg(
+        "/b/products/products",
+        "user_1",
+        serde_json::json!({
+            "name": "My Product"
+        }),
+    );
+    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let prod_id = output_to_json(create_out).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (del, del_input) = delete_msg(&format!("/b/products/products/{prod_id}"), "user_1");
+    let body = output_to_json(dispatch_user(&ctx, del, del_input).await).await;
+    assert_eq!(body["deleted"], true);
+
+    let row =
+        wafer_core::clients::database::get(&ctx, "impresspress__products__products", &prod_id)
+            .await
+            .expect("the row must still exist");
+    assert!(
+        !crate::util::RecordExt::str_field(&row, "deleted_at").is_empty(),
+        "deleted_at must be stamped"
+    );
+}
+
 #[tokio::test]
 async fn user_list_only_own_products() {
     let ctx = user_products_ctx().await;
@@ -728,7 +1022,7 @@ async fn user_list_only_own_products() {
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["data"]["name"], "U1 Product");
+    assert_eq!(records[0]["name"], "U1 Product");
 }
 
 #[tokio::test]
@@ -746,7 +1040,8 @@ async fn user_update_prevents_ownership_change() {
         .unwrap()
         .to_string();
 
-    // Try to change created_by — should be stripped
+    // Try to change created_by — the whole request must be refused, not
+    // silently reduced to the fields the caller does own.
     let (update, update_input) = update_msg(
         &format!("/b/products/products/{prod_id}"),
         "user_1",
@@ -756,8 +1051,16 @@ async fn user_update_prevents_ownership_change() {
         }),
     );
     let out = dispatch_user(&ctx, update, update_input).await;
-    let body = output_to_json(out).await;
-    assert_eq!(body["data"]["created_by"], "user_1");
+    assert!(output_is_error(out, ErrorCode::InvalidArgument).await);
+
+    let record = super::super::repo::products::get(&ctx, &prod_id)
+        .await
+        .expect("the product is still there");
+    assert_eq!(
+        crate::util::RecordExt::str_field(&record, "created_by"),
+        "user_1"
+    );
+    assert_eq!(crate::util::RecordExt::str_field(&record, "name"), "Mine");
 }
 
 // ============================================================
@@ -787,7 +1090,7 @@ async fn user_list_only_own_groups() {
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["data"]["name"], "U1 Group");
+    assert_eq!(records[0]["name"], "U1 Group");
 }
 
 #[tokio::test]
@@ -841,7 +1144,7 @@ async fn user_group_update_prevents_ownership_change() {
     );
     let out = dispatch_user(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
-    assert_eq!(body["data"]["user_id"], "user_1");
+    assert_eq!(body["user_id"], "user_1");
 }
 
 // ============================================================
@@ -867,7 +1170,7 @@ async fn catalog_only_shows_active_products() {
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["data"]["name"], "Active");
+    assert_eq!(records[0]["name"], "Active");
 }
 
 #[tokio::test]
@@ -882,6 +1185,908 @@ async fn catalog_get_hides_non_active() {
     let (msg, input) = get_msg("/b/products/catalog/p_hidden", "");
     let out = dispatch_user(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+// ============================================================
+// Soft-deleted products stay off every customer-facing surface
+// ============================================================
+//
+// The catalog historically filtered on `status` alone, so a soft-deleted
+// product that was still `active` stayed listed and purchasable. This is
+// the hole soft delete would otherwise open; these tests pin that a
+// soft-deleted row is invisible on every customer-facing read.
+
+/// Mark a product soft-deleted the way the (future) soft-delete path will:
+/// writing `deleted_at` directly, bypassing any handler.
+async fn soft_delete_product(ctx: &crate::test_support::TestContext, id: &str) {
+    wafer_core::clients::database::update(
+        ctx,
+        super::super::repo::products::TABLE,
+        id,
+        HashMap::from([(
+            "deleted_at".to_string(),
+            serde_json::json!("2026-09-01T00:00:00Z"),
+        )]),
+    )
+    .await
+    .expect("soft delete");
+}
+
+/// Whether `id`'s row still carries a `deleted_at` stamp, read straight from
+/// the table.
+///
+/// Not `repo::products::get`, which cannot see a soft-deleted row at all and
+/// so cannot tell "still deleted" from "never existed" — the distinction
+/// every restore-authorization assertion below turns on.
+async fn is_soft_deleted(ctx: &crate::test_support::TestContext, id: &str) -> bool {
+    use crate::util::RecordExt;
+
+    let record = wafer_core::clients::database::get(ctx, super::super::repo::products::TABLE, id)
+        .await
+        .expect("the product row must still exist");
+    !record.str_field("deleted_at").is_empty()
+}
+
+/// Build an active, approved product with one published offer through the
+/// same repo functions `stripe::handle_checkout` calls, so checkout has a
+/// real purchasable offer to refuse once the product is soft-deleted.
+async fn seed_published_offer(ctx: &crate::test_support::TestContext, product_id: &str) -> String {
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), serde_json::json!("Checkout product"));
+    data.insert("status".to_string(), serde_json::json!("active"));
+    seed(ctx, "impresspress__products__products", product_id, data).await;
+
+    let definition: super::super::contracts::OfferDefinitionRequest =
+        serde_json::from_value(serde_json::json!({
+            "name": "Plan",
+            "mode": "payment",
+            "currency": "usd",
+            "pricing_model": "fixed",
+            "usage_type": "licensed",
+            "billing_scheme": "per_unit",
+            "tax_behavior": "exclusive",
+            "components": [{
+                "key": "price",
+                "label": "Plan",
+                "required": true,
+                "amount": {"type": "fixed", "unit_amount_minor": 1000}
+            }]
+        }))
+        .expect("offer definition");
+    let offer = super::super::repo::offers::create(ctx, product_id, "admin_1", &definition)
+        .await
+        .expect("create offer");
+    super::super::repo::offers::publish(ctx, product_id, &offer.offer.id)
+        .await
+        .expect("publish offer");
+    offer.offer.id
+}
+
+#[tokio::test]
+async fn catalog_list_omits_a_soft_deleted_active_product() {
+    let ctx = ctx().await;
+
+    let mut keep = HashMap::new();
+    keep.insert("name".to_string(), serde_json::json!("Keep"));
+    keep.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "keep", keep).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/catalog", "");
+    let out = dispatch_user(&ctx, msg, input).await;
+    let body = output_to_json(out).await;
+    let ids: Vec<&str> = body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["keep"]);
+}
+
+#[tokio::test]
+async fn catalog_detail_404s_for_a_soft_deleted_active_product() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("Gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/catalog/gone", "");
+    let out = dispatch_user(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// Characterisation test, not a regression check: `repo::offers::get_public`
+/// already refuses a soft-deleted product's offer today (before this task's
+/// migration), so this must PASS before and after. It pins the behaviour the
+/// migration must not lose, since checkout stops going through the table's
+/// old hardcoded constant directly once this task lands.
+#[tokio::test]
+async fn checkout_refuses_a_soft_deleted_product() {
+    let ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let offer_id = seed_published_offer(&ctx, "gone").await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    let out = super::super::stripe::handle_checkout(&ctx, &msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "checkout must refuse a soft-deleted product's offer"
+    );
+}
+
+// ============================================================
+// Restoring a soft-deleted product — the door back out
+// ============================================================
+//
+// Soft delete without a way back is worse than the hard delete it replaced:
+// a deleted row would be permanently unreachable by any UI. These tests pin
+// the restore endpoint's two obligations: it must clear `deleted_at` on the
+// right row, and the restored row must be visible again everywhere a live
+// product is visible (the public catalog, here — `repo::products::get`'s
+// own restore test already covers the repo layer directly).
+
+#[tokio::test]
+async fn restore_endpoint_returns_the_product_to_the_catalog() {
+    let ctx = ctx().await;
+
+    let mut oops = HashMap::new();
+    oops.insert("name".to_string(), serde_json::json!("oops"));
+    oops.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "oops", oops).await;
+    soft_delete_product(&ctx, "oops").await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/oops/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(body["id"], "oops");
+    assert!(
+        body["deleted_at"].is_null(),
+        "restore must clear deleted_at: {body}"
+    );
+
+    let (catalog_msg, catalog_input) = get_msg("/b/products/catalog", "");
+    let catalog_body = output_to_json(dispatch_user(&ctx, catalog_msg, catalog_input).await).await;
+    assert_eq!(catalog_body["records"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn restore_endpoint_404s_for_an_unknown_product_id() {
+    let ctx = ctx().await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/missing/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(output_is_error(out, ErrorCode::NotFound).await);
+}
+
+/// The live-product case the old `restore_endpoint_404s_for_a_product_that_
+/// was_never_deleted` claimed to cover and did not: it created a product,
+/// ignored its id, and posted restore for the literal id `"missing"`, so it
+/// only ever exercised the unknown-id path above.
+///
+/// Restoring a product that was never deleted is a no-op that answers 200
+/// with the record — clearing an already-null `deleted_at` changes nothing.
+/// Pinned rather than "fixed" because nothing reaches this endpoint except
+/// the Deleted view's Restore button, which only renders for rows that ARE
+/// deleted; see the report accompanying this branch for why a 409 here would
+/// be defensible but is not this wave's change.
+#[tokio::test]
+async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Live" }),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    let id = created["id"]
+        .as_str()
+        .expect("created product id")
+        .to_string();
+
+    let (msg, input) = admin_create_msg(
+        &format!("/admin/b/products/products/{id}/restore"),
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], id,
+        "restoring a live product answers 200 with it: {body}"
+    );
+    assert!(
+        !is_soft_deleted(&ctx, &id).await,
+        "the product must stay live"
+    );
+}
+
+/// A PLATFORM-owned soft-deleted product must be unreachable for a non-admin
+/// through EVERY wire path that reaches a restore handler — not merely
+/// through the one path a declaration happens to match.
+///
+/// `ProductsBlock::handle` enters `handle_user` from two prefixes: the
+/// `/b/products/api`-stripped one and the raw `/b/products/...` one. A
+/// `USER_ROUTES` entry therefore answers at two spellings while
+/// `declared_access` only ever matches the declared one, so restore declared
+/// `Admin` at `/b/products/api/products/{id}/restore` left
+/// `POST /b/products/products/{id}/restore` resolving to the undeclared
+/// fallback tier (`Authenticated`): any logged-in user could resurrect any
+/// soft-deleted product — straight back into the public catalog, and
+/// purchasable, when it was active/approved. Product ids are not secret;
+/// `/b/products/catalog` hands them out.
+///
+/// The seller restore endpoint now answers at both `/b/products/...`
+/// spellings on purpose, so what stops `user_1` there is OWNERSHIP, not the
+/// tier. Seller products are enabled below precisely so the feature flag's
+/// 403 cannot stand in for that check: the product seeded here is
+/// platform-owned (blank `owner_id`/`created_by`), which
+/// `handlers::is_owned_by` refuses for every caller.
+///
+/// Driven through `dispatch_routed` (the real `route_to_block`) because that
+/// is where the tier is enforced — a `dispatch_user` test cannot see this
+/// boundary at all, which is exactly how the escalation shipped.
+#[tokio::test]
+async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() {
+    let ctx = user_products_ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    for path in [
+        "/b/products/products/gone/restore",
+        "/b/products/api/products/gone/restore",
+        "/b/products/api/admin/products/gone/restore",
+    ] {
+        let (msg, input) = create_msg(path, "user_1", serde_json::json!({}));
+        let out = dispatch_routed(&ctx, msg, input).await;
+        assert!(
+            out.collect_buffered().await.is_err(),
+            "a non-admin POST to {path} must not succeed"
+        );
+        assert!(
+            is_soft_deleted(&ctx, "gone").await,
+            "a non-admin POST to {path} restored a soft-deleted product"
+        );
+    }
+
+    // Positive control: the declared admin path DOES restore through the
+    // same router, so the assertions above cannot be passing merely because
+    // nothing routes anywhere.
+    let (msg, input) = admin_create_msg(
+        "/b/products/api/admin/products/gone/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], "gone",
+        "an admin must be able to restore: {body}"
+    );
+    assert!(!is_soft_deleted(&ctx, "gone").await);
+}
+
+/// Soft delete frees the product's slug (migration 005's unique index is
+/// partial on `deleted_at IS NULL`), and nothing stops a product created
+/// afterwards from claiming it. Restoring the original then violates
+/// `impresspress__products__products_owner_slug_uniq`.
+///
+/// That must read as a conflict naming the slug, not an opaque 500: the
+/// Deleted view's Restore button only reloads on success, so a 500 renders
+/// as nothing happening at all on the only door out of soft delete.
+///
+/// The conflict is read off the failed write, not from a pre-check ahead of
+/// it. A pre-check answers about the moment before the write, so a slug
+/// claimed in between produced the very 500 it existed to prevent; the
+/// write's own failure cannot be raced, because the row is still deleted and
+/// still probeable exactly when the write did not land.
+#[tokio::test]
+async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
+    let ctx = ctx().await;
+
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(&ctx, "original").await;
+
+    // Legal only because the delete freed the slug.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("restore over a claimed slug must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug collision is a conflict, not an internal error: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug so an admin can act on it: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(&ctx, "original").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// The admin PATCH refuses a soft-deleted product — a deleted row has to go
+/// back through `restore` before it is editable again. It enforced that with
+/// a separate `get` followed by a separate `update`, which is a guard with a
+/// window in it: a delete landing between the two lets the PATCH write to an
+/// already-deleted row and answer 200.
+///
+/// The window is reproduced exactly rather than raced for. The handler awaits
+/// the request body between its liveness check and its write, so a body that
+/// arrives only after the delete has committed puts the delete precisely
+/// where a concurrent one would land.
+#[tokio::test]
+async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
+    use std::sync::Arc;
+
+    let ctx = Arc::new(ctx().await);
+
+    let mut racer = HashMap::new();
+    racer.insert("name".to_string(), serde_json::json!("before"));
+    racer.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "racer", racer).await;
+
+    let deleting = ctx.clone();
+    let input = wafer_run::InputStream::from_stream(futures::stream::once(async move {
+        super::super::repo::products::soft_delete(deleting.as_ref(), "racer")
+            .await
+            .expect("the concurrent delete lands");
+        serde_json::to_vec(&serde_json::json!({"name": "after"})).unwrap()
+    }));
+    let (msg, _) = update_msg(
+        "/admin/b/products/products/racer",
+        "admin_1",
+        serde_json::json!({}),
+    );
+    let mut msg = msg;
+    msg.set_meta("auth.user_roles", "admin");
+
+    let out = dispatch_admin(ctx.as_ref(), msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "a PATCH whose row was deleted before the write must 404, not report success"
+    );
+
+    let stored = wafer_core::clients::database::get(
+        ctx.as_ref(),
+        super::super::repo::products::TABLE,
+        "racer",
+    )
+    .await
+    .expect("the row still exists");
+    assert_eq!(
+        stored.data.get("name"),
+        Some(&serde_json::json!("before")),
+        "the PATCH must not have written to a deleted row"
+    );
+}
+
+/// Move a competing product in or out of the slug at the exact moment one of
+/// the restore's `UPDATE`s goes out, so a test can stand on any side of the
+/// windows the handler's ordering leaves open.
+#[derive(Clone, Copy)]
+enum RaceMove {
+    /// A live product claims the freed slug just BEFORE the first restore
+    /// write reaches the database — after any pre-check would have looked.
+    ClaimantAppearsFirst,
+    /// The claimant is deleted just AFTER the first restore write refused it,
+    /// so the collision probe that runs next finds nothing to blame.
+    ClaimantVanishesFirst,
+    /// Both moves in sequence, which is the one window the probe cannot
+    /// close: the claimant is deleted after the first write, so the probe
+    /// comes back clear and the handler retries — and a FRESH claimant takes
+    /// the slug before that retry reaches the database.
+    ReclaimedBeforeTheRetry,
+}
+
+/// The id of the second claimant, which takes the slug in the gap between a
+/// clear probe and the retry that probe earned. A different row from
+/// `claimant_id`: the first one is soft-deleted by then, and a deleted row
+/// cannot violate a partial index keyed on `deleted_at IS NULL`.
+const LATE_CLAIMANT: &str = "late_claimant";
+
+/// Run a [`RaceMove`] against the restore's writes, then let each proceed.
+///
+/// The writes themselves are real: they go to the real database and succeed
+/// or violate `..._owner_slug_uniq` exactly as production would. Only the
+/// timing of the competing row is arranged.
+#[derive(Clone)]
+struct RaceTheRestoreWrite {
+    inner: std::sync::Arc<crate::test_support::TestContext>,
+    claimant_id: String,
+    slug: String,
+    when: RaceMove,
+    /// How many of the HANDLER's own filtered writes to the products table
+    /// have gone out, so a move can be hung on the first (the restore) or the
+    /// second (the retry it earns).
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Set while a move is running. The moves write to the products table
+    /// themselves, and a move's own write is not one of the handler's — left
+    /// uncounted it would shift every later move onto the wrong write.
+    moving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RaceTheRestoreWrite {
+    /// Seed a LIVE product holding the contested slug. Legal only while no
+    /// other live row holds it, which is exactly the state each caller below
+    /// has arranged.
+    async fn claim_the_slug(&self, claimant_id: &str) {
+        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut claimant = HashMap::new();
+        claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+        claimant.insert("slug".to_string(), serde_json::json!(self.slug.clone()));
+        seed(
+            self.inner.as_ref(),
+            "impresspress__products__products",
+            claimant_id,
+            claimant,
+        )
+        .await;
+        self.moving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Soft-delete the claimant, freeing the slug again — the same write the
+    /// delete endpoint issues, so the row goes on existing and the index
+    /// stops seeing it.
+    async fn release_the_slug(&self) {
+        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+        super::super::repo::products::soft_delete(self.inner.as_ref(), &self.claimant_id)
+            .await
+            .expect("the concurrent delete of the claimant lands");
+        self.moving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl wafer_run::context::Context for RaceTheRestoreWrite {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), wafer_run::WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: wafer_run::Message,
+        input: wafer_run::InputStream,
+    ) -> wafer_run::OutputStream {
+        #[derive(serde::Deserialize)]
+        struct CollectionPeek {
+            collection: String,
+        }
+
+        if name != "wafer-run/database" || msg.action() != "database.update_where_count" {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|peek| peek.collection)
+            .unwrap_or_default();
+        let ours = collection == super::super::repo::products::TABLE
+            && !self.moving.load(std::sync::atomic::Ordering::SeqCst);
+        let nth = ours.then(|| {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        });
+
+        match (self.when, nth) {
+            (RaceMove::ClaimantAppearsFirst, Some(0)) => {
+                self.claim_the_slug(&self.claimant_id).await
+            }
+            (RaceMove::ReclaimedBeforeTheRetry, Some(1)) => {
+                self.claim_the_slug(LATE_CLAIMANT).await
+            }
+            _ => {}
+        }
+        let out = self
+            .inner
+            .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+            .await;
+        match (self.when, nth) {
+            (RaceMove::ClaimantVanishesFirst, Some(0))
+            | (RaceMove::ReclaimedBeforeTheRetry, Some(0)) => self.release_the_slug().await,
+            _ => {}
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+/// Seed `original`, soft-deleted, holding slug `widget`.
+async fn seed_a_deleted_product_holding_widget(ctx: &crate::test_support::TestContext) {
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(ctx, "original").await;
+}
+
+/// The ordering itself, not just its happy outcome: the restore WRITES first
+/// and only reads if the write refused.
+///
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` seeds its
+/// claimant before the request, so it answers 409 under a pre-check
+/// implementation exactly as it does under this one — it pins the response,
+/// not the ordering the response's correctness depends on. This pins the
+/// ordering, by putting the claimant *inside* the window a pre-check leaves
+/// open: it appears after any look-before-you-write would have looked, and
+/// before the write it makes fail.
+///
+/// A pre-check therefore sees a clear slug, writes, and can only report the
+/// index violation as an opaque 500 — the exact failure it was added to
+/// prevent. Reading the collision off the write's own refusal cannot be
+/// raced this way: the write either landed, in which case there was no
+/// collision, or it did not, in which case the row is still deleted and the
+/// claimant is still there to be named.
+#[tokio::test]
+async fn restore_names_a_slug_claimed_after_a_pre_check_would_have_looked() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ClaimantAppearsFirst,
+        writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&racing, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("restore over a slug claimed mid-flight must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug claimed inside the window must still read as a conflict, not a 500: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(ctx.as_ref(), "original").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// Writing first removed the pre-check's window, but the *classification*
+/// still asks the database a second question, and the rows it asks about are
+/// mutable. If the claimant is renamed or deleted between the failed write
+/// and the probe, the probe finds nothing to blame and the admin gets back
+/// the opaque 500 the whole branch exists to avoid — on a restore that would
+/// now succeed if simply attempted again.
+///
+/// So a clear probe is not an answer, it is a reason to try again: a slug
+/// nothing holds is a slug this product can re-claim. One retry, which either
+/// lands (the collision really had gone) or fails again and is reported for
+/// what it is.
+#[tokio::test]
+async fn restore_lands_when_the_claimant_vanishes_before_the_probe() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    // Legal only because the delete freed the slug.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx.as_ref(),
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ClaimantVanishesFirst,
+        writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&racing, msg, input).await).await;
+    assert_eq!(
+        body["id"], "original",
+        "a collision that has gone by the time it is probed must not become a 500: {body}"
+    );
+    assert!(
+        !is_soft_deleted(ctx.as_ref(), "original").await,
+        "the retried restore must have landed"
+    );
+}
+
+/// The window the retry above opens and does not close. The retry is itself
+/// a write, and the slug it re-claims is free only until someone else takes
+/// it: probe reads clear, another request claims the slug, the retry violates
+/// the same index the first write did.
+///
+/// That second failure used to go straight to `write_error`, which answers
+/// the opaque 500 this entire branch exists to prevent — on a request that
+/// IS a slug conflict and has the slug in hand to name. The Deleted view's
+/// Restore button only reloads on success, so what an admin sees is a button
+/// that does nothing at all, with nothing said about why.
+///
+/// A second failure after a CLEAR probe is therefore reported as the conflict
+/// it is. It is not retried again: a retry loop would chase a slug another
+/// request is free to go on re-claiming, and the honest answer — someone else
+/// holds this slug, free it and try again — is already available. One retry
+/// stays safe for the reason it always was: `restore` only clears
+/// `deleted_at` on the same already-deleted row, so a repeat creates no
+/// duplicate record and no ancillary state.
+#[tokio::test]
+async fn restore_reports_a_conflict_when_the_slug_is_reclaimed_before_the_retry() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    // Legal only because the delete freed the slug, and what makes the FIRST
+    // restore write violate `..._owner_slug_uniq`.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx.as_ref(),
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ReclaimedBeforeTheRetry,
+        writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&racing, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("a retry over a re-claimed slug must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug re-claimed between the probe and the retry must still read as \
+         a conflict, not as the 500 the probe exists to prevent: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(ctx.as_ref(), "original").await,
+        "a refused restore must leave the product deleted"
+    );
+    // The late claimant is the one holding the slug now, and it is live: the
+    // conflict named a real, current claim rather than a stale one.
+    assert!(
+        !is_soft_deleted(ctx.as_ref(), LATE_CLAIMANT).await,
+        "the slug's new holder must still be live"
+    );
+}
+
+/// The third direction of the same rule, and the one the retry's new
+/// classification could get wrong: "cannot have collided" is not "clear".
+///
+/// Migration 005's unique index is partial on `slug <> ''` as well as on
+/// `deleted_at IS NULL`, so a product with no slug cannot be refused by it —
+/// any number of rows may carry an empty one. A failed restore of such a row
+/// is therefore not a slug question at all, and reading the probe's "nothing
+/// holds that slug" as a clear slug would retry a collision that cannot
+/// exist and then, on the second failure, blame a slug that is the empty
+/// string: `Another product already uses the slug ""`, 409, for what is
+/// really a database wobble.
+///
+/// So an empty slug is [`SlugProbe::Unknown`], and the write's own error goes
+/// out against a correlation id — the same answer as a probe that could not
+/// run, for the same reason: no slug answer is available.
+#[tokio::test]
+async fn restore_of_a_slugless_product_reports_the_write_failure_not_a_slug_conflict() {
+    let ctx = ctx().await;
+
+    // No `slug` key at all, which is what every product created without one
+    // carries.
+    let mut slugless = HashMap::new();
+    slugless.insert("name".to_string(), serde_json::json!("Slugless"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "slugless",
+        slugless,
+    )
+    .await;
+    soft_delete_product(&ctx, "slugless").await;
+
+    // Mutations now fail while reads still resolve: the restore write fails
+    // for a reason that has nothing to do with any index, and the probe that
+    // runs next can still read the row it is asked about.
+    let ctx = ctx.break_writes();
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/slugless/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("a restore whose write failed must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::Internal,
+        "a product with no slug cannot collide on the slug index, so its \
+         failed restore must carry the write's own error rather than a \
+         conflict blaming an empty slug: {error:?}"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "slugless").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// The other direction of the same rule: "could not tell" is not "conflict".
+/// When the restore write fails and the collision probe that would name the
+/// slug cannot itself run, the response must carry the write's real failure —
+/// an `Internal` error against a correlation id an admin can quote — rather
+/// than a confident 409 blaming a slug nothing has confirmed is taken.
+///
+/// The restore write is failed by a REAL slug collision (the claimant seeded
+/// below), not by breaking the write itself. That matters: the earlier
+/// version of this test seeded no claimant and relied on
+/// `TestContext::break_list_reads` to fail the write too, which it did only
+/// because `FailingReadsDb` inherited the `DatabaseService` trait's
+/// read-based `update_where_count` default — count, then update. Every real
+/// backend overrides that with one `UPDATE` carrying no `count`, so in
+/// production the write landed, the handler returned 200, and the branch
+/// this test names was unreachable. The test asserted an outcome production
+/// could not produce. With the double corrected, the failure has to come
+/// from something production can actually do — and the unique index from
+/// migration 005 is exactly that.
+#[tokio::test]
+async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
+    let ctx = ctx().await;
+
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "original",
+        original,
+    )
+    .await;
+    soft_delete_product(&ctx, "original").await;
+
+    // Legal only because the delete freed the slug — and it is what makes
+    // the restore's `UPDATE` violate `..._owner_slug_uniq`, exactly as in
+    // `restore_reports_a_slug_conflict_instead_of_an_opaque_error`.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    // Listings now fail while by-id reads still resolve: the restore write
+    // fails on the index, `get_deleted` still finds the row, and the
+    // collision probe's `list_all` is the one read that cannot run — the
+    // exact interleaving a transient database wobble produces on top of a
+    // genuine collision, and the only one that reaches the "probe could not
+    // tell" branch.
+    let ctx = ctx.break_list_reads();
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&ctx, msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::Internal).await,
+        "a probe that could not run must fail the restore, not be read as a clear slug"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "original").await,
+        "a restore that could not check its slug must leave the product deleted"
+    );
 }
 
 // ============================================================
@@ -1420,15 +2625,15 @@ async fn admin_product_duplicate_copies_safe_metadata_and_non_archived_offers_as
     let duplicated = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
     let copy = &duplicated["product"];
     assert_ne!(copy["id"], source["id"]);
-    assert_eq!(copy["data"]["name"], "Original product copy");
-    assert!(copy["data"]["slug"]
+    assert_eq!(copy["name"], "Original product copy");
+    assert!(copy["slug"]
         .as_str()
         .unwrap()
         .starts_with("original-product-copy-"));
-    assert_eq!(copy["data"]["description"], "Keep this description");
-    assert_eq!(copy["data"]["status"], "draft");
-    assert_eq!(copy["data"]["owner_kind"], "platform");
-    assert_eq!(copy["data"]["approval_status"], "approved");
+    assert_eq!(copy["description"], "Keep this description");
+    assert_eq!(copy["status"], "draft");
+    assert_eq!(copy["owner_kind"], "platform");
+    assert_eq!(copy["approval_status"], "approved");
     let offers = duplicated["offers"].as_array().unwrap();
     assert_eq!(offers.len(), 1, "archived offers must not be copied");
     assert_eq!(offers[0]["status"], "draft");
@@ -1469,11 +2674,11 @@ async fn seller_product_duplicate_preserves_owner_moderation_and_rejects_other_s
 
     let (msg, input) = create_msg(&path, "seller_a", serde_json::json!({}));
     let duplicated = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(duplicated["product"]["data"]["owner_kind"], "user");
-    assert_eq!(duplicated["product"]["data"]["owner_id"], "seller_a");
-    assert_eq!(duplicated["product"]["data"]["created_by"], "seller_a");
-    assert_eq!(duplicated["product"]["data"]["status"], "draft");
-    assert_eq!(duplicated["product"]["data"]["approval_status"], "draft");
+    assert_eq!(duplicated["product"]["owner_kind"], "user");
+    assert_eq!(duplicated["product"]["owner_id"], "seller_a");
+    assert_eq!(duplicated["product"]["created_by"], "seller_a");
+    assert_eq!(duplicated["product"]["status"], "draft");
+    assert_eq!(duplicated["product"]["approval_status"], "draft");
 }
 
 #[tokio::test]
@@ -1492,7 +2697,7 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
     );
     let product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
-    assert_eq!(product["data"]["status"], "draft");
+    assert_eq!(product["status"], "draft");
 
     let offer_collection = format!("/admin/b/products/products/{product_id}/offers");
     let (msg, input) = admin_create_msg(
@@ -1546,7 +2751,7 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
         serde_json::json!({"status": "active"}),
     );
     let active_product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
-    assert_eq!(active_product["data"]["status"], "active");
+    assert_eq!(active_product["status"], "active");
 
     let (msg, input) = get_msg(&format!("/b/products/storefront/{product_id}"), "");
     let storefront = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
@@ -1574,8 +2779,8 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
     );
     let product = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
-    assert_eq!(product["data"]["owner_id"], "seller_wizard");
-    assert_eq!(product["data"]["approval_status"], "draft");
+    assert_eq!(product["owner_id"], "seller_wizard");
+    assert_eq!(product["approval_status"], "draft");
 
     let offer_collection = format!("/b/products/products/{product_id}/offers");
     let (msg, input) = create_msg(
@@ -1641,8 +2846,8 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
         serde_json::json!({"status": "active"}),
     );
     let pending = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
-    assert_eq!(pending["data"]["status"], "pending_review");
-    assert_eq!(pending["data"]["approval_status"], "pending");
+    assert_eq!(pending["status"], "pending_review");
+    assert_eq!(pending["approval_status"], "pending");
 
     let (msg, input) = get_msg(&format!("/b/products/storefront/{product_id}"), "");
     assert!(
@@ -1680,6 +2885,491 @@ async fn manage_products_uses_data_table_with_mobile_labels() {
         "data_table cells should carry data-label for the mobile card collapse"
     );
     assert!(html.contains("Widget"), "the seeded product should render");
+}
+
+/// `?view=deleted` is the only way to reach a soft-deleted row from the
+/// admin UI — without it, soft delete is a one-way door. Pins that the
+/// deleted view shows exactly the deleted rows (not the live ones), and
+/// that the default (no `view`) list keeps excluding them.
+#[tokio::test]
+async fn manage_products_deleted_view_lists_only_deleted_products() {
+    let ctx = ctx().await;
+
+    let mut live = HashMap::new();
+    live.insert("name".to_string(), serde_json::json!("live"));
+    live.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "live", live).await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (default_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    let default_html =
+        output_to_html(super::super::pages::manage_products(&ctx, &default_msg).await).await;
+    assert!(default_html.contains(">live<"), "{default_html}");
+    assert!(!default_html.contains(">gone<"), "{default_html}");
+
+    let (mut deleted_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    deleted_msg.set_meta("req.query.view", "deleted");
+    let deleted_html =
+        output_to_html(super::super::pages::manage_products(&ctx, &deleted_msg).await).await;
+    assert!(deleted_html.contains(">gone<"), "{deleted_html}");
+    assert!(!deleted_html.contains(">live<"), "{deleted_html}");
+}
+
+/// The deleted view's table has a `Deleted` column, so it has to be ordered
+/// by it. Sorting the deleted list `created_at desc` (the live list's order)
+/// puts the product an admin just deleted wherever its creation date happens
+/// to fall — which for an old product is the bottom of the list, on the one
+/// page whose entire purpose is undoing a delete that was probably a moment
+/// ago.
+#[tokio::test]
+async fn manage_products_deleted_view_sorts_by_when_the_product_was_deleted() {
+    let ctx = ctx().await;
+
+    // Created most recently, deleted longest ago: first by `created_at
+    // desc`, last by `deleted_at desc`.
+    let mut stale = HashMap::new();
+    stale.insert("name".to_string(), serde_json::json!("Deleted long ago"));
+    stale.insert("status".to_string(), serde_json::json!("active"));
+    stale.insert(
+        "created_at".to_string(),
+        serde_json::json!("2026-02-01T00:00:00Z"),
+    );
+    stale.insert(
+        "deleted_at".to_string(),
+        serde_json::json!("2026-03-01T00:00:00Z"),
+    );
+    seed(&ctx, "impresspress__products__products", "stale", stale).await;
+
+    let mut fresh = HashMap::new();
+    fresh.insert("name".to_string(), serde_json::json!("Deleted just now"));
+    fresh.insert("status".to_string(), serde_json::json!("active"));
+    fresh.insert(
+        "created_at".to_string(),
+        serde_json::json!("2026-01-01T00:00:00Z"),
+    );
+    fresh.insert(
+        "deleted_at".to_string(),
+        serde_json::json!("2026-03-02T00:00:00Z"),
+    );
+    seed(&ctx, "impresspress__products__products", "fresh", fresh).await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    let fresh_at = html
+        .find("Deleted just now")
+        .expect("the recently deleted product must render");
+    let stale_at = html
+        .find("Deleted long ago")
+        .expect("the older deletion must render");
+    assert!(
+        fresh_at < stale_at,
+        "the deleted view must be ordered by deleted_at desc, so the product just deleted \
+         is at the top; got 'Deleted long ago' at {stale_at} before 'Deleted just now' at {fresh_at}"
+    );
+}
+
+/// The deleted view is a dead end unless the way back is obvious: pin that
+/// each deleted row's Restore action posts to the actual restore endpoint,
+/// not the edit page (which 404s for a soft-deleted product until it is
+/// restored).
+#[tokio::test]
+async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    assert!(
+        html.contains("/b/products/api/admin/products/gone/restore"),
+        "deleted row should offer a Restore action wired to the restore endpoint: {html}"
+    );
+    assert!(
+        !html.contains(r#"href="/b/products/admin/products/gone""#),
+        "a deleted row must not link into the edit page, which refuses a soft-deleted product: {html}"
+    );
+}
+
+// The Restore button's URL is built server-side by interpolating the row's id
+// into a path segment, so the id has to be percent-encoded — every
+// browser-side URL in this file already runs its ids through
+// `encodeURIComponent`, and this one had nothing. maud escapes HTML, not URLs.
+//
+// Ids containing `/`, `?` or `#` are reachable, not hypothetical: `db::create`
+// synthesizes a UUID only when the body omits `id`, and the admin create
+// endpoint forwarded the body verbatim until this branch began refusing `id`,
+// so any deployment that ever ran a seeding client against it can hold such a
+// row.
+//
+// Encoding alone is only half a round trip, and the half that is easy to
+// assert. The test below therefore asserts the WHOLE trip — render the URL,
+// send it through the real router, and check the product came back — because
+// an "the HTML contains %2F" assertion passes just as happily when the
+// endpoint on the other end 404s.
+
+/// The URL the Deleted view renders for `id` is the URL that restores `id`.
+///
+/// Drives the real path: `manage_products` renders the row, the `hx-post`
+/// target is read back out of that HTML verbatim (no hand-built URL, so a
+/// change to either half of the encoding is caught), and it goes through
+/// `route_to_block` → `ProductsBlock::handle` → `endpoint_match::dispatch_path`
+/// → `handle_restore_product` → the repository.
+///
+/// The id carries `/`, `?` and `#`, which end a path segment for three
+/// different reasons: path separator, query start, fragment start. Every HTTP
+/// adapter hands impresspress the path still percent-encoded — axum's
+/// `Uri::path`, `url::Url::path` on Cloudflare, `Url.pathname` in the Service
+/// Worker — so `%2F` reaches the matcher intact and the route does not split;
+/// the decode owed is on the matched `{id}`, and that is what
+/// `dispatch_path` now does.
+#[tokio::test]
+async fn the_restore_url_the_deleted_view_renders_restores_that_product() {
+    let ctx = ctx().await;
+
+    let awkward_id = "prod/1?x#y";
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", awkward_id, gone).await;
+    soft_delete_product(&ctx, awkward_id).await;
+
+    let (mut page_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    page_msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &page_msg).await).await;
+
+    let restore_url = rendered_hx_post(&html)
+        .unwrap_or_else(|| panic!("the deleted row must render an hx-post Restore action: {html}"));
+    assert_eq!(
+        restore_url, "/b/products/api/admin/products/prod%2F1%3Fx%23y/restore",
+        "the Restore action must percent-encode the product id into its path segment"
+    );
+
+    // The wire path, unmodified, through the real router.
+    let (msg, input) = admin_create_msg(&restore_url, serde_json::json!({}));
+    let out = dispatch_routed(&ctx, msg, input).await;
+    let body = output_to_json(out).await;
+    assert_eq!(
+        body["id"], awkward_id,
+        "posting the rendered Restore URL must reach the product it names"
+    );
+
+    // And the product is actually live again, not merely answered about.
+    let restored = super::super::repo::products::get(&ctx, awkward_id)
+        .await
+        .expect("the restored product must be readable through the live-only door");
+    assert!(
+        crate::util::RecordExt::str_field(&restored, "deleted_at").is_empty(),
+        "restore must clear deleted_at: {restored:?}"
+    );
+}
+
+/// The value of the first `hx-post="..."` attribute in `html`.
+fn rendered_hx_post(html: &str) -> Option<String> {
+    let start = html.find("hx-post=\"")? + "hx-post=\"".len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The Restore button reloads the page on success. Without an explicit
+/// failure branch a refused restore — a slug collision is reachable, see
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — renders as
+/// nothing happening at all: no reload, no message, on the only door out of
+/// soft delete. Pin that the button feeds the failure into the shared toast
+/// channel `ui::assets::toast_js` already listens on.
+#[tokio::test]
+async fn manage_products_deleted_view_reports_a_failed_restore() {
+    let ctx = ctx().await;
+
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", "gone", gone).await;
+    soft_delete_product(&ctx, "gone").await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    // `showToast` alone would match the page shell's own listener script,
+    // which every admin page carries — the assertion has to see the BUTTON
+    // raising the event.
+    assert!(
+        html.contains("new CustomEvent('showToast'"),
+        "a failed restore must surface, not vanish: {html}"
+    );
+}
+
+// ============================================================
+// The close-only manager for a deleted product
+// ============================================================
+
+/// Seed a soft-deleted product with one published offer and one Payment Link
+/// that never reached Stripe, and return the offer and link ids.
+///
+/// The link is deliberately pending: deactivating it is then a purely local
+/// write, so these tests need no Stripe stand-in for the thing they are
+/// actually about — whether the UI can reach the close operations at all.
+async fn seed_a_deleted_product_with_a_money_surface(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+) -> (String, String) {
+    use super::super::{
+        contracts::PricingPreviewRequest,
+        offer_pricing,
+        repo::{offers as offer_repo, payment_links, products},
+    };
+
+    let offer_id = seed_published_offer(ctx, product_id).await;
+    let managed = offer_repo::get_managed(ctx, &offer_id)
+        .await
+        .expect("the offer is readable");
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: Default::default(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .expect("price the offer");
+    let link_id =
+        payment_links::create_pending(ctx, &offer_id, "", "", "", false, "close-me", &preview, 0)
+            .await
+            .expect("a pending Payment Link")
+            .managed
+            .id;
+
+    products::soft_delete(ctx, product_id)
+        .await
+        .expect("soft delete");
+    (offer_id, link_id)
+}
+
+/// The `ProductState::LiveOrDeleted` widening exists so a deleted product's
+/// Stripe surface can be closed without restoring the listing, but the
+/// Deleted view offered only **Restore** — which puts an active, approved
+/// product straight back into the public catalog. The one affordance on
+/// offer was the dangerous one, and the safe one was reachable only by an
+/// operator who already knew every id.
+#[tokio::test]
+async fn deleted_view_links_to_the_close_only_manager() {
+    let ctx = ctx().await;
+
+    // An id that is not URL-safe, so the link is pinned to carry the same
+    // percent-encoding the Restore action does.
+    let awkward_id = "prod/1?x#y";
+    let mut gone = HashMap::new();
+    gone.insert("name".to_string(), serde_json::json!("gone"));
+    gone.insert("status".to_string(), serde_json::json!("active"));
+    seed(&ctx, "impresspress__products__products", awkward_id, gone).await;
+    soft_delete_product(&ctx, awkward_id).await;
+
+    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+
+    let close_url = "/b/products/admin/products/prod%2F1%3Fx%23y/close";
+    assert!(
+        html.contains(close_url),
+        "a deleted row must offer a way to close its Stripe surface, not only Restore: {html}"
+    );
+
+    // And the link resolves: the SSR page dispatch decodes its id segment the
+    // same way `endpoint_match` decodes an API one, so the encoding the row
+    // applies has an inverse on the other end.
+    let (msg, input) = admin_get_msg(close_url);
+    let page = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        page.contains("Nothing left to close"),
+        "the rendered close link must resolve to that product's close manager: {page}"
+    );
+}
+
+/// The whole point of the page, end to end: the action it renders for a
+/// deleted product's offer actually archives that offer — the first
+/// `ProductState::LiveOrDeleted` operation any UI has ever reached.
+///
+/// The URL is read back out of the rendered HTML rather than hand-built, and
+/// the page itself is fetched through the real router, so both halves — the
+/// SSR route and the API the button targets — are the shipped ones.
+#[tokio::test]
+async fn the_close_manager_archives_a_deleted_products_offer_from_its_own_rendered_action() {
+    let ctx = ctx().await;
+    let (offer_id, _link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    let archive_url = rendered_attr(&html, "hx-delete=\"", &offer_id).unwrap_or_else(|| {
+        panic!("the close manager must render an archive action for offer {offer_id}: {html}")
+    });
+    let (mut msg, input) = delete_msg(&archive_url, "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let archived = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        archived["status"], "archived",
+        "the rendered archive action must archive the deleted product's offer: {archived}"
+    );
+
+    // And it did not resurrect the product.
+    assert!(
+        is_soft_deleted(&ctx, "gone").await,
+        "closing a money surface must not restore the listing"
+    );
+}
+
+/// The same for a Payment Link, which is the half that is actually still
+/// taking money.
+#[tokio::test]
+async fn the_close_manager_deactivates_a_deleted_products_payment_link() {
+    let ctx = ctx().await;
+    let (_offer_id, link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    let deactivate_url = rendered_attr(&html, "hx-delete=\"", &link_id).unwrap_or_else(|| {
+        panic!("the close manager must render a deactivate action for link {link_id}: {html}")
+    });
+    let (mut msg, input) = delete_msg(&deactivate_url, "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let deactivated = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the rendered deactivate action must take the link down: {deactivated}"
+    );
+}
+
+/// Close-only means close-only. A deleted product's manager must not carry
+/// anything that keeps it selling — no create, publish, sync, duplicate or
+/// storefront link — because every one of those is an operation the
+/// `ProductState::Live` gate below it would refuse anyway, and offering it
+/// on a page about shutting a product down is an invitation to do the
+/// opposite.
+#[tokio::test]
+async fn the_close_manager_offers_nothing_that_keeps_selling() {
+    let ctx = ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+
+    // Positive control first, so the refusals below cannot pass on an empty
+    // page.
+    assert!(
+        html.contains("Checkout product") && html.contains("hx-delete="),
+        "the page must render the product and its closing actions: {html}"
+    );
+
+    for forbidden in [
+        "productManagerPublishOffer",
+        "productManagerSyncOffer",
+        "productManagerDuplicate",
+        "productManagerCreateLink",
+        "productManagerSetStatus",
+        "product-manager-form",
+        "/b/products/catalog/gone",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "the close-only manager must not offer `{forbidden}`: {html}"
+        );
+    }
+    // POST and PATCH open or change a money surface; only DELETE closes one.
+    assert!(
+        !html.contains("hx-post=") && !html.contains("hx-patch="),
+        "the close-only manager must only ever issue closing requests: {html}"
+    );
+}
+
+/// A live product belongs in the ordinary manager, which can do everything.
+/// This page reads through `get_deleted`, so it simply does not exist for one.
+#[tokio::test]
+async fn the_close_manager_404s_for_a_live_product() {
+    let ctx = ctx().await;
+    seed_published_offer(&ctx, "alive").await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/products/alive/close");
+    assert!(
+        output_is_error(dispatch_routed(&ctx, msg, input).await, ErrorCode::NotFound).await,
+        "the close-only manager is for deleted products"
+    );
+
+    // Positive control: the same path for a DELETED product renders, so the
+    // 404 above is about the product's state and not about the route.
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "the route itself must exist: {html}"
+    );
+}
+
+/// `/b/products` is a PUBLIC route prefix — every admin page under it is
+/// admin-only solely because its `BlockEndpoint` declares
+/// `AuthLevel::Admin`. A new page path with no declaration is therefore
+/// reachable by anyone, so this drives the real router the way
+/// `restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it`
+/// does.
+#[tokio::test]
+async fn the_close_manager_is_admin_only() {
+    let ctx = ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+
+    let (msg, input) = get_msg("/b/products/admin/products/gone/close", "user_1");
+    assert!(
+        dispatch_routed(&ctx, msg, input)
+            .await
+            .collect_buffered()
+            .await
+            .is_err(),
+        "a non-admin must not reach the close-only manager"
+    );
+
+    // Positive control: the admin does.
+    let (msg, input) = admin_get_msg("/b/products/admin/products/gone/close");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "an admin must reach the page the assertion above denies: {html}"
+    );
+}
+
+/// The value of the first `attr` whose element also mentions `needle`.
+///
+/// Attribute values are unique enough here that a plain scan for the id and a
+/// backwards walk to the attribute would be fragile; this instead takes every
+/// value of `attr` and returns the one containing `needle`.
+fn rendered_attr(html: &str, attr: &str, needle: &str) -> Option<String> {
+    let mut rest = html;
+    while let Some(start) = rest.find(attr) {
+        rest = &rest[start + attr.len()..];
+        let end = rest.find('"')?;
+        let value = &rest[..end];
+        if value.contains(needle) {
+            return Some(value.to_string());
+        }
+        rest = &rest[end..];
+    }
+    None
 }
 
 #[tokio::test]
@@ -2307,6 +3997,8 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
     // two surfaces cannot drift again.
     use wafer_run::{AuthLevel, Block};
 
+    use crate::endpoint_match;
+
     let info = super::super::ProductsBlock::new().info();
 
     for route in super::super::handlers::ADMIN_ROUTES {
@@ -2327,21 +4019,1472 @@ fn dispatch_tables_are_backed_by_declared_endpoints() {
         );
     }
 
+    // A user dispatch route answers at BOTH wire spellings, because
+    // `ProductsBlock::handle` enters `handle_user` from `/b/products/api/...`
+    // (normalized) AND from the raw `/b/products/...` path. Declaring only
+    // one of them is legal — the other then resolves to `declared_access`'s
+    // `Authenticated` fallback — but only while that fallback is no weaker
+    // than the declaration. Restore was declared `Admin` at the `/api/`
+    // spelling alone and was therefore reachable at `Authenticated` through
+    // the raw one: any logged-in user could resurrect any soft-deleted
+    // product. So the rule is not "some spelling is declared" (which that
+    // route satisfied) but "EVERY spelling that reaches the handler is
+    // enforced at least as strictly as the strictest declaration" — which
+    // in practice keeps `Admin` routes off this table entirely, where they
+    // belong on `ADMIN_ROUTES` behind the single `/b/products/api/admin`
+    // prefix.
     for route in super::super::handlers::USER_ROUTES {
-        // User dispatch paths are reached both from `/b/products/api/...`
-        // (normalized) and directly (`catalog`, `checkout`, ...). Either
-        // declaration form keeps the central gate authoritative.
         let api_path = route.template.replacen("/b/products", "/b/products/api", 1);
+        let action = endpoint_match::action_for_method(route.method);
+        let spellings = [
+            (
+                api_path.as_str(),
+                endpoint_match::endpoint_auth(&info.endpoints, action, &api_path),
+            ),
+            (
+                route.template,
+                endpoint_match::endpoint_auth(&info.endpoints, action, route.template),
+            ),
+        ];
         assert!(
-            info.endpoints.iter().any(|endpoint| {
-                endpoint.method == route.method
-                    && (endpoint.path == api_path || endpoint.path == route.template)
-            }),
+            spellings.iter().any(|(_, declared)| declared.is_some()),
             "user dispatch route {:?} {} declared neither as {} nor as {}",
             route.method,
             route.template,
             api_path,
             route.template,
         );
+        let strictest = spellings
+            .iter()
+            .filter_map(|(_, declared)| *declared)
+            .max_by_key(|auth| auth_rank(*auth))
+            .expect("at least one spelling is declared");
+        for (spelling, declared) in spellings {
+            // Undeclared spellings get `declared_access`'s fail-closed
+            // fallback, mirroring routing.rs:567's `route.access.max(..)`
+            // (the `/b/products` prefix tier is `Public`, so the fallback is
+            // the whole decision).
+            let enforced = declared.unwrap_or(AuthLevel::Authenticated);
+            assert!(
+                auth_rank(enforced) >= auth_rank(strictest),
+                "user dispatch route {:?} {} is enforced at {:?} on the {} spelling but \
+                 declared {:?} elsewhere — the weaker spelling reaches the same handler, \
+                 so the declaration is not the tier a caller actually faces. Move it to \
+                 ADMIN_ROUTES (one prefix, one spelling) or declare every spelling.",
+                route.method,
+                route.template,
+                enforced,
+                spelling,
+                strictest,
+            );
+        }
     }
+}
+
+// ============================================================
+// Typed row projection
+// ============================================================
+
+/// Every product endpoint publishes `contracts::ProductView`, flat, with the
+/// exact field set the type declares — not the database layer's
+/// `{id, data: {column → value}}` record, and not whatever else the row holds.
+#[tokio::test]
+async fn product_endpoints_publish_the_flat_product_view() {
+    use crate::blocks::products::contracts::ProductView;
+
+    let ctx = ctx().await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({
+            "name": "Flat",
+            "tags": ["a", "b"],
+            "metadata": {"k": 1},
+            "stock": 3,
+            "fulfillment_kind": "download"
+        }),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(
+        created.get("data").is_none(),
+        "rows are flat views, not {{id, data}} records: {created}"
+    );
+    let view: ProductView =
+        serde_json::from_value(created.clone()).expect("create response is a ProductView");
+    assert_eq!(view.name, "Flat");
+    assert_eq!(view.tags, vec!["a", "b"]);
+    assert_eq!(view.metadata.get("k"), Some(&serde_json::json!(1)));
+    assert_eq!(view.stock, 3);
+    assert_eq!(view.status, "draft");
+    assert_eq!(view.owner_kind, "platform");
+    assert_eq!(view.approval_status, "approved");
+    assert_eq!(view.created_by, "admin_1");
+    assert_eq!(view.fulfillment_kind, "download");
+    assert_eq!(view.current_version, 1);
+    assert_eq!(view.published_at, None);
+    // The response carries exactly the view's keys: nothing the row holds
+    // reaches the wire unless the type names it.
+    assert_eq!(serde_json::to_value(&view).unwrap(), created);
+
+    let id = view.id.clone();
+    let (msg, input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
+    let fetched = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(fetched, created);
+
+    let (msg, input) = admin_get_msg("/admin/b/products/products");
+    let list = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(list["total_count"], 1);
+    assert_eq!(list["page"], 1);
+    assert_eq!(list["page_size"], 20);
+    assert_eq!(list["records"][0], created);
+
+    let (mut msg, input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({"description": "Renamed", "tags": ["c"]}),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    let updated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let updated_view: ProductView =
+        serde_json::from_value(updated.clone()).expect("update response is a ProductView");
+    assert_eq!(updated_view.description, "Renamed");
+    assert_eq!(updated_view.tags, vec!["c"]);
+    assert_eq!(
+        updated_view.name, "Flat",
+        "untouched columns survive a PATCH"
+    );
+    assert_eq!(serde_json::to_value(&updated_view).unwrap(), updated);
+}
+
+/// The seller create path used to hand every key of the body to the
+/// database. The update path stripped the ownership, moderation and provider
+/// columns; the create path did not, so a seller could create a product
+/// already published, already synchronized to a Stripe product they did not
+/// own, or attached to another seller's account. The typed request has no
+/// such fields, so nothing a client sends can reach them on either path.
+#[tokio::test]
+async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
+    use super::super::repo::products::TABLE;
+    use crate::util::RecordExt;
+
+    let ctx = user_products_ctx().await;
+    let smuggled = serde_json::json!({
+        "seller_account_id": "acct_other",
+        "stripe_product_id": "prod_hijacked",
+        "current_version": 9,
+        "published_at": "2026-01-01T00:00:00Z",
+        "submitted_at": "2026-01-01T00:00:00Z",
+        "deleted_at": "2026-01-01T00:00:00Z",
+        "owner_kind": "platform",
+        "owner_id": "attacker",
+        "created_by": "attacker",
+        "approval_status": "approved"
+    });
+    let mut body = smuggled.clone();
+    body["name"] = serde_json::json!("Sneaky");
+    let (msg, input) = create_msg("/b/products/products", "seller_a", body);
+    assert!(
+        output_is_error(
+            dispatch_user(&ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await,
+        "a create naming these columns is refused outright, not quietly stripped"
+    );
+
+    // The same seller creating an honest product gets every one of those
+    // columns from the server, which is the other half of the property: the
+    // values are not merely unreachable from a request body, they are set.
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "seller_a",
+        serde_json::json!({"name": "Honest"}),
+    );
+    let created = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let assert_untouched = |row: &wafer_core::clients::database::Record| {
+        assert_eq!(row.str_field("seller_account_id"), "");
+        assert_eq!(row.str_field("stripe_product_id"), "");
+        assert_eq!(row.i64_field("current_version"), 1);
+        assert_eq!(row.str_field("published_at"), "");
+        assert_eq!(row.str_field("submitted_at"), "");
+        assert_eq!(row.str_field("deleted_at"), "");
+        assert_eq!(row.str_field("owner_kind"), "user");
+        assert_eq!(row.str_field("owner_id"), "seller_a");
+        assert_eq!(row.str_field("created_by"), "seller_a");
+        assert_eq!(row.str_field("approval_status"), "draft");
+    };
+    let row = wafer_core::clients::database::get(&ctx, TABLE, &id)
+        .await
+        .expect("created row");
+    assert_untouched(&row);
+
+    let (msg, input) = update_msg(&format!("/b/products/products/{id}"), "seller_a", smuggled);
+    assert!(
+        output_is_error(
+            dispatch_user(&ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await,
+        "and so is an update naming them"
+    );
+    let row = wafer_core::clients::database::get(&ctx, TABLE, &id)
+        .await
+        .expect("updated row");
+    assert_untouched(&row);
+}
+
+/// A `PATCH` field sent as an explicit `null` is treated as absent: the
+/// column keeps its value rather than becoming a `NULL` write against a
+/// `NOT NULL` column, and the other fields in the same body still apply.
+#[tokio::test]
+async fn seller_patch_treats_explicit_null_fields_as_absent() {
+    use super::super::repo::products::TABLE;
+    use crate::util::RecordExt;
+
+    let ctx = user_products_ctx().await;
+    let (msg, input) = create_msg(
+        "/b/products/products",
+        "seller_a",
+        serde_json::json!({
+            "name": "Kept",
+            "description": "Original",
+            "category": "tools",
+            "stock": 7
+        }),
+    );
+    let created = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let id = created["id"].as_str().expect("created id").to_string();
+    assert_eq!(created["stock"], 7, "{created}");
+
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{id}"),
+        "seller_a",
+        serde_json::json!({
+            "name": "Renamed",
+            "description": null,
+            "category": null,
+            "stock": null
+        }),
+    );
+    let updated = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(updated["name"], "Renamed", "{updated}");
+    assert_eq!(updated["description"], "Original", "{updated}");
+    assert_eq!(updated["category"], "tools", "{updated}");
+    assert_eq!(updated["stock"], 7, "{updated}");
+    let row = wafer_core::clients::database::get(&ctx, TABLE, &id)
+        .await
+        .expect("updated row");
+    assert_eq!(row.str_field("description"), "Original");
+    assert_eq!(row.str_field("category"), "tools");
+    assert_eq!(row.i64_field("stock"), 7);
+}
+
+/// A typed request refuses a value outside its contract instead of writing
+/// it to the column as whatever JSON arrived.
+#[tokio::test]
+async fn typed_product_writes_reject_values_outside_the_contract() {
+    let ctx = ctx().await;
+    for body in [
+        serde_json::json!({"status": "draft"}),
+        serde_json::json!({"name": "x", "status": "published"}),
+        serde_json::json!({"name": "x", "fulfillment_kind": "teleport"}),
+        serde_json::json!({"name": "x", "stock": "many"}),
+        serde_json::json!({"name": "x", "tags": "not-a-list"}),
+    ] {
+        let (msg, input) = admin_create_msg("/admin/b/products/products", body.clone());
+        assert!(
+            output_is_error(
+                dispatch_admin(&ctx, msg, input).await,
+                ErrorCode::InvalidArgument
+            )
+            .await,
+            "{body} must be refused"
+        );
+    }
+}
+
+/// Every group endpoint publishes `contracts::GroupView`, flat, with exactly
+/// the type's field set, on both the admin and the owner tier.
+#[tokio::test]
+async fn group_endpoints_publish_the_flat_group_view() {
+    use crate::blocks::products::contracts::GroupView;
+
+    let ctx = user_products_ctx().await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/groups",
+        serde_json::json!({"name": "Admin group", "description": "d", "user_id": "someone"}),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(created.get("data").is_none(), "{created}");
+    let view: GroupView = serde_json::from_value(created.clone()).expect("GroupView");
+    assert_eq!(view.name, "Admin group");
+    assert_eq!(view.user_id, "someone", "an admin may assign the owner");
+    assert_eq!(view.status, "active", "the table default is reported");
+    assert_eq!(serde_json::to_value(&view).unwrap(), created);
+
+    let (mut msg, input) = request_msg(
+        "update",
+        &format!("/admin/b/products/groups/{}", view.id),
+        "admin_1",
+        serde_json::json!({"description": "changed"}),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    let updated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let updated_view: GroupView = serde_json::from_value(updated.clone()).expect("GroupView");
+    assert_eq!(updated_view.description, "changed");
+    assert_eq!(updated_view.name, "Admin group");
+
+    let (msg, input) = admin_get_msg("/admin/b/products/groups");
+    let list = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(list["total_count"], 1);
+    assert_eq!(list["page_size"], 20);
+    assert_eq!(list["records"][0], updated);
+
+    // Owner tier: `user_id` is not a field of the request, so the row keeps
+    // the caller as owner however the body tries to name someone else.
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "Mine", "user_id": "attacker"}),
+    );
+    let own = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let own_view: GroupView = serde_json::from_value(own.clone()).expect("GroupView");
+    assert_eq!(own_view.user_id, "user_1");
+    assert!(
+        !own_view.group_template_id.is_empty(),
+        "the seeded default template is applied"
+    );
+    assert_eq!(serde_json::to_value(&own_view).unwrap(), own);
+
+    let (msg, input) = get_msg(&format!("/b/products/groups/{}", own_view.id), "user_1");
+    let fetched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(fetched, own);
+
+    let (msg, input) = get_msg("/b/products/groups", "user_1");
+    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(list["records"][0], own);
+    assert_eq!(list["total_count"], 1);
+
+    let (msg, input) = delete_msg(&format!("/b/products/groups/{}", own_view.id), "user_1");
+    let deleted = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(deleted, serde_json::json!({"deleted": true}));
+}
+
+/// A group records who created it the way a product does: the caller, on
+/// both tiers. On the admin tier that is the administrator even when the
+/// body assigns the group to someone else as `user_id`; on the owner tier it
+/// is the owner. `created_by` is not a request field, so a body naming
+/// someone else is ignored rather than honoured.
+#[tokio::test]
+async fn group_creates_record_the_caller_as_created_by() {
+    let ctx = user_products_ctx().await;
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/groups",
+        serde_json::json!({"name": "Assigned", "user_id": "someone", "created_by": "attacker"}),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(created["user_id"], "someone");
+    assert_eq!(
+        created["created_by"], "admin_1",
+        "the admin tier records the administrator: {created}"
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "Mine", "created_by": "attacker"}),
+    );
+    let own = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(own["user_id"], "user_1");
+    assert_eq!(
+        own["created_by"], "user_1",
+        "the owner tier records the owner: {own}"
+    );
+}
+
+/// The type endpoints publish `contracts::ProductTypeView`, flat, with
+/// `is_system` normalized to a boolean whichever way the backend stores it.
+#[tokio::test]
+async fn type_endpoints_publish_the_flat_type_view() {
+    use crate::blocks::products::contracts::{CreateProductTypeRequest, ProductTypeView};
+
+    let ctx = ctx().await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/types",
+        serde_json::json!({"name": "subscription", "description": "Recurring", "is_system": true}),
+    );
+    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(created.get("data").is_none(), "{created}");
+    let view: ProductTypeView = serde_json::from_value(created.clone()).expect("ProductTypeView");
+    assert_eq!(view.name, "subscription");
+    assert_eq!(view.description, "Recurring");
+    assert!(view.is_system);
+    assert_eq!(serde_json::to_value(&view).unwrap(), created);
+    // The INTEGER column is written as `0` / `1`, which Postgres requires.
+    // Reading the SQLite row back cannot show that (a bound `true` reads back
+    // as `1` there too), so the assertion is on the column map the request
+    // encodes, which is what reaches either backend.
+    for (is_system, stored) in [(true, 1), (false, 0)] {
+        let columns = CreateProductTypeRequest {
+            name: "subscription".to_string(),
+            description: None,
+            is_system: Some(is_system),
+        }
+        .into_columns();
+        assert_eq!(columns["is_system"], serde_json::json!(stored));
+    }
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/types",
+        serde_json::json!({"name": "plain"}),
+    );
+    let plain = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(plain["is_system"], false, "the table default is reported");
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/types",
+        serde_json::json!({"name": "bad", "is_system": 1}),
+    );
+    assert!(
+        output_is_error(
+            dispatch_admin(&ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await,
+        "is_system is a boolean on the wire"
+    );
+
+    for (msg, input) in [
+        admin_get_msg("/admin/b/products/types"),
+        get_msg("/b/products/types", "user_1"),
+    ] {
+        let out = if msg.path().starts_with("/admin/") {
+            dispatch_admin(&ctx, msg, input).await
+        } else {
+            dispatch_user(&ctx, msg, input).await
+        };
+        let list = output_to_json(out).await;
+        assert_eq!(list["total_count"], 2, "{list}");
+        assert_eq!(list["page_size"], 20);
+        let names: Vec<&str> = list["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"subscription") && names.contains(&"plain"));
+    }
+
+    let (mut msg, input) = delete_msg(&format!("/admin/b/products/types/{}", view.id), "admin_1");
+    msg.set_meta("auth.user_roles", "admin");
+    let deleted = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert_eq!(deleted, serde_json::json!({"deleted": true}));
+}
+
+/// `GET /b/products/group-templates` was documented as the
+/// `{records, total_count, page, page_size}` envelope every other list uses
+/// but answered with a bare JSON array of raw records. It now publishes the
+/// documented envelope over `contracts::GroupTemplateView` rows.
+#[tokio::test]
+async fn group_templates_publish_the_documented_list_envelope() {
+    use crate::blocks::products::contracts::GroupTemplateView;
+
+    let ctx = ctx().await;
+    let (msg, input) = get_msg("/b/products/group-templates", "user_1");
+    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(list.is_object(), "an envelope, not a bare array: {list}");
+    let records = list["records"].as_array().expect("records");
+    assert_eq!(list["total_count"], records.len());
+    // The descriptions commit to these: `page` is "Always `1`" and
+    // `page_size` is "the fixed ceiling on rows returned", the handler's
+    // `limit: 1000`.
+    assert_eq!(list["page"], 1, "{list}");
+    assert_eq!(list["page_size"], 1000, "{list}");
+    assert!(
+        records.iter().any(|r| r["name"] == "default"),
+        "the seeded default template is listed: {list}"
+    );
+    for record in records {
+        let view: GroupTemplateView =
+            serde_json::from_value(record.clone()).expect("GroupTemplateView");
+        assert_eq!(&serde_json::to_value(&view).unwrap(), record);
+    }
+}
+
+/// `GET /b/products/subscription` publishes `contracts::SubscriptionView`
+/// under `subscription`, or `null` when the user has none. The row's
+/// `user_id` and `stripe_customer_id` are never part of it.
+#[tokio::test]
+async fn subscription_status_publishes_the_typed_projection() {
+    use crate::blocks::products::contracts::SubscriptionStatusResponse;
+
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        super::super::repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_row",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_1")),
+            (
+                "stripe_customer_id".to_string(),
+                serde_json::json!("cus_private"),
+            ),
+            (
+                "stripe_subscription_id".to_string(),
+                serde_json::json!("sub_stripe_1"),
+            ),
+            ("plan".to_string(), serde_json::json!("pro")),
+            ("status".to_string(), serde_json::json!("active")),
+            ("addon_projects".to_string(), serde_json::json!(2)),
+        ]),
+    )
+    .await;
+
+    let (msg, input) = get_msg("/b/products/subscription", "user_1");
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let typed: SubscriptionStatusResponse =
+        serde_json::from_value(body.clone()).expect("SubscriptionStatusResponse");
+    assert_eq!(serde_json::to_value(&typed).unwrap(), body);
+    let subscription = typed.subscription.expect("a subscription");
+    assert_eq!(subscription.id, "sub_row");
+    assert_eq!(subscription.plan, "pro");
+    assert_eq!(subscription.status, "active");
+    assert_eq!(subscription.stripe_subscription_id, "sub_stripe_1");
+    assert_eq!(subscription.addon_projects, 2);
+    assert_eq!(subscription.addon_requests, 0, "table default, not absent");
+    assert_eq!(subscription.grace_period_end, None);
+    let encoded = body.to_string();
+    assert!(!encoded.contains("cus_private"), "{body}");
+    assert!(!encoded.contains("user_id"), "{body}");
+
+    let (msg, input) = get_msg("/b/products/subscription", "user_2");
+    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(body, serde_json::json!({"subscription": null}));
+}
+
+/// The public catalog publishes `contracts::CatalogProductView`: a closed
+/// projection that carries none of the ownership, moderation or provider
+/// columns the row holds. Checked on the wire, with every withheld column
+/// populated on the seeded row so an echo would be visible.
+#[tokio::test]
+async fn public_catalog_withholds_ownership_moderation_and_provider_columns() {
+    use crate::blocks::products::contracts::{CatalogProductListResponse, CatalogProductView};
+
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "p_public",
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Public")),
+            ("status".to_string(), serde_json::json!("active")),
+            ("tags".to_string(), serde_json::json!(["a"])),
+            ("metadata".to_string(), serde_json::json!({"k": "v"})),
+            (
+                "created_by".to_string(),
+                serde_json::json!("creator_secret"),
+            ),
+            ("owner_kind".to_string(), serde_json::json!("user")),
+            ("owner_id".to_string(), serde_json::json!("owner_secret")),
+            (
+                "seller_account_id".to_string(),
+                serde_json::json!("acct_secret"),
+            ),
+            ("approval_status".to_string(), serde_json::json!("approved")),
+            (
+                "stripe_product_id".to_string(),
+                serde_json::json!("prod_secret"),
+            ),
+            ("current_version".to_string(), serde_json::json!(7)),
+            (
+                "submitted_at".to_string(),
+                serde_json::json!("2026-07-01T00:00:00Z"),
+            ),
+            (
+                "published_at".to_string(),
+                serde_json::json!("2026-07-02T00:00:00Z"),
+            ),
+        ]),
+    )
+    .await;
+
+    let (msg, input) = get_msg("/b/products/catalog/p_public", "");
+    let detail = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(detail.get("data").is_none(), "{detail}");
+    let view: CatalogProductView =
+        serde_json::from_value(detail.clone()).expect("CatalogProductView");
+    assert_eq!(serde_json::to_value(&view).unwrap(), detail);
+    assert_eq!(view.name, "Public");
+    assert_eq!(view.tags, vec!["a"]);
+    assert_eq!(view.published_at.as_deref(), Some("2026-07-02T00:00:00Z"));
+
+    let (msg, input) = get_msg("/b/products/catalog", "");
+    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let typed: CatalogProductListResponse =
+        serde_json::from_value(list.clone()).expect("CatalogProductListResponse");
+    assert_eq!(serde_json::to_value(&typed).unwrap(), list);
+    assert_eq!(list["records"][0], detail);
+    assert_eq!(list["total_count"], 1);
+
+    for body in [&detail, &list] {
+        let encoded = body.to_string();
+        for withheld in [
+            "created_by",
+            "creator_secret",
+            "owner_kind",
+            "owner_id",
+            "owner_secret",
+            "seller_account_id",
+            "acct_secret",
+            "approval_status",
+            "stripe_product_id",
+            "prod_secret",
+            "current_version",
+            "submitted_at",
+            "deleted_at",
+        ] {
+            assert!(
+                !encoded.contains(withheld),
+                "public catalog leaked {withheld}: {body}"
+            );
+        }
+    }
+}
+
+/// Moderation writes `published_at = ""` when it returns a product to draft.
+/// The view declares that column as a nullable `date-time`, so the empty
+/// string must read as `null` rather than as a string that is not a date.
+#[tokio::test]
+async fn empty_timestamp_columns_read_as_null() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "p_blank_ts",
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Blank")),
+            ("status".to_string(), serde_json::json!("draft")),
+            ("published_at".to_string(), serde_json::json!("")),
+            (
+                "submitted_at".to_string(),
+                serde_json::json!("2026-07-01T00:00:00Z"),
+            ),
+        ]),
+    )
+    .await;
+    let (msg, input) = admin_get_msg("/admin/b/products/products/p_blank_ts");
+    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    assert!(body["published_at"].is_null(), "{body}");
+    assert_eq!(body["submitted_at"], "2026-07-01T00:00:00Z");
+    assert!(body["deleted_at"].is_null());
+}
+
+// The strictness ordering below is `endpoint_match::auth_rank`, not a copy of
+// it. A copy would go on asserting against its own idea of strictness after
+// the router's changed, leaving this gate green while the thing it guards
+// weakened.
+use crate::endpoint_match::auth_rank;
+
+// ============================================================
+// The request body cannot rewrite a product's identity
+// ============================================================
+
+/// A PATCH body carrying `id` used to reach `update_live` verbatim, so the
+/// write became `SET id = 'new' WHERE id = 'old' AND deleted_at IS NULL`:
+/// one row updated, the guard satisfied, and every `product_id` reference in
+/// `line_items`, `offers`, `product_versions` and `entitlements` orphaned —
+/// the exact failure soft delete exists to prevent. The re-read then looked
+/// up the ORIGINAL id, found nothing, and answered "Product not found", so
+/// the caller was told the write had failed while it had in fact rewritten
+/// the primary key.
+#[tokio::test]
+async fn admin_patch_cannot_rewrite_a_products_id() {
+    let ctx = ctx().await;
+
+    let (create, create_input) = admin_create_msg(
+        "/admin/b/products/products",
+        serde_json::json!({ "name": "Original" }),
+    );
+    let id = output_to_json(dispatch_admin(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (mut update, update_input) = request_msg(
+        "update",
+        &format!("/admin/b/products/products/{id}"),
+        "admin_1",
+        serde_json::json!({ "id": "p_hijacked", "name": "Renamed" }),
+    );
+    update.set_meta("auth.user_roles", "admin");
+    let out = dispatch_admin(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "a body that names an unsettable field must be refused outright"
+    );
+
+    // The row still answers to its own id, and no row answers to the one the
+    // body tried to claim.
+    let kept = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect("the product must still answer to its original id");
+    assert_eq!(kept.id, id);
+    assert_eq!(
+        crate::util::RecordExt::str_field(&kept, "name"),
+        "Original",
+        "a refused write must not apply its other fields either"
+    );
+    assert!(
+        wafer_core::clients::database::get(&ctx, "impresspress__products__products", "p_hijacked")
+            .await
+            .is_err(),
+        "no row may answer to the id the body tried to claim"
+    );
+}
+
+/// The seller-owned PATCH reaches the same `update_live` with the same
+/// caller-supplied body, so it carries the identical primary-key rewrite.
+#[tokio::test]
+async fn seller_patch_cannot_rewrite_a_products_id() {
+    let ctx = user_products_ctx().await;
+
+    let (create, create_input) = create_msg(
+        "/b/products/products",
+        "user_1",
+        serde_json::json!({ "name": "Original" }),
+    );
+    let id = output_to_json(dispatch_user(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (update, update_input) = update_msg(
+        &format!("/b/products/products/{id}"),
+        "user_1",
+        serde_json::json!({ "id": "p_hijacked", "name": "Renamed" }),
+    );
+    let out = dispatch_user(&ctx, update, update_input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "a body that names an unsettable field must be refused outright"
+    );
+
+    let kept = super::super::repo::products::get(&ctx, &id)
+        .await
+        .expect("the product must still answer to its original id");
+    assert_eq!(kept.id, id);
+    assert_eq!(
+        crate::util::RecordExt::str_field(&kept, "name"),
+        "Original",
+        "a refused write must not apply its other fields either"
+    );
+    assert!(
+        wafer_core::clients::database::get(&ctx, "impresspress__products__products", "p_hijacked")
+            .await
+            .is_err(),
+        "no row may answer to the id the body tried to claim"
+    );
+}
+
+/// The handler-level refusal is a 400 for a clear message; the invariant
+/// itself belongs to the repo, which is the layer every future caller goes
+/// through. `update_live` must refuse an `id` in `data` on its own, so a new
+/// call site cannot reintroduce the rewrite by forwarding a map the handler
+/// never saw.
+#[tokio::test]
+async fn update_live_refuses_to_rewrite_the_primary_key() {
+    let ctx = ctx().await;
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), serde_json::json!("Original"));
+    seed(&ctx, "impresspress__products__products", "p1", data).await;
+
+    let error = super::super::repo::products::update_live(
+        &ctx,
+        "p1",
+        HashMap::from([("id".to_string(), serde_json::json!("p_hijacked"))]),
+    )
+    .await
+    .expect_err("a product's id is immutable");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    assert!(
+        super::super::repo::products::get(&ctx, "p1").await.is_ok(),
+        "the row must still answer to its original id"
+    );
+}
+
+/// The repo's `id`-rewrite refusal is a backstop for a caller that did not go
+/// through `reject_unsettable_fields`, and it answers `InvalidArgument` with
+/// a message naming what to change ("a product's id is immutable"). Every
+/// product write handler matched only `NotFound` and funnelled the rest into
+/// `err_internal`, which throws that message away and answers 500 — an
+/// opaque server error for what is squarely a caller mistake, with nothing
+/// for the caller to act on and a correlation id pointing at a log line that
+/// says the same.
+///
+/// Reproduced by answering the write with `InvalidArgument` from below,
+/// which is the shape any repository-level guard has when it reaches these
+/// handlers. All three of them are driven, because each carried its own copy
+/// of the match.
+#[tokio::test]
+async fn a_repo_invalid_argument_reaches_the_caller_as_a_400_carrying_its_message() {
+    use crate::test_support::FailingDbOpContext;
+
+    const REFUSAL: &str = "a product's id is immutable";
+
+    async fn refusing(ctx: &crate::test_support::TestContext) -> FailingDbOpContext {
+        FailingDbOpContext::failing_with(
+            ctx.clone(),
+            vec![(
+                "database.update_where_count",
+                super::super::repo::products::TABLE,
+            )],
+            wafer_run::WaferError::new(ErrorCode::InvalidArgument, REFUSAL),
+        )
+    }
+
+    async fn refusal_message(out: wafer_run::OutputStream) -> String {
+        match out.collect_buffered().await {
+            Err(wafer_run::streams::output::TerminalNotResponse::Error(error)) => {
+                assert_eq!(
+                    error.code,
+                    ErrorCode::InvalidArgument,
+                    "a caller error from the repository must not become a 500: {error:?}"
+                );
+                error.message
+            }
+            other => panic!("the write must be refused: {other:?}"),
+        }
+    }
+
+    // 1. the admin PATCH
+    let ctx = ctx().await;
+    let mut row = HashMap::new();
+    row.insert("name".to_string(), serde_json::json!("Original"));
+    seed(&ctx, "impresspress__products__products", "p_admin", row).await;
+    let refusing_ctx = refusing(&ctx).await;
+    let (mut msg, input) = update_msg(
+        "/admin/b/products/products/p_admin",
+        "admin_1",
+        serde_json::json!({ "name": "Renamed" }),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    let message = refusal_message(dispatch_admin(&refusing_ctx, msg, input).await).await;
+    assert!(
+        message.contains(REFUSAL),
+        "the admin PATCH must pass the refusal's own message through: {message}"
+    );
+
+    // 2. the seller PATCH
+    let ctx = user_products_ctx().await;
+    let (create, create_input) = create_msg(
+        "/b/products/products",
+        "user_1",
+        serde_json::json!({ "name": "Original" }),
+    );
+    let id = output_to_json(dispatch_user(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refusing_ctx = refusing(&ctx).await;
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{id}"),
+        "user_1",
+        serde_json::json!({ "name": "Renamed" }),
+    );
+    let message = refusal_message(dispatch_user(&refusing_ctx, msg, input).await).await;
+    assert!(
+        message.contains(REFUSAL),
+        "the seller PATCH must pass the refusal's own message through: {message}"
+    );
+
+    // 3. admin moderation, which writes the product through the same door
+    let ctx = user_products_ctx().await;
+    let mut pending = HashMap::new();
+    pending.insert("name".to_string(), serde_json::json!("Pending"));
+    pending.insert("owner_kind".to_string(), serde_json::json!("user"));
+    pending.insert("owner_id".to_string(), serde_json::json!("seller_1"));
+    pending.insert("approval_status".to_string(), serde_json::json!("pending"));
+    pending.insert("status".to_string(), serde_json::json!("pending_review"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "p_pending",
+        pending,
+    )
+    .await;
+    seed(
+        &ctx,
+        super::super::repo::seller_accounts::TABLE,
+        "acct_1",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("seller_1")),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stripe_1"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("requirements_json".to_string(), serde_json::json!("{}")),
+            ("fee_basis_points".to_string(), serde_json::json!(250)),
+        ]),
+    )
+    .await;
+    let refusing_ctx = refusing(&ctx).await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/p_pending/approve",
+        serde_json::json!({}),
+    );
+    let message = refusal_message(dispatch_admin(&refusing_ctx, msg, input).await).await;
+    assert!(
+        message.contains(REFUSAL),
+        "product moderation must pass the refusal's own message through: {message}"
+    );
+}
+
+/// A `Context` that soft-deletes `product_id` the moment the FIRST by-id read
+/// of the products table has been answered, and forwards everything else
+/// untouched.
+///
+/// That is a concurrent delete landing between two reads inside one request,
+/// reproduced deterministically instead of raced for. `stripe::handle_checkout`
+/// reads the product twice — once inside `repo::offers::get_public`, once for
+/// the checkout itself — and only the gap between them can produce a
+/// `NotFound` from the second read.
+#[derive(Clone)]
+struct DeleteBetweenProductReads {
+    inner: std::sync::Arc<crate::test_support::TestContext>,
+    product_id: String,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl wafer_run::context::Context for DeleteBetweenProductReads {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), wafer_run::WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: wafer_run::Message,
+        input: wafer_run::InputStream,
+    ) -> wafer_run::OutputStream {
+        #[derive(serde::Deserialize)]
+        struct CollectionPeek {
+            collection: String,
+        }
+
+        if name != "wafer-run/database" || msg.action() != "database.get" {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|peek| peek.collection)
+            .unwrap_or_default();
+        let out = self
+            .inner
+            .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+            .await;
+        if collection == super::super::repo::products::TABLE
+            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            super::super::repo::products::soft_delete(self.inner.as_ref(), &self.product_id)
+                .await
+                .expect("the concurrent delete lands");
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+/// A product soft-deleted between checkout's two product reads must answer
+/// the storefront the same 404 its neighbouring refusals do — "Offer not
+/// found" — not a 500.
+///
+/// `NotFound` from that second read is a state this branch created: the read
+/// used to go straight to the table and could only fail for a row that was
+/// physically gone, so mapping every error to `err_internal` was right. Now
+/// it carries the soft-delete filter, so the ordinary outcome of a delete
+/// landing mid-request renders as a server error on a public storefront —
+/// while the identical condition observed a few microseconds earlier, inside
+/// `repo::offers::get_public`, answers a clean 404.
+#[tokio::test]
+async fn checkout_404s_for_a_product_deleted_between_its_two_reads() {
+    let ctx = std::sync::Arc::new(
+        ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await,
+    );
+    let offer_id = seed_published_offer(ctx.as_ref(), "racing").await;
+
+    let racing = DeleteBetweenProductReads {
+        inner: ctx.clone(),
+        product_id: "racing".to_string(),
+        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    let out = super::super::stripe::handle_checkout(&racing, &msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "a product deleted mid-request must read as a missing offer, not a server error"
+    );
+}
+
+/// One product, one caller, three answers. `owner_id = user_1` with
+/// `created_by = admin_1` is the shape an administrator creating a listing
+/// on a seller's behalf leaves behind, and it split the seller's own product
+/// apart: `pages::product_manager` rendered it, `offers::verify_product`
+/// accepted every offer and Payment Link route on it (both testing
+/// `owner_id` OR `created_by`), while `verify_product_owner` — the single
+/// door for GET/PATCH/DELETE/duplicate on the same product — compared
+/// `created_by` alone and answered 404.
+///
+/// The half that was open is the more dangerous one: creating an offer and
+/// opening a Payment Link is how money starts moving. So the doors agree on
+/// the wider rule, from ONE predicate rather than three copies of it: a
+/// caller may act on a product they own or created.
+#[tokio::test]
+async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhere() {
+    let ctx = user_products_ctx().await;
+
+    let mut assigned = HashMap::new();
+    assigned.insert("name".to_string(), serde_json::json!("Assigned"));
+    assigned.insert("status".to_string(), serde_json::json!("draft"));
+    assigned.insert("owner_kind".to_string(), serde_json::json!("user"));
+    assigned.insert("owner_id".to_string(), serde_json::json!("user_1"));
+    assigned.insert("created_by".to_string(), serde_json::json!("admin_1"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "assigned",
+        assigned,
+    )
+    .await;
+
+    // The two doors that already accepted this caller — the positive
+    // controls the CRUD door has to match, not the other way round.
+    let html = output_to_html(
+        super::super::pages::product_manager(
+            &ctx,
+            &crate::test_support::auth_msg("read", "/b/products/products/assigned", "user_1"),
+            "assigned",
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        html.contains("Assigned"),
+        "the owner's product page already renders for them: {html}"
+    );
+
+    let (msg, input) = get_msg("/b/products/products/assigned/offers", "user_1");
+    let listed = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert!(
+        listed["offers"].is_array(),
+        "the owner's offer routes already accept them: {listed}"
+    );
+
+    // GET
+    let (msg, input) = get_msg("/b/products/products/assigned", "user_1");
+    let fetched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(
+        fetched["id"], "assigned",
+        "the owner must be able to read the product their own page renders: {fetched}"
+    );
+
+    // PATCH
+    let (msg, input) = update_msg(
+        "/b/products/products/assigned",
+        "user_1",
+        serde_json::json!({ "name": "Renamed" }),
+    );
+    let patched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(
+        patched["name"], "Renamed",
+        "the owner must be able to edit it: {patched}"
+    );
+
+    // DELETE
+    let (msg, input) = delete_msg("/b/products/products/assigned", "user_1");
+    let deleted = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    assert_eq!(
+        deleted["deleted"], true,
+        "the owner must be able to delete it: {deleted}"
+    );
+
+    // And the rule is still a rule: a third party is neither owner nor
+    // creator and gets the same 404 from every one of those doors.
+    let (msg, input) = get_msg("/b/products/products/assigned", "user_2");
+    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    let (msg, input) = get_msg("/b/products/products/assigned/offers", "user_2");
+    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    let stranger = super::super::pages::product_manager(
+        &ctx,
+        &crate::test_support::auth_msg("read", "/b/products/products/assigned", "user_2"),
+        "assigned",
+        false,
+    )
+    .await;
+    assert!(output_is_error(stranger, ErrorCode::NotFound).await);
+}
+
+// ============================================================
+// The seller's own deleted products
+// ============================================================
+//
+// Soft delete gave the admin a Deleted view, a restore endpoint and a
+// close-only manager. A seller got the delete and none of the three: their
+// own product list reads live-only, so a product they deleted vanished from
+// every page they can open, while its Prices and Payment Links stayed live in
+// the connected account and went on taking money. Before soft delete a hard
+// delete at least left nothing behind.
+//
+// Authorization is the whole risk here. `/b/products` is a PUBLIC route
+// prefix, so what a caller faces is the tier the endpoint DECLARES — and
+// `ProductsBlock::handle` reaches `handle_user` from two wire spellings, so a
+// tier proven on one says nothing about the other. Every test below therefore
+// drives `dispatch_routed` (the real `route_to_block` → `check_access` →
+// `ProductsBlock::handle`), never a handler directly.
+
+/// Seed a live product owned by `owner`, the way seller-created products
+/// carry ownership: `owner_kind = "user"` with `owner_id` AND `created_by`
+/// both set to the seller.
+async fn seed_seller_product(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    owner: &str,
+    name: &str,
+) {
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), serde_json::json!(name));
+    data.insert("status".to_string(), serde_json::json!("active"));
+    data.insert("owner_kind".to_string(), serde_json::json!("user"));
+    data.insert("owner_id".to_string(), serde_json::json!(owner));
+    data.insert("created_by".to_string(), serde_json::json!(owner));
+    seed(ctx, "impresspress__products__products", id, data).await;
+}
+
+/// [`seed_seller_product`] plus the soft delete, since every test in this
+/// section is about a product the seller has already deleted.
+async fn seed_deleted_seller_product(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    owner: &str,
+    name: &str,
+) {
+    seed_seller_product(ctx, id, owner, name).await;
+    soft_delete_product(ctx, id).await;
+}
+
+/// The seller's mirror of `manage_products_deleted_view_lists_only_deleted_products`,
+/// with the extra obligation that only makes sense on a seller page: the
+/// deleted set is scoped to the caller. `list_deleted` narrows the DELETED
+/// set the same way `list_page` narrows the live one, so the owner filter the
+/// live list already carries has to be handed to it too — without that, the
+/// Deleted tab is every seller's deleted products, on a page reachable by any
+/// authenticated user.
+#[tokio::test]
+async fn my_products_deleted_view_lists_only_the_sellers_own_deleted_products() {
+    let ctx = user_products_ctx().await;
+
+    seed_seller_product(&ctx, "mine_live", "seller_a", "Mine and live").await;
+    seed_deleted_seller_product(&ctx, "mine_gone", "seller_a", "Mine and deleted").await;
+    seed_deleted_seller_product(&ctx, "theirs_gone", "seller_b", "Theirs and deleted").await;
+
+    let (live_msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    let live_html = output_to_html(super::super::pages::my_products(&ctx, &live_msg).await).await;
+    assert!(live_html.contains("Mine and live"), "{live_html}");
+    assert!(!live_html.contains("Mine and deleted"), "{live_html}");
+
+    let (mut deleted_msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    deleted_msg.set_meta("req.query.view", "deleted");
+    let deleted_html =
+        output_to_html(super::super::pages::my_products(&ctx, &deleted_msg).await).await;
+    assert!(deleted_html.contains("Mine and deleted"), "{deleted_html}");
+    assert!(!deleted_html.contains("Mine and live"), "{deleted_html}");
+    assert!(
+        !deleted_html.contains("Theirs and deleted"),
+        "a seller's deleted view must not show another seller's products: {deleted_html}"
+    );
+}
+
+/// Both doors out, not just the dangerous one. Restore returns an active,
+/// approved product to the public catalog immediately; the close-only
+/// manager is how a seller shuts the Stripe surface down *without* doing
+/// that. The admin Deleted view carries both, and a seller whose reason for
+/// deleting was "stop selling this" needs the second one more than the first.
+#[tokio::test]
+async fn my_products_deleted_view_offers_both_restore_and_close() {
+    let ctx = user_products_ctx().await;
+    // An id that is not URL-safe, so both links are pinned to carry the same
+    // percent-encoding the admin view's do.
+    let awkward_id = "prod/1?x#y";
+    seed_deleted_seller_product(&ctx, awkward_id, "seller_a", "Deleted product").await;
+
+    let (mut msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::my_products(&ctx, &msg).await).await;
+
+    assert!(
+        html.contains("/b/products/api/products/prod%2F1%3Fx%23y/restore"),
+        "a seller's deleted row must offer Restore wired to the seller restore endpoint: {html}"
+    );
+    assert!(
+        html.contains("/b/products/my-products/prod%2F1%3Fx%23y/close"),
+        "a seller's deleted row must offer a way to close its Stripe surface: {html}"
+    );
+    assert!(
+        !html.contains(r#"href="/b/products/my-products/prod%2F1%3Fx%23y""#),
+        "a deleted row must not link into the manager, which refuses a soft-deleted product: {html}"
+    );
+    assert!(
+        !html.contains("/b/products/api/admin/"),
+        "a seller page must not target the admin API: {html}"
+    );
+}
+
+/// The whole trip, the way `the_restore_url_the_deleted_view_renders_restores_that_product`
+/// does it for the admin: the URL is read back out of the rendered HTML (so a
+/// change to either half of the encoding is caught) and sent through the real
+/// router.
+#[tokio::test]
+async fn the_restore_url_a_sellers_deleted_view_renders_restores_that_product() {
+    let ctx = user_products_ctx().await;
+    let awkward_id = "prod/1?x#y";
+    seed_deleted_seller_product(&ctx, awkward_id, "seller_a", "Deleted product").await;
+
+    let (mut page_msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    page_msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::my_products(&ctx, &page_msg).await).await;
+    let restore_url = rendered_hx_post(&html)
+        .unwrap_or_else(|| panic!("the deleted row must render an hx-post Restore action: {html}"));
+
+    let (msg, input) = create_msg(&restore_url, "seller_a", serde_json::json!({}));
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], awkward_id,
+        "posting the rendered Restore URL must reach the product it names: {body}"
+    );
+    assert!(
+        !is_soft_deleted(&ctx, awkward_id).await,
+        "the seller's restore must actually clear deleted_at"
+    );
+}
+
+/// The negative half, and the reason every assertion in this section goes
+/// through the router: a seller must not restore a product that is not
+/// theirs, on ANY spelling that reaches the handler.
+///
+/// `ProductsBlock::handle` enters `handle_user` from the `/b/products/api`-
+/// stripped path AND from the raw `/b/products/...` one, so a `USER_ROUTES`
+/// entry answers at two URLs. Both are `Authenticated` here (the declared
+/// one by declaration, the raw one by `declared_access`'s fail-closed
+/// fallback), which means the tier admits every logged-in caller and
+/// OWNERSHIP is the only thing between seller B and seller A's catalog.
+#[tokio::test]
+async fn a_seller_cannot_restore_another_sellers_product_on_any_wire_spelling() {
+    let ctx = user_products_ctx().await;
+    seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
+
+    for path in [
+        "/b/products/products/a_product/restore",
+        "/b/products/api/products/a_product/restore",
+    ] {
+        let (msg, input) = create_msg(path, "seller_b", serde_json::json!({}));
+        assert!(
+            dispatch_routed(&ctx, msg, input)
+                .await
+                .collect_buffered()
+                .await
+                .is_err(),
+            "seller B restored seller A's product through {path}"
+        );
+        assert!(
+            is_soft_deleted(&ctx, "a_product").await,
+            "seller B's refused restore must leave seller A's product deleted ({path})"
+        );
+    }
+
+    // Positive control on BOTH spellings, so the refusals above cannot be
+    // passing merely because nothing routes anywhere. Re-deleted in between,
+    // since the first restore leaves nothing for the second to restore.
+    for path in [
+        "/b/products/products/a_product/restore",
+        "/b/products/api/products/a_product/restore",
+    ] {
+        let (msg, input) = create_msg(path, "seller_a", serde_json::json!({}));
+        let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+        assert_eq!(
+            body["id"], "a_product",
+            "the owner must be able to restore through {path}: {body}"
+        );
+        assert!(!is_soft_deleted(&ctx, "a_product").await);
+        soft_delete_product(&ctx, "a_product").await;
+    }
+}
+
+/// An unauthenticated caller is refused by the router itself: the declared
+/// spelling is `Authenticated`, and the undeclared raw spelling gets
+/// `declared_access`'s `Authenticated` fallback rather than the `/b/products`
+/// prefix's `Public` tier. Pinned because the seller restore endpoint is the
+/// first *write* to live on a public prefix under an owner check alone — if
+/// the tier ever slipped to Public, `is_owned_by`'s empty-`user_id` guard
+/// would be the only thing left.
+#[tokio::test]
+async fn an_anonymous_caller_cannot_restore_a_deleted_product() {
+    let ctx = user_products_ctx().await;
+    seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
+
+    for path in [
+        "/b/products/products/a_product/restore",
+        "/b/products/api/products/a_product/restore",
+    ] {
+        let (msg, input) = create_msg(path, "", serde_json::json!({}));
+        assert!(
+            dispatch_routed(&ctx, msg, input)
+                .await
+                .collect_buffered()
+                .await
+                .is_err(),
+            "an anonymous POST to {path} must not restore a product"
+        );
+        assert!(is_soft_deleted(&ctx, "a_product").await);
+    }
+}
+
+/// The seller half of `the_close_manager_archives_a_deleted_products_offer_
+/// from_its_own_rendered_action`: the page a seller reaches, and the API its
+/// buttons target, are both owner-scoped and both actually work.
+///
+/// The seller-tier offer/payment-link API already permitted this (the
+/// `ProductState::LiveOrDeleted` widening covers `OfferAccess::Owner` too) —
+/// only the page that reaches it was missing, which made the capability
+/// operator-only in practice.
+#[tokio::test]
+async fn a_seller_closes_their_own_deleted_products_money_surface() {
+    let ctx = user_products_ctx().await;
+    let (offer_id, link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    // `seed_published_offer` writes no ownership, so give the row an owner
+    // before the page is asked whose it is.
+    wafer_core::clients::database::update(
+        &ctx,
+        super::super::repo::products::TABLE,
+        "gone",
+        HashMap::from([
+            ("owner_kind".to_string(), serde_json::json!("user")),
+            ("owner_id".to_string(), serde_json::json!("seller_a")),
+            ("created_by".to_string(), serde_json::json!("seller_a")),
+        ]),
+    )
+    .await
+    .expect("assign the product to a seller");
+
+    let (msg, input) = get_msg("/b/products/my-products/gone/close", "seller_a");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        !html.contains("/b/products/api/admin/"),
+        "the seller's close manager must target the seller API, not the admin one: {html}"
+    );
+
+    let archive_url = rendered_attr(&html, "hx-delete=\"", &offer_id).unwrap_or_else(|| {
+        panic!(
+            "the seller close manager must render an archive action for offer {offer_id}: {html}"
+        )
+    });
+    let (msg, input) = delete_msg(&archive_url, "seller_a");
+    let archived = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        archived["status"], "archived",
+        "the rendered archive action must archive the seller's deleted offer: {archived}"
+    );
+
+    let deactivate_url = rendered_attr(&html, "hx-delete=\"", &link_id).unwrap_or_else(|| {
+        panic!(
+            "the seller close manager must render a deactivate action for link {link_id}: {html}"
+        )
+    });
+    let (msg, input) = delete_msg(&deactivate_url, "seller_a");
+    let deactivated = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the rendered deactivate action must take the seller's link down: {deactivated}"
+    );
+
+    // Closing a money surface must not put the listing back in the catalog.
+    assert!(is_soft_deleted(&ctx, "gone").await);
+}
+
+/// The close manager reads a soft-deleted row through `get_deleted`, which is
+/// exactly the read the live-only door refuses — so the ownership check
+/// cannot come from `repo::products::get`, and forgetting it entirely would
+/// have been invisible. Seller B must get the same 404 every other seller
+/// door gives for a product that is not theirs.
+#[tokio::test]
+async fn a_seller_cannot_open_another_sellers_close_manager() {
+    let ctx = user_products_ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    wafer_core::clients::database::update(
+        &ctx,
+        super::super::repo::products::TABLE,
+        "gone",
+        HashMap::from([
+            ("owner_kind".to_string(), serde_json::json!("user")),
+            ("owner_id".to_string(), serde_json::json!("seller_a")),
+            ("created_by".to_string(), serde_json::json!("seller_a")),
+        ]),
+    )
+    .await
+    .expect("assign the product to a seller");
+
+    for user in ["seller_b", ""] {
+        let (msg, input) = get_msg("/b/products/my-products/gone/close", user);
+        assert!(
+            dispatch_routed(&ctx, msg, input)
+                .await
+                .collect_buffered()
+                .await
+                .is_err(),
+            "`{user}` must not reach seller A's close manager"
+        );
+    }
+
+    // Positive control: the owner does.
+    let (msg, input) = get_msg("/b/products/my-products/gone/close", "seller_a");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "the owner must reach the page the assertions above deny: {html}"
+    );
 }

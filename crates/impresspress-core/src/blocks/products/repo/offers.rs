@@ -9,7 +9,7 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use super::{offer_components, variables};
+use super::{offer_components, products, variables};
 use crate::{
     blocks::products::{
         contracts::{
@@ -19,7 +19,7 @@ use crate::{
             VariableDefinition, VariableKind, VariableVisibility,
         },
         money::normalize_currency,
-        offer_pricing, PRODUCTS_TABLE,
+        offer_pricing,
     },
     util::{stamp_created, stamp_updated, RecordExt},
 };
@@ -507,7 +507,7 @@ pub(crate) async fn create(
     created_by: &str,
     definition: &OfferDefinitionRequest,
 ) -> Result<ManagedOffer, WaferError> {
-    db::get(ctx, PRODUCTS_TABLE, product_id).await?;
+    products::get(ctx, product_id).await?;
     let offer_id = uuid::Uuid::now_v7().to_string();
     let offer = build_offer(&offer_id, product_id, 1, definition)?;
     let mut data = definition_data(&offer)?;
@@ -864,14 +864,10 @@ pub(crate) async fn get_public(ctx: &dyn Context, offer_id: &str) -> Result<Offe
         return Err(WaferError::new(ErrorCode::NotFound, "offer not found"));
     }
     let product_id = record.str_field("product_id");
-    let product = db::get(ctx, PRODUCTS_TABLE, product_id).await?;
-    let deleted = product
-        .data
-        .get("deleted_at")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
-    if product.str_field("status") != "active"
-        || product.str_field("approval_status") != "approved"
-        || deleted
+    let product = products::get(ctx, product_id).await?;
+    // `products::get` already answers `NotFound` for a soft-deleted row; only
+    // `status`/`approval_status` are this function's own rules to enforce.
+    if product.str_field("status") != "active" || product.str_field("approval_status") != "approved"
     {
         return Err(WaferError::new(ErrorCode::NotFound, "offer not found"));
     }

@@ -33,8 +33,8 @@ crate::impresspress_feature_block! {
             BlockEndpoint::get("/b/static/webmcp-{hash}.js").summary("Embedded WebMCP registration JS"),
             BlockEndpoint::get("/b/static/itim-latin-{hash}.woff2").summary("Embedded Itim font (latin)"),
             BlockEndpoint::get("/b/static/itim-latin-ext-{hash}.woff2").summary("Embedded Itim font (latin-ext)"),
-            BlockEndpoint::get("/b/static/impresspress-logo-{hash}.png").summary("Embedded Impresspress square logo"),
-            BlockEndpoint::get("/b/static/impresspress-logo-long-{hash}.png").summary("Embedded Impresspress wordmark logo"),
+            BlockEndpoint::get("/b/static/impresspress-logo-{hash}.png").summary("Embedded Impresspress square logo (32px pixel art)"),
+            BlockEndpoint::get("/b/static/impresspress-logo-2x-{hash}.png").summary("Embedded Impresspress square logo at 2x (64px)"),
             BlockEndpoint::get("/b/static/favicon-{hash}.ico").summary("Embedded Impresspress favicon"),
         ];
         #[cfg(feature = "block-llm")]

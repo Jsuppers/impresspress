@@ -14,7 +14,7 @@ mod stripe_provider;
 mod tests;
 
 pub(crate) use handlers::{
-    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCTS_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
+    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
 };
 pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
@@ -27,7 +27,29 @@ use super::rate_limit::{
     check_route_limits, check_user_rate_limit, LimitKey, RateLimit, RateLimitOutcome, RouteLimit,
     UserRateLimiter,
 };
-use crate::http::{err_forbidden, err_not_found};
+use crate::{
+    blocks::crud,
+    http::{err_forbidden, err_not_found},
+    util,
+};
+
+/// The schema `.output::<T>()` would declare for `T`, as a value, for the one
+/// place a derived row must be embedded inside a hand-written envelope: the
+/// product duplication response, whose sibling `offers` field reaches the
+/// recursive `Condition` and so cannot be derived at all yet. Same settings
+/// as wafer-block's `self_contained_schema` (inlined, no `$schema`, serialize
+/// contract), which is private upstream.
+fn view_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    schemars::generate::SchemaSettings::draft2020_12()
+        .with(|settings| {
+            settings.inline_subschemas = true;
+            settings.meta_schema = None;
+            settings.contract = schemars::generate::Contract::Serialize;
+        })
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value()
+}
 
 /// Public commerce operations are keyed by client IP because guest storefronts
 /// deliberately have no authenticated user. Each category can be overridden
@@ -301,534 +323,21 @@ crate::impresspress_feature_block! {
     info: |_this| {
         use wafer_run::{AuthLevel, CollectionSchema};
 
-        // Product row shape (see `migrations/001_products_schema.sqlite.sql`),
-        // reused below by the public catalog list/detail response schemas —
-        // `db::get`/`db::paginated_list` return a `Record { id, data }` where
-        // `data` is the full column map (`id` included).
-        let product_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "slug": {"type": "string"},
-                "currency": {"type": "string"},
-                "status": {"type": "string", "description": "draft | active"},
-                "category": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "metadata": {"type": "object"},
-                "image_url": {"type": "string"},
-                "stock": {"type": "integer"},
-                "group_id": {"type": "string"},
-                "type_id": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "product_template_id": {"type": "string"},
-                "requires": {"type": "string"},
-                "created_by": {"type": "string"},
-                "owner_kind": {"type": "string", "enum": ["platform", "user"]},
-                "owner_id": {"type": "string"},
-                "seller_account_id": {"type": "string"},
-                "approval_status": {"type": "string", "enum": ["draft", "pending_review", "approved", "rejected", "suspended"]},
-                "fulfillment_kind": {"type": "string", "enum": ["none", "manual", "download", "entitlement", "webhook"]},
-                "stripe_product_id": {"type": "string"},
-                "current_version": {"type": "integer", "minimum": 1},
-                "submitted_at": {"type": ["string", "null"], "format": "date-time"},
-                "published_at": {"type": ["string", "null"], "format": "date-time"},
-                "deleted_at": {"type": ["string", "null"], "format": "date-time", "description": "Null unless the product has been soft-deleted."},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let group_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "user_id": {"type": "string", "readOnly": true},
-                "status": {"type": "string"},
-                "created_by": {"type": "string", "readOnly": true},
-                "created_at": {"type": "string", "format": "date-time", "readOnly": true},
-                "updated_at": {"type": "string", "format": "date-time", "readOnly": true}
-            }
-        });
-        let product_type_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "is_system": {"type": "integer"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let group_template_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "display_name": {"type": "string"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let record_schema = |data: serde_json::Value| serde_json::json!({
-            "type": "object",
-            "required": ["id", "data"],
-            "properties": {
-                "id": {"type": "string"},
-                "data": data
-            }
-        });
-        let record_list_schema = |data: serde_json::Value| serde_json::json!({
-            "type": "object",
-            "required": ["records", "total_count"],
-            "properties": {
-                "records": {
-                    "type": "array",
-                    "items": record_schema(data)
-                },
-                "total_count": {"type": "integer"},
-                "page": {"type": "integer"},
-                "page_size": {"type": "integer"}
-            }
-        });
+        // Path parameter schemas stay hand-written. They restate the route
+        // template, and no handler deserializes them — every one reads
+        // `msg.var(..)` by name. A struct declared only to feed
+        // `.path_params::<T>()` would have no runtime user and would
+        // generate a byte-identical parameter list. Query parameters are
+        // typed wherever a handler reads more than one (`contracts::
+        // PageQuery`, `ProductListQuery`, …: `from_message` is the handler's
+        // only reader); the few endpoints that read a single `msg.query(..)`
+        // keep the hand-written form beside that call.
         let id_path_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["id"],
             "properties": {"id": {"type": "string"}}
         });
-        let money_breakdown_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["currency", "subtotal_minor", "discount_minor", "tax_minor", "shipping_minor", "platform_fee_minor", "total_minor"],
-            "properties": {
-                "currency": {"type": "string"},
-                "subtotal_minor": {"type": "integer"},
-                "discount_minor": {"type": "integer"},
-                "tax_minor": {"type": "integer"},
-                "shipping_minor": {"type": "integer"},
-                "platform_fee_minor": {"type": "integer"},
-                "total_minor": {"type": "integer"}
-            }
-        });
-        let pricing_preview_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["offer_id"],
-            "properties": {
-                "offer_id": {"type": "string"},
-                "quantity": {"type": "integer", "minimum": 1, "default": 1},
-                "inputs": {"type": "object"}
-            }
-        });
-        let pricing_preview_output_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["schema_version", "offer_id", "offer_version", "quantity", "inputs", "components", "amounts"],
-            "properties": {
-                "schema_version": {"type": "integer"},
-                "offer_id": {"type": "string"},
-                "offer_version": {"type": "integer"},
-                "quantity": {"type": "integer"},
-                "inputs": {"type": "object"},
-                "components": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["component_id", "key", "label", "included", "required", "unit_amount_minor", "quantity", "total_amount_minor", "reason"],
-                        "properties": {
-                            "component_id": {"type": "string"},
-                            "key": {"type": "string"},
-                            "label": {"type": "string"},
-                            "included": {"type": "boolean"},
-                            "required": {"type": "boolean"},
-                            "unit_amount_minor": {"type": "integer"},
-                            "quantity": {"type": "integer"},
-                            "total_amount_minor": {"type": "integer"},
-                            "reason": {"type": "string"}
-                        }
-                    }
-                },
-                "amounts": money_breakdown_schema
-            }
-        });
-        let checkout_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["offer_id"],
-            "properties": {
-                "offer_id": {"type": "string"},
-                "preset_id": {"type": ["string", "null"]},
-                "quantity": {"type": "integer", "minimum": 1, "default": 1},
-                "inputs": {"type": "object"},
-                "presentation": {"type": "string", "enum": ["hosted", "embedded", "payment_link"], "default": "hosted"},
-                "success_url": {"type": ["string", "null"], "format": "uri"},
-                "cancel_url": {"type": ["string", "null"], "format": "uri"},
-                "buyer_email": {"type": ["string", "null"], "format": "email"}
-            }
-        });
-        let checkout_output_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["order_id", "receipt_token", "receipt_token_expires_at", "presentation", "amounts"],
-            "properties": {
-                "order_id": {"type": "string"},
-                "receipt_token": {"type": "string", "writeOnly": true},
-                "receipt_token_expires_at": {"type": "string", "format": "date-time"},
-                "presentation": {"type": "string", "enum": ["hosted", "embedded", "payment_link"]},
-                "checkout_url": {"type": ["string", "null"], "format": "uri"},
-                "client_secret": {"type": ["string", "null"], "writeOnly": true},
-                "payment_link_url": {"type": ["string", "null"], "format": "uri"},
-                "amounts": money_breakdown_schema
-            }
-        });
-        let purchase_list_schema = record_list_schema(serde_json::json!({"type": "object"}));
-        let purchase_data_schema = serde_json::json!({
-            "type": "object",
-            "required": ["provider_payment_status", "provider_payment_error_code", "provider_payment_error_message", "payment_intent_event_created"],
-            "properties": {
-                "provider_payment_status": {"type": "string", "enum": ["", "succeeded", "payment_failed", "processing", "requires_action", "canceled"]},
-                "provider_payment_error_code": {"type": "string"},
-                "provider_payment_error_message": {"type": "string"},
-                "payment_intent_event_created": {"type": "integer"}
-            }
-        });
-        let purchase_detail_schema = serde_json::json!({
-            "type": "object",
-            "required": ["purchase", "line_items", "refunds", "disputes"],
-            "properties": {
-                "purchase": record_schema(purchase_data_schema),
-                "line_items": {"type": "array", "items": record_schema(serde_json::json!({"type": "object"}))},
-                "refunds": {"type": "array", "items": record_schema(serde_json::json!({"type": "object"}))},
-                "disputes": {
-                    "type": "array",
-                    "items": record_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["purchase_id", "seller_account_id", "stripe_account_id", "provider_dispute_id", "provider_charge_id", "payment_intent_id", "status", "amount_minor", "currency", "reason", "livemode", "event_created", "created_at", "updated_at"],
-                        "properties": {
-                            "purchase_id": {"type": "string"},
-                            "seller_account_id": {"type": "string"},
-                            "stripe_account_id": {"type": "string"},
-                            "provider_dispute_id": {"type": "string"},
-                            "provider_charge_id": {"type": "string"},
-                            "payment_intent_id": {"type": "string"},
-                            "status": {"type": "string", "enum": ["warning_needs_response", "warning_under_review", "warning_closed", "needs_response", "under_review", "won", "lost", "prevented"]},
-                            "amount_minor": {"type": "integer"},
-                            "currency": {"type": "string"},
-                            "reason": {"type": "string"},
-                            "evidence_due_by": {"type": ["string", "null"], "format": "date-time"},
-                            "livemode": {"type": "boolean"},
-                            "event_created": {"type": "integer"},
-                            "closed_at": {"type": ["string", "null"], "format": "date-time"},
-                            "created_at": {"type": "string", "format": "date-time"},
-                            "updated_at": {"type": "string", "format": "date-time"}
-                        }
-                    }))
-                }
-            }
-        });
-        let subscription_status_schema = serde_json::json!({
-            "type": "object",
-            "required": ["subscription"],
-            "properties": {
-                "subscription": {
-                    "type": ["object", "null"],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "plan": {"type": "string"},
-                        "status": {"type": "string"},
-                        "stripe_subscription_id": {"type": "string"},
-                        "grace_period_end": {"type": ["string", "null"], "format": "date-time"},
-                        "addon_projects": {"type": "integer"},
-                        "addon_requests": {"type": "integer"},
-                        "addon_r2_bytes": {"type": "integer"},
-                        "addon_d1_bytes": {"type": "integer"},
-                        "created_at": {"type": "string", "format": "date-time"},
-                        "updated_at": {"type": "string", "format": "date-time"}
-                    }
-                }
-            }
-        });
-        let provider_redirect_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["url"],
-            "properties": {"url": {"type": "string", "format": "uri"}}
-        });
-        let seller_account_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "user_id", "status", "approval_status", "stripe_account_id", "capabilities", "fee_basis_points", "livemode", "country", "default_currency", "dashboard_type", "disabled_reason", "sync_error", "last_synced_at"],
-            "properties": {
-                "id": {"type": "string"},
-                "user_id": {"type": "string"},
-                "status": {"type": "string"},
-                "approval_status": {"type": "string", "enum": ["draft", "pending", "approved", "rejected", "suspended"]},
-                "stripe_account_id": {"type": "string"},
-                "capabilities": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["details_submitted", "charges_enabled", "payouts_enabled", "requirements_due"],
-                    "properties": {
-                        "details_submitted": {"type": "boolean"},
-                        "charges_enabled": {"type": "boolean"},
-                        "payouts_enabled": {"type": "boolean"},
-                        "requirements_due": {"type": "array", "items": {"type": "string"}}
-                    }
-                },
-                "fee_basis_points": {"type": "integer", "minimum": 0, "maximum": 10000},
-                "livemode": {"type": "boolean"},
-                "country": {"type": "string"},
-                "default_currency": {"type": "string"},
-                "dashboard_type": {"type": "string"},
-                "disabled_reason": {"type": "string"},
-                "sync_error": {"type": "string"},
-                "last_synced_at": {"type": "string"}
-            }
-        });
-        let commerce_analytics_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["currency", "gross_volume_minor", "refunded_volume_minor", "net_volume_minor", "platform_fees_minor", "order_count", "paid_order_count", "refunded_order_count", "failed_order_count", "open_dispute_count", "open_disputed_volume_minor", "lost_dispute_count", "lost_disputed_volume_minor", "active_subscription_count", "trialing_subscription_count", "past_due_subscription_count", "canceled_subscription_count", "top_products"],
-            "properties": {
-                "currency": {"type": "string"},
-                "gross_volume_minor": {"type": "integer"},
-                "refunded_volume_minor": {"type": "integer"},
-                "net_volume_minor": {"type": "integer"},
-                "platform_fees_minor": {"type": "integer"},
-                "order_count": {"type": "integer"},
-                "paid_order_count": {"type": "integer"},
-                "refunded_order_count": {"type": "integer"},
-                "failed_order_count": {"type": "integer"},
-                "open_dispute_count": {"type": "integer"},
-                "open_disputed_volume_minor": {"type": "integer"},
-                "lost_dispute_count": {"type": "integer"},
-                "lost_disputed_volume_minor": {"type": "integer"},
-                "active_subscription_count": {"type": "integer"},
-                "trialing_subscription_count": {"type": "integer"},
-                "past_due_subscription_count": {"type": "integer"},
-                "canceled_subscription_count": {"type": "integer"},
-                "top_products": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["product_id", "name", "quantity", "revenue_minor"],
-                        "properties": {
-                            "product_id": {"type": "string"},
-                            "name": {"type": "string"},
-                            "quantity": {"type": "integer"},
-                            "revenue_minor": {"type": "integer"}
-                        }
-                    }
-                }
-            }
-        });
-        let seller_stats_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["seller_account_id", "currency_analytics", "recent_failures"],
-            "properties": {
-                "seller_account_id": {"type": "string"},
-                "currency_analytics": {"type": "array", "items": commerce_analytics_schema},
-                "recent_failures": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["order_id", "status", "currency", "total_minor", "error", "created_at"],
-                        "properties": {
-                            "order_id": {"type": "string"},
-                            "status": {"type": "string"},
-                            "currency": {"type": "string"},
-                            "total_minor": {"type": "integer"},
-                            "error": {"type": "string"},
-                            "created_at": {"type": "string", "format": "date-time"}
-                        }
-                    }
-                }
-            }
-        });
-        let refund_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "amount_minor": {"type": ["integer", "null"], "minimum": 1},
-                "provider_reason": {"type": ["string", "null"], "enum": ["duplicate", "fraudulent", "requested_by_customer", null]},
-                "note": {"type": ["string", "null"], "maxLength": 500},
-                "idempotency_key": {"type": ["string", "null"], "maxLength": 80}
-            }
-        });
-        let refund_output_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["purchase_id", "refund_id", "provider_refund_id", "status", "provider_status", "amount_minor", "refunded_total_minor", "order_total_minor", "currency", "livemode"],
-            "properties": {
-                "purchase_id": {"type": "string"},
-                "refund_id": {"type": "string"},
-                "provider_refund_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "succeeded", "failed"]},
-                "provider_status": {"type": "string"},
-                "amount_minor": {"type": "integer"},
-                "refunded_total_minor": {"type": "integer"},
-                "order_total_minor": {"type": "integer"},
-                "currency": {"type": "string"},
-                "livemode": {"type": "boolean"}
-            }
-        });
-        let admin_stats_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["total_products", "active_products", "total_purchases", "currency_analytics", "total_groups"],
-            "properties": {
-                "total_products": {"type": "integer"},
-                "active_products": {"type": "integer"},
-                "total_purchases": {"type": "integer"},
-                "currency_analytics": {"type": "array", "items": commerce_analytics_schema},
-                "total_groups": {"type": "integer"}
-            }
-        });
-        let stripe_connection_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["state", "configured", "livemode", "account_id", "country", "default_currency", "business_name", "charges_enabled", "payouts_enabled", "details_submitted", "capabilities", "publishable_key_configured", "webhook_secret_configured", "api_version", "error"],
-            "properties": {
-                "state": {"type": "string", "enum": ["not_configured", "connected_test", "connected_live", "misconfigured"]},
-                "configured": {"type": "boolean"},
-                "livemode": {"type": "boolean"},
-                "account_id": {"type": "string"},
-                "country": {"type": "string"},
-                "default_currency": {"type": "string"},
-                "business_name": {"type": "string"},
-                "charges_enabled": {"type": "boolean"},
-                "payouts_enabled": {"type": "boolean"},
-                "details_submitted": {"type": "boolean"},
-                "capabilities": {"type": "object", "additionalProperties": {"type": "string"}},
-                "publishable_key_configured": {"type": "boolean"},
-                "webhook_secret_configured": {"type": "boolean"},
-                "api_version": {"type": "string"},
-                "error": {"type": "string"}
-            }
-        });
-        let webhook_event_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "event_type", "status", "stripe_account_id", "livemode", "attempts", "last_error", "created_at", "updated_at"],
-            "properties": {
-                "id": {"type": "string"},
-                "event_type": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "processing", "failed", "processed", "dead_letter"]},
-                "stripe_account_id": {"type": "string"},
-                "livemode": {"type": "boolean"},
-                "attempts": {"type": "integer"},
-                "processing_started_at": {"type": "string", "format": "date-time"},
-                "next_retry_at": {"type": "string", "format": "date-time"},
-                "last_error": {"type": "string"},
-                "processed_at": {"type": "string", "format": "date-time"},
-                "terminal_at": {"type": "string", "format": "date-time"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let webhook_event_list_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["records", "total_count", "page", "page_size"],
-            "properties": {
-                "records": {"type": "array", "items": webhook_event_schema},
-                "total_count": {"type": "integer"},
-                "page": {"type": "integer"},
-                "page_size": {"type": "integer"}
-            }
-        });
-        let webhook_ack_schema = serde_json::json!({
-            "type": "object",
-            "required": ["received"],
-            "properties": {
-                "received": {"type": "boolean"},
-                "duplicate": {"type": "boolean"},
-                "dead_letter": {"type": "boolean"}
-            }
-        });
-        let provider_operation_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "operation_type", "aggregate_type", "aggregate_id", "stripe_account_id", "status", "attempts", "last_error", "created_at", "updated_at"],
-            "properties": {
-                "id": {"type": "string"},
-                "operation_type": {"type": "string", "enum": ["refund.reconcile"]},
-                "aggregate_type": {"type": "string", "enum": ["refund"]},
-                "aggregate_id": {"type": "string"},
-                "stripe_account_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "processing", "failed", "succeeded", "dead_letter"]},
-                "attempts": {"type": "integer"},
-                "processing_started_at": {"type": "string", "format": "date-time"},
-                "next_attempt_at": {"type": "string", "format": "date-time"},
-                "last_error": {"type": "string"},
-                "completed_at": {"type": "string", "format": "date-time"},
-                "terminal_at": {"type": "string", "format": "date-time"},
-                "created_at": {"type": "string", "format": "date-time"},
-                "updated_at": {"type": "string", "format": "date-time"}
-            }
-        });
-        let provider_operation_list_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["records", "total_count", "page", "page_size"],
-            "properties": {
-                "records": {"type": "array", "items": provider_operation_schema},
-                "total_count": {"type": "integer"},
-                "page": {"type": "integer"},
-                "page_size": {"type": "integer"}
-            }
-        });
-        let provider_reconcile_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["claimed", "succeeded", "retry_scheduled", "dead_letter"],
-            "properties": {
-                "claimed": {"type": "integer"},
-                "succeeded": {"type": "integer"},
-                "retry_scheduled": {"type": "integer"},
-                "dead_letter": {"type": "integer"}
-            }
-        });
-        let deleted_schema = serde_json::json!({
-            "type": "object",
-            "required": ["deleted"],
-            "properties": {"deleted": {"type": "boolean"}}
-        });
-        let product_write_schema = serde_json::json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "slug": {"type": "string"},
-                "currency": {"type": "string"},
-                "status": {"type": "string", "enum": ["draft", "pending_review", "active", "archived"]},
-                "category": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "metadata": {"type": "object"},
-                "image_url": {"type": "string"},
-                "stock": {"type": "integer"},
-                "group_id": {"type": "string"},
-                "type_id": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "product_template_id": {"type": "string"},
-                "fulfillment_kind": {"type": "string", "enum": ["none", "manual", "download", "entitlement", "webhook"]}
-            }
-        });
-        let mut product_update_schema = product_write_schema.clone();
-        product_update_schema
-            .as_object_mut()
-            .expect("product schema is an object")
-            .remove("required");
         let product_id_path_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -864,6 +373,16 @@ crate::impresspress_feature_block! {
                 "link_id": {"type": "string"}
             }
         });
+        // NOT derivable: `Condition` is recursive (`All`/`Any` hold child
+        // `Condition`s), and it reaches these three schemas through
+        // `OfferComponent`/`OfferComponentDraft`. schemars cannot inline a
+        // cycle, so it closes it with `{"$ref": "#/$defs/Condition"}` plus a
+        // sibling `$defs`. Embedded in an OpenAPI document that pointer
+        // resolves against the *document* root, where no `$defs` exists — a
+        // dangling reference that reads as an ordinary `$ref` in a diff.
+        // Verified by swapping one call site and reading the output. These
+        // stay hand-written until `generate_openapi` hoists definitions into
+        // `components/schemas` and rewrites the pointers.
         let offer_definition_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -921,97 +440,16 @@ crate::impresspress_feature_block! {
             "required": ["offers"],
             "properties": {"offers": {"type": "array", "items": managed_offer_schema}}
         });
+        // Half derived: `product` is `contracts::ProductView`; `offers` stays
+        // hand-written because `ManagedOffer` is recursive (see above).
         let product_duplicate_schema = serde_json::json!({
             "type": "object",
             "required": ["product", "offers"],
             "properties": {
-                "product": record_schema(product_schema.clone()),
+                "product": view_schema::<contracts::ProductView>(),
                 "offers": {"type": "array", "items": managed_offer_schema}
             }
         });
-        let checkout_preset_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "slug": {"type": "string"},
-                "inputs": {"type": "object"}
-            }
-        });
-        let checkout_preset_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "offer_id", "name", "slug", "inputs", "active", "configuration_hash"],
-            "properties": {
-                "id": {"type": "string"},
-                "offer_id": {"type": "string"},
-                "name": {"type": "string"},
-                "slug": {"type": "string"},
-                "inputs": {"type": "object"},
-                "active": {"type": "boolean"},
-                "configuration_hash": {"type": "string"}
-            }
-        });
-        let checkout_preset_list_schema = serde_json::json!({
-            "type": "object",
-            "required": ["presets"],
-            "properties": {"presets": {"type": "array", "items": checkout_preset_schema}}
-        });
-        let payment_link_input_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "preset_id": {"type": ["string", "null"]},
-                "after_completion_url": {"type": ["string", "null"], "format": "uri"}
-            }
-        });
-        let managed_payment_link_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "offer_id", "preset_id", "url", "active", "configuration_hash", "sync_status", "sync_error"],
-            "properties": {
-                "id": {"type": "string"},
-                "offer_id": {"type": "string"},
-                "preset_id": {"type": "string"},
-                "url": {"type": "string", "format": "uri"},
-                "active": {"type": "boolean"},
-                "configuration_hash": {"type": "string"},
-                "sync_status": {"type": "string"},
-                "sync_error": {"type": "string"}
-            }
-        });
-        let payment_link_list_schema = serde_json::json!({
-            "type": "object",
-            "required": ["payment_links"],
-            "properties": {"payment_links": {"type": "array", "items": managed_payment_link_schema}}
-        });
-        let group_write_schema = serde_json::json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "group_template_id": {"type": "string"},
-                "user_id": {"type": "string"},
-                "status": {"type": "string"}
-            }
-        });
-        let mut group_update_schema = group_write_schema.clone();
-        group_update_schema
-            .as_object_mut()
-            .expect("group schema is an object")
-            .remove("required");
-        let product_type_write_schema = serde_json::json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "is_system": {"type": "integer", "enum": [0, 1]}
-            }
-        });
-
         BlockInfo::new("impresspress/products", "0.0.1", "http-handler@v1", "Products, pricing, purchases, and payment integration")
             .instance_mode(InstanceMode::Singleton)
             .requires(vec!["wafer-run/database".into(), "wafer-run/config".into(), "wafer-run/network".into()])
@@ -1022,7 +460,7 @@ crate::impresspress_feature_block! {
             // source for both runtime `migrations::apply()` and the
             // Cloudflare D1 build).
             .collections(vec![
-                CollectionSchema::new(PRODUCTS_TABLE),
+                CollectionSchema::new(repo::products::TABLE),
                 CollectionSchema::new(GROUPS_TABLE),
                 CollectionSchema::new(TYPES_TABLE),
                 CollectionSchema::new(PURCHASES_TABLE),
@@ -1071,6 +509,17 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/my-products/{id}")
                     .summary("Manage own product")
                     .auth(AuthLevel::Authenticated),
+                // `{id}` matches exactly one segment and `match_template`
+                // rejects a path with segments left over, so the declaration
+                // above does NOT cover `.../{id}/close`. Undeclared it would
+                // fall to `declared_access`'s `Authenticated` fallback, which
+                // happens to be the right tier — but the page's whole job is
+                // acting on a soft-deleted product, so which tier it answers
+                // at is stated here rather than inherited.
+                BlockEndpoint::get("/b/products/my-products/{id}/close")
+                    .summary("Close own deleted product's Stripe surface")
+                    .description("Archive the offers and deactivate the payment links of a product the caller owns and has deleted, without restoring it to the catalog.")
+                    .auth(AuthLevel::Authenticated),
                 BlockEndpoint::get("/b/products/my-purchases")
                     .summary("View own purchases")
                     .auth(AuthLevel::Authenticated),
@@ -1103,6 +552,12 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/admin/manage").summary("Manage products").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/new").summary("Create product").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/products/{id}").summary("Manage product").auth(AuthLevel::Admin),
+                // `/b/products` is a PUBLIC route prefix, so this declaration
+                // is the only thing that makes the page admin-only.
+                BlockEndpoint::get("/b/products/admin/products/{id}/close")
+                    .summary("Close a deleted product's Stripe surface")
+                    .description("Archive the offers and deactivate the payment links of a soft-deleted product, without restoring it to the catalog.")
+                    .auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/groups").summary("Manage groups").auth(AuthLevel::Admin),
 
                 BlockEndpoint::get("/b/products/admin/purchases").summary("Purchases").auth(AuthLevel::Admin),
@@ -1116,42 +571,33 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/api/admin/products")
                     .summary("List products")
                     .auth(AuthLevel::Admin)
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "minimum": 1},
-                            "page_size": {"type": "integer", "minimum": 1},
-                            "group_id": {"type": "string"},
-                            "status": {"type": "string"},
-                            "search": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(record_list_schema(product_schema.clone()))
+                    .query_params::<contracts::ProductListQuery>()
+                    .output::<contracts::ProductListResponse>()
                     .tags(&["products", "admin"]),
                 BlockEndpoint::post("/b/products/api/admin/products")
                     .summary("Create product")
                     .auth(AuthLevel::Admin)
-                    .input_schema(product_write_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .input::<contracts::CreateProductRequest>()
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "admin"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{id}")
                     .summary("Get product")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "admin"]),
                 BlockEndpoint::patch("/b/products/api/admin/products/{id}")
                     .summary("Update product")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(product_update_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .input::<contracts::UpdateProductRequest>()
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "admin"]),
                 BlockEndpoint::delete("/b/products/api/admin/products/{id}")
                     .summary("Delete product")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(deleted_schema.clone())
+                    .output::<crud::Deleted>()
                     .tags(&["products", "admin"]),
                 BlockEndpoint::post("/b/products/api/admin/products/{id}/duplicate")
                     .summary("Duplicate product and editable offers")
@@ -1163,14 +609,26 @@ crate::impresspress_feature_block! {
                     .summary("Approve a seller product waiting for moderation")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "admin", "moderation"]),
                 BlockEndpoint::post("/b/products/api/admin/products/{id}/reject")
                     .summary("Return a seller product to draft after moderation")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "admin", "moderation"]),
+                BlockEndpoint::post("/b/products/api/admin/products/{id}/restore")
+                    .summary("Restore a soft-deleted product")
+                    .description("Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(id_path_schema.clone())
+                    // Typed like the other 47 rows this branch projects, not
+                    // the raw `{id, data}` envelope it arrived with: it hands
+                    // back the same product row every other product endpoint
+                    // does, and `record_schema`/`product_schema` — its only
+                    // remaining callers — went away with the untyped path.
+                    .output::<contracts::ProductView>()
+                    .tags(&["products", "admin"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers")
                     .summary("List product offers")
                     .auth(AuthLevel::Admin)
@@ -1195,8 +653,8 @@ crate::impresspress_feature_block! {
                     .description("Evaluate an owner-visible immutable or draft offer with the server pricing engine. Browser totals are never trusted.")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(pricing_preview_input_schema.clone())
-                    .output_schema(pricing_preview_output_schema.clone())
+                    .input::<contracts::PricingPreviewRequest>()
+                    .output::<contracts::PricingPreview>()
                     .tags(&["products", "admin", "offers", "pricing"]),
                 BlockEndpoint::patch("/b/products/api/admin/products/{product_id}/offers/{offer_id}")
                     .summary("Update draft offer")
@@ -1233,133 +691,127 @@ crate::impresspress_feature_block! {
                     .summary("List checkout presets")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(checkout_preset_list_schema.clone())
+                    .output::<contracts::CheckoutPresetList>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::post("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets")
                     .summary("Create checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Get checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(preset_path_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::patch("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Update checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(preset_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::delete("/b/products/api/admin/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Archive checkout preset")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(preset_path_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "admin", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("List Payment Links")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(payment_link_list_schema.clone())
+                    .output::<contracts::PaymentLinkList>()
                     .tags(&["products", "admin", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::post("/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("Create or reuse Payment Link")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(payment_link_input_schema.clone())
-                    .output_schema(managed_payment_link_schema.clone())
+                    .input::<contracts::PaymentLinkCreateRequest>()
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "admin", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::delete("/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links/{link_id}")
                     .summary("Deactivate Payment Link")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(link_path_schema.clone())
-                    .output_schema(managed_payment_link_schema.clone())
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "admin", "offers", "payment-links", "stripe"]),
                 // JSON admin API — groups
                 BlockEndpoint::get("/b/products/api/admin/groups")
                     .summary("List groups")
                     .auth(AuthLevel::Admin)
-                    .output_schema(record_list_schema(group_schema.clone()))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::GroupListResponse>()
                     .tags(&["products", "admin", "groups"]),
                 BlockEndpoint::post("/b/products/api/admin/groups")
                     .summary("Create group")
                     .auth(AuthLevel::Admin)
-                    .input_schema(group_write_schema)
-                    .output_schema(record_schema(group_schema.clone()))
+                    .input::<contracts::CreateGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "admin", "groups"]),
                 BlockEndpoint::patch("/b/products/api/admin/groups/{id}")
                     .summary("Update group")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(group_update_schema.clone())
-                    .output_schema(record_schema(group_schema.clone()))
+                    .input::<contracts::UpdateGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "admin", "groups"]),
                 BlockEndpoint::delete("/b/products/api/admin/groups/{id}")
                     .summary("Delete group")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(deleted_schema.clone())
+                    .output::<crud::Deleted>()
                     .tags(&["products", "admin", "groups"]),
                 // JSON admin API — types
                 BlockEndpoint::get("/b/products/api/admin/types")
                     .summary("List types")
                     .auth(AuthLevel::Admin)
-                    .output_schema(record_list_schema(product_type_schema.clone()))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::ProductTypeListResponse>()
                     .tags(&["products", "admin", "types"]),
                 BlockEndpoint::post("/b/products/api/admin/types")
                     .summary("Create type")
                     .auth(AuthLevel::Admin)
-                    .input_schema(product_type_write_schema)
-                    .output_schema(record_schema(product_type_schema.clone()))
+                    .input::<contracts::CreateProductTypeRequest>()
+                    .output::<contracts::ProductTypeView>()
                     .tags(&["products", "admin", "types"]),
                 BlockEndpoint::delete("/b/products/api/admin/types/{id}")
                     .summary("Delete type")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(deleted_schema.clone())
+                    .output::<crud::Deleted>()
                     .tags(&["products", "admin", "types"]),
                 // JSON admin API — purchases + stats
                 BlockEndpoint::get("/b/products/api/admin/purchases")
                     .summary("List purchases")
                     .auth(AuthLevel::Admin)
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "minimum": 1},
-                            "page_size": {"type": "integer", "minimum": 1},
-                            "status": {"type": "string"},
-                            "user_id": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(purchase_list_schema.clone())
+                    .query_params::<contracts::AdminPurchaseListQuery>()
+                    .output::<contracts::PurchaseListResponse>()
                     .tags(&["products", "admin", "orders"]),
                 BlockEndpoint::get("/b/products/api/admin/purchases/{id}")
                     .summary("Get purchase")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(purchase_detail_schema.clone())
+                    .output::<contracts::PurchaseDetailResponse>()
                     .tags(&["products", "admin", "orders"]),
                 BlockEndpoint::post("/b/products/api/admin/purchases/{id}/refund")
                     .summary("Create an idempotent full or partial refund")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(refund_input_schema.clone())
-                    .output_schema(refund_output_schema.clone())
+                    .input::<contracts::RefundRequest>()
+                    .output::<contracts::RefundResult>()
                     .tags(&["products", "admin", "refunds"]),
                 BlockEndpoint::get("/b/products/api/admin/stats")
                     .summary("Commerce analytics separated by currency")
                     .auth(AuthLevel::Admin)
-                    .output_schema(admin_stats_schema)
+                    .output::<contracts::AdminStats>()
                     .tags(&["products", "admin", "analytics"]),
                 BlockEndpoint::get("/b/products/api/admin/stripe/status")
                     .summary("Validate Stripe connection and account mode")
                     .auth(AuthLevel::Admin)
-                    .output_schema(stripe_connection_schema)
+                    .output::<contracts::StripeConnectionStatus>()
                     .tags(&["products", "admin", "stripe"]),
                 BlockEndpoint::get("/b/products/api/admin/webhook-events")
                     .summary("List safe Stripe webhook processing state")
@@ -1372,13 +824,13 @@ crate::impresspress_feature_block! {
                             "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
                         }
                     }))
-                    .output_schema(webhook_event_list_schema)
+                    .output::<contracts::WebhookEventList>()
                     .tags(&["products", "admin", "stripe", "webhooks"]),
                 BlockEndpoint::post("/b/products/api/admin/webhook-events/{id}/replay")
                     .summary("Replay a failed or dead-letter Stripe webhook")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(webhook_ack_schema)
+                    .output::<contracts::WebhookAck>()
                     .tags(&["products", "admin", "stripe", "webhooks"]),
                 BlockEndpoint::get("/b/products/api/admin/provider-operations")
                     .summary("List safe Stripe provider reconciliation state")
@@ -1391,7 +843,7 @@ crate::impresspress_feature_block! {
                             "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
                         }
                     }))
-                    .output_schema(provider_operation_list_schema)
+                    .output::<contracts::ProviderOperationList>()
                     .tags(&["products", "admin", "stripe", "reconciliation"]),
                 BlockEndpoint::post("/b/products/api/admin/provider-operations/reconcile")
                     .summary("Claim and reconcile due Stripe provider operations")
@@ -1401,81 +853,74 @@ crate::impresspress_feature_block! {
                         "type": "object",
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}
                     }))
-                    .output_schema(provider_reconcile_schema)
+                    .output::<contracts::ProviderReconcileResult>()
                     .tags(&["products", "admin", "stripe", "reconciliation"]),
                 BlockEndpoint::get("/b/products/api/admin/sellers")
                     .summary("List seller accounts and capability state")
                     .auth(AuthLevel::Admin)
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["sellers"],
-                        "properties": {"sellers": {"type": "array", "items": seller_account_schema}}
-                    }))
+                    .output::<contracts::SellerAccountList>()
                     .tags(&["products", "admin", "seller", "stripe-connect"]),
                 BlockEndpoint::get("/b/products/api/admin/sellers/{id}")
                     .summary("Get seller account and owned products")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["seller", "products"],
-                        "properties": {
-                            "seller": seller_account_schema,
-                            "products": {"type": "array", "items": record_schema(product_schema.clone())}
-                        }
-                    }))
+                    .output::<contracts::AdminSellerDetail>()
                     .tags(&["products", "admin", "seller", "stripe-connect"]),
                 BlockEndpoint::post("/b/products/api/admin/sellers/{id}/suspend")
                     .summary("Suspend a seller after provider-safe offer archival")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(seller_account_schema.clone())
+                    .output::<contracts::SellerAccount>()
                     .tags(&["products", "admin", "seller", "stripe-connect"]),
                 BlockEndpoint::post("/b/products/api/admin/sellers/{id}/reactivate")
                     .summary("Reactivate a seller for onboarding or sales")
                     .auth(AuthLevel::Admin)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(seller_account_schema.clone())
+                    .output::<contracts::SellerAccount>()
                     .tags(&["products", "admin", "seller", "stripe-connect"]),
                 BlockEndpoint::get("/b/products/api/products")
                     .summary("List own products")
                     .auth(AuthLevel::Authenticated)
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "minimum": 1},
-                            "page_size": {"type": "integer", "minimum": 1},
-                            "group_id": {"type": "string"},
-                            "status": {"type": "string"},
-                            "search": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(record_list_schema(product_schema.clone()))
+                    .query_params::<contracts::ProductListQuery>()
+                    .output::<contracts::ProductListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::post("/b/products/api/products")
                     .summary("Create own product")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(product_write_schema)
-                    .output_schema(record_schema(product_schema.clone()))
+                    .input::<contracts::CreateProductRequest>()
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/api/products/{id}")
                     .summary("Get own product")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::patch("/b/products/api/products/{id}")
                     .summary("Update own product")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(product_update_schema.clone())
-                    .output_schema(record_schema(product_schema.clone()))
+                    .input::<contracts::UpdateProductRequest>()
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::delete("/b/products/api/products/{id}")
                     .summary("Delete own product")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(deleted_schema)
+                    .output::<crud::Deleted>()
+                    .tags(&["products", "seller"]),
+                BlockEndpoint::post("/b/products/api/products/{id}/restore")
+                    .summary("Restore own soft-deleted product")
+                    .description("Clears `deleted_at` on a product the caller owns, undoing their own delete. The admin route is `/b/products/api/admin/products/{id}/restore`; this one is scoped to the caller's own products and answers 404 for anyone else's.")
+                    .auth(AuthLevel::Authenticated)
+                    .path_params_schema(id_path_schema.clone())
+                    // Same typed view as the admin restore, because both
+                    // routes are the same write: `handle_user_restore_product`
+                    // and `handle_restore_product` share one `restore_product`
+                    // body, and it answers `ProductView::from_record`. The
+                    // `record_schema`/`product_schema` envelope this arrived
+                    // with described the untyped path and went away with it.
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::post("/b/products/api/products/{id}/duplicate")
                     .summary("Duplicate own product and editable offers")
@@ -1507,8 +952,8 @@ crate::impresspress_feature_block! {
                     .description("Evaluate an owned immutable or draft offer with the server pricing engine. Browser totals are never trusted.")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(pricing_preview_input_schema.clone())
-                    .output_schema(pricing_preview_output_schema.clone())
+                    .input::<contracts::PricingPreviewRequest>()
+                    .output::<contracts::PricingPreview>()
                     .tags(&["products", "seller", "offers", "pricing"]),
                 BlockEndpoint::patch("/b/products/api/products/{product_id}/offers/{offer_id}")
                     .summary("Update own draft offer")
@@ -1545,52 +990,52 @@ crate::impresspress_feature_block! {
                     .summary("List own checkout presets")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(checkout_preset_list_schema)
+                    .output::<contracts::CheckoutPresetList>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::post("/b/products/api/products/{product_id}/offers/{offer_id}/presets")
                     .summary("Create own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Get own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(preset_path_schema.clone())
-                    .output_schema(checkout_preset_schema.clone())
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::patch("/b/products/api/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Update own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(preset_path_schema.clone())
-                    .input_schema(checkout_preset_input_schema)
-                    .output_schema(checkout_preset_schema.clone())
+                    .input::<contracts::CheckoutPresetRequest>()
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::delete("/b/products/api/products/{product_id}/offers/{offer_id}/presets/{preset_id}")
                     .summary("Archive own checkout preset")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(preset_path_schema)
-                    .output_schema(checkout_preset_schema)
+                    .output::<contracts::CheckoutPreset>()
                     .tags(&["products", "seller", "offers", "payment-links"]),
                 BlockEndpoint::get("/b/products/api/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("List own Payment Links")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema.clone())
-                    .output_schema(payment_link_list_schema)
+                    .output::<contracts::PaymentLinkList>()
                     .tags(&["products", "seller", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::post("/b/products/api/products/{product_id}/offers/{offer_id}/payment-links")
                     .summary("Create or reuse own Payment Link")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(offer_path_schema)
-                    .input_schema(payment_link_input_schema)
-                    .output_schema(managed_payment_link_schema.clone())
+                    .input::<contracts::PaymentLinkCreateRequest>()
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "seller", "offers", "payment-links", "stripe"]),
                 BlockEndpoint::delete("/b/products/api/products/{product_id}/offers/{offer_id}/payment-links/{link_id}")
                     .summary("Deactivate own Payment Link")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(link_path_schema)
-                    .output_schema(managed_payment_link_schema)
+                    .output::<contracts::ManagedPaymentLink>()
                     .tags(&["products", "seller", "offers", "payment-links", "stripe"]),
                 // Authenticated user-owned groups and builder taxonomy. These
                 // routes used to rely on the products prefix's fail-closed
@@ -1599,170 +1044,110 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/groups")
                     .summary("List own product groups")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(record_list_schema(group_schema.clone()))
+                    .output::<contracts::GroupListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::post("/b/products/groups")
                     .summary("Create own product group")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["name"],
-                        "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
-                                        "group_template_id": {"type": "string"},
-                            "status": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(record_schema(group_schema.clone()))
+                    .input::<contracts::CreateOwnGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/groups/{id}")
                     .summary("Get own product group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_schema(group_schema.clone()))
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::patch("/b/products/groups/{id}")
                     .summary("Update own product group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
-                                        "group_template_id": {"type": "string"},
-                            "status": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(record_schema(group_schema))
+                    .input::<contracts::UpdateOwnGroupRequest>()
+                    .output::<contracts::GroupView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::delete("/b/products/groups/{id}")
                     .summary("Delete own product group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["deleted"],
-                        "properties": {"deleted": {"type": "boolean"}}
-                    }))
+                    .output::<crud::Deleted>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/groups/{id}/products")
                     .summary("List products in own group")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(record_list_schema(product_schema.clone()))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::ProductListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/types")
                     .summary("List product types for the authenticated builder")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(record_list_schema(product_type_schema))
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::ProductTypeListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/group-templates")
                     .summary("List group templates for the authenticated builder")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(record_list_schema(group_template_schema))
+                    .output::<contracts::GroupTemplateListResponse>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::get("/b/products/api/seller/account")
                     .summary("Seller Stripe account status")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(seller_account_schema.clone())
+                    .output::<contracts::SellerAccount>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 BlockEndpoint::get("/b/products/api/seller/stats")
                     .summary("Seller analytics separated by currency")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(seller_stats_schema)
+                    .output::<contracts::SellerStats>()
                     .tags(&["products", "seller", "analytics"]),
                 BlockEndpoint::get("/b/products/api/seller/orders")
                     .summary("List seller-owned orders")
                     .auth(AuthLevel::Authenticated)
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "minimum": 1},
-                            "page_size": {"type": "integer", "minimum": 1},
-                            "status": {"type": "string"}
-                        }
-                    }))
-                    .output_schema(purchase_list_schema.clone())
+                    .query_params::<contracts::SellerOrderListQuery>()
+                    .output::<contracts::SellerOrderListResponse>()
                     .tags(&["products", "seller", "orders"]),
                 BlockEndpoint::get("/b/products/api/seller/orders/{id}")
                     .summary("Get seller-owned order")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .output_schema(purchase_detail_schema.clone())
+                    .output::<contracts::SellerOrderDetailResponse>()
                     .tags(&["products", "seller", "orders"]),
                 BlockEndpoint::post("/b/products/api/seller/orders/{id}/refund")
                     .summary("Refund a seller-owned order")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
-                    .input_schema(refund_input_schema)
-                    .output_schema(refund_output_schema)
+                    .input::<contracts::RefundRequest>()
+                    .output::<contracts::RefundResult>()
                     .tags(&["products", "seller", "orders", "refunds"]),
                 BlockEndpoint::post("/b/products/api/seller/onboarding")
                     .summary("Create seller account and Stripe-hosted onboarding link")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["return_url", "refresh_url"],
-                        "properties": {
-                            "return_url": {"type": "string", "format": "uri"},
-                            "refresh_url": {"type": "string", "format": "uri"}
-                        }
-                    }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["account", "url", "expires_at"],
-                        "properties": {
-                            "account": seller_account_schema,
-                            "url": {"type": "string", "format": "uri"},
-                            "expires_at": {"type": "integer"}
-                        }
-                    }))
+                    .input::<contracts::SellerOnboardingRequest>()
+                    .output::<contracts::SellerOnboardingResponse>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 BlockEndpoint::post("/b/products/api/seller/dashboard")
                     .summary("Create Stripe Express dashboard login link")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(provider_redirect_schema.clone())
+                    .output::<contracts::ProviderRedirect>()
                     .tags(&["products", "seller", "stripe-connect"]),
                 // Public + authenticated user surface
-                // Public catalog — highest-value developer-facing surface of
-                // this block; accurate shapes read from `handlers.rs`
-                // (`handle_catalog` → `crud::crud_list` → `RecordList`,
-                // `handle_get_product_public` → `db::get` → `Record`). Full
-                // schema coverage of the admin/purchase/checkout API is a
-                // follow-up.
+                // Public catalog — the anonymous surface of this block. Both
+                // endpoints publish `contracts::CatalogProductView`, whose
+                // field list (not the row) decides what a guest may read.
                 BlockEndpoint::get("/b/products/catalog")
                     .summary("Browse catalog")
                     .description("Public list of active products, sorted by name.")
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "default": 1},
-                            "page_size": {"type": "integer", "default": 20, "maximum": 100}
-                        }
-                    }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "records": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "data": product_schema
-                                    }
-                                }
-                            },
-                            "total_count": {"type": "integer"},
-                            "page": {"type": "integer"},
-                            "page_size": {"type": "integer"}
-                        }
-                    }))
-                    .tags(&["products"]),
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::CatalogProductListResponse>()
+                    .tags(&["products"])
+                    .agent_tool(
+                        "list_products",
+                        "List what this store sells, a page at a time, sorted \
+                         by name. This is the only way to discover a \
+                         product id: call it first, then pass an id to \
+                         `get_product` for that product's offers and pricing \
+                         inputs. There is no search — page through the \
+                         results to find a product by name.",
+                    ),
                 BlockEndpoint::get("/b/products/catalog/{id}")
                     .summary("Product detail")
                     .path_params_schema(serde_json::json!({
@@ -1772,13 +1157,7 @@ crate::impresspress_feature_block! {
                             "id": {"type": "string"}
                         }
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "data": product_schema
-                        }
-                    }))
+                    .output::<contracts::CatalogProductView>()
                     .tags(&["products"]),
                 BlockEndpoint::get("/b/products/storefront.js")
                     .summary("Framework-free product storefront widget")
@@ -1789,17 +1168,7 @@ crate::impresspress_feature_block! {
                     .summary("Browser-safe storefront configuration")
                     .description("Returns only a validated Stripe publishable key and mode. Secret keys, webhook secrets, provider ids, and API URLs are never exposed.")
                     .auth(AuthLevel::Public)
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["schema_version", "embedded_checkout_available"],
-                        "properties": {
-                            "schema_version": {"type": "integer"},
-                            "embedded_checkout_available": {"type": "boolean"},
-                            "stripe_publishable_key": {"type": "string"},
-                            "stripe_mode": {"type": "string", "enum": ["test", "live"]}
-                        }
-                    }))
+                    .output::<contracts::StorefrontConfig>()
                     .tags(&["products", "storefront"])
                     .agent_tool(
                         "get_storefront_config",
@@ -1817,42 +1186,7 @@ crate::impresspress_feature_block! {
                             "product_id": {"type": "string"}
                         }
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["schema_version", "id", "name", "offers"],
-                        "properties": {
-                            "schema_version": {"type": "integer"},
-                            "id": {"type": "string"},
-                            "name": {"type": "string"},
-                            "slug": {"type": "string"},
-                            "description": {"type": "string"},
-                            "image_url": {"type": "string"},
-                            "tags": {"type": "array", "items": {"type": "string"}},
-                            "fulfillment_kind": {"type": "string"},
-                            "offers": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["id", "version", "name", "mode", "currency", "variables"],
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "version": {"type": "integer"},
-                                        "name": {"type": "string"},
-                                        "mode": {"type": "string"},
-                                        "currency": {"type": "string"},
-                                        "pricing_model": {"type": "string"},
-                                        "recurring_interval": {"type": ["string", "null"]},
-                                        "interval_count": {"type": "integer"},
-                                        "variables": {"type": "array"},
-                                        "checkout": {"type": "object"},
-                                        "payment_links": {"type": "array"}
-                                    }
-                                }
-                            }
-                        }
-                    }))
+                    .output::<contracts::StorefrontProduct>()
                     .auth(AuthLevel::Public)
                     .tags(&["products", "storefront"])
                     .agent_tool(
@@ -1880,21 +1214,13 @@ crate::impresspress_feature_block! {
                         },
                         "additionalProperties": true
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "required": ["received"],
-                        "properties": {
-                            "received": {"type": "boolean"},
-                            "duplicate": {"type": "boolean"},
-                            "dead_letter": {"type": "boolean"}
-                        }
-                    }))
+                    .output::<contracts::WebhookAck>()
                     .tags(&["products", "stripe", "webhooks"]),
                 BlockEndpoint::post("/b/products/pricing/preview")
                     .summary("Preview configured offer")
                     .description("Evaluate a persisted active offer from validated customer inputs. Amounts are returned in integer minor units.")
-                    .input_schema(pricing_preview_input_schema)
-                    .output_schema(pricing_preview_output_schema)
+                    .input::<contracts::PricingPreviewRequest>()
+                    .output::<contracts::PricingPreview>()
                     .auth(AuthLevel::Public)
                     .tags(&["products", "pricing"])
                     .agent_tool(
@@ -1906,8 +1232,8 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::post("/b/products/checkout")
                     .summary("Stripe checkout")
                     .description("Create a hosted or embedded Stripe Checkout Session from a public active offer. Guest checkout is supported and every amount is resolved from the immutable offer.")
-                    .input_schema(checkout_input_schema)
-                    .output_schema(checkout_output_schema)
+                    .input::<contracts::CheckoutRequest>()
+                    .output::<contracts::CheckoutResponse>()
                     .auth(AuthLevel::Public)
                     .tags(&["products", "checkout"])
                     .agent_tool(
@@ -1934,23 +1260,7 @@ crate::impresspress_feature_block! {
                         "required": ["receipt_token"],
                         "properties": {"receipt_token": {"type": "string"}}
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["schema_version", "order_id", "status", "reconciliation_status", "amounts", "subscription_cancel_at_period_end"],
-                        "properties": {
-                            "schema_version": {"type": "integer"},
-                            "order_id": {"type": "string"},
-                            "status": {"type": "string"},
-                            "reconciliation_status": {"type": "string"},
-                            "amounts": money_breakdown_schema,
-                            "subscription_status": {"type": "string"},
-                            "subscription_current_period_end": {"type": "string", "format": "date-time"},
-                            "subscription_cancel_at_period_end": {"type": "boolean"},
-                            "paid_at": {"type": "string", "format": "date-time"},
-                            "refunded_at": {"type": "string", "format": "date-time"}
-                        }
-                    }))
+                    .output::<contracts::GuestOrderStatus>()
                     .tags(&["products", "storefront"])
                     .agent_tool(
                         "get_order_status",
@@ -1960,14 +1270,8 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/purchases")
                     .summary("List own purchases")
                     .auth(AuthLevel::Authenticated)
-                    .query_params_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer", "minimum": 1},
-                            "page_size": {"type": "integer", "minimum": 1}
-                        }
-                    }))
-                    .output_schema(purchase_list_schema)
+                    .query_params::<contracts::PageQuery>()
+                    .output::<contracts::BuyerOrderListResponse>()
                     .tags(&["products", "orders"])
                     .agent_tool(
                         "list_my_purchases",
@@ -1978,26 +1282,18 @@ crate::impresspress_feature_block! {
                     .summary("Get own purchase")
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema)
-                    .output_schema(purchase_detail_schema)
+                    .output::<contracts::BuyerOrderDetailResponse>()
                     .tags(&["products", "orders"]),
                 BlockEndpoint::get("/b/products/subscription")
                     .summary("Platform subscription status")
                     .auth(AuthLevel::Authenticated)
-                    .output_schema(subscription_status_schema)
+                    .output::<contracts::SubscriptionStatusResponse>()
                     .tags(&["products", "subscriptions"]),
                 BlockEndpoint::post("/b/products/billing-portal")
                     .summary("Create a Stripe Billing Portal session for an owned customer context")
                     .auth(AuthLevel::Authenticated)
-                    .input_schema(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["return_url"],
-                        "properties": {
-                            "return_url": {"type": "string", "format": "uri"},
-                            "order_id": {"type": ["string", "null"]}
-                        }
-                    }))
-                    .output_schema(provider_redirect_schema)
+                    .input::<contracts::BillingPortalRequest>()
+                    .output::<contracts::ProviderRedirect>()
                     .tags(&["products", "subscriptions", "stripe"]),
             ])
             .config_keys(config_vars())
@@ -2042,9 +1338,37 @@ crate::impresspress_feature_block! {
                                 return pages::admin_seller_detail(ctx, &msg, seller_id).await;
                             }
                         }
-                        if let Some(product_id) = admin_sub.strip_prefix("/products/") {
-                            if !product_id.is_empty() && !product_id.contains('/') {
-                                return pages::product_manager(ctx, &msg, product_id, true).await;
+                        if let Some(rest) = admin_sub.strip_prefix("/products/") {
+                            // `/products/{id}/close` first: the plain manager
+                            // below rejects any remainder containing a `/`,
+                            // so an ordering slip here is a 404, not a
+                            // mis-dispatch.
+                            if let Some(product_id) = rest.strip_suffix("/close") {
+                                if !product_id.is_empty() && !product_id.contains('/') {
+                                    return pages::deleted_product_close(
+                                        ctx,
+                                        &msg,
+                                        &util::url_path_decode(product_id),
+                                        true,
+                                    )
+                                    .await;
+                                }
+                            }
+                            // Decoded for the same reason `endpoint_match`
+                            // decodes its `{name}` bindings: the id reaches
+                            // here exactly as it appeared on the wire, and
+                            // both the pages that link here and
+                            // `productManagerDuplicate`'s
+                            // `encodeURIComponent` navigation put it there
+                            // encoded.
+                            if !rest.is_empty() && !rest.contains('/') {
+                                return pages::product_manager(
+                                    ctx,
+                                    &msg,
+                                    &util::url_path_decode(rest),
+                                    true,
+                                )
+                                .await;
                             }
                         }
                         err_not_found("not found")
@@ -2091,9 +1415,30 @@ crate::impresspress_feature_block! {
                     if !handlers::user_products_enabled(ctx).await {
                         return err_forbidden("User product selling is disabled");
                     }
-                    let product_id = sub.strip_prefix("/my-products/").unwrap_or_default();
-                    if !product_id.is_empty() && !product_id.contains('/') {
-                        return pages::product_manager(ctx, &msg, product_id, false).await;
+                    let rest = sub.strip_prefix("/my-products/").unwrap_or_default();
+                    // `/{id}/close` first, mirroring the admin branch above:
+                    // the plain manager below rejects any remainder holding a
+                    // `/`, so an ordering slip here is a 404 rather than a
+                    // mis-dispatch.
+                    if let Some(product_id) = rest.strip_suffix("/close") {
+                        if !product_id.is_empty() && !product_id.contains('/') {
+                            return pages::deleted_product_close(
+                                ctx,
+                                &msg,
+                                &util::url_path_decode(product_id),
+                                false,
+                            )
+                            .await;
+                        }
+                    }
+                    if !rest.is_empty() && !rest.contains('/') {
+                        return pages::product_manager(
+                            ctx,
+                            &msg,
+                            &util::url_path_decode(rest),
+                            false,
+                        )
+                        .await;
                     }
                 }
                 "/my-purchases" => return pages::my_purchases(ctx, &msg).await,

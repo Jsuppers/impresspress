@@ -1,4 +1,5 @@
 mod cloud;
+mod contracts;
 pub(crate) mod migrations;
 pub(crate) mod models;
 mod pages_admin;
@@ -49,13 +50,20 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/storage/{bucket}/{prefix...}/").summary("Object list (nested)").auth(AuthLevel::Authenticated),
                 BlockEndpoint::get("/b/storage/api/buckets").summary("List buckets").auth(AuthLevel::Authenticated),
                 BlockEndpoint::post("/b/storage/api/buckets").summary("Create bucket").auth(AuthLevel::Authenticated),
-                // Schemas below mirror the real shapes read from
-                // `storage.rs` (`handle_list_objects`/`handle_get_object`,
-                // wire types `wafer_block::wire::storage::{ObjectList,
-                // ObjectInfo}`). These are the two highest-value developer
-                // endpoints for browsing a bucket; full coverage of the
-                // remaining storage routes (buckets, shares, quotas) is a
-                // follow-up.
+                // These are the two highest-value developer endpoints for
+                // browsing a bucket; full coverage of the remaining storage
+                // routes (buckets, shares, quotas) is a follow-up.
+                //
+                // `path_params_schema`/`query_params_schema` stay hand-written
+                // on both endpoints below (same call as `products::mod::info`
+                // for its `id_path_schema` et al.): `extract_bucket_name` /
+                // `extract_object_key` (storage/params.rs) read `msg.var(..)`
+                // with a prefix-strip fallback, and `handle_list_objects`
+                // reads `msg.query(..)` / `msg.pagination_params(..)` by name
+                // — nothing here deserializes into a struct. A struct
+                // declared only to feed `.path_params::<T>()` /
+                // `.query_params::<T>()` would have no runtime user and
+                // would generate a byte-identical parameter list.
                 BlockEndpoint::get("/b/storage/api/buckets/{name}/objects")
                     .summary("List objects")
                     .auth(AuthLevel::Authenticated)
@@ -74,26 +82,17 @@ crate::impresspress_feature_block! {
                             "page_size": {"type": "integer", "default": 50, "maximum": 100}
                         }
                     }))
-                    .output_schema(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "objects": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "key": {"type": "string"},
-                                        "size": {"type": "integer", "description": "Size in bytes"},
-                                        "content_type": {"type": "string"},
-                                        "last_modified": {"type": "string", "format": "date-time"}
-                                    }
-                                }
-                            },
-                            "total_count": {"type": "integer"}
-                        }
-                    }))
+                    .output::<contracts::ObjectListResponse>()
                     .tags(&["storage"]),
                 BlockEndpoint::post("/b/storage/api/buckets/{name}/objects").summary("Upload file").auth(AuthLevel::Authenticated),
+                // No input_schema: `handle_upload_object` accepts either a
+                // raw body (programmatic clients) or a `multipart/form-data`
+                // envelope (browser `FormData` uploads) — see
+                // `crate::multipart` and the `is_multipart` branch in
+                // `storage/objects.rs`. Neither shape is a JSON body, so
+                // there is no `T` to derive a request schema from; a JSON
+                // Schema here would misdescribe what the endpoint accepts.
+                //
                 // No output_schema: the success response is the raw object
                 // body (`Content-Type` set from the stored object's MIME
                 // type), not JSON — see `handle_get_object`'s

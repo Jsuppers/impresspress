@@ -555,10 +555,19 @@
 	height: 16px;
 }
 
-.account-card__logo {
-	max-height: 48px;
+/* Ported from origin/main (ui/assets/components.css) during the main merge
+   -- 2026-09-02. The card header's brand comes from `templates::brand_lockup`,
+   shared with the auth cards. Only the wordmark case needs scoping to this
+   card: cap its width so a wide white-label wordmark can't outgrow the card,
+   and drop the auth-card bottom margin (this header is a flex column with
+   its own gap). The icon lockup keeps its natural 64px -- the built-in mark
+   is pixel art and must not be scaled off a whole multiple of its cell size.
+   Replaces the old `.account-card__logo` rule, which targeted a class
+   `brand_lockup` never renders (it renders `.logo-image`) -- that mismatch
+   predates this merge on both sides. */
+.account-card__head .logo-image {
 	max-width: 220px;
-	object-fit: contain;
+	margin-bottom: 0;
 }
 
 .account-card__title {

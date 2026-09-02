@@ -39,6 +39,7 @@ pub(crate) enum AdminRoute {
     DuplicateProduct,
     ApproveProduct,
     RejectProduct,
+    RestoreProduct,
     ListOffers,
     GetOffer,
     PreviewManagedOffer,
@@ -122,6 +123,11 @@ pub(in crate::blocks::products) const ADMIN_ROUTES: &[EndpointRoute<AdminRoute>]
         HttpMethod::Post,
         "/admin/b/products/products/{id}/reject",
         AdminRoute::RejectProduct,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/admin/b/products/products/{id}/restore",
+        AdminRoute::RestoreProduct,
     ),
     EndpointRoute::new(
         HttpMethod::Get,
@@ -318,6 +324,7 @@ pub(crate) enum UserRoute {
     CreateProduct,
     UpdateProduct,
     DeleteProduct,
+    RestoreProduct,
     DuplicateProduct,
     ListOffers,
     GetOffer,
@@ -377,6 +384,7 @@ impl UserRoute {
                 | UserRoute::CreateProduct
                 | UserRoute::UpdateProduct
                 | UserRoute::DeleteProduct
+                | UserRoute::RestoreProduct
                 | UserRoute::DuplicateProduct
                 | UserRoute::ListOffers
                 | UserRoute::GetOffer
@@ -422,6 +430,7 @@ impl UserRoute {
             UserRoute::CreateProduct
                 | UserRoute::UpdateProduct
                 | UserRoute::DeleteProduct
+                | UserRoute::RestoreProduct
                 | UserRoute::DuplicateProduct
                 | UserRoute::CreateOffer
                 | UserRoute::UpdateOffer
@@ -474,6 +483,11 @@ pub(in crate::blocks::products) const USER_ROUTES: &[EndpointRoute<UserRoute>] =
         HttpMethod::Delete,
         "/b/products/products/{id}",
         UserRoute::DeleteProduct,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/products/products/{id}/restore",
+        UserRoute::RestoreProduct,
     ),
     EndpointRoute::new(
         HttpMethod::Post,
@@ -719,6 +733,7 @@ pub async fn handle_admin(
         AdminRoute::DuplicateProduct => product::handle_duplicate_product(ctx, msg).await,
         AdminRoute::ApproveProduct => sellers::approve_product(ctx, msg).await,
         AdminRoute::RejectProduct => sellers::reject_product(ctx, msg).await,
+        AdminRoute::RestoreProduct => product::handle_restore_product(ctx, msg).await,
         AdminRoute::ListOffers => offers::handle_list(ctx, msg, offers::OfferAccess::Admin).await,
         AdminRoute::GetOffer => offers::handle_get(ctx, msg, offers::OfferAccess::Admin).await,
         AdminRoute::PreviewManagedOffer => {
@@ -773,7 +788,7 @@ pub async fn handle_admin(
         AdminRoute::DeleteType => types::handle_delete_type(ctx, msg).await,
         AdminRoute::ListPurchases => purchase::handle_list_admin(ctx, msg).await,
         AdminRoute::RefundPurchase => purchase::handle_refund(ctx, msg, input).await,
-        AdminRoute::GetPurchase => purchase::handle_get(ctx, msg).await,
+        AdminRoute::GetPurchase => purchase::handle_get_admin(ctx, msg).await,
         AdminRoute::Stats => stats::handle_stats(ctx, msg).await,
         AdminRoute::StripeStatus => provider::connection_status(ctx).await,
         AdminRoute::WebhookEvents => provider::webhook_events(ctx, msg).await,
@@ -830,6 +845,7 @@ pub async fn handle_user(
         UserRoute::CreateProduct => product::handle_user_create_product(ctx, msg, input).await,
         UserRoute::UpdateProduct => product::handle_user_update_product(ctx, msg, input).await,
         UserRoute::DeleteProduct => product::handle_user_delete_product(ctx, msg).await,
+        UserRoute::RestoreProduct => product::handle_user_restore_product(ctx, msg).await,
         UserRoute::DuplicateProduct => product::handle_user_duplicate_product(ctx, msg).await,
         UserRoute::PreviewOffer => commerce::handle_preview(ctx, input).await,
         UserRoute::ListOffers => offers::handle_list(ctx, msg, offers::OfferAccess::Owner).await,

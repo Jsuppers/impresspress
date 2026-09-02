@@ -1,3 +1,4 @@
+mod contracts;
 mod database;
 mod iam;
 mod logs;
@@ -29,6 +30,25 @@ use wafer_run::{
 };
 
 use crate::http::{err_bad_request, err_internal, err_not_found, ok_json};
+
+/// Path-parameter schema for the `/iam/roles/{id}` routes.
+///
+/// Hand-written rather than derived: the handlers read the id by stripping
+/// the path prefix, so a struct declared only to feed `.path_params::<T>()`
+/// would have no runtime user — the same reasoning `tickets` records.
+fn role_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Role id, as returned by the list endpoint (not the role name)."
+            }
+        }
+    })
+}
 
 crate::impresspress_feature_block! {
     /// Admin panel: users, database, IAM, logs, settings (`impresspress/admin`).
@@ -121,10 +141,89 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/admin/grants").summary("WRAP grants management").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/admin/database").summary("Database admin page").auth(AuthLevel::Admin),
                 BlockEndpoint::post("/b/admin/database/query").summary("Run read-only SQL (SSR)").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/users").summary("List users API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/iam/roles").summary("List roles API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/settings").summary("List variables API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/logs").summary("Audit logs API").auth(AuthLevel::Admin),
+                // The JSON API: four reads and the three role writes. Every
+                // other endpoint above and below returns an SSR HTML page, so
+                // it carries no schema and never becomes a tool. The remaining
+                // JSON writes (users, permissions, user-roles, settings) still
+                // echo raw rows and stay undeclared until they are typed.
+                //
+                // The four reads are the block's whole agent surface, and they
+                // are reads by policy, not by accident: a tool's `execute`
+                // runs in the visitor's page with their session cookie and
+                // full ambient authority, and any text the agent reads can
+                // steer it. `no_admin_write_is_an_agent_tool` enforces this.
+                BlockEndpoint::get("/b/admin/api/users")
+                    .summary("List users API")
+                    .auth(AuthLevel::Admin)
+                    .query_params::<contracts::AdminUserListQuery>()
+                    .output::<contracts::AdminUserListResponse>()
+                    .agent_tool(
+                        "list_users",
+                        "List this site's user accounts — email, roles, \
+                         verification and disabled state — one page at a \
+                         time. Use it to answer questions about who has an \
+                         account or who holds a role. Read-only: it cannot \
+                         create, change or remove a user.",
+                    ),
+                BlockEndpoint::get("/b/admin/api/iam/roles")
+                    .summary("List roles API")
+                    .auth(AuthLevel::Admin)
+                    .output::<contracts::AdminRoleListResponse>()
+                    .agent_tool(
+                        "list_roles",
+                        "List the roles defined for this site and what each \
+                         one grants. Call it before answering what a role \
+                         permits, rather than assuming from its name. \
+                         Read-only: it cannot create or change a role.",
+                    ),
+                BlockEndpoint::post("/b/admin/api/iam/roles")
+                    .summary("Create role API")
+                    .auth(AuthLevel::Admin)
+                    .input::<contracts::CreateRoleRequest>()
+                    .output::<contracts::AdminRoleView>(),
+                // `handle()` matches the `update` action, which both PUT and
+                // PATCH map to; PATCH is what the SDK sends and what is
+                // declared.
+                BlockEndpoint::patch("/b/admin/api/iam/roles/{id}")
+                    .summary("Update role API")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(role_id_path_schema())
+                    .input::<contracts::UpdateRoleRequest>()
+                    .output::<contracts::AdminRoleView>(),
+                BlockEndpoint::delete("/b/admin/api/iam/roles/{id}")
+                    .summary("Delete role API")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(role_id_path_schema())
+                    .output::<contracts::AdminRoleDeleteResponse>(),
+                BlockEndpoint::get("/b/admin/api/settings")
+                    .summary("List variables API")
+                    .auth(AuthLevel::Admin)
+                    .output::<contracts::AdminSettingsResponse>()
+                    .agent_tool(
+                        "get_site_settings",
+                        "Read this site's configuration variables as a list of \
+                         entries, each with its key, its value, and whether \
+                         that value is masked. A variable is masked when it \
+                         carries the sensitive flag or its key ends in \
+                         `_SECRET` or `_KEY`; a masked value reads \
+                         `********` and is never the real one. Treat an \
+                         unmasked value as readable configuration, not as \
+                         proof it holds no secret. Read-only: it cannot \
+                         change a setting.",
+                    ),
+                BlockEndpoint::get("/b/admin/api/logs")
+                    .summary("Audit logs API")
+                    .auth(AuthLevel::Admin)
+                    .query_params::<contracts::AdminAuditLogListQuery>()
+                    .output::<contracts::AdminAuditLogListResponse>()
+                    .agent_tool(
+                        "list_audit_log",
+                        "List recorded admin actions, newest first: which \
+                         admin changed which user, role or setting, when, \
+                         and from which client IP. Use it to answer what \
+                         changed on this site and who changed it. Read-only: \
+                         it cannot alter or remove an entry.",
+                    ),
             ])
     },
     handle: |_this, ctx, msg, input| {
@@ -371,6 +470,9 @@ async fn handle_delete_wrap_grant(
 
 #[cfg(test)]
 mod tests {
+    use wafer_block::Block;
+    use wafer_run::HttpMethod;
+
     use super::*;
 
     #[tokio::test]
@@ -391,6 +493,60 @@ mod tests {
             .unwrap_or("");
         assert_eq!(status, "308");
         assert_eq!(location, "/b/admin/settings/email");
+    }
+
+    /// The four admin JSON reads are the block's whole agent surface.
+    ///
+    /// The design spec scopes admin to read tools: a tool's `execute` runs in
+    /// the visitor's page with their session cookie and full ambient
+    /// authority, and any text the agent reads — including user-generated
+    /// content — can steer it. Reads are recoverable; an agent-invocable
+    /// admin write is not, so none exists.
+    #[test]
+    fn admin_json_reads_are_exposed_as_agent_tools() {
+        let info = AdminBlock::default().info();
+        let named: std::collections::HashMap<&str, &str> = info
+            .endpoints
+            .iter()
+            .filter_map(|ep| {
+                ep.agent_tool
+                    .as_ref()
+                    .map(|t| (t.name.as_str(), ep.path.as_str()))
+            })
+            .collect();
+
+        assert_eq!(named.get("list_users"), Some(&"/b/admin/api/users"));
+        assert_eq!(named.get("list_roles"), Some(&"/b/admin/api/iam/roles"));
+        assert_eq!(
+            named.get("get_site_settings"),
+            Some(&"/b/admin/api/settings")
+        );
+        assert_eq!(named.get("list_audit_log"), Some(&"/b/admin/api/logs"));
+        assert_eq!(
+            named.len(),
+            4,
+            "admin's agent surface is exactly the four JSON reads: {named:?}"
+        );
+    }
+
+    /// Every admin tool must be a read. This is the structural half of the
+    /// policy above: annotating a future admin write fails here rather than
+    /// being caught in review.
+    #[test]
+    fn no_admin_write_is_an_agent_tool() {
+        let info: BlockInfo = AdminBlock::default().info();
+        for ep in &info.endpoints {
+            if ep.is_agent_tool() {
+                assert_eq!(
+                    ep.method,
+                    HttpMethod::Get,
+                    "{} is a {:?} and must not be an agent tool: admin tools \
+                     are read-only",
+                    ep.path,
+                    ep.method
+                );
+            }
+        }
     }
 }
 
