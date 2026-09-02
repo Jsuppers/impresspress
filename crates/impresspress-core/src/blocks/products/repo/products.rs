@@ -93,9 +93,11 @@ pub(crate) async fn list_page(
 ///
 /// Shares [`list_deleted`]'s named exception to this module's live-only
 /// rule, and exists for the same reason: `restore` re-claims the row's slug
-/// against the partial unique index from migration 005, so its caller has to
-/// be able to read the slug of a row that `get` cannot see, in order to say
-/// which slug collided instead of surfacing the index violation as a 500.
+/// against the partial unique index from migration 005, so when that write
+/// fails its caller has to be able to read the slug of a row that `get`
+/// cannot see, in order to say which slug collided instead of surfacing the
+/// index violation as a 500. A failed restore leaves the row deleted, which
+/// is exactly why this read still finds it.
 pub(crate) async fn get_deleted(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
     let record = db::get(ctx, TABLE, id).await?;
     if !is_deleted(&record) {

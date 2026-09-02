@@ -1488,6 +1488,12 @@ async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() 
 /// That must read as a conflict naming the slug, not an opaque 500: the
 /// Deleted view's Restore button only reloads on success, so a 500 renders
 /// as nothing happening at all on the only door out of soft delete.
+///
+/// The conflict is read off the failed write, not from a pre-check ahead of
+/// it. A pre-check answers about the moment before the write, so a slug
+/// claimed in between produced the very 500 it existed to prevent; the
+/// write's own failure cannot be raced, because the row is still deleted and
+/// still probeable exactly when the write did not land.
 #[tokio::test]
 async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
     let ctx = ctx().await;
@@ -1597,16 +1603,11 @@ async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
     );
 }
 
-/// The slug pre-check exists so a restore that would violate migration 005's
-/// partial unique index says which slug collided instead of surfacing the
-/// index violation as an opaque 500. Reading a *failed* probe as "no
-/// collision" throws that away: the restore proceeds, hits the index, and
-/// produces exactly the 500 the pre-check was built to prevent — with no log
-/// line naming the real cause, and with the Deleted view's Restore button
-/// (which only reloads on success) showing the admin nothing at all.
-///
-/// A probe that could not run is not evidence of a clear slug. Fail the
-/// restore and say so.
+/// The other direction of the same rule: "could not tell" is not "conflict".
+/// When the restore write fails and the collision probe that would name the
+/// slug cannot itself run, the response must carry the write's real failure —
+/// an `Internal` error against a correlation id an admin can quote — rather
+/// than a confident 409 blaming a slug nothing has confirmed is taken.
 #[tokio::test]
 async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
     let ctx = ctx().await;
@@ -1623,9 +1624,10 @@ async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
     .await;
     soft_delete_product(&ctx, "original").await;
 
-    // `get_deleted` still resolves; the collision probe's listing is what
-    // fails — the exact interleaving a transient database wobble produces,
-    // and the only one that reaches the swallowed branch.
+    // Listings fail while by-id reads still resolve, so the restore write
+    // fails and the collision probe's `list_all` fails with it — the exact
+    // interleaving a transient database wobble produces, and the only one
+    // that reaches the "probe could not tell" branch.
     let ctx = ctx.break_list_reads();
 
     let (msg, input) = admin_create_msg(

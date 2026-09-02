@@ -329,42 +329,45 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
     // afterwards from claiming it. Restoring the original then violates that
     // index's `(owner_kind, owner_id, slug)` key, which arrives here as a
     // generic database failure and would go out as an opaque 500. The
-    // Deleted view's Restore button only acts on success, so that 500 is
+    // Deleted view's Restore button only reloads on success, so that 500 is
     // invisible: the one door out of soft delete would appear to do nothing
     // at all. Name the collision instead, so an admin can free the slug and
     // retry.
-    match repo::products::get_deleted(ctx, id).await {
-        Ok(deleted) => match colliding_slug(ctx, &deleted).await {
-            Ok(Some(slug)) => {
-                return err_conflict(&format!(
-                    "Another product already uses the slug \"{slug}\". Rename or delete that \
-                     product, then restore this one."
-                ))
-            }
-            Ok(None) => {}
-            // A probe that could not run is not evidence of a clear slug.
-            // Proceeding anyway walks straight into the index violation this
-            // pre-check exists to keep out of the response — the opaque 500
-            // comes back regardless, only now with nothing in the logs
-            // explaining it and a Restore button that appears inert.
-            // `err_internal` records the cause against a correlation id the
-            // admin can quote.
-            Err(error) => {
-                return err_internal("Could not check the restored product's slug", error)
-            }
-        },
-        // Not in the deleted set. `restore` below still answers for it,
-        // unchanged: an unknown id is `NotFound`, and a live product is a
-        // no-op that cannot collide with anything since it already holds its
-        // own slug. Both are pinned by the `restore_endpoint_*` tests.
-        Err(e) if e.code == ErrorCode::NotFound => {}
-        Err(e) => return err_internal("Database error", e),
-    }
+    //
+    // The write is what asks the question. This used to be a pre-check
+    // *before* `restore`, which left the answer stale by exactly the gap
+    // between the two statements — a slug claimed inside that gap produced
+    // the same opaque 500 the check existed to prevent. Reading the collision
+    // off the failed write cannot be raced: the write either landed, in which
+    // case there was no collision, or it did not, in which case the row is
+    // still deleted and still there to be probed. It also drops two reads
+    // from every successful restore, which is the common case.
     match repo::products::restore(ctx, id).await {
         Ok(record) => ok_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => match restore_slug_conflict(ctx, id).await {
+            Some(slug) => err_conflict(&format!(
+                "Another product already uses the slug \"{slug}\". Rename or delete that \
+                 product, then restore this one."
+            )),
+            // Not a slug collision, or the probe could not tell. Either way
+            // the original write error is the one worth recording, against a
+            // correlation id the admin can quote.
+            None => err_internal("Database error", e),
+        },
     }
+}
+
+/// The slug a failed [`handle_restore_product`] write collided on, or `None`
+/// when the failure was something else — or when the probe itself could not
+/// run, since "could not tell" must not be reported as a conflict.
+///
+/// Safe to call only after the write failed: the row is then still
+/// soft-deleted, so `get_deleted` can still read the slug it was trying to
+/// re-claim.
+async fn restore_slug_conflict(ctx: &dyn Context, id: &str) -> Option<String> {
+    let deleted = repo::products::get_deleted(ctx, id).await.ok()?;
+    colliding_slug(ctx, &deleted).await.ok().flatten()
 }
 
 /// The slug `deleted` would re-claim on restore, when a LIVE product of the
