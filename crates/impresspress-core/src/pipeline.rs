@@ -481,46 +481,19 @@ mod discovery_tests {
     //!  2. The core developer-facing auth/storage/products endpoints now
     //!     declare schemas, so `wafer_core::discovery::generate_openapi`
     //!     (which skips any endpoint failing `has_schema()`) includes them.
+    //!
+    //! `real_block_infos()` and `discovery_json()` live in
+    //! `test_support.rs` now — shared with the per-block openapi snapshot
+    //! gate (`tests/openapi_snapshot.rs`) so there is one implementation
+    //! rather than two.
 
-    use wafer_run::{AuthLevel, Block, BlockEndpoint, BlockInfo, InputStream};
+    use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, InputStream};
 
     use super::handle_request;
     use crate::{
-        blocks::{auth_ui::AuthUiBlock, files::FilesBlock, products::ProductsBlock},
         features::{AllEnabled, FeatureConfig},
-        test_support::{anon_msg, collect_or_panic, TestContext},
+        test_support::{anon_msg, collect_or_panic, discovery_json, real_block_infos, TestContext},
     };
-
-    /// `BlockInfo` for the three blocks this PR added schemas to, fetched
-    /// from the real block structs (not hand-rolled fixtures) so the test
-    /// exercises the actual declarations shipped in `blocks/{auth_ui,files,
-    /// products}/mod.rs`.
-    fn real_block_infos() -> Vec<BlockInfo> {
-        vec![
-            AuthUiBlock::new().info(),
-            FilesBlock::new().info(),
-            ProductsBlock::new().info(),
-        ]
-    }
-
-    async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
-        let mut msg = anon_msg("retrieve", path);
-        msg.set_meta("http.header.host", host);
-        let out = handle_request(
-            ctx,
-            msg,
-            InputStream::from_bytes(Vec::new()),
-            None,
-            "test-jwt-secret",
-            false,
-            &AllEnabled,
-            &real_block_infos(),
-            &[],
-        )
-        .await;
-        let buf = collect_or_panic(out).await;
-        serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
-    }
 
     #[tokio::test]
     async fn openapi_title_falls_back_to_impresspress_not_host_derived_127() {
@@ -595,6 +568,38 @@ mod discovery_tests {
             me["security"][0]["bearerAuth"],
             serde_json::json!([]),
             "me is AuthLevel::Authenticated — must carry bearerAuth security: {me}"
+        );
+
+        // PATCH /b/auth/api/me was dispatched in handle() but undeclared, so
+        // it was absent here and from the access-tier table. It now shares
+        // GET's response type, so the two cannot drift.
+        let me_patch = &paths["/b/auth/api/me"]["patch"];
+        assert!(
+            !me_patch.is_null(),
+            "PATCH me must appear in /openapi.json now that it's declared: {body}"
+        );
+        let mut patch_fields: Vec<String> = me_patch["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]
+            .as_object()
+            .expect("PATCH me request schema has properties")
+            .keys()
+            .cloned()
+            .collect();
+        patch_fields.sort();
+        assert_eq!(
+            patch_fields,
+            vec!["avatar_url".to_string(), "name".to_string()],
+            "PATCH me request schema must expose exactly the two user-editable fields: {me_patch}"
+        );
+        assert_eq!(
+            me_patch["responses"]["200"]["content"]["application/json"]["schema"],
+            me["responses"]["200"]["content"]["application/json"]["schema"],
+            "PATCH me must publish the same response schema as GET me: {me_patch}"
+        );
+        assert_eq!(
+            me_patch["security"][0]["bearerAuth"],
+            serde_json::json!([]),
+            "PATCH me is AuthLevel::Authenticated — must carry bearerAuth security: {me_patch}"
         );
 
         // /b/auth/api/refresh was previously entirely undeclared (dispatched
@@ -1216,18 +1221,23 @@ mod discovery_tests {
     }
 
     /// Pins the producer-to-consumer contract for `outputSchema` — the field
-    /// `ui/assets/webmcp.js` now reads to decide whether to pass a schema to
+    /// `ui/assets/webmcp.js` reads to decide whether to pass a schema to
     /// `registerTool` and to populate `structuredContent` from the parsed
     /// response body.
     ///
-    /// `get_order_status` declares a self-contained, object-shaped
-    /// `output_schema` with no `$ref`s, so the producer's projection
-    /// (`wafer_core::discovery::agent_output_schema`) has nothing to inline
-    /// and must publish it unchanged. Asserting the WHOLE object, the same
-    /// way `webmcp_manifest_pins_the_producer_invocation_contract` does for
-    /// `invocation`, is what makes a producer-side rename (`outputSchema` to
-    /// `output_schema`, or a dropped field) fail loudly here instead of
-    /// silently breaking `webmcp.js` at runtime.
+    /// `get_order_status`'s schema is derived from `contracts::GuestOrderStatus`
+    /// (`.output::<T>()`), so the literal is not repeated here — the per-block
+    /// snapshot gate (`tests/openapi_snapshot.rs`) already pins every byte of
+    /// it. What this test pins is what that gate cannot:
+    ///
+    /// 1. The manifest carries the *same* projection of that declaration as
+    ///    `/openapi.json` does, minus the root `title` the producer strips
+    ///    (`wafer_core::discovery::agent_output_schema` inlines refs and drops
+    ///    document-level keys; a self-contained schema comes through otherwise
+    ///    unchanged). A producer-side rename of the field, or a dropped
+    ///    property, fails here rather than silently at runtime.
+    /// 2. The shape `webmcp.js` and the storefront rely on: an object schema
+    ///    whose `required` names the fields a guest can always read.
     #[tokio::test]
     async fn webmcp_manifest_pins_the_producer_output_schema_contract() {
         let ctx = TestContext::new().await;
@@ -1240,39 +1250,33 @@ mod discovery_tests {
             .find(|t| t["name"] == "get_order_status")
             .unwrap_or_else(|| panic!("get_order_status must be published: {body}"));
 
+        let openapi = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
+        let mut expected = openapi["paths"]["/b/products/orders/{id}/status"]["get"]["responses"]
+            ["200"]["content"]["application/json"]["schema"]
+            .clone();
+        let expected_obj = expected
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("the endpoint's response schema must be in /openapi.json"));
+        expected_obj.remove("title");
+
         assert_eq!(
-            tool["outputSchema"],
-            serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["schema_version", "order_id", "status", "reconciliation_status", "amounts", "subscription_cancel_at_period_end"],
-                "properties": {
-                    "schema_version": {"type": "integer"},
-                    "order_id": {"type": "string"},
-                    "status": {"type": "string"},
-                    "reconciliation_status": {"type": "string"},
-                    "amounts": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["currency", "subtotal_minor", "discount_minor", "tax_minor", "shipping_minor", "platform_fee_minor", "total_minor"],
-                        "properties": {
-                            "currency": {"type": "string"},
-                            "subtotal_minor": {"type": "integer"},
-                            "discount_minor": {"type": "integer"},
-                            "tax_minor": {"type": "integer"},
-                            "shipping_minor": {"type": "integer"},
-                            "platform_fee_minor": {"type": "integer"},
-                            "total_minor": {"type": "integer"}
-                        }
-                    },
-                    "subscription_status": {"type": "string"},
-                    "subscription_current_period_end": {"type": "string", "format": "date-time"},
-                    "subscription_cancel_at_period_end": {"type": "boolean"},
-                    "paid_at": {"type": "string", "format": "date-time"},
-                    "refunded_at": {"type": "string", "format": "date-time"}
-                }
-            }),
-            "outputSchema shape drifted from what ui/assets/webmcp.js reads: {tool}"
+            tool["outputSchema"], expected,
+            "outputSchema must be the /openapi.json projection of the same declaration, \
+             minus the root title: {tool}"
+        );
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        assert_eq!(
+            tool["outputSchema"]["required"],
+            serde_json::json!([
+                "schema_version",
+                "order_id",
+                "status",
+                "reconciliation_status",
+                "amounts",
+                "subscription_cancel_at_period_end"
+            ]),
+            "the fields a guest can always read drifted from what ui/assets/webmcp.js and \
+             the storefront rely on: {tool}"
         );
     }
 

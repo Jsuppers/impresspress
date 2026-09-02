@@ -1,4 +1,25 @@
 //! Stable, provider-neutral JSON contracts for the commerce APIs.
+//!
+//! # `#[schemars(required)]` on `Option<T>` is not decoration
+//!
+//! `.output::<T>()` generates under schemars' **serialize** contract, so a
+//! response schema states what the server emits. That contract already gets
+//! `required` right for `#[serde(default)]` and for `skip_serializing_if`.
+//! What it does **not** fix is nullability: `Option<T>`'s `JsonSchema` impl
+//! calls `allow_null` unconditionally, without consulting the contract, so
+//! every `Option<String>` renders as `["string", "null"]` even when the
+//! server omits the key rather than writing `null`.
+//!
+//! `#[schemars(required)]` is the one lever that drops that `null` branch,
+//! under either contract. On a non-`Option` field it is genuinely a no-op —
+//! which is why it is easy to mistake for inert everywhere — but on an
+//! `Option<T>` it narrows `["T", "null"]` back to `"T"`. Paired with
+//! `skip_serializing_if = "Option::is_none"` under the serialize contract it
+//! does *not* also force the property into `required`, which is exactly the
+//! shape these fields have: optional, and never `null` when present.
+//!
+//! Removing one of these widens the published response contract. Do not strip
+//! them from an `Option<T>` field without changing what the handler emits.
 
 use std::collections::BTreeMap;
 
@@ -7,32 +28,7 @@ use serde_json::Value;
 
 pub const COMMERCE_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TemplateKind {
-    SimpleProduct,
-    SimpleSubscription,
-    ConfigurableProduct,
-    ConfigurableSubscription,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OwnerKind {
-    Platform,
-    User,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProductStatus {
-    Draft,
-    PendingReview,
-    Active,
-    Archived,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalStatus {
     Draft,
@@ -42,7 +38,7 @@ pub enum ApprovalStatus {
     Suspended,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FulfillmentKind {
     None,
@@ -52,14 +48,14 @@ pub enum FulfillmentKind {
     Webhook,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OfferMode {
     Payment,
     Subscription,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OfferStatus {
     Draft,
@@ -67,14 +63,14 @@ pub enum OfferStatus {
     Archived,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingModel {
     Fixed,
     Components,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RecurringInterval {
     Day,
@@ -83,21 +79,23 @@ pub enum RecurringInterval {
     Year,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageType {
     Licensed,
     Metered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingScheme {
     PerUnit,
     Tiered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TaxBehavior {
     #[default]
@@ -106,7 +104,7 @@ pub enum TaxBehavior {
     Exclusive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ShippingEstimateUnit {
     Hour,
@@ -116,7 +114,9 @@ pub enum ShippingEstimateUnit {
     Month,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutPresentation {
     #[default]
@@ -125,7 +125,7 @@ pub enum CheckoutPresentation {
     PaymentLink,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VariableKind {
     Number,
@@ -138,7 +138,9 @@ pub enum VariableKind {
     Text,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum VariableVisibility {
     #[default]
@@ -147,7 +149,7 @@ pub enum VariableVisibility {
     AdminOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VariableDefinition {
     pub key: String,
@@ -175,7 +177,7 @@ pub struct VariableDefinition {
     pub sort_order: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Condition {
     #[default]
@@ -226,7 +228,7 @@ pub enum Condition {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PricingTier {
     /// Inclusive upper bound for this tier. Only the final tier may omit it.
@@ -237,7 +239,9 @@ pub struct PricingTier {
     pub flat_amount_minor: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageRounding {
     /// Charge one package for any partially used package.
@@ -247,7 +251,7 @@ pub enum PackageRounding {
     Exact,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AmountRule {
     Fixed {
@@ -283,7 +287,7 @@ pub enum AmountRule {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QuantityRule {
     Fixed {
@@ -311,7 +315,7 @@ fn one_u32() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentRecurrence {
     pub interval: RecurringInterval,
@@ -319,7 +323,7 @@ pub struct ComponentRecurrence {
     pub interval_count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OfferComponent {
     pub id: String,
@@ -344,7 +348,7 @@ pub struct OfferComponent {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OfferComponentDraft {
     pub key: String,
@@ -366,7 +370,7 @@ pub struct OfferComponentDraft {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutPolicy {
     /// Minimum evaluated item total before provider discounts, tax, or shipping.
@@ -395,7 +399,7 @@ pub struct CheckoutPolicy {
     pub trial_days: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShippingDeliveryEstimate {
     #[serde(default)]
@@ -405,7 +409,7 @@ pub struct ShippingDeliveryEstimate {
     pub unit: ShippingEstimateUnit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShippingOption {
     pub display_name: String,
@@ -418,7 +422,7 @@ pub struct ShippingOption {
     pub stripe_shipping_rate_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Offer {
     pub id: String,
@@ -446,7 +450,7 @@ pub struct Offer {
     pub stripe_price_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OfferDefinitionRequest {
     pub name: String,
@@ -467,7 +471,7 @@ pub struct OfferDefinitionRequest {
     pub checkout: CheckoutPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedOffer {
     pub status: OfferStatus,
@@ -477,50 +481,7 @@ pub struct ManagedOffer {
     pub offer: Offer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProductTemplate {
-    pub id: String,
-    pub name: String,
-    pub display_name: String,
-    pub kind: TemplateKind,
-    pub schema_version: u32,
-    #[serde(default)]
-    pub variables: Vec<VariableDefinition>,
-    #[serde(default)]
-    pub offer_defaults: Value,
-    pub is_system: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Product {
-    pub id: String,
-    pub name: String,
-    pub slug: String,
-    #[serde(default)]
-    pub description: String,
-    pub owner_kind: OwnerKind,
-    #[serde(default)]
-    pub owner_id: String,
-    #[serde(default)]
-    pub seller_account_id: String,
-    pub status: ProductStatus,
-    pub approval_status: ApprovalStatus,
-    pub fulfillment_kind: FulfillmentKind,
-    pub template_id: String,
-    pub current_version: u32,
-    #[serde(default)]
-    pub image_url: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub offers: Vec<Offer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorefrontOffer {
     pub id: String,
@@ -538,7 +499,7 @@ pub struct StorefrontOffer {
     pub payment_links: Vec<StorefrontPaymentLink>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorefrontProduct {
     pub schema_version: u32,
@@ -555,30 +516,41 @@ pub struct StorefrontProduct {
     pub offers: Vec<StorefrontOffer>,
 }
 
+/// Which Stripe environment a validated publishable key belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StripeMode {
+    Test,
+    Live,
+}
+
 /// Browser-safe deployment configuration. The Stripe secret key, webhook
 /// secret, account ids, and provider API URL are deliberately absent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorefrontConfig {
     pub schema_version: u32,
     pub embedded_checkout_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
     pub stripe_publishable_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stripe_mode: Option<String>,
+    #[schemars(required)]
+    pub stripe_mode: Option<StripeMode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PricingPreviewRequest {
     pub offer_id: String,
     #[serde(default = "one_u64")]
+    #[schemars(range(min = 1))]
     pub quantity: u64,
     #[serde(default)]
     pub inputs: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedComponent {
     pub component_id: String,
@@ -592,7 +564,7 @@ pub struct ResolvedComponent {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MoneyBreakdown {
     pub currency: String,
@@ -605,7 +577,7 @@ pub struct MoneyBreakdown {
     pub total_minor: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PricingPreview {
     pub schema_version: u32,
@@ -617,47 +589,62 @@ pub struct PricingPreview {
     pub amounts: MoneyBreakdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutRequest {
     pub offer_id: String,
     #[serde(default)]
     pub preset_id: Option<String>,
     #[serde(default = "one_u64")]
+    #[schemars(range(min = 1))]
     pub quantity: u64,
     #[serde(default)]
     pub inputs: BTreeMap<String, Value>,
     #[serde(default)]
     pub presentation: CheckoutPresentation,
     #[serde(default)]
+    #[schemars(url)]
     pub success_url: Option<String>,
     #[serde(default)]
+    #[schemars(url)]
     pub cancel_url: Option<String>,
     #[serde(default)]
+    #[schemars(email)]
     pub buyer_email: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutResponse {
     pub order_id: String,
     /// Returned once and never persisted in plaintext. Static storefronts use
     /// it to poll the minimal guest order-status endpoint after Stripe returns.
+    ///
+    /// `writeOnly` marks it as a secret capability that must not be logged or
+    /// echoed. `pipeline.rs` asserts the flag, so it is carried on the
+    /// contract rather than left behind with the hand-written schema.
+    #[schemars(extend("writeOnly" = true))]
     pub receipt_token: String,
+    #[schemars(extend("format" = "date-time"))]
     pub receipt_token_expires_at: String,
     pub presentation: CheckoutPresentation,
     #[serde(default)]
+    #[schemars(url)]
     pub checkout_url: Option<String>,
+    /// Stripe Embedded Checkout client secret. Present only for the embedded
+    /// presentation, and `writeOnly` for the same reason as `receipt_token`.
     #[serde(default)]
+    #[schemars(extend("writeOnly" = true))]
     pub client_secret: Option<String>,
     #[serde(default)]
+    #[schemars(url)]
     pub payment_link_url: Option<String>,
     pub amounts: MoneyBreakdown,
 }
 
 /// Minimal order state exposed to a guest who presents the checkout receipt
 /// capability. Buyer details and all Stripe resource ids remain private.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuestOrderStatus {
     pub schema_version: u32,
@@ -666,17 +653,24 @@ pub struct GuestOrderStatus {
     pub reconciliation_status: String,
     pub amounts: MoneyBreakdown,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
     pub subscription_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub subscription_current_period_end: Option<String>,
     pub subscription_cancel_at_period_end: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub paid_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub refunded_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutPresetRequest {
     pub name: String,
@@ -686,7 +680,7 @@ pub struct CheckoutPresetRequest {
     pub inputs: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutPreset {
     pub id: String,
@@ -698,22 +692,33 @@ pub struct CheckoutPreset {
     pub configuration_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Every checkout preset defined for one offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutPresetList {
+    pub presets: Vec<CheckoutPreset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentLinkCreateRequest {
     #[serde(default)]
     pub preset_id: Option<String>,
+    /// Where Stripe sends the buyer once the Payment Link is paid.
     #[serde(default)]
+    #[schemars(url)]
     pub after_completion_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedPaymentLink {
     pub id: String,
     pub offer_id: String,
     #[serde(default)]
     pub preset_id: String,
+    /// Stripe-hosted Payment Link the buyer opens.
+    #[schemars(url)]
     pub url: String,
     pub active: bool,
     pub configuration_hash: String,
@@ -722,7 +727,14 @@ pub struct ManagedPaymentLink {
     pub sync_error: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Every reusable Stripe Payment Link synchronized for one offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentLinkList {
+    pub payment_links: Vec<ManagedPaymentLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorefrontPaymentLink {
     pub id: String,
@@ -735,61 +747,7 @@ pub struct StorefrontPaymentLink {
     pub pricing: PricingPreview,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrderLineItem {
-    pub product_id: String,
-    pub offer_id: String,
-    #[serde(default)]
-    pub component_id: String,
-    pub description: String,
-    pub unit_amount_minor: i64,
-    pub quantity: u64,
-    pub total_amount_minor: i64,
-    #[serde(default)]
-    pub inputs: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Order {
-    pub id: String,
-    pub status: String,
-    pub mode: OfferMode,
-    #[serde(default)]
-    pub buyer_user_id: String,
-    #[serde(default)]
-    pub buyer_email: String,
-    #[serde(default)]
-    pub seller_account_id: String,
-    pub amounts: MoneyBreakdown,
-    pub items: Vec<OrderLineItem>,
-    #[serde(default)]
-    pub stripe_session_id: String,
-    #[serde(default)]
-    pub stripe_payment_intent_id: String,
-    #[serde(default)]
-    pub stripe_subscription_id: String,
-    pub livemode: bool,
-    pub reconciliation_status: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Subscription {
-    pub id: String,
-    pub status: String,
-    pub product_id: String,
-    pub offer_id: String,
-    pub buyer_user_id: String,
-    pub buyer_email: String,
-    pub current_period_end: Option<String>,
-    pub cancel_at_period_end: bool,
-    pub items: Vec<OrderLineItem>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SellerCapabilities {
     pub details_submitted: bool,
@@ -799,7 +757,7 @@ pub struct SellerCapabilities {
     pub requirements_due: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SellerAccount {
     pub id: String,
@@ -809,6 +767,8 @@ pub struct SellerAccount {
     #[serde(default)]
     pub stripe_account_id: String,
     pub capabilities: SellerCapabilities,
+    /// Platform fee applied to this seller's sales, in basis points.
+    #[schemars(range(max = 10000))]
     pub fee_basis_points: u32,
     #[serde(default)]
     pub livemode: bool,
@@ -826,7 +786,14 @@ pub struct SellerAccount {
     pub last_synced_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Every seller account known to the platform, with its capability state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SellerAccountList {
+    pub sellers: Vec<SellerAccount>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StripeConnectionState {
     NotConfigured,
@@ -835,7 +802,7 @@ pub enum StripeConnectionState {
     Misconfigured,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StripeConnectionStatus {
     pub state: StripeConnectionState,
@@ -861,36 +828,46 @@ pub struct StripeConnectionStatus {
     pub error: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SellerOnboardingRequest {
+    /// Where Stripe returns the seller once onboarding is submitted.
+    #[schemars(url)]
     pub return_url: String,
+    /// Where Stripe returns the seller if the onboarding link expired.
+    #[schemars(url)]
     pub refresh_url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SellerOnboardingResponse {
     pub account: SellerAccount,
+    /// Single-use Stripe-hosted onboarding link.
+    #[schemars(url)]
     pub url: String,
     pub expires_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRedirect {
+    /// Absolute provider-hosted URL the browser must be sent to.
+    #[schemars(url)]
     pub url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BillingPortalRequest {
+    /// Where Stripe returns the customer when they leave the portal.
+    #[schemars(url)]
     pub return_url: String,
     #[serde(default)]
     pub order_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RefundReason {
     Duplicate,
@@ -908,26 +885,29 @@ impl RefundReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RefundRequest {
     /// Exact amount in the order currency's minor unit. Omit to refund the
     /// complete remaining refundable amount.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub amount_minor: Option<i64>,
     /// Stripe's constrained provider reason. Human context belongs in `note`.
     #[serde(default)]
     pub provider_reason: Option<RefundReason>,
     /// Private operator note retained in ImpressPress, never sent to Stripe.
     #[serde(default, alias = "reason")]
+    #[schemars(length(max = 500))]
     pub note: Option<String>,
     /// Stable client operation key. Supplying a fresh key allows a deliberate
     /// second partial refund of the same amount; retries must reuse the key.
     #[serde(default)]
+    #[schemars(length(max = 80))]
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RefundResultStatus {
     Pending,
@@ -935,7 +915,7 @@ pub enum RefundResultStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RefundResult {
     pub purchase_id: String,
@@ -953,7 +933,7 @@ pub struct RefundResult {
     pub livemode: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommerceAnalytics {
     pub currency: String,
@@ -976,7 +956,7 @@ pub struct CommerceAnalytics {
     pub top_products: Vec<AnalyticsProduct>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyticsProduct {
     pub product_id: String,
@@ -986,7 +966,7 @@ pub struct AnalyticsProduct {
 }
 
 /// Ownership-safe failed-order projection for seller operational dashboards.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SellerFailureSummary {
     pub order_id: String,
@@ -995,36 +975,118 @@ pub struct SellerFailureSummary {
     pub total_minor: i64,
     #[serde(default)]
     pub error: String,
+    #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
+}
+
+/// Platform-wide commerce counters for the admin dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdminStats {
+    pub total_products: i64,
+    pub active_products: i64,
+    pub total_purchases: i64,
+    /// One entry per currency the platform has transacted in.
+    pub currency_analytics: Vec<CommerceAnalytics>,
+    pub total_groups: i64,
+}
+
+/// One seller's own commerce counters and recent operational failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SellerStats {
+    /// Empty when the user has not started Stripe onboarding.
+    pub seller_account_id: String,
+    /// One entry per currency this seller has transacted in.
+    pub currency_analytics: Vec<CommerceAnalytics>,
+    pub recent_failures: Vec<SellerFailureSummary>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Acknowledgement returned to Stripe for a delivered webhook event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebhookAck {
+    pub received: bool,
+    /// Present only when the event id had already been recorded, in which
+    /// case no side effect ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub duplicate: bool,
+    /// Present only when the event exhausted its retry budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dead_letter: bool,
+}
+
+impl WebhookAck {
+    /// The event was accepted and processed.
+    pub fn received() -> Self {
+        Self {
+            received: true,
+            duplicate: false,
+            dead_letter: false,
+        }
+    }
+
+    /// The event id was already recorded, so no side effect ran.
+    pub fn duplicate() -> Self {
+        Self {
+            received: true,
+            duplicate: true,
+            dead_letter: false,
+        }
+    }
+
+    /// The event exhausted its retry budget.
+    pub fn dead_letter() -> Self {
+        Self {
+            received: true,
+            duplicate: false,
+            dead_letter: true,
+        }
+    }
 }
 
 /// Safe operational projection of a Stripe event. The signed payload and
 /// processing owner are never serialized to the admin API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookEventSummary {
     pub id: String,
     pub event_type: String,
+    /// One of `pending`, `processing`, `failed`, `processed`, `dead_letter`.
+    #[schemars(extend("enum" = ["pending", "processing", "failed", "processed", "dead_letter"]))]
     pub status: String,
     #[serde(default)]
     pub stripe_account_id: String,
     pub livemode: bool,
     pub attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub processing_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub next_retry_at: Option<String>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub processed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub terminal_at: Option<String>,
+    #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
+    #[schemars(extend("format" = "date-time"))]
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookEventList {
     pub records: Vec<WebhookEventSummary>,
@@ -1035,32 +1097,48 @@ pub struct WebhookEventList {
 
 /// Safe administrator projection of a durable Stripe provider operation.
 /// Request/response payloads, idempotency keys, and lease owners stay private.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderOperationSummary {
     pub id: String,
+    /// Currently only `refund.reconcile`.
+    #[schemars(extend("enum" = ["refund.reconcile"]))]
     pub operation_type: String,
+    /// Currently only `refund`.
+    #[schemars(extend("enum" = ["refund"]))]
     pub aggregate_type: String,
     pub aggregate_id: String,
     #[serde(default)]
     pub stripe_account_id: String,
+    /// One of `pending`, `processing`, `failed`, `succeeded`, `dead_letter`.
+    #[schemars(extend("enum" = ["pending", "processing", "failed", "succeeded", "dead_letter"]))]
     pub status: String,
     pub attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub processing_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub next_attempt_at: Option<String>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    #[schemars(required)]
     pub terminal_at: Option<String>,
+    #[schemars(extend("format" = "date-time"))]
     pub created_at: String,
+    #[schemars(extend("format" = "date-time"))]
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderOperationList {
     pub records: Vec<ProviderOperationSummary>,
@@ -1069,7 +1147,7 @@ pub struct ProviderOperationList {
     pub page_size: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderReconcileResult {
     pub claimed: u64,
@@ -1080,13 +1158,13 @@ pub struct ProviderReconcileResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{Condition, PricingPreviewRequest, TemplateKind};
+    use super::{Condition, OfferMode, PricingPreviewRequest};
 
     #[test]
     fn enums_use_stable_snake_case_wire_names() {
         assert_eq!(
-            serde_json::to_string(&TemplateKind::ConfigurableSubscription).unwrap(),
-            "\"configurable_subscription\""
+            serde_json::to_string(&OfferMode::Subscription).unwrap(),
+            "\"subscription\""
         );
     }
 

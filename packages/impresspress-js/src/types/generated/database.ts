@@ -177,23 +177,23 @@ export interface IAMIAMPolicy {
   createdAt: string | Date;
 }
 
+// A row of `impresspress__admin__roles` as the admin API publishes it —
+// `AdminRoleView` in crates/impresspress-core/src/blocks/admin/contracts.rs.
+// snake_case: the server serializes the view as-is, nothing camel-cases on
+// the wire. (The previous shape here — displayName/type/metadata/createdAt —
+// described no table and no response.)
 export interface IAMRole {
   id: string;
+  // Unique role name — the value stored in user_roles.role and checked by the auth layer
   name: string;
-  displayName: string;
   description: string;
-  // "system" for protected roles, "custom" for user-created roles
-  type: string;
-  metadata: Record<string, any>;
-  createdAt: string | Date;
-  updatedAt: string | Date;
-}
-
-export interface IAMRoleMetadata {
-  // IP whitelist for access control
-  allowedIps: string[];
-  // List of disabled features for this role
-  disabledFeatures: string[];
+  // Advisory metadata for the IAM UI; WRAP grants, not this list, are what the runtime enforces
+  permissions: string[];
+  // Built-in roles cannot be renamed or deleted
+  is_system: boolean;
+  // RFC 3339
+  created_at: string;
+  updated_at: string;
 }
 
 export interface IAMUserRole {

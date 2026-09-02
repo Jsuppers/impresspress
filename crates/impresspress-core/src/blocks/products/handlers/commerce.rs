@@ -9,7 +9,7 @@ use crate::{
     blocks::products::{
         contracts::{
             FulfillmentKind, GuestOrderStatus, MoneyBreakdown, PricingPreviewRequest,
-            StorefrontConfig, StorefrontOffer, StorefrontProduct, VariableVisibility,
+            StorefrontConfig, StorefrontOffer, StorefrontProduct, StripeMode, VariableVisibility,
             COMMERCE_SCHEMA_VERSION,
         },
         offer_pricing,
@@ -22,19 +22,19 @@ use crate::{
 
 const STOREFRONT_WIDGET_JS: &str = include_str!("../assets/storefront.js");
 
-fn validated_publishable_key(value: &str) -> Option<(String, String)> {
+fn validated_publishable_key(value: &str) -> Option<(String, StripeMode)> {
     let value = value.trim();
     let mode = if value.starts_with("pk_test_") {
-        "test"
+        StripeMode::Test
     } else if value.starts_with("pk_live_") {
-        "live"
+        StripeMode::Live
     } else {
         return None;
     };
     if value.len() > 256 || value.len() < 12 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
         return None;
     }
-    Some((value.to_string(), mode.to_string()))
+    Some((value.to_string(), mode))
 }
 
 pub(crate) async fn handle_storefront_config(ctx: &dyn Context) -> OutputStream {

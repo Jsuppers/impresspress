@@ -181,17 +181,17 @@ export class AuthService extends BaseService {
 
   /**
    * Update the current user's profile. Only `name` and `avatar_url` are
-   * accepted server-side (`api/me.rs::handle_update`); unlike `GET /me`,
-   * the update response is the user object directly, not `{ user }`.
+   * accepted server-side (`api/me.rs::handle_update`). Returns the same
+   * `{ user }` envelope as `GET /me` — both handlers share one projection.
    */
   async updateUser(updates: { name?: string; avatar_url?: string }): Promise<AuthSessionUser> {
-    const user = await this.request<AuthSessionUser>({
+    const res = await this.request<{ user: AuthSessionUser }>({
       method: "PATCH",
       url: "/b/auth/api/me",
       data: updates,
     });
-    this.currentUser = user;
-    return user;
+    this.currentUser = res.user;
+    return res.user;
   }
 
   /** Request a password-reset email. `POST /b/auth/api/forgot-password`. */
