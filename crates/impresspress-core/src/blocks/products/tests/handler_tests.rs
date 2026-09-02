@@ -367,10 +367,7 @@ async fn admin_delete_frees_the_products_slug() {
         }),
     );
     let body = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
-    assert_eq!(
-        body["slug"], "jacket",
-        "the reused slug must not conflict"
-    );
+    assert_eq!(body["slug"], "jacket", "the reused slug must not conflict");
 }
 
 // ============================================================
@@ -1419,10 +1416,9 @@ async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
     );
 }
 
-/// Restore is the only endpoint outside `/b/products/api/admin/` that is
-/// declared `Admin`, and it must be unreachable for a non-admin through
-/// EVERY wire path that reaches its handler — not merely through the one
-/// path its declaration happens to match.
+/// A PLATFORM-owned soft-deleted product must be unreachable for a non-admin
+/// through EVERY wire path that reaches a restore handler — not merely
+/// through the one path a declaration happens to match.
 ///
 /// `ProductsBlock::handle` enters `handle_user` from two prefixes: the
 /// `/b/products/api`-stripped one and the raw `/b/products/...` one. A
@@ -1435,12 +1431,19 @@ async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
 /// purchasable, when it was active/approved. Product ids are not secret;
 /// `/b/products/catalog` hands them out.
 ///
+/// The seller restore endpoint now answers at both `/b/products/...`
+/// spellings on purpose, so what stops `user_1` there is OWNERSHIP, not the
+/// tier. Seller products are enabled below precisely so the feature flag's
+/// 403 cannot stand in for that check: the product seeded here is
+/// platform-owned (blank `owner_id`/`created_by`), which
+/// `handlers::is_owned_by` refuses for every caller.
+///
 /// Driven through `dispatch_routed` (the real `route_to_block`) because that
 /// is where the tier is enforced — a `dispatch_user` test cannot see this
 /// boundary at all, which is exactly how the escalation shipped.
 #[tokio::test]
 async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() {
-    let ctx = ctx().await;
+    let ctx = user_products_ctx().await;
 
     let mut gone = HashMap::new();
     gone.insert("name".to_string(), serde_json::json!("gone"));
@@ -4161,8 +4164,8 @@ async fn product_endpoints_publish_the_flat_product_view() {
 /// such fields, so nothing a client sends can reach them on either path.
 #[tokio::test]
 async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
-    use crate::util::RecordExt;
     use super::super::repo::products::TABLE;
+    use crate::util::RecordExt;
 
     let ctx = user_products_ctx().await;
     let smuggled = serde_json::json!({
@@ -4181,7 +4184,11 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
     body["name"] = serde_json::json!("Sneaky");
     let (msg, input) = create_msg("/b/products/products", "seller_a", body);
     assert!(
-        output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::InvalidArgument).await,
+        output_is_error(
+            dispatch_user(&ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await,
         "a create naming these columns is refused outright, not quietly stripped"
     );
 
@@ -4215,7 +4222,11 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
 
     let (msg, input) = update_msg(&format!("/b/products/products/{id}"), "seller_a", smuggled);
     assert!(
-        output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::InvalidArgument).await,
+        output_is_error(
+            dispatch_user(&ctx, msg, input).await,
+            ErrorCode::InvalidArgument
+        )
+        .await,
         "and so is an update naming them"
     );
     let row = wafer_core::clients::database::get(&ctx, TABLE, &id)
@@ -4229,8 +4240,8 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
 /// `NOT NULL` column, and the other fields in the same body still apply.
 #[tokio::test]
 async fn seller_patch_treats_explicit_null_fields_as_absent() {
-    use crate::util::RecordExt;
     use super::super::repo::products::TABLE;
+    use crate::util::RecordExt;
 
     let ctx = user_products_ctx().await;
     let (msg, input) = create_msg(
@@ -5146,4 +5157,334 @@ async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhe
     )
     .await;
     assert!(output_is_error(stranger, ErrorCode::NotFound).await);
+}
+
+// ============================================================
+// The seller's own deleted products
+// ============================================================
+//
+// Soft delete gave the admin a Deleted view, a restore endpoint and a
+// close-only manager. A seller got the delete and none of the three: their
+// own product list reads live-only, so a product they deleted vanished from
+// every page they can open, while its Prices and Payment Links stayed live in
+// the connected account and went on taking money. Before soft delete a hard
+// delete at least left nothing behind.
+//
+// Authorization is the whole risk here. `/b/products` is a PUBLIC route
+// prefix, so what a caller faces is the tier the endpoint DECLARES — and
+// `ProductsBlock::handle` reaches `handle_user` from two wire spellings, so a
+// tier proven on one says nothing about the other. Every test below therefore
+// drives `dispatch_routed` (the real `route_to_block` → `check_access` →
+// `ProductsBlock::handle`), never a handler directly.
+
+/// Seed a live product owned by `owner`, the way seller-created products
+/// carry ownership: `owner_kind = "user"` with `owner_id` AND `created_by`
+/// both set to the seller.
+async fn seed_seller_product(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    owner: &str,
+    name: &str,
+) {
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), serde_json::json!(name));
+    data.insert("status".to_string(), serde_json::json!("active"));
+    data.insert("owner_kind".to_string(), serde_json::json!("user"));
+    data.insert("owner_id".to_string(), serde_json::json!(owner));
+    data.insert("created_by".to_string(), serde_json::json!(owner));
+    seed(ctx, "impresspress__products__products", id, data).await;
+}
+
+/// [`seed_seller_product`] plus the soft delete, since every test in this
+/// section is about a product the seller has already deleted.
+async fn seed_deleted_seller_product(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    owner: &str,
+    name: &str,
+) {
+    seed_seller_product(ctx, id, owner, name).await;
+    soft_delete_product(ctx, id).await;
+}
+
+/// The seller's mirror of `manage_products_deleted_view_lists_only_deleted_products`,
+/// with the extra obligation that only makes sense on a seller page: the
+/// deleted set is scoped to the caller. `list_deleted` narrows the DELETED
+/// set the same way `list_page` narrows the live one, so the owner filter the
+/// live list already carries has to be handed to it too — without that, the
+/// Deleted tab is every seller's deleted products, on a page reachable by any
+/// authenticated user.
+#[tokio::test]
+async fn my_products_deleted_view_lists_only_the_sellers_own_deleted_products() {
+    let ctx = user_products_ctx().await;
+
+    seed_seller_product(&ctx, "mine_live", "seller_a", "Mine and live").await;
+    seed_deleted_seller_product(&ctx, "mine_gone", "seller_a", "Mine and deleted").await;
+    seed_deleted_seller_product(&ctx, "theirs_gone", "seller_b", "Theirs and deleted").await;
+
+    let (live_msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    let live_html = output_to_html(super::super::pages::my_products(&ctx, &live_msg).await).await;
+    assert!(live_html.contains("Mine and live"), "{live_html}");
+    assert!(!live_html.contains("Mine and deleted"), "{live_html}");
+
+    let (mut deleted_msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    deleted_msg.set_meta("req.query.view", "deleted");
+    let deleted_html =
+        output_to_html(super::super::pages::my_products(&ctx, &deleted_msg).await).await;
+    assert!(deleted_html.contains("Mine and deleted"), "{deleted_html}");
+    assert!(!deleted_html.contains("Mine and live"), "{deleted_html}");
+    assert!(
+        !deleted_html.contains("Theirs and deleted"),
+        "a seller's deleted view must not show another seller's products: {deleted_html}"
+    );
+}
+
+/// Both doors out, not just the dangerous one. Restore returns an active,
+/// approved product to the public catalog immediately; the close-only
+/// manager is how a seller shuts the Stripe surface down *without* doing
+/// that. The admin Deleted view carries both, and a seller whose reason for
+/// deleting was "stop selling this" needs the second one more than the first.
+#[tokio::test]
+async fn my_products_deleted_view_offers_both_restore_and_close() {
+    let ctx = user_products_ctx().await;
+    // An id that is not URL-safe, so both links are pinned to carry the same
+    // percent-encoding the admin view's do.
+    let awkward_id = "prod/1?x#y";
+    seed_deleted_seller_product(&ctx, awkward_id, "seller_a", "Deleted product").await;
+
+    let (mut msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::my_products(&ctx, &msg).await).await;
+
+    assert!(
+        html.contains("/b/products/api/products/prod%2F1%3Fx%23y/restore"),
+        "a seller's deleted row must offer Restore wired to the seller restore endpoint: {html}"
+    );
+    assert!(
+        html.contains("/b/products/my-products/prod%2F1%3Fx%23y/close"),
+        "a seller's deleted row must offer a way to close its Stripe surface: {html}"
+    );
+    assert!(
+        !html.contains(r#"href="/b/products/my-products/prod%2F1%3Fx%23y""#),
+        "a deleted row must not link into the manager, which refuses a soft-deleted product: {html}"
+    );
+    assert!(
+        !html.contains("/b/products/api/admin/"),
+        "a seller page must not target the admin API: {html}"
+    );
+}
+
+/// The whole trip, the way `the_restore_url_the_deleted_view_renders_restores_that_product`
+/// does it for the admin: the URL is read back out of the rendered HTML (so a
+/// change to either half of the encoding is caught) and sent through the real
+/// router.
+#[tokio::test]
+async fn the_restore_url_a_sellers_deleted_view_renders_restores_that_product() {
+    let ctx = user_products_ctx().await;
+    let awkward_id = "prod/1?x#y";
+    seed_deleted_seller_product(&ctx, awkward_id, "seller_a", "Deleted product").await;
+
+    let (mut page_msg, _input) = get_msg("/b/products/my-products", "seller_a");
+    page_msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::my_products(&ctx, &page_msg).await).await;
+    let restore_url = rendered_hx_post(&html)
+        .unwrap_or_else(|| panic!("the deleted row must render an hx-post Restore action: {html}"));
+
+    let (msg, input) = create_msg(&restore_url, "seller_a", serde_json::json!({}));
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], awkward_id,
+        "posting the rendered Restore URL must reach the product it names: {body}"
+    );
+    assert!(
+        !is_soft_deleted(&ctx, awkward_id).await,
+        "the seller's restore must actually clear deleted_at"
+    );
+}
+
+/// The negative half, and the reason every assertion in this section goes
+/// through the router: a seller must not restore a product that is not
+/// theirs, on ANY spelling that reaches the handler.
+///
+/// `ProductsBlock::handle` enters `handle_user` from the `/b/products/api`-
+/// stripped path AND from the raw `/b/products/...` one, so a `USER_ROUTES`
+/// entry answers at two URLs. Both are `Authenticated` here (the declared
+/// one by declaration, the raw one by `declared_access`'s fail-closed
+/// fallback), which means the tier admits every logged-in caller and
+/// OWNERSHIP is the only thing between seller B and seller A's catalog.
+#[tokio::test]
+async fn a_seller_cannot_restore_another_sellers_product_on_any_wire_spelling() {
+    let ctx = user_products_ctx().await;
+    seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
+
+    for path in [
+        "/b/products/products/a_product/restore",
+        "/b/products/api/products/a_product/restore",
+    ] {
+        let (msg, input) = create_msg(path, "seller_b", serde_json::json!({}));
+        assert!(
+            dispatch_routed(&ctx, msg, input)
+                .await
+                .collect_buffered()
+                .await
+                .is_err(),
+            "seller B restored seller A's product through {path}"
+        );
+        assert!(
+            is_soft_deleted(&ctx, "a_product").await,
+            "seller B's refused restore must leave seller A's product deleted ({path})"
+        );
+    }
+
+    // Positive control on BOTH spellings, so the refusals above cannot be
+    // passing merely because nothing routes anywhere. Re-deleted in between,
+    // since the first restore leaves nothing for the second to restore.
+    for path in [
+        "/b/products/products/a_product/restore",
+        "/b/products/api/products/a_product/restore",
+    ] {
+        let (msg, input) = create_msg(path, "seller_a", serde_json::json!({}));
+        let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+        assert_eq!(
+            body["id"], "a_product",
+            "the owner must be able to restore through {path}: {body}"
+        );
+        assert!(!is_soft_deleted(&ctx, "a_product").await);
+        soft_delete_product(&ctx, "a_product").await;
+    }
+}
+
+/// An unauthenticated caller is refused by the router itself: the declared
+/// spelling is `Authenticated`, and the undeclared raw spelling gets
+/// `declared_access`'s `Authenticated` fallback rather than the `/b/products`
+/// prefix's `Public` tier. Pinned because the seller restore endpoint is the
+/// first *write* to live on a public prefix under an owner check alone — if
+/// the tier ever slipped to Public, `is_owned_by`'s empty-`user_id` guard
+/// would be the only thing left.
+#[tokio::test]
+async fn an_anonymous_caller_cannot_restore_a_deleted_product() {
+    let ctx = user_products_ctx().await;
+    seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
+
+    for path in [
+        "/b/products/products/a_product/restore",
+        "/b/products/api/products/a_product/restore",
+    ] {
+        let (msg, input) = create_msg(path, "", serde_json::json!({}));
+        assert!(
+            dispatch_routed(&ctx, msg, input)
+                .await
+                .collect_buffered()
+                .await
+                .is_err(),
+            "an anonymous POST to {path} must not restore a product"
+        );
+        assert!(is_soft_deleted(&ctx, "a_product").await);
+    }
+}
+
+/// The seller half of `the_close_manager_archives_a_deleted_products_offer_
+/// from_its_own_rendered_action`: the page a seller reaches, and the API its
+/// buttons target, are both owner-scoped and both actually work.
+///
+/// The seller-tier offer/payment-link API already permitted this (the
+/// `ProductState::LiveOrDeleted` widening covers `OfferAccess::Owner` too) —
+/// only the page that reaches it was missing, which made the capability
+/// operator-only in practice.
+#[tokio::test]
+async fn a_seller_closes_their_own_deleted_products_money_surface() {
+    let ctx = user_products_ctx().await;
+    let (offer_id, link_id) = seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    // `seed_published_offer` writes no ownership, so give the row an owner
+    // before the page is asked whose it is.
+    wafer_core::clients::database::update(
+        &ctx,
+        super::super::repo::products::TABLE,
+        "gone",
+        HashMap::from([
+            ("owner_kind".to_string(), serde_json::json!("user")),
+            ("owner_id".to_string(), serde_json::json!("seller_a")),
+            ("created_by".to_string(), serde_json::json!("seller_a")),
+        ]),
+    )
+    .await
+    .expect("assign the product to a seller");
+
+    let (msg, input) = get_msg("/b/products/my-products/gone/close", "seller_a");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        !html.contains("/b/products/api/admin/"),
+        "the seller's close manager must target the seller API, not the admin one: {html}"
+    );
+
+    let archive_url = rendered_attr(&html, "hx-delete=\"", &offer_id).unwrap_or_else(|| {
+        panic!(
+            "the seller close manager must render an archive action for offer {offer_id}: {html}"
+        )
+    });
+    let (msg, input) = delete_msg(&archive_url, "seller_a");
+    let archived = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        archived["status"], "archived",
+        "the rendered archive action must archive the seller's deleted offer: {archived}"
+    );
+
+    let deactivate_url = rendered_attr(&html, "hx-delete=\"", &link_id).unwrap_or_else(|| {
+        panic!(
+            "the seller close manager must render a deactivate action for link {link_id}: {html}"
+        )
+    });
+    let (msg, input) = delete_msg(&deactivate_url, "seller_a");
+    let deactivated = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the rendered deactivate action must take the seller's link down: {deactivated}"
+    );
+
+    // Closing a money surface must not put the listing back in the catalog.
+    assert!(is_soft_deleted(&ctx, "gone").await);
+}
+
+/// The close manager reads a soft-deleted row through `get_deleted`, which is
+/// exactly the read the live-only door refuses — so the ownership check
+/// cannot come from `repo::products::get`, and forgetting it entirely would
+/// have been invisible. Seller B must get the same 404 every other seller
+/// door gives for a product that is not theirs.
+#[tokio::test]
+async fn a_seller_cannot_open_another_sellers_close_manager() {
+    let ctx = user_products_ctx().await;
+    seed_a_deleted_product_with_a_money_surface(&ctx, "gone").await;
+    wafer_core::clients::database::update(
+        &ctx,
+        super::super::repo::products::TABLE,
+        "gone",
+        HashMap::from([
+            ("owner_kind".to_string(), serde_json::json!("user")),
+            ("owner_id".to_string(), serde_json::json!("seller_a")),
+            ("created_by".to_string(), serde_json::json!("seller_a")),
+        ]),
+    )
+    .await
+    .expect("assign the product to a seller");
+
+    for user in ["seller_b", ""] {
+        let (msg, input) = get_msg("/b/products/my-products/gone/close", user);
+        assert!(
+            dispatch_routed(&ctx, msg, input)
+                .await
+                .collect_buffered()
+                .await
+                .is_err(),
+            "`{user}` must not reach seller A's close manager"
+        );
+    }
+
+    // Positive control: the owner does.
+    let (msg, input) = get_msg("/b/products/my-products/gone/close", "seller_a");
+    let html = output_to_html(dispatch_routed(&ctx, msg, input).await).await;
+    assert!(
+        html.contains("hx-delete="),
+        "the owner must reach the page the assertions above deny: {html}"
+    );
 }

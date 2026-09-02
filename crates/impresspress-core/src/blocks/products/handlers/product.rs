@@ -291,8 +291,8 @@ async fn read_write_body<T: serde::de::DeserializeOwned>(
     input: InputStream,
 ) -> Result<T, OutputStream> {
     let raw = input.collect_to_bytes().await;
-    let named: HashMap<String, serde_json::Value> = serde_json::from_slice(&raw)
-        .map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
+    let named: HashMap<String, serde_json::Value> =
+        serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
     reject_unsettable_fields(&named)?;
     serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))
 }
@@ -313,6 +313,47 @@ async fn verify_product_owner(
         return Err(err_unauthorized("Not authenticated"));
     }
     match repo::products::get(ctx, id).await {
+        Ok(record) => {
+            if !is_owned_by(&record, user_id) {
+                return Err(err_not_found("Product not found"));
+            }
+            Ok(record)
+        }
+        Err(e) if e.code == ErrorCode::NotFound => Err(err_not_found("Product not found")),
+        Err(e) => Err(err_internal("Database error", e)),
+    }
+}
+
+/// Fetch a SOFT-DELETED product and verify the caller may act on it — the
+/// deleted-set twin of [`verify_product_owner`], and the gate on every
+/// owner-scoped door that only makes sense once a product is deleted (the
+/// seller's restore endpoint and close-only manager).
+///
+/// The ownership rule is [`is_owned_by`], the same one every other seller
+/// door uses. Only the read differs, and it has to: `repo::products::get`
+/// answers `NotFound` for a soft-deleted row by design, so a check built on
+/// it would refuse exactly the rows these routes exist for.
+///
+/// `get_deleted` rather than `get_including_deleted`, deliberately. It is the
+/// narrower read — it answers `NotFound` for a LIVE row as well as a missing
+/// one — so a seller route built on it can never be turned into an existence
+/// oracle for the live catalog, and a caller who reaches one of these doors
+/// for a product that was never deleted gets the same 404 as for one that is
+/// not theirs. (The admin restore stays a no-op 200 in that case; it does not
+/// need an ownership read at all, so it never looks the row up first.)
+///
+/// Response shapes mirror [`verify_product_owner`]: 401 unauthenticated, 404
+/// for "missing", "not deleted" and "not yours" alike — existence must not
+/// leak to a non-owner.
+async fn verify_deleted_product_owner(
+    ctx: &dyn Context,
+    id: &str,
+    user_id: &str,
+) -> Result<wafer_core::clients::database::Record, OutputStream> {
+    if user_id.is_empty() {
+        return Err(err_unauthorized("Not authenticated"));
+    }
+    match repo::products::get_deleted(ctx, id).await {
         Ok(record) => {
             if !is_owned_by(&record, user_id) {
                 return Err(err_not_found("Product not found"));
@@ -437,6 +478,23 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
+    restore_product(ctx, id).await
+}
+
+/// Restore a soft-deleted product the caller has already been authorized for.
+///
+/// The shared body of [`handle_restore_product`] (admin tier) and
+/// [`handle_user_restore_product`] (owner-scoped). It contains NO
+/// authorization of its own — the tier gate and the ownership check are the
+/// callers' — and everything below it is about the one thing the two tiers
+/// answer identically: what a restore write means when it fails.
+///
+/// Shared rather than duplicated because that failure handling is the hard
+/// half. A second copy for the seller route would have started as a `restore`
+/// call whose error went straight to `write_error`, which is exactly the
+/// opaque 500 the branches below exist to replace — on the one door out of
+/// soft delete, behind a button that only reloads on success.
+async fn restore_product(ctx: &dyn Context, id: &str) -> OutputStream {
     // Soft delete FREES the product's slug — migration 005's unique index is
     // partial on `deleted_at IS NULL` — and nothing stops a product created
     // afterwards from claiming it. Restoring the original then violates that
@@ -1012,6 +1070,50 @@ pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message)
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
     }
+}
+
+/// Restore a soft-deleted product the CALLER OWNS —
+/// `POST /b/products/api/products/{id}/restore`, declared
+/// `AuthLevel::Authenticated`.
+///
+/// The seller-side twin of [`handle_restore_product`], and the reason the
+/// admin one is no longer the only door: a seller could soft-delete their own
+/// product but not see it, restore it, or recover its id, while its Stripe
+/// Prices and Payment Links stayed live in the connected account and went on
+/// taking money. Before soft delete, a hard delete at least left nothing
+/// behind.
+///
+/// The tier is `Authenticated`, which admits every logged-in caller — so
+/// [`verify_deleted_product_owner`] is the entire authorization boundary, and
+/// it uses [`is_owned_by`], the single ownership rule this block already
+/// shares between the product CRUD routes, the offer routes and
+/// `pages::product_manager`. A second rule here is how those three disagreed
+/// with each other once already.
+///
+/// Unlike the admin route it lives on `USER_ROUTES`, so it answers at BOTH
+/// `/b/products/api/products/{id}/restore` and the raw
+/// `/b/products/products/{id}/restore` — `ProductsBlock::handle` enters
+/// `handle_user` from both. That is safe here precisely because the tier is
+/// the fallback tier: the undeclared spelling resolves to `Authenticated`
+/// too, so neither spelling is weaker than the declaration, and ownership —
+/// not the URL — is what refuses seller B. An `Admin` route could not live
+/// here for exactly that reason, which is what
+/// `dispatch_tables_are_backed_by_declared_endpoints` enforces.
+pub(super) async fn handle_user_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id").to_string();
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    if let Err(response) = verify_deleted_product_owner(ctx, &id, msg.user_id()).await {
+        return response;
+    }
+    // The ownership read above is a separate statement, but nothing it
+    // established can go stale under the write: `owner_kind`/`owner_id`/
+    // `created_by` are all on `UNSETTABLE_FIELDS`, so no endpoint on any tier
+    // re-parents a product. A concurrent restore CAN land in between, and
+    // `repo::products::restore` already answers that correctly — its filtered
+    // write matches zero rows and the re-read hands back the now-live record.
+    restore_product(ctx, &id).await
 }
 
 pub(super) async fn handle_user_duplicate_product(
