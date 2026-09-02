@@ -178,6 +178,60 @@ fn sw_defaults_the_dev_flag_to_false() {
     );
 }
 
+/// The sandbox's seed bundle is fetched from the static host on a cold boot,
+/// so the service worker has to let `/seed/` through. It is the runtime's own
+/// flag that decides, not a second thing an app has to remember to configure.
+#[test]
+fn a_dev_bundle_bypasses_the_seed_prefix() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(
+        sw.contains("url.pathname.startsWith('/seed/')"),
+        "sw.js does not bypass the seed bundle; sw.js = {sw}"
+    );
+    assert!(
+        !sw.contains("__EXTRA_BYPASS__"),
+        "placeholder not substituted"
+    );
+}
+
+/// And only then: a bundle with no sandbox serves no seed, so intercepting
+/// `/seed/` is the correct (and unchanged) behaviour.
+#[test]
+fn a_non_dev_bundle_does_not_bypass_the_seed_prefix() {
+    let tmp = production_pkg_copy();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(!sw.contains("/seed/"), "sw.js = {sw}");
+}
+
+/// The seed prefix joins whatever the app already asked for rather than
+/// replacing it — `examples/dev-sandbox` also bypasses the compiler worker.
+#[test]
+fn the_seed_prefix_joins_an_apps_own_bypass_list() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        extra_bypass_prefix: vec!["/__impresspress_dev/compiler/".to_string()],
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(sw.contains("url.pathname.startsWith('/__impresspress_dev/compiler/')"));
+    assert!(sw.contains("url.pathname.startsWith('/seed/')"));
+}
+
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     for entry in fs::read_dir(src).unwrap() {
         let e = entry.unwrap();

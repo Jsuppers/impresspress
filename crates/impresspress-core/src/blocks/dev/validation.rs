@@ -1,10 +1,12 @@
 //! Static validation of a staged guest block (design §7.4, §6.5).
 //!
-//! Validation has two halves. The *executable* half —
-//! [`super::control::RuntimeControl::validate`] — loads the artifact, parses
-//! `BlockInfo`, runs `Init`/`Start` and one probe. This module is the other
-//! half: pure data rules over the `BlockInfo` the guest reported, the name it
-//! was compiled under, and the block set it is joining.
+//! Validation has three steps, and this module is the middle one. The
+//! executable steps are the host's: [`super::control::RuntimeControl::inspect`]
+//! loads the artifact under no capabilities and parses `BlockInfo`, and
+//! [`super::control::RuntimeControl::probe`] runs `Init`/`Start` and one
+//! request under the spec the rules below accepted. This module is the pure
+//! data half: rules over the `BlockInfo` the guest reported, the name it was
+//! compiled under, and the block set it is joining.
 //!
 //! # Why the rules live beside the spec and not in the host
 //!
@@ -206,8 +208,8 @@ impl Diagnostic {
         )
     }
 
-    /// The refusal a failed [`super::control::RuntimeControl::validate`]
-    /// produces.
+    /// The refusal a failed [`super::control::RuntimeControl::inspect`] or
+    /// [`super::control::RuntimeControl::probe`] produces.
     ///
     /// The code is `guest-{stage}` — `guest-load`, `guest-info`,
     /// `guest-init`, `guest-start`, `guest-probe` — so the stage is machine
@@ -223,7 +225,7 @@ impl Diagnostic {
 /// The refusal a malformed block name produces.
 ///
 /// Exposed on its own because the staging handler refuses the name *before*
-/// it hands the artifact to [`super::control::RuntimeControl::validate`]: a
+/// it hands the artifact to [`super::control::RuntimeControl::inspect`]: a
 /// name that can never be registered would otherwise have an untrusted module
 /// loaded and executed, and the provisional spec the host is handed would
 /// carry a route prefix built from a name the router could not serve.
@@ -304,7 +306,7 @@ fn prefixes_overlap(left: &str, right: &str) -> bool {
 /// * `name` — the short block name from the request (`hello`), *not* the
 ///   registered `site/hello`.
 /// * `info` — what the guest reported through
-///   [`super::control::RuntimeControl::validate`].
+///   [`super::control::RuntimeControl::inspect`].
 /// * `artifact_sha256` — the stored artifact's hash.
 /// * `builtin_routes` — every prefix the router already owns; see
 ///   [`builtin_route_prefixes`].

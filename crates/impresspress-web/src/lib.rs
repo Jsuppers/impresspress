@@ -11,6 +11,12 @@ use wafer_core::interfaces::config::service::ConfigService;
 use wasm_bindgen::prelude::*;
 
 pub mod config;
+// The module documents itself (`//!` in `dev_runtime.rs`). Deliberately no
+// `///` here: rustdoc merges an outer doc comment on the `mod` item with the
+// module's own inner docs and then resolves the whole block in *this* scope,
+// so every intra-doc link the module makes to its own items goes unresolved.
+#[cfg(feature = "browser-devtools")]
+pub mod dev_runtime;
 pub mod runtime_factory;
 
 pub use runtime_factory::{RuntimeFactory, RuntimeOptions};
@@ -70,17 +76,31 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
         dev_enabled: dev_requested,
     })
     .map_err(|e| JsValue::from_str(&e))?;
+
+    // The sandbox control plane is attached BEFORE the first build, so the
+    // cold-start runtime already carries `/b/dev`. Doing it afterwards would
+    // mean the page did not exist until a rebuild — and an instance with no
+    // guest blocks has no reason to rebuild, so on the common path it would
+    // never exist at all. `attach` answers `None` whenever the sandbox is not
+    // active, and the factory is then untouched.
+    #[cfg(feature = "browser-devtools")]
+    let (factory, dev_shared) = dev_runtime::attach(factory);
+    #[cfg(not(feature = "browser-devtools"))]
+    let factory = factory;
+
     let (wafer, _storage_block) = factory.build(&[]).await?;
 
     web_sys::console::log_1(&"impresspress: WAFER runtime started".into());
 
     impresspress_browser::store_wafer(wafer).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    // Task 9 installs the sandbox control plane here: build the
-    // `RuntimeControl` over `factory`, hand it to `DevShared`, put it back on
-    // the factory with `RuntimeFactory::with_dev`, then converge the runtime
-    // onto the stored generation (rebuild + `replace_wafer`). Until then the
-    // factory is dropped after the cold-start build and `dev` stays `None`.
+    // Seed on a fresh instance, converge on whatever the activation journal
+    // was in the middle of, and rebuild with the active block set — all before
+    // returning, because requests only start once `initialize()` resolves.
+    #[cfg(feature = "browser-devtools")]
+    if let Some(shared) = &dev_shared {
+        dev_runtime::install(shared).await;
+    }
 
     Ok(())
 }

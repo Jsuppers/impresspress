@@ -17,7 +17,7 @@
 //! # Why it is not in the block manifest
 //!
 //! Registration happens from the consumer, via `ImpresspressBuilder::extra_block`
-//! and `add_route`, gated on `IMPRESSPRESS__DEV__ENABLED`.
+//! and `add_route`, gated on `IMPRESSPRESS_DEV_ENABLED`.
 //! `feature_block_manifest!` only enumerates blocks whose constructors take no
 //! arguments, and — more to the point — the sandbox's security model
 //! (design §13) depends on this block being absent from every normal
@@ -36,6 +36,7 @@ pub mod migrations;
 pub mod paths;
 pub mod publisher;
 pub mod repo;
+pub mod seed;
 pub mod status;
 pub mod validation;
 pub mod workspace;
@@ -282,6 +283,15 @@ pub struct DevShared {
 
 impl DevShared {
     /// Build the shared state around a [`RuntimeControl`] handle.
+    ///
+    /// `arc_with_non_send_sync`: [`RuntimeControl`] is bounded on
+    /// `MaybeSend + MaybeSync`, which is unbounded on wasm32 — that is what
+    /// lets the browser control hold the live `Rc<Wafer>` and its factory. On
+    /// wasm32 the resulting `Arc` therefore is not `Send`/`Sync`, and on that
+    /// single-threaded target it does not need to be; on native the same
+    /// bounds are `Send + Sync` and the lint does not fire at all. The same
+    /// allowance the block registration path already carries.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(control: Arc<dyn RuntimeControl>) -> Arc<Self> {
         Arc::new(Self {
             control,

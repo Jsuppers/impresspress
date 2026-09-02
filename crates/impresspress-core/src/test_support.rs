@@ -433,6 +433,21 @@ impl TestContext {
         self.storage().ops()
     }
 
+    /// The fixture's object store as the platform service handle.
+    ///
+    /// For the code paths that hold a `StorageService` rather than a
+    /// [`wafer_run::context::Context`] — the runtime rebuild reads guest
+    /// artifacts before there is a runtime to route a `wafer-run/storage` call
+    /// through. Deliberately the *same* store [`Self::storage_get`] reads, so
+    /// a test can prove the two access paths address the same objects.
+    pub fn storage_service(
+        &self,
+    ) -> Arc<dyn wafer_core::interfaces::storage::service::StorageService> {
+        self.storage
+            .clone()
+            .expect("this fixture registered no storage service")
+    }
+
     fn storage(&self) -> &InMemoryStorageService {
         self.storage
             .as_deref()

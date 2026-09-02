@@ -1129,3 +1129,93 @@ async fn boot_clears_a_journal_that_names_an_unreadable_generation() {
         row.failure_message
     );
 }
+
+/// The symmetric hole. `desired` is not the only pointer the persistent
+/// journal holds: an `active` that cannot be loaded would make *every* boot
+/// return `Err` from here on, and the `/b/dev` page that could fix it is
+/// served by the runtime that boot never builds.
+#[tokio::test]
+async fn boot_clears_an_active_pointer_to_a_generation_that_is_gone() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    write_file(&ctx, "site/index.html", "v1", None).await;
+
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    runtime_state::write(
+        &ctx,
+        &RuntimeState {
+            active_generation_id: Some("a-generation-that-never-existed".to_string()),
+            ..state
+        },
+    )
+    .await
+    .expect("journal");
+
+    let blocks = activation::converge_on_boot(&ctx, &ctx.dev_shared())
+        .await
+        .expect("an unloadable active generation must not fail the boot");
+    assert!(blocks.is_empty(), "nothing dynamic is served");
+
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    assert_eq!(state.active_generation_id, None);
+    assert_eq!(state.desired_generation_id, None);
+    assert_eq!(state.activation_phase, ActivationPhase::Idle);
+
+    // The instance is usable again: the next write publishes on top of the
+    // cleared journal instead of failing on the pointer.
+    let next = write_file(&ctx, "site/index.html", "v2", Some(&sha_of("v1"))).await;
+    assert_eq!(next["generation"]["status"], "active");
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v2"[..])
+    );
+}
+
+/// The same, for an `active` row that exists but whose manifest columns do not
+/// parse. Here there is a row, so the refusal is recorded on it.
+#[tokio::test]
+async fn boot_clears_an_active_pointer_to_an_unreadable_generation() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+
+    let corrupt = repo::new_id();
+    generations::insert(
+        &ctx,
+        &NewGeneration {
+            id: corrupt.clone(),
+            parent_id: None,
+            cause: GenerationCause::Seed,
+            // Written by a build this one cannot read.
+            site_manifest_json: "not-json-at-all".to_string(),
+            block_manifest_json: "[]".to_string(),
+            manifest_sha256: "cc".to_string(),
+        },
+    )
+    .await
+    .expect("stage a corrupt generation");
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    runtime_state::write(
+        &ctx,
+        &RuntimeState {
+            active_generation_id: Some(corrupt.clone()),
+            ..state
+        },
+    )
+    .await
+    .expect("journal");
+
+    activation::converge_on_boot(&ctx, &ctx.dev_shared())
+        .await
+        .expect("an unreadable active generation must not fail the boot");
+
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    assert_eq!(state.active_generation_id, None);
+
+    let row = generations::get(&ctx, &corrupt).await.expect("row");
+    assert_eq!(row.status, GenerationStatus::Failed);
+    assert!(
+        row.failure_message
+            .as_deref()
+            .is_some_and(|m| m.contains("site_manifest_json")),
+        "{:?}",
+        row.failure_message
+    );
+}

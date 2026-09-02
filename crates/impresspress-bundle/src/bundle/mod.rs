@@ -8,6 +8,16 @@ use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result};
 
+/// URL prefix the development sandbox's seed bundle is served under, added to
+/// the service worker's bypass list whenever [`AppConfig::dev_enabled`].
+///
+/// The same value as `impresspress_core::blocks::dev::seed::ROOT`. It is
+/// restated rather than imported because this crate deliberately depends on no
+/// impresspress crate — it is native bundling tooling that the wasm32 runtime
+/// never compiles — and pulling `impresspress-core` in for one string would
+/// invert that.
+pub const SEED_BYPASS_PREFIX: &str = "/seed/";
+
 /// Consumer-supplied configuration that controls how templates are rendered.
 /// All fields are optional; sensible defaults are derived from the discovered
 /// wasm-pack output pair when omitted.
@@ -295,11 +305,24 @@ fn build_template_vars(
     // list is empty we expand to the empty string, leaving the existing
     // bypass expression intact. Each entry is quoted and escaped defensively
     // against single quotes in the path.
-    let extra_bypass = if app.extra_bypass_prefix.is_empty() {
+    // The development sandbox's seed bundle is served by the static host, not
+    // by the runtime: on a cold boot the service worker fetches
+    // `/seed/manifest.json` and imports generation 0 from it, and a page
+    // asking for the same files must reach the host too. A runtime that
+    // intercepted the prefix would answer from the published site — which,
+    // on the boot that needs the seed, is empty. Added here rather than by
+    // every consumer, so "the sandbox is on" is the only thing an app has to
+    // say. See `impresspress_core::blocks::dev::seed::ROOT`, which this
+    // crate cannot import (it depends on nothing of impresspress's).
+    let mut prefixes: Vec<&str> = app.extra_bypass_prefix.iter().map(String::as_str).collect();
+    if app.dev_enabled && !prefixes.contains(&SEED_BYPASS_PREFIX) {
+        prefixes.push(SEED_BYPASS_PREFIX);
+    }
+    let extra_bypass = if prefixes.is_empty() {
         String::new()
     } else {
         let mut out = String::new();
-        for prefix in &app.extra_bypass_prefix {
+        for prefix in prefixes {
             let escaped = prefix.replace('\\', "\\\\").replace('\'', "\\'");
             out.push_str(" || url.pathname.startsWith('");
             out.push_str(&escaped);

@@ -771,11 +771,8 @@ pub async fn converge_on_boot(
     let state = repo::runtime_state::read(ctx)
         .await
         .map_err(|e| e.message)?;
+    let (previous, state) = active_or_clear(ctx, &state).await?;
     if let Some(desired) = state.desired_generation_id.clone() {
-        let previous = load_previous(ctx, &state)
-            .await
-            .map_err(|e| e.to_string())?;
-
         match generation::load(ctx, &desired).await {
             Ok((row, manifest)) => {
                 // A failed convergence is not a failed boot, and the failure
@@ -816,11 +813,67 @@ pub async fn converge_on_boot(
         }
     }
 
-    Ok(generation::active(ctx)
+    // Re-read: converging may have activated the desired generation, so the
+    // journal this started from is not necessarily the one that is live now.
+    // The same `active_or_clear` guard applies — a convergence that failed
+    // could have been the thing that left the pointer unreadable.
+    let state = repo::runtime_state::read(ctx)
         .await
-        .map_err(|e| e.message)?
+        .map_err(|e| e.message)?;
+    let (active, _) = active_or_clear(ctx, &state).await?;
+    Ok(active
         .map(|(_, manifest)| manifest.blocks)
         .unwrap_or_default())
+}
+
+/// The generation the journal says is live, or `None` after clearing a pointer
+/// that cannot be loaded.
+///
+/// The symmetric half of the dangling-`desired` recovery below, and it exists
+/// for the same reason: the journal is persistent. A row that has been deleted,
+/// or a `site_manifest_json` that does not parse, would otherwise make
+/// [`converge_on_boot`] return `Err` on *every* boot from then on — the
+/// instance would never serve again, and no `/b/dev` page would come up to fix
+/// it, because the page is served by the runtime the failed boot never built.
+///
+/// So it is treated exactly like a dangling desired: log at `error!`, record
+/// the failure on the row when there is one, clear the journal, and boot with
+/// no active generation. The site files already in `wafer-run/web/site` are
+/// left alone — they are the last coherent publish, and nothing readable says
+/// what should replace them. What the instance loses is the ledger's claim
+/// that they belong to a generation, which is the claim that was corrupt.
+///
+/// Returns the journal as it stands afterwards, so the caller reads the
+/// cleared state rather than the one it passed in.
+async fn active_or_clear(
+    ctx: &dyn Context,
+    state: &RuntimeState,
+) -> Result<(Option<(GenerationRow, GenerationManifest)>, RuntimeState), String> {
+    let Some(id) = state.active_generation_id.clone() else {
+        return Ok((None, state.clone()));
+    };
+    match generation::load(ctx, &id).await {
+        Ok(loaded) => Ok((Some(loaded), state.clone())),
+        Err(e) => {
+            tracing::error!(
+                generation_id = %id,
+                error = %e.message,
+                "dev sandbox: the activation journal names an active generation that cannot be \
+                 loaded; clearing it and booting with nothing dynamic",
+            );
+            abandon_dangling(ctx, &id, &e.message).await?;
+            let cleared = RuntimeState {
+                active_generation_id: None,
+                desired_generation_id: None,
+                activation_phase: ActivationPhase::Idle,
+                generation: state.generation,
+            };
+            repo::runtime_state::write(ctx, &cleared)
+                .await
+                .map_err(|e| e.message)?;
+            Ok((None, cleared))
+        }
+    }
 }
 
 /// Republish the active generation's site after a convergence that did not
