@@ -461,7 +461,11 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
     // doc above) are what these overrides exist to displace.
     //
     // `take_where` is deliberately NOT here: it returns the rows it removed,
-    // so it is a read as much as a write and belongs on the failing side.
+    // so it is a read as much as a write and belongs on the failing side. It
+    // is stated there explicitly, for the same reason the family below is
+    // stated here — the trait's default reaches the failure through a `list`
+    // the real backends' single `DELETE … RETURNING *` never issues, so
+    // inheriting it would make the double right by accident.
 
     async fn update_where(
         &self,
@@ -509,6 +513,19 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
         self.inner
             .increment_field_where(collection, col, delta, filters)
             .await
+    }
+
+    // The one member of that family on the failing side: it hands back the
+    // rows it removed.
+    async fn take_where(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+    ) -> Result<
+        Vec<wafer_core::interfaces::database::service::Record>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        Err(simulated_read_failure())
     }
 
     async fn count(
@@ -605,6 +622,29 @@ fn simulated_read_failure() -> wafer_core::interfaces::database::service::Databa
 /// `DatabaseService` decorator used by [`TestContext::break_writes`]. Every
 /// mutating method fails with [`DatabaseError::Internal`]; every read/schema
 /// method delegates to `inner` unchanged.
+///
+/// "Mutating" includes the filtered-write family (`update_where*`,
+/// `delete_where*`, `take_where`, `increment_field_where`), which this
+/// decorator must override explicitly — the mirror of the same paragraph on
+/// [`FailingReadsDb`]. The `DatabaseService` trait ships *read-based default
+/// implementations* of those: `update_where_count` counts and then updates,
+/// `update_where` lists and then updates by id, `delete_where` lists and then
+/// deletes by id, `take_where` lists and then deletes, and
+/// `increment_field_where` reports that the backend does not implement it at
+/// all. `wafer-block-sqlite`, `wafer-block-postgres` and `D1DatabaseService`
+/// all override the family with a single statement carrying no `count` and no
+/// `list`.
+///
+/// Inheriting the defaults here did not merely reach the right answer by the
+/// wrong route — it reached the WRONG answer whenever the filter matched no
+/// rows: the default lists nothing, writes nothing, and returns `Ok`, so a
+/// filtered write SUCCEEDED on a database whose writes are supposed to be
+/// failing. `repo::products::restore` of an already-live product is exactly
+/// that write. A handler branch reachable only when a filtered write fails
+/// then looks covered while production can never enter it; `restore_fails_
+/// loudly_when_the_slug_collision_probe_cannot_run` was that test on
+/// [`FailingReadsDb`], and this double kept the same defect armed for the
+/// next one.
 struct FailingWritesDb {
     inner: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
 }
@@ -661,6 +701,68 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingWrite
         _collection: &str,
         _id: &str,
     ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    // --- the filtered-write family ---------------------------------------
+    //
+    // Failed, not inherited. See the struct doc above: every one of these is
+    // one `UPDATE`/`DELETE … WHERE` statement on every real backend, and the
+    // trait's read-based defaults answer `Ok` for a filter that matches
+    // nothing — a successful write on a database whose writes are failing.
+
+    async fn update_where(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+        _data: HashMap<String, serde_json::Value>,
+    ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn update_where_count(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+        _data: HashMap<String, serde_json::Value>,
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn delete_where(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+    ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn delete_where_count(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn take_where(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+    ) -> Result<
+        Vec<wafer_core::interfaces::database::service::Record>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        Err(simulated_write_failure())
+    }
+
+    async fn increment_field_where(
+        &self,
+        _collection: &str,
+        _col: &str,
+        _delta: i64,
+        _filters: &[wafer_block::db::Filter],
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
         Err(simulated_write_failure())
     }
 
@@ -1088,25 +1190,79 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
     ]
 }
 
+/// The JWT secret every `handle_request` test call passes.
+pub const TEST_JWT_SECRET: &str = "test-jwt-secret";
+
+/// A `Bearer` access token carrying `roles`, signed the way `auth_ui` signs
+/// one (block-derived key from [`TEST_JWT_SECRET`], the default issuer), so
+/// `pipeline::handle_request`'s step 2 resolves it to a real identity with
+/// those roles. This is how a test asks for a document *as* an authenticated
+/// or admin caller.
+pub fn bearer_for_roles(roles: &[&str]) -> String {
+    use std::{collections::HashMap, time::Duration};
+
+    use wafer_block_crypto::primitives;
+
+    let derived = primitives::derive_block_key(
+        TEST_JWT_SECRET.as_bytes(),
+        crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+    );
+    let mut claims = HashMap::new();
+    claims.insert("sub".to_string(), serde_json::json!("user-test-1"));
+    claims.insert("type".to_string(), serde_json::json!("access"));
+    // Must match `expected_issuer`'s default
+    // (`crate::blocks::auth::helpers::expected_issuer`): a `TestContext` has
+    // no `WAFER_RUN_SHARED__FRONTEND_URL` configured.
+    claims.insert(
+        "iss".to_string(),
+        serde_json::json!("http://localhost:5173"),
+    );
+    claims.insert("roles".to_string(), serde_json::json!(roles));
+    let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+        .expect("test jwt_sign");
+    format!("Bearer {token}")
+}
+
 /// Fetch a discovery document (`/openapi.json` or `/.well-known/agent.json`)
-/// generated from [`real_block_infos`]. Shared by `pipeline.rs`'s discovery
-/// tests and the per-block openapi snapshot gate, so there is one
-/// implementation rather than two.
+/// generated from [`real_block_infos`], as the caller `roles` describes:
+/// `None` is anonymous, `Some(&["user"])` an authenticated user,
+/// `Some(&["admin"])` an admin. The documents are filtered by the caller's
+/// tier the same way the WebMCP manifest is, so which caller asks matters.
+///
+/// The identity is pre-resolved on the message (the same `auth.*` meta
+/// [`admin_msg`] sets), not minted as a JWT, so this works on a bare
+/// [`TestContext::new`] — no auth tables needed. What these tests check is
+/// the filter given a caller; that step 2 resolves a real bearer into that
+/// caller *before* the filter runs is pinned separately, through
+/// [`bearer_for_roles`] on a [`TestContext::with_auth`]
+/// (`pipeline::discovery_tests::openapi_describes_admin_endpoints_to_an_admin`).
 #[cfg(all(
     feature = "block-files",
     feature = "block-messages",
     feature = "block-products",
     feature = "block-tickets"
 ))]
-pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
-    let mut msg = anon_msg("retrieve", path);
+pub async fn discovery_json_as(
+    ctx: &TestContext,
+    path: &str,
+    host: &str,
+    roles: Option<&[&str]>,
+) -> serde_json::Value {
+    let mut msg = match roles {
+        None => anon_msg("retrieve", path),
+        Some(roles) => {
+            let mut msg = auth_msg("retrieve", path, "user-test-1");
+            msg.set_meta("auth.user_roles", roles.join(","));
+            msg
+        }
+    };
     msg.set_meta("http.header.host", host);
     let out = crate::pipeline::handle_request(
         ctx,
         msg,
         InputStream::from_bytes(Vec::new()),
         None,
-        "test-jwt-secret",
+        TEST_JWT_SECRET,
         false,
         &crate::features::AllEnabled,
         &real_block_infos(),
@@ -1115,6 +1271,21 @@ pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_
     .await;
     let buf = collect_or_panic(out).await;
     serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
+}
+
+/// The *complete* discovery document — fetched as an admin, the one caller
+/// who sees every endpoint. Shared by `pipeline.rs`'s discovery tests and the
+/// per-block openapi snapshot gate, both of which assert on privileged
+/// endpoints; a test about what a lower tier receives uses
+/// [`discovery_json_as`] directly.
+#[cfg(all(
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets"
+))]
+pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
+    discovery_json_as(ctx, path, host, Some(&["admin"])).await
 }
 
 /// Fetch the generated `/openapi.json` document. Shared by pipeline tests
@@ -1350,6 +1521,185 @@ mod tests {
         assert!(
             err.to_string().contains("WRAP"),
             "error must mention WRAP, got: {err}"
+        );
+    }
+
+    /// Every entry in the filtered-write family, so a new one added to the
+    /// `DatabaseService` trait shows up here as a compile error rather than
+    /// as a silently inherited default.
+    async fn filtered_writes_all_fail(
+        svc: &dyn wafer_core::interfaces::database::service::DatabaseService,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+        label: &str,
+    ) {
+        let data = HashMap::from([(
+            "name".to_string(),
+            serde_json::json!("written despite the fault"),
+        )]);
+        assert!(
+            svc.update_where(collection, filters, data.clone())
+                .await
+                .is_err(),
+            "update_where must fail ({label})"
+        );
+        assert!(
+            svc.update_where_count(collection, filters, data)
+                .await
+                .is_err(),
+            "update_where_count must fail ({label})"
+        );
+        assert!(
+            svc.delete_where(collection, filters).await.is_err(),
+            "delete_where must fail ({label})"
+        );
+        assert!(
+            svc.delete_where_count(collection, filters).await.is_err(),
+            "delete_where_count must fail ({label})"
+        );
+        assert!(
+            svc.take_where(collection, filters).await.is_err(),
+            "take_where must fail ({label})"
+        );
+        assert!(
+            svc.increment_field_where(collection, "hits", 1, filters)
+                .await
+                .is_err(),
+            "increment_field_where must fail ({label})"
+        );
+    }
+
+    /// `id = ?` for a row that does not exist — the case that separates a
+    /// correct double from one riding the trait defaults.
+    fn matches_nothing() -> Vec<wafer_block::db::Filter> {
+        vec![wafer_block::db::Filter {
+            field: "id".to_string(),
+            operator: wafer_block::db::FilterOp::Equal,
+            value: serde_json::json!("no-such-row"),
+        }]
+    }
+
+    fn matches_the_seeded_row() -> Vec<wafer_block::db::Filter> {
+        vec![wafer_block::db::Filter {
+            field: "id".to_string(),
+            operator: wafer_block::db::FilterOp::Equal,
+            value: serde_json::json!("r1"),
+        }]
+    }
+
+    async fn seeded_ctx() -> TestContext {
+        let ctx = TestContext::new().await;
+        db::exec_raw(
+            &ctx,
+            "CREATE TABLE filtered_writes (id TEXT PRIMARY KEY, name TEXT, hits INTEGER              DEFAULT 0, created_at TEXT, updated_at TEXT)",
+            &[],
+        )
+        .await
+        .expect("create table");
+        db::exec_raw(
+            &ctx,
+            "INSERT INTO filtered_writes (id, name, hits) VALUES ('r1', 'alpha', 0)",
+            &[],
+        )
+        .await
+        .expect("seed row");
+        ctx
+    }
+
+    /// [`TestContext::break_writes`] simulates a backend whose writes fail.
+    /// The filtered-write family has to fail there too — and it is the family
+    /// the `DatabaseService` trait ships READ-BASED defaults for:
+    /// `update_where_count` counts and then updates, `update_where` lists and
+    /// then updates by id, `delete_where` lists and then deletes by id,
+    /// `take_where` lists and then deletes, and `increment_field_where`
+    /// reports "not implemented by this database backend".
+    ///
+    /// `wafer-block-sqlite`, `wafer-block-postgres` and `D1DatabaseService`
+    /// every one override the family with a SINGLE statement carrying no
+    /// `count` and no `list`, so a double that inherits the defaults is a
+    /// database that does not exist. The tell is a write matching zero rows:
+    /// the defaults list nothing, update nothing, and return `Ok` — a
+    /// *successful* write on a backend whose writes are supposed to be
+    /// failing. A handler branch reachable only when a filtered write fails
+    /// then looks covered while production can never enter it, which is
+    /// exactly how `restore_fails_loudly_when_the_slug_collision_probe_
+    /// cannot_run` came to assert an outcome production could not produce
+    /// (see its doc comment; that instance was fixed on `FailingReadsDb`,
+    /// leaving this one armed for the next test to use it).
+    #[tokio::test]
+    async fn break_writes_fails_every_filtered_write() {
+        let ctx = seeded_ctx().await.break_writes();
+
+        // The zero-match case first: this is the one the trait defaults get
+        // wrong, by doing nothing and calling it success.
+        filtered_writes_all_fail(
+            ctx.db_service.as_ref(),
+            "filtered_writes",
+            &matches_nothing(),
+            "no rows matched",
+        )
+        .await;
+        // And the matching case, which the defaults happen to fail — but
+        // only after a read the real backends never issue.
+        filtered_writes_all_fail(
+            ctx.db_service.as_ref(),
+            "filtered_writes",
+            &matches_the_seeded_row(),
+            "one row matched",
+        )
+        .await;
+
+        // Reads still delegate, which is the whole point of `break_writes`:
+        // a handler's "read current state, then persist a change" shape must
+        // reach the branch under test rather than failing earlier.
+        let row = ctx
+            .db_service
+            .get("filtered_writes", "r1")
+            .await
+            .expect("reads must still resolve under break_writes");
+        assert_eq!(
+            row.data.get("name").and_then(|v| v.as_str()),
+            Some("alpha"),
+            "a failed filtered write must not have changed the row"
+        );
+    }
+
+    /// The mirror of the above for [`TestContext::break_reads`]: its
+    /// filtered-write overrides already delegate (a broken read layer must
+    /// not fail a write), and `take_where` — which returns the rows it
+    /// removed, so it reads as much as it writes — fails.
+    ///
+    /// `take_where` used to reach that failure through the trait's default
+    /// (list, then delete by id), so the double only failed because the
+    /// *list* did. Real backends issue one `DELETE … RETURNING *`, so the
+    /// answer was right for a reason production does not have. It is stated
+    /// directly now, like the rest of the family.
+    #[tokio::test]
+    async fn break_reads_leaves_filtered_writes_working_and_fails_take_where() {
+        let ctx = seeded_ctx().await.break_reads();
+        let filters = matches_the_seeded_row();
+        let data = HashMap::from([("name".to_string(), serde_json::json!("beta"))]);
+
+        assert_eq!(
+            ctx.db_service
+                .update_where_count("filtered_writes", &filters, data)
+                .await
+                .expect("a broken read layer must not fail a filtered write"),
+            1,
+        );
+        assert!(
+            ctx.db_service
+                .take_where("filtered_writes", &filters)
+                .await
+                .is_err(),
+            "take_where hands back the rows it removed, so a broken read layer must fail it"
+        );
+        assert_eq!(
+            ctx.db_service
+                .delete_where_count("filtered_writes", &filters)
+                .await
+                .expect("a broken read layer must not fail a filtered delete"),
+            1,
         );
     }
 

@@ -13,6 +13,7 @@ use wafer_run::{
 };
 
 use crate::{
+    endpoint_match,
     features::FeatureConfig,
     http::ResponseBuilder,
     routing::{self, ExtraRoute},
@@ -108,6 +109,31 @@ fn caller_auth_level(msg: &Message) -> AuthLevel {
     AuthLevel::Authenticated
 }
 
+/// Every registered block with its endpoint list narrowed to what `caller`
+/// may invoke, resolved with `routing::effective_access` — the filter the
+/// WebMCP manifest applies, reused so `/openapi.json`, the agent card and the
+/// manifest cannot disagree about who is told an endpoint exists. Blocks are
+/// kept even when nothing in them is visible, so block-level metadata the
+/// documents carry stays stable across tiers.
+fn visible_to_caller(
+    block_infos: &[BlockInfo],
+    caller: AuthLevel,
+    extra_routes: &[ExtraRoute],
+) -> Vec<BlockInfo> {
+    let ceiling = endpoint_match::auth_rank(caller);
+    block_infos
+        .iter()
+        .map(|block| {
+            let mut visible = block.clone();
+            visible.endpoints.retain(|ep| {
+                endpoint_match::auth_rank(routing::effective_access(block, ep, extra_routes))
+                    <= ceiling
+            });
+            visible
+        })
+        .collect()
+}
+
 /// Handle a impresspress request.
 ///
 /// This is the shared entry point that both CF and native adapters call
@@ -144,49 +170,8 @@ pub async fn handle_request(
     block_infos: &[BlockInfo],
     extra_routes: &[ExtraRoute],
 ) -> OutputStream {
-    // 0. Discovery endpoints — public, no auth required
-    let path = msg.path();
-    if path == "/openapi.json" || path == "/.well-known/agent.json" {
-        let is_openapi = path == "/openapi.json";
-        let host = msg.header("host").to_string();
-        let server_url = format!("https://{host}");
-        // The project/display name for the discovery documents (OpenAPI
-        // `info.title` and the agent-card `name`). Previously this was
-        // derived from the `Host` header (`host.split('.').next()`), which
-        // produced garbage for IP-addressed hosts — e.g. `127.0.0.1:8093`
-        // yielded the literal title `"127"`. `WAFER_RUN_SHARED__APP_NAME` is
-        // the existing single-sourced display-name config var (already used
-        // for emails, the login page, and the browser `<title>` — see
-        // `blocks/email.rs`, `ui/mod.rs`), so discovery documents reuse it
-        // instead of inventing a second name knob; it falls back to the
-        // constant `"Impresspress"`, never to the host.
-        let project_name =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await;
-
-        let body = if is_openapi {
-            wafer_core::discovery::generate_openapi(block_infos, &project_name, "", &server_url)
-        } else {
-            wafer_core::discovery::generate_agent_card(block_infos, &project_name, "", &server_url)
-        };
-
-        // [SEC-073] Only emit `Access-Control-Allow-Origin: *` in dev. These
-        // endpoints are intentionally public-discovery (no auth, anyone can
-        // GET them), but advertising `*` to every cross-origin caller in
-        // production lets unauthenticated browser code at any site map the
-        // whole impresspress API surface — useful reconnaissance for a targeted
-        // attack. In prod we just omit the header; non-browser clients
-        // (curl, the agent runtime, server-side fetchers) don't care about
-        // CORS so they still see the body.
-        let environment =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
-        let is_dev = environment.eq_ignore_ascii_case("development");
-
-        let mut resp = ResponseBuilder::new().set_header("Cache-Control", "public, max-age=3600");
-        if is_dev {
-            resp = resp.set_header("Access-Control-Allow-Origin", "*");
-        }
-        return resp.json(&body);
-    }
+    // 0. (Discovery documents moved below step 2 — they are filtered by the
+    //    caller's tier, which is not known here.)
 
     // 1. Strip /api prefix from resource path
     let resource = msg.path().to_string();
@@ -216,9 +201,75 @@ pub async fn handle_request(
     let user_id = msg.user_id().to_string();
     let start_ms = crate::util::now_millis();
 
+    // Discovery documents: `/openapi.json` and the agent card. Placed after
+    // step 2, with the manifest, because they are filtered by the caller's
+    // tier: an endpoint the caller could not invoke is not described to
+    // them. At step 0 `msg.user_id()` is always empty, so a filter there
+    // would hand every caller the anonymous document — silently, since that
+    // is a valid document (`openapi_describes_admin_endpoints_to_an_admin`
+    // pins the placement).
+    //
+    // The route itself stays reachable without credentials: an anonymous
+    // caller gets the Public subset, which is exactly what they can use.
+    if path == "/openapi.json" || path == "/.well-known/agent.json" {
+        let is_openapi = path == "/openapi.json";
+        let host = msg.header("host").to_string();
+        let server_url = format!("https://{host}");
+        // The project/display name for the discovery documents (OpenAPI
+        // `info.title` and the agent-card `name`). Previously this was
+        // derived from the `Host` header (`host.split('.').next()`), which
+        // produced garbage for IP-addressed hosts — e.g. `127.0.0.1:8093`
+        // yielded the literal title `"127"`. `WAFER_RUN_SHARED__APP_NAME` is
+        // the existing single-sourced display-name config var (already used
+        // for emails, the login page, and the browser `<title>` — see
+        // `blocks/email.rs`, `ui/mod.rs`), so discovery documents reuse it
+        // instead of inventing a second name knob; it falls back to the
+        // constant `"Impresspress"`, never to the host.
+        let project_name =
+            config_client::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await;
+
+        // Same ceiling and the same resolver as the manifest below, so the
+        // three projections of one declaration agree on who is told about
+        // it. Two projections with different disclosure rules is the pattern
+        // that produced the `dedupe_hash` leak.
+        let caller = caller_auth_level(&msg);
+        let visible_infos = visible_to_caller(block_infos, caller, extra_routes);
+
+        let body = if is_openapi {
+            wafer_core::discovery::generate_openapi(&visible_infos, &project_name, "", &server_url)
+        } else {
+            wafer_core::discovery::generate_agent_card(
+                &visible_infos,
+                &project_name,
+                "",
+                &server_url,
+            )
+        };
+
+        // [SEC-073] Only emit `Access-Control-Allow-Origin: *` in dev.
+        // Advertising `*` to every cross-origin caller in production lets
+        // unauthenticated browser code at any site map the API surface —
+        // now the Public subset, but still reconnaissance. In prod we just
+        // omit the header; non-browser clients (curl, the agent runtime,
+        // server-side fetchers) don't care about CORS so they still see the
+        // body.
+        let environment =
+            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
+        let is_dev = environment.eq_ignore_ascii_case("development");
+
+        // Per-caller by construction, like the manifest: a shared cache
+        // serving one visitor's document to another would leak the
+        // privileged surface. Was `public, max-age=3600` while the document
+        // was the same for everyone.
+        let mut resp = ResponseBuilder::new().set_header("Cache-Control", "no-store");
+        if is_dev {
+            resp = resp.set_header("Access-Control-Allow-Origin", "*");
+        }
+        return resp.json(&body);
+    }
+
     // WebMCP tool manifest. Placed after step 2 because it needs the resolved
-    // identity — the discovery documents at step 0 are anonymous by design,
-    // this one is not.
+    // identity, like the discovery documents above.
     if path == "/b/webmcp/manifest.json" {
         let caller = caller_auth_level(&msg);
 
@@ -492,7 +543,10 @@ mod discovery_tests {
     use super::handle_request;
     use crate::{
         features::{AllEnabled, FeatureConfig},
-        test_support::{anon_msg, collect_or_panic, discovery_json, real_block_infos, TestContext},
+        test_support::{
+            anon_msg, bearer_for_roles, collect_or_panic, discovery_json, discovery_json_as,
+            real_block_infos, TestContext, TEST_JWT_SECRET,
+        },
     };
 
     #[tokio::test]
@@ -763,10 +817,28 @@ mod discovery_tests {
         let checkout_response =
             &checkout["responses"]["200"]["content"]["application/json"]["schema"];
         assert!(
-            checkout_response["properties"]["receipt_token"]["writeOnly"] == true
+            !checkout_response["properties"]["receipt_token"].is_null()
                 && !checkout_response["properties"]["amounts"].is_null(),
             "checkout must document the receipt token and minor-unit amounts: {checkout}"
         );
+        assert!(
+            checkout_response["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&serde_json::json!("receipt_token"))),
+            "the receipt token is what checkout returns, so it is always present: {checkout}"
+        );
+        // `writeOnly` asserts a field is never present in a response. Both of
+        // these are only ever present in a response — the receipt token is
+        // the product of checkout, the client secret is how an embedded
+        // checkout is opened — so the flag was a false statement that a
+        // strict OpenAPI 3.1 client would act on. Sensitivity is stated in
+        // the description instead.
+        for field in ["receipt_token", "client_secret"] {
+            assert!(
+                checkout_response["properties"][field]["writeOnly"].is_null(),
+                "{field} is returned in the response and must not be marked writeOnly: {checkout}"
+            );
+        }
 
         let guest_status = &paths["/b/products/orders/{id}/status"]["get"];
         let guest_props = &guest_status["responses"]["200"]["content"]["application/json"]
@@ -1052,32 +1124,8 @@ mod discovery_tests {
         infos: &[BlockInfo],
         features: &dyn FeatureConfig,
     ) -> serde_json::Value {
-        use std::{collections::HashMap, time::Duration};
-
-        use wafer_block_crypto::primitives;
-
-        let secret = "test-jwt-secret";
-        let auth_header = roles.map(|roles| {
-            let derived = primitives::derive_block_key(
-                secret.as_bytes(),
-                crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
-            );
-            let mut claims = HashMap::new();
-            claims.insert("sub".to_string(), serde_json::json!("user-webmcp-1"));
-            claims.insert("type".to_string(), serde_json::json!("access"));
-            // Must match `expected_issuer`'s default
-            // (`crate::blocks::auth::helpers::expected_issuer`) — this
-            // test's `TestContext` has no `WAFER_RUN_SHARED__FRONTEND_URL`
-            // configured.
-            claims.insert(
-                "iss".to_string(),
-                serde_json::json!("http://localhost:5173"),
-            );
-            claims.insert("roles".to_string(), serde_json::json!(roles));
-            let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
-                .expect("test jwt_sign");
-            format!("Bearer {token}")
-        });
+        let secret = TEST_JWT_SECRET;
+        let auth_header = roles.map(bearer_for_roles);
 
         let mut msg = anon_msg("retrieve", "/b/webmcp/manifest.json");
         msg.set_meta("http.header.host", "impresspress.example.com");
@@ -1095,6 +1143,131 @@ mod discovery_tests {
         .await;
         let buf = collect_or_panic(out).await;
         serde_json::from_slice(&buf.body).expect("manifest response is valid JSON")
+    }
+
+    /// `/openapi.json` and the agent card were generated at step 0, before
+    /// auth, so every caller received the complete document — Admin paths
+    /// included. They now mirror the manifest: an endpoint the caller could
+    /// not invoke is not described to them. Two projections of one
+    /// declaration with different disclosure rules was the pattern behind
+    /// the `dedupe_hash` leak; this closes the discovery-side half.
+    #[tokio::test]
+    async fn openapi_omits_endpoints_above_the_callers_tier() {
+        let ctx = TestContext::new().await;
+        let host = "impresspress.example.com";
+
+        let anon = discovery_json_as(&ctx, "/openapi.json", host, None).await;
+        assert!(
+            !anon["paths"]["/b/products/storefront/config"].is_null(),
+            "Public endpoints are described to everyone: {}",
+            anon["paths"]
+        );
+        assert!(
+            anon["paths"]["/b/auth/api/me"].is_null(),
+            "an Authenticated endpoint must not be described to an anonymous caller: {}",
+            anon["paths"]
+        );
+        assert!(
+            anon["paths"]["/b/admin/api/users"].is_null(),
+            "an Admin endpoint must not be described to an anonymous caller: {}",
+            anon["paths"]
+        );
+
+        let user = discovery_json_as(&ctx, "/openapi.json", host, Some(&["user"])).await;
+        assert!(
+            !user["paths"]["/b/auth/api/me"].is_null(),
+            "an authenticated caller sees Authenticated endpoints: {}",
+            user["paths"]
+        );
+        assert!(
+            user["paths"]["/b/admin/api/users"].is_null(),
+            "an authenticated non-admin must not see Admin endpoints: {}",
+            user["paths"]
+        );
+    }
+
+    /// Placement regression. At step 0 `msg.user_id()` is empty, so a filter
+    /// there hands every caller the anonymous document — a valid document,
+    /// invisible to a smoke test. The same trap the manifest route has a
+    /// test for.
+    #[tokio::test]
+    async fn openapi_describes_admin_endpoints_to_an_admin() {
+        // A real bearer, resolved by step 2 — not pre-set meta, which a
+        // step-0 filter would also see. Needs the auth tables.
+        let ctx = TestContext::with_auth().await;
+        let bearer = bearer_for_roles(&["admin"]);
+        let mut msg = anon_msg("retrieve", "/openapi.json");
+        msg.set_meta("http.header.host", "impresspress.example.com");
+        let out = handle_request(
+            &ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            Some(&bearer),
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let admin: serde_json::Value = serde_json::from_slice(&collect_or_panic(out).await.body)
+            .expect("openapi response is valid JSON");
+        assert!(
+            !admin["paths"]["/b/admin/api/users"].is_null(),
+            "an admin must receive the Admin endpoints: {}",
+            admin["paths"]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_card_omits_skills_above_the_callers_tier() {
+        let ctx = TestContext::new().await;
+        let host = "impresspress.example.com";
+        fn skill_ids(card: &serde_json::Value) -> Vec<String> {
+            card["skills"]
+                .as_array()
+                .expect("agent card skills array")
+                .iter()
+                .map(|s| s["id"].as_str().expect("skill id").to_string())
+                .collect()
+        }
+
+        let anon = skill_ids(&discovery_json_as(&ctx, "/.well-known/agent.json", host, None).await);
+        assert!(
+            anon.iter().any(|id| id.contains("storefront")),
+            "Public skills are listed for everyone: {anon:?}"
+        );
+        assert!(
+            !anon.iter().any(|id| id.starts_with("impresspress/admin/")),
+            "an anonymous card must not list an Admin block's skills: {anon:?}"
+        );
+
+        let admin = skill_ids(
+            &discovery_json_as(&ctx, "/.well-known/agent.json", host, Some(&["admin"])).await,
+        );
+        assert!(
+            admin.iter().any(|id| id.starts_with("impresspress/admin/")),
+            "an admin's card lists the Admin block's skills: {admin:?}"
+        );
+    }
+
+    /// Per-caller by construction now, so a shared cache serving one
+    /// visitor's document to another would leak the privileged surface —
+    /// the same reasoning as the manifest's `no-store`.
+    #[tokio::test]
+    async fn discovery_documents_are_not_cacheable() {
+        let ctx = TestContext::new().await;
+        for path in ["/openapi.json", "/.well-known/agent.json"] {
+            let headers = discovery_headers(&ctx, path, "impresspress.example.com").await;
+            let cache_control = headers
+                .get("Cache-Control")
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                cache_control.contains("no-store"),
+                "{path} is per-caller and must not be cached, got: {cache_control:?}"
+            );
+        }
     }
 
     /// Every tool name in a manifest.

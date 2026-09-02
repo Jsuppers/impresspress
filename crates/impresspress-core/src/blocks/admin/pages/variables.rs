@@ -65,7 +65,13 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
                 }
                 div .form-group {
                     label .form-checkbox {
-                        input type="checkbox" name="sensitive" value="1";
+                        // Hidden first, checkbox second: `parse_form_body` keeps
+                        // the last value for a repeated key, so a checked box
+                        // posts `1` and an unchecked one still posts an explicit
+                        // `0` rather than nothing. Checked by default — masking
+                        // is the safe side to be wrong on.
+                        input type="hidden" name="sensitive" value="0";
+                        input type="checkbox" name="sensitive" value="1" checked;
                         " Sensitive (mask value in UI)"
                     }
                 }
@@ -489,7 +495,10 @@ pub async fn handle_create_variable(
     let key = body.get("key").map(|s| s.as_str()).unwrap_or("");
     let value = body.get("value").map(|s| s.as_str()).unwrap_or("");
     let description = body.get("description").map(|s| s.as_str());
-    let sensitive = body.get("sensitive").map(|s| s.as_str()).unwrap_or("0") == "1";
+    // Absent means sensitive, same as the JSON API. The modal always posts an
+    // explicit value (a hidden `0` that a checked box overrides with `1`), so
+    // "absent" here is a post that bypassed the form, and it fails safe.
+    let sensitive = body.get("sensitive").map(|s| s == "1").unwrap_or(true);
 
     // Key-required guard, URL/SSRF validation (the SSR path previously had
     // none), audit-log write, and the create live in the shared ops layer.
@@ -627,6 +636,104 @@ mod tests {
         assert!(
             s.contains(r#"aria-label="Edit WAFER_RUN_SHARED__APP_NAME""#),
             "edit button must expose an aria-label with the row key: {s}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod create_form_tests {
+    use wafer_block::db::{Filter, FilterOp};
+    use wafer_core::clients::database as db;
+    use wafer_run::InputStream;
+
+    use super::*;
+    use crate::{
+        blocks::admin::VARIABLES_TABLE,
+        test_support::{admin_msg, collect_or_panic, TestContext},
+    };
+
+    async fn admin_ctx() -> TestContext {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx
+    }
+
+    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> i64 {
+        let rows = db::list_all(
+            ctx,
+            VARIABLES_TABLE,
+            vec![Filter {
+                field: "key".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(key),
+            }],
+        )
+        .await
+        .expect("list variables");
+        rows.first()
+            .unwrap_or_else(|| panic!("{key} was not created"))
+            .i64_field("sensitive")
+    }
+
+    async fn post_form(ctx: &dyn Context, body: &str) {
+        let out = handle_create_variable(
+            ctx,
+            &admin_msg("create", "/admin/variables"),
+            InputStream::from_bytes(body.as_bytes().to_vec()),
+        )
+        .await;
+        collect_or_panic(out).await;
+    }
+
+    /// A form post that says nothing about sensitivity — a curl'd or
+    /// hand-built post, or a form that lost its checkbox — fails safe.
+    #[tokio::test]
+    async fn form_post_without_the_flag_defaults_to_sensitive() {
+        let ctx = admin_ctx().await;
+        post_form(&ctx, "key=SITE_MOTTO&value=move+fast").await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+    }
+
+    #[tokio::test]
+    async fn form_post_with_an_explicit_zero_is_not_sensitive() {
+        let ctx = admin_ctx().await;
+        post_form(&ctx, "key=SITE_MOTTO&value=move+fast&sensitive=0").await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 0);
+    }
+
+    /// The modal posts a hidden `sensitive=0` followed by the checkbox's
+    /// `sensitive=1` when checked; `parse_form_body` keeps the last value,
+    /// which is what makes "unchecked" an explicit answer rather than an
+    /// absence.
+    #[tokio::test]
+    async fn form_post_with_the_checkbox_checked_is_sensitive() {
+        let ctx = admin_ctx().await;
+        post_form(
+            &ctx,
+            "key=SITE_MOTTO&value=move+fast&sensitive=0&sensitive=1",
+        )
+        .await;
+        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+    }
+
+    /// The create modal is checked by default and always posts an explicit
+    /// value, so an admin who unchecks it is making a decision the server
+    /// can see, and one who does not is protected.
+    #[tokio::test]
+    async fn create_modal_posts_the_flag_explicitly_and_is_checked_by_default() {
+        let ctx = admin_ctx().await;
+        let html = settings_body(&ctx, &admin_msg("retrieve", "/admin/settings"))
+            .await
+            .into_string();
+        assert!(
+            html.contains(r#"type="hidden" name="sensitive" value="0""#),
+            "the modal must post an explicit 0 when the box is unchecked: {html}"
+        );
+        assert!(
+            html.contains(r#"type="checkbox" name="sensitive" value="1" checked"#),
+            "the modal's checkbox must be checked by default: {html}"
         );
     }
 }

@@ -427,3 +427,30 @@ fn objects_with_property<'a>(
     }
     out
 }
+
+/// The public submission form carries a honeypot field. It works because a
+/// bot that fills every field it can see fills that one too — which means it
+/// must not be a field the schema can see. `deny_unknown_fields` on the JSON
+/// contract forced it to be declared ("website — Must be left empty"),
+/// publishing the bypass to every schema-reading caller.
+#[tokio::test]
+async fn tickets_openapi_does_not_publish_the_honeypot() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    let request = &doc["paths"]["/b/tickets/api/submissions"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert!(
+        !request["properties"].is_null(),
+        "the public submission request must stay documented: {doc}"
+    );
+    assert!(
+        request["properties"]["website"].is_null(),
+        "the honeypot must not be a published property: {request}"
+    );
+    assert_ne!(
+        request["additionalProperties"],
+        serde_json::json!(false),
+        "unknown keys must be tolerated on this input or the honeypot cannot be read: {request}"
+    );
+}

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marrow &amp; Loom — demo storefront</title>
+<style>
+  :root { --ink:#172033; --muted:#617089; --line:#dbe3ee; --accent:#2563eb; --bg:#fbfcfe; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .shell { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+  header { border-bottom:1px solid var(--line); background:#fff; }
+  header .shell { display:flex; align-items:baseline; gap:16px; padding:20px 24px; }
+  header strong { font-size:17px; letter-spacing:-0.01em; }
+  header span { color:var(--muted); font-size:13px; }
+  header nav { margin-left:auto; }
+  header nav a { color:var(--accent); text-decoration:none; font-size:14px; }
+  h1 { font-size:30px; letter-spacing:-0.02em; margin:40px 0 8px; }
+  .lede { color:var(--muted); margin:0 0 32px; max-width:60ch; }
+  .grid { display:grid; gap:20px; grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+          padding-bottom:56px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:20px; }
+  .card h2 { font-size:17px; margin:0 0 6px; }
+  .card p { color:var(--muted); font-size:14px; margin:0 0 14px; }
+  .tag { display:inline-block; font-size:12px; color:var(--muted);
+         border:1px solid var(--line); border-radius:999px; padding:1px 9px; margin-bottom:10px; }
+  footer { border-top:1px solid var(--line); background:#fff; color:var(--muted);
+           font-size:13px; padding:20px 0; }
+  .empty { color:var(--muted); }
+</style>
+</head>
+<body>
+<header><div class="shell">
+  <strong>Marrow &amp; Loom</strong>
+  <span>demo storefront</span>
+  <nav><a href="/b/admin/">Admin</a></nav>
+</div></header>
+
+<main class="shell">
+  <h1>Everything we make</h1>
+  <p class="lede">
+    This page lists the catalog and mounts a configurator per product. Pricing and
+    checkout are owned by the server — the page only collects inputs.
+  </p>
+  <div class="grid" id="catalog"><p class="empty">Loading the catalog…</p></div>
+</main>
+
+<footer><div class="shell">Static page · server-owned pricing · WebMCP tools registered from this page</div></footer>
+
+<script src="/b/products/storefront.js" defer></script>
+<script>
+  // Same origin as impresspress, so no CORS to configure and the session
+  // cookie rides along — which is also what lets the admin link work.
+  fetch('/b/products/catalog', { credentials: 'same-origin' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (body) {
+      var grid = document.getElementById('catalog');
+      var rows = (body && body.records) || [];
+      if (!rows.length) {
+        grid.innerHTML = '<p class="empty">No products published yet.</p>';
+        return;
+      }
+      grid.innerHTML = '';
+      rows.forEach(function (p) {
+        var card = document.createElement('div');
+        card.className = 'card';
+        var tag = p.fulfillment_kind
+          ? '<span class="tag">' + p.fulfillment_kind + '</span>' : '';
+        card.innerHTML =
+          tag +
+          '<h2></h2><p></p>' +
+          '<impresspress-product product-id="' + p.id + '" presentation="hosted"></impresspress-product>';
+        card.querySelector('h2').textContent = p.name;
+        card.querySelector('p').textContent = p.description || '';
+        grid.appendChild(card);
+      });
+    })
+    .catch(function () {
+      document.getElementById('catalog').innerHTML =
+        '<p class="empty">Could not load the catalog.</p>';
+    });
+</script>
+</body>
+</html>
