@@ -137,6 +137,10 @@ export async function dbFlush() {
 // runtime: wasm-bindgen only ever needs to find `bridge.js` itself
 // (`#[wasm_bindgen(module = "/js/bridge.js")]` in `bridge.rs`), and these
 // functions live inside it.
+// Mirrored on the Rust side as `impresspress_core::blocks::dev::paths::
+// META_SUFFIX`, which refuses it in a dev-sandbox workspace path so a file
+// named after a sidecar can never reach `splitKey` below. Both sides carry
+// the other's name: change one and change the other.
 const META_SUFFIX = '.__meta__';
 
 // Reject path separators and control characters (including DEL); spaces
@@ -178,10 +182,12 @@ export function joinKey(dirs, leaf) {
     return [...dirs, leaf].join('/');
 }
 
+/** Sidecar name for `leaf`. The suffix is mirrored in Rust — see `META_SUFFIX`. */
 export function metaName(leaf) {
     return `${leaf}${META_SUFFIX}`;
 }
 
+/** Whether `name` is a sidecar. The suffix is mirrored in Rust — see `META_SUFFIX`. */
 export function isMetaName(name) {
     return name.endsWith(META_SUFFIX);
 }

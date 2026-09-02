@@ -231,13 +231,17 @@ impl Diagnostic {
 /// carry a route prefix built from a name the router could not serve.
 /// [`validate_static`] applies the same rule through this same function, so
 /// the two paths cannot describe the name differently.
+///
+/// The rule text itself is [`paths::BLOCK_NAME_RULE`], rendered rather than
+/// restated: this message and [`paths::PathError::BadBlockName`] are the two
+/// places the rule is spoken to an agent, and a second spelling is how the
+/// first one went stale.
 pub fn name_format_diagnostic(name: &str) -> Diagnostic {
     Diagnostic::error(
         NAME_FORMAT,
         format!(
-            "{name:?} is not a legal block name: it must match \
-             ^[a-z][a-z0-9_]{{1,31}}$ (a block name is also a directory \
-             segment and a crate name)"
+            "{name:?} is not a legal block name: {}",
+            paths::BLOCK_NAME_RULE
         ),
     )
 }

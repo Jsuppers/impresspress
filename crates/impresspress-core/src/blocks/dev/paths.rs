@@ -33,6 +33,17 @@ pub const MAX_SEGMENT_BYTES: usize = 255;
 /// Longest a whole workspace path may be, in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;
 
+/// Suffix the browser storage backend reserves for a file's metadata sidecar.
+///
+/// **Mirrored in `crates/impresspress-browser/js/bridge.js` as `META_SUFFIX`**
+/// (used by `metaName` / `isMetaName`, and refused by `splitKey`). OPFS stores
+/// no content type of its own, so the browser backend writes one beside every
+/// blob under `<leaf>.__meta__` and hides those names from `list`. A storage
+/// key that ends in it would name somebody's sidecar, so `splitKey` throws —
+/// and that throw arrives *after* `workspace.json` has been saved, which is
+/// why the suffix is refused here instead (see [`validate_path`]).
+pub const META_SUFFIX: &str = ".__meta__";
+
 /// The two halves of the workspace a valid path can land in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceArea {
@@ -58,6 +69,9 @@ pub enum PathError {
     OutsideWorkspace,
     /// The path was `blocks/<name>/…` but `<name>` is not a legal block name.
     BadBlockName(String),
+    /// A `/`-separated segment ended in [`META_SUFFIX`], which the browser
+    /// storage backend reserves for its own metadata sidecars.
+    MetadataSidecar(String),
 }
 
 impl std::fmt::Display for PathError {
@@ -74,10 +88,13 @@ impl std::fmt::Display for PathError {
             Self::OutsideWorkspace => {
                 write!(f, "path must name a file under `site/` or `blocks/<name>/`")
             }
-            Self::BadBlockName(name) => write!(
+            Self::BadBlockName(name) => {
+                write!(f, "block name {name:?} is not allowed: {BLOCK_NAME_RULE}")
+            }
+            Self::MetadataSidecar(segment) => write!(
                 f,
-                "block name {name:?} is not allowed: 2-32 characters, starting with a-z, \
-                 then a-z, 0-9 or _"
+                "path segment {segment:?} is not allowed: {META_SUFFIX:?} is reserved for the \
+                 storage backend's own metadata sidecars; rename the file"
             ),
         }
     }
@@ -96,6 +113,20 @@ impl std::fmt::Display for PathError {
 /// because rewriting would store the file somewhere other than the caller
 /// asked for. The same reasoning governs `wafer_block::wrap`'s
 /// `is_traversal_safe_path`, which refuses the same shape one layer down.
+///
+/// # The metadata sidecar
+///
+/// [`META_SUFFIX`] is refused on **every** segment, not merely the last one
+/// `bridge.js::splitKey` checks: a *directory* named `page.html.__meta__`
+/// lands in the same OPFS directory as the sidecar of a sibling file named
+/// `page.html`, so the two would fight over one name.
+///
+/// Refusing it here rather than leaving it to the storage backend is what
+/// makes the failure recoverable. A site path is only handed to `put` at
+/// publish time, by which point `workspace.json` has already been saved — so
+/// the `TypeError` `splitKey` throws would recur on *every* later site write,
+/// with nothing in the message to say that the fix is to delete a file
+/// written some time ago.
 pub fn validate_path(path: &str) -> Result<WorkspaceArea, PathError> {
     if path.is_empty() {
         return Err(PathError::Empty);
@@ -114,6 +145,9 @@ pub fn validate_path(path: &str) -> Result<WorkspaceArea, PathError> {
         {
             return Err(PathError::BadSegment((*segment).to_string()));
         }
+        if segment.ends_with(META_SUFFIX) {
+            return Err(PathError::MetadataSidecar((*segment).to_string()));
+        }
     }
     match segments.as_slice() {
         ["site", rest @ ..] if !rest.is_empty() => Ok(WorkspaceArea::Site),
@@ -126,6 +160,24 @@ pub fn validate_path(path: &str) -> Result<WorkspaceArea, PathError> {
         _ => Err(PathError::OutsideWorkspace),
     }
 }
+
+/// The rule [`block_name_is_valid`] enforces, in words — stated **once**.
+///
+/// Two agent-facing diagnostics render it: [`PathError::BadBlockName`] and
+/// [`super::validation::name_format_diagnostic`]. They are the only feedback
+/// an agent gets when a name is refused, so a stale copy does not merely
+/// mislead — it makes the retry loop non-self-correcting, because the agent
+/// picks its next name from what the message said was legal. Both messages
+/// therefore read the rule from here rather than restating it.
+///
+/// The underscore is absent from the alphabet on purpose, and the *reason* is
+/// on [`block_name_is_valid`] rather than in this string: a message the agent
+/// has to act on says what is allowed, not what is not.
+pub const BLOCK_NAME_RULE: &str = "it must match `^[a-z][a-z0-9-]{1,31}$` — 2 to 32 characters, \
+                                   a lowercase letter followed by lowercase letters, digits and \
+                                   hyphens, with no doubled hyphen and no trailing hyphen (a \
+                                   block name is also a directory segment, a crate name and half \
+                                   of a block id)";
 
 /// Whether `name` is a legal block name: `^[a-z][a-z0-9-]{1,31}$`.
 ///
@@ -333,6 +385,42 @@ mod tests {
         );
     }
 
+    /// A path naming a metadata sidecar is refused *here*, not by the storage
+    /// backend. `bridge.js::splitKey` throws on the same shape, but only at
+    /// publish time — after `workspace.json` has been saved, which wedges
+    /// every later site write on a `TypeError` from a JS bridge.
+    ///
+    /// Every segment is checked, not only the leaf: a directory named
+    /// `index.html.__meta__` collides with the sidecar of a sibling file
+    /// named `index.html`.
+    #[test]
+    fn metadata_sidecar_names_are_refused_on_every_segment() {
+        for (path, segment) in [
+            ("site/index.html.__meta__", "index.html.__meta__"),
+            ("site/.__meta__", ".__meta__"),
+            ("site/index.html.__meta__/a.css", "index.html.__meta__"),
+            ("blocks/hello/src/lib.rs.__meta__", "lib.rs.__meta__"),
+        ] {
+            assert_eq!(
+                validate_path(path),
+                Err(PathError::MetadataSidecar(segment.to_string())),
+                "{path} names a metadata sidecar"
+            );
+        }
+        // The message has to say what to do about it, and name the suffix.
+        let refusal = validate_path("site/index.html.__meta__")
+            .expect_err("refused")
+            .to_string();
+        assert!(refusal.contains(META_SUFFIX), "{refusal}");
+        assert!(refusal.contains("rename"), "{refusal}");
+        // A path that merely *contains* the suffix is fine — only the tail of
+        // a segment is what the backend reads as a sidecar.
+        assert_eq!(
+            validate_path("site/a.__meta__b.html"),
+            Ok(WorkspaceArea::Site)
+        );
+    }
+
     #[test]
     fn oversized_paths_and_segments_are_refused() {
         let long_segment = "a".repeat(MAX_SEGMENT_BYTES + 1);
@@ -435,6 +523,26 @@ mod tests {
         assert_eq!(
             validate_path("blocks/Bad Name/src/lib.rs"),
             Err(PathError::BadBlockName("Bad Name".to_string()))
+        );
+    }
+
+    /// The refusal an agent reads has to describe the alphabet that is
+    /// actually enforced. It once taught `_`, which wafer-run refuses in a
+    /// block id — so the retry failed for the same reason as the first try.
+    #[test]
+    fn the_block_name_refusal_teaches_the_rule_that_is_enforced() {
+        let refusal = validate_path("blocks/my_shop/src/lib.rs")
+            .expect_err("refused")
+            .to_string();
+        assert!(refusal.contains("my_shop"), "{refusal}");
+        assert!(refusal.contains(BLOCK_NAME_RULE), "{refusal}");
+        // The rule is rendered from one place, and that place names the
+        // hyphen and never offers the underscore.
+        assert!(BLOCK_NAME_RULE.contains("[a-z0-9-]"), "{BLOCK_NAME_RULE}");
+        assert!(BLOCK_NAME_RULE.contains("hyphen"), "{BLOCK_NAME_RULE}");
+        assert!(
+            !BLOCK_NAME_RULE.contains('_'),
+            "the rule must not offer an underscore: {BLOCK_NAME_RULE}"
         );
     }
 

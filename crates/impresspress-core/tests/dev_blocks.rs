@@ -637,6 +637,26 @@ async fn a_hyphenated_block_name_works_and_an_underscored_one_is_refused() {
     let r = stage(&ctx, "my_shop", b"\0asm-underscore").await;
     assert_eq!(r["success"], false, "{r}");
     assert!(codes(&r).contains(&"name-format"), "{r}");
+
+    // The diagnostic is the agent's only feedback channel, so it has to teach
+    // the alphabet that is actually enforced. Offering `_` — which it did
+    // until the rule text was moved to `paths::BLOCK_NAME_RULE` — makes the
+    // retry fail for exactly the same reason as the first try.
+    let message = r["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find(|d| d["code"] == "name-format")
+        .expect("a name-format diagnostic")["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(message.contains("[a-z0-9-]"), "{message}");
+    assert!(message.contains("hyphen"), "{message}");
+    assert!(
+        !message.contains("a-z0-9_"),
+        "the message must not teach the underscore alphabet: {message}"
+    );
 }
 
 #[tokio::test]
