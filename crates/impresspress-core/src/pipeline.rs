@@ -543,6 +543,7 @@ mod discovery_tests {
     use super::handle_request;
     use crate::{
         features::{AllEnabled, FeatureConfig},
+        routing,
         test_support::{
             anon_msg, bearer_for_roles, collect_or_panic, discovery_json, discovery_json_as,
             real_block_infos, TestContext, TEST_JWT_SECRET,
@@ -1354,14 +1355,22 @@ mod discovery_tests {
         // An unauthenticated request must see Public tools only. Anything
         // requiring a session is recon surface if its name is published
         // here. `list_my_purchases` is the shipped Authenticated tool;
-        // `admin_only_probe` (fixture) covers the Admin tier, which nothing
-        // shipped declares.
+        // `admin_only_probe` (fixture) is kept alongside the shipped admin
+        // tools so this still covers the Admin tier if admin's own surface
+        // ever goes away.
         let mut infos = real_block_infos();
         infos.push(admin_tool_block());
         let body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
         let names = tool_names(&body);
 
-        for forbidden in ["list_my_purchases", "admin_only_probe"] {
+        for forbidden in [
+            "list_my_purchases",
+            "admin_only_probe",
+            "list_users",
+            "list_roles",
+            "get_site_settings",
+            "list_audit_log",
+        ] {
             assert!(
                 !names.contains(&forbidden),
                 "anonymous manifest must not name the privileged tool {forbidden}: {names:?}"
@@ -1377,6 +1386,7 @@ mod discovery_tests {
 
         for expected in [
             "get_storefront_config",
+            "list_products",
             "get_product",
             "preview_price",
             "start_checkout",
@@ -1536,6 +1546,59 @@ mod discovery_tests {
         );
     }
 
+    /// `list_products` is the agent's entry point and the only anonymous
+    /// tool that returns a list of rows, so it is the one place an internal
+    /// products column would reach an unauthenticated agent in bulk.
+    ///
+    /// Before the catalog was projected through `CatalogProductView` this
+    /// endpoint echoed the stored row: `owner_id`, `created_by`,
+    /// `seller_account_id`, `owner_kind`, `stripe_product_id`,
+    /// `approval_status`, `submitted_at`, `current_version` and
+    /// `deleted_at` were all public. Annotating it as a tool is only safe
+    /// on top of that projection, and this pins the two together.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_list_products_to_the_public_catalog_view() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "list_products")
+            .unwrap_or_else(|| {
+                panic!("list_products must be published to an anonymous caller: {body}")
+            });
+
+        let published = property_names(&tool["outputSchema"]);
+        assert!(
+            published.contains(&"name".to_string()) && published.contains(&"slug".to_string()),
+            "the walk must reach the catalog row's properties: {published:?}"
+        );
+        assert!(
+            published.contains(&"id".to_string()),
+            "the tool's own description calls it the only way to discover a \
+             product id, so the id must be published: {published:?}"
+        );
+        for withheld in [
+            "owner_id",
+            "created_by",
+            "seller_account_id",
+            "owner_kind",
+            "stripe_product_id",
+            "approval_status",
+            "submitted_at",
+            "current_version",
+            "deleted_at",
+        ] {
+            assert!(
+                !published.contains(&withheld.to_string()),
+                "the public catalog tool must not publish the internal column \
+                 {withheld}: {published:?}"
+            );
+        }
+    }
+
     /// Every `properties` key anywhere under `schema`: the names a consumer
     /// of the schema can read, at any depth.
     fn property_names(schema: &serde_json::Value) -> Vec<String> {
@@ -1623,6 +1686,104 @@ mod discovery_tests {
             !user_names.contains(&"admin_only_probe"),
             "a logged-in non-admin must NOT receive Admin-level tools: {user_names:?}"
         );
+    }
+
+    /// No Admin-tier tool anywhere is a write.
+    ///
+    /// `admin/mod.rs` has its own copy of this over `AdminBlock`, which is
+    /// where an author annotating an admin endpoint will trip it. This one is
+    /// the backstop: the policy is about the Admin tier, not about one block,
+    /// so a POST tool declared under an admin-access route in any other block
+    /// has to fail somewhere too.
+    #[test]
+    fn no_admin_tier_tool_is_a_write() {
+        for block in real_block_infos() {
+            for ep in &block.endpoints {
+                if !ep.is_agent_tool() {
+                    continue;
+                }
+                if routing::effective_access(&block, ep, &[]) != AuthLevel::Admin {
+                    continue;
+                }
+                assert_eq!(
+                    ep.method,
+                    wafer_run::HttpMethod::Get,
+                    "{} {} is an Admin-tier agent tool and must be a read: a tool's \
+                     execute runs with the visitor's full ambient authority",
+                    block.name,
+                    ep.path
+                );
+            }
+        }
+    }
+
+    /// The same three-tier property as above, but against the tools the
+    /// admin block actually ships rather than the `admin_only_probe`
+    /// fixture.
+    ///
+    /// The design spec calls the Admin tier the thinnest coverage on the
+    /// impresspress side and the level where a filtering mistake is most
+    /// costly: these four tools read the site's user list, its roles, its
+    /// configuration and its audit trail. A fixture cannot catch an admin
+    /// endpoint that was mis-tiered in `admin/mod.rs` — only the real
+    /// `BlockInfo` can.
+    #[tokio::test]
+    async fn shipped_admin_tools_reach_only_admin_callers() {
+        const ADMIN_TOOLS: [&str; 4] = [
+            "list_users",
+            "list_roles",
+            "get_site_settings",
+            "list_audit_log",
+        ];
+
+        let ctx = TestContext::with_auth().await;
+        let infos = real_block_infos();
+
+        let admin_body = webmcp_manifest(&ctx, Some(&["admin"]), &infos, &AllEnabled).await;
+        let as_admin = tool_names(&admin_body);
+        for tool in ADMIN_TOOLS {
+            assert!(
+                as_admin.contains(&tool),
+                "an admin session must receive the shipped admin tool {tool}: {as_admin:?}"
+            );
+
+            // Presence of the name is not enough. The producer drops an
+            // `outputSchema` it cannot vouch for and still publishes the
+            // tool, so a refused schema is invisible to a name check: an
+            // agent gets a tool whose result it cannot interpret.
+            // `AdminSettingsResponse` was exactly this — a free-form map
+            // (`additionalProperties: true`) that the wall refused.
+            let published = admin_body["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .find(|t| t["name"] == tool)
+                .expect("just asserted present");
+            assert_eq!(
+                published["outputSchema"]["type"], "object",
+                "{tool} must publish an object outputSchema, not a dropped or \
+                 non-object one: {published}"
+            );
+        }
+
+        // The two discriminating halves. A logged-in non-admin and an
+        // anonymous visitor must both be told nothing about these names:
+        // publishing them is recon surface, and the manifest is the only
+        // place tool names are handed out.
+        let user_body = webmcp_manifest(&ctx, Some(&[]), &infos, &AllEnabled).await;
+        let anon_body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let as_user = tool_names(&user_body);
+        let as_anon = tool_names(&anon_body);
+        for tool in ADMIN_TOOLS {
+            assert!(
+                !as_user.contains(&tool),
+                "a logged-in non-admin must NOT receive the admin tool {tool}: {as_user:?}"
+            );
+            assert!(
+                !as_anon.contains(&tool),
+                "an anonymous visitor must NOT receive the admin tool {tool}: {as_anon:?}"
+            );
+        }
     }
 
     /// The manifest must not advertise tools from a block the admin

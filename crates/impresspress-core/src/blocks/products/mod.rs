@@ -1138,7 +1138,16 @@ crate::impresspress_feature_block! {
                     .description("Public list of active products, sorted by name.")
                     .query_params::<contracts::PageQuery>()
                     .output::<contracts::CatalogProductListResponse>()
-                    .tags(&["products"]),
+                    .tags(&["products"])
+                    .agent_tool(
+                        "list_products",
+                        "List what this store sells, a page at a time, sorted \
+                         by name. This is the only way to discover a \
+                         product id: call it first, then pass an id to \
+                         `get_product` for that product's offers and pricing \
+                         inputs. There is no search — page through the \
+                         results to find a product by name.",
+                    ),
                 BlockEndpoint::get("/b/products/catalog/{id}")
                     .summary("Product detail")
                     .path_params_schema(serde_json::json!({

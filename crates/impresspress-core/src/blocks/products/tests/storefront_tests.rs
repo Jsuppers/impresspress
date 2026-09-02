@@ -346,6 +346,12 @@ fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
         Some(&"/b/products/storefront/{product_id}")
     );
     assert_eq!(
+        named.get("list_products"),
+        Some(&"/b/products/catalog"),
+        "an agent that cannot list products cannot reach get_product: it has \
+         no other way to learn a product id"
+    );
+    assert_eq!(
         named.get("list_my_purchases"),
         Some(&"/b/products/purchases"),
         "at least one Authenticated-level tool must exist, or the manifest's \
@@ -356,6 +362,13 @@ fn storefront_endpoints_are_exposed_as_curated_agent_tools() {
         Some(&"/b/products/pricing/preview")
     );
     assert_eq!(named.get("start_checkout"), Some(&"/b/products/checkout"));
+    assert_eq!(
+        named.len(),
+        7,
+        "the products block's agent surface is exactly the six storefront \
+         tools plus list_products — an extra annotation here is reachable \
+         from any visitor's page: {named:?}"
+    );
     assert_eq!(
         named.get("get_order_status"),
         Some(&"/b/products/orders/{id}/status")

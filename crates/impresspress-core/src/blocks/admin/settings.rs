@@ -6,7 +6,7 @@ use wafer_run::{
 };
 
 use super::{
-    contracts::AdminSettingsResponse,
+    contracts::{AdminSettingView, AdminSettingsResponse},
     ops::{self, MASKED_VALUE},
 };
 use crate::{
@@ -168,15 +168,14 @@ async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
 async fn handle_list(ctx: &dyn Context) -> OutputStream {
     match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
         Ok(records) => {
-            // Convert to key-value map, masking sensitive values. `BTreeMap`
-            // rather than `HashMap`: the response is a public contract, and a
-            // randomized key order made two identical reads differ byte for
-            // byte.
-            let mut settings = BTreeMap::new();
+            // Collected into a `BTreeMap` first, then flattened: the
+            // response is a public contract, and a randomized key order made
+            // two identical reads differ byte for byte.
+            let mut by_key = BTreeMap::new();
             for record in &records {
                 let key = record.str_field("key");
-                let is_sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
-                let value = if is_sensitive {
+                let sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
+                let value = if sensitive {
                     serde_json::Value::String(MASKED_VALUE.to_string())
                 } else {
                     record
@@ -186,10 +185,19 @@ async fn handle_list(ctx: &dyn Context) -> OutputStream {
                         .unwrap_or(serde_json::Value::Null)
                 };
                 if !key.is_empty() {
-                    settings.insert(key.to_string(), value);
+                    by_key.insert(
+                        key.to_string(),
+                        AdminSettingView {
+                            key: key.to_string(),
+                            value,
+                            sensitive,
+                        },
+                    );
                 }
             }
-            ok_json(&AdminSettingsResponse(settings))
+            ok_json(&AdminSettingsResponse {
+                settings: by_key.into_values().collect(),
+            })
         }
         Err(e) => err_internal("Database error", e),
     }
@@ -575,11 +583,22 @@ mod tests {
         seed_var(&ctx, "BOOTSTRAP_ADMIN_PASSWORD", "hunter2", 1).await;
 
         let body = crate::test_support::output_json(handle_list(&ctx).await).await;
+        let by_key: std::collections::HashMap<&str, &serde_json::Value> = body["settings"]
+            .as_array()
+            .expect("settings is an array")
+            .iter()
+            .map(|entry| (entry["key"].as_str().expect("key is a string"), entry))
+            .collect();
 
         assert_eq!(
-            body["SITE_NAME"],
+            by_key["SITE_NAME"]["value"],
             serde_json::json!("Acme"),
             "a non-sensitive value must be published unchanged"
+        );
+        assert_eq!(
+            by_key["SITE_NAME"]["sensitive"],
+            serde_json::json!(false),
+            "a non-sensitive variable must say so"
         );
         for masked in [
             "STRIPE_SECRET",
@@ -587,9 +606,15 @@ mod tests {
             "BOOTSTRAP_ADMIN_PASSWORD",
         ] {
             assert_eq!(
-                body[masked],
+                by_key[masked]["value"],
                 serde_json::json!(MASKED_VALUE),
                 "{masked} must be masked"
+            );
+            assert_eq!(
+                by_key[masked]["sensitive"],
+                serde_json::json!(true),
+                "{masked} must be flagged sensitive, or a reader cannot tell \
+                 the mask from a literal value"
             );
         }
 
