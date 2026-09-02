@@ -738,4 +738,108 @@ mod tests {
             offenders.join("\n")
         );
     }
+
+    /// `pages_carry_no_static_inline_styles` above only sees a static
+    /// `style` attribute. Two other ways of hardcoding presentation are
+    /// invisible to it *by construction*, not merely by directory scope
+    /// (task 12e):
+    ///
+    /// 1. A page-local `const FOO_CSS: &str = "…"` rendered into an inline
+    ///    `<style>` block -- real CSS, but outside `ui/styles/` where no
+    ///    central audit sees it.
+    /// 2. A JS `.style.<prop>` assignment carrying a literal value (e.g.
+    ///    `row.style.cssText` or `el.style.display` set to a quoted
+    ///    constant) -- per-element hardcoded styling that evades the first
+    ///    guard because the attribute it scans for never appears; only a
+    ///    JS property access does.
+    ///
+    /// A *template-interpolated* `.style.` assignment (a Rust `format!`
+    /// value threaded into the JS, visible on the line as a `{…}`
+    /// placeholder) is the legitimate dynamic case and is deliberately
+    /// allowed -- e.g. a runtime-computed percentage or pixel offset.
+    ///
+    /// Deliberately a second, separately-scoped test rather than folded
+    /// into `pages_carry_no_static_inline_styles`: broadening that guard's
+    /// own pattern would immediately re-fail every file 12a-12d already
+    /// cleared, destroying the invariant that a cleared file stays clear.
+    #[test]
+    fn pages_carry_no_page_local_style_drift() {
+        let roots = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+        ];
+        let mut css_const_offenders = Vec::new();
+        let mut style_assignment_offenders = Vec::new();
+        for root in roots {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                // This file's own detection code below necessarily contains
+                // the patterns it searches for, in code form (not just the
+                // doc comments the `//` skip above handles) -- e.g. the
+                // literal `"_CSS:"` needle. Same shape as guard 1's
+                // `blocks/email.rs` exemption: a legitimate, load-bearing
+                // reason, not scope-narrowing.
+                .filter(|e| !e.path().ends_with("ui/mod.rs"))
+            {
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                for (n, line) in src.lines().enumerate() {
+                    let loc = || format!("{}:{}", entry.path().display(), n + 1);
+
+                    // Skip comments entirely for both vectors below (doc/
+                    // inline notes quoting the pattern aren't drift).
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+
+                    // Vector 1: `const SOMETHING_CSS: &str = …` outside
+                    // ui/styles/ (every file this test walks IS outside
+                    // ui/styles/, since that directory holds only .css
+                    // files, not .rs -- so any hit here is an offender).
+                    if line.contains("_CSS:") && line.contains("&str") {
+                        css_const_offenders.push(loc());
+                    }
+
+                    // Vector 2: a literal-value `.style.<prop> = …`
+                    // assignment.
+                    let mut search_from = 0;
+                    while let Some(rel) = line[search_from..].find(".style.") {
+                        let prop_start = search_from + rel + ".style.".len();
+                        let rest = &line[prop_start..];
+                        // Property name: identifier chars only.
+                        let prop_len =
+                            rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
+                        let after_prop = rest[prop_len..].trim_start();
+                        // An assignment is a single `=` not immediately
+                        // followed (or, since we trimmed whitespace-only
+                        // before it, preceded) by another `=` -- so `===`/
+                        // `==` (a comparison, e.g. `m.style.display ===
+                        // 'none'`) is excluded.
+                        if let Some(stripped) = after_prop.strip_prefix('=') {
+                            if !stripped.starts_with('=') {
+                                // Dynamic case: a Rust `format!` placeholder
+                                // threaded into this JS on the same line.
+                                if !stripped.contains('{') {
+                                    style_assignment_offenders.push(loc());
+                                }
+                            }
+                        }
+                        search_from = prop_start + prop_len;
+                    }
+                }
+            }
+        }
+        // Both asserted together (rather than the first short-circuiting
+        // before the second runs) so a single failing run always reports
+        // the full picture of both vectors.
+        assert!(
+            css_const_offenders.is_empty() && style_assignment_offenders.is_empty(),
+            "page-local *_CSS stylesheet constants remain (migrate into ui/styles/components/*.css):\n{}\n\
+             literal-value `.style.` JS assignments remain (convert to a class or the `hidden` IDL property):\n{}",
+            css_const_offenders.join("\n"),
+            style_assignment_offenders.join("\n"),
+        );
+    }
 }
