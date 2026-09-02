@@ -33,13 +33,18 @@ const IMPRESSPRESS_CSP: &str = concat!(
 /// `options` is the object `sw.js` passes: `{ dev: <bool> }`, rendered from
 /// the bundle's `__DEV_ENABLED__` placeholder. A missing or non-boolean `dev`
 /// reads as `false` — the sandbox is never enabled by an unparseable value.
+///
+/// The flag is a *request*. On a build without `browser-devtools` it resolves
+/// to inactive (see `runtime_factory::resolve_dev_active`), and `{ dev: true }`
+/// is then a no-op apart from the single console warning below: same seeded
+/// variables, same CSP, same routes as `{ dev: false }`.
 #[wasm_bindgen]
 pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     if impresspress_browser::is_initialized() {
         return Ok(());
     }
 
-    let dev_enabled = js_sys::Reflect::get(&options, &JsValue::from_str("dev"))
+    let dev_requested = js_sys::Reflect::get(&options, &JsValue::from_str("dev"))
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -50,7 +55,7 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     // off" and "the sandbox is missing", so say so once rather than leaving an
     // operator to wonder why `/b/dev` 404s.
     #[cfg(not(feature = "browser-devtools"))]
-    if dev_enabled {
+    if dev_requested {
         web_sys::console::warn_1(
             &"impresspress: initialize({ dev: true }) on a build without the \
               `browser-devtools` feature — the sandbox is not compiled in and \
@@ -61,8 +66,10 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
 
     impresspress_browser::db_init().await?;
 
-    let factory =
-        RuntimeFactory::new(RuntimeOptions { dev_enabled }).map_err(|e| JsValue::from_str(&e))?;
+    let factory = RuntimeFactory::new(RuntimeOptions {
+        dev_enabled: dev_requested,
+    })
+    .map_err(|e| JsValue::from_str(&e))?;
     let (wafer, _storage_block) = factory.build(&[]).await?;
 
     web_sys::console::log_1(&"impresspress: WAFER runtime started".into());
@@ -101,13 +108,13 @@ struct BrowserBootHooks {
     crypto: Arc<impresspress_browser::crypto::BrowserCryptoService>,
     /// Whether this bundle was booted with the development sandbox requested.
     /// Seeds the sandbox's own variables — see `config::seed_and_load_variables`.
-    dev_enabled: bool,
+    dev_active: bool,
 }
 
 #[wafer_block::wafer_async_trait]
 impl builder::BootHooks for BrowserBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
-        let vars = config::seed_and_load_variables(&self.db, self.dev_enabled).await?;
+        let vars = config::seed_and_load_variables(&self.db, self.dev_active).await?;
         web_sys::console::log_1(
             &format!(
                 "impresspress: {} variables loaded from database",

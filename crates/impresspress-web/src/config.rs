@@ -29,9 +29,15 @@ pub const DEV_ENABLED_KEY: &str = "IMPRESSPRESS_DEV_ENABLED";
 /// and return the full variable map. Browser-equivalent of the native
 /// `seed_and_load_variables()` — there are no process env vars in the browser,
 /// only the local defaults below plus auto-generated secrets.
+/// `dev_active` is the *resolved* verdict from
+/// [`crate::runtime_factory::resolve_dev_active`], never the raw
+/// `initialize({ dev })` request: on a build without `browser-devtools` the
+/// sandbox does not exist, so neither of the two variables below may be
+/// seeded — a feature-off boot must leave a database indistinguishable from
+/// one that never asked for a sandbox.
 pub async fn seed_and_load_variables(
     db: &Arc<dyn DatabaseService>,
-    dev_enabled: bool,
+    dev_active: bool,
 ) -> Result<HashMap<String, String>, String> {
     // Browser-only defaults. These are not declared `ConfigVar`s (so the
     // auto-gen pass won't seed them) and there's no env to source them from —
@@ -67,7 +73,7 @@ pub async fn seed_and_load_variables(
     )
     .await?;
 
-    if dev_enabled {
+    if dev_active {
         // The sandbox owns `/` — an editable site is the point of it — so the
         // router must serve `wafer-run/web` there instead of bouncing
         // anonymous visitors to the login page.

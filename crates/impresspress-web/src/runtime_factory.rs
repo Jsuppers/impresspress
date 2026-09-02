@@ -46,17 +46,62 @@ pub enum DynamicBlock {}
 
 /// Build-time policy that is fixed for the life of the service worker.
 pub struct RuntimeOptions {
-    /// `initialize({ dev: … })` — whether this bundle was booted with the
-    /// browser development sandbox requested. Drives the seeded variables and
-    /// the sandbox CSP relaxations regardless of whether the control plane is
-    /// actually installed, so an activation (Task 9) never has to rewrite
-    /// response headers on a live runtime.
+    /// `initialize({ dev: … })` — what the *bundle asked for*. This is a
+    /// request, not a verdict: [`RuntimeFactory::new`] runs it through
+    /// [`resolve_dev_active`] and keeps only the result, because a bundle can
+    /// ask for a sandbox that was never compiled in.
     pub dev_enabled: bool,
 }
 
+/// Whether the development sandbox is *actually* active.
+///
+/// `feature_compiled` is `cfg!(feature = "browser-devtools")`; `requested` is
+/// the `dev` flag from `initialize({ dev: … })`.
+///
+/// The rule is AND, not OR, and that is the whole security model: with the
+/// feature off the sandbox is **absent**, not merely disabled, so a build
+/// without it must produce a runtime that is indistinguishable from one that
+/// was never asked for a sandbox — no seeded variables, no widened CSP,
+/// nothing but the one console warning `initialize()` emits. "Feature off =
+/// nothing" is not an optimisation; a relaxed `worker-src`/`frame-src` on a
+/// build with no sandbox to use them is pure attack surface.
+///
+/// Taken as parameters rather than read from `cfg!` inside, so the rule is one
+/// pure expression stated once instead of a `cfg!` repeated at each site that
+/// consumes it — every consumer reads [`RuntimeFactory::dev_active`], and the
+/// raw request is deliberately not stored on the factory at all.
+pub const fn resolve_dev_active(feature_compiled: bool, requested: bool) -> bool {
+    feature_compiled && requested
+}
+
+// The rule, checked by rustc in the configuration actually being built rather
+// than by a unit test passing hand-written booleans. `impresspress-web` does
+// not compile for the host at all (every module reaches into
+// `impresspress_browser`'s `#[cfg(target_arch = "wasm32")]` items), so a
+// `#[test]` here would never execute; these `const` assertions do, on every
+// `cargo check --target wasm32-unknown-unknown` in both configurations and in
+// CI's wasm build. That is also the stronger check: it exercises the real
+// `cfg!(feature = …)` wiring below, which a parameterised unit test cannot.
+const _: () = assert!(!resolve_dev_active(
+    cfg!(feature = "browser-devtools"),
+    false
+));
+#[cfg(not(feature = "browser-devtools"))]
+const _: () = assert!(!resolve_dev_active(
+    cfg!(feature = "browser-devtools"),
+    true
+));
+#[cfg(feature = "browser-devtools")]
+const _: () = assert!(resolve_dev_active(cfg!(feature = "browser-devtools"), true));
+
 /// The browser platform services plus the policy every runtime is built under.
 pub struct RuntimeFactory {
-    pub(crate) options: RuntimeOptions,
+    /// The resolved verdict from [`resolve_dev_active`], computed once in
+    /// [`RuntimeFactory::new`]. The raw `initialize({ dev })` request is
+    /// intentionally *not* retained: keeping only the resolved value is what
+    /// makes it impossible for a later consumer to key on "the bundle asked
+    /// for it" on a build where the sandbox does not exist.
+    pub(crate) dev_active: bool,
     pub(crate) config_svc: Arc<dyn ConfigService>,
     /// Held as the concrete type (not `Arc<dyn CryptoService>`) so
     /// [`crate::BrowserBootHooks`] can rotate the JWT secret through
@@ -76,6 +121,9 @@ impl RuntimeFactory {
     /// Construct the browser services once.
     /// `BrowserEmbeddingService::new` is the only fallible one.
     pub fn new(options: RuntimeOptions) -> Result<Self, String> {
+        let dev_active =
+            resolve_dev_active(cfg!(feature = "browser-devtools"), options.dev_enabled);
+
         let config_svc: Arc<dyn ConfigService> =
             Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());
 
@@ -95,11 +143,20 @@ impl RuntimeFactory {
             Arc::new(impresspress_browser::image::BrowserImageService::new());
         let vector: Arc<dyn VectorService> =
             Arc::new(impresspress_browser::vector::BrowserVectorService::new());
+        // Logged as well as returned: this is the one fallible service, the
+        // error surfaces to JS as an opaque `initialize()` rejection, and the
+        // console line is what tells an operator *which* service failed.
         let embedding: Arc<dyn EmbeddingService> =
-            Arc::new(impresspress_browser::vector::BrowserEmbeddingService::new()?);
+            match impresspress_browser::vector::BrowserEmbeddingService::new() {
+                Ok(svc) => Arc::new(svc),
+                Err(e) => {
+                    web_sys::console::error_1(&format!("BrowserEmbeddingService init: {e}").into());
+                    return Err(e);
+                }
+            };
 
         Ok(Self {
-            options,
+            dev_active,
             config_svc,
             crypto,
             llm,
@@ -278,7 +335,7 @@ impl RuntimeFactory {
             block_settings_handle,
             jwt_secret_handle,
             crypto: self.crypto.clone(),
-            dev_enabled: self.options.dev_enabled,
+            dev_active: self.dev_active,
         };
         builder::boot(&mut wafer, &storage_block, &hooks)
             .await
@@ -289,14 +346,15 @@ impl RuntimeFactory {
 
     /// The `Content-Security-Policy` every response is served under.
     ///
-    /// Keyed off `dev_enabled` rather than `dev.is_some()`: the policy is
+    /// Keyed off `dev_active` rather than `dev.is_some()`: the policy is
     /// resolved once per runtime build, and a sandbox activation must not have
     /// to widen headers on a runtime that is already answering requests. A
-    /// bundle that was never booted with `{ dev: true }` therefore carries the
-    /// unrelaxed policy, which is what the feature-off smoke asserts.
+    /// bundle that was never booted with `{ dev: true }` — or that was, on a
+    /// build without `browser-devtools` — therefore carries the unrelaxed
+    /// policy, which is what the feature-off smoke asserts.
     fn csp(&self) -> String {
         let mut csp = crate::IMPRESSPRESS_CSP.to_string();
-        if self.options.dev_enabled {
+        if self.dev_active {
             // The compiler worker (a same-origin module worker that spawns
             // blob-URL subordinate workers) and the live-site preview iframe
             // on `/b/dev`.
