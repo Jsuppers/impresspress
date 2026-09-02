@@ -189,6 +189,14 @@ pub fn favicon_url() -> String {
 }
 
 /// The assembled CSS bundle, built by `build.rs` from `CSS_ORDER`.
+///
+/// Gated on `embed-assets` like [`bytes`]: without it, this `include_str!`
+/// would still compile the ~75 KB bundle into every binary that links this
+/// crate (including a lean Cloudflare Worker), relying on the linker to
+/// notice nothing calls it and garbage-collect it -- "very likely" GC'd is
+/// exactly the gap a `#[cfg]` closes outright. See `bytes`'s doc for why
+/// `embed-assets` is the feature that governs asset bytes at all.
+#[cfg(feature = "embed-assets")]
 pub fn css() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/app.css"))
 }
@@ -473,6 +481,7 @@ mod tests {
         assert!(js.contains("addEventListener(\"click\""));
     }
 
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn brand_accent_matches_tokens_css() {
         // BRAND_ACCENT_HEX exists for CSS-var-less surfaces (emails). It must
@@ -496,6 +505,7 @@ mod tests {
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn tokens_include_new_scale() {
         let s = super::css();
@@ -542,6 +552,7 @@ mod tests {
             "if this now passes, the sidebar-specific token may be redundant");
     }
 
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn tokens_css_declares_the_new_palette() {
         let s = super::css();
@@ -558,6 +569,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn ui_font_stack_is_system_and_itim_is_wordmark_only() {
         let s = super::css();
@@ -912,6 +924,12 @@ mod tests {
     /// gradients -- none currently appear on a `color:`/`background:` in
     /// this bundle, checked by grep) -- such a rule is skipped rather than
     /// assumed compliant, not silently passed.
+    // Depends on `css()`, so it needs the same `embed-assets` gate as every
+    // other CSS-content test in this module -- a no-embed build has no CSS
+    // bytes to check contrast on. This does not weaken the guard: whenever
+    // it IS compiled (default features, and every CI/local run that
+    // exercises the CSS bundle), it still runs and must still pass.
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn text_or_background_in_primary_danger_family_meets_wcag_aa() {
         const PRIMARY_DANGER_FAMILY_TOKENS: &[&str] = &[
@@ -1137,6 +1155,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn css_bundle_includes_all_layers_in_order() {
         let s = super::css();
@@ -1212,6 +1231,39 @@ mod tests {
         }
     }
 
+    /// The "no-embed build" case the branch's spec called for and never got:
+    /// assert the asset bytes are genuinely absent when `embed-assets` is
+    /// off, not merely unreferenced-and-hopefully-linker-stripped.
+    ///
+    /// The strongest form of that guarantee is structural, not a runtime
+    /// assertion: [`bytes`] and [`css`] are themselves `#[cfg(feature =
+    /// "embed-assets")]`-gated (as of this fix), so under this cfg neither
+    /// function -- nor the `include_bytes!`/`include_str!` literals inside
+    /// them -- exists in the compiled crate at all; the compiler enforces
+    /// it, the linker never has to. This test (only compiled under the
+    /// opposite cfg from `embedded_bytes_agree_with_the_manifest` above)
+    /// documents and exercises the other half of that contract: the
+    /// manifest-driven URL surface -- what a lean build actually needs to
+    /// keep working, e.g. to point at R2 or the CDN -- has no dependency on
+    /// embedded bytes and still resolves every asset to a valid
+    /// content-hashed URL.
+    #[cfg(not(feature = "embed-assets"))]
+    #[test]
+    fn no_embed_build_has_no_asset_bytes_only_the_manifest() {
+        assert!(!cfg!(feature = "embed-assets"));
+        assert!(!super::ASSETS.is_empty(), "build.rs still populates the manifest without embed-assets");
+        for e in super::ASSETS {
+            // The filename carries its own content hash (baked in by
+            // build.rs from the source file's bytes, at *build* time -- this
+            // does not require `embed-assets`, which only controls whether
+            // those bytes are additionally compiled into the *runtime*
+            // binary). `url()` must still resolve it correctly.
+            let u = super::url(e.logical);
+            assert!(u.ends_with(e.filename), "{}: url {u} does not end in its own filename", e.logical);
+        }
+    }
+
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn manifest_font_names_appear_in_css_bundle_as_relative_urls() {
         let css = super::css();
