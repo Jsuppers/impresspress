@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "e2e": "playwright test --config=tests/playwright.config.ts"
+    "e2e": "playwright test --config=tests/playwright.config.ts",
+    "e2e:dev": "playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.40.0"

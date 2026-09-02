@@ -766,7 +766,8 @@ async fn seed_on_boot(ctx: &dyn Context, shared: &Arc<DevShared>) -> Result<(), 
         Err(e) => {
             web_sys::console::info_1(
                 &format!(
-                    "impresspress: {} did not parse as a seed manifest ({e}) — booting with no                      seed",
+                    "impresspress: {} did not parse as a seed manifest ({e}) — booting with \
+                     no seed",
                     seed::MANIFEST_URL
                 )
                 .into(),
