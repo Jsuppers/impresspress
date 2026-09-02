@@ -1751,6 +1751,25 @@ The guard test is added once, in **12a**, where it first fails. It stays failing
 | **12b** | `blocks/llm/pages.rs` (44), `blocks/llm/ui.rs` (21), `blocks/messages/pages.rs` (30), `blocks/legalpages/pages.rs` (23) | 118 |
 | **12c** | `blocks/admin/pages/{permissions,blocks,variables,network}.rs` (64), `blocks/userportal/pages/{admin_buttons,profile,security}.rs` (32), `blocks/auth_ui/**` (23), `blocks/tickets/pages.rs` (26), `blocks/vector/pages_ui.rs` (4), plus any remaining stragglers the guard reports | ~156 |
 | **12d** | `ui/settings_form.rs` (28) + the template design pass in Step 4 | 28 + templates |
+| **12e** | The two drift vectors the guard cannot see — see below | ~90 lines + 3 sites |
+
+### Task 12e: the drift the guard is blind to
+
+**Added during 12a**, after its implementer flagged one vector and its reviewer found a second. The `style="…"` guard is an *attribute* check, so two other ways of hardcoding presentation are invisible to it **by construction**, not merely by directory scope:
+
+1. **Page-local `<style>` blocks.** `blocks/products/pages.rs` defines `PRODUCTS_UI_CSS` (a ~90-line `&str` const at line 123) and injects it via `html! { style { … } }` at line 212. It is real CSS with selectors and tokens — better than per-element hardcoding — but it lives outside `ui/styles/`, so no central audit sees it.
+2. **JS-assigned static inline styles.** Three sites in the same file do `row.style.cssText='display:flex;…;border-bottom:1px solid var(--border-color)'` (`pages.rs:2110, 2118, 2124`). These are per-element hardcoded styling, exactly what the guard exists to prevent, and they evade it because the substring is `style.cssText=`, not `style=`.
+
+**Do not fix this by broadening the existing guard.** Retrofitting it to also match `<style>` blocks or `.style.cssText=` would immediately turn `products/pages.rs` red again despite 12a being complete and correct against its brief. The invariant that *a file the guard has cleared stays clear* is what lets 12b, 12c and 12d work independently off a shrinking worklist.
+
+Instead add a **second, separately-scoped guard**, and run this task **after 12d**, when the first guard is green:
+
+- Assert no `*_CSS: &str` constant (or equivalent page-local stylesheet const) exists outside `ui/styles/`.
+- Assert no `.style.` JS assignment carries a *literal* value — a template-interpolated one is the dynamic case and is legitimate.
+
+Then migrate `PRODUCTS_UI_CSS` into the appropriate `ui/styles/components/*.css` files, and convert the three `cssText` sites to classes.
+
+**One cascade detail to preserve:** `PRODUCTS_UI_CSS` renders as an inline `<style>` inside `<body>`, later in document order than the linked stylesheet, so its rules currently win ties against same-specificity utilities. 12a already had to work around this once with a compound `.products-advanced.mt-0` selector (0,2,0). Moving those rules into the linked stylesheet changes that ordering — check every rule that relied on it, and remove the compound-selector workaround once it is no longer needed.
 
 Within each sub-task, commit per file so a regression bisects to a single page:
 
