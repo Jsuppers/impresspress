@@ -235,6 +235,10 @@
 	height: 48px; width: auto;
 	margin: 0 auto 1rem auto; display: block;
 }
+/* Icon + app-name lockup on auth cards. 64px = the 64-cell pixel-art mark at 1:1. */
+.login-brand { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+.login-brand__icon { width: 64px; height: 64px; display: block; }
+.login-brand .login-app-name { margin-bottom: 0; }
 
 .login-app-name {
 	font-size: 1.5rem; font-weight: 700; display: block; margin-bottom: 0.5rem;
@@ -513,7 +517,9 @@
 	padding: 0 var(--spacing-md);
 	min-width: 0;
 }
-.sidebar__brand-icon { display: none; height: 40px; width: 40px; object-fit: contain; flex-shrink: 0; }
+.sidebar__brand-icon { display: none; height: 32px; width: 32px; object-fit: contain; flex-shrink: 0; }
+/* Icon + app-name lockup (no wordmark image): the icon shows when expanded too. */
+.sidebar__brand--text .sidebar__brand-icon { display: block; }
 .sidebar__brand-wordmark { max-width: 100%; height: 48px; width: auto; object-fit: contain; display: block; }
 .sidebar__brand-name { font-size: var(--text-lg); font-weight: 600; color: var(--text-primary); }
 

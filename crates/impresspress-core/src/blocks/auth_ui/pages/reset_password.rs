@@ -47,9 +47,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             html! {
                 div .login-container {
                     div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(config.app_name);
-                        }
+                        (crate::ui::templates::brand_lockup(&logo_url, &config.logo_icon_url, &config.app_name))
                         p .login-subtitle { "Reset your password" }
                     }
 
@@ -126,9 +124,7 @@ fn html_respond(
             html! {
                 div .login-container {
                     div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(config.app_name);
-                        }
+                        (crate::ui::templates::brand_lockup(logo_url, &config.logo_icon_url, &config.app_name))
                     }
                     div style="text-align:center" {
                         div style={"width:48px;height:48px;background:" (color) "15;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:" (color)} {

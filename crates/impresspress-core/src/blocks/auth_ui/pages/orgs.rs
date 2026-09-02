@@ -33,6 +33,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         ui::templates::account_card_page(
             ui::templates::AccountCard {
                 logo_url: &config.logo_url,
+                logo_icon_url: &config.logo_icon_url,
+                app_name: &config.app_name,
                 title: "Organizations",
                 back_href: Some("/b/userportal/"),
             },

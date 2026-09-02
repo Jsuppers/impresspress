@@ -24,8 +24,8 @@ crate::impresspress_feature_block! {
             BlockEndpoint::get("/b/static/webmcp-{hash}.js").summary("Embedded WebMCP registration JS"),
             BlockEndpoint::get("/b/static/itim-latin-{hash}.woff2").summary("Embedded Itim font (latin)"),
             BlockEndpoint::get("/b/static/itim-latin-ext-{hash}.woff2").summary("Embedded Itim font (latin-ext)"),
-            BlockEndpoint::get("/b/static/impresspress-logo-{hash}.png").summary("Embedded Impresspress square logo"),
-            BlockEndpoint::get("/b/static/impresspress-logo-long-{hash}.png").summary("Embedded Impresspress wordmark logo"),
+            BlockEndpoint::get("/b/static/impresspress-logo-{hash}.png").summary("Embedded Impresspress square logo (32px pixel art)"),
+            BlockEndpoint::get("/b/static/impresspress-logo-2x-{hash}.png").summary("Embedded Impresspress square logo at 2x (64px)"),
             BlockEndpoint::get("/b/static/favicon-{hash}.ico").summary("Embedded Impresspress favicon"),
         ];
         #[cfg(feature = "block-llm")]
@@ -100,10 +100,10 @@ crate::impresspress_feature_block! {
             ("/b/static/itim-latin-", ".woff2", "font/woff2", || {
                 ui::assets::itim_latin_woff2()
             }),
-            // `impresspress-logo-long-` must come before `impresspress-logo-` so the
+            // `impresspress-logo-2x-` must come before `impresspress-logo-` so the
             // longer prefix wins (same pattern as `itim-latin-ext-` above).
-            ("/b/static/impresspress-logo-long-", ".png", "image/png", || {
-                ui::assets::logo_long_png()
+            ("/b/static/impresspress-logo-2x-", ".png", "image/png", || {
+                ui::assets::logo_icon_2x_png()
             }),
             ("/b/static/impresspress-logo-", ".png", "image/png", || {
                 ui::assets::logo_icon_png()

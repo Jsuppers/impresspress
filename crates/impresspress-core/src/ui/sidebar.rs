@@ -65,9 +65,12 @@ pub fn sidebar_grouped(
 
     html! {
         nav .sidebar aria-label="Primary" {
-            div .sidebar__brand {
+            // No wordmark image (the default) => icon + app name as text, and
+            // the icon stays visible when expanded (`--text`). A configured
+            // wordmark keeps the old layout: wordmark expanded, icon collapsed.
+            div .sidebar__brand .sidebar__brand--text[logo_url.is_empty()] {
                 @if !logo_icon_url.is_empty() {
-                    img src=(logo_icon_url) alt="" .sidebar__brand-icon;
+                    (crate::ui::templates::brand_icon(logo_icon_url, "sidebar__brand-icon", 32))
                 }
                 @if !logo_url.is_empty() {
                     img src=(logo_url) alt=(app_name) .sidebar__brand-wordmark;
@@ -212,6 +215,68 @@ mod tests {
         assert!(s.contains(">Data<"));
         assert!(s.contains("/b/admin/users"));
         assert!(s.contains(r#"aria-current="page""#));
+    }
+
+    /// Default branding: no wordmark image, so the brand row is the built-in
+    /// pixel-art icon next to the app name. The icon is a `<picture>`: the
+    /// 32-cell file by default and the 64-cell file from 1.5dppx up, chosen
+    /// by a media query (deterministic — `srcset` width descriptors let the
+    /// browser pick an already-cached larger candidate, which then gets
+    /// nearest-neighbour *down*scaled). `.pixel-art` keeps art-pixels square.
+    #[test]
+    fn brand_without_wordmark_renders_pixel_art_icon_and_app_name() {
+        let s = sidebar_grouped(
+            &[],
+            None,
+            "/",
+            "",
+            crate::ui::assets::logo_icon_url(),
+            "Impresspress",
+        )
+        .into_string();
+        assert!(s.contains("sidebar__brand--text"), "{s}");
+        assert!(
+            s.contains(&format!(
+                r#"<picture><source media="(min-resolution: 1.5dppx)" srcset="{}"><img class="sidebar__brand-icon pixel-art" src="{}" width="32" height="32" alt=""></picture>"#,
+                crate::ui::assets::logo_icon_2x_url(),
+                crate::ui::assets::logo_icon_url()
+            )),
+            "{s}"
+        );
+        assert!(!s.contains("sizes="), "{s}");
+        assert!(
+            s.contains(r#"<span class="sidebar__brand-name">Impresspress</span>"#),
+            "{s}"
+        );
+    }
+
+    /// A white-labelled icon URL is a smooth logo we know nothing about:
+    /// no nearest-neighbour class, no built-in srcset.
+    #[test]
+    fn custom_icon_url_gets_no_pixel_art_treatment() {
+        let s =
+            sidebar_grouped(&[], None, "/", "", "https://acme.test/mark.png", "Acme").into_string();
+        assert!(s.contains(r#"src="https://acme.test/mark.png""#), "{s}");
+        assert!(!s.contains("pixel-art"), "{s}");
+        assert!(!s.contains("<picture>"), "{s}");
+    }
+
+    /// A configured wordmark keeps the pre-existing layout: wordmark image,
+    /// icon only when collapsed, no text lockup.
+    #[test]
+    fn wordmark_replaces_the_text_lockup() {
+        let s = sidebar_grouped(
+            &[],
+            None,
+            "/",
+            "https://acme.test/wordmark.png",
+            crate::ui::assets::logo_icon_url(),
+            "Acme",
+        )
+        .into_string();
+        assert!(s.contains("sidebar__brand-wordmark"), "{s}");
+        assert!(!s.contains("sidebar__brand--text"), "{s}");
+        assert!(!s.contains("sidebar__brand-name"), "{s}");
     }
 
     #[test]

@@ -25,3 +25,13 @@ input, textarea, select, [contenteditable="true"] {
 	outline: 2px solid var(--primary-color);
 	outline-offset: 2px;
 }
+
+/* Pixel-art images (the built-in brand mark): scale by nearest-neighbour so
+   the art-pixels stay square. Only applied to art we know is pixel art —
+   never to a white-labelled logo URL. Declared last so `pixelated` wins in
+   browsers that also understand `crisp-edges`. */
+.pixel-art {
+	image-rendering: -webkit-optimize-contrast;
+	image-rendering: crisp-edges;
+	image-rendering: pixelated;
+}

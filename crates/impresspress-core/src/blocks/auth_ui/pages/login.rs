@@ -71,11 +71,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             html! {
                 div .login-container {
                     div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        } @else {
-                            span .login-app-name { (app_name) }
-                        }
+                        (crate::ui::templates::brand_lockup(logo_url, &config.logo_icon_url, app_name))
                         p .login-subtitle { "Sign in to " (app_name) }
                     }
 
@@ -158,6 +154,36 @@ mod tests {
             msg.set_meta(format!("req.query.{k}"), *v);
         }
         msg
+    }
+
+    /// Default branding on the sign-in card: the built-in pixel-art icon at
+    /// 64px — the 64-cell rendition at 1:1, served as a plain `<img>` (no
+    /// `srcset`, nothing for the browser to second-guess) — above the app
+    /// name as text. No raster wordmark.
+    #[tokio::test]
+    async fn default_branding_is_pixel_art_icon_plus_app_name() {
+        let ctx = TestContext::new().await;
+        let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
+        assert!(
+            html.contains(r#"class="login-brand__icon pixel-art""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"<img class="login-brand__icon pixel-art" src="{}" width="64" height="64" alt="">"#,
+                crate::ui::assets::logo_icon_2x_url()
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("srcset"), "{html}");
+        assert!(
+            html.contains(r#"<span class="login-app-name">Impresspress</span>"#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("logo-image"),
+            "no wordmark image by default: {html}"
+        );
     }
 
     /// Explicit, safe `?redirect=` params must still be honored — rendered

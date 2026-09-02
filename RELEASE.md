@@ -131,6 +131,39 @@ Rename whichever product should not hold the slug, then restore. Re-running 020
 is *not* the remedy: once applied, its hash is stamped and the migration
 short-circuits for good.
 
+### Branding: the built-in raster wordmark is gone — no action required
+
+The bundled brand art is now a true pixel-art mark, and the long-form raster
+wordmark (`impresspress-logo-long.png`) has been deleted along with its
+`/b/static/impresspress-logo-long-{hash}.png` route. Brand text is text now:
+`WAFER_RUN_SHARED__LOGO_URL` defaults to blank, and every surface that used to
+show the wordmark — the sidebar, the auth cards and the userportal account
+card — renders the square mark next to the app name instead.
+
+**Why this needs a note.** Older releases declared that route's URL as
+`LOGO_URL`'s *default*, and `seed_defaults` writes a declared default into the
+`variables` table the first time it sees a key with no row. So an existing
+deployment does not fall back to the new blank default: it holds a stored
+`/b/static/impresspress-logo-long-{hash}.png`, pointing at a route this release
+no longer serves. Left alone that is a silently broken image on every page.
+
+**It repairs itself.** `seed_defaults` clears any `LOGO_URL` row still holding
+that route back to blank, on the first boot after the upgrade, and logs a
+warning naming the value it cleared. This deliberately does *not* ship as a
+migration: migrations are gated on `--run-migrations` (see the top of this
+section) and a broken logo gives an operator nothing to opt in *from*, whereas
+`seed_defaults` runs on every boot's `Init` on all three targets. The match is
+scoped to that one built-in route, so a white-labelled `LOGO_URL` of your own
+is never touched.
+
+**If you want a wordmark back,** set `WAFER_RUN_SHARED__LOGO_URL` to your own
+image in Admin → Settings → Variables. It renders exactly as before.
+
+**SDK (`@impresspress/js`):** `IMPRESSPRESS_ASSETS.logoLong` and
+`static/logo_long.png` are removed — a breaking change for any consumer that
+referenced them. `IMPRESSPRESS_ASSETS.logo` (the square mark) and
+`favicon.ico` are unchanged in name and now carry the new art.
+
 ## Pre-Release Checklist
 
 Before tagging a release, verify:

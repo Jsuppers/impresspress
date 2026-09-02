@@ -237,4 +237,40 @@ mod tests {
             "single-card layout must not render shell sidebar/topbar"
         );
     }
+
+    /// `WAFER_RUN_SHARED__LOGO_URL` defaults to blank (there is no built-in
+    /// raster wordmark any more), so the account card's header must fall
+    /// back to the same icon + app-name lockup every auth card uses. Without
+    /// it the card renders with no branding at all.
+    ///
+    /// Asserting on `login-app-name` rather than on the app name alone is
+    /// deliberate: `layout::page` already puts `config.app_name` in the
+    /// document `<title>`, so a bare substring check would pass even with an
+    /// unbranded card.
+    #[tokio::test]
+    async fn blank_logo_url_falls_back_to_app_name_lockup() {
+        let ctx = ctx_with_userportal().await;
+        seed_user(&ctx, "user-a").await;
+        let msg = auth_msg("retrieve", "/b/userportal/", "user-a");
+        let resp = dashboard_page(&ctx, &msg).await;
+        let html = output_html(resp).await;
+
+        let head_start = html
+            .find("account-card__head")
+            .expect("account card header must render");
+        let head = &html[head_start..];
+        let head_end = head
+            .find("account-card__body")
+            .expect("account card body must follow the header");
+        let head = &head[..head_end];
+
+        assert!(
+            head.contains("login-app-name"),
+            "blank LOGO_URL must fall back to the app-name lockup; header was: {head}"
+        );
+        assert!(
+            head.contains("Impresspress"),
+            "the fallback must name the site; header was: {head}"
+        );
+    }
 }

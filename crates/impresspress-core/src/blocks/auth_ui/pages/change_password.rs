@@ -22,11 +22,7 @@ pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
             html! {
                 div .login-container {
                     div .login-logo {
-                        @if !logo_url.is_empty() {
-                            img .logo-image src=(logo_url) alt=(app_name);
-                        } @else {
-                            span .login-app-name { (app_name) }
-                        }
+                        (crate::ui::templates::brand_lockup(logo_url, &config.logo_icon_url, app_name))
                         p .login-subtitle { "Change your password" }
                     }
 
