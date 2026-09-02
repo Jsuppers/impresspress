@@ -316,6 +316,18 @@ const READ_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
             // already captured the money through a Payment Link that soft
             // delete never took down.
             "blocks/products/stripe.rs",
+            // `offers::verify_product` under `ProductState::LiveOrDeleted`,
+            // which is how an admin or owner reaches the *close* half of a
+            // deleted product's money surface: list its offers, archive
+            // them, list its Payment Links, deactivate them. Soft delete
+            // touches nothing in Stripe, so refusing that read would leave a
+            // deleted product's Prices and Links live with no off switch
+            // short of restoring the listing to the public catalog. It is
+            // never a customer-facing read: every caller is Admin- or
+            // Owner-gated, and `ProductState::Live` (the default for
+            // everything that creates, edits, publishes, syncs or opens a
+            // new way to charge) still goes through `products::get`.
+            "blocks/products/handlers/offers.rs",
         ],
     ),
     (

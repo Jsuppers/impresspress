@@ -1171,6 +1171,13 @@ crate::impresspress_feature_block! {
                     .path_params_schema(id_path_schema.clone())
                     .output_schema(record_schema(product_schema.clone()))
                     .tags(&["products", "admin", "moderation"]),
+                BlockEndpoint::post("/b/products/api/admin/products/{id}/restore")
+                    .summary("Restore a soft-deleted product")
+                    .description("Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(id_path_schema.clone())
+                    .output_schema(record_schema(product_schema.clone()))
+                    .tags(&["products", "admin"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers")
                     .summary("List product offers")
                     .auth(AuthLevel::Admin)
