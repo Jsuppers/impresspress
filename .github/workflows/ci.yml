@@ -528,11 +528,14 @@ jobs:
             exit 1
           fi
 
-      - name: Run visual-baseline tests (native server, port 8093)
+      # webmcp.spec.ts runs AFTER the visual baselines: it seeds a product into
+      # the same database, and a product that exists before the admin pages are
+      # screenshotted would show up in them.
+      - name: Run visual-baseline and WebMCP end-to-end tests (native server, port 8093)
         working-directory: crates/impresspress-web
         env:
           TEST_PORT: 8093
-        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts
+        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts tests/e2e/webmcp.spec.ts
 
       - name: Stop server
         if: always()
