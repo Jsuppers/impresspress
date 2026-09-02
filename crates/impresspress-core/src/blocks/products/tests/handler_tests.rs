@@ -1603,6 +1603,235 @@ async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
     );
 }
 
+/// Move a competing product in or out of the slug at the exact moment the
+/// restore's `UPDATE` goes out, so a test can stand on either side of the
+/// window the handler's ordering decides.
+#[derive(Clone, Copy)]
+enum RaceMove {
+    /// A live product claims the freed slug just BEFORE the restore write
+    /// reaches the database — after any pre-check would have looked.
+    ClaimantAppearsFirst,
+    /// The claimant is deleted just AFTER the restore write refused it, so
+    /// the collision probe that runs next finds nothing to blame.
+    ClaimantVanishesFirst,
+}
+
+/// Run a [`RaceMove`] against the first restore write, then let it proceed.
+///
+/// The write itself is real: it goes to the real database and succeeds or
+/// violates `..._owner_slug_uniq` exactly as production would. Only the
+/// timing of the competing row is arranged, and only once.
+#[derive(Clone)]
+struct RaceTheRestoreWrite {
+    inner: std::sync::Arc<crate::test_support::TestContext>,
+    claimant_id: String,
+    slug: String,
+    when: RaceMove,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RaceTheRestoreWrite {
+    async fn make_the_move(&self) {
+        match self.when {
+            RaceMove::ClaimantAppearsFirst => {
+                let mut claimant = HashMap::new();
+                claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+                claimant.insert("slug".to_string(), serde_json::json!(self.slug.clone()));
+                seed(
+                    self.inner.as_ref(),
+                    "impresspress__products__products",
+                    &self.claimant_id,
+                    claimant,
+                )
+                .await;
+            }
+            RaceMove::ClaimantVanishesFirst => {
+                super::super::repo::products::soft_delete(self.inner.as_ref(), &self.claimant_id)
+                    .await
+                    .expect("the concurrent delete of the claimant lands");
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl wafer_run::context::Context for RaceTheRestoreWrite {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), wafer_run::WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: wafer_run::Message,
+        input: wafer_run::InputStream,
+    ) -> wafer_run::OutputStream {
+        #[derive(serde::Deserialize)]
+        struct CollectionPeek {
+            collection: String,
+        }
+
+        if name != "wafer-run/database" || msg.action() != "database.update_where_count" {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|peek| peek.collection)
+            .unwrap_or_default();
+        let ours = collection == super::super::repo::products::TABLE
+            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst);
+
+        if ours && matches!(self.when, RaceMove::ClaimantAppearsFirst) {
+            self.make_the_move().await;
+        }
+        let out = self
+            .inner
+            .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+            .await;
+        if ours && matches!(self.when, RaceMove::ClaimantVanishesFirst) {
+            self.make_the_move().await;
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+/// Seed `original`, soft-deleted, holding slug `widget`.
+async fn seed_a_deleted_product_holding_widget(ctx: &crate::test_support::TestContext) {
+    let mut original = HashMap::new();
+    original.insert("name".to_string(), serde_json::json!("Original"));
+    original.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(ctx, "impresspress__products__products", "original", original).await;
+    soft_delete_product(ctx, "original").await;
+}
+
+/// The ordering itself, not just its happy outcome: the restore WRITES first
+/// and only reads if the write refused.
+///
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` seeds its
+/// claimant before the request, so it answers 409 under a pre-check
+/// implementation exactly as it does under this one — it pins the response,
+/// not the ordering the response's correctness depends on. This pins the
+/// ordering, by putting the claimant *inside* the window a pre-check leaves
+/// open: it appears after any look-before-you-write would have looked, and
+/// before the write it makes fail.
+///
+/// A pre-check therefore sees a clear slug, writes, and can only report the
+/// index violation as an opaque 500 — the exact failure it was added to
+/// prevent. Reading the collision off the write's own refusal cannot be
+/// raced this way: the write either landed, in which case there was no
+/// collision, or it did not, in which case the row is still deleted and the
+/// claimant is still there to be named.
+#[tokio::test]
+async fn restore_names_a_slug_claimed_after_a_pre_check_would_have_looked() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ClaimantAppearsFirst,
+        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let out = dispatch_admin(&racing, msg, input).await;
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("restore over a slug claimed mid-flight must fail: {other:?}"),
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::AlreadyExists,
+        "a slug claimed inside the window must still read as a conflict, not a 500: {error:?}"
+    );
+    assert!(
+        error.message.contains("widget"),
+        "the conflict must name the colliding slug: {}",
+        error.message
+    );
+    assert!(
+        is_soft_deleted(ctx.as_ref(), "original").await,
+        "a refused restore must leave the product deleted"
+    );
+}
+
+/// Writing first removed the pre-check's window, but the *classification*
+/// still asks the database a second question, and the rows it asks about are
+/// mutable. If the claimant is renamed or deleted between the failed write
+/// and the probe, the probe finds nothing to blame and the admin gets back
+/// the opaque 500 the whole branch exists to avoid — on a restore that would
+/// now succeed if simply attempted again.
+///
+/// So a clear probe is not an answer, it is a reason to try again: a slug
+/// nothing holds is a slug this product can re-claim. One retry, which either
+/// lands (the collision really had gone) or fails again and is reported for
+/// what it is.
+#[tokio::test]
+async fn restore_lands_when_the_claimant_vanishes_before_the_probe() {
+    let ctx = std::sync::Arc::new(ctx().await);
+    seed_a_deleted_product_holding_widget(ctx.as_ref()).await;
+
+    // Legal only because the delete freed the slug.
+    let mut claimant = HashMap::new();
+    claimant.insert("name".to_string(), serde_json::json!("Claimant"));
+    claimant.insert("slug".to_string(), serde_json::json!("widget"));
+    seed(
+        ctx.as_ref(),
+        "impresspress__products__products",
+        "claimant",
+        claimant,
+    )
+    .await;
+
+    let racing = RaceTheRestoreWrite {
+        inner: ctx.clone(),
+        claimant_id: "claimant".to_string(),
+        slug: "widget".to_string(),
+        when: RaceMove::ClaimantVanishesFirst,
+        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/original/restore",
+        serde_json::json!({}),
+    );
+    let body = output_to_json(dispatch_admin(&racing, msg, input).await).await;
+    assert_eq!(
+        body["id"], "original",
+        "a collision that has gone by the time it is probed must not become a 500: {body}"
+    );
+    assert!(
+        !is_soft_deleted(ctx.as_ref(), "original").await,
+        "the retried restore must have landed"
+    );
+}
+
 /// The other direction of the same rule: "could not tell" is not "conflict".
 /// When the restore write fails and the collision probe that would name the
 /// slug cannot itself run, the response must carry the write's real failure —
