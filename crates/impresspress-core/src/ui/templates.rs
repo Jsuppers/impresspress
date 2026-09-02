@@ -326,8 +326,15 @@ pub fn auth_split(brand: BrandPanel<'_>, form: Markup) -> Markup {
         div .auth-split {
             aside .auth-split__brand {
                 @if let Some(l) = brand.logo_html { div .auth-split__logo { (l) } }
-                h1 .auth-split__headline { (brand.headline) }
-                @if let Some(t) = brand.tagline { p .auth-split__tagline { (t) } }
+                // Headline + tagline are grouped in one wrapper so they can be
+                // centered vertically as a single unit (see `.auth-split__text`
+                // in auth-split.css) regardless of whether a tagline is
+                // present -- centering the headline alone (no tagline) needs
+                // the same treatment as centering the headline+tagline pair.
+                div .auth-split__text {
+                    h1 .auth-split__headline { (brand.headline) }
+                    @if let Some(t) = brand.tagline { p .auth-split__tagline { (t) } }
+                }
             }
             main .auth-split__form { (form) }
         }

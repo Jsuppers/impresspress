@@ -117,11 +117,20 @@
 .auth-split__logo-img { height: 2rem; width: 2rem; object-fit: contain; display: block; flex-shrink: 0; }
 .auth-split__logo-name { font-size: var(--text-lg); font-weight: 600; color: #ffffff; }
 
-/* Logo pinned top (default flex flow); headline+tagline pushed to the
-   bottom as a group via the headline's auto top margin, rather than
-   `justify-content: space-between` on all three children -- which would
-   space them out evenly and strand the headline in the middle. */
-.auth-split__headline { font-size: 2.5rem; font-weight: 700; margin: auto 0 0; line-height: 1.15; }
+/* Logo pinned top (default flex flow, unaffected by the auto margins
+   below). Headline+tagline are wrapped in `.auth-split__text` (one flex
+   item) and centered vertically in the remaining space with auto margins
+   on *both* sides -- top and bottom auto margins each absorb half the
+   leftover space, which centers the block without disturbing the logo's
+   position. This is deliberately not `justify-content: space-between` on
+   `.auth-split__brand`'s three children -- that would spread logo /
+   headline / tagline out evenly and strand the headline mid-panel instead
+   of keeping it grouped tightly with the tagline. It's also deliberately
+   not an auto margin on the headline alone -- that only pushes the group
+   to the *bottom* (this shipped and was corrected once already); centering
+   needs the margin on both edges of the group. */
+.auth-split__text { margin: auto 0; }
+.auth-split__headline { font-size: 2.5rem; font-weight: 700; margin: 0; line-height: 1.15; }
 .auth-split__tagline { font-size: var(--text-base); margin: var(--spacing-sm) 0 0; color: var(--auth-tagline); }
 
 .auth-split__form { display: flex; align-items: center; justify-content: center; padding: var(--space-2xl) var(--spacing-md); background: #fdfdfd; }
