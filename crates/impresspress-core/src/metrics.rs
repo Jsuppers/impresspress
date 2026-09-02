@@ -48,6 +48,10 @@ pub enum CacheOutcome {
     /// Probe window elapsed (or an explicit dirty flag) but the KV version
     /// stamp still matched — one KV read, no rebuild.
     ProbedFresh,
+    /// Probe window elapsed but the KV version GET itself failed
+    /// (quota/transport). The last known runtime was served unchanged and the
+    /// probe deadline was pushed out with backoff — no rebuild, no KV write.
+    ProbeFailed,
     /// Version stamp moved, or a local write is pending: full rebuild.
     /// `build_ordinal` is this isolate's cumulative build count (1-based);
     /// `duration_ms` covers cache resolution through the completed build.
@@ -72,6 +76,7 @@ impl CacheOutcome {
         match self {
             Self::Hit => "hit",
             Self::ProbedFresh => "probed-fresh",
+            Self::ProbeFailed => "probe-failed",
             Self::Rebuilt { .. } => "rebuilt",
             Self::ColdBuilt { .. } => "cold-built",
         }
@@ -81,7 +86,7 @@ impl CacheOutcome {
     /// for a build; `None` for `Hit`/`ProbedFresh`.
     pub fn build_ordinal(self) -> Option<u32> {
         match self {
-            Self::Hit | Self::ProbedFresh => None,
+            Self::Hit | Self::ProbedFresh | Self::ProbeFailed => None,
             Self::Rebuilt { build_ordinal, .. } | Self::ColdBuilt { build_ordinal, .. } => {
                 Some(build_ordinal)
             }
@@ -91,7 +96,7 @@ impl CacheOutcome {
     /// Runtime-cache resolution duration when this request built a Wafer.
     pub fn build_duration_ms(self) -> Option<u64> {
         match self {
-            Self::Hit | Self::ProbedFresh => None,
+            Self::Hit | Self::ProbedFresh | Self::ProbeFailed => None,
             Self::Rebuilt { duration_ms, .. } | Self::ColdBuilt { duration_ms, .. } => {
                 Some(duration_ms)
             }
@@ -151,6 +156,20 @@ mod tests {
         assert_eq!(
             server_timing_header(CacheOutcome::ProbedFresh),
             r#"cache;desc="probed-fresh""#
+        );
+    }
+
+    #[test]
+    fn probe_failed_is_a_no_build_outcome_with_its_own_label() {
+        // A failed KV version probe that served the last known runtime must be
+        // distinguishable from a successful probe in Server-Timing, or "KV is
+        // down and we are serving stale" is invisible from the outside.
+        assert_eq!(CacheOutcome::ProbeFailed.as_str(), "probe-failed");
+        assert_eq!(CacheOutcome::ProbeFailed.build_ordinal(), None);
+        assert_eq!(CacheOutcome::ProbeFailed.build_duration_ms(), None);
+        assert_eq!(
+            server_timing_header(CacheOutcome::ProbeFailed),
+            r#"cache;desc="probe-failed""#
         );
     }
 

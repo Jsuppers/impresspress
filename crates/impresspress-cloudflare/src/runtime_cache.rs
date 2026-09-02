@@ -26,10 +26,33 @@ use impresspress_core::{cache_key::CONFIG_VERSION_KEY, metrics::CacheOutcome, Is
 
 /// Floor of the isolate-local warm-hit probe window (ms) — see
 /// [`next_probe_deadline_ms`].
-const PROBE_INTERVAL_FLOOR_MS: u64 = 30_000;
+///
+/// 5 minutes, raised from 30s after the 2026-08-31 KV read-quota exhaustion:
+/// at a ~45s average, ~52 continuously active isolates burned the entire
+/// 100k/day free-tier read allowance on version probes alone. KV is
+/// eventually consistent (60s+ propagation), so the old cadence bought no
+/// real freshness. Admin config changes still reach the mutating isolate
+/// instantly via the dirty flag; other warm isolates converge within this
+/// window.
+const PROBE_INTERVAL_FLOOR_MS: u64 = 300_000;
 /// Width of the jitter added on top of the floor (ms) — see
-/// [`next_probe_deadline_ms`].
-const PROBE_INTERVAL_JITTER_MS: u64 = 30_000;
+/// [`next_probe_deadline_ms`]. Probes land 5–10 minutes apart.
+const PROBE_INTERVAL_JITTER_MS: u64 = 300_000;
+/// Ceiling on the widened probe window after consecutive probe FAILURES —
+/// see [`probe_failure_window_ms`]. Retrying an exhausted daily allowance at
+/// full cadence provides no freshness and just manufactures failed
+/// operations.
+///
+/// SCOPE: this backs off the WARM-isolate probe only, which is the read
+/// source that actually dominated the 2026-08-31 exhaustion (~52 continuously
+/// active isolates x ~1,920 probes/day). Cold, transient and busy-slot
+/// hydrations still probe once each, deliberately: a request with no usable
+/// cached runtime has to resolve a version somehow, and their volume is
+/// bounded by isolate churn rather than by wall-clock cadence. The counter
+/// lives on [`ReadyRuntime`], so a rebuild restarts the streak, which is
+/// conservative — it can only shorten the window, never extend it past what
+/// a fresh runtime would use.
+const PROBE_FAILURE_BACKOFF_CAP_MS: u64 = 1_800_000;
 /// Maximum time an isolate-local build slot may remain owned.
 ///
 /// Normal Rust cancellation drops [`BuildGuard`], but Cloudflare can hard-stop
@@ -67,6 +90,32 @@ pub(crate) struct ReadyRuntime {
     /// can take 60s+ to propagate), so probing more often than this floor
     /// buys no real freshness.
     probe_deadline_ms: Cell<u64>,
+    /// Consecutive failed version probes. Widens the next probe window
+    /// (see [`probe_failure_window_ms`]); reset to zero by any successful
+    /// probe.
+    probe_failures: Cell<u32>,
+}
+
+impl ReadyRuntime {
+    /// A probe reached KV: reset the failure streak and re-arm the normal
+    /// jittered window.
+    fn note_probe_success(&self, now: u64) {
+        self.probe_failures.set(0);
+        self.probe_deadline_ms.set(next_probe_deadline_ms(now));
+    }
+
+    /// A probe failed (quota/transport): widen the next window with capped
+    /// exponential backoff so an exhausted daily allowance is not re-polled
+    /// at full cadence by every warm isolate.
+    fn note_probe_failure(&self, now: u64) {
+        let failures = self.probe_failures.get().saturating_add(1);
+        self.probe_failures.set(failures);
+        self.probe_deadline_ms.set(probe_failure_deadline_ms(
+            now,
+            failures,
+            random_probe_jitter_ms(),
+        ));
+    }
 }
 
 // Every cell below is `Cell`/`IsolateCell`, never `RefCell`, and that is a
@@ -295,30 +344,137 @@ fn bypass_prepared(identity: String) {
     PREPARED_BYPASS.with(|slot| slot.set(identity));
 }
 
+/// Whether a warm prepared runtime must abandon its packaged plan. A local
+/// write (`dirty`) always falls back — D1 is the source of truth and the
+/// rebuild reads it directly. An [`VersionProbe::Unavailable`] probe never
+/// does: bypassing a valid plan over a transient read error converted one
+/// failed GET into dynamic D1 rebuilds for the isolate's whole life.
 fn prepared_probe_requires_fallback(
     dirty: bool,
     cached_config_version: &str,
-    observed_config_version: &str,
+    probe: &VersionProbe,
 ) -> bool {
-    dirty || cached_config_version != observed_config_version
+    if dirty {
+        return true;
+    }
+    match probe {
+        VersionProbe::Unavailable => false,
+        VersionProbe::Stamped(v) | VersionProbe::Minted(v) => cached_config_version != v,
+    }
 }
 
-fn prepared_generation_matches(plan_generation: &str, observed_generation: &str) -> bool {
-    plan_generation != impresspress_core::UNBOUND_CONFIG_GENERATION
-        && plan_generation == observed_generation
+/// Whether the packaged plan's generation is current. When the probe is
+/// [`VersionProbe::Unavailable`] the signed plan is trusted as-is: it is a
+/// complete, verified snapshot, and manufacturing an isolate-local generation
+/// to compare against it turned KV read errors into full dynamic builds. An
+/// UNBOUND generation is never trusted, probe or no probe.
+fn prepared_generation_matches(plan_generation: &str, probe: &VersionProbe) -> bool {
+    if plan_generation == impresspress_core::UNBOUND_CONFIG_GENERATION {
+        return false;
+    }
+    match probe {
+        VersionProbe::Unavailable => true,
+        VersionProbe::Stamped(v) | VersionProbe::Minted(v) => plan_generation == v,
+    }
 }
 
-/// A fresh probe deadline: `now` plus a jittered 30-60s window. Jitter
+/// Whether a warm DYNAMIC runtime must rebuild after its probe window
+/// elapsed. Mirrors [`prepared_probe_requires_fallback`]: dirty or a changed
+/// environment always rebuilds; an unavailable probe keeps the last valid
+/// runtime.
+fn dynamic_probe_requires_rebuild(
+    dirty: bool,
+    environment_changed: bool,
+    cached_version: &str,
+    probe: &VersionProbe,
+) -> bool {
+    if dirty || environment_changed {
+        return true;
+    }
+    match probe {
+        VersionProbe::Unavailable => false,
+        VersionProbe::Stamped(v) | VersionProbe::Minted(v) => cached_version != v,
+    }
+}
+
+/// Whether a cold request that lost the build-slot race can serve the cached
+/// runtime instead of building request-locally. With the probe unavailable,
+/// freshness cannot be verified either way — serving the last known good
+/// runtime beats paying for a dynamic build tagged with an unverifiable
+/// stamp.
+///
+/// Callers that ALREADY probed pass that probe down (see
+/// `hydrate_transient_dynamic_runtime`'s `known_probe`) rather than letting
+/// this re-probe: a second probe that flakes to `Unavailable` would
+/// otherwise discard the first probe's proof that the cached version is
+/// stale and serve it as a hit.
+fn transient_dynamic_can_serve_cached(cached_version: &str, probe: &VersionProbe) -> bool {
+    match probe {
+        VersionProbe::Unavailable => true,
+        VersionProbe::Stamped(v) | VersionProbe::Minted(v) => cached_version == v,
+    }
+}
+
+/// Whether a cached PREPARED runtime's config generation is still good for
+/// this probe. `Unavailable` serves it: the caller has already trusted the
+/// signed plan via [`prepared_generation_matches`], so re-hydrating the same
+/// plan would burn a full initialization to reach the identical state. A
+/// runtime with no `config_version` is dynamic, never a prepared cache hit.
+fn prepared_cached_config_matches(
+    cached_config_version: Option<&str>,
+    probe: &VersionProbe,
+) -> bool {
+    let Some(cached) = cached_config_version else {
+        return false;
+    };
+    match probe {
+        VersionProbe::Unavailable => true,
+        VersionProbe::Stamped(v) | VersionProbe::Minted(v) => cached == v,
+    }
+}
+
+/// Jitter for one probe deadline, from 32 bits of randomness. Two random
+/// bytes were enough for the old 30s width; against a 5-minute width a u16
+/// (max 65,535ms) would silently cap the spread at ~65s and re-synchronize
+/// isolates that warmed together.
+fn probe_jitter_ms(raw: u32) -> u64 {
+    u64::from(raw) % PROBE_INTERVAL_JITTER_MS
+}
+
+fn random_probe_jitter_ms() -> u64 {
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        probe_jitter_ms(u32::from_le_bytes(buf))
+    } else {
+        0
+    }
+}
+
+/// A fresh probe deadline: `now` plus a jittered 5–10 minute window. Jitter
 /// avoids every isolate that warmed at the same instant re-probing KV in
 /// lockstep after exactly the same interval.
 fn next_probe_deadline_ms(now: u64) -> u64 {
-    let mut buf = [0u8; 2];
-    let jitter_ms = if getrandom::getrandom(&mut buf).is_ok() {
-        u64::from(u16::from_le_bytes(buf)) % PROBE_INTERVAL_JITTER_MS
-    } else {
-        0
-    };
-    now + PROBE_INTERVAL_FLOOR_MS + jitter_ms
+    now + PROBE_INTERVAL_FLOOR_MS + random_probe_jitter_ms()
+}
+
+/// Probe window after `consecutive_failures` failed probes: the normal floor
+/// doubled per failure, capped at [`PROBE_FAILURE_BACKOFF_CAP_MS`].
+fn probe_failure_window_ms(consecutive_failures: u32) -> u64 {
+    PROBE_INTERVAL_FLOOR_MS
+        .checked_shl(consecutive_failures.min(16))
+        .unwrap_or(PROBE_FAILURE_BACKOFF_CAP_MS)
+        .min(PROBE_FAILURE_BACKOFF_CAP_MS)
+}
+
+/// Absolute deadline for the next probe after `consecutive_failures`
+/// failures. The cap bounds the DEADLINE, jitter included — clamping the
+/// window and then adding jitter on top would overshoot
+/// [`PROBE_FAILURE_BACKOFF_CAP_MS`] by the full jitter width.
+fn probe_failure_deadline_ms(now: u64, consecutive_failures: u32, jitter_ms: u64) -> u64 {
+    let window = probe_failure_window_ms(consecutive_failures)
+        .saturating_add(jitter_ms)
+        .min(PROBE_FAILURE_BACKOFF_CAP_MS);
+    now + window
 }
 
 fn cached() -> Option<Rc<ReadyRuntime>> {
@@ -342,19 +498,67 @@ fn store_if_current(guard: &BuildGuard, rt: Rc<ReadyRuntime>) -> bool {
     true
 }
 
-/// Current KV config-version stamp. Missing key ⇒ stamp a fresh one so all
-/// isolates converge on the same generation.
-async fn current_version(kv: &Arc<dyn impresspress_core::kv::KvBackend>) -> String {
+/// Outcome of one KV config-version probe. The three arms are deliberately
+/// distinct: collapsing `Err` into the missing-key arm is what turned the
+/// 2026-08-30/31 read-quota exhaustion into multi-thousand write-request
+/// bursts (every failed probe minted a stamp and PUT it) and permanently
+/// bypassed packaged plans on transient read errors.
+#[derive(Debug, Clone)]
+enum VersionProbe {
+    /// KV holds a fleet-wide stamp.
+    Stamped(String),
+    /// The key was genuinely absent; a fresh stamp was minted and a PUT
+    /// attempted so all isolates converge on the same generation.
+    Minted(String),
+    /// The GET itself failed (quota/transport). Nothing was minted or
+    /// written; callers keep their last known good state.
+    Unavailable,
+}
+
+impl VersionProbe {
+    /// The observed stamp, for log lines.
+    fn observed(&self) -> &str {
+        match self {
+            Self::Stamped(v) | Self::Minted(v) => v,
+            Self::Unavailable => "<unavailable>",
+        }
+    }
+
+    /// Version string for tagging a dynamic runtime that must be built right
+    /// now. `Unavailable` mints an isolate-local stamp that is deliberately
+    /// NOT persisted: it can never equal a later fleet-wide stamp, so the
+    /// first successful probe after KV recovers forces one clean rebuild.
+    fn into_dynamic_version(self) -> String {
+        match self {
+            Self::Stamped(v) | Self::Minted(v) => v,
+            Self::Unavailable => {
+                let v = crate::kv_cached_db::new_version_stamp();
+                tracing::warn!(local_stamp = %v, "config-version unavailable; tagging dynamic runtime with an unpersisted local stamp");
+                v
+            }
+        }
+    }
+}
+
+/// Probe the KV config-version stamp. Missing key ⇒ stamp a fresh one so all
+/// isolates converge on the same generation. A failed GET ⇒
+/// [`VersionProbe::Unavailable`], with no mint and no write: a quota or
+/// availability error must never be treated as a missing key.
+async fn probe_version(kv: &Arc<dyn impresspress_core::kv::KvBackend>) -> VersionProbe {
     match kv.get(CONFIG_VERSION_KEY).await {
-        Ok(Some(v)) => v,
-        _ => {
+        Ok(Some(v)) => VersionProbe::Stamped(v),
+        Ok(None) => {
             let v = crate::kv_cached_db::new_version_stamp();
             if let Err(e) =
                 impresspress_core::kv::put_version_stamp_with_retry(kv.as_ref(), &v).await
             {
                 tracing::warn!(error = %e, "config-version stamp persist failed; runtime tagged with local stamp only (KV unstamped; re-mints until a put lands)");
             }
-            v
+            VersionProbe::Minted(v)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "config-version probe failed; treating KV as unavailable (no stamp minted, no write attempted)");
+            VersionProbe::Unavailable
         }
     }
 }
@@ -416,6 +620,13 @@ where
     // them unused when the completed runtime is visible.
     let mut register_blocks = Some(register_blocks);
     let mut register_post_build = Some(register_post_build);
+    // Whether this request's build attempt CONSUMED the isolate dirty flag.
+    // Only a consumed signal may be re-marked if the build then fails: the
+    // cold branch never takes DIRTY, and re-marking there would force the
+    // NEXT successful runtime into an immediate full dynamic rebuild
+    // (read_through, D1 structural reads — the multi-second path this file's
+    // own comments flag for Cloudflare 1102 risk).
+    let mut dirty_consumed = false;
 
     let (probed_version, read_through, is_cold, built_at, build_guard) = loop {
         let now = impresspress_core::util::now_millis();
@@ -460,6 +671,7 @@ where
                         .expect("build hooks are consumed by at most one build attempt"),
                     environment_identity.clone(),
                     now,
+                    None,
                 )
                 .await;
             }
@@ -479,6 +691,7 @@ where
                     .expect("build hooks are consumed by at most one build attempt"),
                 environment_identity.clone(),
                 now,
+                None,
             )
             .await;
         };
@@ -487,6 +700,7 @@ where
         // completed a build while this one was waiting on its timer.
         let resolution = if let Some(rt) = cached() {
             let dirty = take_dirty();
+            dirty_consumed = dirty;
             let environment_changed = rt.environment_identity != environment_identity;
 
             if !dirty
@@ -499,33 +713,65 @@ where
 
             // Always derive the probe handle from THIS request's Env. The
             // immutable cached runtime intentionally retains no KV binding.
-            let probe_kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
-            let version = current_version(&probe_kv).await;
+            let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
+                Ok(kv) => kv,
+                Err(e) => {
+                    // Same reasoning as the build-failure paths below: this
+                    // attempt already took the flag, so propagating without
+                    // restoring it strands the isolate on pre-write state.
+                    if dirty {
+                        mark_dirty();
+                    }
+                    return Err(e.into());
+                }
+            };
+            let probe = probe_version(&probe_kv).await;
 
             // A pure deadline-elapsed probe (not dirty) that finds the
             // version unchanged just extends the window — no rebuild needed.
             // A LOCAL write (`dirty`) always rebuilds even if KV still reports
-            // the old version because KV is eventually consistent.
-            if !dirty
-                && rt.config_version.is_none()
-                && !environment_changed
-                && rt.version == version
+            // the old version because KV is eventually consistent. An
+            // unavailable probe keeps the last valid runtime with a widened
+            // window: rebuilding over a read error is exactly the
+            // amplification the three-way probe exists to prevent.
+            if rt.config_version.is_none()
+                && !dynamic_probe_requires_rebuild(dirty, environment_changed, &rt.version, &probe)
             {
-                rt.probe_deadline_ms.set(next_probe_deadline_ms(now));
-                return Ok((rt, CacheOutcome::ProbedFresh));
+                let outcome = if matches!(probe, VersionProbe::Unavailable) {
+                    rt.note_probe_failure(now);
+                    CacheOutcome::ProbeFailed
+                } else {
+                    rt.note_probe_success(now);
+                    CacheOutcome::ProbedFresh
+                };
+                return Ok((rt, outcome));
             }
-            tracing::info!(old = %rt.version, new = %version, dirty, environment_changed, "config version, Worker environment, or local state changed; rebuilding runtime");
-            (version, true, false, now, build_guard)
+            tracing::info!(old = %rt.version, new = %probe.observed(), dirty, environment_changed, "config version, Worker environment, or local state changed; rebuilding runtime");
+            (probe.into_dynamic_version(), true, false, now, build_guard)
         } else {
             // Cold isolate: probe before build so the finished runtime is
             // tagged with a version no newer than the config it loaded.
             let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
-            (current_version(&kv).await, false, true, now, build_guard)
+            (
+                probe_version(&kv).await.into_dynamic_version(),
+                false,
+                true,
+                now,
+                build_guard,
+            )
         };
         break resolution;
     };
 
-    let mut built = crate::build_runtime(
+    // This build already CONSUMED the dirty flag (`take_dirty` above). If it
+    // now fails, that local-write signal must not die with it: the isolate
+    // would keep serving the pre-write runtime as zero-await hits until the
+    // probe deadline elapses — a window this change widened from 30-60s to
+    // 5-10 minutes, and up to the backoff cap when probes are failing too.
+    // Gated on `dirty_consumed` so a cold build failure (which never took the
+    // flag) cannot manufacture a dirty signal and charge the next runtime a
+    // full dynamic rebuild it does not need.
+    let mut built = match crate::build_runtime(
         env,
         request_config,
         None,
@@ -541,21 +787,36 @@ where
             bump_on_write: true,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(built) => built,
+        Err(e) => {
+            if dirty_consumed {
+                mark_dirty();
+            }
+            return Err(e);
+        }
+    };
 
     // Dynamic WRAP grants must be registered before seal. Strictly initialize
     // every slot under the build owner's concrete services before publishing
     // the Wafer: Workers requests must never wait on another request's shared
     // lazy-init mutex/future. The concrete services are dropped instead of
     // entering ReadyRuntime.
-    crate::request_services::scope(built.services.clone(), async {
+    if let Err(e) = crate::request_services::scope(built.services.clone(), async {
         crate::apply_db_wrap_grants(&mut built).await;
         built.wafer.seal().await.map_err(|e| format!("seal: {e}"))?;
         impresspress_core::builder::strict_init_all_blocks(&built.wafer)
             .await
             .map_err(|error| format!("strict cached-runtime Init: {error}"))
     })
-    .await?;
+    .await
+    {
+        if dirty_consumed {
+            mark_dirty();
+        }
+        return Err(e.into());
+    }
     crate::request_services::scope_sync(built.services.clone(), || {
         impresspress_core::builder::post_start(&built.wafer, &built.storage_block);
     });
@@ -573,6 +834,7 @@ where
         config_version: None,
         environment_identity,
         probe_deadline_ms: Cell::new(next_probe_deadline_ms(built_at)),
+        probe_failures: Cell::new(0),
     });
     if !store_if_current(&build_guard, rt.clone()) {
         // The runtime is complete and internally consistent; only the right to
@@ -611,11 +873,19 @@ where
 
 /// Hydrate a packaged immutable plan without D1 settings or WRAP-grant reads.
 /// One KV config-version read tags the cold hydration, followed by the same
-/// bounded 30–60s probes used by dynamic runtimes. A local dirty signal or a
+/// bounded jittered probes used by dynamic runtimes. A local dirty signal or a
 /// moved version permanently bypasses this plan/environment pair in the
 /// isolate and restores dynamic hydration, preserving admin mutation
 /// semantics without putting D1 structural reads back on the prepared cold
 /// path.
+// Eight arguments, one over clippy's threshold, and deliberately a parameter
+// rather than something the caller sets on the returned handle afterwards.
+// Every call site probes (or knowingly skips probing) differently, and a site
+// that forgot to record a blind window is precisely the defect this argument
+// was added to fix — a compiler-enforced parameter cannot be forgotten, a
+// follow-up call can. Bundling the existing seven into a struct would add
+// indirection to a private function with four call sites and hide that.
+#[allow(clippy::too_many_arguments)]
 async fn hydrate_prepared_runtime<F, G>(
     env: &worker::Env,
     request_config: &std::collections::HashMap<String, String>,
@@ -673,6 +943,7 @@ where
         config_version: Some(plan.config_generation.clone()),
         environment_identity,
         probe_deadline_ms: Cell::new(next_probe_deadline_ms(started_at)),
+        probe_failures: Cell::new(0),
     });
     Ok((rt, build_ordinal, duration_ms))
 }
@@ -718,6 +989,7 @@ async fn hydrate_transient_dynamic_runtime<F, G>(
     register_post_build: G,
     environment_identity: String,
     started_at: u64,
+    known_probe: Option<VersionProbe>,
 ) -> Result<(Rc<ReadyRuntime>, CacheOutcome), Box<dyn std::error::Error>>
 where
     F: FnOnce(
@@ -730,16 +1002,38 @@ where
 {
     // Read KV with THIS request's binding — never the owner's — then re-check
     // the cache before paying for a build the owner may have just finished.
-    let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
-    let probed_version = current_version(&kv).await;
+    // With the probe unavailable a matching cached runtime is served as-is:
+    // its freshness cannot be verified either way, and a request-local build
+    // would carry an unverifiable stamp at full dynamic-build cost.
+    //
+    // A caller that already probed passes its result in. That saves the
+    // second KV read (two version GETs per request through the post-deploy
+    // busy window, against a subrequest ceiling and the read budget this
+    // whole change exists to protect) AND keeps its evidence: re-probing
+    // could return `Unavailable` and serve a cached version the caller's own
+    // probe had just proved stale.
+    let probe = match known_probe {
+        Some(probe) => probe,
+        None => {
+            let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+            probe_version(&kv).await
+        }
+    };
     if let Some(rt) = cached() {
         if rt.environment_identity == environment_identity
             && rt.config_version.is_none()
-            && rt.version == probed_version
+            && transient_dynamic_can_serve_cached(&rt.version, &probe)
         {
+            // Record the failed probe even though this request is served:
+            // it widens the next probe window, which is the whole point of
+            // the backoff during an outage.
+            if matches!(probe, VersionProbe::Unavailable) {
+                rt.note_probe_failure(started_at);
+            }
             return Ok((rt, CacheOutcome::Hit));
         }
     }
+    let probed_version = probe.into_dynamic_version();
 
     let mut built = crate::build_runtime(
         env,
@@ -789,6 +1083,7 @@ where
         config_version: None,
         environment_identity,
         probe_deadline_ms: Cell::new(next_probe_deadline_ms(started_at)),
+        probe_failures: Cell::new(0),
     });
     tracing::info!(
         build_ordinal,
@@ -857,14 +1152,17 @@ where
         // request-scoped, so it can serve safely without touching the owner's
         // build slot or replacing the isolate cache.
         let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
-        let config_version = current_version(&kv).await;
-        if !prepared_generation_matches(&plan.config_generation, &config_version) {
+        let probe = probe_version(&kv).await;
+        if !prepared_generation_matches(&plan.config_generation, &probe) {
             // The plan is stale AND the slot is busy — the post-deploy window,
             // where a config-generation bump invalidates the packaged plan for
             // every isolate at once. The non-busy path below reacts by bypassing
             // the plan and rebuilding dynamically; do the same request-locally
             // rather than refusing. Isolate-wide bypass state is left to the
             // owner, which reaches the same check once it holds the slot.
+            // (An unavailable probe never lands here: the signed plan is
+            // trusted rather than replaced with a dynamic build the probe
+            // cannot justify.)
             return hydrate_transient_dynamic_runtime(
                 env,
                 request_config,
@@ -872,14 +1170,23 @@ where
                 register_post_build,
                 environment_identity,
                 now,
+                // This request already probed, and that probe is what proved
+                // the plan stale. Re-probing would cost a second KV read and
+                // could flake to `Unavailable`, discarding this evidence.
+                Some(probe),
             )
             .await;
         }
         if let Some(rt) = cached() {
             if rt.environment_identity == environment_identity
                 && rt.version == plan_generation
-                && rt.config_version.as_deref() == Some(config_version.as_str())
+                && prepared_cached_config_matches(rt.config_version.as_deref(), &probe)
             {
+                // Same as the transient dynamic path: a failed probe still
+                // widens this runtime's next probe window.
+                if matches!(probe, VersionProbe::Unavailable) {
+                    rt.note_probe_failure(now);
+                }
                 return Ok((rt, CacheOutcome::Hit));
             }
         }
@@ -953,21 +1260,32 @@ where
                     return Ok((rt, CacheOutcome::Hit));
                 }
 
-                let probe_kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
-                let observed_config_version = current_version(&probe_kv).await;
-                if !prepared_probe_requires_fallback(
-                    dirty,
-                    cached_config_version,
-                    &observed_config_version,
-                ) {
-                    rt.probe_deadline_ms.set(next_probe_deadline_ms(now));
+                let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        // `dirty` was consumed above; losing it here would
+                        // strand the isolate on pre-write state for a full
+                        // probe window.
+                        if dirty {
+                            mark_dirty();
+                        }
+                        return Err(e.into());
+                    }
+                };
+                let probe = probe_version(&probe_kv).await;
+                if !prepared_probe_requires_fallback(dirty, cached_config_version, &probe) {
+                    if matches!(probe, VersionProbe::Unavailable) {
+                        rt.note_probe_failure(now);
+                        return Ok((rt, CacheOutcome::ProbeFailed));
+                    }
+                    rt.note_probe_success(now);
                     return Ok((rt, CacheOutcome::ProbedFresh));
                 }
 
                 tracing::info!(
                     plan_hash = %plan_generation,
                     old_config_version = %cached_config_version,
-                    new_config_version = %observed_config_version,
+                    new_config_version = %probe.observed(),
                     dirty,
                     "mutable admin state changed; bypassing packaged plan for this isolate"
                 );
@@ -992,12 +1310,12 @@ where
     // prior runtime. The new plan is tagged with the current KV generation.
     let _ = take_dirty();
     let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
-    let config_version = current_version(&kv).await;
-    if !prepared_generation_matches(&plan.config_generation, &config_version) {
+    let probe = probe_version(&kv).await;
+    if !prepared_generation_matches(&plan.config_generation, &probe) {
         tracing::info!(
             plan_hash = %plan_generation,
             plan_config_generation = %plan.config_generation,
-            observed_config_generation = %config_version,
+            observed_config_generation = %probe.observed(),
             "prepared plan generation is stale; bypassing it for this isolate"
         );
         bypass_prepared(prepared_identity);
@@ -1175,13 +1493,18 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn local_dirty_forces_prepared_fallback_even_before_kv_converges() {
-        assert!(prepared_probe_requires_fallback(true, "v1", "v1"));
-        assert!(!prepared_probe_requires_fallback(false, "v1", "v1"));
+        let same = VersionProbe::Stamped("v1".to_string());
+        assert!(prepared_probe_requires_fallback(true, "v1", &same));
+        assert!(!prepared_probe_requires_fallback(false, "v1", &same));
     }
 
     #[wasm_bindgen_test]
     fn moved_config_version_forces_prepared_fallback() {
-        assert!(prepared_probe_requires_fallback(false, "v1", "v2"));
+        assert!(prepared_probe_requires_fallback(
+            false,
+            "v1",
+            &VersionProbe::Stamped("v2".to_string())
+        ));
     }
 
     #[wasm_bindgen_test]
@@ -1189,15 +1512,24 @@ mod tests {
         let v1 = "1".repeat(32);
         let v2 = "2".repeat(32);
         // Isolate A started while the candidate's generation was current.
-        assert!(prepared_generation_matches(&v1, &v1));
+        assert!(prepared_generation_matches(
+            &v1,
+            &VersionProbe::Stamped(v1.clone())
+        ));
         // A later admin/deploy mutation moves KV. A fresh isolate must not
         // hydrate the older packaged v1 structure.
-        assert!(!prepared_generation_matches(&v1, &v2));
+        assert!(!prepared_generation_matches(
+            &v1,
+            &VersionProbe::Stamped(v2.clone())
+        ));
         // The replacement Worker plan is accepted by another fresh isolate.
-        assert!(prepared_generation_matches(&v2, &v2));
+        assert!(prepared_generation_matches(
+            &v2,
+            &VersionProbe::Stamped(v2.clone())
+        ));
         assert!(!prepared_generation_matches(
             impresspress_core::UNBOUND_CONFIG_GENERATION,
-            impresspress_core::UNBOUND_CONFIG_GENERATION,
+            &VersionProbe::Stamped(impresspress_core::UNBOUND_CONFIG_GENERATION.to_string()),
         ));
     }
 
@@ -1223,5 +1555,297 @@ mod tests {
         bypass_prepared(original.clone());
         assert!(prepared_is_bypassed(&original));
         assert!(!prepared_is_bypassed(&changed));
+    }
+
+    /// What a probe mock's `get` returns, to drive all three
+    /// [`VersionProbe`] arms.
+    enum ProbeKvGet {
+        Value(&'static str),
+        Missing,
+        Fail,
+    }
+
+    /// In-memory [`impresspress_core::kv::KvBackend`] that scripts `get` and
+    /// counts every write-class call. `delete` is unreachable on the probe
+    /// path.
+    struct ProbeMockKv {
+        get: ProbeKvGet,
+        writes: Cell<u32>,
+    }
+
+    impl ProbeMockKv {
+        fn new(get: ProbeKvGet) -> (Arc<dyn impresspress_core::kv::KvBackend>, Arc<Self>) {
+            let concrete = Arc::new(Self {
+                get,
+                writes: Cell::new(0),
+            });
+            (
+                concrete.clone() as Arc<dyn impresspress_core::kv::KvBackend>,
+                concrete,
+            )
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl impresspress_core::kv::KvBackend for ProbeMockKv {
+        async fn get(&self, _key: &str) -> Result<Option<String>, String> {
+            match self.get {
+                ProbeKvGet::Value(v) => Ok(Some(v.to_string())),
+                ProbeKvGet::Missing => Ok(None),
+                ProbeKvGet::Fail => Err("simulated kv read failure".to_string()),
+            }
+        }
+
+        async fn put_with_ttl(
+            &self,
+            _key: &str,
+            _value: &str,
+            _ttl_secs: u64,
+        ) -> Result<(), String> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+
+        async fn put(&self, _key: &str, _value: &str) -> Result<(), String> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), String> {
+            unreachable!("the version probe never deletes")
+        }
+    }
+
+    /// THE August 30/31 write-storm mechanism: a KV read failure must not be
+    /// treated as a missing stamp. Minting + PUTting on `Err` converted read
+    /// exhaustion into thousands of write requests.
+    #[wasm_bindgen_test]
+    async fn probe_error_returns_unavailable_and_never_writes() {
+        let (kv, mock) = ProbeMockKv::new(ProbeKvGet::Fail);
+        let probe = probe_version(&kv).await;
+        assert!(
+            matches!(probe, VersionProbe::Unavailable),
+            "a failed GET is an availability problem, not a missing key"
+        );
+        assert_eq!(
+            mock.writes.get(),
+            0,
+            "a KV read error must cause zero KV write attempts"
+        );
+    }
+
+    /// A genuinely absent stamp keeps today's convergence behavior: mint one
+    /// and persist it so every isolate lands on the same generation.
+    #[wasm_bindgen_test]
+    async fn probe_missing_key_still_mints_and_persists_stamp() {
+        let (kv, mock) = ProbeMockKv::new(ProbeKvGet::Missing);
+        let probe = probe_version(&kv).await;
+        match probe {
+            VersionProbe::Minted(v) => assert!(!v.is_empty()),
+            other => panic!("expected Minted for a missing key, got {other:?}"),
+        }
+        assert_eq!(mock.writes.get(), 1, "exactly one successful PUT");
+    }
+
+    #[wasm_bindgen_test]
+    async fn probe_present_key_returns_stamp_without_write() {
+        let (kv, mock) = ProbeMockKv::new(ProbeKvGet::Value("stamp-a"));
+        let probe = probe_version(&kv).await;
+        match probe {
+            VersionProbe::Stamped(v) => assert_eq!(v, "stamp-a"),
+            other => panic!("expected Stamped, got {other:?}"),
+        }
+        assert_eq!(mock.writes.get(), 0);
+    }
+
+    /// A transient KV error on a warm prepared probe previously minted a
+    /// local stamp, mismatched the cached generation, and PERMANENTLY
+    /// bypassed the packaged plan for the isolate — converting one failed
+    /// read into dynamic D1 rebuilds for the isolate's whole life.
+    #[wasm_bindgen_test]
+    fn warm_prepared_probe_error_does_not_bypass_plan() {
+        assert!(!prepared_probe_requires_fallback(
+            false,
+            "gen-a",
+            &VersionProbe::Unavailable
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn dirty_state_forces_prepared_fallback_even_when_probe_fails() {
+        // A local admin write must still win: D1 is the source of truth and
+        // the rebuild path reads it directly.
+        assert!(prepared_probe_requires_fallback(
+            true,
+            "gen-a",
+            &VersionProbe::Unavailable
+        ));
+    }
+
+    /// Cold prepared hydration with KV unavailable must trust the signed
+    /// plan (its own `config_generation`) instead of manufacturing an
+    /// isolate-local generation and falling back to a full dynamic build.
+    #[wasm_bindgen_test]
+    fn prepared_plan_is_trusted_when_probe_fails() {
+        assert!(prepared_generation_matches(
+            "gen-a",
+            &VersionProbe::Unavailable
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn unbound_plan_is_never_trusted_even_when_probe_fails() {
+        assert!(!prepared_generation_matches(
+            impresspress_core::UNBOUND_CONFIG_GENERATION,
+            &VersionProbe::Unavailable
+        ));
+    }
+
+    /// The dynamic warm path mirrors the prepared one: probe error ⇒ keep
+    /// serving the last valid runtime; never rebuild on unavailability alone.
+    #[wasm_bindgen_test]
+    fn dynamic_probe_error_keeps_last_valid_runtime() {
+        assert!(!dynamic_probe_requires_rebuild(
+            false,
+            false,
+            "v1",
+            &VersionProbe::Unavailable
+        ));
+        // A genuine version move still rebuilds…
+        assert!(dynamic_probe_requires_rebuild(
+            false,
+            false,
+            "v1",
+            &VersionProbe::Stamped("v2".to_string())
+        ));
+        // …a matching stamp does not…
+        assert!(!dynamic_probe_requires_rebuild(
+            false,
+            false,
+            "v1",
+            &VersionProbe::Stamped("v1".to_string())
+        ));
+        // …and dirty or environment changes always do, probe or no probe.
+        assert!(dynamic_probe_requires_rebuild(
+            true,
+            false,
+            "v1",
+            &VersionProbe::Unavailable
+        ));
+        assert!(dynamic_probe_requires_rebuild(
+            false,
+            true,
+            "v1",
+            &VersionProbe::Unavailable
+        ));
+    }
+
+    /// A cold request that lost the build-slot race and cannot verify
+    /// freshness (KV error) serves the cached runtime rather than paying for
+    /// a request-local dynamic build it cannot version-tag honestly.
+    #[wasm_bindgen_test]
+    fn transient_dynamic_serves_cached_runtime_when_probe_fails() {
+        assert!(transient_dynamic_can_serve_cached(
+            "v1",
+            &VersionProbe::Unavailable
+        ));
+        assert!(transient_dynamic_can_serve_cached(
+            "v1",
+            &VersionProbe::Stamped("v1".to_string())
+        ));
+        assert!(!transient_dynamic_can_serve_cached(
+            "v1",
+            &VersionProbe::Stamped("v2".to_string())
+        ));
+    }
+
+    /// The probe window is the 2026-08-31 read-quota fix: ~45s average per
+    /// isolate burned ~1,920 reads/day/isolate against a 100k/day allowance.
+    /// Pin the window to the reviewed 5–10 minute range as a property, not an
+    /// exact value.
+    #[wasm_bindgen_test]
+    fn probe_window_is_five_to_ten_minutes() {
+        assert!(PROBE_INTERVAL_FLOOR_MS >= 300_000);
+        assert!(PROBE_INTERVAL_FLOOR_MS + PROBE_INTERVAL_JITTER_MS <= 600_000);
+    }
+
+    /// With a 5-minute jitter width, two random bytes (max 65,535ms) would
+    /// silently cap the spread at ~65s and re-synchronize isolates that
+    /// warmed together. The jitter source must be at least 32 bits wide.
+    #[wasm_bindgen_test]
+    fn probe_jitter_uses_more_than_16_bits_of_randomness() {
+        let jitter = probe_jitter_ms(16_777_215);
+        assert_eq!(jitter, 16_777_215 % PROBE_INTERVAL_JITTER_MS);
+        assert!(u64::from(u32::try_from(jitter).unwrap()) > u64::from(u16::MAX));
+        assert!(probe_jitter_ms(u32::MAX) < PROBE_INTERVAL_JITTER_MS);
+    }
+
+    /// A cached prepared runtime must be servable when the probe is
+    /// unavailable: the signed plan is already trusted on that path, so
+    /// paying a fresh hydration for the same plan is pure waste.
+    #[wasm_bindgen_test]
+    fn prepared_cached_config_is_served_when_probe_is_unavailable() {
+        assert!(prepared_cached_config_matches(
+            Some("gen-a"),
+            &VersionProbe::Unavailable
+        ));
+        assert!(prepared_cached_config_matches(
+            Some("gen-a"),
+            &VersionProbe::Stamped("gen-a".to_string())
+        ));
+        assert!(!prepared_cached_config_matches(
+            Some("gen-a"),
+            &VersionProbe::Stamped("gen-b".to_string())
+        ));
+        // A dynamic runtime (no config_version) is not a prepared cache hit.
+        assert!(!prepared_cached_config_matches(
+            None,
+            &VersionProbe::Unavailable
+        ));
+    }
+
+    /// Retrying an exhausted daily allowance at the normal cadence provides
+    /// no freshness and just manufactures failed operations: consecutive
+    /// probe failures must widen the window, up to a cap.
+    /// The cap must bound the DEADLINE, not just the pre-jitter window.
+    /// `probe_failure_window_ms` is clamped and then jitter was added on top,
+    /// so the real ceiling exceeded the documented one by the full jitter
+    /// width — the helper's own test could not see it because it never looked
+    /// at the deadline.
+    #[wasm_bindgen_test]
+    fn probe_failure_deadline_never_exceeds_the_documented_cap() {
+        let now = 1_000_000;
+        for failures in [1u32, 2, 5, 10, u32::MAX] {
+            for jitter in [0, PROBE_INTERVAL_JITTER_MS - 1] {
+                let deadline = probe_failure_deadline_ms(now, failures, jitter);
+                assert!(
+                    deadline > now,
+                    "a widened window must still be in the future"
+                );
+                assert!(
+                    deadline <= now + PROBE_FAILURE_BACKOFF_CAP_MS,
+                    "failures={failures} jitter={jitter} produced {} past the cap",
+                    deadline - now
+                );
+            }
+        }
+        // Jitter must still spread isolates apart below the cap.
+        assert_ne!(
+            probe_failure_deadline_ms(now, 1, 0),
+            probe_failure_deadline_ms(now, 1, 60_000)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn probe_failure_backoff_doubles_and_caps() {
+        assert_eq!(probe_failure_window_ms(0), PROBE_INTERVAL_FLOOR_MS);
+        assert_eq!(probe_failure_window_ms(1), 2 * PROBE_INTERVAL_FLOOR_MS);
+        assert!(probe_failure_window_ms(2) <= PROBE_FAILURE_BACKOFF_CAP_MS);
+        assert_eq!(probe_failure_window_ms(10), PROBE_FAILURE_BACKOFF_CAP_MS);
+        // Absurd counts must not overflow the shift.
+        assert_eq!(
+            probe_failure_window_ms(u32::MAX),
+            PROBE_FAILURE_BACKOFF_CAP_MS
+        );
     }
 }
