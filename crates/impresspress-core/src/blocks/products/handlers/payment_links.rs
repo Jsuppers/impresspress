@@ -3,7 +3,7 @@
 use wafer_core::clients::database::Record;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
-use super::offers::{self, OfferAccess};
+use super::offers::{self, OfferAccess, ProductState};
 use crate::{
     blocks::products::{
         contracts::{CheckoutPresetRequest, PaymentLinkCreateRequest},
@@ -25,8 +25,9 @@ async fn authorized_offer(
     ctx: &dyn Context,
     msg: &Message,
     access: OfferAccess,
+    state: ProductState,
 ) -> Result<Record, OutputStream> {
-    let product = offers::verify_product(ctx, msg, access).await?;
+    let product = offers::verify_product(ctx, msg, access, state).await?;
     if offers::offer_id(msg).is_empty() {
         return Err(err_bad_request("Missing offer ID"));
     }
@@ -46,7 +47,7 @@ pub(super) async fn list_presets(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::Live).await {
         return response;
     }
     match checkout_presets::list_for_offer(ctx, offers::offer_id(msg)).await {
@@ -60,7 +61,7 @@ pub(super) async fn get_preset(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::Live).await {
         return response;
     }
     if preset_id(msg).is_empty() {
@@ -78,7 +79,7 @@ pub(super) async fn create_preset(
     input: InputStream,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::Live).await {
         return response;
     }
     let request: CheckoutPresetRequest = match body(input).await {
@@ -97,7 +98,7 @@ pub(super) async fn update_preset(
     input: InputStream,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::Live).await {
         return response;
     }
     if preset_id(msg).is_empty() {
@@ -118,7 +119,7 @@ pub(super) async fn archive_preset(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::Live).await {
         return response;
     }
     if preset_id(msg).is_empty() {
@@ -135,7 +136,9 @@ pub(super) async fn list_links(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    // Widened for the same reason as the offer listing: naming the links of a
+    // deleted product is how the caller finds the ones still taking money.
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::LiveOrDeleted).await {
         return response;
     }
     match payment_links::list_for_offer(ctx, offers::offer_id(msg)).await {
@@ -150,7 +153,7 @@ pub(super) async fn create_link(
     input: InputStream,
     access: OfferAccess,
 ) -> OutputStream {
-    let product = match authorized_offer(ctx, msg, access).await {
+    let product = match authorized_offer(ctx, msg, access, ProductState::Live).await {
         Ok(product) => product,
         Err(response) => return response,
     };
@@ -169,7 +172,10 @@ pub(super) async fn deactivate_link(
     msg: &Message,
     access: OfferAccess,
 ) -> OutputStream {
-    if let Err(response) = authorized_offer(ctx, msg, access).await {
+    // Widened: deactivation only ever closes. `create_link` above deliberately
+    // stays live-only — opening a new way to charge for a deleted product is
+    // the opposite operation.
+    if let Err(response) = authorized_offer(ctx, msg, access, ProductState::LiveOrDeleted).await {
         return response;
     }
     if link_id(msg).is_empty() {

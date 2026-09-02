@@ -8,8 +8,8 @@ use std::cell::Cell;
 use wafer_block::http_codec;
 use wafer_core::clients::{config as config_client, database as db};
 use wafer_run::{
-    context::Context, streams::output::TerminalNotResponse, BlockInfo, ErrorCode, InputStream,
-    Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
+    context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockInfo, ErrorCode,
+    InputStream, Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
 };
 
 use crate::{
@@ -78,6 +78,34 @@ fn enqueue_request_log(
 /// after each dispatch and persists the rows off the response path.
 pub fn drain_queued_request_logs() -> Vec<QueuedRequestLog> {
     REQUEST_LOG_QUEUE.with(|queue| queue.take().unwrap_or_default())
+}
+
+/// The `AuthLevel` ceiling for this request, used to filter the WebMCP tool
+/// manifest.
+///
+/// Reads the SAME source the router's admin gate enforces with:
+/// `crate::util::is_admin` (`util.rs:173`) inspects the `auth.user_roles`
+/// meta set from the verified JWT by `extract_auth_meta`, and
+/// `routing.rs:375` admits `RouteAccess::Admin` on exactly that basis.
+///
+/// It is tempting to query roles from the database instead. Do not — the
+/// manifest would then answer a different question than the gate. A user
+/// granted admin in the roles table after their token was minted would be
+/// advertised admin tools that the router then 403s (publishing tool names
+/// to someone who cannot invoke them, the precise SEC-073 problem this
+/// filtering exists to prevent), and a revoked admin whose JWT is still live
+/// would be under-reported while the router still admits their calls. Same
+/// source, no drift — and no DB round trip per page view.
+///
+/// Synchronous and infallible by construction: there is nothing to fail.
+fn caller_auth_level(msg: &Message) -> AuthLevel {
+    if msg.user_id().is_empty() {
+        return AuthLevel::Public;
+    }
+    if crate::util::is_admin(msg) {
+        return AuthLevel::Admin;
+    }
+    AuthLevel::Authenticated
 }
 
 /// Handle a impresspress request.
@@ -187,6 +215,71 @@ pub async fn handle_request(
     let client_ip = msg.remote_addr().to_string();
     let user_id = msg.user_id().to_string();
     let start_ms = crate::util::now_millis();
+
+    // WebMCP tool manifest. Placed after step 2 because it needs the resolved
+    // identity — the discovery documents at step 0 are anonymous by design,
+    // this one is not.
+    if path == "/b/webmcp/manifest.json" {
+        let caller = caller_auth_level(&msg);
+
+        // `block_infos` is every REGISTERED block, but `route_to_block`
+        // 404s any block the admin feature toggle has turned off
+        // (routing.rs's feature gate, backed by the live `block_settings`
+        // row). Advertising a disabled block's tools would hand the agent
+        // names that 404 on every call, so the manifest is generated from
+        // the enabled subset only — gated under the same name the router
+        // gates with (`feature_gate_name`; the inspector's `BlockInfo` name
+        // and its route's `block` name differ).
+        let enabled_infos: Vec<BlockInfo> = block_infos
+            .iter()
+            .filter(|b| features.is_block_enabled(routing::feature_gate_name(&b.name)))
+            .cloned()
+            .collect();
+
+        // MUST resolve the auth ceiling with `routing::effective_access`, not
+        // the plain `ep.auth`. This router admits on `max(prefix_tier,
+        // ep.auth)` (routing.rs:440), so a `generate_webmcp_declared_auth`-
+        // style filter on `ep.auth` alone would advertise a Public-declared
+        // endpoint mounted under an Admin prefix to anonymous callers — the
+        // router still 403s, so it is not a data leak, but it publishes a
+        // tool name the caller cannot use (the recon surface this filtering
+        // exists to prevent) and hands the agent a tool that always fails.
+        //
+        // `extra_routes` is threaded in so a downstream `add_route` — which
+        // `route_to_block` enforces just like a built-in — is resolved too.
+        //
+        // MUST be `generate_webmcp_report`, not `generate_webmcp`. This
+        // route is unauthenticated and served with `Cache-Control: no-store`,
+        // so every anonymous GET re-runs generation; `generate_webmcp`'s
+        // wrapper logs one `tracing::warn!` per refused endpoint on every
+        // call, which turns an unauthenticated endpoint into unbounded
+        // warn-level log volume for a caller in a loop. Refusals are mostly
+        // static — a defect in a block's own declarations, identical for
+        // every call and every caller — with one exception:
+        // `DuplicateToolName` is counted per-manifest against the
+        // auth-filtered set this same `caller`/effective-auth pair would
+        // produce (see `generate_webmcp_report`'s doc comment, "Refusals are
+        // the same for every caller — with one exception"), so it is not
+        // static across callers, only across repeated calls by the same
+        // caller. Either way they are computed and logged exactly once, at
+        // runtime construction, in `builder::registration::build()` (using
+        // an `AuthLevel::Admin` ceiling, which — because the auth filter is
+        // monotone — still sees every collision that exists anywhere,
+        // including ones invisible at this route's actual `caller`). The
+        // manifest content emitted here is unaffected either way: `_report`
+        // runs the identical generation and only changes where the refusal
+        // list goes. Refusals discarded on purpose — see the comment above.
+        let (body, _refused) =
+            wafer_core::discovery::generate_webmcp_report(&enabled_infos, caller, |block, ep| {
+                routing::effective_access(block, ep, extra_routes)
+            });
+
+        // Per-session by construction: a shared cache serving one visitor's
+        // manifest to another would leak the privileged tool surface.
+        return ResponseBuilder::new()
+            .set_header("Cache-Control", "no-store")
+            .json(&body);
+    }
 
     // 2a. CSRF: cookie-authenticated unsafe-method requests must pass the
     // Fetch-Metadata/Origin/Referer policy before any block sees them. Bearer
@@ -389,12 +482,12 @@ mod discovery_tests {
     //!     declare schemas, so `wafer_core::discovery::generate_openapi`
     //!     (which skips any endpoint failing `has_schema()`) includes them.
 
-    use wafer_run::{Block, BlockInfo, InputStream};
+    use wafer_run::{AuthLevel, Block, BlockEndpoint, BlockInfo, InputStream};
 
     use super::handle_request;
     use crate::{
         blocks::{auth_ui::AuthUiBlock, files::FilesBlock, products::ProductsBlock},
-        features::AllEnabled,
+        features::{AllEnabled, FeatureConfig},
         test_support::{anon_msg, collect_or_panic, TestContext},
     };
 
@@ -890,6 +983,528 @@ mod discovery_tests {
                 "removed legacy builder path must not be documented: {path}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // WebMCP manifest — the third discovery document, but auth-filtered and
+    // per-session (unlike `/openapi.json` and the agent card, which are
+    // anonymous by design).
+    // -------------------------------------------------------------------
+
+    /// Like `discovery_json`, but returns the response headers instead of
+    /// parsing the body — used to assert on `Cache-Control`.
+    async fn discovery_headers(
+        ctx: &TestContext,
+        path: &str,
+        host: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut msg = anon_msg("retrieve", path);
+        msg.set_meta("http.header.host", host);
+        let out = handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            "test-jwt-secret",
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        buf.meta
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .key
+                    .strip_prefix("resp.header.")
+                    .map(|name| (name.to_string(), entry.value))
+            })
+            .collect()
+    }
+
+    /// Drive `GET /b/webmcp/manifest.json` through the whole pipeline and
+    /// return the parsed manifest.
+    ///
+    /// `roles: None` sends no `Authorization` header at all (an anonymous
+    /// visitor). `Some(roles)` mints a real, signed access token carrying
+    /// that `roles` claim — `Some(&[])` is a logged-in non-admin,
+    /// `Some(&["admin"])` an admin.
+    ///
+    /// Deliberately NOT `test_support::auth_msg` / `admin_msg`, which stamp
+    /// `auth.user_id` / `auth.user_roles` directly onto the `Message`
+    /// before `handle_request` ever runs. That would leave the identity
+    /// populated even if the WebMCP manifest branch were wrongly placed at
+    /// step 0 — before `extract_auth_meta` populates auth meta from the
+    /// header — which would defeat the tests that exist to catch that
+    /// placement bug. Only a Bearer header that step 2 must independently
+    /// verify exercises the ordering.
+    async fn webmcp_manifest(
+        ctx: &TestContext,
+        roles: Option<&[&str]>,
+        infos: &[BlockInfo],
+        features: &dyn FeatureConfig,
+    ) -> serde_json::Value {
+        use std::{collections::HashMap, time::Duration};
+
+        use wafer_block_crypto::primitives;
+
+        let secret = "test-jwt-secret";
+        let auth_header = roles.map(|roles| {
+            let derived = primitives::derive_block_key(
+                secret.as_bytes(),
+                crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+            );
+            let mut claims = HashMap::new();
+            claims.insert("sub".to_string(), serde_json::json!("user-webmcp-1"));
+            claims.insert("type".to_string(), serde_json::json!("access"));
+            // Must match `expected_issuer`'s default
+            // (`crate::blocks::auth::helpers::expected_issuer`) — this
+            // test's `TestContext` has no `WAFER_RUN_SHARED__FRONTEND_URL`
+            // configured.
+            claims.insert(
+                "iss".to_string(),
+                serde_json::json!("http://localhost:5173"),
+            );
+            claims.insert("roles".to_string(), serde_json::json!(roles));
+            let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+                .expect("test jwt_sign");
+            format!("Bearer {token}")
+        });
+
+        let mut msg = anon_msg("retrieve", "/b/webmcp/manifest.json");
+        msg.set_meta("http.header.host", "impresspress.example.com");
+        let out = handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            auth_header.as_deref(),
+            secret,
+            false,
+            features,
+            infos,
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        serde_json::from_slice(&buf.body).expect("manifest response is valid JSON")
+    }
+
+    /// Every tool name in a manifest.
+    fn tool_names(manifest: &serde_json::Value) -> Vec<&str> {
+        manifest["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name"))
+            .collect()
+    }
+
+    /// A block declaring one Admin-tier agent tool.
+    ///
+    /// Nothing shipped declares one — every real tool today is Public or
+    /// Authenticated — so without this fixture no assertion could tell
+    /// `caller_auth_level`'s Admin branch apart from its Authenticated
+    /// branch: both would produce the same tool set, and an Admin test
+    /// would pass whether or not the branch worked. Mounted under
+    /// `/b/admin/`, so `routing::effective_access` resolves it to Admin the
+    /// same way the router would.
+    fn admin_tool_block() -> BlockInfo {
+        BlockInfo::new(
+            "impresspress/admin",
+            "0.0.1",
+            "http-handler@v1",
+            "admin tool probe",
+        )
+        .endpoints(vec![BlockEndpoint::get("/b/admin/api/tool-probe")
+            .summary("Admin-only probe")
+            .auth(AuthLevel::Admin)
+            .agent_tool("admin_only_probe", "An admin-only probe tool.")])
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_is_served_and_versioned() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        assert_eq!(body["schema_version"], serde_json::json!(1));
+        assert!(
+            body["tools"].is_array(),
+            "manifest must carry a tools array: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_for_anonymous_caller_contains_no_privileged_tools() {
+        let ctx = TestContext::new().await;
+
+        // An unauthenticated request must see Public tools only. Anything
+        // requiring a session is recon surface if its name is published
+        // here. `list_my_purchases` is the shipped Authenticated tool;
+        // `admin_only_probe` (fixture) covers the Admin tier, which nothing
+        // shipped declares.
+        let mut infos = real_block_infos();
+        infos.push(admin_tool_block());
+        let body = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let names = tool_names(&body);
+
+        for forbidden in ["list_my_purchases", "admin_only_probe"] {
+            assert!(
+                !names.contains(&forbidden),
+                "anonymous manifest must not name the privileged tool {forbidden}: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_manifest_exposes_the_storefront_purchase_path() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+        let names = tool_names(&body);
+
+        for expected in [
+            "get_storefront_config",
+            "get_product",
+            "preview_price",
+            "start_checkout",
+            "get_order_status",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "anonymous visitors must get the public purchase path; missing {expected}: {names:?}"
+            );
+        }
+    }
+
+    /// Pins the producer-to-consumer contract for `invocation` — the object
+    /// `ui/assets/webmcp.js` reads to build every request it makes.
+    ///
+    /// `webmcp.js` has no test infrastructure of its own, and the wafer-run
+    /// rev this consumes is pinned to a branch that is still moving, so a
+    /// producer-side rename (`path_params` to `pathParams`, a dropped
+    /// `method`, a changed placeholder syntax) would otherwise land silently
+    /// green here and break every tool at runtime. Asserting the WHOLE
+    /// object — not a key at a time — is what makes a rename fail.
+    ///
+    /// `get_order_status` is the tool that exercises both a path param and
+    /// a query param, so it pins the most contract surface of the six.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_the_producer_invocation_contract() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "get_order_status")
+            .unwrap_or_else(|| panic!("get_order_status must be published: {body}"));
+
+        assert_eq!(
+            tool["invocation"],
+            serde_json::json!({
+                "method": "get",
+                "path": "/b/products/orders/{id}/status",
+                "path_params": ["id"],
+                "query_params": ["receipt_token"],
+                "body_params": [],
+            }),
+            "invocation shape drifted from what ui/assets/webmcp.js reads: {tool}"
+        );
+    }
+
+    /// Pins the producer-to-consumer contract for `outputSchema` — the field
+    /// `ui/assets/webmcp.js` now reads to decide whether to pass a schema to
+    /// `registerTool` and to populate `structuredContent` from the parsed
+    /// response body.
+    ///
+    /// `get_order_status` declares a self-contained, object-shaped
+    /// `output_schema` with no `$ref`s, so the producer's projection
+    /// (`wafer_core::discovery::agent_output_schema`) has nothing to inline
+    /// and must publish it unchanged. Asserting the WHOLE object, the same
+    /// way `webmcp_manifest_pins_the_producer_invocation_contract` does for
+    /// `invocation`, is what makes a producer-side rename (`outputSchema` to
+    /// `output_schema`, or a dropped field) fail loudly here instead of
+    /// silently breaking `webmcp.js` at runtime.
+    #[tokio::test]
+    async fn webmcp_manifest_pins_the_producer_output_schema_contract() {
+        let ctx = TestContext::new().await;
+        let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
+
+        let tool = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "get_order_status")
+            .unwrap_or_else(|| panic!("get_order_status must be published: {body}"));
+
+        assert_eq!(
+            tool["outputSchema"],
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["schema_version", "order_id", "status", "reconciliation_status", "amounts", "subscription_cancel_at_period_end"],
+                "properties": {
+                    "schema_version": {"type": "integer"},
+                    "order_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "reconciliation_status": {"type": "string"},
+                    "amounts": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["currency", "subtotal_minor", "discount_minor", "tax_minor", "shipping_minor", "platform_fee_minor", "total_minor"],
+                        "properties": {
+                            "currency": {"type": "string"},
+                            "subtotal_minor": {"type": "integer"},
+                            "discount_minor": {"type": "integer"},
+                            "tax_minor": {"type": "integer"},
+                            "shipping_minor": {"type": "integer"},
+                            "platform_fee_minor": {"type": "integer"},
+                            "total_minor": {"type": "integer"}
+                        }
+                    },
+                    "subscription_status": {"type": "string"},
+                    "subscription_current_period_end": {"type": "string", "format": "date-time"},
+                    "subscription_cancel_at_period_end": {"type": "boolean"},
+                    "paid_at": {"type": "string", "format": "date-time"},
+                    "refunded_at": {"type": "string", "format": "date-time"}
+                }
+            }),
+            "outputSchema shape drifted from what ui/assets/webmcp.js reads: {tool}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_is_not_cacheable() {
+        let ctx = TestContext::new().await;
+        let headers =
+            discovery_headers(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
+
+        let cache_control = headers
+            .get("Cache-Control")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            cache_control.contains("no-store"),
+            "the manifest is per-session and must not be cached, got: {cache_control:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webmcp_manifest_reflects_an_authenticated_caller() {
+        let ctx = TestContext::with_auth().await;
+
+        // A valid session for a non-admin user (empty `roles` claim).
+        let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
+        let names = tool_names(&body);
+
+        assert!(
+            names.contains(&"list_my_purchases"),
+            "an authenticated caller must receive Authenticated-level tools — if this \
+             fails with only Public tools present, the manifest branch is running \
+             before auth meta is set (step 0 instead of after step 2): {names:?}"
+        );
+    }
+
+    /// `caller_auth_level`'s Admin branch: an `admin` role in the verified
+    /// JWT must raise the manifest's ceiling to Admin, not stop at
+    /// Authenticated.
+    #[tokio::test]
+    async fn webmcp_manifest_reflects_an_admin_caller() {
+        let ctx = TestContext::with_auth().await;
+        let mut infos = real_block_infos();
+        infos.push(admin_tool_block());
+
+        let as_admin = webmcp_manifest(&ctx, Some(&["admin"]), &infos, &AllEnabled).await;
+        let admin_names = tool_names(&as_admin);
+        assert!(
+            admin_names.contains(&"admin_only_probe"),
+            "an admin session must receive Admin-level tools: {admin_names:?}"
+        );
+        assert!(
+            admin_names.contains(&"list_my_purchases"),
+            "an admin is also authenticated — the lower tiers must still be there: {admin_names:?}"
+        );
+
+        // The discriminating half: the SAME blocks, for a logged-in caller
+        // without the role. If this passed too, the assertions above would
+        // prove nothing about the Admin branch specifically.
+        let as_user = webmcp_manifest(&ctx, Some(&[]), &infos, &AllEnabled).await;
+        let user_names = tool_names(&as_user);
+        assert!(
+            !user_names.contains(&"admin_only_probe"),
+            "a logged-in non-admin must NOT receive Admin-level tools: {user_names:?}"
+        );
+    }
+
+    /// The manifest must not advertise tools from a block the admin
+    /// disable toggle has turned off — `route_to_block` 404s every call to
+    /// such a block, so every advertised tool would fail.
+    #[tokio::test]
+    async fn disabled_block_contributes_no_tools() {
+        // Everything on except `impresspress/products` — the shape a live
+        // admin toggle produces.
+        struct ProductsDisabled;
+        impl FeatureConfig for ProductsDisabled {
+            fn is_block_enabled(&self, full_name: &str) -> bool {
+                full_name != "impresspress/products"
+            }
+        }
+
+        let ctx = TestContext::new().await;
+        let infos = real_block_infos();
+
+        let enabled = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        assert!(
+            tool_names(&enabled).contains(&"get_product"),
+            "precondition: the products block publishes tools while enabled: {enabled}"
+        );
+
+        let disabled = webmcp_manifest(&ctx, None, &infos, &ProductsDisabled).await;
+        assert_eq!(
+            tool_names(&disabled),
+            Vec::<&str>::new(),
+            "a disabled block must contribute no tools — every call to it 404s: {disabled}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Refusal-logging amplification (see also
+    // `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`
+    // for the "still reported somewhere" half of this fix).
+    // -------------------------------------------------------------------
+
+    /// Minimal `tracing::Subscriber` that records the rendered `message`
+    /// field of every event it sees, so a test can assert on what was (or
+    /// was not) logged without pulling in `tracing-subscriber`.
+    #[derive(Clone, Default)]
+    struct MessageCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MessageVisitor<'a> {
+        out: &'a mut String,
+    }
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.out = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for MessageCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MessageVisitor { out: &mut message });
+            self.0
+                .lock()
+                .expect("MessageCapture mutex poisoned")
+                .push(message);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    impl MessageCapture {
+        fn count_containing(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .expect("MessageCapture mutex poisoned")
+                .iter()
+                .filter(|m| m.contains(needle))
+                .count()
+        }
+    }
+
+    /// The exact text `generate_webmcp`'s wrapper (and now
+    /// `builder::registration::build()`) attaches to the refusal warning —
+    /// duplicated here rather than imported so this test does not depend on
+    /// the message staying byte-for-byte in sync with production wording
+    /// beyond this recognizable substring.
+    const REFUSAL_WARNING: &str =
+        "webmcp: endpoint opted in to agent-tool exposure but was refused";
+
+    /// A block declaring two endpoints that opt into the SAME tool name —
+    /// `WebMcpRefusal::DuplicateToolName`. Unlike every other refusal
+    /// reason, this one is caller-dependent in general (its census is
+    /// counted per auth-filtered manifest — see
+    /// `generate_webmcp_report`'s doc comment), but both endpoints here
+    /// declare the same `Public` auth, so the collision is visible to every
+    /// caller and the distinction does not matter for this fixture. Used to
+    /// prove the per-request manifest path no longer logs about it.
+    fn duplicate_tool_name_block() -> BlockInfo {
+        BlockInfo::new(
+            "test/webmcp-refusal-fixture",
+            "0.0.1",
+            "http-handler@v1",
+            "two endpoints sharing one tool name, on purpose",
+        )
+        .endpoints(vec![
+            BlockEndpoint::get("/b/webmcp-refusal-fixture/one")
+                .summary("first")
+                .auth(AuthLevel::Public)
+                .agent_tool("webmcp_refusal_fixture_dup", "first"),
+            BlockEndpoint::get("/b/webmcp-refusal-fixture/two")
+                .summary("second")
+                .auth(AuthLevel::Public)
+                .agent_tool("webmcp_refusal_fixture_dup", "second"),
+        ])
+    }
+
+    /// The bug this whole fix targets: N refused endpoints previously meant
+    /// N `tracing::warn!` calls on EVERY GET of the unauthenticated,
+    /// `no-store` manifest route — unbounded warn-level log volume for any
+    /// anonymous caller that loops the request. Refusals are static across
+    /// repeated calls by the same caller (this fixture's `DuplicateToolName`
+    /// refusal happens to also be the same across callers, since both
+    /// endpoints share one auth tier — that is not true of the reason in
+    /// general), so the per-request path must log zero of them; they are
+    /// logged once elsewhere instead (see
+    /// `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`).
+    #[tokio::test]
+    async fn webmcp_manifest_request_does_not_log_refusals() {
+        let ctx = TestContext::new().await;
+        let infos = vec![duplicate_tool_name_block()];
+
+        // Precondition: this fixture really does trigger a refusal — both
+        // endpoints sharing the name — so a silently-inert fixture couldn't
+        // make the assertion below pass vacuously.
+        let (_, refused) = wafer_core::discovery::generate_webmcp_report(
+            &infos,
+            AuthLevel::Admin,
+            |_block, ep| ep.auth,
+        );
+        assert_eq!(
+            refused.len(),
+            2,
+            "precondition: both endpoints sharing the tool name must be refused: {refused:?}"
+        );
+
+        let capture = MessageCapture::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        // Hit the manifest endpoint more than once — the bug is per-request
+        // amplification, so one call passing would be weak evidence.
+        let _first = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        let _second = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
+        drop(guard);
+
+        assert_eq!(
+            capture.count_containing(REFUSAL_WARNING),
+            0,
+            "the per-request manifest path must not log per-refusal warnings — refusals \
+             are static across repeated calls and are logged once, at runtime \
+             construction, not per anonymous request"
+        );
     }
 }
 

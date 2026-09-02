@@ -14,7 +14,7 @@ mod stripe_provider;
 mod tests;
 
 pub(crate) use handlers::{
-    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCTS_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
+    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
 };
 pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
@@ -27,7 +27,10 @@ use super::rate_limit::{
     check_route_limits, check_user_rate_limit, LimitKey, RateLimit, RateLimitOutcome, RouteLimit,
     UserRateLimiter,
 };
-use crate::http::{err_forbidden, err_not_found};
+use crate::{
+    http::{err_forbidden, err_not_found},
+    util,
+};
 
 /// Public commerce operations are keyed by client IP because guest storefronts
 /// deliberately have no authenticated user. Each category can be overridden
@@ -1022,7 +1025,7 @@ crate::impresspress_feature_block! {
             // source for both runtime `migrations::apply()` and the
             // Cloudflare D1 build).
             .collections(vec![
-                CollectionSchema::new(PRODUCTS_TABLE),
+                CollectionSchema::new(repo::products::TABLE),
                 CollectionSchema::new(GROUPS_TABLE),
                 CollectionSchema::new(TYPES_TABLE),
                 CollectionSchema::new(PURCHASES_TABLE),
@@ -1103,6 +1106,12 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/admin/manage").summary("Manage products").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/new").summary("Create product").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/products/{id}").summary("Manage product").auth(AuthLevel::Admin),
+                // `/b/products` is a PUBLIC route prefix, so this declaration
+                // is the only thing that makes the page admin-only.
+                BlockEndpoint::get("/b/products/admin/products/{id}/close")
+                    .summary("Close a deleted product's Stripe surface")
+                    .description("Archive the offers and deactivate the payment links of a soft-deleted product, without restoring it to the catalog.")
+                    .auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/products/admin/groups").summary("Manage groups").auth(AuthLevel::Admin),
 
                 BlockEndpoint::get("/b/products/admin/purchases").summary("Purchases").auth(AuthLevel::Admin),
@@ -1171,6 +1180,13 @@ crate::impresspress_feature_block! {
                     .path_params_schema(id_path_schema.clone())
                     .output_schema(record_schema(product_schema.clone()))
                     .tags(&["products", "admin", "moderation"]),
+                BlockEndpoint::post("/b/products/api/admin/products/{id}/restore")
+                    .summary("Restore a soft-deleted product")
+                    .description("Clears `deleted_at`, undoing `soft_delete`. A soft-deleted product is not editable through the normal admin PATCH until it is restored.")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(id_path_schema.clone())
+                    .output_schema(record_schema(product_schema.clone()))
+                    .tags(&["products", "admin"]),
                 BlockEndpoint::get("/b/products/api/admin/products/{product_id}/offers")
                     .summary("List product offers")
                     .auth(AuthLevel::Admin)
@@ -1800,7 +1816,12 @@ crate::impresspress_feature_block! {
                             "stripe_mode": {"type": "string", "enum": ["test", "live"]}
                         }
                     }))
-                    .tags(&["products", "storefront"]),
+                    .tags(&["products", "storefront"])
+                    .agent_tool(
+                        "get_storefront_config",
+                        "Get this store's checkout configuration, including whether embedded \
+                         checkout is available. Call once before starting a checkout.",
+                    ),
                 BlockEndpoint::get("/b/products/storefront/{product_id}")
                     .summary("Storefront product and offers")
                     .description("Safe public product detail with active offer summaries and public pricing inputs; internal ownership, provider, and pricing-rule fields are omitted.")
@@ -1849,7 +1870,12 @@ crate::impresspress_feature_block! {
                         }
                     }))
                     .auth(AuthLevel::Public)
-                    .tags(&["products", "storefront"]),
+                    .tags(&["products", "storefront"])
+                    .agent_tool(
+                        "get_product",
+                        "Get one product's full details and its purchasable offers, including \
+                         pricing inputs. Call this before previewing a price or starting checkout.",
+                    ),
                 BlockEndpoint::post("/b/products/webhooks")
                     .summary("Receive signed Stripe webhook events")
                     .description("Public transport endpoint authenticated by the Stripe-Signature HMAC header. Raw request bytes are verified before parsing or applying any side effect.")
@@ -1886,14 +1912,29 @@ crate::impresspress_feature_block! {
                     .input_schema(pricing_preview_input_schema)
                     .output_schema(pricing_preview_output_schema)
                     .auth(AuthLevel::Public)
-                    .tags(&["products", "pricing"]),
+                    .tags(&["products", "pricing"])
+                    .agent_tool(
+                        "preview_price",
+                        "Calculate the exact total for an offer given the customer's chosen \
+                         options, before any payment. Returns amounts in integer minor units. \
+                         Use this to answer 'how much would X cost' without starting checkout.",
+                    ),
                 BlockEndpoint::post("/b/products/checkout")
                     .summary("Stripe checkout")
                     .description("Create a hosted or embedded Stripe Checkout Session from a public active offer. Guest checkout is supported and every amount is resolved from the immutable offer.")
                     .input_schema(checkout_input_schema)
                     .output_schema(checkout_output_schema)
                     .auth(AuthLevel::Public)
-                    .tags(&["products", "checkout"]),
+                    .tags(&["products", "checkout"])
+                    .agent_tool(
+                        "start_checkout",
+                        "Begin a purchase and return a Stripe checkout URL for the customer to \
+                         complete. Always send `presentation: \"hosted\"` — the `embedded` and \
+                         `payment_link` modes leave `checkout_url` null and return values only a \
+                         web page can use. This does NOT complete the payment: always give the \
+                         returned `checkout_url` to the customer so they can confirm and pay \
+                         themselves.",
+                    ),
                 BlockEndpoint::get("/b/products/orders/{id}/status")
                     .summary("Guest checkout status")
                     .description("Returns a minimal order projection when supplied with the short-lived receipt capability issued at checkout. Buyer and provider identifiers are omitted.")
@@ -1926,7 +1967,12 @@ crate::impresspress_feature_block! {
                             "refunded_at": {"type": "string", "format": "date-time"}
                         }
                     }))
-                    .tags(&["products", "storefront"]),
+                    .tags(&["products", "storefront"])
+                    .agent_tool(
+                        "get_order_status",
+                        "Check whether an order has been paid, using the receipt token issued \
+                         when checkout started. Use this after the customer says they have paid.",
+                    ),
                 BlockEndpoint::get("/b/products/purchases")
                     .summary("List own purchases")
                     .auth(AuthLevel::Authenticated)
@@ -1938,7 +1984,12 @@ crate::impresspress_feature_block! {
                         }
                     }))
                     .output_schema(purchase_list_schema)
-                    .tags(&["products", "orders"]),
+                    .tags(&["products", "orders"])
+                    .agent_tool(
+                        "list_my_purchases",
+                        "List the signed-in customer's own past purchases. Requires a signed-in \
+                         session; returns nothing useful for anonymous visitors.",
+                    ),
                 BlockEndpoint::get("/b/products/purchases/{id}")
                     .summary("Get own purchase")
                     .auth(AuthLevel::Authenticated)
@@ -2007,9 +2058,36 @@ crate::impresspress_feature_block! {
                                 return pages::admin_seller_detail(ctx, &msg, seller_id).await;
                             }
                         }
-                        if let Some(product_id) = admin_sub.strip_prefix("/products/") {
-                            if !product_id.is_empty() && !product_id.contains('/') {
-                                return pages::product_manager(ctx, &msg, product_id, true).await;
+                        if let Some(rest) = admin_sub.strip_prefix("/products/") {
+                            // `/products/{id}/close` first: the plain manager
+                            // below rejects any remainder containing a `/`,
+                            // so an ordering slip here is a 404, not a
+                            // mis-dispatch.
+                            if let Some(product_id) = rest.strip_suffix("/close") {
+                                if !product_id.is_empty() && !product_id.contains('/') {
+                                    return pages::deleted_product_close(
+                                        ctx,
+                                        &msg,
+                                        &util::url_path_decode(product_id),
+                                    )
+                                    .await;
+                                }
+                            }
+                            // Decoded for the same reason `endpoint_match`
+                            // decodes its `{name}` bindings: the id reaches
+                            // here exactly as it appeared on the wire, and
+                            // both the pages that link here and
+                            // `productManagerDuplicate`'s
+                            // `encodeURIComponent` navigation put it there
+                            // encoded.
+                            if !rest.is_empty() && !rest.contains('/') {
+                                return pages::product_manager(
+                                    ctx,
+                                    &msg,
+                                    &util::url_path_decode(rest),
+                                    true,
+                                )
+                                .await;
                             }
                         }
                         err_not_found("not found")
@@ -2058,7 +2136,13 @@ crate::impresspress_feature_block! {
                     }
                     let product_id = sub.strip_prefix("/my-products/").unwrap_or_default();
                     if !product_id.is_empty() && !product_id.contains('/') {
-                        return pages::product_manager(ctx, &msg, product_id, false).await;
+                        return pages::product_manager(
+                            ctx,
+                            &msg,
+                            &util::url_path_decode(product_id),
+                            false,
+                        )
+                        .await;
                     }
                 }
                 "/my-purchases" => return pages::my_purchases(ctx, &msg).await,
