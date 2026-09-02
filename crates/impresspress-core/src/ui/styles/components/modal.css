@@ -94,7 +94,7 @@ dialog.modal input[type="password"] {
 	border-radius: 6px;
 	font-size: 0.875rem;
 	color: var(--text-primary);
-	background: var(--bg-card, #fff);
+	background: var(--surface-1);
 }
 /* Focus ring comes from the global :where(...):focus-visible rule in
    base.css (the old `outline: var(--focus-ring)` here was an invalid

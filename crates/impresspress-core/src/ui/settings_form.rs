@@ -129,7 +129,7 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
                     div .value-reveal-wrapper {
                         input .form-input #(var.key) name=(var.key) type="password" value=(value)
                             placeholder=(if has_value { "******** (set)" } else { "Not configured" });
-                        button type="button" .btn .btn-ghost .btn-icon .btn-icon-right
+                        button type="button" .btn .btn--ghost .btn--icon .btn-icon-right
                             onclick={"var i=document.getElementById('" (var.key) "');if(i.type==='password'){i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')}else{i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')}"}
                             title="Reveal"
                             aria-label="Reveal value"

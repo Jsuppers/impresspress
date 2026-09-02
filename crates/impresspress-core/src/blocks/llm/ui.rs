@@ -162,7 +162,7 @@ fn add_provider_form() -> Markup {
                 }
             }
             div .flex .justify-end .mt-3 {
-                button .btn.btn-primary type="submit" { "Add provider" }
+                button .btn.btn--primary type="submit" { "Add provider" }
             }
             // Normalize `models` CSV → JSON array, and coerce `enabled`
             // checkbox to a bool before htmx serialises. Both transforms
@@ -272,7 +272,7 @@ fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
             td {
                 div .flex .gap-2 .flex-wrap {
                     button
-                        .btn.btn-sm.btn-secondary
+                        .btn.btn--sm.btn--secondary
                         hx-post={"/b/llm/api/providers/" (id) "/discover-models"}
                         hx-confirm={"Discover models for \"" (cfg.name) "\" from its /v1/models endpoint?"}
                         hx-on--after-request="if(event.detail.successful){location.reload()}"
@@ -280,7 +280,7 @@ fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
                         "Discover"
                     }
                     button
-                        .btn.btn-sm.btn-danger
+                        .btn.btn--sm.btn--danger
                         hx-delete={"/b/llm/api/providers/" (id)}
                         hx-confirm={"Delete provider \"" (cfg.name) "\"?"}
                         hx-target="closest tr"
@@ -436,7 +436,7 @@ fn model_row(model: &ModelInfo) -> Markup {
             td {
                 div .flex .gap-2 .flex-wrap {
                     button
-                        .btn.btn-sm.btn-secondary
+                        .btn.btn--sm.btn--secondary
                         hx-post=(load_url)
                         hx-swap="none"
                         hx-confirm={"Load model \"" (model_id) "\" on backend \"" (backend_id) "\"?"}
@@ -444,7 +444,7 @@ fn model_row(model: &ModelInfo) -> Markup {
                         "Load"
                     }
                     button
-                        .btn.btn-sm.btn-ghost
+                        .btn.btn--sm.btn--ghost
                         hx-post=(unload_url)
                         hx-swap="none"
                         hx-confirm={"Unload model \"" (model_id) "\" on backend \"" (backend_id) "\"?"}

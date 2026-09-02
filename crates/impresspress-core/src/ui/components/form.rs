@@ -23,7 +23,7 @@ pub fn search_input_with_value(
             div .flex .items-center .gap-2 .mb-2 .text-sm {
                 span .text-muted { "Results for " }
                 span .font-semibold { "\"" (current_value) "\"" }
-                a .btn .btn-ghost .btn-sm
+                a .btn .btn--ghost .btn--sm
                     href=(hx_get)
                     hx-get=(hx_get)
                     hx-target=(hx_target)

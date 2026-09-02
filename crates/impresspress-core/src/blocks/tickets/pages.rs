@@ -110,9 +110,9 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     placeholder="Assignee ID" maxlength="160";
             }
             div .ticket-filter-actions {
-                button .btn .btn-secondary type="submit" { "Filter" }
-                a .btn .btn-ghost href="/b/tickets/admin/types" { "Manage types" }
-                a .btn .btn-ghost href="/b/tickets/admin/settings" { "Settings" }
+                button .btn .btn--secondary type="submit" { "Filter" }
+                a .btn .btn--ghost href="/b/tickets/admin/types" { "Manage types" }
+                a .btn .btn--ghost href="/b/tickets/admin/settings" { "Settings" }
             }
         }
         div .table-container {
@@ -170,7 +170,7 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         option value=(priority) { (priority) }
                     }
                 } }
-                button .btn .btn-primary type="submit" { "Create ticket" }
+                button .btn .btn--primary type="submit" { "Create ticket" }
             }
         }
         script { (PreEscaped(ADMIN_FORM_JS)) }
@@ -228,7 +228,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header(
             service::str_field(ticket, "reference"),
             Some(report.subject.as_str()),
-            Some(html! { a .btn .btn-ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
+            Some(html! { a .btn .btn--ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
         ))
         @if escalation != "none" {
             div .alert .alert--warning .mb-4 {
@@ -303,7 +303,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     label { "Reason" textarea .form-input name="reason" maxlength="4000" {} }
                     label { input type="checkbox" name="legal_hold"
                         checked[service::bool_field(ticket, "legal_hold")]; " Legal hold" }
-                    button .btn .btn-primary type="submit" { "Update workflow" }
+                    button .btn .btn--primary type="submit" { "Update workflow" }
                 }
             }
         }
@@ -311,7 +311,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
             h2 { "Internal note" }
             form .ticket-note-form data-json-form data-endpoint=(note_endpoint) {
                 textarea .form-input name="note" maxlength="4000" required {}
-                button .btn .btn-secondary type="submit" { "Add note" }
+                button .btn .btn--secondary type="submit" { "Add note" }
             }
         }
         section .mt-5 {
@@ -397,7 +397,7 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header(
             "Ticket types",
             Some("Configure public report categories and internal work types"),
-            Some(html! { a .btn .btn-ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
+            Some(html! { a .btn .btn--ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
         ))
         details {
             summary { "Create type" }
@@ -422,7 +422,7 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 label { input type="checkbox" name="requires_contact"; " Requires contact email" }
                 label { input type="checkbox" name="requests_evidence"; " Requests evidence" }
                 label { "Sort order" input .form-input type="number" name="sort_order" value="0"; }
-                button .btn .btn-primary type="submit" { "Create type" }
+                button .btn .btn--primary type="submit" { "Create type" }
             }
         }
         @for kind in &types {
@@ -466,7 +466,7 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     label { input type="checkbox" name="requests_evidence" checked[service::bool_field(kind, "requests_evidence")]; " Requests evidence" }
                     label { "Sort order" input .form-input type="number" name="sort_order"
                         value=(number_field(kind, "sort_order")); }
-                    button .btn .btn-secondary type="submit" { "Save type" }
+                    button .btn .btn--secondary type="submit" { "Save type" }
                 }
             }
         }
@@ -504,8 +504,8 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 "Configuration changes use the central Variables screen so this block keeps "
                 "the reviewed HTTP contract to one read-only settings route."
             }
-            a .btn .btn-secondary href="/b/admin/settings/variables" { "Manage variables" }
-            a .btn .btn-ghost href="/b/tickets/submit" target="_blank" rel="noopener" {
+            a .btn .btn--secondary href="/b/admin/settings/variables" { "Manage variables" }
+            a .btn .btn--ghost href="/b/tickets/submit" target="_blank" rel="noopener" {
                 "Open public form"
             }
         }

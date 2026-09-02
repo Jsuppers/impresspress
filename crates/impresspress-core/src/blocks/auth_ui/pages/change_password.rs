@@ -47,7 +47,7 @@ pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
                     }
 
                     div .text-center .mt-4 {
-                        a .btn .btn-ghost href="javascript:history.back()" { "Cancel" }
+                        a .btn .btn--ghost href="javascript:history.back()" { "Cancel" }
                     }
                 }
 

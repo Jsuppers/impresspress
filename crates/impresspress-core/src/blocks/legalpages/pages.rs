@@ -169,16 +169,16 @@ pub(super) fn editor_markup_for_test(
                 }
             }
             div .flex .gap-2 {
-                a .btn .btn-sm .btn-ghost
+                a .btn .btn--sm .btn--ghost
                     href={"/b/legalpages/" (doc_type)}
                     target="_blank"
                 {
                     "Open public page"
                 }
-                button #btn-save .btn .btn-sm .btn-secondary onclick="saveDocument(false)" {
+                button #btn-save .btn .btn--sm .btn--secondary onclick="saveDocument(false)" {
                     "Save Draft"
                 }
-                button #btn-publish .btn .btn-sm .btn-primary onclick="saveDocument(true)" {
+                button #btn-publish .btn .btn--sm .btn--primary onclick="saveDocument(true)" {
                     "Publish"
                 }
             }
@@ -611,10 +611,10 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 "See how your changes look on the public pages."
             }
             div .flex .gap-2 {
-                a .btn .btn-sm .btn-ghost href="/b/legalpages/privacy" target="_blank" {
+                a .btn .btn--sm .btn--ghost href="/b/legalpages/privacy" target="_blank" {
                     (icons::eye()) " Privacy Policy"
                 }
-                a .btn .btn-sm .btn-ghost href="/b/legalpages/terms" target="_blank" {
+                a .btn .btn--sm .btn--ghost href="/b/legalpages/terms" target="_blank" {
                     (icons::eye()) " Terms of Service"
                 }
             }

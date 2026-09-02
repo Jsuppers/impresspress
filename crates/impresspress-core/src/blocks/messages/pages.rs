@@ -100,7 +100,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
                         label .form-label for="new-context-title" { "Title" }
                         input .form-input .messages-new__title #new-context-title type="text" name="title" placeholder="e.g. Deploy planning" required;
                     }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }
@@ -309,7 +309,7 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
 
     html! {
         div .flex .items-center .gap-3 .mb-6 {
-            a .btn .btn-ghost .btn-sm href="/b/messages/" { (ui::icons::arrow_left()) " Back" }
+            a .btn .btn--ghost .btn--sm href="/b/messages/" { (ui::icons::arrow_left()) " Back" }
             h2 .page-title .m-0 { (display_title) }
             span .badge .text-capitalize { (context_type) }
             span .badge { (context_status) }
@@ -357,7 +357,7 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
                         rows="3"
                         required
                     {}
-                    button .btn .btn-primary type="submit" { "Add" }
+                    button .btn .btn--primary type="submit" { "Add" }
                 }
             }
         }
@@ -368,7 +368,7 @@ fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) ->
     html! {
         div .thread-pane {
             div .thread-pane__head {
-                h3 .thread-pane__title {
+                h2 .thread-pane__title {
                     "Conversations"
                 }
             }
@@ -454,7 +454,7 @@ fn render_conversation_composer(post_url: &str) -> Markup {
                     required
                     onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.closest('form').requestSubmit();}"
                 {}
-                button .btn .btn-primary .h-fit type="submit" { "Send" }
+                button .btn .btn--primary .h-fit type="submit" { "Send" }
             }
         }
     }

@@ -141,7 +141,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         "Add grants for third-party or WASM blocks. These are loaded at startup alongside code-declared grants."
                     }
                 }
-                button .btn .btn-primary .btn-sm onclick="openModal('add-grant-modal')" {
+                button .btn .btn--primary .btn--sm onclick="openModal('add-grant-modal')" {
                     (icons::plus()) " Add Grant"
                 }
             }
@@ -195,7 +195,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                                     }
                                     td .text-13 { (description) }
                                     td {
-                                        button .btn .btn-danger .btn-sm
+                                        button .btn .btn--danger .btn--sm
                                             hx-delete={"/b/admin/grants/rules/" (id)}
                                             hx-target="#content"
                                             hx-confirm="Delete this grant?"
@@ -356,8 +356,8 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         placeholder="e.g. Analytics block needs to read user profiles";
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('add-grant-modal')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Add Grant" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('add-grant-modal')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Add Grant" }
                 }
             }
         }))

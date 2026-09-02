@@ -97,9 +97,21 @@
 	   can't express gaps that fall between existing steps (12px, 20px)
 	   without inventing awkward names like --spacing-sm-md, and two
 	   coexisting spacing systems was the actual bug this fixes. Every
-	   former --spacing-*/--space-2xl consumer has been migrated to the
-	   matching step below -- there is no alias, so a stray old name now
-	   fails to resolve instead of silently reintroducing the drift. */
+	   former --spacing-xs..xl and --space-2xl consumer has been migrated to
+	   the matching step below -- there is no alias, so a stray old name now
+	   fails to resolve instead of silently reintroducing the drift.
+
+	   (This sentence used to read "--spacing-" then a star then a slash.
+	   That sequence closes the comment: CSS comments do not nest and have
+	   no escape, so the first closer wins wherever it appears -- even
+	   mid-word. The parser then read the remaining prose as a declaration
+	   and, recovering, discarded everything up to the next semicolon, which
+	   was the end of `--space-1: 0.25rem;`. That token silently vanished
+	   from :root, and all 55 `var(--space-1)` uses fell back to the `*`
+	   reset's 0 -- which is why the small-button size class (now
+	   `.btn--sm`) and `.topbar__palette` rendered
+	   with no padding at all. The guard in ui/assets.rs now fails the build
+	   if any referenced token is missing from :root.) */
 	--space-1: 0.25rem;  /*  4px */
 	--space-2: 0.5rem;   /*  8px */
 	--space-3: 0.75rem;  /* 12px */

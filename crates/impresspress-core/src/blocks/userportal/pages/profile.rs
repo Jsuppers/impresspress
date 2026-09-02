@@ -64,7 +64,7 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     input .form-input #display-name type="text" name="name"
                         value=(display_name) placeholder="Enter your name";
                 }
-                button .btn .btn-primary type="submit" .w-full { "Save" }
+                button .btn .btn--primary type="submit" .w-full { "Save" }
             }
         }
     };

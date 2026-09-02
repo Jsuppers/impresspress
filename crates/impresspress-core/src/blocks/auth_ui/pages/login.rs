@@ -106,7 +106,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         }
 
                         div .auth-actions {
-                            button type="button" class="btn btn-ghost btn-sm" onclick="handleForgot()" {
+                            button type="button" class="btn btn--ghost btn--sm" onclick="handleForgot()" {
                                 "Forgot password?"
                             }
                         }

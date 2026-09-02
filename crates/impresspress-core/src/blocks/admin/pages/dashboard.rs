@@ -407,7 +407,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
         section .card {
             header .card__head {
                 h2 .card__title { "Recent Users" }
-                a .btn .btn-ghost .btn-sm href="/b/admin/users" { "View all" }
+                a .btn .btn--ghost .btn--sm href="/b/admin/users" { "View all" }
             }
             div .card__body {
                 @if recent_users.is_empty() {
@@ -436,7 +436,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
         section .card {
             header .card__head {
                 h2 .card__title { "Recent Errors" }
-                a .btn .btn-ghost .btn-sm .card__actions href="/b/admin/logs?status=ERROR" { "View all" }
+                a .btn .btn--ghost .btn--sm .card__actions href="/b/admin/logs?status=ERROR" { "View all" }
             }
             div .card__body {
                 @if recent_errors.is_empty() {

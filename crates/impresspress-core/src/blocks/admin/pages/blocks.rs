@@ -85,11 +85,11 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let page_action = html! {
         div .flex .gap-2 {
-            a .btn .btn-sm .btn-secondary .gap-1 href="https://wafer.run/registry" target="_blank"
+            a .btn .btn--sm .btn--secondary .gap-1 href="https://wafer.run/registry" target="_blank"
             {
                 (icons::arrow_up_right()) " Explore WASM blocks"
             }
-            a .btn .btn-secondary .btn-sm href="/b/inspector/ui" target="_blank" {
+            a .btn .btn--secondary .btn--sm href="/b/inspector/ui" target="_blank" {
                 (icons::globe()) " Open Inspector"
             }
         }
@@ -187,7 +187,7 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                 }
                                 span .block-card__version { "v" (block.version) }
                                 @if is_enabled && !block.admin_url.is_empty() {
-                                    a .btn .btn-sm .btn-primary .block-card__open
+                                    a .btn .btn--sm .btn--primary .block-card__open
                                         href=(block.admin_url)
                                         onclick="event.stopPropagation()"
                                     { "Open" }
@@ -343,7 +343,7 @@ pub async fn handle_block_detail(
             div .flex .items-center .justify-between .mb-4 {
                 div .flex .items-center .gap-2 {
                     @if is_enabled && !block.admin_url.is_empty() {
-                        a .btn .btn-sm .btn-primary href=(block.admin_url) {
+                        a .btn .btn--sm .btn--primary href=(block.admin_url) {
                             (icons::settings()) " Open Admin UI"
                         }
                     }

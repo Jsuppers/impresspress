@@ -19,7 +19,7 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user = UserInfo::from_message(msg);
 
     let refresh_action = html! {
-        button .btn .btn-secondary .btn-sm
+        button .btn .btn--secondary .btn--sm
             hx-get="/b/admin/storage"
             hx-target="#content"
         { (icons::refresh_cw()) " Refresh" }

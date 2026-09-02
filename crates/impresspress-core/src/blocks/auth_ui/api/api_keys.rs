@@ -136,7 +136,7 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
                                 code #new-api-key .api-key-value .text-13 {
                                     (key_for_display)
                                 }
-                                button type="button" .btn .btn-secondary .btn-sm .flex-none
+                                button type="button" .btn .btn--secondary .btn--sm .flex-none
                                     onclick=(copy_js)
                                 { "Copy" }
                             }

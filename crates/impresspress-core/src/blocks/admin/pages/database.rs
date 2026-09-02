@@ -290,7 +290,7 @@ fn sql_panel(selected: Option<&str>, query: Option<&str>, result: Option<Markup>
                     placeholder="SELECT … FROM …"
                 { (initial) }
                 div .db-sql__actions {
-                    button .btn .btn-primary type="submit" { "Run" }
+                    button .btn .btn--primary type="submit" { "Run" }
                     span .text-muted .text-sm { "Read-only: SELECT, PRAGMA, EXPLAIN, WITH" }
                 }
             }

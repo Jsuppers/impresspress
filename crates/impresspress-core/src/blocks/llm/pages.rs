@@ -215,10 +215,10 @@ fn render_thread_list_pane(threads: &[db::Record], active_id: Option<&str>) -> M
     html! {
         div .thread-pane {
             div .thread-pane__head {
-                h3 .thread-pane__title {
+                h2 .thread-pane__title {
                     "Threads"
                 }
-                button .btn.btn-sm.btn-primary onclick="createNewThread()" {
+                button .btn.btn--sm.btn--primary onclick="createNewThread()" {
                     (icons::plus())
                 }
             }
@@ -322,7 +322,7 @@ fn render_composer(thread_id: Option<&str>) -> Markup {
                     {}
                 }
                 div .flex .flex-col .items-center .gap-1 {
-                    button #send-btn .btn.btn-primary .h-fit type="submit" disabled[!enabled] {
+                    button #send-btn .btn.btn--primary .h-fit type="submit" disabled[!enabled] {
                         "Send"
                     }
                     span #send-status .text-muted .text-xs .nowrap {}
@@ -360,7 +360,7 @@ fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
                 div .card .p-3 {
                     div .flex .items-center .gap-2 .mb-2 {
                         span .text-sm .font-medium { "Loading model..." }
-                        button #model-unload-btn .btn.btn-sm.btn-ghost onclick="unloadLocalModel()" .ml-auto {
+                        button #model-unload-btn .btn.btn--sm.btn--ghost onclick="unloadLocalModel()" .ml-auto {
                             "Cancel"
                         }
                     }
@@ -376,7 +376,7 @@ fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
                 }
             }
 
-            a .btn.btn-ghost.btn-sm .justify-start href="/b/llm/settings" {
+            a .btn.btn--ghost.btn--sm .justify-start href="/b/llm/settings" {
                 (ui::icons::settings()) " Settings"
             }
         }
@@ -491,7 +491,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                     td .text-muted .text-xs { (date) }
                                     td {
                                         button
-                                            .btn.btn-sm.btn-danger
+                                            .btn.btn--sm.btn--danger
                                             hx-delete={"/b/llm/api/config/" (ov.id)}
                                             hx-confirm={"Remove override for thread " (tid) "?"}
                                             hx-target="closest tr"

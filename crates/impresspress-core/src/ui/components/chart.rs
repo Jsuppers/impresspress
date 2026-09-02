@@ -26,7 +26,7 @@ pub fn bar_chart_card(
                     h2 .card__title { (title) }
                     p .card__subtitle { (subtitle) }
                 }
-                a .btn .btn-ghost .btn-sm .card__actions href=(view_href) { "View" }
+                a .btn .btn--ghost .btn--sm .card__actions href=(view_href) { "View" }
             }
             div .card__body {
                 table .charts-css .column style=(format!("--chart-color: {color_var}")) {
@@ -167,7 +167,7 @@ pub fn line_chart_card(
                     h2 .card__title { (title) }
                     p .card__subtitle { (subtitle) }
                 }
-                a .btn .btn-ghost .btn-sm .card__actions href=(view_href) { "View" }
+                a .btn .btn--ghost .btn--sm .card__actions href=(view_href) { "View" }
             }
             div .card__body {
                 div .chart {

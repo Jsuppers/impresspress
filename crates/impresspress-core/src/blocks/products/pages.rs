@@ -253,19 +253,19 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 span .products-guide__number { "1" }
                 h3 { "Connect Stripe" }
                 p .text-muted .text-sm { "Add your Stripe keys and confirm that payments are ready." }
-                a .text-sm href="/b/products/admin/stripe" { "Check Stripe setup " (icons::arrow_right()) }
+                a .products-guide__link .text-sm href="/b/products/admin/stripe" { "Check Stripe setup" (icons::arrow_right()) }
             }
             article .products-guide__item {
                 span .products-guide__number { "2" }
                 h3 { "Create a product" }
                 p .text-muted .text-sm { "Choose a one-time product, subscription, or configurable checkout." }
-                a .text-sm href="/b/products/admin/new" { "Create a product " (icons::arrow_right()) }
+                a .products-guide__link .text-sm href="/b/products/admin/new" { "Create a product" (icons::arrow_right()) }
             }
             article .products-guide__item {
                 span .products-guide__number { "3" }
                 h3 { "Publish and share" }
                 p .text-muted .text-sm { "Publish the price, then copy a payment link or add checkout to your site." }
-                a .text-sm href="/b/products/admin/manage" { "Manage products " (icons::arrow_right()) }
+                a .products-guide__link .text-sm href="/b/products/admin/manage" { "Manage products" (icons::arrow_right()) }
             }
         }
         (render_overview_empty_state(products_count, user_products_enabled))

@@ -20,7 +20,7 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
 
     html! {
         div .mb-3 {
-            button .btn .btn-primary .btn-sm onclick="openModal('create-var')" {
+            button .btn .btn--primary .btn--sm onclick="openModal('create-var')" {
                 (icons::plus()) " Add Variable"
             }
         }
@@ -76,8 +76,8 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
                     }
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('create-var')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('create-var')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }))
@@ -187,7 +187,7 @@ fn var_row(row: &VarRow) -> Markup {
                 }
             }
             td {
-                button .btn .btn-sm .btn-ghost
+                button .btn .btn--sm .btn--ghost
                     hx-get={"/b/admin/variables/" (row.key) "/edit"}
                     hx-target="#edit-var-modal"
                     hx-swap="innerHTML"
@@ -295,7 +295,7 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                                         }
                                     }
                                     td {
-                                        button .btn .btn-sm .btn-ghost
+                                        button .btn .btn--sm .btn--ghost
                                             hx-get={"/b/admin/variables/" (key) "/edit"}
                                             hx-target="#edit-var-modal"
                                             hx-swap="innerHTML"
@@ -555,7 +555,7 @@ pub async fn handle_edit_variable_form(
                                 type="password"
                                 name="value"
                                 value=(value);
-                            button .btn .btn-ghost .btn-icon .btn-icon-right
+                            button .btn .btn--ghost .btn--icon .btn-icon-right
                                 type="button"
                                 onclick="var i=document.getElementById('edit-value');if(i.type==='password'){i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')}else{i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')}"
                                 title="Reveal"
@@ -576,8 +576,8 @@ pub async fn handle_edit_variable_form(
                     }
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('edit-var-modal-overlay')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Save" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('edit-var-modal-overlay')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Save" }
                 }
             }
         }

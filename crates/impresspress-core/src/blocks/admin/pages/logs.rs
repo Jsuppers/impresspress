@@ -26,7 +26,7 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let refresh_action = html! {
-        button .btn .btn-secondary .btn-sm
+        button .btn .btn--secondary .btn--sm
             hx-get={"/b/admin/logs?tab=" (active_tab)}
             hx-target="#content"
         { (icons::refresh_cw()) " Refresh" }

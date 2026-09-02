@@ -84,7 +84,7 @@ pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStrea
                     input .form-input #sort_order type="number" name="sort_order"
                         value="0" .w-80;
                 }
-                button .btn .btn-primary type="submit" .nowrap {
+                button .btn .btn--primary type="submit" .nowrap {
                     (icons::plus()) " Add"
                 }
             }
@@ -140,7 +140,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                     td { (btn.i64_field("sort_order")) }
                                     td {
                                         div .flex .gap-1 {
-                                            button .btn .btn-ghost .btn-sm
+                                            button .btn .btn--ghost .btn--sm
                                                 hx-get=(format!("/b/userportal/admin/buttons/{}/edit", btn.id))
                                                 hx-target=(format!("#edit-modal-{}", btn.id))
                                                 hx-swap="innerHTML"
@@ -148,7 +148,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                             {
                                                 (icons::edit())
                                             }
-                                            button .btn .btn-ghost .btn-sm .text-danger
+                                            button .btn .btn--ghost .btn--sm .text-danger
                                                 hx-delete=(format!("/b/userportal/admin/buttons/{}", btn.id))
                                                 hx-target="#buttons-table"
                                                 hx-swap="outerHTML"
@@ -287,10 +287,10 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                         value=(record.i64_field("sort_order"));
                 }
                 div .flex .gap-2 .justify-end {
-                    button .btn .btn-secondary type="button"
+                    button .btn .btn--secondary type="button"
                         onclick=(format!("closeModal('edit-btn-{id}')"))
                     { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Save" }
+                    button .btn .btn--primary type="submit" { "Save" }
                 }
             }
         }))

@@ -322,7 +322,7 @@ fn form_markup(
                 }
                 div .cf-turnstile data-sitekey=(site_key) data-action="ticket_submit" {}
                 noscript { p { "JavaScript is required only for the anti-spam challenge." } }
-                button .btn .btn-primary type="submit" { "Submit report" }
+                button .btn .btn--primary type="submit" { "Submit report" }
             }
             @if !support_email.is_empty() {
                 p .text-muted { "You can also email " (support_email_link(support_email)) "." }

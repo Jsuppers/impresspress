@@ -1026,6 +1026,109 @@ mod tests {
         format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2)
     }
 
+    /// Every `var(--token)` referenced anywhere in the bundle must resolve to
+    /// a declaration in `:root`.
+    ///
+    /// An unresolvable `var()` does not fall back to something sensible -- the
+    /// whole declaration becomes invalid at computed-value time and the
+    /// property reverts to whatever won before it, which in this bundle is the
+    /// `*, *::before, *::after { margin: 0; padding: 0 }` reset in base.css.
+    /// The element silently renders with NO padding rather than the wrong
+    /// padding, and nothing in the build or the test suite notices.
+    ///
+    /// This is not hypothetical. `--space-1` went missing from `:root` because
+    /// a prose comment in tokens.css contained the two characters that close a
+    /// CSS comment, mid-word, in the token name `--spacing-` + star + slash.
+    /// CSS comments do not nest and have no escape, so the comment ended
+    /// there; the parser read the rest of the sentence as a declaration and,
+    /// recovering, discarded everything up to the next semicolon -- the end of
+    /// `--space-1: 0.25rem;`. All 55 `var(--space-1)` uses then fell back to
+    /// the reset, so `.btn--sm` (`padding: var(--space-1) var(--space-3)`) and
+    /// `.topbar__palette` rendered with zero padding: the "Open" button on the
+    /// Blocks page was 15px tall with its label touching the pill edge.
+    ///
+    /// Only fallback-less references count. `var(--border, #e2e8f0)` renders
+    /// its fallback and is fine (though this bundle has a few of those whose
+    /// fallback is byte-identical to an existing token, which is its own small
+    /// smell -- they were replaced with the token itself).
+    ///
+    /// The failure mode is what makes this worth a guard: a missing token is
+    /// invisible in the source (the declaration is right there in tokens.css),
+    /// invisible to the CSS bundler (it is valid CSS -- just not the CSS
+    /// anyone wrote), and invisible to every screenshot test that has not been
+    /// re-baselined. Only resolving references against definitions catches it.
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn every_referenced_custom_property_is_defined_in_root() {
+        let s = super::css();
+        let tokens = parse_root_tokens(s);
+
+        // Only references WITHOUT a fallback can break. `var(--x, #fff)` is
+        // valid whether or not `--x` exists -- the fallback renders -- so it is
+        // not a defect, just an undefined name. `var(--x)` with no fallback is
+        // the one that drops its whole declaration.
+        let mut referenced: std::collections::BTreeSet<String> = Default::default();
+        let mut rest = s;
+        while let Some(i) = rest.find("var(--") {
+            rest = &rest[i + "var(".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let after = rest[name.len()..].trim_start();
+            if after.starts_with(',') {
+                continue; // has a fallback -- renders fine
+            }
+            referenced.insert(name);
+        }
+
+        // Tokens a caller may legitimately supply per-deployment or per-render,
+        // which therefore have no `:root` default. Each is set from Rust via an
+        // inline custom property on the element that consumes it.
+        const CALLER_SUPPLIED: &[&str] = &[
+            // ui/components/table.rs sets this per-column on the <th>.
+            "--col-width",
+            // ui/components/chart.rs sets these per-datapoint: the sparkline's
+            // end-dot offset and each bar's height fraction.
+            "--dot-y",
+            "--size",
+            // ui/components/chart.rs sets the series colour on the wrapper.
+            "--chart-color",
+            // blocks/files/pages_user/cloudstorage.rs sets the quota bar width.
+            "--fill-pct",
+            // ui/templates.rs lets a deployment theme its public pages.
+            "--public-page-bg",
+        ];
+
+        let missing: Vec<&String> = referenced
+            .iter()
+            .filter(|n| !tokens.contains_key(n.as_str()))
+            .filter(|n| !CALLER_SUPPLIED.contains(&n.as_str()))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these custom properties are referenced by the stylesheet but never \
+             defined in :root, so every declaration using them is dropped and \
+             the property falls back to the `*` reset (usually to 0): {missing:?}. \
+             If one is deliberately supplied by a caller at render time, add it \
+             to CALLER_SUPPLIED with a note saying who sets it."
+        );
+
+        // Sanity floor: the extractor must actually be finding references. If a
+        // refactor changed `var()` spelling, the assertion above would pass
+        // vacuously on an empty set.
+        assert!(
+            referenced.len() > 40,
+            "only {} var() references found -- the extractor has probably \
+             stopped matching, making the check above vacuous",
+            referenced.len()
+        );
+    }
+
     /// Selectors this contrast guard does not hold to the 4.5:1 text floor,
     /// each with its own reason -- not a silent pass.
     const CONTRAST_EXEMPT_SELECTORS: &[&str] = &[

@@ -50,8 +50,8 @@ pub fn render_create_index_modal() -> Markup {
                     }
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('create-vector-index')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('create-vector-index')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         },

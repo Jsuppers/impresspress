@@ -18,7 +18,7 @@ use crate::{
 pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     html! {
         div .filter-bar .mb-2 {
-            button .btn .btn-secondary .btn-sm
+            button .btn .btn--secondary .btn--sm
                 hx-get="/b/admin/settings/network"
                 hx-target="#content"
             { (icons::refresh_cw()) " Refresh" }
@@ -294,7 +294,7 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
         @if has_more {
             @let next_offset = offset + limit;
             div .text-center .p-2 {
-                button .btn .btn-secondary .btn-sm
+                button .btn .btn--secondary .btn--sm
                     hx-get={"/b/admin/network/detail/inbound?method=" (method) "&path=" (path) "&offset=" (next_offset)}
                     hx-target="closest div"
                     hx-swap="outerHTML"

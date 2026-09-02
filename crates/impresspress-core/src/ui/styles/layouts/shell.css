@@ -138,6 +138,13 @@
 	display: flex; align-items: center; gap: var(--space-2);
 	padding: var(--space-2) var(--space-2); border-radius: var(--radius-md);
 	color: #ffffff; text-decoration: none; font-size: var(--text-sm);
+	/* Row height must come from the 16px icon, not the label's text line.
+	   At the default line-height the 14px label boxes to 17px and wins, so
+	   the row was 33px expanded and 32px collapsed (where the label is
+	   hidden) -- a 1px difference that accumulated down the list, leaving
+	   the last icon 11.5px out of place on collapse. line-height: 1 makes
+	   the icon the tallest child in both states. */
+	line-height: 1;
 }
 .sidebar__nav-item:hover { background: var(--navy-700); color: #ffffff; }
 .sidebar__nav-item.is-active {
@@ -209,10 +216,23 @@
 /* Collapsed sidebar: icon-only mode */
 .shell:has(.sidebar.collapsed) { grid-template-columns: var(--sidebar-collapsed-width) minmax(0, 1fr); }
 .sidebar.collapsed { width: var(--sidebar-collapsed-width); }
+/* Text that disappears when collapsed. `display: none` is right for the
+   INLINE labels -- they sit beside their icon, so removing them from flow is
+   what lets the row narrow -- but wrong for the group label, which is a BLOCK
+   above its items: dropping it from flow pulled every icon below it upward,
+   by a different amount per group (measured +19.5px for the first, -17.5px by
+   the fifth). `visibility: hidden` keeps its box, so the vertical rhythm is
+   byte-identical between the two states. */
 .sidebar.collapsed .sidebar__brand-name,
-.sidebar.collapsed .sidebar__group-label,
 .sidebar.collapsed .sidebar__nav-label,
 .sidebar.collapsed .sidebar__user-text { display: none; }
+/* `overflow: hidden` as well: the label keeps its box, but its TEXT is not
+   constrained by it -- a single long word ("COMMUNICATION", 117px) cannot
+   wrap inside the 56px box, so it spilled and pushed
+   `.sidebar__groups` (overflow-x: auto) to 125px of scroll width, putting a
+   horizontal scrollbar across the bottom of the collapsed rail. Clipping the
+   invisible label removes the overflow at source. */
+.sidebar.collapsed .sidebar__group-label { visibility: hidden; overflow: hidden; }
 /* .sidebar__brand-icon has no collapsed override -- it's `display: block` by
    default now (shown in both states), so collapsing only needs to hide the
    name/labels above. */
@@ -220,19 +240,21 @@
    panel, both on the same flush navy slab — just narrower with the icon
    mark. (An earlier attempt merged the brand INTO the panel with a negative
    margin; that produced a seam that read as broken.) */
-.sidebar.collapsed .sidebar__brand { justify-content: center; padding: 0; }
-.sidebar.collapsed .sidebar__nav-item { justify-content: center; padding: var(--space-2) 0; }
-.sidebar.collapsed .sidebar__user { justify-content: center; }
-/* The toggle centers in the collapsed rail; reserve a row for it at the top
-   of the panel so it doesn't sit on top of the first nav icon (the group
-   labels that pad that area when expanded are display:none here). */
-.sidebar.collapsed .sidebar__collapse-toggle { left: 50%; right: auto; transform: translateX(-50%); }
-/* Left off the token scale deliberately: 44px clears the collapse-toggle's
-   own box (0.5rem top offset + 28px height = 36px) by 8px. It's a computed
-   clearance value tied to that element's exact geometry, not a spacing-
-   rhythm choice -- snapping to the nearest step (--space-12, 48px) would
-   only add 4px of slack, but there's no correctness reason to round it. */
-.sidebar.collapsed .sidebar__groups { padding-top: 2.75rem; }
+/* Collapsing must not MOVE anything -- it only narrows the rail and hides
+   text. Centring the row instead (and zeroing the horizontal padding) pushed
+   every icon 12px to the right and the brand mark 4px, so icons visibly
+   jumped sideways as the sidebar animated. Keeping the expanded alignment and
+   padding leaves every icon at exactly the same x in both states, which is
+   what makes the transition read as the panel narrowing around a fixed rail
+   of icons rather than as the icons rearranging themselves. */
+/* The toggle keeps its expanded position (pinned top-right of the rail) and
+   the groups keep their expanded padding. Both overrides that used to live
+   here -- re-centring the toggle, then adding 2.75rem of top padding to the
+   groups so the centred toggle would not land on the first nav icon --
+   existed only to compensate for each other, and together they pushed the
+   whole nav down 20px on collapse. With the group label keeping its box
+   (above), the toggle has the same clearance it has when expanded and needs
+   no reserved row. */
 
 /* ===== Shell + topbar (Phase 1) ===== */
 /* No gap/padding on the grid itself -- the sidebar must be flush to the

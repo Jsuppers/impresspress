@@ -51,7 +51,7 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         name="new_password" required;
                 }
                 div #change-pw-result {}
-                button .btn .btn-primary type="submit" .w-full { "Change password" }
+                button .btn .btn--primary type="submit" .w-full { "Change password" }
             }
         }
         section .account-section {
@@ -67,7 +67,7 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     @if !user_email.is_empty() { " — " (user_email) }
                 }
                 div #resend-verification-result {}
-                button .btn .btn-secondary
+                button .btn .btn--secondary
                     type="button"
                     .w-full
                     onclick=(format!(

@@ -98,7 +98,7 @@ fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> M
                         td data-label="Last used" { time datetime=(r.last_used_at) { (r.last_used_at) } }
                         td data-label="Expires" { time datetime=(r.expires_at) { (r.expires_at) } }
                         td data-label="" {
-                            button .btn .btn-ghost .btn-sm
+                            button .btn .btn--ghost .btn--sm
                                 hx-delete=(format!("/b/userportal/sessions/{}", hex_encode(&r.token_hash)))
                                 hx-target="closest tr"
                                 hx-swap="outerHTML"

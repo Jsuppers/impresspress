@@ -102,7 +102,15 @@
 	}
 	.chat-rail { display: none; }
 }
-.chat-threads { background: var(--surface-3); border-right: 1px solid var(--border-light); overflow-y: auto; }
+/* The rail had no padding at all, so `.thread-pane`'s "THREADS" heading sat
+   flush against the left edge and its "+" button flush against the right and
+   top -- the button's right edge was exactly the rail's (measured 0px gap).
+   --space-4 rather than the cards' --space-6: this is a 280px rail, where
+   24px a side would spend 17% of the width on gutters. */
+.chat-threads {
+	background: var(--surface-3); border-right: 1px solid var(--border-light);
+	overflow-y: auto; padding: var(--space-4);
+}
 /* Active thread/conversation card — brand tint, same pair as the active
    sidebar item. One rule serves both SSR (data-active from the server) and
    the LLM page's client-side thread switcher (llm-chat.js toggles the same

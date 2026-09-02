@@ -247,14 +247,14 @@ fn single_user_row(record: &db::Record, roles: &[String], current_uid: &str) -> 
                     span .text-muted .text-sm { "(you)" }
                 } @else {
                     @if disabled {
-                        button .btn .btn-sm .btn-success
+                        button .btn .btn--sm .btn--success
                             hx-post={"/b/admin/users/" (record.id) "/enable"}
                             hx-target={"#user-row-" (record.id)}
                             hx-swap="outerHTML"
                             title="Enable user"
                         { "Enable" }
                     } @else {
-                        button .btn .btn-sm .btn-secondary
+                        button .btn .btn--sm .btn--secondary
                             hx-post={"/b/admin/users/" (record.id) "/disable"}
                             hx-target={"#user-row-" (record.id)}
                             hx-swap="outerHTML"
@@ -263,7 +263,7 @@ fn single_user_row(record: &db::Record, roles: &[String], current_uid: &str) -> 
                         { "Disable" }
                     }
                     " "
-                    button .btn .btn-sm .btn-danger
+                    button .btn .btn--sm .btn--danger
                         hx-delete={"/b/admin/users/" (record.id)}
                         hx-target={"#user-row-" (record.id)}
                         hx-swap="outerHTML"
@@ -374,7 +374,7 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
     html! {
         div .flex .items-center .justify-between .mb-4 {
             h3 .font-semibold { "Roles" }
-            button .btn .btn-primary .btn-sm onclick="openModal('create-role')" {
+            button .btn .btn--primary .btn--sm onclick="openModal('create-role')" {
                 (icons::plus()) " Create Role"
             }
         }
@@ -408,7 +408,7 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
                                     }
                                     td {
                                         @if !is_system {
-                                            button .btn .btn-sm .btn-danger
+                                            button .btn .btn--sm .btn--danger
                                                 hx-delete={"/b/admin/iam/roles/" (record.id)}
                                                 hx-target="#iam-content"
                                                 hx-confirm={"Delete role \"" (name) "\"?"}
@@ -438,8 +438,8 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
                     input .form-input type="text" #role-desc name="description" placeholder="Optional description";
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('create-role')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('create-role')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }))
@@ -460,7 +460,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
     html! {
         div .flex .items-center .justify-between .mb-4 {
             h3 .font-semibold { "API Keys" }
-            button .btn .btn-primary .btn-sm onclick="openModal('create-api-key')" {
+            button .btn .btn--primary .btn--sm onclick="openModal('create-api-key')" {
                 (icons::plus()) " Create API Key"
             }
         }
@@ -505,7 +505,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                                     }
                                     td {
                                         @if revoked.is_empty() {
-                                            button .btn .btn-sm .btn-secondary
+                                            button .btn .btn--sm .btn--secondary
                                                 hx-post={"/b/auth/api/api-keys/" (record.id) "/revoke"}
                                                 hx-target="#users-tab-content"
                                                 hx-confirm="Revoke this API key?"
@@ -531,8 +531,8 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                     input .form-input type="text" #key-name name="name" placeholder="e.g. CI/CD key" required;
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('create-api-key')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('create-api-key')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }))
