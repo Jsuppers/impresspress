@@ -26,9 +26,9 @@ fn display_money(amount_minor: i64, currency: &str) -> String {
 
 fn analytics_section(analytics: &[CommerceAnalytics], title: &str, seller_view: bool) -> Markup {
     html! {
-        section style="margin-top:1.5rem" {
-            h2 style="margin-bottom:.25rem" { (title) }
-            p .text-muted .text-sm style="margin-top:0" {
+        section .products-section {
+            h2 .mb-1 { (title) }
+            p .text-muted .text-sm .mt-0 {
                 "Money is reported separately for each currency. Gross values include orders that were later refunded; after-refund sales subtract customer refunds."
                 @if seller_view { " Proceeds shown here subtract recorded platform fees but are before Stripe fees, disputes, reserves, and payout adjustments; Stripe remains authoritative for available balance and payouts." }
             }
@@ -36,11 +36,11 @@ fn analytics_section(analytics: &[CommerceAnalytics], title: &str, seller_view: 
                 (components::empty_state(icons::bar_chart(), "No sales data yet", "Completed orders and subscription activity will appear here.", None))
             } @else {
                 @for currency in analytics {
-                    article .card style="margin-top:1rem" {
+                    article .card .mt-4 {
                         header .card__head {
                             div {
                                 h3 .card__title { (currency.currency) }
-                                p .text-muted .text-sm style="margin:.25rem 0 0" { (currency.paid_order_count) " paid of " (currency.order_count) " checkout records" }
+                                p .text-muted .text-sm .text-subtitle { (currency.paid_order_count) " paid of " (currency.order_count) " checkout records" }
                             }
                             (components::status_badge(&currency.currency))
                         }
@@ -90,7 +90,7 @@ fn analytics_section(analytics: &[CommerceAnalytics], title: &str, seller_view: 
 
 fn seller_failures_section(failures: &[SellerFailureSummary]) -> Markup {
     html! {
-        section style="margin-top:1.5rem" {
+        section .products-section {
             h2 { "Recent payment failures" }
             p .text-muted .text-sm { "Failed seller orders that may need customer follow-up. Stripe Dashboard provides provider-level payment details." }
             @if failures.is_empty() {
@@ -336,7 +336,7 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
             (components::stat_card("Offers", &offers_count.to_string(), icons::dollar_sign(), None))
             (components::stat_card("Orders", &purchases_count.to_string(), icons::shopping_cart(), None))
         }
-        div .products-section__head style="margin-top:1.5rem" {
+        div .products-section__head .mt-6 {
             div {
                 h2 { "Get selling in three steps" }
                 p .text-muted .text-sm { "Start with the essentials. You can refine every setting later." }
@@ -682,9 +682,9 @@ pub async fn admin_seller_detail(
             header .card__head {
                 div {
                     h3 .card__title { "Seller account" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" { "Stripe verification and selling access" }
+                    p .text-muted .text-sm .text-subtitle { "Stripe verification and selling access" }
                 }
-                div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap" {
+                div .flex .gap-2 .items-center .flex-wrap {
                     (components::status_badge(&seller.status))
                     button .btn .(action_class) .btn--sm type="button" data-seller-action=(action) onclick="adminSellerSetState(this)" { (action_label) }
                 }
@@ -713,7 +713,7 @@ pub async fn admin_seller_detail(
                 }
             }
         }
-        section style="margin-top:1.5rem" {
+        section .products-section {
             h2 { "Owned products" }
             @if products.is_empty() {
                 (components::empty_state(icons::package(), "No products", "This seller has not created any products.", None))
@@ -847,7 +847,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
         nav .product-wizard-progress aria-label="Product setup progress" {
             ol {
                 @for (number, label) in [(1, "Type"), (2, "Basics"), (3, "Price"), (4, "Checkout"), (5, "Publish")] {
-                    li data-wizard-indicator=(number) .badge .(if number == 1 { "badge-primary" } else { "badge-secondary" }) style="justify-content:center" {
+                    li data-wizard-indicator=(number) .badge .(if number == 1 { "badge-primary" } else { "badge-secondary" }) .badge--center {
                         // Completed steps get a check icon (revealed by the
                         // wizard JS) so state is not conveyed by color alone.
                         span .wizard-step-check aria-hidden="true" hidden { (icons::check()) }
@@ -857,17 +857,17 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             }
         }
         form #product-wizard-form novalidate onsubmit="return false" {
-            p #product-wizard-error .text-sm role="alert" aria-live="assertive" hidden style="color:var(--accent-danger);margin-top:0" {}
+            p #product-wizard-error .text-sm role="alert" aria-live="assertive" hidden .text-danger .mt-0 {}
 
             section .card data-wizard-step="1" {
                 header .card__head {
                     div {
                         h3 .card__title { "What are you selling?" }
-                        p .text-muted .text-sm style="margin:.25rem 0 0" { "Choose the closest match. You can change every detail before saving." }
+                        p .text-muted .text-sm .text-subtitle { "Choose the closest match. You can change every detail before saving." }
                     }
                 }
                 div .card__body {
-                    fieldset style="border:0;padding:0;margin:0" {
+                    fieldset .fieldset-reset {
                         legend .sr-only { "Product template" }
                         div .product-template-grid {
                             @for (value, title, description) in &template_definitions {
@@ -934,11 +934,11 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                 header .card__head {
                     div {
                         h3 .card__title { "Pricing" }
-                        p .text-muted .text-sm style="margin:.25rem 0 0" { "Set the amount customers will see at checkout." }
+                        p .text-muted .text-sm .text-subtitle { "Set the amount customers will see at checkout." }
                     }
                 }
                 div .card__body {
-                    div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem" {
+                    div .grid .grid-auto-180 .gap-4 {
                         div .form-group {
                             label .form-label .required for="wizard-currency" { "Currency" }
                             input #wizard-currency .form-input type="text" value=(default_currency) maxlength="3" list="wizard-currency-options" required;
@@ -951,7 +951,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                             label .form-label .required for="wizard-price" { "Price" }
                             input #wizard-price .form-input type="text" inputmode="decimal" value="0.00" required;
                         }
-                        details .products-advanced style="grid-column:1/-1;margin-top:0" {
+                        details .products-advanced .col-span-full .mt-0 {
                             summary { "Advanced price settings (optional)" }
                             div .products-advanced__body {
                                 div .products-form-grid .products-form-grid--compact {
@@ -989,20 +989,20 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                         }
                     }
                     div #wizard-advanced-pricing hidden {
-                        section style="margin-top:1rem" {
-                            div style="display:flex;align-items:center;justify-content:space-between;gap:1rem" {
+                        section .mt-4 {
+                            div .flex .items-center .justify-between .gap-4 {
                                 div {
-                                    h4 style="margin:0" { "Customer fields" }
+                                    h4 .m-0 { "Customer fields" }
                                     p .text-muted .text-sm { "Collect dates, quantities, choices, toggles, and notes from the customer." }
                                 }
                                 button .btn .btn--secondary .btn--sm type="button" onclick="addWizardVariable()" { "+ Add input" }
                             }
                             div #wizard-variables {}
                         }
-                        section style="margin-top:1.5rem" {
-                            div style="display:flex;align-items:center;justify-content:space-between;gap:1rem" {
+                        section .products-section {
+                            div .flex .items-center .justify-between .gap-4 {
                                 div {
-                                    h4 style="margin:0" { "Itemized price rows" }
+                                    h4 .m-0 { "Itemized price rows" }
                                     p .text-muted .text-sm { "Build the total from clear rows such as base booking, nights, guests, and add-ons." }
                                 }
                                 button .btn .btn--secondary .btn--sm type="button" onclick="addWizardComponent()" { "+ Add row" }
@@ -1038,10 +1038,10 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                             input #wizard-trial-days .form-input type="number" min="0" max="730" value="0";
                         }
                     }
-                    div #wizard-shipping-settings .card hidden style="margin-top:1rem" {
+                    div #wizard-shipping-settings .card hidden .mt-4 {
                         div .card__body {
-                            h4 style="margin-top:0" { "Shipping destinations and rates" }
-                            div style="display:grid;grid-template-columns:minmax(180px,1fr) minmax(280px,2fr);gap:1rem" {
+                            h4 .mt-0 { "Shipping destinations and rates" }
+                            div .grid .grid-shipping .gap-4 {
                                 div .form-group {
                                     label .form-label for="wizard-shipping-countries" { "Allowed countries" }
                                     input #wizard-shipping-countries .form-input type="text" value=(platform_country) placeholder="NZ, AU, US";
@@ -1190,8 +1190,8 @@ function addWizardVariable(seed){
   seed=seed||{};var index=productWizardVariableIndex++;
   var row=document.createElement('section');row.className='card';row.dataset.variableRow='';row.style.marginTop='.75rem';
   row.innerHTML=`<div class="card__body">
-    <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:center"><strong>Customer input</strong><button class="btn btn--secondary btn--sm" type="button" data-remove-row>Remove</button></div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-top:.75rem">
+    <div class="flex justify-between gap-3 items-center"><strong>Customer input</strong><button class="btn btn--secondary btn--sm" type="button" data-remove-row>Remove</button></div>
+    <div class="grid grid-auto-150 gap-3 mt-3">
       <div class="form-group"><label class="form-label required" for="wizard-variable-key-${index}">Key</label><input class="form-input" id="wizard-variable-key-${index}" data-variable-key required placeholder="quantity"></div>
       <div class="form-group"><label class="form-label required" for="wizard-variable-label-${index}">Label</label><input class="form-input" id="wizard-variable-label-${index}" data-variable-label required placeholder="Quantity"></div>
       <div class="form-group"><label class="form-label" for="wizard-variable-kind-${index}">Type</label><select class="form-select" id="wizard-variable-kind-${index}" data-variable-kind><option value="integer">Whole number</option><option value="number">Decimal number</option><option value="date">Date</option><option value="date_time">Date and time</option><option value="boolean">Yes / no</option><option value="select">Choice</option><option value="multi_select">Multiple choices</option><option value="text">Text</option></select></div>
@@ -1202,7 +1202,7 @@ function addWizardVariable(seed){
       <div class="form-group"><label class="form-label" for="wizard-variable-visibility-${index}">Visibility</label><select class="form-select" id="wizard-variable-visibility-${index}" data-variable-visibility><option value="public">Customer</option><option value="hidden">Hidden</option><option value="admin_only">Admin only</option></select></div>
       <div class="form-group"><label class="form-label" for="wizard-variable-default-${index}">Default value</label><input class="form-input" id="wizard-variable-default-${index}" data-variable-default placeholder="Optional"></div>
       <div class="form-group" data-variable-length-wrap><label class="form-label" for="wizard-variable-length-${index}">Maximum text length</label><input class="form-input" id="wizard-variable-length-${index}" data-variable-length type="number" min="1" max="10000"></div>
-    </div><label style="display:flex;gap:.5rem"><input type="checkbox" data-variable-required> Required</label>
+    </div><label class="flex gap-2"><input type="checkbox" data-variable-required> Required</label>
     <div class="form-group"><label class="form-label" for="wizard-variable-help-${index}">Help text</label><input class="form-input" id="wizard-variable-help-${index}" data-variable-help maxlength="500" placeholder="Shown beside this input"></div>
   </div>`;
   row.querySelector('[data-remove-row]').onclick=function(){row.remove()};
@@ -1235,8 +1235,8 @@ function addWizardComponent(seed){
   seed=seed||{};var index=productWizardComponentIndex++;
   var row=document.createElement('section');row.className='card';row.dataset.componentRow='';row.style.marginTop='.75rem';
   row.innerHTML=`<div class="card__body">
-    <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:center"><strong>Price row</strong><button class="btn btn--secondary btn--sm" type="button" data-remove-row>Remove</button></div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-top:.75rem">
+    <div class="flex justify-between gap-3 items-center"><strong>Price row</strong><button class="btn btn--secondary btn--sm" type="button" data-remove-row>Remove</button></div>
+    <div class="grid grid-auto-150 gap-3 mt-3">
       <div class="form-group"><label class="form-label required" for="wizard-component-key-${index}">Key</label><input class="form-input" id="wizard-component-key-${index}" data-component-key required placeholder="base"></div>
       <div class="form-group"><label class="form-label required" for="wizard-component-label-${index}">Label</label><input class="form-input" id="wizard-component-label-${index}" data-component-label required placeholder="Base price"></div>
       <div class="form-group"><label class="form-label" for="wizard-component-description-${index}">Description</label><input class="form-input" id="wizard-component-description-${index}" data-component-description maxlength="500"></div>
@@ -1247,15 +1247,15 @@ function addWizardComponent(seed){
       <div class="form-group"><label class="form-label" for="wizard-condition-input-${index}">Condition input</label><input class="form-input" id="wizard-condition-input-${index}" data-condition-input></div>
       <div class="form-group"><label class="form-label" for="wizard-condition-value-${index}">Condition value</label><input class="form-input" id="wizard-condition-value-${index}" data-condition-value></div>
     </div>
-    <details style="margin:.75rem 0"><summary>Advanced calculation details</summary>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem;margin-top:.75rem">
+    <details class="my-3"><summary>Advanced calculation details</summary>
+      <div class="grid grid-auto-180 gap-3 mt-3">
         <div class="form-group"><label class="form-label" for="wizard-component-base-${index}">Base amount</label><input class="form-input" id="wizard-component-base-${index}" data-component-base inputmode="decimal" value="0.00"><p class="text-muted text-sm">Used by base + per-unit pricing.</p></div>
         <div class="form-group"><label class="form-label" for="wizard-component-package-size-${index}">Units per package</label><input class="form-input" id="wizard-component-package-size-${index}" data-component-package-size type="number" min="1" value="1"><p class="text-muted text-sm">Used by package pricing.</p></div>
         <div class="form-group"><label class="form-label" for="wizard-component-rounding-${index}">Partial packages</label><select class="form-select" id="wizard-component-rounding-${index}" data-component-rounding><option value="up">Round up and charge a package</option><option value="exact">Require an exact multiple</option></select></div>
       </div>
       <div class="form-group"><label class="form-label" for="wizard-component-details-${index}">Lookup prices or tiers</label><textarea class="form-textarea" id="wizard-component-details-${index}" data-component-details rows="4" placeholder="Lookup: small = 10.00&#10;Tier: 10 | 1.00 | 0.00&#10;Final tier: * | 0.80 | 0.00"></textarea><p class="text-muted text-sm">Lookup rows use <code>choice = amount</code>. Tier rows use <code>upper bound | unit amount | flat amount</code>; use <code>*</code> for the final open tier.</p></div>
     </details>
-    <label style="display:flex;gap:.5rem"><input type="checkbox" data-component-required> Required row</label>
+    <label class="flex gap-2"><input type="checkbox" data-component-required> Required row</label>
   </div>`;
   row.querySelector('[data-remove-row]').onclick=function(){row.remove()};
   row.querySelector('[data-component-key]').value=seed.key||'';
@@ -1655,7 +1655,7 @@ fn render_offer_variable_input(
             }
             @match variable.kind {
                 VariableKind::Boolean => {
-                    label style="display:flex;align-items:center;gap:.5rem;min-height:2.5rem" {
+                    label .flex .items-center .gap-2 .min-h-10 {
                         input id=(id) type="checkbox" data-offer-variable=(data_attribute) data-variable-key=(variable.key) data-variable-kind=(kind) checked[variable.default_value == Some(serde_json::Value::Bool(true))];
                         "Yes"
                     }
@@ -1721,15 +1721,15 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
     };
     let pricing_label = commerce_wire(&offer.pricing_model).replace('_', " ");
     html! {
-        section .card data-offer-card data-offer-id=(offer.id) data-offer-url=(offer_url) data-preview-url=(preview_url) data-presets-url=(presets_url) data-links-url=(links_url) data-currency=(offer.currency) style="margin-top:1rem" {
+        section .card data-offer-card data-offer-id=(offer.id) data-offer-url=(offer_url) data-preview-url=(preview_url) data-presets-url=(presets_url) data-links-url=(links_url) data-currency=(offer.currency) .mt-4 {
             header .card__head {
                 div {
-                    div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap" {
-                        h3 .card__title style="margin:0" { (offer.name) }
+                    div .flex .items-center .gap-2 .flex-wrap {
+                        h3 .card__title { (offer.name) }
                         (components::status_badge(&status))
                         span .badge .badge-secondary { "v" (offer.version) }
                     }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         (charge_label) " · " (pricing_label) " pricing · " (offer.currency)
                         @if let Some(interval) = offer.recurring_interval {
                             " · every " (offer.interval_count) " " (commerce_wire(&interval))
@@ -1787,13 +1787,13 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                         }
                     }
                 }
-                div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem" {
+                div .grid .grid-auto-220 .gap-4 {
                     div {
-                        h4 style="margin:.25rem 0" { "Customer fields" }
+                        h4 .my-1 { "Customer fields" }
                         @if offer.variables.is_empty() {
                             p .text-muted .text-sm { "No customer fields" }
                         } @else {
-                            ul style="margin:.5rem 0;padding-left:1.25rem" {
+                            ul .list-compact {
                                 @for variable in &offer.variables {
                                     li { (variable.label) " (" (commerce_wire(&variable.kind)) ")" @if variable.required { " — required" } }
                                 }
@@ -1801,15 +1801,15 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                         }
                     }
                     div {
-                        h4 style="margin:.25rem 0" { "Itemized price rows" }
-                        ul style="margin:.5rem 0;padding-left:1.25rem" {
+                        h4 .my-1 { "Itemized price rows" }
+                        ul .list-compact {
                             @for component in &offer.components {
                                 li { strong { (component.label) } ": " (amount_rule_summary(&component.amount, &offer.currency)) }
                             }
                         }
                     }
                     div {
-                        h4 style="margin:.25rem 0" { "Checkout" }
+                        h4 .my-1 { "Checkout" }
                         p .text-muted .text-sm {
                             (offer.components.len()) " row(s), " (offer.variables.len()) " input(s)"
                             @if let Some(minimum) = offer.checkout.minimum_total_minor { ", minimum " (display_money(minimum, &offer.currency)) }
@@ -1821,19 +1821,19 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                     }
                 }
                 @if managed.status == OfferStatus::Draft {
-                    details style="margin-top:1rem" {
-                        summary style="cursor:pointer;font-weight:600" { "Advanced draft definition" }
+                    details .mt-4 {
+                        summary .summary-strong { "Advanced draft definition" }
                         p .text-muted .text-sm { "Edit the complete typed offer JSON. Published offers are immutable; duplicate one to create an editable draft." }
                         textarea .form-textarea data-offer-definition rows="18" spellcheck="false" { (definition) }
-                        button .btn .btn--primary .btn--sm type="button" style="margin-top:.75rem" onclick="productManagerSaveOffer(this)" { "Save draft definition" }
+                        button .btn .btn--primary .btn--sm type="button" .mt-3 onclick="productManagerSaveOffer(this)" { "Save draft definition" }
                     }
                 }
                 @if managed.status == OfferStatus::Active {
-                    section style="border-top:1px solid var(--border-color);margin-top:1.25rem;padding-top:1.25rem" {
-                        h4 style="margin:0" { "Shareable Stripe Payment Links" }
+                    section .details-block--divider {
+                        h4 .m-0 { "Shareable Stripe Payment Links" }
                         p .text-muted .text-sm { "Create a hosted checkout link you can paste into an email, button, or social post. Products with choices save those choices as a reusable preset." }
                         @if !offer.variables.is_empty() {
-                            div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem" {
+                            div .grid .grid-auto-260 .gap-4 {
                                 div .form-group {
                                     label .form-label { "Preset name" }
                                     input .form-input data-preset-name type="text" value=(format!("{} share link", offer.name));
@@ -1844,39 +1844,39 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                                 }
                                 @for variable in &offer.variables { (render_offer_variable_input(variable, &offer.id, "preset")) }
                             }
-                            details style="margin:.5rem 0 1rem" {
-                                summary style="cursor:pointer" { "Advanced preset JSON" }
+                            details .details-block--spaced {
+                                summary { "Advanced preset JSON" }
                                 textarea .form-textarea data-preset-values rows="5" spellcheck="false" { (preset_defaults) }
                             }
                         }
-                        div .form-group style="max-width:620px" {
+                        div .form-group .form-group--narrow {
                             label .form-label { "After-completion URL (optional)" }
                             input .form-input data-link-completion-url type="url" placeholder="https://example.com/thank-you";
                         }
-                        div style="display:flex;gap:.5rem;flex-wrap:wrap" {
+                        div .flex .gap-2 .flex-wrap {
                             button .btn .btn--primary .btn--sm type="button" data-create-link onclick="productManagerCreateLink(this)" { "+ Create or reuse Payment Link" }
                             @if !offer.variables.is_empty() {
                                 button .btn .btn--secondary .btn--sm type="button" onclick="productManagerNewPreset(this)" { "New preset" }
                             }
                         }
                         @if !offer.variables.is_empty() {
-                            h5 style="margin-bottom:.25rem" { "Saved presets" }
+                            h5 .mb-1 { "Saved presets" }
                             div data-checkout-presets aria-live="polite" { p .text-muted .text-sm { "Loading presets…" } }
                         }
-                        div data-payment-links style="margin-top:1rem" { p .text-muted .text-sm { "Loading Payment Links…" } }
+                        div data-payment-links .mt-4 { p .text-muted .text-sm { "Loading Payment Links…" } }
                     }
-                    details style="border-top:1px solid var(--border-color);margin-top:1.25rem;padding-top:1.25rem" {
-                        summary style="cursor:pointer;font-weight:600" { "Hosted, embedded, and static-site integration" }
+                    details .details-block--divider {
+                        summary .summary-strong { "Hosted, embedded, and static-site integration" }
                         p .text-muted .text-sm { "The browser sends inputs to Impresspress for authoritative pricing. Replace the placeholder domain with this Impresspress deployment; secret Stripe keys never belong in static HTML." }
                         div .form-group {
                             label .form-label { "Hosted Checkout widget" }
                             textarea .form-textarea data-integration-snippet readonly rows="4" spellcheck="false" { (hosted_snippet) }
-                            button .btn .btn--secondary .btn--sm type="button" style="margin-top:.5rem" onclick="productManagerCopyField(this)" { "Copy hosted snippet" }
+                            button .btn .btn--secondary .btn--sm type="button" .mt-2 onclick="productManagerCopyField(this)" { "Copy hosted snippet" }
                         }
                         div .form-group {
                             label .form-label { "Embedded Checkout widget" }
                             textarea .form-textarea data-integration-snippet readonly rows="4" spellcheck="false" { (embedded_snippet) }
-                            button .btn .btn--secondary .btn--sm type="button" style="margin-top:.5rem" onclick="productManagerCopyField(this)" { "Copy embedded snippet" }
+                            button .btn .btn--secondary .btn--sm type="button" .mt-2 onclick="productManagerCopyField(this)" { "Copy embedded snippet" }
                         }
                     }
                 }
@@ -1952,12 +1952,12 @@ pub async fn product_manager(
             header .card__head {
                 div {
                     div .products-status-stack {
-                        h3 .card__title style="margin:0" { "Product details" }
+                        h3 .card__title { "Product details" }
                         (components::status_badge(status))
                         @if product.str_field("owner_kind") == "user" { span .badge .badge-secondary { "Review: " (approval) } }
                     }
                     @if !admin && status == "pending_review" {
-                        p .text-muted .text-sm style="margin:.25rem 0 0" { "This product is awaiting administrator review and is not public yet." }
+                        p .text-muted .text-sm .text-subtitle { "This product is awaiting administrator review and is not public yet." }
                     }
                 }
                 div .products-actions {
@@ -2002,16 +2002,16 @@ pub async fn product_manager(
                 }
             }
         }
-        section #product-manager-visual-editor .card hidden style="margin-top:1.5rem" {
+        section #product-manager-visual-editor .card hidden .mt-6 {
             header .card__head {
                 div {
                     h3 #manager-visual-title .card__title { "Edit pricing draft" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" { "Manage customer inputs, itemized price rows, conditions, and recurring terms without editing JSON." }
+                    p .text-muted .text-sm .text-subtitle { "Manage customer inputs, itemized price rows, conditions, and recurring terms without editing JSON." }
                 }
                 button .btn .btn--secondary .btn--sm type="button" onclick="productManagerCloseVisualEditor()" { "Close editor" }
             }
             div .card__body {
-                div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem" {
+                div .grid .grid-auto-180 .gap-4 {
                     div .form-group {
                         label .form-label .required for="manager-visual-offer-name" { "Offer name" }
                         input #manager-visual-offer-name .form-input type="text" maxlength="160" required;
@@ -2033,22 +2033,22 @@ pub async fn product_manager(
                         input #manager-visual-interval-count .form-input type="number" min="1" max="36" step="1" value="1";
                     }
                 }
-                section style="margin-top:1rem" {
-                    div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap" {
-                        div { h4 style="margin:0" { "Customer fields" } p .text-muted .text-sm { "Typed quantities, choices, flags, and text used by price rows." } }
+                section .mt-4 {
+                    div .flex .items-center .justify-between .gap-4 .flex-wrap {
+                        div { h4 .m-0 { "Customer fields" } p .text-muted .text-sm { "Typed quantities, choices, flags, and text used by price rows." } }
                         button .btn .btn--secondary .btn--sm type="button" onclick="addWizardVariable()" { "+ Add input" }
                     }
                     div #wizard-variables {}
                 }
-                section style="margin-top:1.5rem" {
-                    div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap" {
-                        div { h4 style="margin:0" { "Itemized price rows" } p .text-muted .text-sm { "Fixed, per-unit, lookup, tiered, package, and conditional rows are supported." } }
+                section .products-section {
+                    div .flex .items-center .justify-between .gap-4 .flex-wrap {
+                        div { h4 .m-0 { "Itemized price rows" } p .text-muted .text-sm { "Fixed, per-unit, lookup, tiered, package, and conditional rows are supported." } }
                         button .btn .btn--secondary .btn--sm type="button" onclick="addWizardComponent()" { "+ Add row" }
                     }
                     div #wizard-components {}
                 }
                 p .text-muted .text-sm { "Checkout collection, shipping, tax, and fulfillment settings remain unchanged. Advanced nested conditions and quantity rules are preserved when saved." }
-                div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap" {
+                div .flex .gap-2 .mt-4 .flex-wrap {
                     button .btn .btn--primary .btn--sm type="button" onclick="productManagerSaveVisualOffer(this)" { "Save visual changes" }
                     button .btn .btn--secondary .btn--sm type="button" onclick="productManagerCloseVisualEditor()" { "Cancel" }
                 }
@@ -2160,9 +2160,9 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
         })))
 
         p #catalog-admin-error .login-error role="alert" aria-live="assertive" hidden {}
-        section #group-editor .card hidden style="margin-bottom:1rem" {
+        section #group-editor .card hidden .mb-4 {
             header .card__head {
-                div { h3 #group-editor-title .card__title { "New group" } p .text-muted .text-sm style="margin:.25rem 0 0" { "Give the group a clear name customers will recognize." } }
+                div { h3 #group-editor-title .card__title { "New group" } p .text-muted .text-sm .text-subtitle { "Give the group a clear name customers will recognize." } }
             }
             div .card__body {
                 form onsubmit="productCatalogSaveGroup(event)" {
@@ -2204,7 +2204,7 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         html! { span .text-muted .text-sm { (r.str_field("description")) } },
                         components::status_badge(r.str_field("status")),
                         html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
-                        html! { div style="display:flex;gap:.4rem;flex-wrap:wrap" {
+                        html! { div .flex .gap-2 .flex-wrap {
                             button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-record-description=(r.str_field("description")) data-record-status=(r.str_field("status")) onclick="productCatalogEditGroup(this)" { "Edit" }
                             button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) onclick="productCatalogDelete(this,'group')" { "Delete" }
                         } },
@@ -2310,13 +2310,13 @@ pub async fn purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 fn setup_check(label: &str, complete: bool, detail: &str) -> Markup {
     html! {
-        li style="display:flex;align-items:flex-start;gap:.75rem;margin-bottom:.75rem" {
+        li .flex .items-start .gap-3 .mb-3 {
             span .badge .(if complete { "badge-success" } else { "badge-warning" }) {
                 @if complete { "Ready" } @else { "Action needed" }
             }
             div {
                 strong { (label) }
-                p .text-muted .text-sm style="margin:.2rem 0 0" { (detail) }
+                p .text-muted .text-sm .text-subtitle { (detail) }
             }
         }
     }
@@ -2350,17 +2350,17 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
             header .card__head {
                 div {
                     h3 .card__title { "Connection" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" { (summary) }
+                    p .text-muted .text-sm .text-subtitle { (summary) }
                 }
                 span #stripe-state .badge .(badge_class) { (state_label) }
             }
             div .card__body {
                 @if !status.error.is_empty() {
-                    p #stripe-error .text-sm style="color:var(--accent-danger);margin-top:0" {
+                    p #stripe-error .text-sm .text-danger .mt-0 {
                         (status.error)
                     }
                 } @else {
-                    p #stripe-error .text-sm .text-muted style="margin-top:0" {}
+                    p #stripe-error .text-sm .text-muted .mt-0 {}
                 }
                 div .stats-grid {
                     (components::stat_card("Payments", if status.charges_enabled { "Enabled" } else { "Unavailable" }, icons::credit_card(), None))
@@ -2375,7 +2375,7 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
                         p { strong { "API version: " } code { (&status.api_version) } }
                     }
                 }
-                div style="display:flex;gap:.75rem;flex-wrap:wrap;margin-top:1.25rem" {
+                div .flex .gap-3 .flex-wrap .mt-5 {
                     button #stripe-test-button .btn .btn--secondary .btn--md type="button" onclick="testStripeConnection()" {
                         "Test connection"
                     }
@@ -2560,17 +2560,17 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Some(html! { a .btn .btn--secondary .btn--sm href="/b/products/admin/settings" { "Edit Stripe settings" } }),
         ))
         @if status.state == StripeConnectionState::ConnectedTest {
-            section .card style="border-color:var(--accent-warning);margin-bottom:1rem" {
+            section .card .card--warning .mb-4 {
                 div .card__body {
                     strong { "Test mode is active" }
-                    p .text-muted .text-sm style="margin:.35rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         "Checkout is safe to exercise, but no real funds will move. Replace both keys with matching live-mode keys only after the checklist below is complete."
                     }
                 }
             }
         }
         (stripe_connection_card(&status))
-        div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;margin-top:1rem" {
+        div .grid .grid-auto-320 .gap-4 .mt-4 {
             section .card {
                 header .card__head { h3 .card__title { "Go-live checklist" } }
                 div .card__body {
@@ -2613,18 +2613,18 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
         details .products-advanced {
             summary { "Advanced: webhook delivery history" }
-            section #stripe-webhook-operations .card style="border:0;box-shadow:none" {
-            header .card__head style="align-items:flex-end;gap:1rem;flex-wrap:wrap" {
+            section #stripe-webhook-operations .card .card--flat {
+            header .card__head .card__head--end {
                 div {
                     h3 .card__title { "Webhook delivery health" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         "Review failed Stripe notifications and replay one after the underlying problem is fixed."
                     }
                 }
-                div style="display:flex;gap:.5rem;align-items:end;flex-wrap:wrap" {
+                div .flex .gap-2 .items-end .flex-wrap {
                     label .text-sm for="stripe-webhook-filter" {
                         "Status"
-                        select #stripe-webhook-filter onchange="loadStripeWebhookEvents()" style="display:block;margin-top:.25rem" {
+                        select #stripe-webhook-filter onchange="loadStripeWebhookEvents()" .d-block .mt-1 {
                             option value="dead_letter" selected { "Needs manual review" }
                             option value="failed" { "Waiting to retry" }
                             option value="processing" { "Processing" }
@@ -2636,7 +2636,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 }
             }
             div .card__body {
-                p #stripe-webhook-summary .text-muted .text-sm aria-live="polite" style="margin-top:0" {}
+                p #stripe-webhook-summary .text-muted .text-sm aria-live="polite" .mt-0 {}
                 p #stripe-webhook-error .login-error role="alert" aria-live="assertive" hidden {}
                 div #stripe-webhook-events aria-live="polite" { "Loading webhook events…" }
                 noscript { p .text-muted .text-sm { "JavaScript is required to inspect and replay webhook deliveries." } }
@@ -2645,18 +2645,18 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
         details .products-advanced {
             summary { "Advanced: Stripe recovery tools" }
-            section #stripe-provider-operations .card style="border:0;box-shadow:none" {
-            header .card__head style="align-items:flex-end;gap:1rem;flex-wrap:wrap" {
+            section #stripe-provider-operations .card .card--flat {
+            header .card__head .card__head--end {
                 div {
                     h3 .card__title { "Provider reconciliation" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         "Retry incomplete Stripe updates and review any operation that could not recover automatically."
                     }
                 }
-                div style="display:flex;gap:.5rem;align-items:end;flex-wrap:wrap" {
+                div .flex .gap-2 .items-end .flex-wrap {
                     label .text-sm for="stripe-provider-filter" {
                         "Status"
-                        select #stripe-provider-filter onchange="loadStripeProviderOperations()" style="display:block;margin-top:.25rem" {
+                        select #stripe-provider-filter onchange="loadStripeProviderOperations()" .d-block .mt-1 {
                             option value="dead_letter" selected { "Needs manual review" }
                             option value="failed" { "Waiting to retry" }
                             option value="pending" { "Pending" }
@@ -2670,7 +2670,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 }
             }
             div .card__body {
-                p #stripe-provider-summary .text-muted .text-sm aria-live="polite" style="margin-top:0" {}
+                p #stripe-provider-summary .text-muted .text-sm aria-live="polite" .mt-0 {}
                 p #stripe-provider-reconcile-result .text-sm role="status" aria-live="polite" {}
                 p #stripe-provider-error .login-error role="alert" aria-live="assertive" hidden {}
                 div #stripe-provider-operations-list aria-live="polite" { "Loading provider operations…" }
@@ -2720,7 +2720,7 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
             header .card__head {
                 div {
                     h3 .card__title { "Stripe seller account" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         "Stripe hosts identity verification, payouts, and the Express dashboard."
                     }
                 }
@@ -2729,27 +2729,27 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
                 }
             }
             div .card__body {
-                div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem" {
+                div .grid .grid-auto-150 .gap-4 {
                     div {
-                        p .text-muted .text-sm style="margin:0" { "Charges" }
+                        p .text-muted .text-sm .m-0 { "Charges" }
                         strong { @if account.is_some_and(|a| a.capabilities.charges_enabled) { "Enabled" } @else { "Unavailable" } }
                     }
                     div {
-                        p .text-muted .text-sm style="margin:0" { "Payouts" }
+                        p .text-muted .text-sm .m-0 { "Payouts" }
                         strong { @if account.is_some_and(|a| a.capabilities.payouts_enabled) { "Enabled" } @else { "Unavailable" } }
                     }
                     div {
-                        p .text-muted .text-sm style="margin:0" { "Platform fee" }
+                        p .text-muted .text-sm .m-0 { "Platform fee" }
                         strong { (fee_percent(account.map_or(fee_basis_points, |a| a.fee_basis_points))) }
                     }
                     div {
-                        p .text-muted .text-sm style="margin:0" { "Mode" }
+                        p .text-muted .text-sm .m-0 { "Mode" }
                         strong { @if account.is_some_and(|a| a.livemode) { "Live" } @else { "Test" } }
                     }
                 }
                 @if let Some(account) = account {
                     @if !account.capabilities.requirements_due.is_empty() {
-                        div style="margin-top:1rem" {
+                        div .mt-4 {
                             strong { "Information Stripe still needs" }
                             ul .text-sm {
                                 @for requirement in &account.capabilities.requirements_due {
@@ -2759,13 +2759,13 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
                         }
                     }
                     @if !account.disabled_reason.is_empty() {
-                        p .text-sm style="color:var(--accent-danger)" { "Stripe restriction: " (friendly_requirement(&account.disabled_reason)) }
+                        p .text-sm .text-danger { "Stripe restriction: " (friendly_requirement(&account.disabled_reason)) }
                     }
                     @if !account.sync_error.is_empty() {
                         p .text-muted .text-sm { "Last refresh: " (account.sync_error) }
                     }
                 }
-                div style="display:flex;gap:.75rem;flex-wrap:wrap;margin-top:1.25rem" {
+                div .flex .gap-3 .flex-wrap .mt-5 {
                     @if !suspended && !ready {
                         button .btn .btn--primary .btn--md type="button" onclick="startSellerOnboarding()" {
                             @if has_account { "Continue Stripe setup" } @else { "Connect Stripe to sell" }
@@ -2883,7 +2883,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Some("Review what you bought, manage billing, or start selling"),
             None,
         ))
-        div #commerce-portal-error .text-sm hidden style="color:var(--accent-danger);margin-bottom:1rem" {}
+        div #commerce-portal-error .text-sm hidden .text-danger .mb-4 {}
         div .products-callout {
             div .products-callout__copy {
                 strong { "One commerce workspace" }
@@ -2897,22 +2897,22 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 (components::stat_card("Products for sale", &product_count.to_string(), icons::package(), None))
             }
         }
-        section .card style="margin-top:1rem" {
+        section .card .mt-4 {
             header .card__head {
                 div {
                     h3 .card__title { "Purchases and subscriptions" }
-                    p .text-muted .text-sm style="margin:.25rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         "Review orders here. Stripe's secure Billing Portal handles saved payment methods, invoices, and subscription changes."
                     }
                 }
             }
-            div .card__body style="display:flex;gap:.75rem;flex-wrap:wrap" {
+            div .card__body .flex .gap-3 .flex-wrap {
                 a .btn .btn--primary .btn--md href="/b/products/my-purchases" { "View purchases" }
                 button .btn .btn--secondary .btn--md type="button" onclick="manageBuyerBilling()" { "Manage billing" }
             }
         }
         @if seller_enabled {
-            div style="margin-top:1rem" {
+            div .mt-4 {
                 (seller_status_card(seller_account.as_ref(), fee_basis_points))
             }
         }
@@ -2933,7 +2933,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 fn seller_page_links(active: &str) -> Markup {
     html! {
-        nav aria-label="Seller workspace" style="display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem" {
+        nav aria-label="Seller workspace" .flex .gap-3 .flex-wrap .mb-4 {
             a .btn .(if active == "dashboard" { "btn--primary" } else { "btn--secondary" }) .btn--sm href="/b/products/selling" { "Dashboard" }
             a .btn .(if active == "products" { "btn--primary" } else { "btn--secondary" }) .btn--sm href="/b/products/my-products" { "Products and links" }
             a .btn .(if active == "orders" { "btn--primary" } else { "btn--secondary" }) .btn--sm href="/b/products/selling/orders" { "Orders and subscriptions" }
@@ -2982,7 +2982,7 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
         (portal_tabs("selling", seller_enabled))
         (seller_page_links("dashboard"))
         (components::page_header("Seller dashboard", Some("Sales, subscriptions, Stripe readiness, and actions"), None))
-        div #commerce-portal-error .text-sm hidden style="color:var(--accent-danger);margin-bottom:1rem" {}
+        div #commerce-portal-error .text-sm hidden .text-danger .mb-4 {}
         (seller_status_card(account.as_ref(), fee_basis_points))
         (analytics_section(&analytics, "Your sales by currency", true))
         (seller_failures_section(&failures))
@@ -3214,12 +3214,12 @@ async fn order_detail(
     let content = html! {
         (tabs)
         a .text-sm href=(back_url) { "← " (back_label) }
-        div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;flex-wrap:wrap;margin-top:1rem" {
+        div .flex .justify-between .gap-4 .items-start .flex-wrap .mt-4 {
             div {
-                h1 style="margin-bottom:.35rem" { "Order #" (purchase.id.get(..8).unwrap_or(&purchase.id)) }
-                p .text-muted style="margin-top:0" { "Placed " (purchase.str_field("created_at").get(..10).unwrap_or("—")) }
+                h1 .mb-1 { "Order #" (purchase.id.get(..8).unwrap_or(&purchase.id)) }
+                p .text-muted .mt-0 { "Placed " (purchase.str_field("created_at").get(..10).unwrap_or("—")) }
             }
-            div style="display:flex;gap:.5rem;align-items:center" {
+            div .flex .gap-2 .items-center {
                 (components::status_badge(purchase.str_field("status")))
                 @if purchase.bool_field("livemode") {
                     (components::status_badge("live"))
@@ -3257,12 +3257,12 @@ async fn order_detail(
                     ("Subscription canceled", purchase.str_field("subscription_canceled_at")),
                 ] {
                     @if !value.is_empty() {
-                        div { p .text-muted .text-sm style="margin:0" { (label) } strong .text-sm { (value) } }
+                        div { p .text-muted .text-sm .m-0 { (label) } strong .text-sm { (value) } }
                     }
                 }
             }
         }
-        section .card style="margin-top:1rem" {
+        section .card .mt-4 {
             header .card__head { h2 .card__title { "Items" } }
             div .card__body {
                 @if line_items.is_empty() {
@@ -3286,7 +3286,7 @@ async fn order_detail(
                 }
             }
         }
-        div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-top:1rem" {
+        div .grid .grid-auto-280 .gap-4 .mt-4 {
             section .card {
                 header .card__head { h2 .card__title { "Buyer and checkout" } }
                 div .card__body .text-sm {
@@ -3296,10 +3296,10 @@ async fn order_detail(
                     p { strong { "Seller account: " } (if purchase.str_field("seller_account_id").is_empty() { "Platform" } else { purchase.str_field("seller_account_id") }) }
                 }
             }
-            details .products-advanced style="margin-top:0" {
+            details .products-advanced .mt-0 {
                 summary { "Technical payment details" }
                 div .products-advanced__body .text-sm {
-                    h2 style="font-size:1rem;margin-top:0" { "Provider reconciliation" }
+                    h2 .details-heading { "Provider reconciliation" }
                     p { strong { "State: " } (components::status_badge(purchase.str_field("reconciliation_status"))) }
                     @if !purchase.str_field("provider_payment_status").is_empty() {
                         p { strong { "Payment state: " } (components::status_badge(purchase.str_field("provider_payment_status"))) }
@@ -3313,24 +3313,24 @@ async fn order_detail(
                         @if !value.is_empty() { p { strong { (label) ": " } code { (value) } } }
                     }
                     @if !purchase.str_field("reconciliation_error").is_empty() {
-                        p style="color:var(--accent-danger)" { (purchase.str_field("reconciliation_error")) }
+                        p .text-danger { (purchase.str_field("reconciliation_error")) }
                     }
                     @if !purchase.str_field("provider_payment_error_code").is_empty() {
                         p { strong { "Provider code: " } code { (purchase.str_field("provider_payment_error_code")) } }
                     }
                     @if !purchase.str_field("provider_payment_error_message").is_empty()
                         && purchase.str_field("provider_payment_error_message") != purchase.str_field("reconciliation_error") {
-                        p style="color:var(--accent-danger)" { (purchase.str_field("provider_payment_error_message")) }
+                        p .text-danger { (purchase.str_field("provider_payment_error_message")) }
                     }
                 }
             }
         }
         @if !purchase.str_field("stripe_subscription_id").is_empty() {
-            section .card style="margin-top:1rem" {
+            section .card .mt-4 {
                 header .card__head {
                     div {
                         h2 .card__title { "Subscription" }
-                        p .text-muted .text-sm style="margin:.25rem 0 0" { code { (purchase.str_field("stripe_subscription_id")) } }
+                        p .text-muted .text-sm .text-subtitle { code { (purchase.str_field("stripe_subscription_id")) } }
                     }
                     (components::status_badge(purchase.str_field("subscription_status")))
                 }
@@ -3345,7 +3345,7 @@ async fn order_detail(
             }
         }
         @if !refunds.is_empty() {
-            section .card style="margin-top:1rem" {
+            section .card .mt-4 {
                 header .card__head { h2 .card__title { "Refund history" } }
                 div .card__body {
                     @let cols = [
@@ -3367,12 +3367,12 @@ async fn order_detail(
             }
         }
         @if !disputes.is_empty() {
-            section .card style="margin-top:1rem" {
+            section .card .mt-4 {
                 header .card__head {
                     div {
                         h2 .card__title { "Payment disputes" }
                         @if matches!(access, OrderPageAccess::Admin | OrderPageAccess::Seller) {
-                            p .text-muted .text-sm style="margin:.25rem 0 0" { "Evidence, balance impact, and payout actions are managed in Stripe. This ledger mirrors signed provider events." }
+                            p .text-muted .text-sm .text-subtitle { "Evidence, balance impact, and payout actions are managed in Stripe. This ledger mirrors signed provider events." }
                         }
                     }
                 }
@@ -3396,11 +3396,11 @@ async fn order_detail(
             }
         }
         @if refund_url.is_some() && refundable {
-            section .card style="margin-top:1rem" {
+            section .card .mt-4 {
                 header .card__head { h2 .card__title { "Create refund" } }
                 div .card__body {
                     p .text-muted .text-sm { "Leave the amount blank to refund the complete remaining balance. Stripe refunds and proportional Connect fee/transfer reversals are requested before local success is recorded." }
-                    div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem" {
+                    div .grid .grid-auto-240 .gap-4 {
                         div .form-group { label .form-label for="order-refund-amount" { "Amount (" (currency) ")" } input #order-refund-amount .form-input type="text" inputmode="decimal" placeholder="Full remaining amount" {} }
                         div .form-group { label .form-label for="order-refund-note" { "Private note" } textarea #order-refund-note .form-textarea maxlength="500" {} }
                     }
@@ -3689,10 +3689,10 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
             }
         }
         @if !trusted_server {
-            section .card style="border-color:var(--accent-warning);margin-bottom:1rem" {
+            section .card .card--warning .mb-4 {
                 div .card__body {
                     strong { "Browser runtime safety" }
-                    p .text-muted .text-sm style="margin:.35rem 0 0" {
+                    p .text-muted .text-sm .text-subtitle {
                         "Stripe secret keys and signed webhooks are disabled here because browser storage is controlled by the visitor. Point the storefront widget at a trusted native or Cloudflare API, or use a pre-created Payment Link."
                     }
                 }
