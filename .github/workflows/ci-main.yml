@@ -129,6 +129,47 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
 
+  # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
+  # migration tests that check each block's `*.postgres.sql` twin is the one
+  # its Rust list actually references — was dead code in CI: nothing anywhere
+  # ran `cargo test` with that feature on. `products-postgres` below does not
+  # cover them; it globs the `.sql` files through `psql`, which proves the SQL
+  # parses and runs but says nothing about whether any Rust constant points at
+  # it. A migration wired into `SQLITE_MIGRATIONS` and forgotten in
+  # `POSTGRES_MIGRATIONS` compiled clean and failed no test.
+  #
+  # No Postgres service container: the `postgres` feature is a pure cfg flag on
+  # impresspress-core (`postgres = []`), and on impresspress-native it only
+  # pulls `wafer-block-postgres` in as a dependency. Nothing under it opens a
+  # connection at test time — the assertions are all against embedded SQL text.
+  # `products-postgres` is where a real server belongs, and it has one.
+  #
+  # impresspress-native is built alongside impresspress-core because it holds
+  # the only non-test postgres-gated Rust (`make_postgres_database_service`),
+  # which nothing else in CI compiles. Neither crate has a build.rs, so this
+  # job needs no `build-wasm` artifact and does not depend on that job.
+  test-postgres:
+    name: Tests (postgres feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: test-postgres
+
+      # `package/feature` spelling because `--features` needs it whenever more
+      # than one package is selected.
+      - name: Run tests with the postgres feature
+        run: cargo test --locked -p impresspress-core -p impresspress-native --features impresspress-core/postgres,impresspress-native/postgres
+
   wasm:
     name: Cloudflare wasm32 check
     needs: build-wasm
