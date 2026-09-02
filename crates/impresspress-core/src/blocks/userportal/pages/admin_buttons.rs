@@ -53,25 +53,25 @@ pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStrea
         ))
 
         // Add button form
-        div .card style="margin-bottom:1.5rem;padding:1.25rem" {
-            h3 style="margin:0 0 1rem;font-size:1rem" { "Add Button" }
+        div .card .p-5 .mb-6 {
+            h3 .text-16 .m-0 .mb-4 { "Add Button" }
             form
                 hx-post="/b/userportal/admin/buttons"
                 hx-target="#buttons-table"
                 hx-swap="outerHTML"
-                style="display:grid;grid-template-columns:1fr 1fr 1fr auto auto;gap:0.75rem;align-items:end"
+                .grid .admin-buttons-form-grid .items-end .gap-3
             {
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="label" { "Label" }
                     input .form-input #label type="text" name="label"
                         placeholder="e.g. My Products" required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="path" { "Path" }
                     input .form-input #path type="text" name="path"
                         placeholder="e.g. /b/products/mine" required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="icon" { "Icon" }
                     select .form-input #icon name="icon" {
                         @for &(value, display) in ICON_OPTIONS {
@@ -79,12 +79,12 @@ pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStrea
                         }
                     }
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="sort_order" { "Order" }
                     input .form-input #sort_order type="number" name="sort_order"
-                        value="0" style="width:5rem";
+                        value="0" .w-80;
                 }
-                button .btn .btn-primary type="submit" style="white-space:nowrap" {
+                button .btn .btn-primary type="submit" .nowrap {
                     (icons::plus()) " Add"
                 }
             }
@@ -122,7 +122,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                 th { "Icon" }
                                 th { "Path" }
                                 th { "Order" }
-                                th style="width:6rem" { "Actions" }
+                                th .w-96 { "Actions" }
                             }
                         }
                         tbody {
@@ -130,7 +130,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                 tr {
                                     td .font-medium { (btn.str_field("label")) }
                                     td {
-                                        span .nav-icon style="display:inline-flex" {
+                                        span .nav-icon .d-inline-flex {
                                             (nav_icon(btn.str_field("icon")))
                                         }
                                         " "
@@ -139,7 +139,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                     td { code { (btn.str_field("path")) } }
                                     td { (btn.i64_field("sort_order")) }
                                     td {
-                                        div style="display:flex;gap:0.25rem" {
+                                        div .flex .gap-1 {
                                             button .btn .btn-ghost .btn-sm
                                                 hx-get=(format!("/b/userportal/admin/buttons/{}/edit", btn.id))
                                                 hx-target=(format!("#edit-modal-{}", btn.id))
@@ -262,19 +262,19 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                 hx-put=(format!("/b/userportal/admin/buttons/{id}"))
                 hx-target="#buttons-table"
                 hx-swap="outerHTML"
-                style="display:flex;flex-direction:column;gap:0.75rem"
+                .flex .flex-col .gap-3
             {
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Label" }
                     input .form-input type="text" name="label"
                         value=(record.str_field("label")) required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Path" }
                     input .form-input type="text" name="path"
                         value=(record.str_field("path")) required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Icon" }
                     select .form-input name="icon" {
                         @for &(value, display) in ICON_OPTIONS {
@@ -282,12 +282,12 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                         }
                     }
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Order" }
                     input .form-input type="number" name="sort_order"
                         value=(record.i64_field("sort_order"));
                 }
-                div style="display:flex;gap:0.5rem;justify-content:flex-end" {
+                div .flex .gap-2 .justify-end {
                     button .btn .btn-secondary type="button"
                         onclick=(format!("document.getElementById('edit-btn-{id}').style.display='none'"))
                     { "Cancel" }

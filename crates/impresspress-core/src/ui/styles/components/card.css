@@ -687,3 +687,6 @@
 .ticket-form-grid--type-create { margin: 1rem 0; max-width: 50rem; }
 .ticket-form-grid--type-edit { margin-top: 1rem; }
 
+/* ===== Portal buttons admin (blocks/userportal/pages/admin_buttons.rs) ===== */
+.admin-buttons-form-grid { grid-template-columns: 1fr 1fr 1fr auto auto; }
+
