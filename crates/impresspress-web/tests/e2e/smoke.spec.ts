@@ -96,6 +96,25 @@ test('the default bundle has no dev block', async ({ page }) => {
     async () => (await fetch('/b/auth/login')).headers.get('content-security-policy'),
   );
   expect(csp).not.toBeNull();
+  // `worker-src` exists ONLY when the sandbox is active — nothing else in the
+  // bundle spawns a worker.
   expect(csp).not.toContain('worker-src');
-  expect(csp).not.toContain('frame-src');
+  // The sandbox previews the live site in a same-origin iframe and relaxes
+  // this to `'self'` (`runtime_factory.rs`); a normal deployment refuses
+  // framing outright.
+  expect(csp).toContain("frame-ancestors 'none'");
+  // Deliberately NOT `expect(csp).not.toContain('frame-src')`, which is what
+  // this line used to say. The products block declares
+  // `frame-src https://js.stripe.com https://hooks.stripe.com
+  // https://checkout.stripe.com` for Stripe Checkout, so a feature-OFF bundle
+  // has a `frame-src` too — and this assertion failed the first time it was
+  // run against a real built `pkg/` (Plan 1 Task 10's fix round).
+  //
+  // Honest about what these two lines currently prove: measured side by side,
+  // a `browser-devtools` + `[dev] enabled` bundle serves a byte-identical CSP,
+  // so neither line discriminates today. The factory's
+  // `wafer-run/security-headers` block config is not reaching the response —
+  // see the Task 10 fix report. Once that is fixed these assertions become
+  // real, which is why they are written for the intended behaviour rather
+  // than deleted.
 });

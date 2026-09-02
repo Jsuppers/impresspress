@@ -76,8 +76,21 @@ pub async fn seed_and_load_variables(
     if dev_active {
         // The sandbox owns `/` — an editable site is the point of it — so the
         // router must serve `wafer-run/web` there instead of bouncing
-        // anonymous visitors to the login page.
-        impresspress_core::boot::seed_variable_if_absent(
+        // anonymous visitors to the login page (design §7.3).
+        //
+        // FORCE-SET, not seeded. This hook runs *after* the admin block's
+        // `lifecycle(Init)`, which has already written every declared
+        // `config_vars` default — and `WAFER_RUN_SHARED__HAS_LANDING_PAGE` is
+        // declared, defaulting to `"false"`. `seed_variable_if_absent` is
+        // therefore a guaranteed no-op on this key, which is precisely the
+        // bug Plan 1 Task 10's e2e caught: the sandbox published a site that
+        // `/` then refused to serve. It is also not merely an ordering
+        // accident to be worked around — a sandbox bundle ALWAYS has a site
+        // (the seed guarantees one), so this is a fact about the deployment
+        // rather than a default anyone should be able to leave at `"false"`,
+        // and re-asserting it on every boot is the honest expression of that.
+        // `set_variable` writes nothing when the value already matches.
+        impresspress_core::boot::set_variable(
             db,
             "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
             "true",

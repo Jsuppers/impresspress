@@ -4,8 +4,8 @@
 #
 # The bundle is produced through the **sealed** web flow, which is the only
 # flow that lets the `browser-devtools` wasm be substituted without a second
-# consumer crate: `sealed_web::build` resolves the wasm and the JS glue through
-# `IMPRESSPRESS_WEB_WASM` / `IMPRESSPRESS_WEB_JS` (see
+# consumer crate: `sealed_web::build` resolves the wasm, the JS glue and the
+# inline-JS snippets through `IMPRESSPRESS_WEB_PKG_DIR` (see
 # `crates/impresspress/src/cli/helpers/wasm.rs`), so a feature-on `wasm-pack`
 # output can be bundled by the same CLI the ordinary flow uses.
 #
@@ -108,8 +108,10 @@ TOML
 
 (
   cd "$BUNDLE_DIR"
-  IMPRESSPRESS_WEB_WASM="$WEB/pkg-dev/impresspress_web_bg.wasm" \
-  IMPRESSPRESS_WEB_JS="$WEB/pkg-dev/impresspress_web.js" \
+  # The whole wasm-pack output, not two files out of three: the JS glue
+  # imports from `snippets/`, and a dist missing that tree cannot load its own
+  # module.
+  IMPRESSPRESS_WEB_PKG_DIR="$WEB/pkg-dev" \
     "$IMPRESSPRESS" build --target web --release
 )
 
@@ -121,29 +123,16 @@ grep -q 'dev: true' "$DIST/sw.js" || {
   echo "build-dev-bundle.sh: $DIST/sw.js does not boot with { dev: true } — is [dev] enabled set?" >&2
   exit 1
 }
+# The glue's first statement is an import from here. A dist without it loads no
+# module at all, and the failure mode — a service worker that self-destructs and
+# leaves the boot shell up — is a 60-second Playwright timeout rather than an
+# error, so it is worth one line here.
+[ -d "$DIST/snippets" ] || {
+  echo "build-dev-bundle.sh: $DIST/snippets is missing; the JS glue cannot resolve its imports" >&2
+  exit 1
+}
 
-# 4. The rest of the wasm-pack output.
-#
-#    KNOWN GAP IN THE SEALED WEB FLOW, staged here rather than papered over:
-#    `crates/impresspress/src/cli/flows/sealed_web.rs` writes exactly two files
-#    out of a `wasm-pack --target web` build — `impresspress_web_bg.wasm` and
-#    `impresspress_web.js`. That output is three things, not two: the glue's
-#    first statement is
-#      import { … } from './snippets/impresspress-browser-<hash>/js/bridge.js';
-#    (`impresspress-browser`'s `#[wasm_bindgen(module = "/js/bridge.js")]`
-#    inline JS), and without `snippets/` the module fails to load, `sw.js`
-#    self-destructs, and every sealed × web bundle serves the boot shell
-#    forever. The embed × web flow does not hit this because it bundles pkg/
-#    in place, where wasm-pack already wrote the directory.
-#
-#    The root-cause fix is in `sealed_web.rs` (and in the `include_bytes!` pair
-#    `crates/impresspress/build.rs` bakes, which today has no snippets to
-#    resolve at all). Until it lands, the e2e cannot boot the bundle it builds,
-#    so the directory is staged here — visibly, and only here.
-rm -rf "$DIST/snippets"
-cp -r "$WEB/pkg-dev/snippets" "$DIST/snippets"
-
-# 5. The seed bundle, served as static files under the `/seed/` prefix the
+# 4. The seed bundle, served as static files under the `/seed/` prefix the
 #    service worker bypasses when the sandbox is on.
 rm -rf "$DIST/seed"
 cp -r "$FIXTURE/seed" "$DIST/seed"

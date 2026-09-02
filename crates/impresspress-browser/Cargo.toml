@@ -16,6 +16,12 @@ web-sys = { version = "0.3", features = [
     "Headers", "ReadableStream",
     "Url",
     "console",
+    # `convert::request_to_message` synthesizes the `Host` and
+    # `Sec-Fetch-Site` a service worker is never sent: `RequestMode` is the
+    # discriminator, and `WorkerGlobalScope`/`WorkerLocation` are how the
+    # worker learns its own origin. See the comment at that call site.
+    "RequestMode",
+    "WorkerGlobalScope", "WorkerLocation",
 ] }
 js-sys = "0.3"
 # Bridges a Rust `Stream<Item = JsValue>` to a JS `ReadableStream`. Used by

@@ -30,6 +30,15 @@ pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
     let js_path = dist.join("impresspress_web.js");
     std::fs::write(&js_path, &*js_bytes).map_err(|e| anyhow!("write {js_path:?}: {e}"))?;
 
+    // 3b. The inline-JS snippets the glue imports from. The THIRD part of a
+    //     wasm-pack output, and not optional: `impresspress_web.js` opens with
+    //     `import { … } from './snippets/<crate>-<hash>/js/bridge.js'`, so a
+    //     dist without the tree cannot load its own module — the service
+    //     worker self-destructs and the app serves its boot shell forever.
+    //     `sw.js` has always had `/snippets/` on its bypass list; until this
+    //     landed there was simply nothing there to bypass to.
+    write_snippets(&dist, &wasm::resolve_impresspress_web_snippets()?)?;
+
     // 4. Run the bundler — content-hash assets + render templates.
     //    This calls impresspress_bundle::bundle::run, which writes the
     //    static shell (index.html, sw.js, loader.js) into dist/.
@@ -59,6 +68,36 @@ pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
 
     let profile = if release { "release" } else { "dev" };
     println!("built sealed × web ({profile}) → dist/");
+    Ok(())
+}
+
+/// Write `snippets` under `dist/snippets/`, creating the per-crate
+/// directories wasm-bindgen named.
+///
+/// Every relative path is checked to be exactly that — relative, with no `..`
+/// segment. The list comes from a directory the operator pointed at, so this
+/// is not the difference between safe and unsafe by itself; it is the
+/// difference between a typo landing in `dist/` and a typo landing anywhere
+/// on the filesystem.
+fn write_snippets(
+    dist: &Path,
+    snippets: &[(String, std::borrow::Cow<'static, [u8]>)],
+) -> Result<()> {
+    for (rel, bytes) in snippets {
+        let rel_path = Path::new(rel);
+        if rel_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(anyhow!("snippet path {rel:?} is not a plain relative path"));
+        }
+        let dst = dist.join("snippets").join(rel_path);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&dst, bytes).map_err(|e| anyhow!("write {}: {e}", dst.display()))?;
+    }
     Ok(())
 }
 

@@ -33,32 +33,25 @@ import { readFileSync } from 'node:fs';
  *     `artifacts/<sha>.wasm` and re-serves both halves.
  *  7. **Rollback removes the block** and leaves the site it did not change.
  *
- * # Two assertions this file is currently RED on, and why they stay
+ * # Two product defects this file found on its first run
  *
- * Both are product defects this test found on its first run. They are asserted
- * the way the design requires rather than worked around, so the fix is what
- * turns the job green:
+ * Both are fixed (Task 10, fix round 1) and both are asserted here the way the
+ * design requires, so a regression is a failure rather than a workaround:
  *
- *  * **`/` does not serve the published site.**
- *    `WAFER_RUN_SHARED__HAS_LANDING_PAGE` stays `"false"` in a sandbox bundle.
- *    `impresspress-web/src/config.rs` seeds it `"true"` with
- *    `seed_variable_if_absent`, but the admin block's own `Init` has already
- *    written the declared default from `config_vars.rs` — and "if absent"
- *    cannot beat a row that is already there. Design §7.3 requires the
- *    sandbox to own `/`.
- *  * **Every cookie-authenticated `POST` is `403 cross-origin request
- *    blocked`.** A service worker's `FetchEvent.request.headers` carries none
- *    of `Sec-Fetch-Site`, `Origin`, `Referer` or `Host` (they are forbidden
- *    header names, and the Fetch spec appends `Sec-Fetch-*` only *after* the
- *    worker), so `impresspress-core/src/csrf.rs`'s `enforce_origin_policy`
- *    reaches its fail-closed tail for every mutation in the browser target.
- *    Not sandbox-specific: it is every `fetch`-driven admin form in the
- *    browser bundle. The same requests succeed with an `Authorization: Bearer`
- *    header, which is the exempt path.
- *
- * With those two bypassed, everything below this line was observed to pass —
- * the guest compiles, serves `/b/hello/`, survives a worker restart and rolls
- * back. See the Task 10 report.
+ *  * **`/` must serve the published site.** A sandbox bundle force-sets
+ *    `WAFER_RUN_SHARED__HAS_LANDING_PAGE` (`impresspress-web/src/config.rs`).
+ *    Seeding it could not work: the admin block's `Init` writes the declared
+ *    `"false"` default before that hook runs, and "insert if absent" never
+ *    beats a row that is already there.
+ *  * **Cookie-authenticated mutations must be allowed.** A service worker's
+ *    `FetchEvent.request` carries none of `Sec-Fetch-Site`, `Origin`,
+ *    `Referer` or `Host`, so `csrf::enforce_origin_policy` used to reach its
+ *    fail-closed tail for EVERY mutation in the browser bundle — the whole
+ *    admin UI, not just the sandbox. `impresspress-browser`'s
+ *    `convert::request_to_message` now synthesizes the two the worker can
+ *    prove (`Host` from its own location, `Sec-Fetch-Site` from
+ *    `Request::mode` + `Request::referrer`), failing closed on anything else.
+ *    Every `postJson` below is that path.
  */
 
 /** The proof guest (`experiments/browser-service-worker-blocks/guest`). */
@@ -240,6 +233,17 @@ test('a fresh origin seeds itself, serves the seeded site, and keeps the sandbox
   // `403` rather than the browser redirect to the login page.
   const sandbox = await page.evaluate(async () => (await fetch('/b/dev/api/status')).status);
   expect(sandbox).toBe(403);
+
+  // NOT asserted here, deliberately: the CSP relaxation the sandbox is
+  // supposed to carry (`worker-src 'self' blob:` for the `/b/dev` compiler
+  // worker, `frame-ancestors 'self'` for its live-site preview iframe —
+  // `runtime_factory.rs::csp` and the `frame_ancestors` override beside it).
+  // Measured on this very bundle, the served header is byte-identical to the
+  // feature-OFF bundle's: no `worker-src`, and `frame-ancestors 'none'`. The
+  // `wafer-run/security-headers` block config the factory builds is not
+  // reaching the response at all, so there is nothing true to assert yet.
+  // Recorded in the Task 10 fix report; it belongs to Task 4's wiring, and
+  // Plan 2's page cannot spawn its worker until it is fixed.
 });
 
 test('the dev sandbox stages a guest, survives a restart and rolls back', async ({ page }) => {
