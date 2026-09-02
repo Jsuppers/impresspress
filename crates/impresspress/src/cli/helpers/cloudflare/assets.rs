@@ -48,23 +48,48 @@ pub fn resolve_asset_base_url(has_r2: bool) -> String {
 /// the source-relative `logical` name, so the published R2 objects are
 /// immutable and match the URLs `ui::assets::url()` emits.
 ///
-/// Requires an `embed-assets`-enabled build (the CLI's default): publishing
-/// needs the real bytes to hash and upload, and a lean build genuinely
-/// doesn't have them compiled in.
+/// `ASSETS` is unconditional (`build.rs` lists every asset file on disk
+/// regardless of Cargo features), but `ui_assets::bytes()` returns `None`
+/// for an entry gated behind a block feature the CLI wasn't built with
+/// (`marked.min.js`/`purify.min.js`/`llm-chat.js` need `block-llm`,
+/// `files-browser.js` needs `block-files`) — a supported combination, e.g.
+/// `--no-default-features --features sqlite,embed-assets`. Such entries are
+/// skipped rather than treated as an error, with a warning naming exactly
+/// what was skipped so the omission is visible in the deploy log instead of
+/// silently missing at runtime.
+///
+/// Note: this only fixes the CLI-build-without-`block-*` case. A CLI built
+/// WITH a block feature but deployed against a *worker* built without the
+/// matching feature (or vice versa) is a separate, unresolved seam — the
+/// published set here is always the CLI's, not the worker's, so a mismatch
+/// between the two independent builds can still under- or over-publish.
+/// Left as follow-up; not attempted here.
 pub fn ui_asset_entries() -> Vec<ReleaseAssetEntry> {
-    ui_assets::ASSETS
+    let mut skipped: Vec<&str> = Vec::new();
+    let entries = ui_assets::ASSETS
         .iter()
-        .map(|e| {
-            let bytes = ui_assets::bytes(e.logical)
-                .expect("publishing requires an embed-assets-enabled CLI build");
-            ReleaseAssetEntry {
+        .filter_map(|e| {
+            let Some(bytes) = ui_assets::bytes(e.logical) else {
+                skipped.push(e.logical);
+                return None;
+            };
+            Some(ReleaseAssetEntry {
                 logical_key: e.filename.to_string(),
                 size: bytes.len() as u64,
                 sha256: impresspress_core::util::sha256_hex(bytes),
                 content_type: e.content_type.to_string(),
-            }
+            })
         })
-        .collect()
+        .collect();
+    if !skipped.is_empty() {
+        eprintln!(
+            "warning: skipping {} UI asset(s) with no embedded bytes on this CLI build \
+             (missing block feature(s) — see ui_asset_entries doc): {}",
+            skipped.len(),
+            skipped.join(", "),
+        );
+    }
+    entries
 }
 
 /// Deterministic identity and inventory of the local release asset set.

@@ -85,3 +85,33 @@ fn ui_asset_entries_carry_hashed_keys_and_content_types() {
     assert!(entries.iter().all(|e| !e.content_type.is_empty()));
     assert!(entries.iter().all(|e| e.sha256.len() == 64));
 }
+
+// Regression for a real repro: `impresspress deploy cloudflare` built with
+// `--no-default-features --features sqlite,embed-assets` (a supported
+// combination — the worker just doesn't run block-llm/block-files) used to
+// panic in `ui_asset_entries()` claiming "publishing requires an
+// embed-assets-enabled CLI build" — misleading, since embed-assets *is* on;
+// the manifest just also lists block-llm/block-files-gated logical assets
+// this feature set has no bytes for. Only meaningful (and only compiled)
+// under that exact feature combination; run with:
+// `cargo test -p impresspress --no-default-features --features sqlite,embed-assets`.
+#[cfg(all(
+    feature = "embed-assets",
+    not(feature = "block-llm"),
+    not(feature = "block-files")
+))]
+#[test]
+fn ui_asset_entries_skips_block_gated_assets_instead_of_panicking() {
+    let entries = ui_asset_entries();
+    // The base set (app.css, htmx, webmcp, fonts, logos, favicon) still
+    // publishes; exactly the 4 block-llm/block-files-gated logical assets
+    // (marked.min.js, purify.min.js, llm-chat.js, files-browser.js) are
+    // absent from the manifest's bytes on this feature set and must be
+    // skipped, not panic the whole publish.
+    assert!(!entries.is_empty());
+    assert_eq!(
+        entries.len(),
+        impresspress_core::ui::assets::ASSETS.len() - 4,
+        "expected exactly the 4 block-llm/block-files-gated assets to be skipped"
+    );
+}
