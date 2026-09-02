@@ -9,9 +9,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use super::control::{
-    DynamicBlockSpec, RuntimeControl, ValidatedGuest, ValidationFailure, ValidationStage,
-};
+use super::control::{DynamicBlockSpec, RuntimeControl, ValidationFailure, ValidationStage};
 
 /// A [`RuntimeControl`] that records what it was asked to do instead of
 /// building anything.
@@ -19,31 +17,38 @@ use super::control::{
 /// `rebuild` appends the requested block set and bumps the generation counter,
 /// so a test can assert both *what* was activated and *how many times* — the
 /// two things the real control plane is responsible for and the page keys on.
+/// `inspect` reports whatever `BlockInfo` the test set, and `probe` records
+/// the spec it was handed, so a test can assert that the guest was executed
+/// under the ACCEPTED capabilities rather than its own declaration.
 pub struct FakeControl {
     /// Every block set handed to `rebuild`, oldest first.
     pub rebuilt: Mutex<Vec<Vec<DynamicBlockSpec>>>,
-    /// What every `validate` call answers, unless
-    /// [`Self::fail_next_validate`] has armed a one-shot refusal. `Ok(())`
-    /// becomes a [`ValidatedGuest`] carrying [`Self::validated_info`], or a
-    /// `BlockInfo` named after the spec when no test set one.
-    pub validate_result: Mutex<Result<(), ValidationFailure>>,
-    /// The `BlockInfo` a successful `validate` reports, set by
+    /// The `BlockInfo` a successful `inspect` reports, set by
     /// [`Self::set_validated_info`].
     ///
     /// This is what makes the static rules testable without wasmi: the
     /// executable half of validation is the seam, so a test that wants to
-    /// exercise "a guest that declares X" states X here rather than
-    /// compiling a guest that declares it.
+    /// exercise "a guest that declares X" states X here rather than compiling
+    /// a guest that declares it.
     validated_info: Mutex<Option<wafer_run::BlockInfo>>,
-    /// Set by [`Self::fail_next_validate`]: the refusal the next `validate`
+    /// Set by [`Self::fail_next_inspect`]: the refusal the next `inspect`
     /// answers with, consumed by that call.
     ///
     /// One-shot for the same reason [`Self::fail_rebuild`] is: the
     /// interesting request is usually the one *after* a refusal.
-    fail_validate: Mutex<Option<ValidationFailure>>,
-    /// Bumped by every `validate` call, refusals included. A test that
-    /// asserts a request was refused *before* the guest ran reads this.
-    validations: AtomicU64,
+    fail_inspect: Mutex<Option<ValidationFailure>>,
+    /// Set by [`Self::fail_next_probe`]: the refusal the next `probe` answers
+    /// with, consumed by that call.
+    fail_probe: Mutex<Option<ValidationFailure>>,
+    /// Every spec handed to `probe`, oldest first.
+    ///
+    /// Recorded rather than merely counted because the *capabilities* a probe
+    /// runs under are the point of the inspect/probe split: a test asserts
+    /// that they are the ACCEPTED set, not the guest's raw declaration.
+    probed: Mutex<Vec<DynamicBlockSpec>>,
+    /// Bumped by every `inspect` call, refusals included. A test that asserts
+    /// a request was refused *before* the module was loaded reads this.
+    inspections: AtomicU64,
     /// Set by [`Self::fail_next_rebuild`]: the message the next `rebuild`
     /// refuses with, consumed by that call.
     ///
@@ -70,40 +75,49 @@ impl FakeControl {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             rebuilt: Mutex::new(Vec::new()),
-            validate_result: Mutex::new(Ok(())),
             validated_info: Mutex::new(None),
-            fail_validate: Mutex::new(None),
-            validations: AtomicU64::new(0),
+            fail_inspect: Mutex::new(None),
+            fail_probe: Mutex::new(None),
+            probed: Mutex::new(Vec::new()),
+            inspections: AtomicU64::new(0),
             fail_rebuild: Mutex::new(None),
             gate_rebuild: Mutex::new(None),
             generation: AtomicU64::new(0),
         })
     }
 
-    /// A control whose next `validate` refuses at `stage`.
+    /// A control whose next `probe` refuses at `stage`.
     pub fn rejecting(stage: ValidationStage, message: &str) -> Arc<Self> {
         let control = Self::new();
-        *control
-            .validate_result
-            .lock()
-            .expect("validate_result mutex") = Err(ValidationFailure::new(stage, message));
+        control.fail_next_probe(stage, message);
         control
     }
 
-    /// Make every successful `validate` report `info`.
+    /// Make every successful `inspect` report `info`.
     pub fn set_validated_info(&self, info: wafer_run::BlockInfo) {
         *self.validated_info.lock().expect("validated_info mutex") = Some(info);
     }
 
-    /// Make the next `validate` refuse at `stage` with `message`.
-    pub fn fail_next_validate(&self, stage: ValidationStage, message: &str) {
-        *self.fail_validate.lock().expect("fail_validate mutex") =
+    /// Make the next `inspect` refuse at `stage` with `message`.
+    pub fn fail_next_inspect(&self, stage: ValidationStage, message: &str) {
+        *self.fail_inspect.lock().expect("fail_inspect mutex") =
             Some(ValidationFailure::new(stage, message));
     }
 
-    /// How many times `validate` has been called.
-    pub fn validations(&self) -> u64 {
-        self.validations.load(Ordering::SeqCst)
+    /// Make the next `probe` refuse at `stage` with `message`.
+    pub fn fail_next_probe(&self, stage: ValidationStage, message: &str) {
+        *self.fail_probe.lock().expect("fail_probe mutex") =
+            Some(ValidationFailure::new(stage, message));
+    }
+
+    /// How many times `inspect` has been called.
+    pub fn inspections(&self) -> u64 {
+        self.inspections.load(Ordering::SeqCst)
+    }
+
+    /// The specs handed to `probe`, oldest first.
+    pub fn probes(&self) -> Vec<DynamicBlockSpec> {
+        self.probed.lock().expect("probed mutex").clone()
     }
 
     /// The block sets handed to `rebuild`, oldest first.
@@ -115,7 +129,7 @@ impl FakeControl {
     ///
     /// The mirror of [`Self::rejecting`] for the other half of the seam: that
     /// one refuses a guest at validation, this one refuses the runtime swap
-    /// itself — the failure activation has to survive with the previous
+    /// itself — the failed activation has to survive with the previous
     /// generation still live.
     pub fn fail_next_rebuild(&self, message: &str) {
         *self.fail_rebuild.lock().expect("fail_rebuild mutex") = Some(message.to_string());
@@ -132,38 +146,36 @@ impl FakeControl {
 
 #[wafer_block::wafer_async_trait]
 impl RuntimeControl for FakeControl {
-    async fn validate(
-        &self,
-        spec: &DynamicBlockSpec,
-        _artifact: &[u8],
-    ) -> Result<ValidatedGuest, ValidationFailure> {
-        self.validations.fetch_add(1, Ordering::SeqCst);
-        if let Some(failure) = self
-            .fail_validate
-            .lock()
-            .expect("fail_validate mutex")
-            .take()
-        {
+    async fn inspect(&self, _artifact: &[u8]) -> Result<wafer_run::BlockInfo, ValidationFailure> {
+        self.inspections.fetch_add(1, Ordering::SeqCst);
+        if let Some(failure) = self.fail_inspect.lock().expect("fail_inspect mutex").take() {
             return Err(failure);
         }
-        self.validate_result
-            .lock()
-            .expect("validate_result mutex")
-            .clone()?;
-        let info = self
+        Ok(self
             .validated_info
             .lock()
             .expect("validated_info mutex")
             .clone()
             .unwrap_or_else(|| {
                 wafer_run::BlockInfo::new(
-                    &spec.name,
+                    "site/fake",
                     "0.0.0",
                     "http-handler@v1",
-                    "fake validated guest",
+                    "fake inspected guest",
                 )
-            });
-        Ok(ValidatedGuest { info })
+            }))
+    }
+
+    async fn probe(
+        &self,
+        spec: &DynamicBlockSpec,
+        _artifact: &[u8],
+    ) -> Result<(), ValidationFailure> {
+        if let Some(failure) = self.fail_probe.lock().expect("fail_probe mutex").take() {
+            return Err(failure);
+        }
+        self.probed.lock().expect("probed mutex").push(spec.clone());
+        Ok(())
     }
 
     async fn rebuild(&self, blocks: &[DynamicBlockSpec]) -> Result<(), String> {

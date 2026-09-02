@@ -922,3 +922,161 @@ async fn files_admin_overview_allows_admin_both_forms() {
         assert_eq!(ctx.calls(), vec!["impresspress/files".to_string()]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Declared per-endpoint auth on EXTRA routes.
+//
+// An extra route used to enforce its own `access` and nothing else, which
+// made `BlockEndpoint::auth` documentation-only for every block a downstream
+// project registers with `add_route`. The dev sandbox is registered exactly
+// that way and its dynamically-added guest blocks declare their own
+// per-endpoint auth on a `Public` prefix, so a guest endpoint marked `Admin`
+// was served to anonymous callers.
+//
+// The refinement applies only when the target block declares at least one
+// endpoint. A block that declares none keeps its route's tier — otherwise
+// `declared_access`'s fail-closed `Authenticated` default would lock every
+// path of every catch-all block that has ever been registered this way.
+// ---------------------------------------------------------------------------
+
+/// A guest-shaped block: one `Public` root and one `Admin` API path, both
+/// under a prefix an extra route serves as `Public`.
+fn guest_block_infos() -> Vec<BlockInfo> {
+    vec![
+        BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "a guest block").endpoints(vec![
+            BlockEndpoint::get("/b/hello/").auth(AuthLevel::Public),
+            BlockEndpoint::post("/b/hello/api/admin").auth(AuthLevel::Admin),
+        ]),
+    ]
+}
+
+fn guest_extra() -> Vec<ExtraRoute> {
+    vec![ExtraRoute {
+        prefix: "/b/hello/".into(),
+        access: RouteAccess::Public,
+        block_name: "site/hello".into(),
+    }]
+}
+
+#[tokio::test]
+async fn declared_admin_endpoint_under_a_public_extra_route_rejects_anonymous() {
+    let ctx = RecordingContext::new();
+    let msg = make_msg("/b/hello/api/admin");
+    let mut msg = msg;
+    msg.set_meta(wafer_run::META_REQ_ACTION, "create");
+
+    let stream = routing::route_to_block(
+        &ctx,
+        msg,
+        InputStream::empty(),
+        &AllEnabled,
+        &guest_block_infos(),
+        &guest_extra(),
+    )
+    .await;
+    // 403, the same refusal `authenticated_extra_route_forbids_empty_user_id`
+    // asserts for a non-HTML request with no session.
+    assert_eq!(response_status(stream).await, 403);
+    assert!(ctx.calls().is_empty(), "must not dispatch to the block");
+}
+
+#[tokio::test]
+async fn declared_admin_endpoint_under_a_public_extra_route_allows_admin() {
+    let ctx = RecordingContext::new();
+    let mut msg = make_msg_with_admin("/b/hello/api/admin", "admin-1");
+    msg.set_meta(wafer_run::META_REQ_ACTION, "create");
+
+    let stream = routing::route_to_block(
+        &ctx,
+        msg,
+        InputStream::empty(),
+        &AllEnabled,
+        &guest_block_infos(),
+        &guest_extra(),
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 200);
+    assert_eq!(ctx.calls(), vec!["site/hello".to_string()]);
+}
+
+#[tokio::test]
+async fn a_declared_public_endpoint_under_a_public_extra_route_is_still_public() {
+    // The refinement takes the STRICTER of the two, so a block that means a
+    // path to be public says so and keeps it.
+    let ctx = RecordingContext::new();
+    let stream = routing::route_to_block(
+        &ctx,
+        make_msg("/b/hello/"),
+        InputStream::empty(),
+        &AllEnabled,
+        &guest_block_infos(),
+        &guest_extra(),
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 200);
+    assert_eq!(ctx.calls(), vec!["site/hello".to_string()]);
+}
+
+#[tokio::test]
+async fn an_undeclared_path_under_a_declaring_block_falls_back_to_authenticated() {
+    // Fail-closed, exactly as it does under a built-in route: a block that
+    // declares its surface has opted into the declaration being the answer,
+    // and a path it never declared is not silently public.
+    let ctx = RecordingContext::new();
+    let stream = routing::route_to_block(
+        &ctx,
+        make_msg("/b/hello/undeclared"),
+        InputStream::empty(),
+        &AllEnabled,
+        &guest_block_infos(),
+        &guest_extra(),
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 403);
+    assert!(ctx.calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_extra_route_to_a_block_that_declares_no_endpoints_keeps_its_tier() {
+    // The compatibility case: every existing `add_route` consumer registers a
+    // catch-all block with no declared endpoints, and must keep working.
+    let ctx = RecordingContext::new();
+    let infos = vec![BlockInfo::new(
+        "gizza-ai/chat",
+        "0.0.1",
+        "http-handler@v1",
+        "chat",
+    )];
+    let extras = vec![ExtraRoute {
+        prefix: "/b/chat/".into(),
+        access: RouteAccess::Public,
+        block_name: "gizza-ai/chat".into(),
+    }];
+
+    let stream = routing::route_to_block(
+        &ctx,
+        make_msg("/b/chat/anything"),
+        InputStream::empty(),
+        &AllEnabled,
+        &infos,
+        &extras,
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 200);
+    assert_eq!(ctx.calls(), vec!["gizza-ai/chat".to_string()]);
+
+    // And a block with no `BlockInfo` at all — the case the earlier tests in
+    // this file drive — is unchanged too.
+    let ctx = RecordingContext::new();
+    let stream = routing::route_to_block(
+        &ctx,
+        make_msg("/b/chat/anything"),
+        InputStream::empty(),
+        &AllEnabled,
+        &[],
+        &extras,
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 200);
+    assert_eq!(ctx.calls(), vec!["gizza-ai/chat".to_string()]);
+}

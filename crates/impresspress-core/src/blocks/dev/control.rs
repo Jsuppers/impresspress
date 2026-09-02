@@ -8,10 +8,24 @@
 //! boundary: the dev block hands over a validated spec set and the host
 //! answers with a rebuilt, swapped-in runtime.
 //!
-//! The static half of validation (names, route prefixes, capability
-//! namespaces, collisions) is the caller's — it is pure data and lives beside
-//! the spec. [`RuntimeControl::validate`] is only the part that has to
-//! actually execute a guest.
+//! # Validation is three steps, in this order
+//!
+//! 1. [`RuntimeControl::inspect`] — instantiate the module under
+//!    `BlockCapabilities::none()` and read its `BlockInfo`. No lifecycle
+//!    event runs, so no guest code that could use a capability runs either.
+//! 2. The caller's static rules (`super::validation`) — names, route
+//!    prefixes, capability namespaces, collisions. Pure data over that
+//!    `BlockInfo`; they are what turn the guest's *declaration* into an
+//!    accepted [`DynamicBlockSpec`].
+//! 3. [`RuntimeControl::probe`] — Init, Start and one request under the
+//!    capabilities of that **accepted** spec.
+//!
+//! The order is the whole point. A single `validate` that ran the lifecycle
+//! under the guest's own declaration would execute untrusted code under
+//! authority nothing had approved yet — a module declaring
+//! `collections: Any` would have its `Init` run with it. Splitting the seam
+//! means the only capabilities a guest ever executes under are the ones step
+//! 2 accepted.
 
 use serde::{Deserialize, Serialize};
 
@@ -157,7 +171,8 @@ impl PartialEq for DynamicBlockSpec {
 
 impl Eq for DynamicBlockSpec {}
 
-/// Where a guest failed [`RuntimeControl::validate`].
+/// Where a guest failed [`RuntimeControl::inspect`] or
+/// [`RuntimeControl::probe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationStage {
@@ -198,15 +213,6 @@ impl ValidationStage {
     }
 }
 
-/// A guest that loaded, initialized, started and answered a probe under its
-/// declared capabilities.
-#[derive(Clone, Debug)]
-pub struct ValidatedGuest {
-    /// The `BlockInfo` the guest reported. The caller checks it against the
-    /// spec (name, routes, endpoints) before activating the generation.
-    pub info: wafer_block::BlockInfo,
-}
-
 /// A structured refusal. Surfaced to the agent as a diagnostic in the tool
 /// result, never as a transport error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -243,14 +249,40 @@ impl std::fmt::Display for ValidationFailure {
 /// [`crate::FeatureConfig`].
 #[wafer_block::wafer_async_trait]
 pub trait RuntimeControl: wafer_run::MaybeSend + wafer_run::MaybeSync {
-    /// Load the artifact under its declared capabilities and limits, parse
-    /// `BlockInfo`, run Init/Start and one probe request. Static rules are
-    /// checked by the caller first; this is the executable half.
-    async fn validate(
+    /// Step 1: compile and instantiate `artifact` under
+    /// `wafer_block::BlockCapabilities::none()` and return the `BlockInfo` it
+    /// reports.
+    ///
+    /// **No lifecycle event and no request may run here.** The guest's own
+    /// capability declaration is *inside* the value this returns, so nothing
+    /// has approved it yet; the deny-all set is what makes reading the
+    /// declaration safe. Failures are [`ValidationStage::Load`] (wasmi could
+    /// not compile or instantiate) or [`ValidationStage::Info`] (`BlockInfo`
+    /// did not parse, or failed WAFER validation).
+    ///
+    /// The `BlockInfo` must be returned exactly as the guest reported it —
+    /// the caller's rules read the name, the endpoints, the agent tool names,
+    /// `requires` and `capabilities` out of it, and a host that normalized
+    /// any of those would silently disable a rule.
+    async fn inspect(&self, artifact: &[u8]) -> Result<wafer_block::BlockInfo, ValidationFailure>;
+
+    /// Step 3: run `Init`, `Start` and one probe request under
+    /// `spec.capabilities`.
+    ///
+    /// `spec` is the **accepted** spec — the one the caller's static rules
+    /// produced and approved, not the guest's raw declaration. It is also
+    /// exactly what [`Self::rebuild`] will be handed, so a guest that traps
+    /// here would have trapped live.
+    ///
+    /// A dry run: nothing is swapped in, and a trap must fail this call
+    /// without poisoning the outer runtime (design §6.6). Failures are
+    /// [`ValidationStage::Init`], [`ValidationStage::Start`] or
+    /// [`ValidationStage::Probe`].
+    async fn probe(
         &self,
         spec: &DynamicBlockSpec,
         artifact: &[u8],
-    ) -> Result<ValidatedGuest, ValidationFailure>;
+    ) -> Result<(), ValidationFailure>;
 
     /// Rebuild the runtime with exactly this block set and swap it in.
     async fn rebuild(&self, blocks: &[DynamicBlockSpec]) -> Result<(), String>;

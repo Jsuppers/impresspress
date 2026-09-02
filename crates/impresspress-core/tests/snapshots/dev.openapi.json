@@ -229,6 +229,7 @@
         "content": {
           "application/json": {
             "schema": {
+              "additionalProperties": false,
               "description": "Request of `POST /b/dev/api/builds/stage`.\n\nOne compiled `wasm32-wasip1` module, with everything needed to explain it\nafterwards. Staging validates the artifact and, if it passes, activates a\nnew generation carrying it — there is no separate \"activate\" call.",
               "properties": {
                 "artifact_base64": {

@@ -36,7 +36,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use wafer_block::{Allowlist, BlockCapabilities, BlockInfo};
+use wafer_block::{capabilities::HeaderPolicy, wrap, Allowlist, BlockCapabilities, BlockInfo};
 
 use super::{
     control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind, ValidationFailure},
@@ -109,6 +109,14 @@ pub const CAP_VECTOR: &str = "cap-vector";
 pub const CAP_CALLABLE: &str = "cap-callable";
 /// `callable_blocks` and `requires` describe different sets.
 pub const CAP_REQUIRES_MISMATCH: &str = "cap-requires-mismatch";
+/// The guest declared readable or writable sensitive headers.
+pub const CAP_HEADERS: &str = "cap-headers";
+/// Activating the block would put more than [`paths::MAX_BLOCKS`] blocks in
+/// the runtime.
+pub const TOO_MANY_BLOCKS: &str = "too-many-blocks";
+/// A block already in the active set has no readable stored `BlockInfo`, so
+/// the duplicate-agent-tool rule cannot be applied against it.
+pub const BUILD_ROW_MISSING: &str = "build-row-missing";
 /// The artifact is over [`MAX_ARTIFACT_BYTES`].
 pub const ARTIFACT_TOO_LARGE: &str = "artifact-too-large";
 
@@ -416,6 +424,24 @@ pub fn validate_static(
         }
     }
 
+    // --- The size of the block set ----------------------------------------
+    // `active` is every OTHER block in the target generation, so activating
+    // this one makes the set one larger. The quota in `files.rs` bounds how
+    // many block *source trees* the workspace holds, which is not the same
+    // number: a block whose sources were deleted after it was staged is
+    // still in the runtime. This is the check on what actually runs.
+    if active.len() >= paths::MAX_BLOCKS {
+        found.push(Diagnostic::error(
+            TOO_MANY_BLOCKS,
+            format!(
+                "the runtime already serves {} blocks and the sandbox allows {}; \
+                 remove one before adding another",
+                active.len(),
+                paths::MAX_BLOCKS,
+            ),
+        ));
+    }
+
     // --- Capabilities -----------------------------------------------------
     // A guest that declares nothing gets `none()`, and that is also what the
     // spec it is loaded under carries: deny-by-default is the value, not an
@@ -432,10 +458,20 @@ pub fn validate_static(
     Ok(DynamicBlockSpec {
         name: registered,
         artifact_sha256: artifact_sha256.to_string(),
-        // One prefix, `Public` at the router. The router still applies each
-        // declared endpoint's own `auth` on top (`routing::declared_access`),
-        // so a guest endpoint marked `Admin` is admin-only even though the
-        // prefix is not — this tier is the floor, not the decision.
+        // One prefix, `Public` at the router — the FLOOR, not the decision.
+        //
+        // The sandbox is registered as a `routing::ExtraRoute`, and until the
+        // fix that landed with these rules an extra route enforced its own
+        // tier alone: a guest endpoint declared `Admin` was served to
+        // anonymous callers. `routing::extra_route_access` now refines an
+        // extra route with `declared_access` whenever the target block
+        // declares endpoints — which a guest block always does — so a guest's
+        // `Admin` endpoint really is admin-only, and an UNDECLARED path under
+        // its prefix falls back to `Authenticated` rather than to this tier.
+        //
+        // That is why `Public` here is safe *and* why it is right: a guest
+        // that wants a genuinely public route has to declare the endpoint
+        // `Public`, which is the same bargain every built-in block makes.
         routes: vec![DynamicRoute {
             prefix,
             access: RouteAccessKind::Public,
@@ -462,12 +498,47 @@ fn check_capabilities(
     capabilities: &BlockCapabilities,
     found: &mut Vec<Diagnostic>,
 ) {
+    // Destructured exhaustively, never read field by field.
+    //
+    // This function is the sandbox's authority gate: whatever it does not
+    // refuse is granted to an untrusted guest verbatim, because the accepted
+    // spec carries the guest's own declaration. A capability the producer
+    // adds that nobody enumerated here would therefore be handed over in
+    // silence — which is exactly how `headers` (a policy that can give a
+    // guest the admin session cookie on its own route) went unnoticed.
+    // Destructuring makes the compiler the enforcement: a new field upstream
+    // breaks this build, the same way `capabilities_eq` in `control.rs` does.
+    let BlockCapabilities {
+        collections,
+        raw_sql,
+        ddl,
+        // MAY be true (spec amendment 10). The structured schema ops are
+        // authorized on the table as well as on the schema sentinel, so they
+        // cannot reach outside `collections`; raw `ddl` runs an arbitrary
+        // statement and can, which is why only that one is refused.
+        schema: _schema,
+        storage_folders,
+        crypto,
+        network,
+        config,
+        vector_indexes,
+        callable_blocks,
+        headers,
+    } = capabilities;
+    let HeaderPolicy {
+        readable,
+        writable,
+        // `masked` only ever ADDS to the default-denied set, in both
+        // directions, so it can only narrow what a guest sees or sends.
+        masked: _masked,
+    } = headers;
+
     let collection_prefix = format!("site__{name}__");
     let folder = format!("site/{name}");
     let config_prefix = format!("SITE__{}__", name.to_uppercase());
 
     check_allowlist(
-        &capabilities.collections,
+        collections,
         CAP_COLLECTION,
         "collection",
         &format!("{collection_prefix}*"),
@@ -475,20 +546,30 @@ fn check_capabilities(
         found,
     );
     check_allowlist(
-        &capabilities.storage_folders,
+        storage_folders,
         CAP_FOLDER,
         "storage folder",
         &folder,
         |entry| {
-            // An entry ending in `/` matches nothing upstream
-            // (`BlockCapabilities::allows_storage_folder`), so accepting one
-            // would hand back a capability that silently denies everything.
-            !entry.ends_with('/') && (entry == folder || entry.starts_with(&format!("{folder}/")))
+            // Three hazards, all of which look like a legal entry:
+            //
+            // * an entry ending in `/` matches NOTHING upstream
+            //   (`BlockCapabilities::allows_storage_folder`), so granting one
+            //   hands back a capability that silently denies everything;
+            // * an entry with an empty, `.` or `..` segment is not a folder
+            //   name at all — `site/hello/../other` textually sits under
+            //   `site/hello` while naming a sibling, and nothing normalizes
+            //   it. `wrap::is_traversal_safe_path` is the producer's own rule
+            //   for that shape, used here rather than restated;
+            // * anything outside the block's own folder.
+            !entry.ends_with('/')
+                && wrap::is_traversal_safe_path(entry)
+                && (entry == folder || entry.starts_with(&format!("{folder}/")))
         },
         found,
     );
     check_allowlist(
-        &capabilities.config,
+        config,
         CAP_CONFIG,
         "config key",
         &format!("{config_prefix}*"),
@@ -496,39 +577,47 @@ fn check_capabilities(
         found,
     );
 
-    if capabilities.raw_sql {
+    if *raw_sql {
         found.push(Diagnostic::error(
             CAP_RAW_SQL,
             "raw SQL is never granted to a guest; use the typed database ops",
         ));
     }
-    // `schema` is deliberately NOT refused (spec amendment 10): the
-    // structured schema ops are authorized on the table *and* on the schema
-    // sentinel, so they cannot reach outside `collections`. Raw `ddl` runs an
-    // arbitrary statement and can.
-    if capabilities.ddl {
+    if *ddl {
         found.push(Diagnostic::error(
             CAP_DDL,
             "raw DDL is never granted to a guest; declare `schema: true` for \
              the structured table ops on your own collections",
         ));
     }
-    if capabilities.crypto {
+    if *crypto {
         found.push(Diagnostic::error(
             CAP_CRYPTO,
             "the crypto service is never granted to a guest",
         ));
     }
-    if capabilities.network.is_enabled() {
+    if network.is_enabled() {
         found.push(Diagnostic::error(
             CAP_NETWORK,
             "guests have no network access; a page talks to other origins, a block does not",
         ));
     }
-    if capabilities.vector_indexes.is_enabled() {
+    if vector_indexes.is_enabled() {
         found.push(Diagnostic::error(
             CAP_VECTOR,
             "vector indexes are never granted to a guest",
+        ));
+    }
+    if !readable.is_empty() || !writable.is_empty() {
+        found.push(Diagnostic::error(
+            CAP_HEADERS,
+            format!(
+                "the guest declares readable [{}] and writable [{}] sensitive headers; a \
+                 sandboxed block is never granted either — it serves an unauthenticated \
+                 route, and the admin session cookie and `authorization` travel on it",
+                readable.join(", "),
+                writable.join(", "),
+            ),
         ));
     }
 
@@ -538,7 +627,7 @@ fn check_capabilities(
     // different blocks.
     let allowed: BTreeSet<&str> = ALLOWED_CALLABLE_BLOCKS.iter().copied().collect();
     let required: BTreeSet<&str> = info.requires.iter().map(String::as_str).collect();
-    match &capabilities.callable_blocks {
+    match callable_blocks {
         Allowlist::None => compare_requires(&BTreeSet::new(), &required, found),
         Allowlist::Any => found.push(Diagnostic::error(
             CAP_CALLABLE,

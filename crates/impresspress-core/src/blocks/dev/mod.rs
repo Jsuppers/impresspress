@@ -51,8 +51,8 @@ use wafer_run::{
 };
 
 pub use self::control::{
-    DynamicBlockSpec, DynamicRoute, RouteAccessKind, RuntimeControl, ValidatedGuest,
-    ValidationFailure, ValidationStage,
+    DynamicBlockSpec, DynamicRoute, RouteAccessKind, RuntimeControl, ValidationFailure,
+    ValidationStage,
 };
 use crate::{
     endpoint_match::{self, EndpointRoute},

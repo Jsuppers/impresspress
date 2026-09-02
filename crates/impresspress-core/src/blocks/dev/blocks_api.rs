@@ -10,6 +10,19 @@
 //! have to describe and the page would have to reconcile, and nothing in the
 //! design wants it.
 //!
+//! # The order validation runs in
+//!
+//! `inspect` (read the guest's `BlockInfo` under deny-all capabilities) →
+//! `validate_static` (the rules, which turn that declaration into an accepted
+//! spec) → `probe` (Init/Start/one request under the ACCEPTED capabilities).
+//!
+//! Running the lifecycle first — under whatever the guest declared — would
+//! execute untrusted code with authority nothing had approved: a module
+//! declaring `collections: Any` would have its `Init` run with it, and the
+//! refusal would arrive afterwards. `inspect` therefore runs no guest code
+//! beyond instantiation and `__wafer_info`, and `probe` runs under exactly
+//! the spec `rebuild` will later be handed.
+//!
 //! # Why a refusal is a 200
 //!
 //! The caller is an agent. Design §7.4 is explicit that validation refusals
@@ -161,22 +174,12 @@ async fn stage(
         .cloned()
         .collect();
 
-    // The executable half. The spec is provisional: the capabilities a guest
-    // is loaded under are its own declaration, which is inside the
-    // `BlockInfo` this call is what returns — so the host reads them from the
-    // module and this deny-all set is the floor, not the grant.
-    let provisional = DynamicBlockSpec {
-        name: registered.clone(),
-        artifact_sha256: artifact_sha256.clone(),
-        routes: vec![super::DynamicRoute {
-            prefix: format!("/b/{name}/"),
-            access: super::RouteAccessKind::Public,
-        }],
-        capabilities: wafer_block::BlockCapabilities::none(),
-        wafer_guest_version: 0,
-    };
-    let info = match shared.control.validate(&provisional, artifact).await {
-        Ok(guest) => guest.info,
+    // Step 1: read the guest's own `BlockInfo`, under deny-all capabilities
+    // and without running a single lifecycle event. Everything the rules
+    // below decide is in that value, including the capability set the guest
+    // is asking for.
+    let info = match shared.control.inspect(artifact).await {
+        Ok(info) => info,
         Err(failure) => {
             let diagnostics = together(&request.diagnostics, vec![Diagnostic::guest(&failure)]);
             invalidate(ctx, &build.id, &diagnostics).await?;
@@ -184,14 +187,24 @@ async fn stage(
         }
     };
 
-    // The static half, against the block set this one is joining.
+    let claimed = match claimed_tool_names(ctx, &others).await? {
+        ClaimedToolNames::Complete(claimed) => claimed,
+        ClaimedToolNames::Incomplete(diagnostic) => {
+            let diagnostics = together(&request.diagnostics, vec![diagnostic]);
+            invalidate(ctx, &build.id, &diagnostics).await?;
+            return Ok(refusal_response(Some(build.id), diagnostics));
+        }
+    };
+
+    // Step 2: the rules, against the block set this one is joining. What they
+    // return IS the authority the guest gets — nothing else grants any.
     let spec = match validation::validate_static(
         name,
         &info,
         &artifact_sha256,
         &validation::builtin_route_prefixes(),
         &others,
-        &claimed_tool_names(ctx, &others).await?,
+        &claimed,
     ) {
         Ok(spec) => spec,
         Err(found) => {
@@ -200,6 +213,15 @@ async fn stage(
             return Ok(refusal_response(Some(build.id), diagnostics));
         }
     };
+
+    // Step 3: run the guest, under the accepted spec. This is the same value
+    // `rebuild` is handed below, so a guest that traps here would have
+    // trapped live.
+    if let Err(failure) = shared.control.probe(&spec, artifact).await {
+        let diagnostics = together(&request.diagnostics, vec![Diagnostic::guest(&failure)]);
+        invalidate(ctx, &build.id, &diagnostics).await?;
+        return Ok(refusal_response(Some(build.id), diagnostics));
+    }
 
     let block_info_json = serde_json::to_string(&info).map_err(encoding_error)?;
     repo::builds::set_status(
@@ -234,17 +256,30 @@ async fn stage(
     }))
 }
 
+/// The outcome of gathering every agent tool name already claimed.
+///
+/// Two cases, because "I could not read one of the active blocks" is not the
+/// same as "nothing else claims this name" and must never be spelled the same
+/// way. Silently skipping a block would disable half the duplicate rule for
+/// exactly the block the rule is about.
+enum ClaimedToolNames {
+    /// Every active block's `BlockInfo` was read.
+    Complete(BTreeSet<String>),
+    /// A block in the active set has no readable stored `BlockInfo`, so the
+    /// rule cannot be applied and the stage is refused.
+    Incomplete(Diagnostic),
+}
+
 /// Every agent tool name already claimed: by a built-in block, or by one of
 /// the dynamic blocks already in the target generation.
 ///
 /// The dynamic half comes from each block's stored `BlockInfo` rather than
 /// from the generation manifest, which carries routes and capabilities but
-/// not endpoints. A block whose build row has gone is not silently skipped —
-/// it cannot be, because the row is what the block was accepted on.
+/// not endpoints.
 async fn claimed_tool_names(
     ctx: &dyn Context,
     others: &[DynamicBlockSpec],
-) -> Result<BTreeSet<String>, WaferError> {
+) -> Result<ClaimedToolNames, WaferError> {
     let mut claimed: BTreeSet<String> = ctx
         .registered_blocks()
         .iter()
@@ -252,27 +287,45 @@ async fn claimed_tool_names(
         .filter_map(|endpoint| endpoint.agent_tool.as_ref().map(|tool| tool.name.clone()))
         .collect();
     for block in others {
+        // A block is in the active set because a build row accepted it, so a
+        // row that is gone or unreadable is a broken invariant — not a licence
+        // to skip the check. Refusing the stage keeps the guarantee ("no two
+        // blocks claim one tool name") true; skipping would leave it silently
+        // untested for exactly the block the rule is about.
         let Some(row) =
             repo::builds::latest_valid_for_artifact(ctx, &block.artifact_sha256).await?
         else {
-            continue;
-        };
-        let info: BlockInfo = serde_json::from_str(&row.block_info_json).map_err(|e| {
-            WaferError::new(
-                ErrorCode::Internal,
+            return Ok(ClaimedToolNames::Incomplete(Diagnostic::error(
+                validation::BUILD_ROW_MISSING,
                 format!(
-                    "build {} for {} holds an unreadable BlockInfo: {e}",
-                    row.id, block.name
+                    "{} is in the active generation but has no accepted build recording its \
+                     BlockInfo, so its agent tool names cannot be checked for collisions; \
+                     remove and re-stage it",
+                    block.name
                 ),
-            )
-        })?;
+            )));
+        };
+        let info: BlockInfo = match serde_json::from_str(&row.block_info_json) {
+            Ok(info) => info,
+            Err(e) => {
+                return Ok(ClaimedToolNames::Incomplete(Diagnostic::error(
+                    validation::BUILD_ROW_MISSING,
+                    format!(
+                        "build {} for {} holds a BlockInfo that cannot be read ({e}), so its \
+                         agent tool names cannot be checked for collisions; remove and re-stage \
+                         that block",
+                        row.id, block.name
+                    ),
+                )));
+            }
+        };
         claimed.extend(
             info.endpoints
                 .iter()
                 .filter_map(|endpoint| endpoint.agent_tool.as_ref().map(|tool| tool.name.clone())),
         );
     }
-    Ok(claimed)
+    Ok(ClaimedToolNames::Complete(claimed))
 }
 
 /// Mark a build refused, keeping the reasons on the row.

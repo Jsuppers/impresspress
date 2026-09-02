@@ -20,6 +20,7 @@ use base64ct::{Base64, Encoding};
 use impresspress_core::{
     blocks::dev::{
         control::ValidationStage,
+        paths::MAX_BLOCKS,
         repo::builds::{self, BuildStatus},
         test_support::FakeControl,
         validation::MAX_ARTIFACT_BYTES,
@@ -55,6 +56,19 @@ fn hello_info(name: &str) -> BlockInfo {
     )
     .auth(AuthLevel::Public)
     .summary("hello")])
+}
+
+/// A guest named `site/{name}` serving the one endpoint that implies.
+fn named_info(name: &str) -> BlockInfo {
+    BlockInfo::new(
+        format!("site/{name}"),
+        "0.1.0",
+        "http-handler@v1",
+        "a block",
+    )
+    .endpoints(vec![BlockEndpoint::get(&format!("/b/{name}/"))
+        .auth(AuthLevel::Public)
+        .summary("root")])
 }
 
 /// Stage `artifact` for block `name`, returning the parsed response body.
@@ -403,13 +417,16 @@ async fn a_reserved_block_name_never_reaches_the_runtime() {
 }
 
 // ---------------------------------------------------------------------------
-// The executable half
+// The executable half: inspect, then the rules, then probe
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn an_executable_validation_failure_is_a_diagnostic_not_a_transport_error() {
     let control = FakeControl::new();
-    control.fail_next_validate(ValidationStage::Init, "trap: unreachable");
+    // The guest declares itself correctly, so the static rules pass and the
+    // refusal can only come from running it.
+    control.set_validated_info(hello_info("site/hello"));
+    control.fail_next_probe(ValidationStage::Init, "trap: unreachable");
     let ctx = TestContext::with_dev(control.clone()).await;
 
     let out = dev_post(
@@ -425,7 +442,7 @@ async fn an_executable_validation_failure_is_a_diagnostic_not_a_transport_error(
     .await;
     assert_eq!(output_status(out).await, 200);
 
-    control.fail_next_validate(ValidationStage::Init, "trap: unreachable");
+    control.fail_next_probe(ValidationStage::Init, "trap: unreachable");
     let r = stage(&ctx, "hello", ARTIFACT).await;
     assert_eq!(r["success"], false, "{r}");
     assert_eq!(r["diagnostics"][0]["code"], "guest-init");
@@ -440,9 +457,187 @@ async fn an_executable_validation_failure_is_a_diagnostic_not_a_transport_error(
     assert_eq!(row.status, BuildStatus::Invalid);
 }
 
+/// The order is the guarantee: a guest is inspected under deny-all
+/// capabilities, the rules turn its declaration into an accepted spec, and
+/// only then is it executed — under that accepted spec.
+#[tokio::test]
+async fn a_guest_is_only_ever_executed_under_the_capabilities_the_rules_accepted() {
+    let control = FakeControl::new();
+    let mut info = hello_info("site/hello");
+    info.requires = vec!["wafer-run/storage".to_string()];
+    info.capabilities = Some(BlockCapabilities {
+        storage_folders: Allowlist::Only(BTreeSet::from(["site/hello".to_string()])),
+        callable_blocks: Allowlist::Only(BTreeSet::from(["wafer-run/storage".to_string()])),
+        ..BlockCapabilities::none()
+    });
+    control.set_validated_info(info);
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    assert_eq!(stage(&ctx, "hello", ARTIFACT).await["success"], true);
+
+    let probes = control.probes();
+    assert_eq!(probes.len(), 1, "{probes:?}");
+    assert_eq!(probes[0].name, "site/hello");
+    assert!(probes[0].capabilities.allows_storage_folder("site/hello/a"));
+    // And it is the same value the runtime was rebuilt with — a guest that
+    // survived the probe cannot then be given something else.
+    assert_eq!(probes[0], control.rebuilds()[0][0]);
+}
+
+/// A refused guest is never executed at all: the rules run between `inspect`
+/// and `probe`, so nothing about the guest's own capability declaration ever
+/// reaches a lifecycle event.
+#[tokio::test]
+async fn a_refused_guest_is_never_run() {
+    let control = FakeControl::new();
+    let mut info = hello_info("site/hello");
+    info.capabilities = Some(BlockCapabilities {
+        collections: Allowlist::Any,
+        ..BlockCapabilities::none()
+    });
+    control.set_validated_info(info);
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let r = stage(&ctx, "hello", ARTIFACT).await;
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(control.inspections(), 1);
+    assert!(
+        control.probes().is_empty(),
+        "a guest whose declaration was refused must never run: {:?}",
+        control.probes(),
+    );
+}
+
+#[tokio::test]
+async fn a_guest_that_fails_to_load_is_refused_before_the_rules_run() {
+    let control = FakeControl::new();
+    control.fail_next_inspect(ValidationStage::Load, "not a wasm module");
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let r = stage(&ctx, "hello", ARTIFACT).await;
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(r["diagnostics"][0]["code"], "guest-load");
+    assert!(control.probes().is_empty());
+    assert!(control.rebuilds().is_empty());
+}
+
+/// A guest may not ask to read or write the sensitive header set. Its route
+/// is reachable without a session, so `cookie` would hand it the admin
+/// session it is being sandboxed away from.
+#[tokio::test]
+async fn a_guest_that_asks_for_sensitive_headers_is_refused() {
+    let control = FakeControl::new();
+    let mut info = hello_info("site/hello");
+    info.capabilities = Some(BlockCapabilities {
+        headers: wafer_block::capabilities::HeaderPolicy {
+            readable: vec!["cookie".to_string(), "authorization".to_string()],
+            ..Default::default()
+        },
+        ..BlockCapabilities::none()
+    });
+    control.set_validated_info(info);
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let r = stage(&ctx, "hello", ARTIFACT).await;
+    assert_eq!(r["success"], false, "{r}");
+    assert!(codes(&r).contains(&"cap-headers"), "{r}");
+    assert!(control.probes().is_empty());
+    assert!(control.rebuilds().is_empty());
+}
+
+/// `masked` only ever narrows what a guest sees, so it is not a refusal.
+#[tokio::test]
+async fn masking_extra_headers_is_not_a_refusal() {
+    let control = FakeControl::new();
+    let mut info = hello_info("site/hello");
+    info.capabilities = Some(BlockCapabilities {
+        headers: wafer_block::capabilities::HeaderPolicy {
+            masked: vec!["x-internal-token".to_string()],
+            ..Default::default()
+        },
+        ..BlockCapabilities::none()
+    });
+    control.set_validated_info(info);
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    assert_eq!(stage(&ctx, "hello", ARTIFACT).await["success"], true);
+}
+
 // ---------------------------------------------------------------------------
 // Limits and malformed requests
 // ---------------------------------------------------------------------------
+
+/// The 17th block is refused. The workspace quota bounds source trees, not
+/// what is running, so this is the check on the runtime itself.
+#[tokio::test]
+async fn the_block_set_cannot_grow_past_the_limit() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    for i in 0..MAX_BLOCKS {
+        let name = format!("blk{i}");
+        control.set_validated_info(named_info(&name));
+        let r = stage(&ctx, &name, format!("\0asm{i}").as_bytes()).await;
+        assert_eq!(r["success"], true, "block {i}: {r}");
+    }
+    assert_eq!(
+        control.rebuilds().last().expect("a rebuild").len(),
+        MAX_BLOCKS
+    );
+
+    control.set_validated_info(named_info("onemore"));
+    let r = stage(&ctx, "onemore", b"\0asm-onemore").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert!(codes(&r).contains(&"too-many-blocks"), "{r}");
+    // Replacing one of the existing sixteen is still fine — the set does not
+    // grow.
+    control.set_validated_info(named_info("blk0"));
+    let r = stage(&ctx, "blk0", b"\0asm-blk0-v2").await;
+    assert_eq!(r["success"], true, "{r}");
+}
+
+/// The duplicate-tool rule must never be skipped for a block it cannot read.
+#[tokio::test]
+async fn a_block_whose_build_row_is_unreadable_refuses_the_next_stage() {
+    let control = FakeControl::new();
+    control.set_validated_info(named_info("first"));
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let first = stage(&ctx, "first", ARTIFACT).await;
+    assert_eq!(first["success"], true, "{first}");
+
+    // Corrupt the stored `BlockInfo` of the live block. Its tool names can no
+    // longer be read, so nothing can promise the next block does not collide
+    // with them.
+    let build_id = first["build_id"].as_str().expect("build_id");
+    builds::set_status(&ctx, build_id, BuildStatus::Valid, None, Some("{ not json"))
+        .await
+        .expect("corrupt the row");
+
+    control.set_validated_info(named_info("second"));
+    let r = stage(&ctx, "second", b"\0asm-second").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert!(codes(&r).contains(&"build-row-missing"), "{r}");
+    // Still exactly the one block that was live before.
+    assert_eq!(control.rebuilds().len(), 1);
+}
+
+/// Block names are hyphenated, not underscored: wafer-run refuses an
+/// underscore in a block id outright, so `my_shop` could never be registered.
+#[tokio::test]
+async fn a_hyphenated_block_name_works_and_an_underscored_one_is_refused() {
+    let control = FakeControl::new();
+    control.set_validated_info(named_info("my-shop"));
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let r = stage(&ctx, "my-shop", ARTIFACT).await;
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(control.rebuilds()[0][0].name, "site/my-shop");
+    assert_eq!(control.rebuilds()[0][0].routes[0].prefix, "/b/my-shop/");
+
+    let r = stage(&ctx, "my_shop", b"\0asm-underscore").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert!(codes(&r).contains(&"name-format"), "{r}");
+}
 
 #[tokio::test]
 async fn oversized_artifacts_are_refused_before_validation() {
@@ -454,7 +649,7 @@ async fn oversized_artifacts_are_refused_before_validation() {
     let r = stage(&ctx, "hello", &vec![0u8; MAX_ARTIFACT_BYTES + 1]).await;
     assert_eq!(r["success"], false, "{r}");
     assert_eq!(r["diagnostics"][0]["code"], "artifact-too-large");
-    assert_eq!(control.validations(), 0);
+    assert_eq!(control.inspections(), 0);
     // Nothing was compiled that could be explained later, so no row exists.
     assert_eq!(r["build_id"], serde_json::Value::Null);
 
@@ -463,7 +658,7 @@ async fn oversized_artifacts_are_refused_before_validation() {
     let r = stage(&ctx, "hello", &vec![0u8; MAX_ARTIFACT_BYTES + 4096]).await;
     assert_eq!(r["success"], false, "{r}");
     assert_eq!(r["diagnostics"][0]["code"], "artifact-too-large");
-    assert_eq!(control.validations(), 0);
+    assert_eq!(control.inspections(), 0);
     assert_eq!(r["build_id"], serde_json::Value::Null);
 }
 
@@ -506,7 +701,7 @@ async fn an_illegal_block_name_is_refused_as_a_diagnostic() {
     assert_eq!(r["success"], false, "{r}");
     assert!(codes(&r).contains(&"name-format"), "{r}");
     assert_eq!(
-        control.validations(),
+        control.inspections(),
         0,
         "an illegal name never runs a guest"
     );

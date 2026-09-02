@@ -108,6 +108,17 @@ pub async fn handle_rollback(ctx: &dyn Context, shared: &DevShared, msg: &Messag
     let intent = ActivationIntent::Rollback {
         target: target.clone(),
     };
+    // A rollback replaces the whole block set, exactly as a compile or a
+    // removal does — so it takes the same lock, for the same reason. Without
+    // it, a compile that read the active block set just before this rollback
+    // ran would compose its own set from a snapshot the rollback has already
+    // replaced, and would put the rolled-back block straight back.
+    //
+    // The lock spans the workspace adoption too: a rollback that published an
+    // old site but was overtaken before it could write the workspace would
+    // leave the two disagreeing, and the next site write would silently undo
+    // it.
+    let _compiling = shared.compile.lock().await;
     let outcome = match activation::request(ctx, shared, GenerationCause::Rollback, intent).await {
         Ok(outcome) => outcome,
         Err(e) => return e.into_response(),

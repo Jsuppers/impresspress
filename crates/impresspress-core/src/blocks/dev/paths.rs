@@ -127,11 +127,28 @@ pub fn validate_path(path: &str) -> Result<WorkspaceArea, PathError> {
     }
 }
 
-/// Whether `name` is a legal block name: `^[a-z][a-z0-9_]{1,31}$`.
+/// Whether `name` is a legal block name: `^[a-z][a-z0-9-]{1,31}$`.
 ///
 /// A block name becomes a directory segment, a crate name and half of a
-/// registered block id, so it is restricted to the intersection all three
-/// accept.
+/// registered block id (`site/{name}`), so it is restricted to the
+/// intersection all three accept.
+///
+/// # Why no underscore
+///
+/// `wafer_run::runtime::validate_block_name` refuses an underscore in either
+/// segment of a block id outright ("underscore not allowed in block segment,
+/// use hyphen"), so `site/my_shop` could never be registered. The reason is
+/// WRAP: `wafer_block::wrap::resource_prefix` maps `-` to `_` to build a
+/// resource prefix from a block id (`site/my-shop` → `site__my_shop__`), and
+/// an id that already contained `_` would produce a prefix two different ids
+/// could claim. Refusing the character here is what turns that into a
+/// diagnostic the agent can act on instead of a registration failure inside
+/// a runtime rebuild.
+///
+/// The block's *resources* keep the `__`-separated spelling with the
+/// hyphenated name inside — `site__my-shop__notes`, which
+/// `wrap::resource_owner` maps back to `site/my-shop`, the block's own id.
+/// That is the direction WRAP's own-namespace check actually uses.
 pub fn block_name_is_valid(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -144,7 +161,13 @@ pub fn block_name_is_valid(name: &str) -> bool {
     (1..=31).contains(&rest.len())
         && rest
             .iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        // wafer-run additionally refuses a doubled hyphen and a trailing one;
+        // a leading one cannot occur because the first character is checked
+        // above. Refusing them here keeps this function the single answer to
+        // "can this block be registered?".
+        && !name.contains("--")
+        && !name.ends_with('-')
 }
 
 /// A lower bound on how many bytes `encoded` decodes to, for padded
@@ -350,12 +373,37 @@ mod tests {
         }
     }
 
+    /// A hyphenated block name still owns its `__`-spelled resources.
+    ///
+    /// This is the invariant the `cap-collection` / `cap-config` namespaces
+    /// rest on: WRAP's own-namespace check calls `resource_owner` on the
+    /// resource and compares it to the caller's block id. Pinned against the
+    /// pinned wafer-block, because a change to either mapping would silently
+    /// turn every declared collection into a cross-block reach.
+    #[test]
+    fn a_hyphenated_block_owns_its_underscore_spelled_resources() {
+        assert!(block_name_is_valid("my-shop"));
+        assert_eq!(
+            wafer_block::wrap::resource_owner("site__my-shop__notes"),
+            Some("site/my-shop".to_string()),
+        );
+        assert_eq!(
+            wafer_block::wrap::resource_owner("SITE__MY-SHOP__GREETING"),
+            Some("site/my-shop".to_string()),
+        );
+        // And a single-word name, the common case.
+        assert_eq!(
+            wafer_block::wrap::resource_owner("site__hello__notes"),
+            Some("site/hello".to_string()),
+        );
+    }
+
     #[test]
     fn block_names_follow_the_declared_pattern() {
         for good in [
             "ab",
             "hello",
-            "hello_world",
+            "my-shop",
             "a1",
             &format!("a{}", "b".repeat(31)),
         ] {
@@ -367,7 +415,13 @@ mod tests {
             "1abc",
             "_abc",
             "Abc",
-            "ab-cd",
+            // An underscore can never be registered as half of a block id —
+            // wafer-run refuses it, and WRAP's `-`↔`_` mapping is why.
+            "my_shop",
+            "hello_world",
+            // wafer-run refuses these shapes too.
+            "my--shop",
+            "shop-",
             "ab cd",
             "abc.def",
             &format!("a{}", "b".repeat(32)),

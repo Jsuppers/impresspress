@@ -355,6 +355,7 @@ impl FileConflict {
 /// afterwards. Staging validates the artifact and, if it passes, activates a
 /// new generation carrying it — there is no separate "activate" call.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StageBuildRequest {
     /// The block's short name, e.g. `hello` for the sources under
     /// `blocks/hello/`. It is registered as `site/hello` and serves
@@ -409,6 +410,7 @@ pub struct StageBuildResponse {
 /// declared names against the path template's placeholders when it builds the
 /// agent tool for the endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BlockPathParams {
     /// The block's short name, e.g. `hello` for the block registered as
     /// `site/hello`.
