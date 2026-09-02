@@ -170,16 +170,13 @@ const roles = await impresspress.iam.getRoles();
 
 const role = await impresspress.iam.createRole({
   name: 'editor',
-  display_name: 'Content Editor',
   description: 'Can edit content',
-  metadata: {
-    allowed_ips: ['192.168.1.0/24'],
-    disabled_features: ['delete'],
-  },
+  permissions: ['posts.write'],
 });
 
-await impresspress.iam.updateRole('editor', { description: 'Updated description' });
-await impresspress.iam.deleteRole('editor');
+// Update and delete are keyed by the role's id, not its name.
+await impresspress.iam.updateRole(role.id, { description: 'Updated description' });
+await impresspress.iam.deleteRole(role.id);
 ```
 
 ### Products

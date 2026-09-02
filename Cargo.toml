@@ -9,11 +9,15 @@ members = [
     "crates/impresspress",
     "crates/impresspress-web",
     "examples/minimal-browser",
+    "examples/webmcp-demo",
 ]
 # impresspress-cloudflare is wasm32-only (depends on `worker`/`wasm-bindgen`,
 # whose StorageService futures wrap `!Send` JsFuture). Excluded from
 # default-members so host `cargo test`/`cargo check` skip it; build it
 # explicitly with `cargo <cmd> -p impresspress-cloudflare --target wasm32-unknown-unknown`.
+# examples/webmcp-demo is its Cloudflare consumer and wasm32-only for the same
+# reason; it is built by `impresspress build --target cloudflare` from its own
+# directory.
 default-members = [
     "crates/impresspress-browser",
     "crates/impresspress-bundle",

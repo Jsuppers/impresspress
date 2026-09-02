@@ -1,3 +1,4 @@
+mod contracts;
 mod database;
 mod iam;
 mod logs;
@@ -29,6 +30,25 @@ use wafer_run::{
 };
 
 use crate::http::{err_bad_request, err_internal, err_not_found, ok_json};
+
+/// Path-parameter schema for the `/iam/roles/{id}` routes.
+///
+/// Hand-written rather than derived: the handlers read the id by stripping
+/// the path prefix, so a struct declared only to feed `.path_params::<T>()`
+/// would have no runtime user — the same reasoning `tickets` records.
+fn role_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Role id, as returned by the list endpoint (not the role name)."
+            }
+        }
+    })
+}
 
 crate::impresspress_feature_block! {
     /// Admin panel: users, database, IAM, logs, settings (`impresspress/admin`).
@@ -121,10 +141,48 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/admin/grants").summary("WRAP grants management").auth(AuthLevel::Admin),
                 BlockEndpoint::get("/b/admin/database").summary("Database admin page").auth(AuthLevel::Admin),
                 BlockEndpoint::post("/b/admin/database/query").summary("Run read-only SQL (SSR)").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/users").summary("List users API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/iam/roles").summary("List roles API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/settings").summary("List variables API").auth(AuthLevel::Admin),
-                BlockEndpoint::get("/b/admin/api/logs").summary("Audit logs API").auth(AuthLevel::Admin),
+                // The JSON API: four reads and the three role writes. Every
+                // other endpoint above and below returns an SSR HTML page, so
+                // it carries no schema and never becomes a tool. The remaining
+                // JSON writes (users, permissions, user-roles, settings) still
+                // echo raw rows and stay undeclared until they are typed.
+                BlockEndpoint::get("/b/admin/api/users")
+                    .summary("List users API")
+                    .auth(AuthLevel::Admin)
+                    .query_params::<contracts::AdminUserListQuery>()
+                    .output::<contracts::AdminUserListResponse>(),
+                BlockEndpoint::get("/b/admin/api/iam/roles")
+                    .summary("List roles API")
+                    .auth(AuthLevel::Admin)
+                    .output::<contracts::AdminRoleListResponse>(),
+                BlockEndpoint::post("/b/admin/api/iam/roles")
+                    .summary("Create role API")
+                    .auth(AuthLevel::Admin)
+                    .input::<contracts::CreateRoleRequest>()
+                    .output::<contracts::AdminRoleView>(),
+                // `handle()` matches the `update` action, which both PUT and
+                // PATCH map to; PATCH is what the SDK sends and what is
+                // declared.
+                BlockEndpoint::patch("/b/admin/api/iam/roles/{id}")
+                    .summary("Update role API")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(role_id_path_schema())
+                    .input::<contracts::UpdateRoleRequest>()
+                    .output::<contracts::AdminRoleView>(),
+                BlockEndpoint::delete("/b/admin/api/iam/roles/{id}")
+                    .summary("Delete role API")
+                    .auth(AuthLevel::Admin)
+                    .path_params_schema(role_id_path_schema())
+                    .output::<contracts::AdminRoleDeleteResponse>(),
+                BlockEndpoint::get("/b/admin/api/settings")
+                    .summary("List variables API")
+                    .auth(AuthLevel::Admin)
+                    .output::<contracts::AdminSettingsResponse>(),
+                BlockEndpoint::get("/b/admin/api/logs")
+                    .summary("Audit logs API")
+                    .auth(AuthLevel::Admin)
+                    .query_params::<contracts::AdminAuditLogListQuery>()
+                    .output::<contracts::AdminAuditLogListResponse>(),
             ])
     },
     handle: |_this, ctx, msg, input| {

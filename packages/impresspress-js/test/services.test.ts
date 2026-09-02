@@ -58,9 +58,11 @@ describe("AuthService", () => {
     expect(user?.id).toBe("u1");
   });
 
-  it("updateUser reads the update response directly (no {user} wrapper, unlike GET /me)", async () => {
+  it("updateUser unwraps the same {user} envelope as GET /me", async () => {
     fetchMock.mockResolvedValueOnce(
-      fakeJsonResponse({ id: "u1", email: "a@b.com", roles: ["user"], name: "New Name" }),
+      fakeJsonResponse({
+        user: { id: "u1", email: "a@b.com", roles: ["user"], name: "New Name" },
+      }),
     );
     const c = client();
     const user = await c.auth.updateUser({ name: "New Name" });
@@ -774,10 +776,50 @@ describe("ProductsExtension", () => {
 });
 
 describe("IAMService", () => {
-  it("getRoles calls the real /b/admin/api/iam/roles route", async () => {
-    fetchMock.mockResolvedValueOnce(fakeJsonResponse([]));
-    await client().iam.getRoles();
+  const role = {
+    id: "r1",
+    name: "editor",
+    description: "",
+    permissions: ["posts.write"],
+    is_system: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+
+  it("getRoles unwraps the {records, total_count, page, page_size} envelope the route returns", async () => {
+    fetchMock.mockResolvedValueOnce(
+      fakeJsonResponse({ records: [role], total_count: 1, page: 1, page_size: 1000 }),
+    );
+    const roles = await client().iam.getRoles();
     expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/b/admin/api/iam/roles");
+    expect(roles).toEqual([role]);
+  });
+
+  it("createRole posts the typed body and reads the flat role back", async () => {
+    fetchMock.mockResolvedValueOnce(fakeJsonResponse(role));
+    const created = await client().iam.createRole({ name: "editor", permissions: ["posts.write"] });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://api.test/b/admin/api/iam/roles");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ name: "editor", permissions: ["posts.write"] });
+    expect(created.id).toBe("r1");
+  });
+
+  it("updateRole PATCHes by role id, not name", async () => {
+    fetchMock.mockResolvedValueOnce(fakeJsonResponse({ ...role, description: "Edits posts" }));
+    const updated = await client().iam.updateRole("r1", { description: "Edits posts" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://api.test/b/admin/api/iam/roles/r1");
+    expect(init.method).toBe("PATCH");
+    expect(updated.description).toBe("Edits posts");
+  });
+
+  it("deleteRole DELETEs by role id", async () => {
+    fetchMock.mockResolvedValueOnce(fakeJsonResponse({ deleted: true }));
+    await client().iam.deleteRole("r1");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://api.test/b/admin/api/iam/roles/r1");
+    expect(init.method).toBe("DELETE");
   });
 });
 

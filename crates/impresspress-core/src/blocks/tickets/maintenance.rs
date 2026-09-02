@@ -7,23 +7,72 @@ use wafer_run::{context::Context, WaferError};
 use super::{config::SecurityReadiness, repo};
 use crate::util::json_map;
 
-#[derive(Debug, Serialize)]
+/// Outcome of one retention pass, as returned by
+/// `POST /b/tickets/api/admin/retention/prune`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct MaintenanceResult {
+    /// Whether every delete in the pass succeeded. A `false` here is answered
+    /// with HTTP 503 so a scheduler retries.
     pub complete: bool,
+    /// Expired analyses removed.
     pub analyses_deleted: i64,
+    /// Expired audit events removed.
     pub events_deleted: i64,
+    /// Expired tickets removed. Tickets under legal hold never expire.
     pub tickets_deleted: i64,
+    /// Stale submission rate-limit counters removed.
     pub rate_counters_deleted: i64,
+    /// Names of the deletes that failed (`"analyses"`, `"events"`,
+    /// `"tickets"`, `"rate-counters"`).
     pub errors: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// The stored record of the last retention pass.
+// `id` is not published: the row is a singleton keyed on the literal
+// `"singleton"`, so the column carries no information.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MaintenanceState {
+    /// `YYYY-MM-DD` of the last pass, or `""` before the first one.
+    pub last_pruned_day: String,
+    /// RFC 3339 timestamp of the last pass, or `null` before the first one.
+    pub last_pruned_at: Option<String>,
+    /// Comma-joined names of the deletes that failed on the last pass, or `""`
+    /// when it completed.
+    pub last_prune_error: String,
+}
+
+impl MaintenanceState {
+    /// Project the `impresspress__tickets__maintenance` singleton row.
+    fn from_record(record: &db::Record) -> Self {
+        use crate::util::RecordExt;
+
+        Self {
+            last_pruned_day: record.str_field("last_pruned_day").to_string(),
+            last_pruned_at: match record.data.get("last_pruned_at") {
+                Some(serde_json::Value::String(value)) => Some(value.clone()),
+                _ => None,
+            },
+            last_prune_error: record.str_field("last_prune_error").to_string(),
+        }
+    }
+}
+
+/// Response body of `GET /b/tickets/api/admin/status`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct OperationalStatus {
+    /// Whether protected public reporting is currently able to accept a
+    /// submission, and what is missing when it is not.
     pub security: SecurityReadiness,
+    /// Tickets still in the `"new"` state.
     pub new_tickets: i64,
+    /// Tickets at `"urgent"` priority, in any state.
     pub urgent_tickets: i64,
+    /// Tickets in `"new"`, `"triaged"` or `"investigating"`.
     pub open_tickets: i64,
-    pub last_maintenance: Option<db::Record>,
+    /// The last retention pass, or `null` when none has run.
+    pub last_maintenance: Option<MaintenanceState>,
+    /// Whether an audit-timeline write has failed since the flag was last
+    /// cleared. While true, the timeline may be incomplete.
     pub audit_degraded: bool,
 }
 
@@ -109,8 +158,8 @@ pub async fn status(ctx: &dyn Context) -> Result<OperationalStatus, WaferError> 
         }],
     )
     .await?;
-    let last_maintenance = db::get(ctx, repo::MAINTENANCE, "singleton").await.ok();
-    let audit_degraded = last_maintenance
+    let stored = db::get(ctx, repo::MAINTENANCE, "singleton").await.ok();
+    let audit_degraded = stored
         .as_ref()
         .is_some_and(|record| super::service::bool_field(record, "audit_degraded"));
     Ok(OperationalStatus {
@@ -118,7 +167,7 @@ pub async fn status(ctx: &dyn Context) -> Result<OperationalStatus, WaferError> 
         new_tickets,
         urgent_tickets,
         open_tickets,
-        last_maintenance,
+        last_maintenance: stored.as_ref().map(MaintenanceState::from_record),
         audit_degraded,
     })
 }

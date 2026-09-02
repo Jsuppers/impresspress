@@ -1,0 +1,150 @@
+{
+  "/b/storage/api/buckets/{name}/objects": {
+    "get": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "Bucket name",
+            "type": "string"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page",
+          "required": false,
+          "schema": {
+            "default": 1,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "page_size",
+          "required": false,
+          "schema": {
+            "default": 50,
+            "maximum": 100,
+            "type": "integer"
+          }
+        },
+        {
+          "in": "query",
+          "name": "prefix",
+          "required": false,
+          "schema": {
+            "description": "Key prefix filter",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "`GET /b/storage/api/buckets/{name}/objects` response body. Mirrors\n`wafer_core::clients::storage::ObjectList` minus `next_cursor`:\n[`super::storage::objects::handle_list_objects`] always calls\n`store::list` with `cursor: None` (offset-only paging), and every\nbackend (S3, local-storage, Cloudflare R2) returns `next_cursor: None`\nin offset mode unconditionally — so on this endpoint the field can never\nbe anything but absent. Carrying it here would describe a cursor-paging\ncapability this endpoint does not actually expose.",
+                "properties": {
+                  "objects": {
+                    "description": "Objects in this page.",
+                    "items": {
+                      "description": "Mirrors `wafer_core::clients::storage::ObjectInfo`.",
+                      "properties": {
+                        "content_type": {
+                          "type": "string"
+                        },
+                        "key": {
+                          "description": "Object key.",
+                          "type": "string"
+                        },
+                        "last_modified": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "size": {
+                          "description": "Size in bytes.",
+                          "format": "int64",
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "size",
+                        "content_type",
+                        "last_modified"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "total_count": {
+                    "description": "Total number of objects matching the filter (across all pages). See\n`ObjectList::total_count` for the lower-bound caveat on some backends.",
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "objects",
+                  "total_count"
+                ],
+                "title": "ObjectListResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List objects",
+      "tags": [
+        "storage"
+      ]
+    }
+  },
+  "/b/storage/api/buckets/{name}/objects/{key}": {
+    "get": {
+      "description": "Returns the raw object bytes with the stored Content-Type — not a JSON envelope.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "key",
+          "required": true,
+          "schema": {
+            "description": "Object key (may contain '/')",
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "Bucket name",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Download file",
+      "tags": [
+        "storage"
+      ]
+    }
+  }
+}

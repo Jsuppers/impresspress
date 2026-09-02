@@ -106,17 +106,25 @@ pub async fn list_contexts(
     db::list(ctx, CONTEXTS_TABLE, &opts).await
 }
 
+/// Applies only the fields present in `updates` — `status`/`title`/
+/// `metadata` are the entire updatable set for a context; the caller (now
+/// `contracts::UpdateContextRequest`) has no field beyond these three.
 pub async fn update_context(
     ctx: &dyn Context,
     id: &str,
-    updates: std::collections::HashMap<String, serde_json::Value>,
+    status: Option<String>,
+    title: Option<String>,
+    metadata: Option<serde_json::Value>,
 ) -> Result<db::Record, WaferError> {
-    let allowed = ["status", "title", "metadata"];
     let mut data = std::collections::HashMap::new();
-    for key in &allowed {
-        if let Some(v) = updates.get(*key) {
-            data.insert(key.to_string(), v.clone());
-        }
+    if let Some(status) = status {
+        data.insert("status".to_string(), serde_json::Value::String(status));
+    }
+    if let Some(title) = title {
+        data.insert("title".to_string(), serde_json::Value::String(title));
+    }
+    if let Some(metadata) = metadata {
+        data.insert("metadata".to_string(), metadata);
     }
     crate::util::stamp_updated(&mut data);
 

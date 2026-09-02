@@ -124,7 +124,15 @@ wafer-run = { workspace = true }
 wafer-core = { workspace = true }
 # wafer-block — wire types + codec used directly by feature blocks that
 # encode/decode service payloads (e.g. llm chunks, vector queries).
-wafer-block = { workspace = true }
+# `json-schema` pulls in schemars derive support, used by the openapi
+# snapshot gate (tests/openapi_snapshot.rs) and, later, by the derive
+# migration itself.
+wafer-block = { workspace = true, features = ["json-schema"] }
+# `chrono04` turns on schemars' impl for `chrono::DateTime<Tz>` (renders as
+# `{"type": "string", "format": "date-time"}`), needed by
+# `blocks::files::contracts::ObjectInfoResponse::last_modified` — a real
+# `chrono::DateTime<Utc>` field, not a pre-formatted `String`.
+schemars = { version = "1", features = ["chrono04"] }
 # SQL utilities (query builders, value conversion). sea-query is reached
 # transitively through this crate — impresspress-core builds no queries with the
 # raw sea-query API itself, so it declares no direct sea-query dependency. A

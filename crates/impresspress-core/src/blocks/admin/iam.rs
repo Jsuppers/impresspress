@@ -4,7 +4,13 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::logs::audit_log;
+use super::{
+    contracts::{
+        AdminRoleDeleteResponse, AdminRoleListResponse, AdminRoleView, CreateRoleRequest,
+        UpdateRoleRequest,
+    },
+    logs::audit_log,
+};
 use crate::{
     blocks::auth::bump_auth_version,
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
@@ -35,7 +41,7 @@ pub async fn handle(
         ("retrieve", "/admin/iam/roles") => handle_list_roles(ctx).await,
         ("create", "/admin/iam/roles") => handle_create_role(ctx, msg, input).await,
         ("update", _) if path.starts_with("/admin/iam/roles/") => {
-            handle_update_role(ctx, path, input).await
+            handle_update_role(ctx, msg, path, input).await
         }
         ("delete", _) if path.starts_with("/admin/iam/roles/") => {
             handle_delete_role(ctx, msg, path).await
@@ -66,20 +72,19 @@ async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
         ..Default::default()
     };
     match db::list(ctx, ROLES_TABLE, &opts).await {
-        Ok(result) => ok_json(&result),
+        // Project onto the closed `AdminRoleView` field list. Besides pinning
+        // the published field set, this normalizes `permissions`: the column is
+        // JSON-encoded TEXT that the SQLite backend sniffs back into an array
+        // while Postgres/D1 return the raw string, so the untyped response had
+        // no single shape a schema could describe.
+        Ok(result) => ok_json(&AdminRoleListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
 }
 
 async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    #[derive(serde::Deserialize)]
-    struct Req {
-        name: String,
-        description: Option<String>,
-        permissions: Option<Vec<String>>,
-    }
     let raw = input.collect_to_bytes().await;
-    let body: Req = match serde_json::from_slice(&raw) {
+    let body: CreateRoleRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -93,19 +98,33 @@ async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream
     )
     .await
     {
-        Ok(record) => ok_json(&record),
+        // Same projection as the list: the ops layer returns the raw
+        // `db::Record`, whose `{id, data: {…}}` envelope and backend-dependent
+        // `permissions` encoding are exactly what `AdminRoleView` exists to
+        // normalize away. Echoing it here would publish a second shape for
+        // the same row.
+        Ok(record) => ok_json(&AdminRoleView::from_record(&record)),
         Err(out) => out,
     }
 }
 
-async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -> OutputStream {
+async fn handle_update_role(
+    ctx: &dyn Context,
+    msg: &Message,
+    path: &str,
+    input: InputStream,
+) -> OutputStream {
     let id = path.strip_prefix("/admin/iam/roles/").unwrap_or("");
     if id.is_empty() {
         return err_bad_request("Missing role ID");
     }
 
     let raw = input.collect_to_bytes().await;
-    let body_peek: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
+    // Typed rather than a `HashMap` peek plus a per-branch key whitelist: the
+    // published schema names exactly these three fields, and a `permissions`
+    // that is not an array of strings is refused here instead of being
+    // written to the column as whatever JSON arrived.
+    let body: UpdateRoleRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -122,35 +141,119 @@ async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -
         Err(e) => return err_internal("Database error", e),
     };
 
-    if existing.bool_field("is_system") {
-        if body_peek.contains_key("name") {
-            return err_forbidden("Cannot rename system roles");
-        }
-        let mut data = HashMap::new();
-        for key in &["description", "permissions"] {
-            if let Some(val) = body_peek.get(*key) {
-                data.insert(key.to_string(), val.clone());
-            }
-        }
-        crate::util::stamp_updated(&mut data);
-        return match db::update(ctx, ROLES_TABLE, id, data).await {
-            Ok(record) => ok_json(&record),
-            Err(e) => err_internal("Database error", e),
-        };
+    let is_system = existing.bool_field("is_system");
+    if is_system && body.name.is_some() {
+        return err_forbidden("Cannot rename system roles");
     }
 
+    // `user_roles.role` stores the role NAME, not its id (`fetch_roles` reads
+    // the `role` column; `handle_assign_role` writes `body.role`). A rename
+    // that does not carry the grants with it leaves every assignment naming a
+    // role that no longer exists, so the grant silently stops matching.
+    let old_name = existing.str_field("name").to_string();
+    let rename_to = body
+        .name
+        .as_deref()
+        .filter(|name| *name != old_name)
+        .map(str::to_string);
+
     let mut data = HashMap::new();
-    for key in &["name", "description", "permissions"] {
-        if let Some(val) = body_peek.get(*key) {
-            data.insert(key.to_string(), val.clone());
-        }
+    if let Some(name) = body.name {
+        data.insert("name".to_string(), serde_json::Value::String(name));
+    }
+    if let Some(description) = body.description {
+        data.insert(
+            "description".to_string(),
+            serde_json::Value::String(description),
+        );
+    }
+    if let Some(permissions) = body.permissions {
+        data.insert("permissions".to_string(), serde_json::json!(permissions));
     }
     crate::util::stamp_updated(&mut data);
-    match db::update(ctx, ROLES_TABLE, id, data).await {
-        Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Role not found"),
-        Err(e) => err_internal("Database error", e),
+    let record = match db::update(ctx, ROLES_TABLE, id, data).await {
+        Ok(record) => record,
+        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Role not found"),
+        Err(e) => return err_internal("Database error", e),
+    };
+
+    if let Some(new_name) = rename_to {
+        if let Err(out) = cascade_role_rename(ctx, &old_name, &new_name).await {
+            return out;
+        }
     }
+
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "role.update",
+        &format!("roles/{id}"),
+        msg.remote_addr(),
+    )
+    .await;
+
+    // Same projection as list/create, for the same reason.
+    ok_json(&AdminRoleView::from_record(&record))
+}
+
+/// Carry a role rename onto every `user_roles` row naming the old value, and
+/// invalidate the affected users' access tokens.
+///
+/// The grants store the role name, so this is what keeps them pointing at the
+/// role they were granted. The auth-version bump is the same reasoning as
+/// `handle_assign_role`'s: the set of roles a live JWT was minted with has
+/// changed, so it must stop authenticating.
+async fn cascade_role_rename(
+    ctx: &dyn Context,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), OutputStream> {
+    let grants = match db::list_all(
+        ctx,
+        USER_ROLES_TABLE,
+        vec![Filter {
+            field: "role".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(old_name.to_string()),
+        }],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return Err(err_internal("Database error", e)),
+    };
+
+    for grant in &grants {
+        let mut data = HashMap::new();
+        data.insert(
+            "role".to_string(),
+            serde_json::Value::String(new_name.to_string()),
+        );
+        crate::util::stamp_updated(&mut data);
+        if let Err(e) = db::update(ctx, USER_ROLES_TABLE, &grant.id, data).await {
+            return Err(err_internal(
+                "Role renamed but its grants did not follow",
+                e,
+            ));
+        }
+
+        let user_id = grant.str_field("user_id");
+        if user_id.is_empty() {
+            continue;
+        }
+        if let Err(e) = bump_auth_version(ctx, user_id).await {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "role grant renamed but auth_version bump failed"
+            );
+            return Err(err_internal(
+                "Role renamed but session invalidation failed",
+                e,
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn handle_delete_role(ctx: &dyn Context, msg: &Message, path: &str) -> OutputStream {
@@ -158,7 +261,7 @@ async fn handle_delete_role(ctx: &dyn Context, msg: &Message, path: &str) -> Out
     // System-role guard, delete, and audit-log write live in the shared ops
     // layer (the JSON path previously logged nothing).
     match super::ops::delete_role(ctx, msg, id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Ok(()) => ok_json(&AdminRoleDeleteResponse { deleted: true }),
         Err(out) => out,
     }
 }
@@ -455,6 +558,65 @@ mod tests {
         }
     }
 
+    /// The roles list publishes exactly `AdminRoleView`'s fields, and
+    /// `permissions` arrives as an array of strings.
+    ///
+    /// The array is the part worth pinning: the column is JSON-encoded TEXT,
+    /// and only the SQLite backend decodes it on read. Echoing the row would
+    /// make the published `array of string` schema false on Postgres and D1,
+    /// where the same column comes back as a string.
+    #[tokio::test]
+    async fn list_roles_publishes_exactly_the_contract_fields() {
+        let ctx = TestContext::with_admin().await;
+        let msg = crate::test_support::admin_msg("create", "/admin/iam/roles");
+        let created = super::super::ops::create_role(
+            &ctx,
+            &msg,
+            "editor",
+            Some("Can edit content"),
+            Some(vec!["posts.write".to_string(), "posts.read".to_string()]),
+        )
+        .await;
+        assert!(created.is_ok(), "create role should succeed");
+
+        let body = crate::test_support::output_json(handle_list_roles(&ctx).await).await;
+
+        let editor = body["records"]
+            .as_array()
+            .expect("records array")
+            .iter()
+            .find(|r| r["name"] == serde_json::json!("editor"))
+            .expect("the created role is listed");
+
+        let mut got: Vec<&str> = editor
+            .as_object()
+            .expect("role object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "created_at",
+                "description",
+                "id",
+                "is_system",
+                "name",
+                "permissions",
+                "updated_at"
+            ],
+            "the wire field set must equal AdminRoleView's"
+        );
+
+        assert_eq!(
+            editor["permissions"],
+            serde_json::json!(["posts.write", "posts.read"]),
+            "permissions must be an array of strings on every backend"
+        );
+        assert_eq!(editor["is_system"], serde_json::json!(false));
+    }
+
     /// Seed a real system role (`is_system: true`) via the shared
     /// `seed_defaults` path and return its row id.
     async fn seed_system_role(ctx: &dyn Context) -> String {
@@ -481,6 +643,141 @@ mod tests {
         InputStream::from_bytes(serde_json::to_vec(&json).unwrap())
     }
 
+    /// The system-role guard on the delete path must fail closed, exactly as
+    /// the update path does. A transient read error previously fell through
+    /// the `if let Ok(role)` and deleted the row — and this endpoint is now
+    /// declared, schema-bearing and agent-reachable.
+    #[tokio::test]
+    async fn delete_role_rejects_deletion_when_guard_read_errors() {
+        let ctx = TestContext::with_admin().await;
+        let role_id = seed_system_role(&ctx).await;
+        let failing = FailingGetContext { inner: ctx };
+
+        let out = super::super::ops::delete_role(
+            &failing,
+            &admin_msg("delete", "/admin/iam/roles"),
+            &role_id,
+        )
+        .await;
+
+        match out {
+            Err(stream) => {
+                assert!(
+                    output_is_error(stream, "Internal").await,
+                    "a failed guard read must be reported, not treated as \
+                     'not a system role'"
+                );
+            }
+            Ok(()) => panic!("delete succeeded while the system-role guard read was failing"),
+        }
+
+        // The row must still be there: the mutation must not have run.
+        let still_there = db::get(&failing.inner, ROLES_TABLE, &role_id).await;
+        assert!(
+            still_there.is_ok(),
+            "the system role was deleted despite the guard read failing"
+        );
+    }
+
+    /// `user_roles.role` stores the role NAME, so renaming a role definition
+    /// without cascading silently orphans every grant: the assignment rows
+    /// keep naming a role that no longer exists, and every auth check that
+    /// reads them stops matching.
+    #[tokio::test]
+    async fn update_role_rename_cascades_to_its_assignments() {
+        let ctx = TestContext::with_admin().await;
+
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({ "name": "editor", "permissions": ["posts.write"] })),
+            )
+            .await,
+        )
+        .await;
+        let role_id = created["id"].as_str().expect("created role id").to_string();
+
+        // Grant it to a user, the way the admin UI does.
+        let assigned = handle_assign_role(
+            &ctx,
+            &admin_msg("create", "/admin/iam/user-roles"),
+            body_input(serde_json::json!({ "user_id": "user_1", "role": "editor" })),
+        )
+        .await;
+        assert!(
+            assigned.collect_buffered().await.is_ok(),
+            "seeding the role assignment must succeed"
+        );
+
+        let out = handle_update_role(
+            &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
+            &format!("/admin/iam/roles/{role_id}"),
+            body_input(serde_json::json!({ "name": "editor-v2" })),
+        )
+        .await;
+        assert!(out.collect_buffered().await.is_ok(), "rename must succeed");
+
+        let rows = db::list_all(
+            &ctx,
+            USER_ROLES_TABLE,
+            vec![Filter {
+                field: "user_id".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("user_1"),
+            }],
+        )
+        .await
+        .expect("list assignments");
+        let names: Vec<&str> = rows.iter().map(|r| r.str_field("role")).collect();
+        assert_eq!(
+            names,
+            vec!["editor-v2"],
+            "the grant must follow the rename, or it names a role that no \
+             longer exists"
+        );
+    }
+
+    /// Every other role mutation writes an audit row; a rename — which
+    /// invalidates every grant naming the old value — wrote none.
+    #[tokio::test]
+    async fn update_role_writes_an_audit_row() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({ "name": "auditor", "permissions": [] })),
+            )
+            .await,
+        )
+        .await;
+        let role_id = created["id"].as_str().expect("created role id").to_string();
+
+        let out = handle_update_role(
+            &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
+            &format!("/admin/iam/roles/{role_id}"),
+            body_input(serde_json::json!({ "description": "reads everything" })),
+        )
+        .await;
+        assert!(out.collect_buffered().await.is_ok(), "update must succeed");
+
+        let rows = db::list_all(
+            &ctx,
+            super::super::logs::AUDIT_LOGS_TABLE,
+            vec![Filter {
+                field: "action".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("role.update"),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        assert_eq!(rows.len(), 1, "a role update must leave an audit trail");
+    }
+
     #[tokio::test]
     async fn update_role_rejects_mutation_when_guard_read_errors() {
         // Real system role exists in the DB (renaming it would break auth).
@@ -494,6 +791,7 @@ mod tests {
         let path = format!("/admin/iam/roles/{role_id}");
         let out = handle_update_role(
             &failing,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"name": "renamed-admin"})),
         )
@@ -533,6 +831,7 @@ mod tests {
         let path = format!("/admin/iam/roles/{role_id}");
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"name": "renamed-admin"})),
         )
@@ -546,6 +845,7 @@ mod tests {
         let path = "/admin/iam/roles/does-not-exist".to_string();
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"description": "x"})),
         )
@@ -567,12 +867,130 @@ mod tests {
         let path = format!("/admin/iam/roles/{}", created.id);
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"name": "renamed-editor"})),
         )
         .await;
         let json = output_json(out).await;
-        assert_eq!(json["data"]["name"], "renamed-editor");
+        assert_eq!(json["name"], "renamed-editor");
+        assert!(
+            json.get("data").is_none(),
+            "the record envelope must not survive the projection: {json}"
+        );
+    }
+
+    /// Every field name a role write publishes, sorted — must equal what the
+    /// list publishes, since all three go through `AdminRoleView`.
+    fn role_fields(role: &serde_json::Value) -> Vec<&str> {
+        let mut got: Vec<&str> = role
+            .as_object()
+            .expect("role object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        got
+    }
+
+    const ROLE_VIEW_FIELDS: [&str; 7] = [
+        "created_at",
+        "description",
+        "id",
+        "is_system",
+        "name",
+        "permissions",
+        "updated_at",
+    ];
+
+    /// `POST` used to `ok_json` the raw `db::Record` from `ops::create_role`
+    /// — the `{id, data: {…}}` envelope with `permissions` in whatever
+    /// encoding the backend returned. It must publish the list's projection.
+    #[tokio::test]
+    async fn create_role_publishes_the_list_projection() {
+        let ctx = TestContext::with_admin().await;
+        let out = handle_create_role(
+            &ctx,
+            &admin_msg("create", "/admin/iam/roles"),
+            body_input(serde_json::json!({
+                "name": "editor",
+                "description": "Can edit content",
+                "permissions": ["posts.write"]
+            })),
+        )
+        .await;
+        let role = output_json(out).await;
+
+        assert_eq!(role_fields(&role), ROLE_VIEW_FIELDS);
+        assert_eq!(role["name"], serde_json::json!("editor"));
+        assert_eq!(role["permissions"], serde_json::json!(["posts.write"]));
+        assert_eq!(role["is_system"], serde_json::json!(false));
+    }
+
+    /// `PATCH` publishes the same projection, and a `permissions` value the
+    /// schema does not admit is refused rather than written.
+    #[tokio::test]
+    async fn update_role_publishes_the_list_projection_and_types_permissions() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        let path = format!("/admin/iam/roles/{}", created["id"].as_str().unwrap());
+
+        let updated = output_json(
+            handle_update_role(
+                &ctx,
+                &admin_msg("update", "/admin/iam/roles"),
+                &path,
+                body_input(serde_json::json!({"permissions": ["posts.read", "posts.write"]})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(role_fields(&updated), ROLE_VIEW_FIELDS);
+        assert_eq!(
+            updated["permissions"],
+            serde_json::json!(["posts.read", "posts.write"])
+        );
+
+        let out = handle_update_role(
+            &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
+            &path,
+            body_input(serde_json::json!({"permissions": "posts.*"})),
+        )
+        .await;
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "a permissions value that is not an array of strings must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_role_reports_deleted() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        let path = format!("/admin/iam/roles/{}", created["id"].as_str().unwrap());
+
+        let body = output_json(
+            handle_delete_role(&ctx, &admin_msg("delete", "/admin/iam/roles"), &path).await,
+        )
+        .await;
+        assert_eq!(body, serde_json::json!({"deleted": true}));
     }
 
     /// P2c: assigning a role is a security-relevant grant — it must bump the

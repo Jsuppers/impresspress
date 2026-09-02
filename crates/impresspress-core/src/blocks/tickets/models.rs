@@ -98,27 +98,40 @@ string_enum!(ActorType {
     System => "system",
 });
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Request body of `POST /b/tickets/api/admin/types`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketTypeInput {
+    /// Immutable lowercase slug, 2–48 characters, identifying the type.
     pub key: String,
+    /// Title shown to reporters and reviewers, 2–80 characters.
     pub title: String,
+    /// Short explanation of what belongs under this type, ≤500 characters.
     #[serde(default)]
     pub description: String,
+    /// Longer guidance shown on the public form, ≤1000 characters.
     #[serde(default)]
     pub guidance: String,
+    /// Priority applied to tickets filed under this type: `"low"`,
+    /// `"normal"`, `"high"` or `"urgent"`.
     #[serde(default = "default_priority")]
     pub default_priority: String,
+    /// Review track: `"none"`, `"legal"`, `"privacy"` or `"safety"`.
     #[serde(default = "default_escalation")]
     pub escalation_kind: String,
+    /// Whether the public form offers this type.
     #[serde(default)]
     pub public_visible: bool,
+    /// Whether a reporter must supply an email address and consent to a reply.
     #[serde(default)]
     pub requires_contact: bool,
+    /// Whether the form asks for an evidence URL.
     #[serde(default)]
     pub requests_evidence: bool,
+    /// Whether the type accepts new tickets.
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Ordering weight, between -1000000 and 1000000.
     #[serde(default)]
     pub sort_order: i64,
 }
@@ -163,20 +176,36 @@ impl TicketTypeInput {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Request body of `PATCH /b/tickets/api/admin/types/{id}`.
+///
+/// Every field is optional; an omitted field is left as stored.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketTypeUpdate {
+    /// Accepted only when it equals the stored key — the key is immutable.
     #[serde(default)]
     pub key: Option<String>,
+    /// New title, 2–80 characters.
     pub title: Option<String>,
+    /// New description, ≤500 characters.
     pub description: Option<String>,
+    /// New guidance, ≤1000 characters.
     pub guidance: Option<String>,
+    /// `"low"`, `"normal"`, `"high"` or `"urgent"`.
     pub default_priority: Option<String>,
+    /// `"none"`, `"legal"`, `"privacy"` or `"safety"`.
     pub escalation_kind: Option<String>,
+    /// Whether the public form offers this type. Removing the last public type
+    /// while public submissions are on is rejected with 409.
     pub public_visible: Option<bool>,
+    /// Whether a reporter must supply an email address and consent to a reply.
     pub requires_contact: Option<bool>,
+    /// Whether the form asks for an evidence URL.
     pub requests_evidence: Option<bool>,
+    /// Whether the type accepts new tickets. Deactivating the last public type
+    /// while public submissions are on is rejected with 409.
     pub active: Option<bool>,
+    /// Ordering weight, between -1000000 and 1000000.
     pub sort_order: Option<i64>,
 }
 
@@ -207,23 +236,23 @@ impl TicketTypeUpdate {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+// Not a wire type, and deliberately not serde-derived. Both intake paths build
+// it in Rust from their own request struct - `AdminCreateTicketRequest` in
+// `rest`, `PublicSubmissionRequest` (or a form body) in `public` - because the
+// two surfaces accept different fields: only the public one may set reporter
+// contact details. It previously carried `Deserialize`/`Serialize` that no
+// caller used, which made it read like a third request contract.
+/// The intake fields common to every ticket source, before validation.
+#[derive(Debug, Clone)]
 pub struct CreateTicketInput {
     pub type_id: String,
     pub subject: String,
     pub description: String,
-    #[serde(default)]
     pub source_path: String,
-    #[serde(default)]
     pub subject_type: String,
-    #[serde(default)]
     pub subject_id: String,
-    #[serde(default)]
     pub evidence_url: String,
-    #[serde(default)]
     pub reporter_email: String,
-    #[serde(default)]
     pub reporter_wants_reply: bool,
     pub priority: Option<String>,
 }
@@ -274,14 +303,30 @@ impl CreateTicketInput {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Request body of `PATCH /b/tickets/api/admin/tickets/{id}`.
+///
+/// Only workflow fields are mutable. The original report is immutable: no
+/// field here can edit the subject, description, evidence URL or reporter
+/// contact details.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowUpdate {
+    /// New workflow state: `"new"`, `"triaged"`, `"investigating"`,
+    /// `"resolved"`, `"rejected"`, `"spam"` or `"duplicate"`. A closed ticket
+    /// can only reopen to `"triaged"`.
     pub status: Option<String>,
+    /// `"low"`, `"normal"`, `"high"` or `"urgent"`.
     pub priority: Option<String>,
+    /// Id of the reviewer to assign, or `""` to unassign.
     pub assignee_id: Option<String>,
+    /// Id of the ticket this one duplicates. Required when moving to
+    /// `"duplicate"`, and must name an existing, different ticket.
     pub duplicate_of: Option<String>,
+    /// Suspend retention for this ticket. A ticket under hold never expires.
     pub legal_hold: Option<bool>,
+    /// Why the change was made, ≤4000 characters. Required when closing a
+    /// ticket (`"resolved"`, `"rejected"`, `"spam"`, `"duplicate"`) and
+    /// recorded on the audit timeline.
     #[serde(default)]
     pub reason: String,
 }
@@ -334,18 +379,32 @@ impl WorkflowUpdate {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Request body of `POST /b/tickets/api/admin/tickets/{id}/analyses`.
+///
+/// An analysis is advisory and append-only. Posting one records a suggestion;
+/// it never changes the ticket's type, priority or status.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisInput {
+    /// Name of the system producing the analysis, 1–80 characters.
     pub source: String,
+    /// Model identifier, ≤160 characters.
     pub model: Option<String>,
+    /// Prompt version, ≤80 characters.
     #[serde(default)]
     pub prompt_version: String,
+    /// The analysis itself, 1–4000 characters.
     pub summary: String,
+    /// Ticket type to suggest. Must name an active type.
     pub suggested_type_id: Option<String>,
+    /// `"low"`, `"normal"`, `"high"` or `"urgent"`.
     pub suggested_priority: Option<String>,
+    /// Reported confidence, between 0 and 1 inclusive.
     pub confidence: f64,
+    /// Proposed follow-up actions, ≤8192 bytes once encoded. Stored verbatim;
+    /// the block neither interprets nor executes them.
     #[serde(default = "empty_array")]
+    #[schemars(with = "Vec<serde_json::Value>")]
     pub suggested_actions: serde_json::Value,
 }
 
