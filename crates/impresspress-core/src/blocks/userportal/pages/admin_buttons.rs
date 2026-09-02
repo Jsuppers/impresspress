@@ -330,3 +330,79 @@ pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
 
     buttons_table_response(ctx).await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+    use wafer_core::clients::database as db;
+
+    use super::*;
+    use crate::{
+        blocks::userportal::UserPortalBlock,
+        test_support::{output_html, TestContext},
+    };
+
+    async fn ctx_with_userportal() -> TestContext {
+        let mut ctx = TestContext::with_userportal().await;
+        ctx.register_block("impresspress/userportal", std::sync::Arc::new(UserPortalBlock::new()));
+        ctx
+    }
+
+    fn button_data(label: &str, icon: &str, path: &str) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert("label".to_string(), json!(label));
+        m.insert("icon".to_string(), json!(icon));
+        m.insert("path".to_string(), json!(path));
+        m.insert("sort_order".to_string(), json!(0));
+        m
+    }
+
+    /// Regression test for the six-week-silent bug (task 12e): the edit
+    /// modal is `components::modal()`, which renders the boolean `hidden`
+    /// attribute (`[hidden] { display: none !important; }` in base.css).
+    /// A plain `el.style.display='flex'` inline-style toggle can never beat
+    /// that `!important`, so the modal could never actually open even
+    /// though the fragment rendered "successfully". This asserts the
+    /// fragment routes through the shared `openModal`/`closeModal` helpers
+    /// (which flip the `hidden` IDL property, not `style.display`) instead
+    /// of reintroducing a hand-rolled inline-style toggle.
+    #[tokio::test]
+    async fn edit_button_form_opens_via_shared_modal_helpers_not_inline_style() {
+        let ctx = ctx_with_userportal().await;
+        let record = db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+
+        // The handler takes `id` directly (the real route,
+        // `GET /b/userportal/admin/buttons/{id}/edit`, is parsed and
+        // dispatched by `userportal/mod.rs` before reaching this function).
+        let resp = handle_edit_button_form(&ctx, &record.id).await;
+        let html = output_html(resp).await;
+
+        // The modal container itself must still start hidden via the real
+        // `hidden` attribute (not an inline style) -- `components::modal()`
+        // renders `id=(id) hidden` in that order.
+        assert!(
+            html.contains(&format!(r#"id="edit-btn-{}" hidden"#, record.id)),
+            "modal must render the boolean `hidden` attribute:\n{html}"
+        );
+        // Auto-show and Cancel must route through the shared helpers.
+        assert!(
+            html.contains(&format!("openModal('edit-btn-{}')", record.id)),
+            "auto-show script must call the shared openModal helper:\n{html}"
+        );
+        assert!(
+            html.contains(&format!("closeModal('edit-btn-{}')", record.id)),
+            "Cancel button must call the shared closeModal helper:\n{html}"
+        );
+        // The exact bug: a plain inline `style.display` toggle always loses
+        // to `[hidden] { display: none !important; }`, so the modal could
+        // never open. Any reintroduction of that pattern must fail this.
+        assert!(
+            !html.contains("style.display"),
+            "modal must not be toggled via a plain inline style.display assignment:\n{html}"
+        );
+    }
+}
