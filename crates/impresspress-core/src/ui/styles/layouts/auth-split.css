@@ -36,6 +36,38 @@
 	animation: shake 0.3s ease-in-out;
 }
 
+/* Success box (signup/reset-password result). No `display` here
+   deliberately: the element starts `hidden` (native attribute, see
+   base.css's `[hidden]` rule) and the shown state is the default block
+   flow — the same shape the `#success` div had when it carried an inline
+   `display:block`. #ecfdf5/#a7f3d0/#059669 have no matching design token;
+   carried over unchanged from the original inline styles. */
+.login-success {
+	background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px;
+	padding: 0.75rem; margin-bottom: 1rem; font-size: 0.813rem; color: #059669;
+}
+
+/* ===== Auth status result page (reset-password/verify success-or-failure,
+   signup's "check your email") =====
+   `.auth-status__icon`'s colour is a per-render outcome (success vs. failure)
+   computed in Rust, so it's handed to CSS as `--icon-color`/`--icon-bg`
+   custom properties rather than a static class -- the guard's own carve-out
+   for a dynamic runtime value. Signup's icon is always the success state, so
+   it uses the static `--success` modifier instead. */
+.auth-status { text-align: center; }
+.auth-status__icon {
+	width: 48px; height: 48px; border-radius: 50%;
+	display: flex; align-items: center; justify-content: center;
+	margin: 0 auto 1rem; font-size: 1.5rem;
+}
+.auth-status__icon--dynamic { background: var(--icon-bg); color: var(--icon-color); }
+/* #ecfdf5 has no matching token; --accent-success (#10b981) does match the
+   original literal and is used in place of it. */
+.auth-status__icon--success { background: #ecfdf5; color: var(--accent-success); }
+.auth-status__title { font-size: 1.25rem; font-weight: 700; margin: 0 0 0.5rem; }
+.auth-status__message { color: var(--text-secondary); font-size: 0.875rem; line-height: 1.6; margin: 0 0 1.5rem; }
+.auth-status__action { display: inline-block; width: auto; padding: 0.625rem 1.25rem; text-decoration: none; }
+
 @keyframes shake {
 	0%, 100% { transform: translateX(0); }
 	25% { transform: translateX(-5px); }

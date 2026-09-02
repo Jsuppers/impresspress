@@ -132,7 +132,7 @@ pub(super) fn oauth_provider_icon(provider: &str) -> Markup {
 /// area so it's consistent with the email/password flow.
 ///
 /// `login.rs` renders `#error`/`#info` via `components::alert`, which starts
-/// `hidden` (not `style="display:none"`). `base.css` pins
+/// `hidden` (not an inline `display:none` style). `base.css` pins
 /// `[hidden] { display: none !important; }`, so revealing the element must
 /// clear the `hidden` IDL property (`el.hidden = false`), not set
 /// `el.style.display` — a plain inline style loses to that `!important`.
@@ -277,22 +277,22 @@ pub(super) fn signup_script() -> &'static str {
     {
         r#"
 var $=function(id){return document.getElementById(id)};
-function showErr(m){var e=$('error');e.textContent=m;e.style.display='flex'}
+function showErr(m){var e=$('error');e.textContent=m;e.hidden=false}
 async function handleSignup(ev){
   ev.preventDefault();
   var btn=$('btn');btn.disabled=true;btn.textContent='Creating account...';
-  $('error').style.display='none';
+  $('error').hidden=true;
   var email=$('email').value,pw=$('password').value;
   try{
     var r=await fetch('/b/auth/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pw})});
     var d=await r.json();
     if(!r.ok||d.error){showErr((d.error&&d.error.message)||d.error||d.message||'Signup failed');btn.disabled=false;btn.textContent='Create Account';return false}
     if(d.email_verified===false){
-      $('form').style.display='none';$('signin-link').style.display='none';
+      $('form').hidden=true;$('signin-link').hidden=true;
       $('verify-msg').textContent='We sent a verification link to '+email+'. Click the link to activate your account.';
       var back=$('back-to-signin');
       if(back){var qs='email='+encodeURIComponent(email);var r2=$('redirect').value;if(r2){qs+='&redirect='+encodeURIComponent(r2)}back.setAttribute('href','/b/auth/login?'+qs);}
-      $('success').style.display='block';
+      $('success').hidden=false;
     }else{
       if(d.access_token){
         var secure=location.protocol==='https:'?'; Secure':'';
@@ -311,22 +311,22 @@ async function handleSignup(ev){
     {
         r#"
 var $=function(id){return document.getElementById(id)};
-function showErr(m){var e=$('error');e.textContent=m;e.style.display='flex'}
+function showErr(m){var e=$('error');e.textContent=m;e.hidden=false}
 async function handleSignup(ev){
   ev.preventDefault();
   var btn=$('btn');btn.disabled=true;btn.textContent='Creating account...';
-  $('error').style.display='none';
+  $('error').hidden=true;
   var email=$('email').value,pw=$('password').value;
   try{
     var r=await fetch('/b/auth/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pw})});
     var d=await r.json();
     if(!r.ok||d.error){showErr((d.error&&d.error.message)||d.error||d.message||'Signup failed');btn.disabled=false;btn.textContent='Create Account';return false}
     if(d.email_verified===false){
-      $('form').style.display='none';$('signin-link').style.display='none';
+      $('form').hidden=true;$('signin-link').hidden=true;
       $('verify-msg').textContent='We sent a verification link to '+email+'. Click the link to activate your account.';
       var back=$('back-to-signin');
       if(back){var qs='email='+encodeURIComponent(email);var r2=$('redirect').value;if(r2){qs+='&redirect='+encodeURIComponent(r2)}back.setAttribute('href','/b/auth/login?'+qs);}
-      $('success').style.display='block';
+      $('success').hidden=false;
     }else{
       var redir=$('redirect').value||d.default_redirect||'/';
       window.location.href=redir;
