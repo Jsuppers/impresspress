@@ -279,3 +279,103 @@ fn no_write_escape_hatch_allowlist_entry_is_dead() {
         }
     }
 }
+
+/// The read-side twin of [`WRITE_ESCAPE_HATCHES`], and the one that matters
+/// most for what a customer can see.
+///
+/// The scans above prove nothing *names the products table* outside
+/// `repo::products`, and the write list proves no new call site writes past
+/// the soft-delete filter. Neither says anything about the two functions in
+/// that module that deliberately *read* past it: `get_including_deleted` and
+/// `list_all_including_deleted`. Both are `pub(crate)`, both compile cleanly
+/// from anywhere in the block, and both return a soft-deleted product's row
+/// as if it were live — so a new handler reaching for either one puts a
+/// deleted product back in front of a customer while every other gate in
+/// this file stays green. That is the exact argument the write-side list
+/// makes for itself; it applies at least as strongly here, because a leaked
+/// read is visible to a buyer whereas a stray write is visible to an admin.
+///
+/// Each call site is listed with its justification, and the same limits
+/// apply as above: other crates, non-Rust sources, aliases and re-exports are
+/// out of reach, and nothing re-checks that a listed file's uses are still
+/// the ones justified here.
+const READ_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
+    (
+        // Reads one row whatever its soft-delete state.
+        "products::get_including_deleted",
+        &[
+            // this file: needs the identifier in order to scan for it
+            "blocks/products/tests/repo_door_test.rs",
+            // two callers, both of which read a DELETED product on purpose
+            // and neither of which shows it to anyone:
+            // `archive_offer_catalog` needs `owner_kind`/`owner_id` and
+            // `stripe_product_id` to take a deleted product's Prices out of
+            // the live Stripe catalog, which is precisely when that most
+            // needs doing; and `reconcile_payment_link_session` needs the
+            // product name for the buyer's own receipt after Stripe has
+            // already captured the money through a Payment Link that soft
+            // delete never took down.
+            "blocks/products/stripe.rs",
+        ],
+    ),
+    (
+        // Lists rows whatever their soft-delete state.
+        "products::list_all_including_deleted",
+        &[
+            // this file: needs the identifier in order to scan for it
+            "blocks/products/tests/repo_door_test.rs",
+            // seller suspension, which is a fraud control and so has to cover
+            // every row the seller owns — soft delete takes nothing down in
+            // Stripe, so exempting the deleted rows would leave exactly them
+            // still taking money.
+            "blocks/products/handlers/sellers.rs",
+            // asserts that suspension reached the deleted rows too, which it
+            // can only do by reading the set that spans both.
+            "blocks/products/tests/seller_governance_tests.rs",
+        ],
+    ),
+];
+
+#[test]
+fn read_side_escape_hatches_are_allowlisted() {
+    let sources = crate_sources();
+    for (ident, allowlist) in READ_ESCAPE_HATCHES {
+        let offenders: Vec<&String> = sources
+            .iter()
+            .filter(|(path, _)| !matches_allowlist(path, allowlist))
+            .filter(|(_, src)| src.contains(ident))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these files call `{ident}`, which reads past the soft-delete \
+             filter and so can hand a soft-deleted product to a caller, \
+             without being justified in READ_ESCAPE_HATCHES. Use `get` / \
+             `list_all` unless reading a deleted row is genuinely what the \
+             operation means, and say why here if it is: {offenders:?}"
+        );
+    }
+}
+
+/// [`no_write_escape_hatch_allowlist_entry_is_dead`] for the read list: an
+/// entry naming a file that no longer calls the function silently
+/// pre-approves whatever that file does next.
+#[test]
+fn no_read_escape_hatch_allowlist_entry_is_dead() {
+    let sources = crate_sources();
+    for (ident, allowlist) in READ_ESCAPE_HATCHES {
+        for entry in *allowlist {
+            if *entry == "blocks/products/tests/repo_door_test.rs" {
+                continue;
+            }
+            let uses = sources
+                .iter()
+                .any(|(path, src)| path == entry && src.contains(ident));
+            assert!(
+                uses,
+                "`{entry}` is allowlisted for `{ident}` but no longer calls it; \
+                 drop the entry rather than leaving a standing exemption"
+            );
+        }
+    }
+}
