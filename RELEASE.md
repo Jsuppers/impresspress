@@ -74,21 +74,27 @@ The admin and seller UIs send only caller-owned fields and are unaffected. An
 API client that round-trips a whole product record back into a `PATCH` must
 now send only the fields it is changing.
 
-### Products: deleting a product is undoable from the admin UI
+### Products: deleting a product is undoable
 
 Deleting a product is now a soft delete: the row stays, with every
 `line_items` / `offers` / `product_versions` / `entitlements` reference to it
 intact, and only `deleted_at` changes. That is the point of the change — the
 hard delete it replaces orphaned a completed order's line items.
 
-Admin → Products now has a **Deleted** tab listing those rows most-recently-
+Admin → Products has a **Deleted** tab listing those rows most-recently-
 deleted first, with **Restore** on each. A deleted product is not editable
 until it is restored.
+
+Sellers get the same thing for their own products: **My Products** has the
+same **Deleted** tab, showing only the caller's own deleted products, with
+**Restore** (`POST /b/products/api/products/{id}/restore`) and **Close Stripe
+surface** on each row. Both are scoped to the caller — another seller's
+deleted product answers 404 on every path.
 
 **Closing a deleted product's Stripe surface.** Soft delete touches nothing in
 Stripe: a deleted product's Prices and Payment Links stay live in the connected
 account and keep taking money, and deleting the product archives none of them.
-Each row in the Deleted tab therefore also carries **Close Stripe surface**,
+Each row in a Deleted tab therefore also carries **Close Stripe surface**,
 which opens a close-only manager for that product: archive its offers,
 deactivate its payment links, nothing else. Use it *before* Restore if the
 reason for the delete was that the product should stop selling — Restore puts
@@ -96,14 +102,13 @@ an active, approved product back into the public catalog immediately.
 
 **Known gaps.**
 
-- A seller cannot restore their own deleted product, and has no deleted view
-  or close-only manager of their own. The seller-tier API already permits both
-  (archiving an offer and deactivating a payment link work for a seller's own
-  deleted product); only the UI is missing. A seller has to ask an
-  administrator.
 - The close-only manager acts one offer and one link at a time. There is no
   "close everything" action, and nothing blocks Restore while a money surface
   is still open.
+- A suspended seller cannot restore a deleted product, nor archive its offers
+  or deactivate its payment links — those are all mutations a platform
+  suspension stops (suspension already archives the seller's Stripe catalog).
+  An administrator can do any of them on their behalf.
 
 ### Products: restoring a deleted product whose slug was taken
 
@@ -112,7 +117,8 @@ already holds. Repairing it would violate migration 005's partial unique slug
 index and abort the migration, which is unrecoverable in place: the hash never
 gets stamped, so every later boot retries and re-fails, and on Cloudflare that
 is a 500 on every request. A skipped row keeps its current half-state and stays
-listed in the admin *deleted products* view, where **Restore** is the remedy —
+listed in the *deleted products* view (admin, or the owning seller's My
+Products), where **Restore** is the remedy —
 it reports the slug conflict in plain language instead of failing opaquely. To
 find them:
 

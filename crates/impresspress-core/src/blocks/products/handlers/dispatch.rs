@@ -324,6 +324,7 @@ pub(crate) enum UserRoute {
     CreateProduct,
     UpdateProduct,
     DeleteProduct,
+    RestoreProduct,
     DuplicateProduct,
     ListOffers,
     GetOffer,
@@ -383,6 +384,7 @@ impl UserRoute {
                 | UserRoute::CreateProduct
                 | UserRoute::UpdateProduct
                 | UserRoute::DeleteProduct
+                | UserRoute::RestoreProduct
                 | UserRoute::DuplicateProduct
                 | UserRoute::ListOffers
                 | UserRoute::GetOffer
@@ -428,6 +430,7 @@ impl UserRoute {
             UserRoute::CreateProduct
                 | UserRoute::UpdateProduct
                 | UserRoute::DeleteProduct
+                | UserRoute::RestoreProduct
                 | UserRoute::DuplicateProduct
                 | UserRoute::CreateOffer
                 | UserRoute::UpdateOffer
@@ -480,6 +483,11 @@ pub(in crate::blocks::products) const USER_ROUTES: &[EndpointRoute<UserRoute>] =
         HttpMethod::Delete,
         "/b/products/products/{id}",
         UserRoute::DeleteProduct,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/products/products/{id}/restore",
+        UserRoute::RestoreProduct,
     ),
     EndpointRoute::new(
         HttpMethod::Post,
@@ -837,6 +845,7 @@ pub async fn handle_user(
         UserRoute::CreateProduct => product::handle_user_create_product(ctx, msg, input).await,
         UserRoute::UpdateProduct => product::handle_user_update_product(ctx, msg, input).await,
         UserRoute::DeleteProduct => product::handle_user_delete_product(ctx, msg).await,
+        UserRoute::RestoreProduct => product::handle_user_restore_product(ctx, msg).await,
         UserRoute::DuplicateProduct => product::handle_user_duplicate_product(ctx, msg).await,
         UserRoute::PreviewOffer => commerce::handle_preview(ctx, input).await,
         UserRoute::ListOffers => offers::handle_list(ctx, msg, offers::OfferAccess::Owner).await,
