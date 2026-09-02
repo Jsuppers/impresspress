@@ -102,7 +102,9 @@
 /* ===== Pagination ===== */
 .pagination { display: flex; align-items: center; gap: var(--spacing-md); padding: var(--spacing-md) 0; font-size: var(--text-sm); color: var(--text-secondary); }
 .pagination__count { margin-right: auto; }
-.pagination__prev, .pagination__next { color: var(--primary-color); text-decoration: none; }
+/* --primary-color is 3.66:1 on white -- below the 4.5:1 AA floor for this
+   text link; --primary-button (4.99:1, computed) is the text-safe sibling. */
+.pagination__prev, .pagination__next { color: var(--primary-button); text-decoration: none; }
 .pagination__prev.is-disabled, .pagination__next.is-disabled { color: var(--text-muted); pointer-events: none; }
 
 /* ── Database admin ─────────────────────────────────────── */

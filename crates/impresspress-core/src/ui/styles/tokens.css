@@ -31,6 +31,12 @@
 	--accent-success: #10b981;
 	--accent-warning: #f59e0b;
 	--accent-danger: #ef4444;
+	/* Red text on white needs 4.5:1. #ef4444 is only 3.76:1 (and only
+	   3.76:1-ish on its own pale tint backgrounds), so text uses the darker
+	   #b91c1c (6.47:1 on white, 5.70:1 on the #ef444419 tint) while #ef4444
+	   stays for non-text use -- icons, borders, chart marks -- which need
+	   only 3:1. Mirrors how --primary-button relates to --primary-color. */
+	--accent-danger-text: #b91c1c;
 	/* "Info" reads as the brand accent, not blue — success/warning/danger
 	   keep their universal hues, but informational chips/toasts/charts must
 	   sit inside the warm brand palette (the old #3b82f6 blue clashed on

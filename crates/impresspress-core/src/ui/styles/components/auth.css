@@ -11,7 +11,10 @@
 	font-size: var(--text-sm);
 }
 
-.alert--error { background: #ef444419; color: var(--accent-danger); }
+/* --accent-danger is 3.76:1 on this tint -- below the 4.5:1 AA floor;
+   --accent-danger-text (5.70:1 on this tint, computed) is the text-safe
+   sibling. */
+.alert--error { background: #ef444419; color: var(--accent-danger-text); }
 .alert--info { background: var(--accent-info-bg); color: var(--accent-info); }
 .alert--success { background: #10b98119; color: var(--accent-success); }
 

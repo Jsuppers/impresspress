@@ -6,8 +6,12 @@
 }
 
 .badge-success { background: #10b98119; color: var(--accent-success); }
-.badge-primary { background: var(--accent-info-bg); color: var(--primary-color); }
-.badge-danger { background: #ef444419; color: var(--accent-danger); }
+/* Own (lighter) tint rather than the shared --accent-info-bg: at that var's
+   9.8%-alpha strength, --primary-button on top only reaches 4.35:1 here
+   (computed) -- below the 4.5:1 AA floor. A 6% color-mix keeps the same
+   pale-pink badge look and gets --primary-button to 4.60:1 (computed). */
+.badge-primary { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
+.badge-danger { background: #ef444419; color: var(--accent-danger-text); }
 .badge-warning { background: #f59e0b19; color: var(--accent-warning); }
 .badge-info { background: var(--accent-info-bg); color: var(--accent-info); }
 .badge-secondary { background: #e2e8f0; color: #334155; }
@@ -21,8 +25,11 @@
    colours has a matching design token; carried over unchanged from the
    original inline styles (#fff1e6 already has precedent as a literal "brand
    tint" — see card.css's .message-card--user — the other four do not and are
-   flagged here). */
-.badge--tone-brand { background: #fff1e6; color: var(--primary-hover); }
+   flagged here). --primary-hover (#e02523) on #fff1e6 is only 4.26:1
+   (computed, Task 12c) -- below the 4.5:1 AA floor; --primary-button
+   (4.51:1, computed, same as .form-tabs li.is-active a in layouts/page.css)
+   is this app's established AA-safe red for text on this exact tint. */
+.badge--tone-brand { background: #fff1e6; color: var(--primary-button); }
 .badge--tone-green { background: #dcfce7; color: #166534; }
 .badge--tone-amber { background: #fef3c7; color: #92400e; }
 .badge--tone-red { background: #fce4ec; color: #c62828; }

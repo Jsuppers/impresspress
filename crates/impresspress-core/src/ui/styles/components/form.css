@@ -236,7 +236,10 @@ body:has(.products-tabs) .filter-bar { margin: 1rem 0; padding: .75rem; border: 
 .text-center { text-align: center; }
 .text-right { text-align: right; }
 .text-muted { color: var(--text-muted); }
-.text-danger { color: var(--accent-danger); }
+/* --accent-danger (#ef4444) is 3.76:1 on white -- below the 4.5:1 AA floor
+   for this normal-size error text; --accent-danger-text (6.47:1, computed)
+   is the text-safe sibling. --accent-danger itself stays for non-text use. */
+.text-danger { color: var(--accent-danger-text); }
 .text-success { color: var(--accent-success); }
 /* Strong warning text (variables admin warning notes) — #92400e has no
  * matching design token; carried over unchanged from the original inline

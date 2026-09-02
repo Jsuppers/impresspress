@@ -48,10 +48,13 @@
 }
 /* change-password's success box: same box, centered content, larger padding,
    and its own message styling (child overrides the box's font-size/color,
-   so the two don't need to agree). #16a34a has no matching design token;
-   carried over unchanged. */
+   so the two don't need to agree). #16a34a has no matching design token and
+   was only 3.13:1 on the box's #ecfdf5 background (computed, Task 12c) --
+   below the 4.5:1 AA floor. #166534 (6.77:1 on #ecfdf5, computed) replaces
+   it -- same literal already used for .badge--tone-green's text in
+   components/badge.css. */
 .login-success--centered { padding: 1rem; text-align: center; }
-.change-password-success-text { font-size: 0.875rem; color: #16a34a; margin: 0 0 1rem; font-weight: 500; }
+.change-password-success-text { font-size: 0.875rem; color: #166534; margin: 0 0 1rem; font-weight: 500; }
 
 /* ===== Auth status result page (reset-password/verify success-or-failure,
    signup's "check your email") =====
@@ -128,8 +131,11 @@
 	color: var(--text-secondary);
 }
 
+/* --primary-color is 3.66:1 on white (.login-container's background) --
+   below the 4.5:1 AA floor; --primary-button (4.99:1, computed) is the
+   text-safe sibling. */
 .signup-link a {
-	color: var(--primary-color); text-decoration: none;
+	color: var(--primary-button); text-decoration: none;
 	font-weight: 600; transition: color 0.2s;
 }
 

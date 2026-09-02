@@ -44,7 +44,11 @@
 
 .tab:hover { color: var(--text-primary); }
 
-.tab.active { color: var(--primary-color); }
+/* --primary-color is 3.66:1 on white -- below the 4.5:1 AA floor for this
+   text label; --primary-button (4.99:1, computed) is the text-safe sibling.
+   The underline bar below stays on --primary-color: it's a 2px decorative
+   rule, not text, and only needs the 3:1 non-text floor (already cleared). */
+.tab.active { color: var(--primary-button); }
 
 .tab.active::after {
 	content: ''; position: absolute;

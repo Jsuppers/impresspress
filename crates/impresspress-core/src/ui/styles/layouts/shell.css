@@ -105,7 +105,10 @@
 }
 
 .profile-menu-item:hover { background: var(--bg-hover); }
-.profile-menu-item-danger { color: var(--accent-danger); }
+/* `.profile-menu` is a white floating dropdown card (see comment above) --
+   --accent-danger is 3.76:1 there, below AA; --accent-danger-text
+   (6.47:1 on white, computed) is the text-safe sibling. */
+.profile-menu-item-danger { color: var(--accent-danger-text); }
 .profile-menu-item-danger:hover { background: rgba(239, 68, 68, 0.1); }
 
 /* ===== Sidebar groups (Phase 1) ===== */
@@ -249,7 +252,10 @@ body:has(.products-tabs) .shell__body { padding: 1.1rem 1.4rem; }
 .topbar__subtitle { color: var(--text-secondary); font-size: 14px; }
 .topbar__crumbs li + li::before { content: "›"; padding: 0 0.3rem; color: var(--text-muted); }
 .topbar__crumbs a { color: var(--text-secondary); text-decoration: none; }
-.topbar__crumbs a:hover { color: var(--primary-color); text-decoration: underline; }
+/* --primary-color is 3.66:1 on white (.topbar's background) -- below the
+   4.5:1 AA floor for this 16px hover-state link text; --primary-button
+   (4.99:1, computed) is the text-safe sibling. */
+.topbar__crumbs a:hover { color: var(--primary-button); text-decoration: underline; }
 /* Current page — an `h1` rendered AFTER the breadcrumb nav. Font copies what
    the last crumb used to get (16px from the ol rule, normal weight,
    text-primary from the old [aria-current="page"] rule) so the visual output

@@ -628,6 +628,104 @@ mod tests {
         );
     }
 
+    /// Selectors where `color: var(--primary-color)` or `color:
+    /// var(--accent-danger)` is legitimate non-text use -- the value only
+    /// sets `currentColor` for a child SVG icon, or colors a Unicode glyph
+    /// whose accessible name is overridden by `aria-label` (so no assistive
+    /// tech ever reads the glyph as text). WCAG's 3:1 non-text floor applies
+    /// there, not the 4.5:1 text floor, and #fd3534 (3.66:1 on white) already
+    /// clears 3:1 -- darkening these would flatten the palette for no
+    /// accessibility gain. Each entry is commented with why it's exempt.
+    const NON_TEXT_ACCENT_COLOR_SELECTORS: &[&str] = &[
+        // `.db-table-group__icon` wraps `icons::package()`/`icons::database()`
+        // (database.rs) -- an SVG icon, not text; `color` only feeds the
+        // SVG's `currentColor`.
+        ".db-table-group__icon",
+        // `.public-page__back` renders a literal "\u{2190}" (templates.rs)
+        // but carries `aria-label="Go back"` / `title="Go back"`, so its
+        // accessible name is the label, not the glyph -- functionally an
+        // icon button, not readable text. Genuinely ambiguous; flagged in
+        // the Task 15 report rather than silently assumed. `css_leaf_blocks`
+        // keeps a comma-grouped selector as one joined string (source
+        // newline included), hence the exact text below rather than two
+        // entries.
+        ".public-page__back:hover,\n.public-page__back:focus-visible",
+    ];
+
+    // Companion to `no_new_white_text_on_primary_color_background` above,
+    // added in Task 15 to close a directional blind spot: contrast is
+    // symmetric, so `--primary-color` (3.66:1 on white) and `--accent-danger`
+    // (3.76:1 on white/pale tints) fail AA as TEXT on a light background just
+    // as surely as they fail as a background under white text -- but the
+    // guard above only ever looked at one direction (background-with-white,
+    // in the SAME rule). This scans the other direction: a rule that sets
+    // `color` to one of these two tokens without also setting a dark
+    // `background`/`background-color` in the same rule.
+    //
+    // What this covers: every leaf rule in the assembled bundle (including
+    // inside `@media`) whose `color:` declaration names `var(--primary-color)`
+    // or `var(--accent-danger)` -- literally, e.g. as a fallback in
+    // `var(--public-page-accent, var(--primary-color))` too -- and that has
+    // no `background`/`background-color` declaration naming a dark surface
+    // (the navy tokens, `black`, or `#000`) in the same rule.
+    //
+    // What this is blind to: the same set of gaps the companion guard
+    // documents (cross-rule cascades, inline styles/JS, near-dark values not
+    // literally spelled out here) -- plus, structurally, it cannot tell text
+    // from a currentColor-only icon fill or an aria-labelled glyph, which is
+    // why `NON_TEXT_ACCENT_COLOR_SELECTORS` exists as an explicit,
+    // commented-per-entry exemption rather than a silent pass. It also can't
+    // see a *different* token carrying the same failing value (e.g.
+    // `--accent-info: #fd3534`, `--primary-hover: #e02523` on some
+    // backgrounds) -- those are real but out of this guard's literal scope
+    // and are called out in the Task 15 report instead of guessed at here.
+    #[test]
+    fn no_light_background_text_using_primary_color_or_accent_danger() {
+        let s = super::css();
+        // A background is treated as "dark" only when it names one of these
+        // literal dark surfaces -- the navy scale (and its `--bg-sidebar`
+        // alias) or black. No current rule needs this carve-out (nothing in
+        // the bundle pairs `color: var(--primary-color)` with a dark
+        // background in the same rule today), but the assertion is written
+        // to allow one rather than to assume it can never happen.
+        const DARK_BG_MARKERS: &[&str] = &[
+            "var(--navy-900)",
+            "var(--navy-800)",
+            "var(--navy-700)",
+            "var(--bg-sidebar)",
+            "#000",
+            "black",
+        ];
+        let offenders: Vec<String> = css_leaf_blocks(s)
+            .into_iter()
+            .filter(|(selector, body)| {
+                if NON_TEXT_ACCENT_COLOR_SELECTORS.contains(&selector.as_str()) {
+                    return false;
+                }
+                let has_unsafe_text_color = body.split(';').any(|d| {
+                    let d = d.trim();
+                    d.starts_with("color:")
+                        && (d.contains("var(--primary-color)") || d.contains("var(--accent-danger)"))
+                });
+                if !has_unsafe_text_color {
+                    return false;
+                }
+                let has_dark_bg = body.split(';').any(|d| {
+                    let d = d.trim();
+                    (d.starts_with("background:") || d.starts_with("background-color:"))
+                        && DARK_BG_MARKERS.iter().any(|m| d.contains(m))
+                });
+                !has_dark_bg
+            })
+            .map(|(selector, _)| selector)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "text colored with --primary-color/--accent-danger on a light background (route to \
+             --primary-button / --accent-danger-text instead): {offenders:?}"
+        );
+    }
+
     #[test]
     fn palette_js_present_and_self_invoking() {
         let js = super::palette_js();
