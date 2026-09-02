@@ -687,6 +687,14 @@
 .ticket-form-grid--type-create { margin: 1rem 0; max-width: 50rem; }
 .ticket-form-grid--type-edit { margin-top: 1rem; }
 
+/* ===== Vector backend-unavailable callout (blocks/vector/pages_ui.rs) =====
+   The callout box itself (`.callout .callout--warning`) keeps its existing
+   inline `style="...--spacing-md...--radius-md..."` -- it mixes design
+   tokens with two untokenized literal colours (#fff8e1/#92400e) and is
+   already guard-exempt (the style carries `--` custom properties). Only the
+   child inline styles below needed a class. */
+.callout__code { font-size: 12px; padding: 1px 4px; background: rgba(0,0,0,0.05); border-radius: 3px; }
+
 /* ===== Portal buttons admin (blocks/userportal/pages/admin_buttons.rs) ===== */
 .admin-buttons-form-grid { grid-template-columns: 1fr 1fr 1fr auto auto; }
 

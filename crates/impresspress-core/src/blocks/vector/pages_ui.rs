@@ -185,11 +185,11 @@ pub async fn index_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             @if !backend_available {
                 div .callout .callout--warning style="margin-bottom: var(--spacing-md); padding: var(--spacing-md); background: #fff8e1; border: 1px solid #f0d78c; border-radius: var(--radius-md); color: #92400e" {
                     strong { "Vector backend not available" }
-                    p style="margin: 4px 0 0; font-size: 13px" {
+                    p .mt-1 .text-13 {
                         "The "
-                        code style="font-size: 12px; padding: 1px 4px; background: rgba(0,0,0,0.05); border-radius: 3px" { "wafer-run/vector" }
+                        code .callout__code { "wafer-run/vector" }
                         " block isn't registered in this build, so indexes can't be created or queried here. Use the browser-WASM build (with "
-                        code style="font-size: 12px; padding: 1px 4px; background: rgba(0,0,0,0.05); border-radius: 3px" { "impresspress-web" }
+                        code .callout__code { "impresspress-web" }
                         ") or wire a vector service via your runtime config."
                     }
                 }
