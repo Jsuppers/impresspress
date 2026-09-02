@@ -168,6 +168,17 @@ async fn each_order_tier_publishes_only_its_own_fields() {
 
     let (msg, _input) = get_msg("/b/products/purchases/pur_tiers", "user_1");
     let detail = output_to_json(purchase::handle_get(&ctx, &msg).await).await;
+    // Pin the parent before asserting what is missing from it. `Value::Null`
+    // answers `None` to every `get`, so an absence loop over a `purchase` key
+    // that had stopped existing — because the response was renamed, flattened
+    // or replaced by an error envelope — would pass while checking nothing.
+    // The list assertions above are self-pinning (they assert presence too);
+    // this one is not, so it says so explicitly.
+    assert!(
+        detail["purchase"].is_object(),
+        "buyer order detail must carry a `purchase` object, or the loop below \
+         asserts nothing: {detail}"
+    );
     for field in PLATFORM_ONLY {
         assert!(
             detail["purchase"].get(field).is_none(),
