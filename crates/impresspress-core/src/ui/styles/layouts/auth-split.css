@@ -46,6 +46,12 @@
 	background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px;
 	padding: 0.75rem; margin-bottom: 1rem; font-size: 0.813rem; color: #059669;
 }
+/* change-password's success box: same box, centered content, larger padding,
+   and its own message styling (child overrides the box's font-size/color,
+   so the two don't need to agree). #16a34a has no matching design token;
+   carried over unchanged. */
+.login-success--centered { padding: 1rem; text-align: center; }
+.change-password-success-text { font-size: 0.875rem; color: #16a34a; margin: 0 0 1rem; font-weight: 500; }
 
 /* ===== Auth status result page (reset-password/verify success-or-failure,
    signup's "check your email") =====
