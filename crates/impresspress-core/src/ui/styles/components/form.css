@@ -153,8 +153,13 @@
 .text-success { color: var(--accent-success); }
 .text-sm { font-size: 0.875rem; }
 .text-xs { font-size: 0.75rem; }
+.text-lg { font-size: var(--text-lg); }
 .font-medium { font-weight: 500; }
 .font-semibold { font-weight: 600; }
+.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.text-capitalize { text-transform: capitalize; }
+.nowrap { white-space: nowrap; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Margin/gap scale follows the same 0.25rem step as the existing mt-1/mt-2/
  * mt-4 and gap-2/gap-4 utilities below (n * 0.25rem). */
 .m-0 { margin: 0; }
@@ -165,32 +170,63 @@
 .mt-4 { margin-top: 1rem; }
 .mt-5 { margin-top: 1.25rem; }
 .mt-6 { margin-top: 1.5rem; }
+.mt-8 { margin-top: 2rem; }
 .mb-1 { margin-bottom: 0.25rem; }
 .mb-2 { margin-bottom: 0.5rem; }
 .mb-3 { margin-bottom: 0.75rem; }
 .mb-4 { margin-bottom: 1rem; }
+.mb-5 { margin-bottom: 1.25rem; }
+.mb-6 { margin-bottom: 1.5rem; }
+.mb-8 { margin-bottom: 2rem; }
 .my-1 { margin: 0.25rem 0; }
 .my-3 { margin: 0.75rem 0; }
+.ml-auto { margin-left: auto; }
+.mr-2 { margin-right: 0.5rem; }
+/* Padding scale, same 0.25rem step as the margin scale above. */
+.p-0 { padding: 0; }
+.p-2 { padding: 0.5rem; }
+.p-3 { padding: 0.75rem; }
+.p-4 { padding: 1rem; }
+.p-5 { padding: 1.25rem; }
+.p-6 { padding: 1.5rem; }
+.p-8 { padding: 2rem; }
 /* A muted description paragraph directly under a heading — the products
  * admin pages' most common inline style before this pass (15 sites). */
 .text-subtitle { margin: 0.25rem 0 0; }
 .flex { display: flex; }
+.flex-col { flex-direction: column; }
 .flex-1 { flex: 1; }
 .flex-wrap { flex-wrap: wrap; }
 .items-center { align-items: center; }
 .items-start { align-items: flex-start; }
 .items-end { align-items: flex-end; }
 .justify-between { justify-content: space-between; }
+.justify-start { justify-content: flex-start; }
+.justify-end { justify-content: flex-end; }
+.gap-1 { gap: 0.25rem; }
 .gap-2 { gap: 0.5rem; }
 .gap-3 { gap: 0.75rem; }
 .gap-4 { gap: 1rem; }
 .hidden { display: none; }
 .d-block { display: block; }
+.relative { position: relative; }
 .min-h-10 { min-height: 2.5rem; }
 .col-span-full { grid-column: 1 / -1; }
 .form-group--narrow { max-width: 620px; }
 .fieldset-reset { border: 0; padding: 0; margin: 0; }
 .list-compact { margin: 0.5rem 0; padding-left: 1.25rem; }
+.w-auto { width: auto; }
+.w-full { width: 100%; }
+/* Fixed narrow table column (e.g. a "Method"/"Auth" header cell). */
+.w-80 { width: 80px; }
+.h-fit { height: fit-content; }
+.resize-vertical { resize: vertical; }
+.resize-none { resize: none; }
+.overflow-y-auto { overflow-y: auto; }
+.cursor-pointer { cursor: pointer; }
+/* Read-only display field (e.g. env-var-backed settings the admin can't
+ * edit inline) — visually distinct from an editable .form-input. */
+.form-input--readonly { background: var(--bg-secondary); }
 
 /* Compound override: `details.products-advanced` (a page-local component
  * class defined in `blocks/products/pages.rs`'s own `<style>` block, which

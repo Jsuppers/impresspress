@@ -596,3 +596,74 @@
 	height: 18px;
 }
 
+/* ===== Message card (Messages block entry_card) =====
+   Three accent variants keyed off entry kind/role — neutral (default/
+   artifact/status/agent), warning (notification/system), and the brand
+   "user" tint. #fefce8/#eab308 (warning) and #fff1e6 (user) have no
+   matching design token: #fff1e6 is an already-established literal value
+   elsewhere in the codebase (`.form-tabs li.is-active a`, styles/layouts/
+   page.css) for the same "active brand tint" concept, reused verbatim
+   here rather than invented; #fefce8/#eab308 have no precedent elsewhere
+   and are carried over unchanged from the original inline styles — see
+   task-12b report. */
+.message-card--neutral { margin-bottom: 0.75rem; background: var(--surface-3); border-left: 3px solid var(--border-color); }
+.message-card--warning { margin-bottom: 0.75rem; background: #fefce8; border-left: 3px solid #eab308; }
+.message-card--user { margin-bottom: 0.75rem; background: #fff1e6; border-left: 3px solid var(--primary-color); }
+.message-card__content { margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+/* ===== Thread/conversation list pane =====
+   Shared by blocks/llm/pages.rs (chat thread list) and blocks/messages/
+   pages.rs (conversation list) — identical left-rail pane shape in the
+   chat_page template's thread-list slot. */
+.thread-pane { display: flex; flex-direction: column; gap: 0.75rem; height: 100%; }
+.thread-pane__head { display: flex; align-items: center; justify-content: space-between; }
+.thread-pane__title {
+	margin: 0; font-size: var(--text-sm); font-weight: 600; color: var(--text-muted);
+	text-transform: uppercase; letter-spacing: 0.05em;
+}
+.thread-pane__scroll { overflow-y: auto; flex: 1; }
+.thread-pane__empty { padding: 1rem; font-size: var(--text-sm); }
+.thread-card {
+	display: block; text-decoration: none; color: inherit;
+	margin-bottom: 0.375rem; padding: 0.625rem 0.75rem;
+	transition: box-shadow 0.15s;
+}
+.thread-card__row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.thread-card__title {
+	font-weight: 500; font-size: var(--text-sm);
+	overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
+.thread-card__date { font-size: var(--text-xs); flex-shrink: 0; }
+
+/* ===== Chat composer (llm chat_page composer pane) =====
+   Toggled instead of the old `style=(if enabled {""} else
+   {"opacity:0.4;pointer-events:none"}))` inline conditional — see
+   `blocks/admin/pages/blocks.rs`'s `.block-card--disabled` for the same
+   `class={ "x" @if cond { " x--disabled" } }` pattern this follows. */
+.chat-form--disabled { opacity: 0.4; pointer-events: none; }
+
+/* ===== Chat empty state (no thread selected) ===== */
+.chat-empty-state { text-align: center; padding: 3rem 1rem; }
+.chat-empty-state__icon { font-size: 2.5rem; margin-bottom: 0.75rem; }
+
+/* ===== Model load progress (llm chat right rail) =====
+   `.model-progress-fill`'s width starts at 0% and is updated at runtime by
+   `bar.style.width = pct + '%'` in ui/assets/llm-chat.js — a
+   template-interpolated JS assignment, not a literal one, so it stays (see
+   task-12b report / task-12e scope note). */
+.model-progress-track { background: var(--bg-secondary); border-radius: 0.25rem; height: 6px; overflow: hidden; }
+.model-progress-fill { height: 100%; background: var(--primary-color); width: 0%; transition: width 0.3s; }
+
+/* ===== LLM providers table (blocks/llm/ui.rs) =====
+   Long endpoint/model-list cells truncate instead of wrapping and blowing
+   out the table width. */
+.llm-cell--endpoint { max-width: 260px; }
+.llm-cell--models { max-width: 280px; }
+
+/* ===== Messages block: task/notification single-pane entries list ===== */
+.entries-list--scroll { max-height: 60vh; overflow-y: auto; }
+
+/* ===== Legal pages editor status bar (blocks/legalpages/pages.rs) ===== */
+.editor-status__title { font-size: 1.25rem; font-weight: 600; margin: 0; }
+.editor-status__version { background: var(--bg-hover); color: var(--text-muted); }
+
