@@ -690,3 +690,15 @@
 /* ===== Portal buttons admin (blocks/userportal/pages/admin_buttons.rs) ===== */
 .admin-buttons-form-grid { grid-template-columns: 1fr 1fr 1fr auto auto; }
 
+/* ===== Variables admin warnings (blocks/admin/pages/variables.rs) =====
+ * #92400e / #fef3c7 have no matching design token; carried over unchanged
+ * from the original inline styles. The banner's border does match
+ * --accent-warning (#f59e0b) and uses the token. */
+.var-warning-note { color: #92400e; font-size: 11px; margin-top: 2px; }
+.var-warning-banner {
+	background: #fef3c7; border: 1px solid var(--accent-warning);
+	border-radius: 8px; padding: 0.75rem; margin-bottom: 1rem;
+	font-size: 0.813rem; color: #92400e;
+	display: flex; align-items: center; gap: 0.5rem;
+}
+

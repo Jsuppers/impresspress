@@ -112,6 +112,16 @@
 	transform: translateY(-50%); color: #6b7280; pointer-events: none;
 }
 
+/* Right-side icon variant (e.g. the reveal/hide button on a sensitive
+ * variable's value field) — mirrors the left-icon rules above but on the
+ * opposite edge, and the button stays clickable (`.input-icon` above is
+ * `pointer-events: none`, which a reveal button can't be). */
+.form-input-wrapper--icon-right .form-input { padding-right: 3rem; }
+.form-input-wrapper--icon-right .btn-icon-right {
+	position: absolute; right: 0.25rem; top: 50%;
+	transform: translateY(-50%);
+}
+
 .form-hint {
 	display: block; margin-top: 0.375rem;
 	font-size: 0.75rem; color: #6b7280;
@@ -151,6 +161,10 @@
 .text-muted { color: var(--text-muted); }
 .text-danger { color: var(--accent-danger); }
 .text-success { color: var(--accent-success); }
+/* Strong warning text (variables admin warning notes) — #92400e has no
+ * matching design token; carried over unchanged from the original inline
+ * styles. */
+.text-warning-strong { color: #92400e; }
 .text-sm { font-size: 0.875rem; }
 .text-xs { font-size: 0.75rem; }
 .text-lg { font-size: var(--text-lg); }
@@ -229,6 +243,7 @@
 .w-auto { width: auto; }
 .w-full { width: 100%; }
 /* Fixed narrow table column (e.g. a "Method"/"Auth" header cell). */
+.w-50 { width: 50px; }
 .w-60 { width: 60px; }
 .w-70 { width: 70px; }
 .w-80 { width: 80px; }
