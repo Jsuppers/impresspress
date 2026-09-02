@@ -157,8 +157,14 @@ jobs:
           path: crates/impresspress-web/pkg
 
       # impresspress-cloudflare is wasm-only (cdylib targeting CF Workers).
+      # `--all-targets` so `#[cfg(test)]` code (e.g. static_asset_target_tests,
+      # including the path-traversal guard on asset serving) is at least
+      # compiled -- plain `cargo check` skips test code entirely, so without
+      # this a test-only compile error would go undetected here. Actually
+      # *executing* wasm32 tests needs a wasm-bindgen-test-runner in CI,
+      # which this does not attempt -- follow-up.
       - name: Check impresspress-cloudflare (wasm32)
-        run: cargo check --locked -p impresspress-cloudflare --target wasm32-unknown-unknown
+        run: cargo check --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --all-targets
 
       # Compile-time DatabaseService conformance assertions (wafer-run #319
       # shared suite) for the D1 + KV-cached adapters. Off-by-default feature so

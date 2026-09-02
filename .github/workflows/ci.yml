@@ -183,9 +183,15 @@ jobs:
       # impresspress-cloudflare is wasm-only (cdylib targeting CF Workers).
       # Excluded from host `cargo test`/`clippy` because its R2/D1 services
       # wrap `!Send` JsFutures that violate wafer-core's Send-bound traits
-      # on host. Verify the crate compiles for wasm32 here.
+      # on host. Verify the crate compiles for wasm32 here. `--all-targets`
+      # so `#[cfg(test)]` code (e.g. static_asset_target_tests, including
+      # the path-traversal guard on asset serving) is at least compiled --
+      # plain `cargo check` skips test code entirely, so without this a
+      # test-only compile error would go undetected here. Actually
+      # *executing* wasm32 tests needs a wasm-bindgen-test-runner in CI,
+      # which this does not attempt -- follow-up.
       - name: Check impresspress-cloudflare (wasm32)
-        run: cargo check --locked -p impresspress-cloudflare --target wasm32-unknown-unknown
+        run: cargo check --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --all-targets
 
       # Compile-time DatabaseService conformance assertions (wafer-run #319
       # shared suite) for the D1 + KV-cached adapters. Off-by-default feature so
