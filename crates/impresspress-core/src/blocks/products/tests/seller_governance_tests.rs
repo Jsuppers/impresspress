@@ -311,6 +311,61 @@ async fn suspended_seller_cannot_issue_refunds() {
     );
 }
 
+/// Restoring a product returns an active, approved listing to the public
+/// catalog — a mutation, and exactly the kind a platform suspension exists to
+/// stop. It is the mirror of the delete the same seller could not issue while
+/// suspended, so it belongs on `requires_unsuspended_seller` alongside it;
+/// leaving it off would have let a suspended seller relist while every other
+/// door was shut.
+///
+/// An administrator can still restore on their behalf through
+/// `/b/products/api/admin/products/{id}/restore`, which is not seller-gated.
+#[tokio::test]
+async fn suspended_seller_cannot_restore_their_own_deleted_product() {
+    let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
+    seed_seller(&test_ctx, "seller_restore_gate", "maker_restore_gate", true).await;
+    let product_id = create_seller_product(&test_ctx, "maker_restore_gate", "Gated print").await;
+
+    let (msg, input) = create_msg(
+        &format!("/b/products/products/{product_id}/restore"),
+        "maker_restore_gate",
+        json!({}),
+    );
+    // Positive control BEFORE the suspension, so the refusal below is about
+    // the suspension and not about the route, the id, or ownership. The
+    // product is live, so this is the "not deleted" 404, not a permission
+    // error — a different code from the one asserted after suspension.
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::NotFound,
+        )
+        .await,
+        "an unsuspended owner must get past the suspension gate"
+    );
+
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/sellers/seller_restore_gate/suspend",
+        json!({}),
+    );
+    let suspended = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    assert_eq!(suspended["status"], "suspended");
+
+    let (msg, input) = create_msg(
+        &format!("/b/products/products/{product_id}/restore"),
+        "maker_restore_gate",
+        json!({}),
+    );
+    assert!(
+        output_is_error(
+            dispatch_user(&test_ctx, msg, input).await,
+            ErrorCode::PermissionDenied,
+        )
+        .await,
+        "a suspended seller must not restore a product back into the catalog"
+    );
+}
+
 #[tokio::test]
 async fn admin_seller_api_and_pages_expose_owned_products_and_safe_capability_state() {
     let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;

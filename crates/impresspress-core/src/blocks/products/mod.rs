@@ -509,6 +509,17 @@ crate::impresspress_feature_block! {
                 BlockEndpoint::get("/b/products/my-products/{id}")
                     .summary("Manage own product")
                     .auth(AuthLevel::Authenticated),
+                // `{id}` matches exactly one segment and `match_template`
+                // rejects a path with segments left over, so the declaration
+                // above does NOT cover `.../{id}/close`. Undeclared it would
+                // fall to `declared_access`'s `Authenticated` fallback, which
+                // happens to be the right tier — but the page's whole job is
+                // acting on a soft-deleted product, so which tier it answers
+                // at is stated here rather than inherited.
+                BlockEndpoint::get("/b/products/my-products/{id}/close")
+                    .summary("Close own deleted product's Stripe surface")
+                    .description("Archive the offers and deactivate the payment links of a product the caller owns and has deleted, without restoring it to the catalog.")
+                    .auth(AuthLevel::Authenticated),
                 BlockEndpoint::get("/b/products/my-purchases")
                     .summary("View own purchases")
                     .auth(AuthLevel::Authenticated),
@@ -897,6 +908,19 @@ crate::impresspress_feature_block! {
                     .auth(AuthLevel::Authenticated)
                     .path_params_schema(id_path_schema.clone())
                     .output::<crud::Deleted>()
+                    .tags(&["products", "seller"]),
+                BlockEndpoint::post("/b/products/api/products/{id}/restore")
+                    .summary("Restore own soft-deleted product")
+                    .description("Clears `deleted_at` on a product the caller owns, undoing their own delete. The admin route is `/b/products/api/admin/products/{id}/restore`; this one is scoped to the caller's own products and answers 404 for anyone else's.")
+                    .auth(AuthLevel::Authenticated)
+                    .path_params_schema(id_path_schema.clone())
+                    // Same typed view as the admin restore, because both
+                    // routes are the same write: `handle_user_restore_product`
+                    // and `handle_restore_product` share one `restore_product`
+                    // body, and it answers `ProductView::from_record`. The
+                    // `record_schema`/`product_schema` envelope this arrived
+                    // with described the untyped path and went away with it.
+                    .output::<contracts::ProductView>()
                     .tags(&["products", "seller"]),
                 BlockEndpoint::post("/b/products/api/products/{id}/duplicate")
                     .summary("Duplicate own product and editable offers")
@@ -1316,6 +1340,7 @@ crate::impresspress_feature_block! {
                                         ctx,
                                         &msg,
                                         &util::url_path_decode(product_id),
+                                        true,
                                     )
                                     .await;
                                 }
@@ -1381,12 +1406,27 @@ crate::impresspress_feature_block! {
                     if !handlers::user_products_enabled(ctx).await {
                         return err_forbidden("User product selling is disabled");
                     }
-                    let product_id = sub.strip_prefix("/my-products/").unwrap_or_default();
-                    if !product_id.is_empty() && !product_id.contains('/') {
+                    let rest = sub.strip_prefix("/my-products/").unwrap_or_default();
+                    // `/{id}/close` first, mirroring the admin branch above:
+                    // the plain manager below rejects any remainder holding a
+                    // `/`, so an ordering slip here is a 404 rather than a
+                    // mis-dispatch.
+                    if let Some(product_id) = rest.strip_suffix("/close") {
+                        if !product_id.is_empty() && !product_id.contains('/') {
+                            return pages::deleted_product_close(
+                                ctx,
+                                &msg,
+                                &util::url_path_decode(product_id),
+                                false,
+                            )
+                            .await;
+                        }
+                    }
+                    if !rest.is_empty() && !rest.contains('/') {
                         return pages::product_manager(
                             ctx,
                             &msg,
-                            &util::url_path_decode(product_id),
+                            &util::url_path_decode(rest),
                             false,
                         )
                         .await;
