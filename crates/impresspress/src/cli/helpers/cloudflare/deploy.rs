@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "embed-assets")]
 use impresspress_core::ui::assets as ui_assets;
 use serde::{Deserialize, Serialize};
 
@@ -724,6 +725,7 @@ pub struct R2ReleaseUploadReport {
 }
 
 /// Report for [`r2_upload_ui_assets`].
+#[cfg(feature = "embed-assets")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UiAssetUploadReport {
     pub uploaded: usize,
@@ -740,11 +742,20 @@ pub struct UiAssetUploadReport {
 /// reads back to resolve `/b/static/{filename}` on a lean (no `embed-assets`)
 /// worker once `IMPRESSPRESS_ASSET_BASE_URL` points at `/b/static/` (see
 /// [`super::assets::resolve_asset_base_url`]).
+///
+/// Gated on `embed-assets`: publishing the CLI's UI asset bytes requires the
+/// CLI itself to have those bytes compiled in. This is independent of the
+/// *worker* build, which is intentionally built lean (without
+/// `embed-assets`) and instead reads these objects back from R2 at runtime.
+/// See the call site in `cli::flows::embed_cloudflare::deploy` for what
+/// happens when the CLI is built without this feature.
+#[cfg(feature = "embed-assets")]
 pub fn r2_upload_ui_assets(bucket: &str) -> Result<UiAssetUploadReport> {
     let mut client = WranglerR2Client { bucket };
     r2_upload_ui_assets_with_client(&mut client, OBJECT_RETRY_SECS)
 }
 
+#[cfg(feature = "embed-assets")]
 fn r2_upload_ui_assets_with_client<C: R2ObjectClient>(
     client: &mut C,
     retry_delays: &[u64],
@@ -1135,15 +1146,18 @@ mod tests {
         task::JoinSet,
     };
 
+    #[cfg(feature = "embed-assets")]
+    use super::r2_upload_ui_assets_with_client;
     use super::{
         artifact_sha256, free_plan_ten_ms_compatible_config, parse_labeled_line,
-        r2_upload_release_with_client, r2_upload_ui_assets_with_client, resolve_secret,
-        smoke_authenticated_concurrency, upload_deployment_record_with_client,
-        verify_artifact_sha256, DeploymentReleaseRecord, R2ObjectClient,
-        CONCURRENT_SMOKE_MAX_IN_FLIGHT, CONCURRENT_SMOKE_TOTAL_REQUESTS, FREE_PLAN_CPU_LIMIT_ERROR,
-        FREE_PLAN_CPU_LIMIT_ERROR_CODE,
+        r2_upload_release_with_client, resolve_secret, smoke_authenticated_concurrency,
+        upload_deployment_record_with_client, verify_artifact_sha256, DeploymentReleaseRecord,
+        R2ObjectClient, CONCURRENT_SMOKE_MAX_IN_FLIGHT, CONCURRENT_SMOKE_TOTAL_REQUESTS,
+        FREE_PLAN_CPU_LIMIT_ERROR, FREE_PLAN_CPU_LIMIT_ERROR_CODE,
     };
-    use crate::cli::helpers::cloudflare::assets::{ui_asset_entries, ReleaseManifest};
+    #[cfg(feature = "embed-assets")]
+    use crate::cli::helpers::cloudflare::assets::ui_asset_entries;
+    use crate::cli::helpers::cloudflare::assets::ReleaseManifest;
 
     fn configured_smoke_paths() -> Vec<String> {
         [
@@ -1506,6 +1520,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn ui_asset_upload_publishes_every_entry_at_its_plain_hashed_filename() {
         let mut r2 = MemoryR2::default();

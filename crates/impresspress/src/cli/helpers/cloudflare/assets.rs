@@ -64,6 +64,14 @@ pub fn resolve_asset_base_url(has_r2: bool) -> String {
 /// published set here is always the CLI's, not the worker's, so a mismatch
 /// between the two independent builds can still under- or over-publish.
 /// Left as follow-up; not attempted here.
+///
+/// Gated on `embed-assets` because it calls [`ui_assets::bytes`], which is
+/// itself gated: a CLI built without `embed-assets` has no asset bytes
+/// compiled in at all, so there is nothing here to enumerate. Callers that
+/// need to publish UI assets to R2 (see `r2_upload_ui_assets` and its call
+/// site in `embed_cloudflare::deploy`) branch on the same feature and fail
+/// loudly instead of silently publishing nothing.
+#[cfg(feature = "embed-assets")]
 pub fn ui_asset_entries() -> Vec<ReleaseAssetEntry> {
     let mut skipped: Vec<&str> = Vec::new();
     let entries = ui_assets::ASSETS

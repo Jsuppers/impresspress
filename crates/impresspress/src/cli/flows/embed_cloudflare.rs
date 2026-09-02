@@ -306,10 +306,28 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     // (`static_asset_target` / `serve_static_asset_from_r2`), not by the
     // (compiled-out) embedded byte path.
     if !cfg.r2.bucket_name.is_empty() {
-        let ui_asset_upload = cf_deploy::r2_upload_ui_assets(&cfg.r2.bucket_name)?;
-        println!(
-            "-> published {} UI asset object(s) to R2",
-            ui_asset_upload.uploaded
+        #[cfg(feature = "embed-assets")]
+        {
+            let ui_asset_upload = cf_deploy::r2_upload_ui_assets(&cfg.r2.bucket_name)?;
+            println!(
+                "-> published {} UI asset object(s) to R2",
+                ui_asset_upload.uploaded
+            );
+        }
+        // An R2 bucket is configured, so the deployed worker expects to read
+        // its UI assets (CSS/JS/fonts/logos) back from R2 at
+        // `/b/static/{filename}`. Without `embed-assets`, this CLI binary
+        // has no asset bytes compiled in to publish there — proceeding would
+        // silently leave the bucket empty and every `/b/static/` request on
+        // the live site 404ing. Fail the deploy loudly instead, before any
+        // candidate is promoted, rather than let this ship broken.
+        #[cfg(not(feature = "embed-assets"))]
+        bail!(
+            "cloudflare.r2.bucket_name is configured, but this `impresspress` CLI binary was \
+             built without the `embed-assets` feature, so it has no UI asset bytes to publish \
+             to R2. Rebuild the CLI with default features (or explicitly with \
+             `--features embed-assets`) before running `deploy cloudflare` against an \
+             R2-backed target."
         );
     }
 

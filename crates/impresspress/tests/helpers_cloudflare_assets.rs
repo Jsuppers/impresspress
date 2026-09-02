@@ -1,7 +1,9 @@
 use std::{fs, path::Path};
 
+#[cfg(feature = "embed-assets")]
+use impresspress::cli::helpers::cloudflare::assets::ui_asset_entries;
 use impresspress::cli::helpers::cloudflare::assets::{
-    mime_for_path, resolve_asset_base_url, stage, ui_asset_entries,
+    mime_for_path, resolve_asset_base_url, stage,
 };
 use tempfile::tempdir;
 
@@ -76,6 +78,7 @@ fn asset_base_url_falls_back_to_versioned_cdn_without_r2() {
     assert!(b.ends_with('/'));
 }
 
+#[cfg(feature = "embed-assets")]
 #[test]
 fn ui_asset_entries_carry_hashed_keys_and_content_types() {
     let entries = ui_asset_entries();
