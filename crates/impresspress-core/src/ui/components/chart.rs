@@ -24,7 +24,7 @@ pub fn bar_chart_card(
             header .card__head {
                 div {
                     h3 .card__title { (title) }
-                    p style="margin:0;font-size:var(--text-xs);color:var(--text-muted)" { (subtitle) }
+                    p .card__subtitle { (subtitle) }
                 }
                 a .btn .btn-ghost .btn-sm .card__actions href=(view_href) { "View" }
             }

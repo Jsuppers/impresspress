@@ -716,18 +716,53 @@ mod tests {
             {
                 let src = std::fs::read_to_string(entry.path()).unwrap();
                 for (n, line) in src.lines().enumerate() {
-                    // A `style=` carrying `--` is a runtime value handed to CSS as
-                    // a custom property (--size, --chart-color). That is the
-                    // correct mechanism and is deliberately allowed.
-                    //
                     // `blocks/email.rs` is exempt entirely: it builds HTML email
                     // bodies, and email clients strip `<style>` blocks and do not
                     // load external stylesheets, so inline styles are the only
                     // mechanism that works there. This is the same reason
                     // `assets::BRAND_ACCENT_HEX` exists. Removing them would break
                     // email rendering, not improve it.
-                    if line.contains("style=") && !line.contains("--") {
-                        offenders.push(format!("{}:{}", entry.path().display(), n + 1));
+
+                    // `style=(…)`/`style={…}` -- a Rust expression spliced into
+                    // the attribute (maud's dynamic-attribute syntax) -- hands a
+                    // runtime value to CSS, most often as a custom property
+                    // (--size, --chart-color). That is the correct, deliberately
+                    // allowed mechanism; skip it outright rather than trying to
+                    // parse Rust expressions as CSS.
+                    if line.contains("style=(") || line.contains("style={") {
+                        continue;
+                    }
+                    // A *static* `style="…"` attribute is scanned per
+                    // declaration, not as a whole line: a declaration is exempt
+                    // only when it assigns a custom property itself
+                    // (`--foo: …`), not merely because some *other* declaration
+                    // on the same line/attribute happens to reference one via
+                    // `var(--foo)`. `var(--foo)` as a *value* is exactly as
+                    // static/hardcoded as any other literal -- only *setting* a
+                    // custom property is the deferred-to-CSS mechanism this
+                    // guard exists to preserve. (A line that merely contains
+                    // the substring `style="` by coincidence -- e.g. this very
+                    // check's own `"style="` string literal, self-scanned
+                    // because this guard also walks `src/ui` -- never yields a
+                    // colon-bearing declaration below, so it produces no
+                    // offenders, same as a real absence.)
+                    if let Some(value) = line
+                        .split_once("style=\"")
+                        .and_then(|(_, rest)| rest.split_once('"'))
+                        .map(|(value, _)| value)
+                    {
+                        for decl in value.split(';').map(str::trim).filter(|d| !d.is_empty()) {
+                            let Some((prop, _)) = decl.split_once(':') else {
+                                continue;
+                            };
+                            if !prop.trim().starts_with("--") {
+                                offenders.push(format!(
+                                    "{}:{} ({decl})",
+                                    entry.path().display(),
+                                    n + 1
+                                ));
+                            }
+                        }
                     }
                 }
             }

@@ -727,12 +727,20 @@
 .ticket-form-grid--type-edit { margin-top: 1rem; }
 
 /* ===== Vector backend-unavailable callout (blocks/vector/pages_ui.rs) =====
-   The callout box itself (`.callout .callout--warning`) keeps its existing
-   inline `style="...--spacing-md...--radius-md..."` -- it mixes design
-   tokens with two untokenized literal colours (#fff8e1/#92400e) and is
-   already guard-exempt (the style carries `--` custom properties). Only the
-   child inline styles below needed a class. */
+   #fff8e1/#f0d78c/#92400e have no matching design tokens (--accent-warning
+   is #f59e0b, too saturated for a pale banner tint) -- same pattern as
+   auth-split.css's #ecfdf5/#a7f3d0/#059669 pair. 6.67:1 computed (#92400e
+   on #fff8e1), clears the 4.5:1 AA text floor. */
+.callout { margin-bottom: var(--spacing-md); padding: var(--spacing-md); border-radius: var(--radius-md); }
+.callout--warning { background: #fff8e1; border: 1px solid #f0d78c; color: #92400e; }
 .callout__code { font-size: 12px; padding: 1px 4px; background: rgba(0,0,0,0.05); border-radius: 3px; }
+
+/* ===== API key reveal card (blocks/auth_ui/api/api_keys.rs) ===== */
+.api-key-card { margin-bottom: var(--spacing-md); }
+.api-key-copy-hint { margin: 0 0 var(--spacing-sm); color: var(--text-secondary); }
+.api-key-reveal-row { display: flex; gap: var(--spacing-sm); align-items: stretch; }
+.api-key-value { flex: 1 1 auto; padding: var(--spacing-sm); background: var(--bg-secondary); border-radius: var(--radius-md); font-family: ui-monospace, Menlo, monospace; word-break: break-all; user-select: all; }
+.api-key-name-hint { margin: var(--spacing-sm) 0 0; font-size: var(--text-xs); color: var(--text-muted); }
 
 /* ===== Portal buttons admin (blocks/userportal/pages/admin_buttons.rs) ===== */
 .admin-buttons-form-grid { grid-template-columns: 1fr 1fr 1fr auto auto; }

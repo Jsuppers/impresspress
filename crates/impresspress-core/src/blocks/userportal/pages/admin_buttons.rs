@@ -148,13 +148,12 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                             {
                                                 (icons::edit())
                                             }
-                                            button .btn .btn-ghost .btn-sm
+                                            button .btn .btn-ghost .btn-sm .text-danger
                                                 hx-delete=(format!("/b/userportal/admin/buttons/{}", btn.id))
                                                 hx-target="#buttons-table"
                                                 hx-swap="outerHTML"
                                                 hx-confirm="Delete this button?"
                                                 title="Delete"
-                                                style="color:var(--danger)"
                                             {
                                                 (icons::trash())
                                             }

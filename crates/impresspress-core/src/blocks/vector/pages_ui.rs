@@ -183,7 +183,7 @@ pub async fn index_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         None,
         html! {
             @if !backend_available {
-                div .callout .callout--warning style="margin-bottom: var(--spacing-md); padding: var(--spacing-md); background: #fff8e1; border: 1px solid #f0d78c; border-radius: var(--radius-md); color: #92400e" {
+                div .callout .callout--warning {
                     strong { "Vector backend not available" }
                     p .mt-1 .text-13 {
                         "The "
