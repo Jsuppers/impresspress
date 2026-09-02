@@ -19,7 +19,7 @@
    --accent-info-bg/--accent-info are retired; a local 6% color-mix plus
    --primary-button (4.60:1, computed) is the fix. */
 .alert--info { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
-.alert--success { background: #10b98119; color: var(--accent-success); }
+.alert--success { background: #10b98119; color: var(--accent-success-text); }
 /* --accent-warning (#f59e0b) is only ~2.3:1 on white -- nowhere near the
    4.5:1 AA floor for text; --accent-warning-text (#92400e, 6.56:1 on this
    tint, computed) is the text-safe sibling. Mirrors .alert--error above. */

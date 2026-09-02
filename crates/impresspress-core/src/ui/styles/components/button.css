@@ -22,7 +22,11 @@
 }
 
 .btn-secondary:hover { background: var(--bg-hover); }
-.btn-success { background: var(--accent-success); color: white; }
+/* --accent-success (#10b981) under white text is 2.54:1 -- below AA, and
+   below even the 3:1 non-text floor. --accent-success-text (7.13:1,
+   computed) serves this role too, exactly as --accent-danger-text does for
+   .btn-danger just below. */
+.btn-success { background: var(--accent-success-text); color: white; }
 /* --accent-danger (#ef4444) under white text is 3.76:1 -- below AA;
    --accent-danger-text (6.47:1, computed) is dark enough to serve this
    role too (contrast is symmetric -- same value either direction), mirroring

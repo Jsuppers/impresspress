@@ -503,7 +503,7 @@ pub fn public_page(opts: PublicPage<'_>, body: Markup) -> Markup {
                     header .public-page__header {
                         div .public-page__header-inner {
                             a .public-page__back href=(href) title="Go back" aria-label="Go back" {
-                                "\u{2190}"
+                                (crate::ui::icons::arrow_left())
                             }
                         }
                     }

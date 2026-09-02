@@ -623,19 +623,56 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
+    /// Every value here is read from the LIVE token map rather than written
+    /// as a frozen hex literal. It used to spell all four out -- and drifted:
+    /// it asserted on `#64748b` while calling it "--text-muted" long after
+    /// that token had moved to `#5d6b7f`, so the assertion still passed while
+    /// describing a colour the stylesheet no longer used. A test naming a
+    /// token must resolve that token, or it is a snapshot of a past build
+    /// wearing the token's name.
+    #[cfg(feature = "embed-assets")]
     #[test]
     fn brand_tokens_meet_wcag_aa() {
+        let tokens = parse_root_tokens(super::css());
+        let hex = |name: &str| -> String {
+            let raw = tokens
+                .get(name)
+                .unwrap_or_else(|| panic!("token {name} missing from :root"));
+            let rgba = resolve_color(raw, &tokens, 0)
+                .unwrap_or_else(|| panic!("token {name} ({raw}) did not resolve to a colour"));
+            hex_of(composite_over(rgba, (255, 255, 255)))
+        };
+
+        let primary_button = hex("--primary-button");
+        let sidebar_bg = hex("--bg-sidebar");
+        let sidebar_muted = hex("--sidebar-text-muted");
+        let text_muted = hex("--text-muted");
+
         // White-on-red button surfaces carry normal-size text: 4.5:1 required.
-        assert!(contrast("#d92320", "#ffffff") >= 4.5,
-            "primary-button fails AA: {}", contrast("#d92320", "#ffffff"));
-        // Sidebar foregrounds on navy.
-        assert!(contrast("#ffffff", "#0a1122") >= 4.5);
-        assert!(contrast("#94a3b8", "#0a1122") >= 4.5,
-            "sidebar muted text fails AA");
-        // The regression this guards: --text-muted is 3.95:1 on navy and must
-        // never be reused as a sidebar foreground.
-        assert!(contrast("#64748b", "#0a1122") < 4.5,
-            "if this now passes, the sidebar-specific token may be redundant");
+        assert!(
+            contrast(&primary_button, "#ffffff") >= 4.5,
+            "--primary-button ({primary_button}) fails AA under white text: {:.2}:1",
+            contrast(&primary_button, "#ffffff")
+        );
+        // Sidebar foregrounds on the navy slab.
+        assert!(
+            contrast("#ffffff", &sidebar_bg) >= 4.5,
+            "white on --bg-sidebar ({sidebar_bg}) fails AA"
+        );
+        assert!(
+            contrast(&sidebar_muted, &sidebar_bg) >= 4.5,
+            "--sidebar-text-muted ({sidebar_muted}) on --bg-sidebar ({sidebar_bg}) fails AA: {:.2}:1",
+            contrast(&sidebar_muted, &sidebar_bg)
+        );
+        // The regression this guards: the page-level muted token is too dark
+        // for the navy slab (3.47:1 as of --text-muted #5d6b7f), which is why
+        // --sidebar-text-muted exists as a separate, lighter token. If this
+        // ever passes, the two have converged and one of them is redundant.
+        assert!(
+            contrast(&text_muted, &sidebar_bg) < 4.5,
+            "--text-muted ({text_muted}) now clears AA on --bg-sidebar ({sidebar_bg}) -- \
+             the separate --sidebar-text-muted token may be redundant"
+        );
     }
 
     #[cfg(feature = "embed-assets")]
@@ -947,143 +984,159 @@ mod tests {
         format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2)
     }
 
-    /// Selectors where a `color:` resolving into the primary/danger family
-    /// (see the test below) is legitimate non-text, or text-adjacent but
-    /// not itself text -- each with its own reason, not a silent pass.
-    const PRIMARY_DANGER_FAMILY_EXEMPT_SELECTORS: &[&str] = &[
+    /// Selectors this contrast guard does not hold to the 4.5:1 text floor,
+    /// each with its own reason -- not a silent pass.
+    const CONTRAST_EXEMPT_SELECTORS: &[&str] = &[
         // `.db-table-group__icon` wraps `icons::package()`/`icons::database()`
         // (database.rs) -- an SVG icon, not text; `color` only feeds the
         // SVG's `currentColor`. WCAG's 3:1 non-text floor applies, and
         // #fd3534 (3.66:1 on white) already clears it.
         ".db-table-group__icon",
-        // `.form-label.required::after`'s generated content (' *') ornaments
-        // the visible label text right next to it (e.g. "Email *") rather
-        // than substituting for it -- the label itself already conveys the
-        // field name, so this doesn't fall under SC 1.4.3 as text. Left at
-        // the literal #ef4444 (== --accent-danger's value) rather than
-        // darkened.
-        ".form-label.required::after",
+        // Disabled form controls. WCAG 2.x SC 1.4.3 explicitly exempts text
+        // in "inactive user interface components" from the contrast minimum,
+        // and the muted look is what communicates the disabled state. 4.39:1
+        // (computed) -- deliberately just under, not an oversight.
+        ".form-input:disabled",
+        ".form-select:disabled",
+        ".form-textarea:disabled",
     ];
 
-    /// Supersedes the two narrower, name-matching contrast guards this test
-    /// module used to carry (a `background: var(--primary-color)` +
-    /// `color: white` check from Task 12a, and a `color:
-    /// var(--primary-color)`/`var(--accent-danger)` check added alongside
-    /// it in Task 15) with one value-based assertion covering both
-    /// directions at once. Matching by resolved value rather than by a
-    /// token's literal name/spelling is what closes the alias hole that
-    /// let `--accent-info: #fd3534` -- and the bare literal `#ef4444` in
-    /// `.form-error`/`.form-label.required::after` -- evade both
-    /// predecessors: a new token or a re-literalized hex sharing one of
-    /// these five tokens' current value cannot rename its way past this.
+    /// Text whose background comes from an ANCESTOR rule rather than its own.
+    /// A single-rule scan cannot see the cascade, so without this table these
+    /// selectors would either be skipped (unverified) or measured against a
+    /// wrong assumed-white background and reported as false failures. Mapping
+    /// each to the token its true ancestor actually sets means they get
+    /// genuinely checked instead of waved through -- the navy panels are the
+    /// only place in the bundle where text sits on a non-white surface set by
+    /// a parent.
+    const ANCESTOR_BACKGROUNDS: &[(&str, &str)] = &[
+        // `.sidebar`'s navy slab is painted by `.sidebar__nav` in
+        // components/nav.css (`background: var(--bg-sidebar)`); every
+        // `.sidebar__*` label, link and avatar caption renders on it.
+        (".sidebar__", "--bg-sidebar"),
+        // `.auth-split__brand` sets `background: var(--navy-900)` for the
+        // login page's left-hand brand panel (layouts/auth-split.css).
+        (".auth-split__", "--navy-900"),
+    ];
+
+    /// Asserts every text/background pair the CSS bundle declares meets the
+    /// 4.5:1 WCAG AA floor for normal text, matching on RESOLVED COLOR VALUES
+    /// rather than token names.
     ///
-    /// Scope: this only evaluates a rule whose resolved TEXT color, or
-    /// whose own resolved BACKGROUND color (declared in the SAME rule --
-    /// this is still a single-rule scan, see below), equals the CURRENT
-    /// resolved value of one of `PRIMARY_DANGER_FAMILY_TOKENS` -- i.e. this
-    /// project's brand-red/danger-red design family, recomputed from the
-    /// live token values every run rather than a hex list frozen into the
-    /// test. A rule outside that family (green success text, amber warning
-    /// text, disabled/placeholder gray, the navy sidebar/auth-split brand
-    /// panel's own white-on-navy palette, ...) is never evaluated here --
-    /// those are real, separate contrast questions this guard does not
-    /// answer. It was scoped this way deliberately: the fully general
-    /// version (assert on every resolvable `color:` in the bundle,
-    /// defaulting to a white background when none is declared) was built
-    /// and run first, and surfaced ~30 additional offenders -- almost all
-    /// either genuine pre-existing gaps in that unrelated success/warning/
-    /// gray palette (a separate, larger, unbudgeted audit), or false
-    /// positives from elements that render on a dark ancestor background
-    /// (`.sidebar__nav-item`, `.auth-split__logo-name`, ...) this
-    /// single-rule scan has no way to see -- which the family-scoping
-    /// above happens to filter out for free, since white and
-    /// `--sidebar-text-muted` aren't primary/danger-family values either.
-    /// Both lists (the unrelated pre-existing gaps, and confirmation of
-    /// which "false positives" were checked against their true ancestor
-    /// background rather than just assumed) are in the Task 15 report.
+    /// Value-matching is what closes the alias hole that let
+    /// `--accent-info: #fd3534` -- and bare literals like `#ef4444` --
+    /// evade the two earlier name-matching guards (Tasks 12a and 15): a new
+    /// token, or a re-literalized hex, cannot rename its way past this.
     ///
-    /// What this still can't see, even inside its declared scope: a
-    /// background and text color declared in two DIFFERENT rules that
-    /// combine at runtime (parent background + child text color); colors
-    /// applied via inline `style`/JS; a family value expressed through a
-    /// CSS function this resolver doesn't parse (`rgb()`/`rgba()`,
-    /// gradients -- none currently appear on a `color:`/`background:` in
-    /// this bundle, checked by grep) -- such a rule is skipped rather than
-    /// assumed compliant, not silently passed.
+    /// This guard used to be scoped to the primary/danger (brand-red) token
+    /// family only. That scoping is why it never saw the success and warning
+    /// families: `--accent-success` (#10b981) as text was 2.54:1 on white and
+    /// 2.31:1 on its own tint, and `.badge-warning` was 1.99:1 -- the worst
+    /// pair in the bundle -- both structurally invisible to a family-filtered
+    /// check, and both shipped. The narrow scope was a deliberate, documented
+    /// deferral of "a separate, larger, unbudgeted audit"; that audit has now
+    /// been done (every failing pair fixed, `--accent-success-text` added to
+    /// match the `-text` siblings danger and warning already had, and
+    /// `--text-secondary`/`--text-muted` given tint headroom), so the filter
+    /// is gone and this now evaluates EVERY rule with a resolvable text color.
+    /// Scoping a guard to the family whose bug prompted it is exactly how the
+    /// next family's copy of that bug survives.
+    ///
+    /// Background resolution, in order: the rule's own `background`/
+    /// `background-color`; else an `ANCESTOR_BACKGROUNDS` entry; else the
+    /// page surface (white). Translucent tints are alpha-composited over the
+    /// resolved background before measuring.
+    ///
+    /// What this still cannot see: a parent background paired with child text
+    /// outside the `ANCESTOR_BACKGROUNDS` table; colors applied via inline
+    /// `style` or JS; and values expressed through CSS functions the resolver
+    /// does not parse. Such a rule is SKIPPED rather than assumed compliant --
+    /// so the count below is asserted too, to catch a future refactor that
+    /// silently drops rules out of coverage by making them unresolvable.
     // Depends on `css()`, so it needs the same `embed-assets` gate as every
     // other CSS-content test in this module -- a no-embed build has no CSS
-    // bytes to check contrast on. This does not weaken the guard: whenever
-    // it IS compiled (default features, and every CI/local run that
-    // exercises the CSS bundle), it still runs and must still pass.
+    // bytes to check contrast on.
     #[cfg(feature = "embed-assets")]
     #[test]
-    fn text_or_background_in_primary_danger_family_meets_wcag_aa() {
-        const PRIMARY_DANGER_FAMILY_TOKENS: &[&str] = &[
-            "--primary-color",
-            "--primary-hover",
-            "--primary-button",
-            "--accent-danger",
-            "--accent-danger-text",
-        ];
-
+    fn text_and_background_pairs_meet_wcag_aa() {
         let s = super::css();
         let tokens = parse_root_tokens(s);
-        let family_values: std::collections::HashSet<Rgba> = PRIMARY_DANGER_FAMILY_TOKENS
-            .iter()
-            .filter_map(|name| tokens.get(*name))
-            .filter_map(|v| resolve_color(v, &tokens, 0))
-            .collect();
-        assert_eq!(
-            family_values.len(),
-            PRIMARY_DANGER_FAMILY_TOKENS.len(),
-            "expected all {} family tokens to resolve to distinct values -- \
-             if this fails, either the token map/parser broke, or two family \
-             tokens now share a value (not necessarily wrong, but re-check \
-             this test's scoping assumption if so)",
-            PRIMARY_DANGER_FAMILY_TOKENS.len()
-        );
+
+        let exempt = |selector: &str| -> bool {
+            selector
+                .split(',')
+                .map(str::trim)
+                .any(|part| CONTRAST_EXEMPT_SELECTORS.contains(&part))
+        };
+        let ancestor_bg = |selector: &str| -> Option<Rgba> {
+            ANCESTOR_BACKGROUNDS.iter().find_map(|(prefix, token)| {
+                if selector
+                    .split(',')
+                    .map(str::trim)
+                    .any(|part| part.starts_with(prefix))
+                {
+                    resolve_color(tokens.get(*token)?, &tokens, 0)
+                } else {
+                    None
+                }
+            })
+        };
 
         let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
         for (selector, body) in css_leaf_blocks(s) {
-            if PRIMARY_DANGER_FAMILY_EXEMPT_SELECTORS.contains(&selector.as_str()) {
+            if exempt(&selector) {
                 continue;
             }
-            let decls: Vec<&str> = body.split(';').map(str::trim).filter(|d| !d.is_empty()).collect();
+            let decls: Vec<&str> = body
+                .split(';')
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .collect();
             let Some(color_decl) = decls.iter().find(|d| d.starts_with("color:")).copied() else {
                 continue;
             };
             let Some(text_rgba) = resolve_color(&color_decl["color:".len()..], &tokens, 0) else {
                 continue; // unresolvable -- can't verify, skip (documented above)
             };
+            if text_rgba.3 == 0 {
+                continue; // fully transparent text, not visible
+            }
 
+            // The surface this rule's own background (if any) paints onto:
+            // an ancestor's background where we know it, else the page.
+            let base_rgb = composite_over(
+                ancestor_bg(&selector).unwrap_or((255, 255, 255, 255)),
+                (255, 255, 255),
+            );
             let bg_decl: Option<&str> = decls
                 .iter()
                 .find(|d| d.starts_with("background:") || d.starts_with("background-color:"))
                 .copied();
-            let bg_rgba = match bg_decl {
-                None => (255u8, 255u8, 255u8, 255u8), // no local background -> page surface (--surface-1)
+            // A declared background composites OVER that base rather than
+            // replacing it, so `background: transparent` (and any translucent
+            // tint) correctly shows the ancestor through it. Compositing
+            // against white unconditionally instead would have reported
+            // `.sidebar__collapse-toggle` -- transparent over the navy slab --
+            // as 2.56:1 white-background text, a false failure.
+            let bg_rgb = match bg_decl {
                 Some(d) => {
                     let val = d.split_once(':').map(|x| x.1).unwrap_or_default();
                     match resolve_color(val, &tokens, 0) {
-                        Some(c) => c,
-                        None => continue, // background present but unresolvable -- can't verify, skip
+                        Some(c) => composite_over(c, base_rgb),
+                        None => continue, // declared but unresolvable -- can't verify
                     }
                 }
+                None => base_rgb,
             };
 
-            if text_rgba.3 == 0 {
-                continue; // fully transparent text, not visible
-            }
-            if !family_values.contains(&text_rgba) && !family_values.contains(&bg_rgba) {
-                continue; // neither side is this guard's declared family -- out of scope
-            }
-
-            let bg_rgb = composite_over(bg_rgba, (255, 255, 255));
             let text_rgb = composite_over(text_rgba, bg_rgb);
             let ratio = contrast(&hex_of(text_rgb), &hex_of(bg_rgb));
+            checked += 1;
             if ratio < 4.5 {
                 offenders.push(format!(
-                    "{selector}: {ratio:.2}:1 ({} text on {} background)",
+                    "{}: {ratio:.2}:1 ({} text on {} background)",
+                    selector.split(',').next().unwrap_or(&selector).trim(),
                     hex_of(text_rgb),
                     hex_of(bg_rgb)
                 ));
@@ -1092,7 +1145,18 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "primary/danger-family text/background pairs failing 4.5:1 AA (computed): {offenders:?}"
+            "text/background pairs failing 4.5:1 AA (computed): {offenders:#?}"
+        );
+        // Coverage floor: the bundle currently resolves ~200 such pairs. If a
+        // refactor makes colors unresolvable to this parser (moving them into
+        // an unparsed CSS function, say), rules would drop out of coverage
+        // silently and the assert above would pass vacuously. Deliberately
+        // loose -- this catches a collapse, not normal drift.
+        assert!(
+            checked > 120,
+            "only {checked} text/background pairs were resolvable -- expected >120; \
+             the resolver has probably stopped understanding a common value form, \
+             which would make the contrast assertion above vacuous"
         );
     }
 

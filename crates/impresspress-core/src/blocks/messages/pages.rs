@@ -309,7 +309,7 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
 
     html! {
         div .flex .items-center .gap-3 .mb-6 {
-            a .btn .btn-ghost .btn-sm href="/b/messages/" { "\u{2190} Back" }
+            a .btn .btn-ghost .btn-sm href="/b/messages/" { (ui::icons::arrow_left()) " Back" }
             h2 .page-title .m-0 { (display_title) }
             span .badge .text-capitalize { (context_type) }
             span .badge { (context_status) }

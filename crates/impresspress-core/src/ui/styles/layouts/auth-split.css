@@ -93,7 +93,7 @@
    too instead of being the one sibling left failing. */
 .login-success {
 	background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px;
-	padding: var(--space-3); margin-bottom: var(--space-4); font-size: 0.813rem; color: #166534;
+	padding: var(--space-3); margin-bottom: var(--space-4); font-size: 0.813rem; color: var(--accent-success-text);
 }
 /* change-password's success box: same box, centered content, larger padding,
    and its own message styling (child overrides the box's font-size/color,
@@ -103,7 +103,7 @@
    it -- same literal already used for .badge--tone-green's text in
    components/badge.css. */
 .login-success--centered { padding: var(--space-4); text-align: center; }
-.change-password-success-text { font-size: 0.875rem; color: #166534; margin: 0 0 var(--space-4); font-weight: 500; }
+.change-password-success-text { font-size: 0.875rem; color: var(--accent-success-text); margin: 0 0 var(--space-4); font-weight: 500; }
 
 /* ===== Auth status result page (reset-password/verify success-or-failure,
    signup's "check your email") =====
@@ -123,10 +123,19 @@
    the 48px badge, matching the `.db-table-group__icon svg` override
    precedent for an icon inside an oversized badge. */
 .auth-status__icon svg { width: 24px; height: 24px; }
-.auth-status__icon--dynamic { background: var(--icon-bg); color: var(--icon-color); }
-/* #ecfdf5 has no matching token; --accent-success (#10b981) does match the
-   original literal and is used in place of it. */
-.auth-status__icon--success { background: #ecfdf5; color: var(--accent-success); }
+/* Was `.auth-status__icon--dynamic`, coloured by `--icon-color`/`--icon-bg`
+   custom properties set inline from Rust (verify.rs, reset_password.rs) --
+   the no-inline-styles guard's carve-out for a "dynamic runtime value". The
+   value was never open-ended: it was a two-state boolean, `#10b981` for
+   success and `#ef4444` for failure. Being inline put both states outside
+   every CSS-based check, and both were failing: 2.34:1 and 3.39:1 against
+   their own tints (computed). As static modifiers they are covered by the
+   contrast guard like everything else, and they match how signup.rs has
+   always rendered its always-successful icon. */
+.auth-status__icon--success { background: #ecfdf5; color: var(--accent-success-text); }
+/* #fef2f2 replaces the old inline `#ef444415` tint (~#fef0f0 over white) --
+   a hair lighter, and a real red-50 rather than an alpha-suffixed literal. */
+.auth-status__icon--failure { background: #fef2f2; color: var(--accent-danger-text); }
 .auth-status__title { font-size: 1.25rem; font-weight: 700; margin: 0 0 var(--space-2); }
 .auth-status__message { color: var(--text-secondary); font-size: 0.875rem; line-height: 1.6; margin: 0 0 var(--space-6); }
 .auth-status__action { display: inline-block; width: auto; padding: var(--space-3) var(--space-5); text-decoration: none; }

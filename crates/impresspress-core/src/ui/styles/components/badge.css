@@ -5,14 +5,18 @@
 	font-size: 0.75rem; font-weight: 500;
 }
 
-.badge-success { background: #10b98119; color: var(--accent-success); }
+.badge-success { background: #10b98119; color: var(--accent-success-text); }
 /* Own (lighter) tint rather than the shared --accent-info-bg: at that var's
    9.8%-alpha strength, --primary-button on top only reaches 4.35:1 here
    (computed) -- below the 4.5:1 AA floor. A 6% color-mix keeps the same
    pale-pink badge look and gets --primary-button to 4.60:1 (computed). */
 .badge-primary { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
 .badge-danger { background: #ef444419; color: var(--accent-danger-text); }
-.badge-warning { background: #f59e0b19; color: var(--accent-warning); }
+/* --accent-warning (#f59e0b) on its own tint is 1.99:1 -- the worst pair in
+   the stylesheet. --accent-warning-text (6.56:1 here, computed) is the
+   text-safe sibling and already existed; this rule simply never adopted it,
+   the way .alert--warning did. */
+.badge-warning { background: #f59e0b19; color: var(--accent-warning-text); }
 /* --accent-info was #fd3534, byte-identical to --primary-color -- the
    white-on-red bug (Task 12a) hiding behind an alias, here in the reverse
    (text) direction. --accent-info/--accent-info-bg are retired (see
@@ -35,7 +39,7 @@
    (4.51:1, computed, same as .form-tabs li.is-active a in layouts/page.css)
    is this app's established AA-safe red for text on this exact tint. */
 .badge--tone-brand { background: #fff1e6; color: var(--primary-button); }
-.badge--tone-green { background: #dcfce7; color: #166534; }
+.badge--tone-green { background: #dcfce7; color: var(--accent-success-text); }
 .badge--tone-amber { background: #fef3c7; color: #92400e; }
 .badge--tone-red { background: #fce4ec; color: #c62828; }
 /* Slate tone reuses --bg-hover (#f1f5f9 is already that token's value) but

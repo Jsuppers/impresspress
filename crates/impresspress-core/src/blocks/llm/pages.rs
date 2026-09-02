@@ -278,7 +278,7 @@ fn render_messages_pane(_entries: &[db::Record], thread_id: Option<&str>) -> Mar
         div #messages-area {
             @if thread_id.is_none() {
                 div #no-thread-prompt .chat-empty-state {
-                    div .chat-empty-state__icon { "\u{1f4ac}" }
+                    div .chat-empty-state__icon { (ui::icons::message_square()) }
                     p .text-lg .mb-2 { "Start a new conversation" }
                     p .text-muted .mb-6 { "Click the " strong { "+" } " button to create a thread, then type your message." }
                 }
@@ -377,7 +377,7 @@ fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
             }
 
             a .btn.btn-ghost.btn-sm .justify-start href="/b/llm/settings" {
-                "\u{2699} Settings"
+                (ui::icons::settings()) " Settings"
             }
         }
     }

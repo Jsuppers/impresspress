@@ -98,7 +98,9 @@
  * kept as its own component rather than reusing those, matching the
  * original CSS 1:1 in shape. Every color in the original page-local styles
  * was an exact match for an existing token (`#e2e8f0` = --border-color,
- * `#64748b` = --text-muted, `#f1f5f9` = --bg-hover, `#1e293b` =
+ * `#64748b` = --text-muted (that token has since been darkened to
+ * `#5d6b7f` for AA headroom on tinted surfaces -- these rules follow the
+ * token, not the original literal), `#f1f5f9` = --bg-hover, `#1e293b` =
  * --text-primary, `white` = --surface-1) -- re-typed onto the tokens rather
  * than carried over as literals. */
 .editor-tabs { display: flex; gap: var(--space-1); margin-bottom: -1px; border-bottom: 1px solid var(--border-color); }

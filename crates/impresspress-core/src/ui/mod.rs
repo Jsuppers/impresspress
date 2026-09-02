@@ -693,6 +693,190 @@ mod tests {
         );
     }
 
+    /// Icons are Lucide SVGs from `ui::icons`, never text characters. A glyph
+    /// icon renders in the body font (or, for emoji, the platform's colour
+    /// emoji font), so it ignores `currentColor`, ignores the icon set's
+    /// stroke weight, and sits on the text baseline instead of the icon grid
+    /// -- it cannot be made to match the icons beside it.
+    ///
+    /// This scans BOTH spellings, because they are equally invisible in a
+    /// rendered page but not equally visible in source: a literal `\u{26a0}`
+    /// character, and the `\u{...}` Rust escape. Every glyph icon this guard
+    /// was written for was in the escaped form -- a grep for emoji characters
+    /// over this same tree reported zero hits while six escaped glyph icons
+    /// (a speech balloon, a gear, two warning signs, a tick/cross pair and two
+    /// back-arrows) were live on real pages. Checking only the literal form
+    /// would reproduce exactly that false all-clear.
+    ///
+    /// General Punctuation (U+2000-U+206F) is deliberately NOT flagged: em
+    /// dashes, ellipses and curly quotes are typography, not icons, and this
+    /// tree uses them heavily as text.
+    ///
+    /// Only STRING LITERALS are scanned. Prose comments in this tree use `→`
+    /// constantly ("Non-htmx → full document with chrome", "status→color
+    /// policy") and none of it reaches a page; scanning whole lines made this
+    /// guard fail on 15 comments and 1 real string, which is a guard that gets
+    /// deleted rather than obeyed.
+    #[test]
+    fn pages_use_lucide_icons_not_text_glyphs() {
+        /// Pictographs, dingbats, arrows and symbol blocks -- the ranges a
+        /// glyph icon is drawn from. Excludes General Punctuation.
+        fn is_glyph_icon(c: u32) -> bool {
+            matches!(c,
+                0x1F300..=0x1FAFF   // emoji / pictographs
+                | 0x2190..=0x21FF   // arrows
+                | 0x2600..=0x27BF   // misc symbols + dingbats (checkmarks, gear, warning)
+                | 0x2B00..=0x2BFF   // misc symbols and arrows
+                | 0xFE0F            // variation selector-16 (emoji presentation)
+            )
+        }
+
+        /// Glyphs that stand for a physical KEY in a keyboard-shortcut hint,
+        /// not for an action. The command palette's footer reads
+        /// "\u{2191}\u{2193} navigate \u{b7} \u{21b5} open \u{b7} Esc close":
+        /// those arrows are what is printed on the arrow keys, the same
+        /// convention as \u{2318} for Cmd. Substituting Lucide arrows there
+        /// would read as "go up"/"go back" -- an instruction rather than a key
+        /// name -- and would not sit inline in a compact hint string.
+        const KEYBOARD_HINT_GLYPHS: &[(&str, u32)] = &[
+            ("src/ui/palette.rs", 0x2191), // UP ARROW
+            ("src/ui/palette.rs", 0x2193), // DOWN ARROW
+            ("src/ui/palette.rs", 0x21B5), // RETURN SYMBOL
+        ];
+
+        /// The spans of `line` that are inside a double-quoted literal.
+        /// Deliberately simple: it tracks `\"` escapes and nothing else, which
+        /// is enough because the alternative it must exclude -- comment prose
+        /// -- never contains a quote-delimited glyph.
+        fn string_spans(line: &str) -> Vec<String> {
+            let mut spans = Vec::new();
+            let mut cur = String::new();
+            let mut in_str = false;
+            let mut escaped = false;
+            for c in line.chars() {
+                if in_str {
+                    if escaped {
+                        cur.push(c);
+                        escaped = false;
+                    } else if c == '\\' {
+                        cur.push(c);
+                        escaped = true;
+                    } else if c == '"' {
+                        spans.push(std::mem::take(&mut cur));
+                        in_str = false;
+                    } else {
+                        cur.push(c);
+                    }
+                } else if c == '"' {
+                    in_str = true;
+                }
+            }
+            if !cur.is_empty() {
+                spans.push(cur);
+            }
+            spans
+        }
+
+        let roots = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for root in roots {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                // `blocks/email.rs` builds HTML email bodies. Inline SVG is
+                // unreliable across mail clients (Gmail strips it outright),
+                // so a text glyph is the working mechanism there -- the same
+                // carve-out, for the same reason, as the inline-style guard.
+                .filter(|e| !e.path().ends_with("blocks/email.rs"))
+                // `ui/icons.rs` IS the icon set; its doc comments name the
+                // glyphs each icon replaced.
+                .filter(|e| !e.path().ends_with("ui/icons.rs"))
+            {
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                let file = entry
+                    .path()
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(entry.path())
+                    .display()
+                    .to_string();
+                let allowed = |cp: u32| {
+                    KEYBOARD_HINT_GLYPHS
+                        .iter()
+                        .any(|(f, c)| *c == cp && file.replace('\\', "/").ends_with(f))
+                };
+                // Skip `#[cfg(test)]` modules: assertion messages are not
+                // rendered markup, and they legitimately use symbols as prose
+                // ("no row yet \u{21d2} defaults enabled"). Tracked by brace
+                // depth from the `mod ... {` that follows the attribute.
+                let mut test_mod_depth: Option<i32> = None;
+                let mut pending_cfg_test = false;
+                for (n, line) in src.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    if let Some(depth) = test_mod_depth.as_mut() {
+                        *depth += line.matches('{').count() as i32;
+                        *depth -= line.matches('}').count() as i32;
+                        if *depth <= 0 {
+                            test_mod_depth = None;
+                        }
+                        continue;
+                    }
+                    if trimmed.starts_with("#[cfg(test)]") {
+                        pending_cfg_test = true;
+                        continue;
+                    }
+                    if pending_cfg_test && trimmed.starts_with("mod ") && line.contains('{') {
+                        pending_cfg_test = false;
+                        let depth = line.matches('{').count() as i32
+                            - line.matches('}').count() as i32;
+                        if depth > 0 {
+                            test_mod_depth = Some(depth);
+                        }
+                        continue;
+                    }
+                    if trimmed.starts_with("//") {
+                        continue; // comment line -- prose, never rendered
+                    }
+                    for span in string_spans(line) {
+                        for c in span.chars() {
+                            if is_glyph_icon(c as u32) && !allowed(c as u32) {
+                                offenders.push(format!(
+                                    "{file}:{}: literal glyph {c:?} (U+{:04X})",
+                                    n + 1,
+                                    c as u32
+                                ));
+                            }
+                        }
+                        // The escaped spelling: `\u{26a0}`.
+                        let mut rest = span.as_str();
+                        while let Some(i) = rest.find("\\u{") {
+                            rest = &rest[i + 3..];
+                            let Some(end) = rest.find('}') else { break };
+                            if let Ok(cp) = u32::from_str_radix(&rest[..end], 16) {
+                                if is_glyph_icon(cp) && !allowed(cp) {
+                                    offenders.push(format!(
+                                        "{file}:{}: escaped glyph \\u{{{:x}}} (U+{cp:04X})",
+                                        n + 1,
+                                        cp
+                                    ));
+                                }
+                            }
+                            rest = &rest[end..];
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "text glyphs used as icons -- use a `ui::icons::*` Lucide SVG instead \
+             (add one if it is missing): {offenders:#?}"
+        );
+    }
+
     /// Inline styles bypass the shared style layer, so pages drift out of the
     /// design system one hardcoded colour at a time. The only legitimate use is
     /// handing a runtime value to CSS as a custom property.

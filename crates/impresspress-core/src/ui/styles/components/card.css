@@ -173,13 +173,14 @@
 	height: 32px;
 	border-radius: var(--radius-md);
 	color: var(--text-secondary);
-	font-size: 1.1rem;
 	text-decoration: none;
 	transition: background var(--transition-fast), color var(--transition-fast);
 }
-/* The rendered glyph ("\u2190") substitutes for a text link -- it carries
-   `aria-label="Go back"`/`title="Go back"` (templates.rs), so it's read as
-   navigation text, not decoration. Fallback was --primary-color, 3.34:1 on
+/* The icon (`icons::arrow_left()`, formerly a bare "\u2190" glyph sized by
+   the `font-size: 1.1rem` this rule used to carry -- which an SVG ignores)
+   substitutes for a text link: it carries `aria-label="Go back"`/
+   `title="Go back"` (templates.rs), so it's read as navigation text, not
+   decoration. Fallback was --primary-color, 3.34:1 on
    --bg-hover -- below AA; --primary-button (4.55:1 on --bg-hover, computed)
    is the text-safe sibling. A caller-supplied --public-page-accent override
    is per-deploy config, same as --primary-color itself -- out of this
@@ -387,7 +388,12 @@
 	margin: 0; color: var(--text-primary);
 	word-break: break-word;
 }
-.block-card__check { color: var(--accent-success); font-size: var(--text-base); line-height: 1; flex-shrink: 0; }
+/* `font-size` here used to size the "\u{2713}"/"\u{2717}" text glyphs; the
+   marks are now `icons::check()`/`icons::x()`, so the size moves to the svg
+   rule below (16px to sit with the card title rather than the icon set's
+   default 18px). */
+.block-card__check { color: var(--accent-success-text); line-height: 0; flex-shrink: 0; }
+.block-card__check svg { width: 16px; height: 16px; }
 .block-card__check--off { color: var(--text-muted); }
 .block-card__summary {
 	font-size: var(--text-sm); color: var(--text-secondary);
@@ -685,7 +691,13 @@
 
 /* ===== Chat empty state (no thread selected) ===== */
 .chat-empty-state { text-align: center; padding: var(--space-12) var(--space-4); }
-.chat-empty-state__icon { font-size: 2.5rem; margin-bottom: var(--space-3); }
+/* Was `font-size: 2.5rem`, sizing a 40px "\u{1f4ac}" emoji glyph. The icon is
+   now `icons::message_square()`; an SVG does not scale with font-size, so the
+   40px is restated as explicit width/height or it would render at the icon
+   set's 18px default. Muted so a large empty-state mark reads as quiet
+   furniture rather than an alert. */
+.chat-empty-state__icon { margin-bottom: var(--space-3); color: var(--text-muted); line-height: 0; }
+.chat-empty-state__icon svg { width: 40px; height: 40px; }
 
 /* ===== Model load progress (llm chat right rail) =====
    `.model-progress-fill`'s width starts at 0% and is updated at runtime by
@@ -762,9 +774,12 @@
 .var-warning-banner {
 	background: #fef3c7; border: 1px solid var(--accent-warning);
 	border-radius: 8px; padding: var(--space-3); margin-bottom: var(--space-4);
-	font-size: 0.813rem; color: #92400e;
+	font-size: 0.813rem; color: var(--accent-warning-text);
 	display: flex; align-items: center; gap: var(--space-2);
 }
+/* Sized down from the icon set's 18px default to sit with 0.813rem text.
+   `flex-shrink: 0` keeps the mark round when the message wraps. */
+.var-warning-banner svg { width: 14px; height: 14px; flex-shrink: 0; }
 
 /* ===== Products admin (cards) =====
  * Migrated from `blocks/products/pages.rs`'s page-local `PRODUCTS_UI_CSS`

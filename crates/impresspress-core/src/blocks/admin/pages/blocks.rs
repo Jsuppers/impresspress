@@ -173,9 +173,9 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             div .block-card__head {
                                 h3 .block-card__title { (block.name) }
                                 @if is_enabled {
-                                    span .block-card__check title="Enabled" { "\u{2713}" }
+                                    span .block-card__check title="Enabled" { (ui::icons::check()) }
                                 } @else {
-                                    span .block-card__check .block-card__check--off title="Disabled" { "\u{2717}" }
+                                    span .block-card__check .block-card__check--off title="Disabled" { (ui::icons::x()) }
                                 }
                             }
                             p .block-card__summary { (block.summary) }

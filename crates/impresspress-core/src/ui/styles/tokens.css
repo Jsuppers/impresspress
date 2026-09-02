@@ -29,6 +29,17 @@
 	--auth-tagline: #7095c4;
 
 	--accent-success: #10b981;
+	/* Same problem as --accent-danger-text/--accent-warning-text below:
+	   #10b981 (emerald) is only 2.54:1 on white and 2.31:1 on its own
+	   #10b98119 tint -- it fails even the 3:1 non-text floor, so it was
+	   never safe as a foreground anywhere. #166534 is 7.13:1 on white,
+	   6.50:1 on the tint and 6.77:1 on #ecfdf5 (computed); #10b981 stays
+	   for fills and borders. The value is not new -- Task 12c already
+	   picked #166534 twice as a literal (.login-success,
+	   .change-password-success-text) and .badge--tone-green used it too,
+	   so this token unifies three existing literals rather than
+	   introducing a fourth green. */
+	--accent-success-text: #166534;
 	--accent-warning: #f59e0b;
 	--accent-danger: #ef4444;
 	/* Red text on white needs 4.5:1. #ef4444 is only 3.76:1 (and only
@@ -62,8 +73,18 @@
 	--bg-hover: #f1f5f9;
 
 	--text-primary: #1e293b;
-	--text-secondary: #64748b;
-	--text-muted: #64748b;
+	/* #64748b was 4.76:1 on white -- only 0.26 above the 4.5:1 AA floor,
+	   so it cleared AA on the page background and failed on every tinted
+	   surface the app actually puts it on: 4.48:1 on --surface-2, 4.34:1
+	   on --bg-hover, 4.18:1 on --bg-secondary (computed). The token had no
+	   headroom, which is why the failures showed up scattered across
+	   .table th, .public-page__version, .editor-status__version and
+	   .admin-dashboard-mobile-hint rather than in one place. #5d6b7f keeps
+	   the same slate hue and is 4.76:1 on --bg-secondary, the darkest tint
+	   in use -- i.e. it now has on the worst surface the headroom the old
+	   value only had on white (5.42:1 there). */
+	--text-secondary: #5d6b7f;
+	--text-muted: #5d6b7f;
 
 	--border-color: #e2e8f0;
 	--border-light: #f1f5f9;

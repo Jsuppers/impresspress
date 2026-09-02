@@ -290,7 +290,7 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                                         }
                                         @if !warning.is_empty() {
                                             div .text-warning-strong .text-xs .mt-1 {
-                                                "\u{26a0} " (warning)
+                                                (ui::icons::triangle_alert()) (warning)
                                             }
                                         }
                                     }
@@ -572,7 +572,7 @@ pub async fn handle_edit_variable_form(
                 }
                 @if !warning.is_empty() {
                     div .var-warning-banner {
-                        "\u{26a0} " (warning)
+                        (ui::icons::triangle_alert()) (warning)
                     }
                 }
                 div .form-actions {

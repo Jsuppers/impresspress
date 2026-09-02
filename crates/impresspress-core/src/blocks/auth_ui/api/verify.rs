@@ -168,7 +168,14 @@ fn html_respond(
     auth_headline: &str,
     auth_tagline: &str,
 ) -> OutputStream {
-    let color = if success { "#10b981" } else { "#ef4444" };
+    // Static modifier rather than an inline `--icon-color`/`--icon-bg` pair:
+    // the two states are fixed, so their colours belong in the stylesheet
+    // where the contrast guard can see them (see auth-split.css).
+    let icon_state = if success {
+        "auth-status__icon--success"
+    } else {
+        "auth-status__icon--failure"
+    };
     let config = ui::SiteConfig {
         app_name: app_name.to_string(),
         logo_url: logo_url.to_string(),
@@ -187,7 +194,7 @@ fn html_respond(
             html! {
                 div .login-container {
                     div .auth-status {
-                        div .auth-status__icon .auth-status__icon--dynamic aria-hidden="true" style={"--icon-color:" (color) ";--icon-bg:" (color) "15"} {
+                        div class={"auth-status__icon " (icon_state)} aria-hidden="true" {
                             @if success { (icons::check()) } @else { (icons::x()) }
                         }
                         h2 .auth-status__title { (title) }

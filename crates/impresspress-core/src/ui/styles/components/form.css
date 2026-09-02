@@ -65,7 +65,10 @@
    floor, but this is the "merely ornaments a visible label" case, not text;
    left as-is and exempted in the contrast guard (ui/assets.rs) rather than
    darkened. */
-.form-label.required::after { content: ' *'; color: #ef4444; }
+/* #ef4444 is 3.76:1 on white -- below AA, and this asterisk is text, not a
+   non-text indicator. --accent-danger-text (6.47:1) is the same token every
+   other danger-text surface uses. */
+.form-label.required::after { content: ' *'; color: var(--accent-danger-text); }
 
 .form-input,
 .form-select,
@@ -77,7 +80,10 @@
 }
 
 .form-input::placeholder,
-.form-textarea::placeholder { color: #a0aec0; }
+/* #a0aec0 was 2.26:1 on the input's white background. Placeholder text is
+   text and needs 4.5:1; #6b7280 is 4.83:1 (computed) and still reads
+   lighter than the #111827 input value above. */
+.form-textarea::placeholder { color: #6b7280; }
 
 .form-input:hover:not(:disabled),
 .form-select:hover:not(:disabled),
@@ -259,11 +265,18 @@ body:has(.products-tabs) .filter-bar { margin: var(--space-4) 0; padding: var(--
    for this normal-size error text; --accent-danger-text (6.47:1, computed)
    is the text-safe sibling. --accent-danger itself stays for non-text use. */
 .text-danger { color: var(--accent-danger-text); }
-.text-success { color: var(--accent-success); }
+.text-success { color: var(--accent-success-text); }
 /* Strong warning text (variables admin warning notes) — #92400e has no
  * matching design token; carried over unchanged from the original inline
  * styles. */
-.text-warning-strong { color: #92400e; }
+/* #92400e is --accent-warning-text's own value -- the literal predated the
+   token. Now carries an `icons::triangle_alert()` mark, so it aligns and
+   sizes that icon the way .var-warning-banner does for the same warning. */
+.text-warning-strong {
+	color: var(--accent-warning-text);
+	display: flex; align-items: center; gap: var(--space-1);
+}
+.text-warning-strong svg { width: 14px; height: 14px; flex-shrink: 0; }
 .text-sm { font-size: 0.875rem; }
 .text-xs { font-size: 0.75rem; }
 .text-lg { font-size: var(--text-lg); }

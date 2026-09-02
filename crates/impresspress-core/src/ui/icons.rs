@@ -103,6 +103,22 @@ pub fn chevron_left() -> Markup {
     icon(r#"<path d="m15 18-6-6 6-6"/>"#)
 }
 
+/// Lucide `arrow-left`. Replaces the bare "\u{2190}" LEFT ARROW character
+/// that "Back" links used to render: a text glyph picks up the body font
+/// rather than the icon set, so its weight and baseline never matched the
+/// Lucide icon sitting next to it in the same button row.
+pub fn arrow_left() -> Markup {
+    icon(r#"<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>"#)
+}
+
+/// Lucide `message-square`. Replaces the "\u{1f4ac}" SPEECH BALLOON emoji in
+/// the LLM chat empty state -- an emoji renders in the platform's colour
+/// emoji font, so it ignored `currentColor` and looked nothing like the rest
+/// of the icon set.
+pub fn message_square() -> Markup {
+    icon(r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>"#)
+}
+
 pub fn chevron_right() -> Markup {
     icon(r#"<path d="m9 18 6-6-6-6"/>"#)
 }
@@ -191,6 +207,12 @@ pub fn arrow_down_left() -> Markup {
 
 pub fn arrow_up_right() -> Markup {
     icon(r#"<path d="M7 17 17 7"/><path d="M7 7h10v10"/>"#)
+}
+
+/// Lucide `arrow-right`. Replaces the bare "\u{2192}" RIGHT ARROW that
+/// "continue" links trailed their label with -- the mirror of [`arrow_left`].
+pub fn arrow_right() -> Markup {
+    icon(r#"<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>"#)
 }
 
 pub fn filter() -> Markup {
