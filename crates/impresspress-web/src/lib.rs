@@ -82,11 +82,10 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     // mean the page did not exist until a rebuild — and an instance with no
     // guest blocks has no reason to rebuild, so on the common path it would
     // never exist at all. `attach` answers `None` whenever the sandbox is not
-    // active, and the factory is then untouched.
+    // active, and the factory is then untouched. Without the feature there is
+    // no `attach` at all and `factory` is used as constructed.
     #[cfg(feature = "browser-devtools")]
-    let (factory, dev_shared) = dev_runtime::attach(factory);
-    #[cfg(not(feature = "browser-devtools"))]
-    let factory = factory;
+    let (factory, sandbox) = dev_runtime::attach(factory);
 
     let (wafer, _storage_block) = factory.build(&[]).await?;
 
@@ -98,8 +97,8 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     // was in the middle of, and rebuild with the active block set — all before
     // returning, because requests only start once `initialize()` resolves.
     #[cfg(feature = "browser-devtools")]
-    if let Some(shared) = &dev_shared {
-        dev_runtime::install(shared).await;
+    if let Some(sandbox) = &sandbox {
+        dev_runtime::install(sandbox).await;
     }
 
     Ok(())

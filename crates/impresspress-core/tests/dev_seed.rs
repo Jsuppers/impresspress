@@ -20,7 +20,7 @@ use impresspress_core::{
         repo::{self, generations::GenerationCause, runtime_state},
         seed::{self, SeedBlock, SeedFetch, SeedFile, SeedManifest},
         test_support::FakeControl,
-        workspace,
+        validation, workspace,
     },
     test_support::TestContext,
 };
@@ -325,6 +325,36 @@ async fn an_artifact_that_does_not_match_its_declared_hash_is_refused() {
         error.contains("/seed/blocks/hello.wasm") && error.contains("site/hello"),
         "{error}"
     );
+}
+
+/// The artifact size limit exists to bound what the artifact store holds, and
+/// a bundle that arrived over the network is no more entitled to exceed it
+/// than one that arrived over `POST /b/dev/api/builds/stage`.
+#[tokio::test]
+async fn an_oversized_artifact_is_refused_and_never_stored() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let huge = vec![0u8; validation::MAX_ARTIFACT_BYTES + 1];
+    let mut manifest = manifest();
+    manifest.blocks[0].spec.artifact_sha256 = blobs::sha256_hex(&huge);
+    let bundle = bundle().with(&seed::artifact_url("hello"), &huge);
+
+    let error = seed::import(&ctx, &manifest, &bundle)
+        .await
+        .expect_err("an oversized artifact must refuse the import");
+    assert!(
+        error.contains("artifact is at least") && error.contains("/seed/blocks/hello.wasm"),
+        "{error}"
+    );
+    // Refused beside the hash check and before the `put`: the store never saw
+    // it, and neither did the workspace.
+    assert!(!artifacts::exists(&ctx, &blobs::sha256_hex(&huge))
+        .await
+        .expect("exists"));
+    assert!(workspace::load(&ctx)
+        .await
+        .expect("workspace")
+        .files
+        .is_empty());
 }
 
 #[tokio::test]

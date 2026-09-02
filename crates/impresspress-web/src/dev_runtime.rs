@@ -40,7 +40,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::Arc,
 };
 
@@ -192,15 +192,42 @@ impl Context for DenyAllContext {
 // The control
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// The one strong handle to the sandbox's runtime factory.
+    ///
+    /// The factory is a process-lifetime singleton — every rebuild goes
+    /// through it, and it owns the platform services every runtime shares — so
+    /// it is owned here, by the module, exactly as the live `Wafer` is owned
+    /// by `impresspress_browser::runtime`. That is what lets
+    /// [`BrowserRuntimeControl`] hold a [`Weak`] and the reference graph stay
+    /// acyclic: control → (weak) factory → `DevShared` → control.
+    static FACTORY: RefCell<Option<Rc<RuntimeFactory>>> = const { RefCell::new(None) };
+}
+
 /// The host's half of activation, backed by wasmi and the shared
 /// [`RuntimeFactory`].
 pub struct BrowserRuntimeControl {
     /// The factory every rebuild goes through, once [`Self::set_factory`] has
-    /// closed the cycle described in the module header. `None` only between
-    /// construction and that call, which is a window no `rebuild` can reach.
-    factory: RefCell<Option<Rc<RuntimeFactory>>>,
+    /// closed the cycle described in the module header.
+    ///
+    /// `Weak`, because the factory holds the `DevShared` that holds this
+    /// control: a strong handle here would be a reference cycle, and the
+    /// factory transitively owns every platform service, so it is not a cycle
+    /// anyone would want leaked. The strong handle lives in [`FACTORY`].
+    factory: RefCell<Weak<RuntimeFactory>>,
     /// Bumped by every successful rebuild; read by `GET /b/dev/api/status`.
     generation: Cell<u64>,
+    /// The block set of the last **successful** rebuild, or `None` before the
+    /// first one.
+    ///
+    /// Read by [`install`] to decide whether the runtime already carries the
+    /// block set the ledger says is active. The generation counter alone
+    /// cannot answer that: `activation::restore` folds a failed
+    /// `rebuild(previous)` into a message and returns, so a runtime can be
+    /// left carrying the block set of a generation the ledger has just marked
+    /// `Failed` — with the counter bumped by the rebuild that *did* succeed
+    /// on the way in.
+    last_built: RefCell<Option<Vec<DynamicBlockSpec>>>,
 }
 
 impl BrowserRuntimeControl {
@@ -209,26 +236,47 @@ impl BrowserRuntimeControl {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            factory: RefCell::new(None),
+            factory: RefCell::new(Weak::new()),
             generation: Cell::new(0),
+            last_built: RefCell::new(None),
         })
     }
 
-    /// Close the control → factory half of the cycle.
+    /// Close the control → factory half of the cycle, taking ownership of the
+    /// strong handle in [`FACTORY`].
     pub fn set_factory(&self, factory: &Rc<RuntimeFactory>) {
-        *self.factory.borrow_mut() = Some(Rc::clone(factory));
+        FACTORY.with(|slot| *slot.borrow_mut() = Some(Rc::clone(factory)));
+        *self.factory.borrow_mut() = Rc::downgrade(factory);
     }
 
-    /// The factory, cloned out.
+    /// The factory, upgraded out of the `Weak`.
     ///
-    /// Cloned rather than borrowed because every caller is about to `await`,
-    /// and a `RefCell` borrow held across a suspension point is a panic
-    /// waiting for the first concurrent activation.
+    /// Taken out of the `RefCell` rather than borrowed across the caller's
+    /// `await`s: a borrow held across a suspension point is a panic waiting
+    /// for the first concurrent activation.
     fn factory(&self) -> Result<Rc<RuntimeFactory>, String> {
         self.factory
             .borrow()
-            .clone()
-            .ok_or_else(|| "the sandbox runtime factory was never installed".to_string())
+            .upgrade()
+            .ok_or_else(|| "the sandbox runtime factory is not installed".to_string())
+    }
+
+    /// Whether the live runtime was last built from exactly `blocks`.
+    ///
+    /// Compared by name and artifact hash — the two fields that decide what
+    /// code is registered under which name. Capabilities and routes are
+    /// functions of an accepted spec that is itself keyed by those two, so a
+    /// difference in either would be a difference here first.
+    fn already_built(&self, blocks: &[DynamicBlockSpec]) -> bool {
+        let built = self.last_built.borrow();
+        let Some(built) = built.as_deref() else {
+            return blocks.is_empty();
+        };
+        built.len() == blocks.len()
+            && built
+                .iter()
+                .zip(blocks)
+                .all(|(a, b)| a.name == b.name && a.artifact_sha256 == b.artifact_sha256)
     }
 }
 
@@ -413,6 +461,7 @@ impl RuntimeControl for BrowserRuntimeControl {
             .await
             .map_err(|e| describe_js(&e, "building the runtime"))?;
         impresspress_browser::replace_wafer(wafer).map_err(|e| e.to_string())?;
+        *self.last_built.borrow_mut() = Some(blocks.to_vec());
         self.generation.set(self.generation.get().saturating_add(1));
         Ok(())
     }
@@ -445,10 +494,26 @@ impl RuntimeControl for BrowserRuntimeControl {
 ///   `impresspress/dev/…`. The storage block's own cross-block WRAP check —
 ///   the one that admits the reach into `wafer-run/web/site` — still runs
 ///   against the real grant list.
-/// * `check_resource_access` allows. This is the host's own trusted entry, in
-///   the same sense `Wafer::run_block` is documented to be: it runs before any
-///   request has been served, on behalf of the block that owns the data it
-///   touches.
+/// * `check_resource_access` runs the **real** WRAP check — the identical
+///   `wrap::check_access` call `RuntimeContext::check_resource_access` makes,
+///   keyed on the same caller and against the runtime's own grants and admin
+///   block. Boot is not a reason to grant the dev block more than a request
+///   would, and a blanket `Ok(())` here would have made boot the one path on
+///   which a bug in any of it was invisible. It admits what it has to:
+///   `impresspress__dev__*` tables self-admit under the own-resource rule,
+///   `__ddl__` / `__schema__` admit any attributable caller, and storage
+///   resources reach this call already rewritten by
+///   `ImpresspressStorageBlock` into un-prefixed paths — the block's own
+///   folder for blobs and artifacts, `wafer-run/web/site/…` for the publisher
+///   — which the storage self-admit rule allows exactly as it does for a
+///   request. That block's own cross-block gate runs too, because this
+///   context calls *into* it rather than around it.
+///
+/// The one thing boot does not reproduce is `RuntimeContext::dispatch_call`'s
+/// `requires` / `allows_call_block` gate, which asks whether the *calling
+/// block* may call the callee. There is no calling block here — the host is
+/// asking on the dev block's behalf, in the same sense `Wafer::run_block` is
+/// documented to be a trusted entry.
 ///
 /// The `Rc` is pinned to the runtime that was live when [`install`] started,
 /// and a rebuild during boot swaps a *different* one in behind it. That is
@@ -492,11 +557,18 @@ impl Context for BootContext {
 
     fn check_resource_access(
         &self,
-        _resource: &str,
-        _resource_type: wafer_run::ResourceType,
-        _is_write: bool,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
     ) -> Result<(), WaferError> {
-        Ok(())
+        wafer_run::wrap::check_access(
+            Some(BLOCK_NAME),
+            resource,
+            is_write,
+            Some(&resource_type),
+            self.wafer.wrap_grants(),
+            self.wafer.wrap_admin_block(),
+        )
     }
 }
 
@@ -563,16 +635,28 @@ impl seed::SeedFetch for SwFetch {
 // Installation
 // ---------------------------------------------------------------------------
 
+/// The two halves of an attached sandbox: the control the host drives, and the
+/// shared state the `impresspress/dev` block runs on.
+///
+/// Both are needed by [`install`] and neither can be reached from the other:
+/// `DevShared` holds the control only as `Arc<dyn RuntimeControl>` (no
+/// downcast), and the control deliberately does not hold `DevShared` — that
+/// would be the reference cycle the [`Weak`] factory handle exists to avoid.
+pub struct Sandbox {
+    control: Arc<BrowserRuntimeControl>,
+    shared: Arc<DevShared>,
+}
+
 /// Attach the sandbox control plane to `factory`, before the first runtime is
 /// built.
 ///
 /// Returns the shared factory handle and — when the sandbox is actually active
-/// — the `DevShared` [`install`] needs. `None` is the whole "feature off (or
+/// — the [`Sandbox`] [`install`] needs. `None` is the whole "feature off (or
 /// flag off) = nothing" rule from this crate's `resolve_dev_active`: no
 /// control, no `DevShared`, so `RuntimeFactory::with_dev` is never called and
 /// the runtime that gets built is byte-identical to one that never asked for a
 /// sandbox.
-pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Arc<DevShared>>) {
+pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Sandbox>) {
     if !factory.dev_active {
         return (Rc::new(factory), None);
     }
@@ -580,7 +664,7 @@ pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Arc<DevSha
     let shared = DevShared::new(control.clone());
     let factory = Rc::new(factory.with_dev(shared.clone()));
     control.set_factory(&factory);
-    (factory, Some(shared))
+    (factory, Some(Sandbox { control, shared }))
 }
 
 /// Bring the sandbox up on the runtime that was just stored.
@@ -591,25 +675,31 @@ pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Arc<DevSha
 ///    no `/seed/manifest.json` is the ordinary case and not an error.
 /// 2. **Converge** on whatever the activation journal says was in flight, and
 ///    learn the block set the active generation declares.
-/// 3. **Rebuild**, when that set is not empty and steps 1–2 have not already
-///    rebuilt, *before returning*. Requests only start arriving once
-///    `initialize()` has resolved, so this is what keeps a request from being
-///    served by the base runtime while its blocks are still pending.
+/// 3. **Rebuild**, unless the runtime already carries exactly that block set,
+///    *before returning*. Requests only start arriving once `initialize()` has
+///    resolved, so this is what keeps a request from being served by a runtime
+///    whose blocks are still pending.
 ///
-/// The "have not already rebuilt" guard is the runtime generation counter.
-/// Activating a seed that carries blocks, or converging on an interrupted
-/// activation, rebuilds on its own — and in every path through
-/// `activation.rs` the *last* rebuild is with the set that ends up active,
-/// which is exactly what `converge_on_boot` then returns. Rebuilding again
-/// would boot a second identical runtime (migrations, block init and all) on
-/// the one boot that can least afford it: the first.
+/// The guard compares the converged set against the set of the last
+/// **successful** rebuild ([`BrowserRuntimeControl::already_built`]), not
+/// against a counter of how many rebuilds happened. Steps 1–2 do rebuild on
+/// their own — activating a seed that carries blocks, or converging on an
+/// interrupted activation — and rebuilding a second, identical runtime
+/// (migrations, block init and all) on the one boot that can least afford it
+/// is worth avoiding. But "some rebuild happened" is not the same claim:
+/// `activation::restore` folds a failed `rebuild(previous)` into a message and
+/// carries on, so a runtime can be left carrying the block set of a generation
+/// the ledger has just marked `Failed` while the counter records the rebuild
+/// that *did* succeed on the way in. Comparing the sets is what makes this
+/// step corrective rather than merely idempotent — including the case where
+/// the ledger says nothing is active and the runtime is holding a block.
 ///
 /// Every step logs its own failure and continues rather than failing
 /// `initialize()`. A sandbox that refuses to boot is a sandbox whose `/b/dev`
 /// page — the only thing that could fix it — never comes up; a sandbox that
 /// boots with nothing dynamic still serves the page, the ledger and the
 /// diagnostics that say why.
-pub async fn install(shared: &Arc<DevShared>) {
+pub async fn install(sandbox: &Sandbox) {
     let Some(wafer) = impresspress_browser::current_wafer() else {
         web_sys::console::error_1(
             &"impresspress: the dev sandbox cannot install before a runtime is stored".into(),
@@ -617,7 +707,7 @@ pub async fn install(shared: &Arc<DevShared>) {
         return;
     };
     let ctx = BootContext { wafer };
-    let generation_before = shared.control.runtime_generation();
+    let shared = &sandbox.shared;
 
     if let Err(e) = seed_on_boot(&ctx, shared).await {
         web_sys::console::error_1(&format!("impresspress: dev sandbox seed import: {e}").into());
@@ -632,7 +722,7 @@ pub async fn install(shared: &Arc<DevShared>) {
             return;
         }
     };
-    if blocks.is_empty() || shared.control.runtime_generation() != generation_before {
+    if sandbox.control.already_built(&blocks) {
         return;
     }
     if let Err(e) = shared.control.rebuild(&blocks).await {
@@ -666,8 +756,24 @@ async fn seed_on_boot(ctx: &dyn Context, shared: &Arc<DevShared>) -> Result<(), 
     let Some(bytes) = fetch.try_get(seed::MANIFEST_URL).await? else {
         return Ok(());
     };
-    let manifest: SeedManifest =
-        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", seed::MANIFEST_URL))?;
+    // A 200 whose body is not a seed manifest is "no seed", not a failure. A
+    // static host that answers every unknown path with the SPA's `index.html`
+    // is the common case, and on such a host the *absence* of a bundle looks
+    // exactly like this. Said at info: worth seeing when a seed was expected,
+    // and not a fault when one was not.
+    let manifest: SeedManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            web_sys::console::info_1(
+                &format!(
+                    "impresspress: {} did not parse as a seed manifest ({e}) — booting with no                      seed",
+                    seed::MANIFEST_URL
+                )
+                .into(),
+            );
+            return Ok(());
+        }
+    };
     let Some(generation) = seed::import(ctx, &manifest, &fetch).await? else {
         return Ok(());
     };

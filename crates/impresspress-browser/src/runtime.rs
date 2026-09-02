@@ -56,8 +56,15 @@ pub fn store_wafer(wafer: wafer_run::Wafer) -> Result<(), StoreError> {
     })
 }
 
-/// Swap in a rebuilt runtime and hand back the one that was active so the
-/// caller can restore it if a later activation step fails.
+/// Swap in a rebuilt runtime and hand back the one that was active.
+///
+/// The returned handle is what makes the swap reversible: an activation
+/// rebuilds the runtime *before* it publishes the site, so a publish that
+/// fails afterwards has to put the previous runtime back. Hold the returned
+/// `Rc` across the rest of the activation and pass it to [`restore_wafer`] on
+/// that path; drop it once the activation has committed. A caller that
+/// discards it cannot undo the swap — the old runtime is gone as soon as the
+/// last handle to it is.
 pub fn replace_wafer(wafer: wafer_run::Wafer) -> Result<Rc<wafer_run::Wafer>, StoreError> {
     RUNTIME.with(|r| {
         let mut slot = r.borrow_mut();

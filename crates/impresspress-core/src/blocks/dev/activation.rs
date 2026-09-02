@@ -837,11 +837,20 @@ pub async fn converge_on_boot(
 /// it, because the page is served by the runtime the failed boot never built.
 ///
 /// So it is treated exactly like a dangling desired: log at `error!`, record
-/// the failure on the row when there is one, clear the journal, and boot with
+/// the failure on the row when there is one, clear the pointer, and boot with
 /// no active generation. The site files already in `wafer-run/web/site` are
 /// left alone — they are the last coherent publish, and nothing readable says
 /// what should replace them. What the instance loses is the ledger's claim
 /// that they belong to a generation, which is the claim that was corrupt.
+///
+/// **`desired` is kept.** Only the `active` half is cleared, because an
+/// unreadable `active` says nothing about an interrupted activation that is
+/// still perfectly loadable — and that activation is the best answer available
+/// to "what should this instance serve?". [`converge_on_boot`] therefore still
+/// converges on it, with `previous = None`, which republishes its site whole
+/// and leaves the instance serving a generation the ledger can describe. A
+/// `desired` that is *also* unloadable falls into the dangling-desired arm
+/// below and is abandoned there.
 ///
 /// Returns the journal as it stands afterwards, so the caller reads the
 /// cleared state rather than the one it passed in.
@@ -864,9 +873,7 @@ async fn active_or_clear(
             abandon_dangling(ctx, &id, &e.message).await?;
             let cleared = RuntimeState {
                 active_generation_id: None,
-                desired_generation_id: None,
-                activation_phase: ActivationPhase::Idle,
-                generation: state.generation,
+                ..state.clone()
             };
             repo::runtime_state::write(ctx, &cleared)
                 .await

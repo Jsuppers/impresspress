@@ -47,6 +47,7 @@ use super::{
     generation::GenerationManifest,
     paths,
     repo::{self, runtime_state},
+    validation,
     workspace::{self, Workspace},
 };
 
@@ -248,6 +249,19 @@ pub async fn import(
         // of it to disagree with.
         let url = artifact_url(name);
         let bytes = fetch.get(&url).await?;
+        // The same bound the staging path enforces, for the same reason: the
+        // limit exists to bound what the artifact store holds, and a bundle
+        // that arrived over the network is no more entitled to exceed it than
+        // one that arrived over `POST /b/dev/api/builds/stage`. Checked beside
+        // the hash and before the `put`, so an oversized module is never
+        // stored. The wording is `Diagnostic::artifact_too_large`'s, which is
+        // where the limit and its remedy are stated.
+        if bytes.len() > validation::MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{url}: {}",
+                validation::Diagnostic::artifact_too_large(bytes.len()).message
+            ));
+        }
         let actual = blobs::sha256_hex(&bytes);
         if actual != block.spec.artifact_sha256 {
             return Err(format!(

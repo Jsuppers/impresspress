@@ -1219,3 +1219,59 @@ async fn boot_clears_an_active_pointer_to_an_unreadable_generation() {
         row.failure_message
     );
 }
+
+/// Clearing an unreadable `active` must not throw away a `desired` that loads
+/// perfectly well. The interrupted activation is the best answer available to
+/// "what should this instance serve?", and converging on it is what leaves the
+/// ledger and the published folder describing the same thing again.
+#[tokio::test]
+async fn an_unreadable_active_pointer_still_converges_on_a_loadable_desired() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    // A real, loadable generation, staged but never activated.
+    let desired = repo::new_id();
+    let site = serde_json::json!({"files": []}).to_string();
+    generations::insert(
+        &ctx,
+        &NewGeneration {
+            id: desired.clone(),
+            parent_id: None,
+            cause: GenerationCause::Seed,
+            site_manifest_json: site,
+            block_manifest_json: "[]".to_string(),
+            manifest_sha256: "dd".to_string(),
+        },
+    )
+    .await
+    .expect("stage the desired generation");
+
+    // ...behind an `active` pointer nothing can load.
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    runtime_state::write(
+        &ctx,
+        &RuntimeState {
+            active_generation_id: Some("a-generation-that-never-existed".to_string()),
+            desired_generation_id: Some(desired.clone()),
+            activation_phase: ActivationPhase::Publishing,
+            ..state
+        },
+    )
+    .await
+    .expect("journal");
+
+    let blocks = activation::converge_on_boot(&ctx, &ctx.dev_shared())
+        .await
+        .expect("boot must not fail");
+    assert!(blocks.is_empty());
+
+    let state = runtime_state::read(&ctx).await.expect("read journal");
+    assert_eq!(
+        state.active_generation_id.as_deref(),
+        Some(desired.as_str()),
+        "the loadable desired generation is what the instance ends up serving"
+    );
+    assert_eq!(state.desired_generation_id, None);
+    assert_eq!(state.activation_phase, ActivationPhase::Idle);
+    assert_eq!(status_of_generation(&ctx, &desired).await, "active");
+}

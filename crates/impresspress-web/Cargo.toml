@@ -19,7 +19,16 @@ dynamic-wasm-blocks = ["wafer-run/wasmi"]
 # anything, and a bundle built without it ignores the flag entirely — the
 # sandbox's security model is that the block is absent from normal
 # deployments, not merely switched off in one.
-browser-devtools = ["dynamic-wasm-blocks", "impresspress-core/block-dev"]
+# `web-sys/ServiceWorkerGlobalScope` + `WorkerGlobalScope`: seed-on-boot
+# fetches `/seed/manifest.json` from the worker's own global (`web_sys::window()`
+# is `None` there). Pulled in by the feature rather than unconditionally, so a
+# feature-off build compiles exactly the web-sys surface it did before.
+browser-devtools = [
+    "dynamic-wasm-blocks",
+    "impresspress-core/block-dev",
+    "web-sys/ServiceWorkerGlobalScope",
+    "web-sys/WorkerGlobalScope",
+]
 
 [dependencies]
 # Browser framework (platform services + SW plumbing)
@@ -33,10 +42,6 @@ web-sys = { version = "0.3", features = [
     "Headers", "ReadableStream",
     "Url",
     "console",
-    # The service worker's own global, and the `fetch` it inherits from
-    # `WorkerGlobalScope`: `web_sys::window()` is `None` here, and the dev
-    # sandbox's seed-on-boot has to read `/seed/manifest.json` itself.
-    "ServiceWorkerGlobalScope", "WorkerGlobalScope",
 ] }
 js-sys = "0.3"
 
