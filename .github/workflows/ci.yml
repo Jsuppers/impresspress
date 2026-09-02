@@ -187,6 +187,16 @@ jobs:
       - name: Check impresspress-cloudflare (wasm32)
         run: cargo check --locked -p impresspress-cloudflare --target wasm32-unknown-unknown
 
+      # `--tests` is what pulls the crate's `#[wasm_bindgen_test]` modules into
+      # the type check — the plain check above does not compile `#[cfg(test)]`
+      # code at all, so a signature break in the runtime-cache / KV-cache
+      # regression tests sat invisible. Same reasoning (and same fix) as the
+      # `Check impresspress-browser conformance wiring` step below; kept
+      # separate from the `cloudflare-wasm-test` job so it runs unconditionally
+      # even when that job's path filter skips.
+      - name: Check impresspress-cloudflare tests (wasm32)
+        run: cargo check --locked --tests -p impresspress-cloudflare --target wasm32-unknown-unknown
+
       # Compile-time DatabaseService conformance assertions (wafer-run #319
       # shared suite) for the D1 + KV-cached adapters. Off-by-default feature so
       # the ~1.3k-line suite never enters the production Worker wasm; this step
@@ -221,6 +231,59 @@ jobs:
   # browser install needed. Independent of the impresspress-web wasm build
   # (build.rs's include_bytes! prereq only matters for the `impresspress`
   # crate), so this job doesn't need `build-wasm`'s artifact.
+  # impresspress-cloudflare's `#[wasm_bindgen_test]`s (runtime_cache.rs's
+  # probe/backoff/plan-trust policy and kv_cached_db.rs's row-cache
+  # write-suppression) were compiled by nothing and run by nothing: the crate
+  # is excluded from the host `cargo test` above, and the wasm `cargo check`
+  # skipped `#[cfg(test)]` entirely. That is how the KV error-as-miss defect
+  # (2026-08-30/31 read exhaustion -> multi-thousand write bursts) reached
+  # production with a green pipeline.
+  #
+  # `wasm-pack test --node` does NOT work here — the crate is a cdylib and
+  # wasm-pack collects 0 tests from it — so this drives the same
+  # wasm-bindgen-test-runner directly through cargo. The runner is part of
+  # wasm-bindgen-cli and its version must match the `wasm-bindgen` crate
+  # (0.2.122, pinned in Cargo.lock) or it refuses to run the module.
+  # These are pure-logic tests (in-memory KV/DB doubles, no worker::Env, no
+  # real fetch), so Node is enough; no browser install needed.
+  cloudflare-wasm-test:
+    name: Cloudflare WASM tests (impresspress-cloudflare)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for impresspress-cloudflare changes
+        id: cloudflare-changes
+        run: |
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/)
+          if [ -z "$CHANGED" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust
+        if: steps.cloudflare-changes.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        if: steps.cloudflare-changes.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen-test-runner
+        if: steps.cloudflare-changes.outputs.skip != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
+      - name: Run impresspress-cloudflare wasm tests (Node)
+        if: steps.cloudflare-changes.outputs.skip != 'true'
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --lib
+
   browser-wasm-test:
     name: Browser WASM tests (impresspress-browser)
     runs-on: ubuntu-latest
@@ -465,11 +528,14 @@ jobs:
             exit 1
           fi
 
-      - name: Run visual-baseline tests (native server, port 8093)
+      # webmcp.spec.ts runs AFTER the visual baselines: it seeds a product into
+      # the same database, and a product that exists before the admin pages are
+      # screenshotted would show up in them.
+      - name: Run visual-baseline and WebMCP end-to-end tests (native server, port 8093)
         working-directory: crates/impresspress-web
         env:
           TEST_PORT: 8093
-        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts
+        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts tests/e2e/webmcp.spec.ts
 
       - name: Stop server
         if: always()
@@ -605,6 +671,23 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM impresspress__products__product_templates WHERE id IN ('simple_product','simple_subscription','configurable_product','configurable_subscription')")" -eq 4
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE table_name = 'impresspress__products__purchases' AND column_name IN ('shipping_cents','subscription_event_created','provider_payment_status','payment_intent_event_created')")" -eq 4
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE (table_name, column_name) IN (('impresspress__products__refunds','stripe_event_created'),('impresspress__products__seller_accounts','stripe_event_created'),('impresspress__products__provider_operations','processing_owner'))")" -eq 3
+
+      # 020 repairs historical `deleted_at = ''` rows. Those rows sit OUTSIDE
+      # 005's partial unique slug index (`slug <> '' AND deleted_at IS NULL`),
+      # so while one existed another product was free to take its slug —
+      # and the repair pulls it back into the index against that slug. A
+      # unique violation there aborts the whole migration (only a duplicate
+      # ADD COLUMN is tolerated), leaving the hash unstamped so every later
+      # boot re-runs and re-fails; on Cloudflare that is a 500 per request.
+      # `slug_collision_cannot_fail_020` pins the guard on SQLite — this pins
+      # the same behaviour on real PostgreSQL. 020 already ran above against
+      # an empty table and is re-runnable.
+      - name: Migration 020 tolerates a slug collision
+        run: |
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__products__products (id, name, slug, deleted_at, created_at, updated_at) VALUES ('blank_jacket', 'bj', 'jacket', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('live_jacket', 'lj', 'jacket', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_hat_a', 'ba', 'hat', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_hat_b', 'bb', 'hat', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_scarf', 'bs', 'scarf', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('blank_noslug', 'bn', '', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('live_noslug', 'ln', '', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+          psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/products/migrations/020_normalize_blank_deleted_at.postgres.sql
+          test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at IS NULL")" = "blank_noslug,blank_scarf,live_jacket,live_noslug"
+          test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at = ''")" = "blank_hat_a,blank_hat_b,blank_jacket"
 
   audit:
     name: Security Audit

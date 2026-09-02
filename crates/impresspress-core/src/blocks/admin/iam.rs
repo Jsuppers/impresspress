@@ -41,7 +41,7 @@ pub async fn handle(
         ("retrieve", "/admin/iam/roles") => handle_list_roles(ctx).await,
         ("create", "/admin/iam/roles") => handle_create_role(ctx, msg, input).await,
         ("update", _) if path.starts_with("/admin/iam/roles/") => {
-            handle_update_role(ctx, path, input).await
+            handle_update_role(ctx, msg, path, input).await
         }
         ("delete", _) if path.starts_with("/admin/iam/roles/") => {
             handle_delete_role(ctx, msg, path).await
@@ -108,7 +108,12 @@ async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream
     }
 }
 
-async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -> OutputStream {
+async fn handle_update_role(
+    ctx: &dyn Context,
+    msg: &Message,
+    path: &str,
+    input: InputStream,
+) -> OutputStream {
     let id = path.strip_prefix("/admin/iam/roles/").unwrap_or("");
     if id.is_empty() {
         return err_bad_request("Missing role ID");
@@ -141,6 +146,17 @@ async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -
         return err_forbidden("Cannot rename system roles");
     }
 
+    // `user_roles.role` stores the role NAME, not its id (`fetch_roles` reads
+    // the `role` column; `handle_assign_role` writes `body.role`). A rename
+    // that does not carry the grants with it leaves every assignment naming a
+    // role that no longer exists, so the grant silently stops matching.
+    let old_name = existing.str_field("name").to_string();
+    let rename_to = body
+        .name
+        .as_deref()
+        .filter(|name| *name != old_name)
+        .map(str::to_string);
+
     let mut data = HashMap::new();
     if let Some(name) = body.name {
         data.insert("name".to_string(), serde_json::Value::String(name));
@@ -155,12 +171,89 @@ async fn handle_update_role(ctx: &dyn Context, path: &str, input: InputStream) -
         data.insert("permissions".to_string(), serde_json::json!(permissions));
     }
     crate::util::stamp_updated(&mut data);
-    match db::update(ctx, ROLES_TABLE, id, data).await {
-        // Same projection as list/create, for the same reason.
-        Ok(record) => ok_json(&AdminRoleView::from_record(&record)),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Role not found"),
-        Err(e) => err_internal("Database error", e),
+    let record = match db::update(ctx, ROLES_TABLE, id, data).await {
+        Ok(record) => record,
+        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Role not found"),
+        Err(e) => return err_internal("Database error", e),
+    };
+
+    if let Some(new_name) = rename_to {
+        if let Err(out) = cascade_role_rename(ctx, &old_name, &new_name).await {
+            return out;
+        }
     }
+
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "role.update",
+        &format!("roles/{id}"),
+        msg.remote_addr(),
+    )
+    .await;
+
+    // Same projection as list/create, for the same reason.
+    ok_json(&AdminRoleView::from_record(&record))
+}
+
+/// Carry a role rename onto every `user_roles` row naming the old value, and
+/// invalidate the affected users' access tokens.
+///
+/// The grants store the role name, so this is what keeps them pointing at the
+/// role they were granted. The auth-version bump is the same reasoning as
+/// `handle_assign_role`'s: the set of roles a live JWT was minted with has
+/// changed, so it must stop authenticating.
+async fn cascade_role_rename(
+    ctx: &dyn Context,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), OutputStream> {
+    let grants = match db::list_all(
+        ctx,
+        USER_ROLES_TABLE,
+        vec![Filter {
+            field: "role".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(old_name.to_string()),
+        }],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return Err(err_internal("Database error", e)),
+    };
+
+    for grant in &grants {
+        let mut data = HashMap::new();
+        data.insert(
+            "role".to_string(),
+            serde_json::Value::String(new_name.to_string()),
+        );
+        crate::util::stamp_updated(&mut data);
+        if let Err(e) = db::update(ctx, USER_ROLES_TABLE, &grant.id, data).await {
+            return Err(err_internal(
+                "Role renamed but its grants did not follow",
+                e,
+            ));
+        }
+
+        let user_id = grant.str_field("user_id");
+        if user_id.is_empty() {
+            continue;
+        }
+        if let Err(e) = bump_auth_version(ctx, user_id).await {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "role grant renamed but auth_version bump failed"
+            );
+            return Err(err_internal(
+                "Role renamed but session invalidation failed",
+                e,
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn handle_delete_role(ctx: &dyn Context, msg: &Message, path: &str) -> OutputStream {
@@ -550,6 +643,141 @@ mod tests {
         InputStream::from_bytes(serde_json::to_vec(&json).unwrap())
     }
 
+    /// The system-role guard on the delete path must fail closed, exactly as
+    /// the update path does. A transient read error previously fell through
+    /// the `if let Ok(role)` and deleted the row — and this endpoint is now
+    /// declared, schema-bearing and agent-reachable.
+    #[tokio::test]
+    async fn delete_role_rejects_deletion_when_guard_read_errors() {
+        let ctx = TestContext::with_admin().await;
+        let role_id = seed_system_role(&ctx).await;
+        let failing = FailingGetContext { inner: ctx };
+
+        let out = super::super::ops::delete_role(
+            &failing,
+            &admin_msg("delete", "/admin/iam/roles"),
+            &role_id,
+        )
+        .await;
+
+        match out {
+            Err(stream) => {
+                assert!(
+                    output_is_error(stream, "Internal").await,
+                    "a failed guard read must be reported, not treated as \
+                     'not a system role'"
+                );
+            }
+            Ok(()) => panic!("delete succeeded while the system-role guard read was failing"),
+        }
+
+        // The row must still be there: the mutation must not have run.
+        let still_there = db::get(&failing.inner, ROLES_TABLE, &role_id).await;
+        assert!(
+            still_there.is_ok(),
+            "the system role was deleted despite the guard read failing"
+        );
+    }
+
+    /// `user_roles.role` stores the role NAME, so renaming a role definition
+    /// without cascading silently orphans every grant: the assignment rows
+    /// keep naming a role that no longer exists, and every auth check that
+    /// reads them stops matching.
+    #[tokio::test]
+    async fn update_role_rename_cascades_to_its_assignments() {
+        let ctx = TestContext::with_admin().await;
+
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({ "name": "editor", "permissions": ["posts.write"] })),
+            )
+            .await,
+        )
+        .await;
+        let role_id = created["id"].as_str().expect("created role id").to_string();
+
+        // Grant it to a user, the way the admin UI does.
+        let assigned = handle_assign_role(
+            &ctx,
+            &admin_msg("create", "/admin/iam/user-roles"),
+            body_input(serde_json::json!({ "user_id": "user_1", "role": "editor" })),
+        )
+        .await;
+        assert!(
+            assigned.collect_buffered().await.is_ok(),
+            "seeding the role assignment must succeed"
+        );
+
+        let out = handle_update_role(
+            &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
+            &format!("/admin/iam/roles/{role_id}"),
+            body_input(serde_json::json!({ "name": "editor-v2" })),
+        )
+        .await;
+        assert!(out.collect_buffered().await.is_ok(), "rename must succeed");
+
+        let rows = db::list_all(
+            &ctx,
+            USER_ROLES_TABLE,
+            vec![Filter {
+                field: "user_id".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("user_1"),
+            }],
+        )
+        .await
+        .expect("list assignments");
+        let names: Vec<&str> = rows.iter().map(|r| r.str_field("role")).collect();
+        assert_eq!(
+            names,
+            vec!["editor-v2"],
+            "the grant must follow the rename, or it names a role that no \
+             longer exists"
+        );
+    }
+
+    /// Every other role mutation writes an audit row; a rename — which
+    /// invalidates every grant naming the old value — wrote none.
+    #[tokio::test]
+    async fn update_role_writes_an_audit_row() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/admin/iam/roles"),
+                body_input(serde_json::json!({ "name": "auditor", "permissions": [] })),
+            )
+            .await,
+        )
+        .await;
+        let role_id = created["id"].as_str().expect("created role id").to_string();
+
+        let out = handle_update_role(
+            &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
+            &format!("/admin/iam/roles/{role_id}"),
+            body_input(serde_json::json!({ "description": "reads everything" })),
+        )
+        .await;
+        assert!(out.collect_buffered().await.is_ok(), "update must succeed");
+
+        let rows = db::list_all(
+            &ctx,
+            super::super::logs::AUDIT_LOGS_TABLE,
+            vec![Filter {
+                field: "action".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("role.update"),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        assert_eq!(rows.len(), 1, "a role update must leave an audit trail");
+    }
+
     #[tokio::test]
     async fn update_role_rejects_mutation_when_guard_read_errors() {
         // Real system role exists in the DB (renaming it would break auth).
@@ -563,6 +791,7 @@ mod tests {
         let path = format!("/admin/iam/roles/{role_id}");
         let out = handle_update_role(
             &failing,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"name": "renamed-admin"})),
         )
@@ -602,6 +831,7 @@ mod tests {
         let path = format!("/admin/iam/roles/{role_id}");
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"name": "renamed-admin"})),
         )
@@ -615,6 +845,7 @@ mod tests {
         let path = "/admin/iam/roles/does-not-exist".to_string();
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"description": "x"})),
         )
@@ -636,6 +867,7 @@ mod tests {
         let path = format!("/admin/iam/roles/{}", created.id);
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"name": "renamed-editor"})),
         )
@@ -714,6 +946,7 @@ mod tests {
         let updated = output_json(
             handle_update_role(
                 &ctx,
+                &admin_msg("update", "/admin/iam/roles"),
                 &path,
                 body_input(serde_json::json!({"permissions": ["posts.read", "posts.write"]})),
             )
@@ -728,6 +961,7 @@ mod tests {
 
         let out = handle_update_role(
             &ctx,
+            &admin_msg("update", "/admin/iam/roles"),
             &path,
             body_input(serde_json::json!({"permissions": "posts.*"})),
         )

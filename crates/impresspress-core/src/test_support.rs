@@ -356,10 +356,29 @@ impl TestContext {
     /// read/repository function surfaces — rather than swallows — a genuine
     /// read failure instead of collapsing it into the same "not found" /
     /// zero-valued result it uses for a legitimate absence.
-    pub fn break_reads(mut self) -> Self {
+    pub fn break_reads(self) -> Self {
+        self.with_failing_reads(true)
+    }
+
+    /// Like [`Self::break_reads`], but single-row `get` still delegates to the
+    /// real data: only the multi-row reads (`list`/`count`/`sum`/`aggregate`/
+    /// `query_raw`) fail.
+    ///
+    /// This is the shape a "load one record, then query for related rows"
+    /// handler actually faces when the database wobbles — the single-row read
+    /// lands and the follow-up query is the one that fails.
+    /// [`Self::break_reads`] cannot reach that branch at all, because it fails
+    /// the first read and the handler never gets as far as the query under
+    /// test.
+    pub fn break_list_reads(self) -> Self {
+        self.with_failing_reads(false)
+    }
+
+    fn with_failing_reads(mut self, fail_get: bool) -> Self {
         let broken: Arc<dyn wafer_core::interfaces::database::service::DatabaseService> =
             Arc::new(FailingReadsDb {
                 inner: self.db_service.clone(),
+                fail_get,
             });
         self.db_service = broken.clone();
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
@@ -369,24 +388,46 @@ impl TestContext {
     }
 }
 
-/// `DatabaseService` decorator used by [`TestContext::break_reads`]. Every
-/// read method fails with [`DatabaseError::Internal`]; every mutating/schema
-/// method delegates to `inner` unchanged.
+/// `DatabaseService` decorator used by [`TestContext::break_reads`] and
+/// [`TestContext::break_list_reads`]. Every read method fails with
+/// [`DatabaseError::Internal`]; every mutating/schema method delegates to
+/// `inner` unchanged.
+///
+/// "Mutating" includes the filtered-write family (`update_where*`,
+/// `delete_where*`, `increment_field_where`), which this decorator must
+/// override explicitly even though it has nothing to change about them. The
+/// `DatabaseService` trait ships *read-based default implementations* of
+/// those — `update_where_count` counts and then updates, `update_where`
+/// lists and then updates by id — so a decorator that leaves them alone
+/// inherits a write that begins with a read, and every filtered write fails
+/// here for a reason no real backend has. `wafer-block-sqlite`,
+/// `wafer-block-postgres` and `D1DatabaseService` all override the family
+/// with a single statement carrying no `count` and no `list`, so a test
+/// double that keeps the defaults asserts against a database that does not
+/// exist: a handler branch reachable only when a filtered write fails looks
+/// covered while production can never enter it.
 struct FailingReadsDb {
     inner: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+    /// `false` exempts single-row `get` from the failure, so a test can fail
+    /// a *listing* while a by-id read still succeeds — see
+    /// [`TestContext::break_list_reads`].
+    fail_get: bool,
 }
 
 #[async_trait::async_trait]
 impl wafer_core::interfaces::database::service::DatabaseService for FailingReadsDb {
     async fn get(
         &self,
-        _collection: &str,
-        _id: &str,
+        collection: &str,
+        id: &str,
     ) -> Result<
         wafer_core::interfaces::database::service::Record,
         wafer_core::interfaces::database::service::DatabaseError,
     > {
-        Err(simulated_read_failure())
+        if self.fail_get {
+            return Err(simulated_read_failure());
+        }
+        self.inner.get(collection, id).await
     }
 
     async fn list(
@@ -429,6 +470,63 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
         id: &str,
     ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
         self.inner.delete(collection, id).await
+    }
+
+    // --- the filtered-write family ---------------------------------------
+    //
+    // Delegated, not failed. Each is one `UPDATE`/`DELETE … WHERE` statement
+    // on every real backend; the trait's read-based defaults (see the struct
+    // doc above) are what these overrides exist to displace.
+    //
+    // `take_where` is deliberately NOT here: it returns the rows it removed,
+    // so it is a read as much as a write and belongs on the failing side.
+
+    async fn update_where(
+        &self,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+        data: HashMap<String, serde_json::Value>,
+    ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.update_where(collection, filters, data).await
+    }
+
+    async fn update_where_count(
+        &self,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+        data: HashMap<String, serde_json::Value>,
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner
+            .update_where_count(collection, filters, data)
+            .await
+    }
+
+    async fn delete_where(
+        &self,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+    ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.delete_where(collection, filters).await
+    }
+
+    async fn delete_where_count(
+        &self,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.delete_where_count(collection, filters).await
+    }
+
+    async fn increment_field_where(
+        &self,
+        collection: &str,
+        col: &str,
+        delta: i64,
+        filters: &[wafer_block::db::Filter],
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner
+            .increment_field_where(collection, col, delta, filters)
+            .await
     }
 
     async fn count(
@@ -791,6 +889,13 @@ impl Context for TestContext {
 pub struct FailingDbOpContext {
     inner: TestContext,
     failing: Vec<(&'static str, &'static str)>,
+    /// The error the matched op answers with. `Internal` (via
+    /// [`FailingDbOpContext::new`]) for an infra outage;
+    /// [`FailingDbOpContext::failing_with`] picks another code so a test can
+    /// reproduce a *caller* error arriving from below — an
+    /// `InvalidArgument` a repository guard raised, say — and pin how the
+    /// handler above translates it.
+    error: WaferError,
 }
 
 /// Request-body shape shared by every `wafer-run/database` wire request:
@@ -807,7 +912,27 @@ impl FailingDbOpContext {
     /// with a simulated [`ErrorCode::Internal`] error. All other calls pass
     /// through untouched.
     pub fn new(inner: TestContext, failing: Vec<(&'static str, &'static str)>) -> Self {
-        Self { inner, failing }
+        Self::failing_with(
+            inner,
+            failing,
+            WaferError::new(ErrorCode::Internal, "simulated database outage"),
+        )
+    }
+
+    /// [`Self::new`] with the answered error chosen by the caller, for the
+    /// codes that are not an outage — a repository guard's `InvalidArgument`,
+    /// a `FailedPrecondition`, and so on. A handler that funnels every
+    /// non-`NotFound` error into a 500 discards exactly these.
+    pub fn failing_with(
+        inner: TestContext,
+        failing: Vec<(&'static str, &'static str)>,
+        error: WaferError,
+    ) -> Self {
+        Self {
+            inner,
+            failing,
+            error,
+        }
     }
 }
 
@@ -834,10 +959,7 @@ impl Context for FailingDbOpContext {
                 .iter()
                 .any(|(op, table)| *op == msg.action() && *table == collection)
             {
-                return OutputStream::error(WaferError::new(
-                    ErrorCode::Internal,
-                    "simulated database outage",
-                ));
+                return OutputStream::error(self.error.clone());
             }
             return self
                 .inner

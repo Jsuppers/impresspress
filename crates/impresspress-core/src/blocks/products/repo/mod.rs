@@ -12,6 +12,7 @@ pub(crate) mod offer_components;
 pub(crate) mod offers;
 pub(crate) mod payment_links;
 pub(crate) mod product_versions;
+pub(crate) mod products;
 pub(crate) mod provider_operations;
 pub(crate) mod purchases;
 pub(crate) mod refunds;

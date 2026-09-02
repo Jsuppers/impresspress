@@ -18,6 +18,12 @@ its arguments is worse than no tool** — refuse rather than mislead.
 | Producer follow-ups | wafer-run **#324** | **MERGED** (`61e68a0`, squash). Review follow-ups filed: wafer-run **#325** (outputSchema wall lacks `required ⊆ properties`), **#326** (`RuntimeError` not `#[non_exhaustive]` + two weak tests) |
 | WebMCP consumer | impresspress **#72** | **MERGED** (`8b48bcd`) after the pin bump to `61e68a0` (`e204c98`); CI 13/13 |
 | Derive migration | impresspress **#74** | **OPEN** — `feat/derive-migration`; 22 migration commits + 4 follow-ups, `main` (post-#72) merged in as `e27895c` |
+| Four schema decisions | impresspress **#75** | **OPEN** — `feat/schema-decisions`, stacked on #74 (no CI until it retargets `main`; suite run locally) |
+| Real-server WebMCP e2e | impresspress **#76** | **OPEN** — `test/webmcp-e2e`, base `main`; CI 13/13 |
+| llm + vector typed (spec step 8) | impresspress **#79** | **OPEN** — `feat/type-llm-vector`, stacked on #75; 13 llm + 9 vector JSON endpoints typed, both blocks under the snapshot gate; independently reviewed pre-push (three confirmed findings fixed on the branch); native-only, non-gating for the submission |
+| products' CRUD rows typed | impresspress **#80** | **OPEN** — `feat/type-products-rows`, stacked on #75; all 47 row endpoints projected through `contracts::*View` / `*Request`, three security holes closed (§3), order `status` + `reconciliation_status` published as enums; independently reviewed pre-push (DO-NOT-PUSH verdict on four false descriptions — all fixed on the branch) |
+| Admin read tools + product discovery | impresspress **#81** | **OPEN** — `feat/agent-read-tools`, stacked on #80; the four admin JSON reads become `list_users` / `list_roles` / `get_site_settings` / `list_audit_log` (the spec's scoped read tools, never written), and `GET /b/products/catalog` becomes `list_products`, the agent's only way to discover a product id. `AdminSettingsResponse` reshaped so it can carry an `outputSchema` at all |
+| Demo consumer + preview-host fix | impresspress **#77** | **OPEN** — `feat/webmcp-demo-consumer`, base `main`; CI 13/13 (one rerun: the runner's apt mirror answered 403 during `playwright install --with-deps`, not the PR) |
 
 ### Merge order — resolved
 
@@ -162,8 +168,10 @@ stacked on #74:
   explicit value.
 
 ### Work remaining
-- **products' 69 unmigrated sites.** 22 need the `components/schemas` hoist; 47
-  need typed handlers (currently generic CRUD over DB column maps).
+- **products' 22 offer sites.** `ManagedOffer` / `OfferDefinitionRequest` and
+  the offer list / product-duplicate outputs that embed them reach the
+  recursive `Condition` and need the `components/schemas` hoist. The other 47
+  (every row endpoint) are typed in **#80**.
 - **The `$defs` → `components/schemas` hoist.** Recursive contracts still
   produce dangling refs in `/openapi.json`. Not a regression — before #323 every
   named type did. The WebMCP side is fail-safe (refused, not published wrong).
@@ -205,13 +213,38 @@ The spec's §Submission context, as of 2026-08-28 end of day:
 | MIT `LICENSE` on the default branch | ✅ on `main` since #72 |
 | Tool-registration code visible in-repo | ✅ `crates/impresspress-core/src/ui/assets/webmcp.js` on `main` |
 | Both repos public, write-up names both | ✅ public; ❌ write-up not started |
-| Live URL reachable from the ChatGPT browser | ❌ not deployed. `wrangler` is logged in; the deployable is a *consumer* crate (`impresspress-cloudflare` is a library — see the wasm measurement doc), so the target is wafer-site's Cloudflare build or a minimal consumer. Outward-facing: needs a go. |
+| Live URL reachable from the ChatGPT browser | ✅ **https://impresspress-webmcp-demo.jorissuppers.workers.dev** — `examples/webmcp-demo` (its own D1/R2/KV on the account), admin `admin@example.com` (password in the session scratchpad), one seeded product with a published per-page offer; anonymous manifest serves the five tools. No Stripe key yet, so `start_checkout` returns an error result until one is entered in `/b/admin/variables` — and note **impresspress#78**: on Workers, config edits are currently invisible to the runtime (shared vars have no read path; nothing sets `variables.block`), so the demo runs on defaults and the Stripe key will need that fix or the workaround in the README. |
 | Demo video < 3 minutes | ❌ human |
 | Agent-driven browse → price → checkout | ❌ human, plan 3 task 5 |
 
+Deploy traps, all hit on 2026-08-28 (recorded in `examples/webmcp-demo/README.md`):
+`wrangler versions upload` cannot create a Worker (error 10007) — the first
+deploy needs one plain `wrangler deploy`; `impresspress deploy secret` needs
+`--target cloudflare` too; the Worker needs a KV namespace bound as
+`CONFIG_CACHE` that the generator does not emit (`/_deploy/prepare` fails with
+`invalid kv store` without it) — supplied via `wrangler.overrides.toml`; the
+first admin is whoever signs up with the email in the D1 `variables` row
+`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` — except that on Workers that
+row is never read: **impresspress#78** — shared `WAFER_RUN_SHARED__*` variables
+have no read path on Cloudflare, and `seed_defaults`/admin writes never set
+`variables.block`, which the lazy per-block loader filters on, so block-scoped
+edits are invisible too. The demo's admin was promoted with a direct
+`UPDATE wafer_run__auth__users SET role='admin'`; its `ENVIRONMENT`,
+`FRONTEND_URL` and `APP_NAME` edits sit in D1 unread. `wrangler kv key`
+commands default to the LOCAL store — pass `--remote`. The Worker now live was
+built from this branch plus #77's files (adapter fix + `examples/webmcp-demo`);
+once #74, #75 and #77 are on `main`, redeploy from `main`.
+
 Engineering that does **not** gate the submission but is still open: products'
-69 unmigrated sites; `llm` (18 endpoints) and `vector` (11) declare no schemas
-at all (spec step 8, native-only, non-gating); the `$defs` hoist (wafer-run).
+22 offer sites (recursive `Condition`); the `$defs` hoist (wafer-run). The
+`llm`/`vector` typing (**#79**), products' row endpoints (**#80**) and the
+admin read tools + `list_products` (**#81**) landed as stacked PRs on
+2026-08-28.
+
+**Merge-order debt between #81 and #76.** `webmcp.spec.ts` (#76, on `main`)
+asserts exact tool sets at `:198`, `:304` and `:329`; #81 adds `list_products`
+to the Public set and four tools to the Admin set. Neither is red today — the
+branches have not met. Whichever merges second carries the spec update.
 
 ## 5. Traps for whoever picks this up
 
