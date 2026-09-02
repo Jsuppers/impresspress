@@ -1605,6 +1605,29 @@ git commit -m "test(wasmi): std-only JSON-codec guest proves DB/storage/config o
 
 ---
 
+### Task 8b: Raw body frames reach JSON guests untranscoded; storage folder capabilities are prefixes
+
+*(Added during execution from Task 8's findings C1/C2 — see the Plan 0 ledger.)*
+
+**Files:**
+- Modify: `crates/wafer-block/src/streams/output.rs` (or wherever `OutputStream`/`StreamEvent` are defined) — an explicit raw-body marker
+- Modify: `crates/wafer-core/src/interfaces/storage/handler.rs` (`storage.get`, `storage.get_streaming`) and the network handler's streamed body if it uses the same header+raw-body shape
+- Modify: `crates/wafer-run/src/wasm/stream.rs` (`StreamState` remembers raw mode) and `crates/wafer-run/src/wasm/wasmi_loader/mod.rs` (read arm honours it)
+- Modify: `crates/wafer-block/src/capabilities.rs` (`allows_storage_folder`)
+- Modify: `crates/wafer-run/tests/json_host_guest/src/lib.rs`, `crates/wafer-run/tests/json_host_codec_e2e.rs`
+
+**Interfaces:**
+- Produces: a stream-level, explicit signal — `StreamEvent::Meta` carrying the key `frame.encoding` with value `raw` (constant `wafer_block::stream::FRAME_ENCODING_META` / `FRAME_ENCODING_RAW`) emitted by a handler immediately before it starts writing raw body chunks. `StreamState` records `raw_frames = true` when it sees it; the wasmi read arm skips transcoding for a JSON guest while `raw_frames` is set. Frames before the marker (the `ObjectInfo` header) are still transcoded. No content sniffing anywhere.
+- Produces: `BlockCapabilities::allows_storage_folder(resource)` admits `resource` when an `Only` entry equals it OR is a proper prefix followed by `/` (`"site/jhg"` admits `"site/jhg/a.txt"` and `"site/jhg/sub/b"`, never `"site/jhgx/..."`); `Any`/`None` unchanged. Document the field as folders-or-object-paths.
+- Produces: the fixture's `test.storage` returns `header_json + "\n" + body_bytes` so the test asserts both the transcoded `ObjectInfo` and the raw `[104,105]` body; the guest's `capabilities.storage_folders` is `Only(["<its folder>"])` (a folder, not an object path).
+
+- [ ] **Step 1: Failing tests.** (a) `capabilities.rs` unit tests: folder prefix admits nested keys, rejects sibling-prefix collisions, exact object path still admits itself. (b) `json_host_codec_e2e::json_guest_storage_round_trip` now asserts the header decodes as JSON (`content_type == "text/plain"`, `size == 2`) AND the body bytes equal `[104, 105]`; the guest's declared `storage_folders` is the folder. (c) a `stream.rs` unit test: a `Meta(frame.encoding=raw)` event flips `raw_frames` and later chunks are yielded unchanged by `next_chunk`. Run: they fail (InvalidArgument on the body frame; folder capability denied).
+- [ ] **Step 2: Implement** the marker constant + emission in the storage handler(s) (and the network streamed-body handler if it shares the shape — check `crates/wafer-core/src/interfaces/network/handler.rs`), the `StreamState` flag (`next_chunk` observes `Meta` events instead of skipping them silently, sets the flag, and keeps skipping them as frames), the read-arm condition (`if json && !bytes.is_empty() && !raw`), and the prefix semantics. Native clients that already concatenate raw body frames are unaffected because they never saw `Meta` frames as data.
+- [ ] **Step 3: Run** `scripts/build-fixtures.sh && cargo test -p wafer-run && cargo test -p wafer-core --test handler_storage_wrap_authorization` plus `cargo test -p wafer-block`. Expected: PASS; existing storage/network e2e suites unchanged.
+- [ ] **Step 4: Commit** `fix(wasmi): raw body frames pass through to JSON guests via an explicit stream marker; storage folder capabilities are prefixes`.
+
+---
+
 ### Task 9: Keep cyclic definitions under `$defs` instead of refusing them
 
 **Files:**
