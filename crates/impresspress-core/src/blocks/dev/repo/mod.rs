@@ -15,7 +15,11 @@ pub mod runtime_state;
 /// the agent and embedded in export bundles, and a v7 id leaks the wall-clock
 /// time of every workspace edit into those artifacts. Ordering comes from
 /// `created_at`, which the rows carry explicitly.
-pub(crate) fn new_id() -> String {
+///
+/// Public because a generation's id is part of the manifest that is hashed
+/// into `manifest_sha256` (design §11.3), so the caller has to hold it before
+/// the row is written. One definition of "a row id" for the whole block.
+pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 

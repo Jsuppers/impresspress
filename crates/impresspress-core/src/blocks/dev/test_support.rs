@@ -25,6 +25,23 @@ pub struct FakeControl {
     /// What the next `validate` call answers. `Ok(())` becomes a
     /// [`ValidatedGuest`] carrying a `BlockInfo` named after the spec.
     pub validate_result: Mutex<Result<(), ValidationFailure>>,
+    /// Set by [`Self::fail_next_rebuild`]: the message the next `rebuild`
+    /// refuses with, consumed by that call.
+    ///
+    /// One-shot rather than sticky because the interesting activation is the
+    /// one *after* a failure — the previous generation has to still be live,
+    /// and a control that refused forever could not show that.
+    fail_rebuild: Mutex<Option<String>>,
+    /// Set by [`Self::gate_next_rebuild`]: the next `rebuild` parks on this
+    /// until the test's sender fires.
+    ///
+    /// The activation queue's coalescing only exists while an activation is
+    /// *in flight*, and nothing else in the fixture blocks: every database
+    /// and storage call completes without yielding, so two `request` futures
+    /// polled together would run strictly one after the other and the queue
+    /// would never be contended. This is the one place a test can hold an
+    /// activation open on purpose.
+    gate_rebuild: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     /// Bumped by every successful `rebuild`.
     generation: AtomicU64,
 }
@@ -35,6 +52,8 @@ impl FakeControl {
         Arc::new(Self {
             rebuilt: Mutex::new(Vec::new()),
             validate_result: Mutex::new(Ok(())),
+            fail_rebuild: Mutex::new(None),
+            gate_rebuild: Mutex::new(None),
             generation: AtomicU64::new(0),
         })
     }
@@ -52,6 +71,24 @@ impl FakeControl {
     /// The block sets handed to `rebuild`, oldest first.
     pub fn rebuilds(&self) -> Vec<Vec<DynamicBlockSpec>> {
         self.rebuilt.lock().expect("rebuilt mutex").clone()
+    }
+
+    /// Make the next `rebuild` refuse with `message`, recording nothing.
+    ///
+    /// The mirror of [`Self::rejecting`] for the other half of the seam: that
+    /// one refuses a guest at validation, this one refuses the runtime swap
+    /// itself — the failure activation has to survive with the previous
+    /// generation still live.
+    pub fn fail_next_rebuild(&self, message: &str) {
+        *self.fail_rebuild.lock().expect("fail_rebuild mutex") = Some(message.to_string());
+    }
+
+    /// Hold the next `rebuild` open until the returned sender fires (or is
+    /// dropped), so a test can observe what happens *during* an activation.
+    pub fn gate_next_rebuild(&self) -> futures::channel::oneshot::Sender<()> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        *self.gate_rebuild.lock().expect("gate_rebuild mutex") = Some(rx);
+        tx
     }
 }
 
@@ -77,6 +114,18 @@ impl RuntimeControl for FakeControl {
     }
 
     async fn rebuild(&self, blocks: &[DynamicBlockSpec]) -> Result<(), String> {
+        // Taken out of the lock before the await: a `MutexGuard` is not held
+        // across a suspension point anywhere in this fixture, for the same
+        // reason the activation queue never holds one.
+        let gate = self.gate_rebuild.lock().expect("gate_rebuild mutex").take();
+        if let Some(gate) = gate {
+            // A dropped sender releases the gate too: a test that forgets to
+            // fire it fails on its assertions, not on a hang.
+            let _ = gate.await;
+        }
+        if let Some(message) = self.fail_rebuild.lock().expect("fail_rebuild mutex").take() {
+            return Err(message);
+        }
         self.rebuilt
             .lock()
             .expect("rebuilt mutex")

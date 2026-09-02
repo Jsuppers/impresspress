@@ -11,6 +11,7 @@ use impresspress_core::{
         contracts::StatusResponse,
         control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind},
         repo::{
+            self,
             generations::{self, GenerationCause, GenerationStatus, NewGeneration},
             runtime_state::{self, ActivationPhase, RuntimeState},
         },
@@ -69,6 +70,7 @@ async fn active_generation_ctx(rebuilds: u64) -> (TestContext, String) {
     let generation = generations::insert(
         &ctx,
         &NewGeneration {
+            id: repo::new_id(),
             parent_id: None,
             cause: GenerationCause::BlockCompile,
             site_manifest_json: SITE_MANIFEST.to_string(),

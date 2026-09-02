@@ -116,7 +116,7 @@
                 "properties": {
                   "generation": {
                     "additionalProperties": false,
-                    "description": "The generation this delete published, when it published one.",
+                    "description": "The generation this delete published, when it published one. A delete\nunder `site/` publishes; a delete under `blocks/` does not.",
                     "properties": {
                       "activated_at": {
                         "description": "RFC 3339 time the generation went live, or null if it never did.",
@@ -413,7 +413,7 @@
                 "properties": {
                   "generation": {
                     "additionalProperties": false,
-                    "description": "The generation this write published, when it published one. A\n`blocks/` write never publishes on its own, and a `site/` write\npublishes only once activation is wired.",
+                    "description": "The generation this write published, when it published one. A write\nunder `site/` publishes; a write under `blocks/` does not — only a\ncompile turns block source into a published block.",
                     "properties": {
                       "activated_at": {
                         "description": "RFC 3339 time the generation went live, or null if it never did.",
@@ -570,6 +570,771 @@
         }
       ],
       "summary": "Write a workspace file"
+    }
+  },
+  "/b/dev/api/generations": {
+    "get": {
+      "parameters": [
+        {
+          "in": "query",
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "description": "How many generations to return, newest first. Defaults to the\nretention window (20) and is capped at 200.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `GET /b/dev/api/generations`.",
+                "properties": {
+                  "generations": {
+                    "description": "Matching generations, newest first.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One entry in the publication ledger, as the status and generation views\npublish it.",
+                      "properties": {
+                        "activated_at": {
+                          "description": "RFC 3339 time the generation went live, or null if it never did.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "blocks": {
+                          "description": "Number of blocks in the generation's block manifest.",
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "cause": {
+                          "description": "What created this generation.",
+                          "oneOf": [
+                            {
+                              "const": "site_write",
+                              "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "site_delete",
+                              "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "block_compile",
+                              "description": "A successful compile stage; the block set changed.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "block_remove",
+                              "description": "A block was removed; the block set changed.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "rollback",
+                              "description": "A republish of an earlier generation's manifests.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "seed",
+                              "description": "Generation 0, imported from the seed bundle on cold boot.",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "created_at": {
+                          "description": "RFC 3339 creation time.",
+                          "type": "string"
+                        },
+                        "id": {
+                          "description": "Generation id.",
+                          "type": "string"
+                        },
+                        "parent_id": {
+                          "description": "The generation this one was derived from, or null for the first.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "site_files": {
+                          "description": "Number of files in the generation's site manifest.",
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "status": {
+                          "description": "Where the generation sits in its lifecycle.",
+                          "oneOf": [
+                            {
+                              "const": "staged",
+                              "description": "Recorded, not yet examined.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "validating",
+                              "description": "Blobs, artifacts and guests are being checked.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "activating",
+                              "description": "The runtime swap and site publish are in progress.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "active",
+                              "description": "Currently serving.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "failed",
+                              "description": "Abandoned; `failure_message` says why.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "superseded",
+                              "description": "Aged out of the retention window.",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "parent_id",
+                        "cause",
+                        "status",
+                        "created_at",
+                        "activated_at",
+                        "site_files",
+                        "blocks"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "generations"
+                ],
+                "title": "GenerationListResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List generations"
+    }
+  },
+  "/b/dev/api/generations/{id}": {
+    "get": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "The generation's id, as `GET /b/dev/api/generations` reports it.",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `GET /b/dev/api/generations/{id}`.",
+                "properties": {
+                  "diff_from_parent": {
+                    "additionalProperties": false,
+                    "description": "What this generation changed relative to the one it was derived from.\nA generation with no parent adds everything it holds.",
+                    "properties": {
+                      "added_blocks": {
+                        "description": "Blocks the generation adds.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "added_paths": {
+                        "description": "Site paths the generation adds.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "changed_blocks": {
+                        "description": "Blocks whose spec changed.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "changed_paths": {
+                        "description": "Site paths whose content hash changed.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "removed_blocks": {
+                        "description": "Blocks the generation drops.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "removed_paths": {
+                        "description": "Site paths the generation drops.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "added_paths",
+                      "changed_paths",
+                      "removed_paths",
+                      "added_blocks",
+                      "changed_blocks",
+                      "removed_blocks"
+                    ],
+                    "type": "object"
+                  },
+                  "manifest": {
+                    "additionalProperties": false,
+                    "description": "The manifest the generation publishes: its site files and its blocks.",
+                    "properties": {
+                      "blocks": {
+                        "description": "The blocks the generation's runtime is built from.",
+                        "items": {
+                          "description": "Everything the host needs to put one compiled guest into a runtime.\n\nThis is also the block entry of the generation manifest (design §11.3), so\na stored `block_manifest_json` decodes straight into `Vec<DynamicBlockSpec>`\nwith no intermediate shape.",
+                          "properties": {
+                            "artifact_sha256": {
+                              "description": "SHA-256 of the `wasm32-wasip1` artifact, hex-encoded.",
+                              "type": "string"
+                            },
+                            "capabilities": {
+                              "description": "Capabilities the guest is loaded under. Deny-by-default; the caller\nvalidates the declared set against the block's own namespace before\nthis ever reaches [`RuntimeControl`].\n\n`BlockCapabilities` is a producer type that derives neither\n`JsonSchema` nor `PartialEq`. It is published as a free-form object\nhere, and compared field-by-field in the `PartialEq` impl below."
+                            },
+                            "name": {
+                              "description": "Registered block name (`site/{name}`).",
+                              "type": "string"
+                            },
+                            "routes": {
+                              "description": "Route prefixes the block serves.",
+                              "items": {
+                                "description": "One route prefix a dynamically-registered block serves.",
+                                "properties": {
+                                  "access": {
+                                    "description": "Access tier the router enforces for the prefix.",
+                                    "oneOf": [
+                                      {
+                                        "const": "Public",
+                                        "description": "No auth check; anyone may reach the route.",
+                                        "type": "string"
+                                      },
+                                      {
+                                        "const": "Authenticated",
+                                        "description": "A resolved user identity is required.",
+                                        "type": "string"
+                                      },
+                                      {
+                                        "const": "Admin",
+                                        "description": "The `admin` role is required.",
+                                        "type": "string"
+                                      }
+                                    ]
+                                  },
+                                  "prefix": {
+                                    "description": "Route prefix, normalized and under `/b/{block}/`.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "prefix",
+                                  "access"
+                                ],
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "wafer_guest_version": {
+                              "description": "`wafer_guest.rs` ABI version the artifact was built against.",
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "artifact_sha256",
+                            "routes",
+                            "capabilities",
+                            "wafer_guest_version"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "generation_id": {
+                        "description": "The generation this manifest describes.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "schema_version": {
+                        "description": "Manifest schema version. `1` for every manifest this build writes.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "site": {
+                        "additionalProperties": false,
+                        "description": "The files the generation publishes.",
+                        "properties": {
+                          "files": {
+                            "default": [],
+                            "description": "Every file the generation publishes, path relative to the site root.",
+                            "items": {
+                              "additionalProperties": false,
+                              "description": "One file in the workspace: where it is, which blob holds it, how big it is\nand what it is served as.\n\nThe same type is what a generation's site manifest is made of — a\ngeneration *is* the workspace's `site/` entries, frozen — so there is one\ndefinition rather than a wire type and a stored type that have to be kept\nin step.",
+                              "properties": {
+                                "content_type": {
+                                  "description": "Content type the file is served with.",
+                                  "type": "string"
+                                },
+                                "path": {
+                                  "description": "Where the file lives. Workspace-relative (`site/index.html`) in the\nfiles API; relative to its area's root (`index.html`) in a\ngeneration's site manifest and in a block's source listing.",
+                                  "type": "string"
+                                },
+                                "sha256": {
+                                  "description": "SHA-256 of the file's content-addressed blob, hex-encoded.",
+                                  "type": "string"
+                                },
+                                "size": {
+                                  "description": "Size in bytes.",
+                                  "format": "uint64",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "path",
+                                "sha256",
+                                "size",
+                                "content_type"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "files"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "schema_version",
+                      "generation_id",
+                      "parent_id",
+                      "site",
+                      "blocks"
+                    ],
+                    "type": "object"
+                  },
+                  "summary": {
+                    "additionalProperties": false,
+                    "description": "The ledger entry.",
+                    "properties": {
+                      "activated_at": {
+                        "description": "RFC 3339 time the generation went live, or null if it never did.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "blocks": {
+                        "description": "Number of blocks in the generation's block manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cause": {
+                        "description": "What created this generation.",
+                        "oneOf": [
+                          {
+                            "const": "site_write",
+                            "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "site_delete",
+                            "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_compile",
+                            "description": "A successful compile stage; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_remove",
+                            "description": "A block was removed; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "rollback",
+                            "description": "A republish of an earlier generation's manifests.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "seed",
+                            "description": "Generation 0, imported from the seed bundle on cold boot.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "description": "RFC 3339 creation time.",
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "Generation id.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "site_files": {
+                        "description": "Number of files in the generation's site manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "status": {
+                        "description": "Where the generation sits in its lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "staged",
+                            "description": "Recorded, not yet examined.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "validating",
+                            "description": "Blobs, artifacts and guests are being checked.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "activating",
+                            "description": "The runtime swap and site publish are in progress.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "active",
+                            "description": "Currently serving.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "failed",
+                            "description": "Abandoned; `failure_message` says why.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "superseded",
+                            "description": "Aged out of the retention window.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "parent_id",
+                      "cause",
+                      "status",
+                      "created_at",
+                      "activated_at",
+                      "site_files",
+                      "blocks"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "summary",
+                  "manifest",
+                  "diff_from_parent"
+                ],
+                "title": "GenerationDetail",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Read one generation"
+    }
+  },
+  "/b/dev/api/generations/{id}/rollback": {
+    "post": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "The generation's id, as `GET /b/dev/api/generations` reports it.",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of every endpoint whose whole job is to activate a generation.",
+                "properties": {
+                  "generation": {
+                    "additionalProperties": false,
+                    "description": "The generation that went live.",
+                    "properties": {
+                      "activated_at": {
+                        "description": "RFC 3339 time the generation went live, or null if it never did.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "blocks": {
+                        "description": "Number of blocks in the generation's block manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cause": {
+                        "description": "What created this generation.",
+                        "oneOf": [
+                          {
+                            "const": "site_write",
+                            "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "site_delete",
+                            "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_compile",
+                            "description": "A successful compile stage; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_remove",
+                            "description": "A block was removed; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "rollback",
+                            "description": "A republish of an earlier generation's manifests.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "seed",
+                            "description": "Generation 0, imported from the seed bundle on cold boot.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "description": "RFC 3339 creation time.",
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "Generation id.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "site_files": {
+                        "description": "Number of files in the generation's site manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "status": {
+                        "description": "Where the generation sits in its lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "staged",
+                            "description": "Recorded, not yet examined.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "validating",
+                            "description": "Blobs, artifacts and guests are being checked.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "activating",
+                            "description": "The runtime swap and site publish are in progress.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "active",
+                            "description": "Currently serving.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "failed",
+                            "description": "Abandoned; `failure_message` says why.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "superseded",
+                            "description": "Aged out of the retention window.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "parent_id",
+                      "cause",
+                      "status",
+                      "created_at",
+                      "activated_at",
+                      "site_files",
+                      "blocks"
+                    ],
+                    "type": "object"
+                  },
+                  "progress": {
+                    "description": "One entry per phase the activation passed through, with how long it\ntook. The last is always `active`.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One phase of an activation, with how long it took.\n\nPublished in every mutating tool result (design §7.5) so the page can show\nwhere the time went without a push channel.",
+                      "properties": {
+                        "detail": {
+                          "description": "Human-readable detail for the progress panel.",
+                          "type": "string"
+                        },
+                        "ms": {
+                          "description": "Milliseconds spent in it.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "phase": {
+                          "description": "The phase this step covers.",
+                          "oneOf": [
+                            {
+                              "const": "idle",
+                              "description": "Nothing in flight.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "validating",
+                              "description": "Hashes, manifests and guests are being checked.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "building_runtime",
+                              "description": "A candidate runtime is being constructed from the block set.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "publishing",
+                              "description": "The site files are being written into `wafer-run/web/site`.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "active",
+                              "description": "The generation is live.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "failed",
+                              "description": "The activation was abandoned; the previous generation is still live.",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "ms",
+                        "detail"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "generation",
+                  "progress"
+                ],
+                "title": "ActivationResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Republish an earlier generation"
     }
   },
   "/b/dev/api/status": {

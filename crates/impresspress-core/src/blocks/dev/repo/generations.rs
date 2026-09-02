@@ -142,10 +142,18 @@ pub struct GenerationRow {
     pub failure_message: Option<String>,
 }
 
-/// The caller-supplied half of a new ledger row; the repo mints the id,
-/// timestamp and initial status.
+/// The caller-supplied half of a new ledger row; the repo stamps the
+/// timestamp and the initial status.
+///
+/// The id is caller-supplied, unlike every other repo in the tree, because a
+/// generation's id is *part of the manifest* that `manifest_sha256` is taken
+/// over (design §11.3). A repo that minted it would hand back a row whose
+/// stored hash could not cover its own identity — the caller mints the id
+/// with [`super::new_id`], stamps it into the manifest, hashes, and inserts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewGeneration {
+    /// The id to file the row under, from [`super::new_id`].
+    pub id: String,
     /// Parent generation, or `None` for generation 0.
     pub parent_id: Option<String>,
     /// What created it.
@@ -162,7 +170,7 @@ pub struct NewGeneration {
 /// row (so the caller has the minted id without re-reading).
 pub async fn insert(ctx: &dyn Context, new: &NewGeneration) -> Result<GenerationRow, WaferError> {
     let row = GenerationRow {
-        id: super::new_id(),
+        id: new.id.clone(),
         parent_id: new.parent_id.clone(),
         status: GenerationStatus::Staged,
         cause: new.cause,
@@ -318,6 +326,7 @@ mod tests {
 
     fn new_generation(cause: GenerationCause) -> NewGeneration {
         NewGeneration {
+            id: super::super::new_id(),
             parent_id: None,
             cause,
             site_manifest_json: SITE_MANIFEST.to_string(),

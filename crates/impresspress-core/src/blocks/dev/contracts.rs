@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
+    activation::ProgressStep,
     control::{DynamicBlockSpec, DynamicRoute},
+    generation::{GenerationDiff, GenerationManifest},
     repo::{
         generations::{GenerationCause, GenerationStatus},
         runtime_state::ActivationPhase,
@@ -107,6 +109,77 @@ impl ActiveBlockView {
             routes: spec.routes.clone(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The generations API (`/b/dev/api/generations*`)
+// ---------------------------------------------------------------------------
+
+/// Query parameters of `GET /b/dev/api/generations`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GenerationListQuery {
+    /// How many generations to return, newest first. Defaults to the
+    /// retention window (20) and is capped at 200.
+    pub limit: Option<u32>,
+}
+
+impl GenerationListQuery {
+    /// Read the query off a request.
+    ///
+    /// The one place `?limit=` is parsed, so the published schema and the
+    /// handler cannot describe different parameters. A value that is not a
+    /// number is `None` — the default — rather than a `400`: a listing is a
+    /// read, and refusing it teaches a caller nothing it could not see from
+    /// the page size it got back.
+    pub fn from_message(msg: &wafer_run::Message) -> Self {
+        Self {
+            limit: msg.query("limit").parse().ok(),
+        }
+    }
+}
+
+/// Path parameters of every `/b/dev/api/generations/{id}*` route.
+///
+/// Declared as a type rather than a hand-written schema so the published
+/// parameter and the `{id}` the router binds cannot describe different things:
+/// `wafer_core::discovery` cross-checks the declared names against the path
+/// template's placeholders when it builds the agent tool for the endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GenerationPathParams {
+    /// The generation's id, as `GET /b/dev/api/generations` reports it.
+    pub id: String,
+}
+
+/// Response of `GET /b/dev/api/generations`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationListResponse {
+    /// Matching generations, newest first.
+    pub generations: Vec<GenerationSummary>,
+}
+
+/// Response of `GET /b/dev/api/generations/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationDetail {
+    /// The ledger entry.
+    pub summary: GenerationSummary,
+    /// The manifest the generation publishes: its site files and its blocks.
+    pub manifest: GenerationManifest,
+    /// What this generation changed relative to the one it was derived from.
+    /// A generation with no parent adds everything it holds.
+    pub diff_from_parent: GenerationDiff,
+}
+
+/// Response of every endpoint whose whole job is to activate a generation.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationResponse {
+    /// The generation that went live.
+    pub generation: GenerationSummary,
+    /// One entry per phase the activation passed through, with how long it
+    /// took. The last is always `active`.
+    pub progress: Vec<ProgressStep>,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,9 +289,9 @@ pub struct FileWriteResponse {
     pub sha256: String,
     /// Size in bytes.
     pub size: u64,
-    /// The generation this write published, when it published one. A
-    /// `blocks/` write never publishes on its own, and a `site/` write
-    /// publishes only once activation is wired.
+    /// The generation this write published, when it published one. A write
+    /// under `site/` publishes; a write under `blocks/` does not — only a
+    /// compile turns block source into a published block.
     pub generation: Option<GenerationSummary>,
 }
 
@@ -238,7 +311,8 @@ pub struct FileDeleteRequest {
 pub struct FileDeleteResponse {
     /// Workspace-relative path that was removed.
     pub path: String,
-    /// The generation this delete published, when it published one.
+    /// The generation this delete published, when it published one. A delete
+    /// under `site/` publishes; a delete under `blocks/` does not.
     pub generation: Option<GenerationSummary>,
 }
 

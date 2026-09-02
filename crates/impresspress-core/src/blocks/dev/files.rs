@@ -41,14 +41,18 @@ use base64ct::{Base64, Encoding};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use super::{
-    blobs,
+    activation, blobs,
     contracts::{
         FileConflict, FileDeleteRequest, FileDeleteResponse, FileEncoding, FileListQuery,
         FileListResponse, FileReadRequest, FileReadResponse, FileWriteRequest, FileWriteResponse,
+        GenerationSummary, SiteManifest,
     },
+    generation::{self, GenerationManifest},
     no_store, no_store_error, no_store_error_status,
     paths::{self, WorkspaceArea},
+    repo::generations::GenerationCause,
     workspace::{self, FileEntry, Workspace},
+    DevShared,
 };
 use crate::{blocks::crud, http::err_internal};
 
@@ -110,7 +114,11 @@ pub async fn handle_read(ctx: &dyn Context, input: InputStream) -> OutputStream 
 }
 
 /// `POST /b/dev/api/files/write` — create or replace one file.
-pub async fn handle_write(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle_write(
+    ctx: &dyn Context,
+    shared: &DevShared,
+    input: InputStream,
+) -> OutputStream {
     let request: FileWriteRequest = match read_body(input).await {
         Ok(request) => request,
         Err(refusal) => return refusal,
@@ -183,25 +191,39 @@ pub async fn handle_write(ctx: &dyn Context, input: InputStream) -> OutputStream
     if let Err(e) = workspace::save(ctx, &ws).await {
         return err_internal("dev workspace save", e);
     }
+
+    // Publish, if the file that changed is one the site serves. The order is
+    // load-bearing: the workspace is saved first, so the manifest the
+    // activation freezes is one that has already been persisted — an
+    // activation that published content the workspace had lost would be
+    // unreproducible from the workspace it claims to project.
+    let generation =
+        match publish_if_site(ctx, shared, &area, &ws, GenerationCause::SiteWrite).await {
+            Ok(generation) => generation,
+            Err(refusal) => return refusal,
+        };
     no_store().json(&FileWriteResponse {
         path: entry.path,
         sha256: entry.sha256,
         size: entry.size,
-        // Task 7 wires a `site/` write to an activation; until then a write
-        // stages nothing.
-        generation: None,
+        generation,
     })
 }
 
 /// `POST /b/dev/api/files/delete` — drop one file from the manifest.
-pub async fn handle_delete(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle_delete(
+    ctx: &dyn Context,
+    shared: &DevShared,
+    input: InputStream,
+) -> OutputStream {
     let request: FileDeleteRequest = match read_body(input).await {
         Ok(request) => request,
         Err(refusal) => return refusal,
     };
-    if let Err(e) = paths::validate_path(&request.path) {
-        return no_store_error(ErrorCode::InvalidArgument, &e.to_string());
-    }
+    let area = match paths::validate_path(&request.path) {
+        Ok(area) => area,
+        Err(e) => return no_store_error(ErrorCode::InvalidArgument, &e.to_string()),
+    };
     let mut ws = match workspace::load(ctx).await {
         Ok(ws) => ws,
         Err(e) => return err_internal("dev workspace load", e),
@@ -215,10 +237,54 @@ pub async fn handle_delete(ctx: &dyn Context, input: InputStream) -> OutputStrea
     if let Err(e) = workspace::save(ctx, &ws).await {
         return err_internal("dev workspace save", e);
     }
+    let generation =
+        match publish_if_site(ctx, shared, &area, &ws, GenerationCause::SiteDelete).await {
+            Ok(generation) => generation,
+            Err(refusal) => return refusal,
+        };
     no_store().json(&FileDeleteResponse {
         path: request.path,
-        generation: None,
+        generation,
     })
+}
+
+/// Publish the workspace's `site/` half as a new generation, when the file
+/// that changed was one the site serves.
+///
+/// A `blocks/` edit publishes nothing (design §7.2): block source only reaches
+/// the runtime through a compile, and republishing on every keystroke in a
+/// `.rs` file would rebuild the runtime from an artifact that has not been
+/// rebuilt.
+///
+/// The block half of the manifest is the *active* generation's, unchanged —
+/// this is a site republish, so `block_set_changed` is false and the runtime
+/// is left alone.
+async fn publish_if_site(
+    ctx: &dyn Context,
+    shared: &DevShared,
+    area: &WorkspaceArea,
+    ws: &Workspace,
+    cause: GenerationCause,
+) -> Result<Option<GenerationSummary>, OutputStream> {
+    if !matches!(area, WorkspaceArea::Site) {
+        return Ok(None);
+    }
+    let blocks = match generation::active(ctx).await {
+        Ok(active) => active
+            .map(|(_row, manifest)| manifest.blocks)
+            .unwrap_or_default(),
+        Err(e) => return Err(err_internal("dev active generation", e)),
+    };
+    let next = GenerationManifest::staged(
+        SiteManifest {
+            files: workspace::site_manifest(ws),
+        },
+        blocks,
+    );
+    match activation::request(ctx, shared, cause, next).await {
+        Ok(outcome) => Ok(Some(outcome.generation)),
+        Err(e) => Err(e.into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------

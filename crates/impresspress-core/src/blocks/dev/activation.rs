@@ -1,0 +1,764 @@
+//! The activation queue: one serialized path from "here is the state I want"
+//! to "that state is live".
+//!
+//! # Why a queue at all
+//!
+//! Activation is not atomic. It journals, may rebuild the runtime, and writes
+//! a set of files into a folder browsers are reading. Two of those running at
+//! once would interleave their publishes and their journal writes, and the
+//! result would be a site assembled from two generations. So exactly one runs
+//! at a time, and the rest wait.
+//!
+//! Requests that arrive during an activation **coalesce** (design §7.3): the
+//! queue keeps only the latest desired manifest, and every waiter resolves
+//! with the generation that ends up carrying its change. An agent that writes
+//! six files in a row therefore publishes twice — once for the file it started
+//! with, once for the other five — rather than six times, and no caller is
+//! told its write landed before it did.
+//!
+//! # Why it lives on `DevShared`
+//!
+//! The browser runtime is rebuilt (and the dev block re-instantiated) by the
+//! very activations this queue orders. State held on the block would be
+//! discarded halfway through the operation that discarded it, so the queue
+//! lives on the `Arc<DevShared>` that outlives any one runtime.
+//!
+//! # The mutex
+//!
+//! `std::sync::Mutex`, and the guard is never held across an `await`: every
+//! lock is taken inside a small synchronous method ([`ActivationQueue::admit`],
+//! [`ActivationQueue::next`]) that returns owned data. That is what keeps the
+//! returned futures `Send` on native, and what keeps a single-threaded browser
+//! runtime from deadlocking on its own queue.
+
+use std::sync::Mutex;
+
+use futures::channel::oneshot;
+use serde::{Deserialize, Serialize};
+use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
+
+use super::{
+    artifacts, blobs,
+    contracts::GenerationSummary,
+    control::DynamicBlockSpec,
+    generation::{self, GenerationManifest},
+    no_store_error_status,
+    publisher::publish_site,
+    repo::{
+        self,
+        generations::{GenerationCause, GenerationRow, GenerationStatus, NewGeneration},
+        runtime_state::{ActivationPhase, RuntimeState},
+    },
+};
+use crate::util::now_millis;
+
+/// How many generations the ledger keeps before older rows are labelled
+/// [`GenerationStatus::Superseded`] (design §7.3).
+pub const RETAINED_GENERATIONS: usize = 20;
+
+// ---------------------------------------------------------------------------
+// Outcomes
+// ---------------------------------------------------------------------------
+
+/// What one activation produced.
+#[derive(Debug, Clone)]
+pub struct ActivationOutcome {
+    /// The generation that is now live.
+    pub generation: GenerationSummary,
+    /// One step per phase the activation passed through, in order.
+    pub progress: Vec<ProgressStep>,
+}
+
+/// One phase of an activation, with how long it took.
+///
+/// Published in every mutating tool result (design §7.5) so the page can show
+/// where the time went without a push channel.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressStep {
+    /// The phase this step covers.
+    pub phase: ActivationPhase,
+    /// Milliseconds spent in it.
+    pub ms: u64,
+    /// Human-readable detail for the progress panel.
+    pub detail: String,
+}
+
+/// Why an activation did not happen.
+///
+/// Three kinds, because they mean three different things to the caller: the
+/// request described a state that cannot be built (fix the request), the host
+/// could not build it (retry or roll back), or persistence failed (retry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationError {
+    /// The manifest referenced content that is not stored. Reported as `422`:
+    /// the request was well-formed and refused on its content.
+    Validation(Vec<String>),
+    /// [`super::control::RuntimeControl`] refused to build or swap the
+    /// runtime. `500`.
+    Runtime(String),
+    /// The ledger, the journal or the object store failed. `500`.
+    Storage(String),
+}
+
+impl ActivationError {
+    /// HTTP status this refusal is sent as.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Validation(_) => 422,
+            Self::Runtime(_) | Self::Storage(_) => 500,
+        }
+    }
+
+    /// The refusal as a `/b/dev` response.
+    ///
+    /// The single place `ActivationError` becomes HTTP, so every endpoint that
+    /// activates answers the same status for the same failure. Built through
+    /// [`super::no_store_error_status`] rather than [`crate::http::err_internal`]
+    /// for two reasons: design §12 requires `Cache-Control: no-store` on every
+    /// `/b/dev` response including the refusals, and the message *is* the
+    /// product here — the sandbox surfaces build and validation diagnostics to
+    /// its agent, and a sanitized "internal error" would delete the only thing
+    /// the caller can act on. The route is admin-only at the router, so the
+    /// detail never reaches an unauthenticated caller.
+    pub fn into_response(self) -> OutputStream {
+        let code = match self {
+            Self::Validation(_) => ErrorCode::InvalidArgument,
+            Self::Runtime(_) | Self::Storage(_) => ErrorCode::Internal,
+        };
+        no_store_error_status(code, self.status(), &self.to_string())
+    }
+}
+
+impl std::fmt::Display for ActivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(reasons) => {
+                write!(
+                    f,
+                    "the generation cannot be activated: {}",
+                    reasons.join("; ")
+                )
+            }
+            Self::Runtime(message) => write!(f, "the runtime could not be rebuilt: {message}"),
+            Self::Storage(message) => write!(f, "the activation could not be stored: {message}"),
+        }
+    }
+}
+
+/// Persistence failures all arrive the same way.
+fn storage_error(e: WaferError) -> ActivationError {
+    ActivationError::Storage(e.message)
+}
+
+// ---------------------------------------------------------------------------
+// The queue
+// ---------------------------------------------------------------------------
+
+/// The serialized activation queue. One per [`super::DevShared`].
+#[derive(Default)]
+pub struct ActivationQueue {
+    inner: Mutex<QueueState>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    /// Whether an activation is in flight.
+    running: bool,
+    /// The latest desired state, and everyone waiting for it.
+    pending: Option<Pending>,
+}
+
+/// A coalesced request: one manifest, and every caller that will resolve with
+/// its outcome.
+struct Pending {
+    cause: GenerationCause,
+    manifest: GenerationManifest,
+    waiters: Vec<oneshot::Sender<Result<ActivationOutcome, ActivationError>>>,
+}
+
+/// What [`ActivationQueue::admit`] decided for a caller.
+enum Admission {
+    /// The caller runs the activation itself, and then drains whatever queued
+    /// up behind it.
+    Drive(GenerationCause, GenerationManifest),
+    /// Someone else is running; the caller waits for the coalesced outcome.
+    Wait(oneshot::Receiver<Result<ActivationOutcome, ActivationError>>),
+}
+
+impl ActivationQueue {
+    /// An idle queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Admit one request: drive it, or fold it into the pending state.
+    ///
+    /// Folding replaces the pending *manifest* (the newest desired state is
+    /// the one to converge on) but keeps every waiter, so a caller whose
+    /// manifest was superseded still resolves — with the generation that
+    /// carries its change, because the newer manifest was built from a
+    /// workspace that already contained it.
+    fn admit(&self, cause: GenerationCause, manifest: GenerationManifest) -> Admission {
+        let mut state = self.inner.lock().expect("activation queue mutex");
+        if !state.running {
+            state.running = true;
+            return Admission::Drive(cause, manifest);
+        }
+        let (tx, rx) = oneshot::channel();
+        match state.pending.as_mut() {
+            Some(pending) => {
+                pending.cause = cause;
+                pending.manifest = manifest;
+                pending.waiters.push(tx);
+            }
+            None => {
+                state.pending = Some(Pending {
+                    cause,
+                    manifest,
+                    waiters: vec![tx],
+                });
+            }
+        }
+        Admission::Wait(rx)
+    }
+
+    /// Take the next queued request, or release the queue when there is none.
+    ///
+    /// Releasing and taking are the same operation on purpose: a gap between
+    /// "I found nothing pending" and "I marked myself not running" is a gap in
+    /// which a new request would queue behind a driver that has already
+    /// stopped draining.
+    fn next(&self) -> Option<Pending> {
+        let mut state = self.inner.lock().expect("activation queue mutex");
+        let pending = state.pending.take();
+        if pending.is_none() {
+            state.running = false;
+        }
+        pending
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Requesting an activation
+// ---------------------------------------------------------------------------
+
+/// Publish `next` as a new generation, waiting for it (or for the generation
+/// that supersedes it) to go live.
+pub async fn request(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+    cause: GenerationCause,
+    next: GenerationManifest,
+) -> Result<ActivationOutcome, ActivationError> {
+    match shared.activation.admit(cause, next) {
+        Admission::Wait(rx) => rx.await.unwrap_or_else(|_| {
+            Err(ActivationError::Runtime(
+                "the activation this change was folded into was abandoned".to_string(),
+            ))
+        }),
+        Admission::Drive(cause, manifest) => {
+            let mine = activate(ctx, shared, cause, manifest).await;
+            // Drain: whoever queued up while this ran gets their outcome from
+            // here, because they have no task of their own to run it on.
+            while let Some(pending) = shared.activation.next() {
+                let outcome = activate(ctx, shared, pending.cause, pending.manifest).await;
+                for waiter in pending.waiters {
+                    // A caller that went away is not an error; the activation
+                    // it asked for still happened.
+                    let _ = waiter.send(outcome.clone());
+                }
+            }
+            mine
+        }
+    }
+}
+
+/// Stage `manifest` as a new generation and activate it.
+async fn activate(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+    cause: GenerationCause,
+    mut manifest: GenerationManifest,
+) -> Result<ActivationOutcome, ActivationError> {
+    let state = repo::runtime_state::read(ctx)
+        .await
+        .map_err(storage_error)?;
+    let previous = load_previous(ctx, &state).await?;
+
+    // The id is minted here, not by the repo, because the manifest has to
+    // carry it before it is hashed (design §11.3) — and the parent is
+    // whatever is active *now*, which for a coalesced request is not what was
+    // active when the caller built the manifest.
+    let id = repo::new_id();
+    manifest.identify(id.clone(), state.active_generation_id.clone());
+
+    let row = repo::generations::insert(
+        ctx,
+        &NewGeneration {
+            id,
+            parent_id: manifest.parent_id.clone(),
+            cause,
+            site_manifest_json: generation::canonical_text(&manifest.site)
+                .map_err(storage_error)?,
+            block_manifest_json: generation::canonical_text(&manifest.blocks)
+                .map_err(storage_error)?,
+            manifest_sha256: generation::manifest_sha256(&manifest).map_err(storage_error)?,
+        },
+    )
+    .await
+    .map_err(storage_error)?;
+
+    activate_staged(ctx, shared, &row, &manifest, previous.as_ref(), &state).await
+}
+
+/// Drive an already-staged generation to live.
+///
+/// Split from [`activate`] because boot recovery converges on a row that
+/// already exists: re-staging it would mint a second id for one desired state
+/// and break the append-only history's parent chain.
+async fn activate_staged(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+    row: &GenerationRow,
+    manifest: &GenerationManifest,
+    previous: Option<&(GenerationRow, GenerationManifest)>,
+    state: &RuntimeState,
+) -> Result<ActivationOutcome, ActivationError> {
+    let id = row.id.as_str();
+    let previous_manifest = previous.map(|(_, manifest)| manifest);
+    let mut progress = Progress::start();
+
+    // --- Validate ---------------------------------------------------------
+    journal(ctx, state, Some(id), ActivationPhase::Validating).await?;
+    set_status(ctx, id, GenerationStatus::Validating, None, None).await?;
+    let missing = missing_content(ctx, manifest).await?;
+    if !missing.is_empty() {
+        let error = ActivationError::Validation(missing);
+        abandon(ctx, id, state, &error.to_string()).await?;
+        return Err(error);
+    }
+    progress.record(
+        ActivationPhase::Validating,
+        format!(
+            "{} site files, {} blocks",
+            manifest.site.files.len(),
+            manifest.blocks.len()
+        ),
+    );
+
+    // --- Rebuild the runtime, if the block set changed ---------------------
+    // `Activating` covers both remaining phases (design §7.2): from here on
+    // the runtime swap and the site publish are what a reader of the ledger is
+    // watching, and the journal's phase says which of the two is running.
+    set_status(ctx, id, GenerationStatus::Activating, None, None).await?;
+    let rebuilt = generation::block_set_changed(previous_manifest, manifest);
+    if rebuilt {
+        journal(ctx, state, Some(id), ActivationPhase::BuildingRuntime).await?;
+        if let Err(message) = shared.control.rebuild(&manifest.blocks).await {
+            let error = ActivationError::Runtime(message);
+            abandon(ctx, id, state, &error.to_string()).await?;
+            return Err(error);
+        }
+        progress.record(
+            ActivationPhase::BuildingRuntime,
+            format!("{} blocks", manifest.blocks.len()),
+        );
+    }
+
+    // --- Publish the site -------------------------------------------------
+    journal(ctx, state, Some(id), ActivationPhase::Publishing).await?;
+    let diff = generation::diff(previous_manifest, manifest);
+    if let Err(e) = publish_site(ctx, previous_manifest.map(|m| &m.site), &manifest.site).await {
+        let error =
+            ActivationError::Storage(restore(ctx, shared, manifest, previous, rebuilt, e).await);
+        abandon(ctx, id, state, &error.to_string()).await?;
+        return Err(error);
+    }
+    progress.record(
+        ActivationPhase::Publishing,
+        format!(
+            "{} written, {} removed",
+            diff.added_paths.len() + diff.changed_paths.len(),
+            diff.removed_paths.len()
+        ),
+    );
+
+    // --- Commit -----------------------------------------------------------
+    let now = repo::now();
+    set_status(ctx, id, GenerationStatus::Active, None, Some(&now)).await?;
+    if let Some((previous_row, _)) = previous.filter(|(row, _)| row.id != id) {
+        // Exactly one generation is `Active` at a time: the column is the
+        // row's own lifecycle, and the row that was serving has stopped.
+        //
+        // The `id` guard is for boot convergence: a journal whose `desired`
+        // and `active` name the same generation (a hand-edited row, or a
+        // future writer) would otherwise have this supersede the generation it
+        // has just activated, leaving nothing live.
+        set_status(
+            ctx,
+            &previous_row.id,
+            GenerationStatus::Superseded,
+            None,
+            None,
+        )
+        .await?;
+    }
+    repo::runtime_state::write(
+        ctx,
+        &RuntimeState {
+            active_generation_id: Some(row.id.clone()),
+            desired_generation_id: None,
+            activation_phase: ActivationPhase::Idle,
+            generation: state.generation.saturating_add(1),
+        },
+    )
+    .await
+    .map_err(storage_error)?;
+    repo::generations::mark_superseded_before(ctx, RETAINED_GENERATIONS)
+        .await
+        .map_err(storage_error)?;
+    progress.record(ActivationPhase::Active, format!("generation {}", row.id));
+
+    // Re-read rather than patch the local row: the summary the caller is
+    // handed must be what the ledger holds, not what this function believes
+    // it wrote.
+    let activated = repo::generations::get(ctx, &row.id)
+        .await
+        .map_err(storage_error)?;
+    Ok(ActivationOutcome {
+        generation: generation::summarize(&activated, manifest),
+        progress: progress.steps,
+    })
+}
+
+/// Put the site back the way it was after a failed publish, and describe what
+/// happened.
+///
+/// The rebuilt runtime is rolled back first (design §7.3: a failure after the
+/// swap restores the previous `Rc`), then the previous site files are
+/// republished with the half-published manifest as the "before" — that is what
+/// removes files the failed publish had already added.
+async fn restore(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+    attempted: &GenerationManifest,
+    previous: Option<&(GenerationRow, GenerationManifest)>,
+    rebuilt: bool,
+    failure: WaferError,
+) -> String {
+    let mut message = format!("publishing the site failed: {}", failure.message);
+    let previous_manifest = previous.map(|(_, manifest)| manifest);
+    if rebuilt {
+        let blocks: &[DynamicBlockSpec] = previous_manifest.map_or(&[], |m| m.blocks.as_slice());
+        if let Err(e) = shared.control.rebuild(blocks).await {
+            message.push_str(&format!(
+                "; restoring the previous runtime also failed: {e}"
+            ));
+        }
+    }
+    let restored = match previous_manifest {
+        Some(manifest) => publish_site(ctx, Some(&attempted.site), &manifest.site).await,
+        None => publish_site(ctx, Some(&attempted.site), &Default::default()).await,
+    };
+    if let Err(e) = restored {
+        message.push_str(&format!(
+            "; restoring the previous site also failed: {}",
+            e.message
+        ));
+    }
+    message
+}
+
+/// Mark a generation `Failed` and put the journal back at rest with the
+/// previous generation still live.
+async fn abandon(
+    ctx: &dyn Context,
+    id: &str,
+    state: &RuntimeState,
+    message: &str,
+) -> Result<(), ActivationError> {
+    set_status(ctx, id, GenerationStatus::Failed, Some(message), None).await?;
+    // `Idle`, not `Failed`: the journal answers "is a recovery owed?", and a
+    // generation that has been abandoned owes none. Why it failed is on the
+    // row, which keeps it.
+    repo::runtime_state::write(
+        ctx,
+        &RuntimeState {
+            active_generation_id: state.active_generation_id.clone(),
+            desired_generation_id: None,
+            activation_phase: ActivationPhase::Idle,
+            generation: state.generation,
+        },
+    )
+    .await
+    .map_err(storage_error)
+}
+
+/// Journal an in-flight phase, leaving the active generation untouched.
+async fn journal(
+    ctx: &dyn Context,
+    state: &RuntimeState,
+    desired: Option<&str>,
+    phase: ActivationPhase,
+) -> Result<(), ActivationError> {
+    repo::runtime_state::write(
+        ctx,
+        &RuntimeState {
+            active_generation_id: state.active_generation_id.clone(),
+            desired_generation_id: desired.map(str::to_string),
+            activation_phase: phase,
+            generation: state.generation,
+        },
+    )
+    .await
+    .map_err(storage_error)
+}
+
+async fn set_status(
+    ctx: &dyn Context,
+    id: &str,
+    status: GenerationStatus,
+    failure: Option<&str>,
+    activated_at: Option<&str>,
+) -> Result<(), ActivationError> {
+    repo::generations::set_status(ctx, id, status, failure, activated_at)
+        .await
+        .map_err(storage_error)
+}
+
+/// The generation the journal says is live, with its manifest.
+async fn load_previous(
+    ctx: &dyn Context,
+    state: &RuntimeState,
+) -> Result<Option<(GenerationRow, GenerationManifest)>, ActivationError> {
+    generation::active_from(ctx, state)
+        .await
+        .map_err(storage_error)
+}
+
+/// Content the manifest names that the stores do not hold — empty when
+/// everything is there.
+///
+/// Presence *is* the hash check: both stores are content-addressed, so the key
+/// a manifest names is the hash of the bytes filed under it. Re-reading and
+/// re-hashing every blob would make each keystroke cost a full pass over the
+/// site to learn something the key already states.
+///
+/// The `Err` is a storage failure — the store could not answer — which is a
+/// different thing from the store answering that content is gone.
+async fn missing_content(
+    ctx: &dyn Context,
+    manifest: &GenerationManifest,
+) -> Result<Vec<String>, ActivationError> {
+    let mut missing = Vec::new();
+    for sha in generation::site_blob_shas(manifest) {
+        if !blobs::exists(ctx, sha).await.map_err(storage_error)? {
+            missing.push(format!("no blob is stored for site content {sha}"));
+        }
+    }
+    for spec in &manifest.blocks {
+        if !artifacts::exists(ctx, &spec.artifact_sha256)
+            .await
+            .map_err(storage_error)?
+        {
+            missing.push(format!(
+                "no artifact is stored for block {} ({})",
+                spec.name, spec.artifact_sha256
+            ));
+        }
+    }
+    Ok(missing)
+}
+
+// ---------------------------------------------------------------------------
+// Boot convergence
+// ---------------------------------------------------------------------------
+
+/// Converge on whatever the journal says was in flight, and report the block
+/// set the host should build its runtime from.
+///
+/// A non-empty `desired_generation_id` on start is a recovery journal, not a
+/// leftover (design §7.3): the process died somewhere between "I decided to
+/// activate this" and "it is live". Converging re-runs the same steps on the
+/// same staged row. If that fails, the previously active generation's site is
+/// restored and the journal cleared, so the sandbox always boots serving
+/// something coherent.
+///
+/// The return value is what the caller cannot get anywhere else: the block set
+/// the active generation declares. The runtime is the host's to build (Task
+/// 9), so this function decides *what* should be live and hands it over rather
+/// than calling `rebuild` itself — at boot there is no previous runtime to
+/// swap.
+pub async fn converge_on_boot(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+) -> Result<Vec<DynamicBlockSpec>, String> {
+    let state = repo::runtime_state::read(ctx)
+        .await
+        .map_err(|e| e.message)?;
+    if let Some(desired) = state.desired_generation_id.clone() {
+        let (row, manifest) = generation::load(ctx, &desired)
+            .await
+            .map_err(|e| e.message)?;
+        let previous = load_previous(ctx, &state)
+            .await
+            .map_err(|e| e.to_string())?;
+        // A failed convergence is not a failed boot, and the failure is not
+        // discarded: `activate_staged` has already written it to the
+        // generation's `failure_message` and put the journal back at rest, so
+        // it is readable at `GET /b/dev/api/generations/{id}`. What it cannot
+        // do is guarantee the published folder matches the generation that is
+        // live again — the interrupted publish may have written half of the
+        // desired one — so republish that from the manifest authoritative for
+        // it, treating the abandoned manifest as what is currently out there.
+        if activate_staged(ctx, shared, &row, &manifest, previous.as_ref(), &state)
+            .await
+            .is_err()
+        {
+            if let Some((_, previous_manifest)) = previous.as_ref() {
+                publish_site(ctx, Some(&manifest.site), &previous_manifest.site)
+                    .await
+                    .map_err(|e| e.message)?;
+            }
+        }
+    }
+
+    Ok(generation::active(ctx)
+        .await
+        .map_err(|e| e.message)?
+        .map(|(_, manifest)| manifest.blocks)
+        .unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Progress
+// ---------------------------------------------------------------------------
+
+/// Accumulates one [`ProgressStep`] per phase, each timed from the end of the
+/// previous one.
+struct Progress {
+    since: u64,
+    steps: Vec<ProgressStep>,
+}
+
+impl Progress {
+    fn start() -> Self {
+        Self {
+            since: now_millis(),
+            steps: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, phase: ActivationPhase, detail: String) {
+        let now = now_millis();
+        self.steps.push(ProgressStep {
+            phase,
+            // Saturating because `now_millis` is wall-clock: a clock that
+            // steps backwards mid-activation must report 0 ms, not a phase
+            // that took eighteen quintillion of them.
+            ms: now.saturating_sub(self.since),
+            detail,
+        });
+        self.since = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocks::dev::contracts::SiteManifest;
+
+    fn manifest(id: &str) -> GenerationManifest {
+        let mut manifest = GenerationManifest::staged(SiteManifest::default(), Vec::new());
+        manifest.identify(id.to_string(), None);
+        manifest
+    }
+
+    /// The first caller drives; the queue is then busy.
+    #[test]
+    fn the_first_request_drives_and_the_rest_wait() {
+        let queue = ActivationQueue::new();
+        assert!(matches!(
+            queue.admit(GenerationCause::SiteWrite, manifest("a")),
+            Admission::Drive(GenerationCause::SiteWrite, _)
+        ));
+        assert!(matches!(
+            queue.admit(GenerationCause::SiteWrite, manifest("b")),
+            Admission::Wait(_)
+        ));
+    }
+
+    /// Coalescing: the newest manifest wins, and every waiter is carried over
+    /// to it — including the one whose own manifest was displaced.
+    #[test]
+    fn queued_requests_coalesce_onto_the_newest_manifest() {
+        let queue = ActivationQueue::new();
+        let _driver = queue.admit(GenerationCause::SiteWrite, manifest("a"));
+        let _first = queue.admit(GenerationCause::SiteWrite, manifest("b"));
+        let _second = queue.admit(GenerationCause::BlockCompile, manifest("c"));
+
+        let pending = queue.next().expect("something is pending");
+        assert_eq!(pending.manifest.generation_id, "c");
+        assert_eq!(pending.cause, GenerationCause::BlockCompile);
+        assert_eq!(pending.waiters.len(), 2, "the displaced waiter is kept");
+    }
+
+    /// Draining an empty queue releases it, so the next request drives.
+    #[test]
+    fn the_queue_is_released_only_when_nothing_is_pending() {
+        let queue = ActivationQueue::new();
+        let _driver = queue.admit(GenerationCause::SiteWrite, manifest("a"));
+        let _waiter = queue.admit(GenerationCause::SiteWrite, manifest("b"));
+
+        assert!(queue.next().is_some());
+        // Still running: the driver has not finished the batch it just took.
+        assert!(matches!(
+            queue.admit(GenerationCause::SiteWrite, manifest("c")),
+            Admission::Wait(_)
+        ));
+        assert!(queue.next().is_some());
+        assert!(queue.next().is_none());
+        assert!(matches!(
+            queue.admit(GenerationCause::SiteWrite, manifest("d")),
+            Admission::Drive(..)
+        ));
+    }
+
+    #[test]
+    fn refusals_carry_the_status_the_caller_should_see() {
+        assert_eq!(
+            ActivationError::Validation(vec!["no blob".to_string()]).status(),
+            422
+        );
+        assert_eq!(ActivationError::Runtime("boom".to_string()).status(), 500);
+        assert_eq!(ActivationError::Storage("db".to_string()).status(), 500);
+        // The message is the product: it must name what went wrong.
+        assert!(ActivationError::Runtime("wasmi: boom".to_string())
+            .to_string()
+            .contains("wasmi: boom"));
+        assert!(
+            ActivationError::Validation(vec!["a".to_string(), "b".to_string()])
+                .to_string()
+                .contains("a; b")
+        );
+    }
+
+    #[test]
+    fn progress_times_each_phase_and_ends_at_active() {
+        let mut progress = Progress::start();
+        progress.record(ActivationPhase::Validating, "1 file".to_string());
+        progress.record(ActivationPhase::Publishing, "1 written".to_string());
+        progress.record(ActivationPhase::Active, "generation g1".to_string());
+        let phases: Vec<ActivationPhase> = progress.steps.iter().map(|s| s.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                ActivationPhase::Validating,
+                ActivationPhase::Publishing,
+                ActivationPhase::Active
+            ]
+        );
+        assert_eq!(progress.steps[0].detail, "1 file");
+    }
+}

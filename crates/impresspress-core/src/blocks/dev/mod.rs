@@ -23,12 +23,17 @@
 //! (design §13) depends on this block being absent from every normal
 //! deployment, not merely disabled in one.
 
+pub mod activation;
+pub mod artifacts;
 pub mod blobs;
 pub mod contracts;
 pub mod control;
 pub mod files;
+pub mod generation;
+pub mod generations_api;
 pub mod migrations;
 pub mod paths;
+pub mod publisher;
 pub mod repo;
 pub mod status;
 pub mod workspace;
@@ -78,6 +83,12 @@ pub enum Route {
     ApiFilesWrite,
     /// `POST /b/dev/api/files/delete`
     ApiFilesDelete,
+    /// `GET /b/dev/api/generations`
+    ApiGenerations,
+    /// `GET /b/dev/api/generations/{id}`
+    ApiGenerationDetail,
+    /// `POST /b/dev/api/generations/{id}/rollback`
+    ApiGenerationRollback,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
@@ -104,6 +115,21 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         HttpMethod::Post,
         "/b/dev/api/files/delete",
         Route::ApiFilesDelete,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/api/generations",
+        Route::ApiGenerations,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/api/generations/{id}",
+        Route::ApiGenerationDetail,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/dev/api/generations/{id}/rollback",
+        Route::ApiGenerationRollback,
     ),
 ];
 
@@ -188,17 +214,27 @@ pub fn wrap_grants() -> Vec<wafer_run::ResourceGrant> {
 
 /// State shared by every `/b/dev` handler.
 ///
-/// Held behind an `Arc` because the activation queue (Task 7) is shared
-/// mutable state that outlives any one request.
+/// Held behind an `Arc` because the activation queue is shared mutable state
+/// that outlives any one request — and outlives the runtime an activation
+/// rebuilds.
 pub struct DevShared {
     /// The host's half of activation: builds and swaps the live runtime.
     pub control: Arc<dyn RuntimeControl>,
+    /// The one serialized path from a desired state to a live one.
+    ///
+    /// On the shared state rather than on [`DevBlock`] because activation is
+    /// what re-instantiates the block: a queue owned by the block would be
+    /// dropped halfway through the operation that dropped it.
+    pub activation: activation::ActivationQueue,
 }
 
 impl DevShared {
     /// Build the shared state around a [`RuntimeControl`] handle.
     pub fn new(control: Arc<dyn RuntimeControl>) -> Arc<Self> {
-        Arc::new(Self { control })
+        Arc::new(Self {
+            control,
+            activation: activation::ActivationQueue::new(),
+        })
     }
 }
 
@@ -262,6 +298,21 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin)
                 .input::<contracts::FileDeleteRequest>()
                 .output::<contracts::FileDeleteResponse>(),
+            BlockEndpoint::get("/b/dev/api/generations")
+                .summary("List generations")
+                .auth(AuthLevel::Admin)
+                .query_params::<contracts::GenerationListQuery>()
+                .output::<contracts::GenerationListResponse>(),
+            BlockEndpoint::get("/b/dev/api/generations/{id}")
+                .summary("Read one generation")
+                .auth(AuthLevel::Admin)
+                .path_params::<contracts::GenerationPathParams>()
+                .output::<contracts::GenerationDetail>(),
+            BlockEndpoint::post("/b/dev/api/generations/{id}/rollback")
+                .summary("Republish an earlier generation")
+                .auth(AuthLevel::Admin)
+                .path_params::<contracts::GenerationPathParams>()
+                .output::<contracts::ActivationResponse>(),
         ])
         .admin_url(ROUTE_PREFIX)
         // The sandbox is registered only where it is meant to exist; a
@@ -285,8 +336,13 @@ impl Block for DevBlock {
             Route::ApiStatus => status::handle(ctx, &self.shared).await,
             Route::ApiFilesList => files::handle_list(ctx, &msg).await,
             Route::ApiFilesRead => files::handle_read(ctx, input).await,
-            Route::ApiFilesWrite => files::handle_write(ctx, input).await,
-            Route::ApiFilesDelete => files::handle_delete(ctx, input).await,
+            Route::ApiFilesWrite => files::handle_write(ctx, &self.shared, input).await,
+            Route::ApiFilesDelete => files::handle_delete(ctx, &self.shared, input).await,
+            Route::ApiGenerations => generations_api::handle_list(ctx, &msg).await,
+            Route::ApiGenerationDetail => generations_api::handle_detail(ctx, &msg).await,
+            Route::ApiGenerationRollback => {
+                generations_api::handle_rollback(ctx, &self.shared, &msg).await
+            }
         }
     }
 

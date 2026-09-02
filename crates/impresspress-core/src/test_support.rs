@@ -70,6 +70,18 @@ pub struct TestContext {
     /// consumer's registration produces, instead of calling a block's
     /// `handle()` past the gate.
     extra_routes: Vec<ExtraRoute>,
+    /// The object store behind the registered `wafer-run/storage` block, when
+    /// a constructor installed one. Kept so [`Self::storage_get`] and
+    /// [`Self::storage_ops`] can read the store *underneath* the namespacing
+    /// wrapper — the only way a test can assert what another block's
+    /// namespace actually holds.
+    storage: Option<Arc<InMemoryStorageService>>,
+    /// The shared state the registered `impresspress/dev` block was built
+    /// over, when [`Self::with_dev`] installed one. Handed back by
+    /// [`Self::dev_shared`] so a test can drive the activation queue directly
+    /// rather than only through HTTP.
+    #[cfg(feature = "block-dev")]
+    dev_shared: Option<Arc<crate::blocks::dev::DevShared>>,
 }
 
 impl TestContext {
@@ -93,6 +105,9 @@ impl TestContext {
             wrap_grants: Vec::new(),
             wrap_admin_block: String::new(),
             extra_routes: Vec::new(),
+            storage: None,
+            #[cfg(feature = "block-dev")]
+            dev_shared: None,
         }
     }
 
@@ -331,19 +346,17 @@ impl TestContext {
             dev::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx.register_block(
-            dev::BLOCK_NAME,
-            Arc::new(dev::DevBlock::new(dev::DevShared::new(control))),
-        );
+        let shared = dev::DevShared::new(control);
+        ctx.dev_shared = Some(shared.clone());
+        ctx.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // namespacing wrapper — that wrapper is what turns the block's own
         // `blobs` / `""` folders into `impresspress/dev/…`, and what would
         // refuse a cross-block reach that the grant list did not cover.
-        let storage = crate::blocks::storage::create(
-            Arc::new(InMemoryStorageService::new()),
-            Arc::from("impresspress/admin"),
-        );
+        let store = Arc::new(InMemoryStorageService::new());
+        ctx.storage = Some(store.clone());
+        let storage = crate::blocks::storage::create(store, Arc::from("impresspress/admin"));
         // The storage block runs its OWN cross-block check against a grant
         // list the runtime injects after startup. Leaving it empty (the
         // constructor's state) would refuse every `@`-prefixed reach
@@ -364,6 +377,66 @@ impl TestContext {
     /// [`Self::dispatch`] routes through it.
     pub fn add_extra_route(&mut self, route: ExtraRoute) {
         self.extra_routes.push(route);
+    }
+
+    /// The shared state the fixture's `impresspress/dev` block is built over.
+    ///
+    /// The same `Arc` the block holds — not a copy — so a test that drives
+    /// `activation::request` through this handle contends for the very queue
+    /// the HTTP handlers use.
+    #[cfg(feature = "block-dev")]
+    pub fn dev_shared(&self) -> Arc<crate::blocks::dev::DevShared> {
+        self.dev_shared
+            .clone()
+            .expect("this fixture registered no dev block; use TestContext::with_dev")
+    }
+
+    /// Read an object out of the fixture's object store *underneath* the
+    /// per-block namespacing wrapper.
+    ///
+    /// `block` is the namespace owner (`"wafer-run/web"`), `folder` its folder
+    /// (`"site"`), `key` the object — i.e. exactly the three parts
+    /// [`crate::blocks::storage`] concatenates into `{block}/{folder}/{key}`.
+    /// Going through the store directly is the point: a test asserting what
+    /// the *published site* holds must not be able to satisfy itself by
+    /// reading through the dev block's own grants.
+    pub async fn storage_get(
+        &self,
+        block: &str,
+        folder: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, wafer_core::interfaces::storage::service::StorageError> {
+        use wafer_core::interfaces::storage::service::StorageService as _;
+        let (bytes, _info) = self
+            .storage()
+            .get(&format!("{block}/{folder}"), key)
+            .await?;
+        Ok(bytes)
+    }
+
+    /// Make the fixture's object store refuse the next `put`.
+    ///
+    /// The one failure a test cannot otherwise produce: a publish that fails
+    /// after the runtime has already been swapped, which the activation queue
+    /// has to unwind.
+    pub fn fail_next_storage_put(&self, message: &str) {
+        self.storage().fail_next_put(message);
+    }
+
+    /// Every mutating storage operation the fixture's store has seen, oldest
+    /// first, as `"{op} {folder}/{key}"`.
+    ///
+    /// Ordering is the assertion this exists for: the site publisher must
+    /// write `index.html` after the assets it references, and only the order
+    /// of the `put`s can show that.
+    pub fn storage_ops(&self) -> Vec<String> {
+        self.storage().ops()
+    }
+
+    fn storage(&self) -> &InMemoryStorageService {
+        self.storage
+            .as_deref()
+            .expect("this fixture registered no storage service")
     }
 
     /// Route `msg` through [`crate::routing::route_to_block`] using this
@@ -1542,12 +1615,47 @@ pub struct InMemoryStorageService {
     /// as a filesystem backend's `create_dir_all` and S3's implicit prefixes
     /// both do.
     folders: Mutex<std::collections::BTreeMap<String, (bool, chrono::DateTime<chrono::Utc>)>>,
+    /// Set by [`Self::fail_next_put`]: the message the next `put` refuses
+    /// with, consumed by that call.
+    ///
+    /// A publish that fails *after* the runtime has been swapped is the one
+    /// path the sandbox has to unwind (design §7.3), and nothing else in a
+    /// fixture can produce it: every other failure is refused before anything
+    /// has been changed.
+    fail_next_put: Mutex<Option<String>>,
+    /// Every mutating operation in the order it arrived, as
+    /// `"{op} {folder}/{key}"`.
+    ///
+    /// Content-addressed stores make *what* was written easy to assert and
+    /// *when* impossible: two publishes of the same bytes are indistinguishable
+    /// in the final state. The site publisher's contract is an ordering one
+    /// (`index.html` after everything it references), so the order has to be
+    /// recorded as it happens.
+    ops: Mutex<Vec<String>>,
 }
 
 impl InMemoryStorageService {
     /// A store with no folders and no objects.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make the next `put` refuse with `message`, storing nothing.
+    pub fn fail_next_put(&self, message: &str) {
+        *self.fail_next_put.lock().expect("fail_next_put mutex") = Some(message.to_string());
+    }
+
+    /// Every mutating operation this store has seen, oldest first.
+    pub fn ops(&self) -> Vec<String> {
+        self.ops.lock().expect("ops mutex poisoned").clone()
+    }
+
+    /// Record one mutating operation.
+    fn record(&self, op: &str, folder: &str, key: &str) {
+        self.ops
+            .lock()
+            .expect("ops mutex poisoned")
+            .push(format!("{op} {folder}/{key}"));
     }
 }
 
@@ -1561,6 +1669,15 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
         content_type: &str,
     ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
         let now = chrono::Utc::now();
+        self.record("put", folder, key);
+        if let Some(message) = self
+            .fail_next_put
+            .lock()
+            .expect("fail_next_put mutex")
+            .take()
+        {
+            return Err(wafer_core::interfaces::storage::service::StorageError::Internal(message));
+        }
         self.folders
             .lock()
             .expect("folders mutex poisoned")
@@ -1608,6 +1725,7 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
         folder: &str,
         key: &str,
     ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
+        self.record("delete", folder, key);
         self.objects
             .lock()
             .expect("objects mutex poisoned")

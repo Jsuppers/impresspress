@@ -73,9 +73,12 @@ async fn write_then_list_then_read_round_trips_with_hashes() {
     .await;
     assert_eq!(w["path"], "site/index.html");
     assert_eq!(w["size"], 11);
-    // Task 6 stages nothing: activation (and the generation it summarizes)
-    // arrives in Task 7.
-    assert_eq!(w["generation"], serde_json::Value::Null);
+    // A `site/` write publishes: the response carries the generation it
+    // created. What that generation does is `dev_activation.rs`'s subject;
+    // here it only has to be *there*, so this file's round trip is not
+    // silently exercising an unpublished write.
+    assert_eq!(w["generation"]["cause"], "site_write");
+    assert_eq!(w["generation"]["status"], "active");
     let sha = w["sha256"].as_str().expect("sha256").to_string();
     assert_eq!(sha.len(), 64);
 
