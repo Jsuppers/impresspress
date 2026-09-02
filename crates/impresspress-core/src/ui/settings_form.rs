@@ -112,67 +112,63 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
     let value = if is_sensitive { "" } else { value };
     match var.input_type {
         InputType::Toggle => html! {
-            div .form-group style="margin-bottom:1.25rem" {
-                label style="display:flex;align-items:center;gap:0.75rem;cursor:pointer" {
-                    input type="checkbox" name=(var.key)
-                        checked[value == "true"]
-                        style="width:1.25rem;height:1.25rem;accent-color:var(--primary)";
-                    span .form-label style="margin:0" { (label) }
+            div .form-group {
+                label .form-checkbox {
+                    input type="checkbox" name=(var.key) checked[value == "true"];
+                    (label)
                 }
                 @if !var.description.is_empty() {
-                    p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                    p .form-hint { (var.description) }
                 }
             }
         },
         InputType::Password => {
             html! {
-                div .form-group style="margin-bottom:1.25rem" {
+                div .form-group {
                     label .form-label for=(var.key) { (label) }
-                    div style="display:flex;align-items:center;gap:0.5rem" {
+                    div .value-reveal-wrapper {
                         input .form-input #(var.key) name=(var.key) type="password" value=(value)
-                            placeholder=(if has_value { "******** (set)" } else { "Not configured" })
-                            style="flex:1";
-                        button type="button" .btn .btn-ghost .btn-sm
+                            placeholder=(if has_value { "******** (set)" } else { "Not configured" });
+                        button type="button" .btn .btn-ghost .btn-icon .btn-icon-right
                             onclick={"var i=document.getElementById('" (var.key) "');if(i.type==='password'){i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')}else{i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')}"}
                             title="Reveal"
                             aria-label="Reveal value"
                         { (super::icons::eye()) }
                     }
                     @if !var.description.is_empty() {
-                        p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                        p .form-hint { (var.description) }
                     }
                 }
             }
         }
         InputType::Color => html! {
-            div .form-group style="margin-bottom:1.25rem" {
+            div .form-group {
                 label .form-label for=(var.key) { (label) }
-                div style="display:flex;align-items:center;gap:0.75rem" {
+                div .color-picker-row {
                     input .form-input #(var.key) name=(var.key) type="text" value=(value)
-                        placeholder=(var.default) style="flex:1";
-                    input type="color" value=(value)
-                        style="width:40px;height:36px;border:1px solid #e2e8f0;border-radius:6px;cursor:pointer;padding:2px"
+                        placeholder=(var.default);
+                    input .color-swatch-input type="color" value=(value)
                         onchange={"document.getElementById('" (var.key) "').value=this.value"};
                 }
                 @if !var.description.is_empty() {
-                    p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                    p .form-hint { (var.description) }
                 }
             }
         },
         InputType::Textarea => html! {
-            div .form-group style="margin-bottom:1.25rem" {
+            div .form-group {
                 label .form-label for=(var.key) { (label) }
                 textarea .form-input #(var.key) name=(var.key) rows="4"
                     placeholder=(var.default) { (value) }
                 @if !var.description.is_empty() {
-                    p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                    p .form-hint { (var.description) }
                 }
             }
         },
         // A Select without declared options degrades to the plain text
         // widget below rather than rendering an empty, unusable dropdown.
         InputType::Select if !var.options.is_empty() => html! {
-            div .form-group style="margin-bottom:1.25rem" {
+            div .form-group {
                 label .form-label for=(var.key) { (label) }
                 select .form-select #(var.key) name=(var.key) {
                     @for option in &var.options {
@@ -183,27 +179,27 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
                     }
                 }
                 @if !var.description.is_empty() {
-                    p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                    p .form-hint { (var.description) }
                 }
             }
         },
         InputType::Number => html! {
-            div .form-group style="margin-bottom:1.25rem" {
+            div .form-group {
                 label .form-label for=(var.key) { (label) }
                 input .form-input #(var.key) name=(var.key) type="number" value=(value)
                     placeholder=(var.default);
                 @if !var.description.is_empty() {
-                    p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                    p .form-hint { (var.description) }
                 }
             }
         },
         InputType::Url | InputType::Text | InputType::Select => html! {
-            div .form-group style="margin-bottom:1.25rem" {
+            div .form-group {
                 label .form-label for=(var.key) { (label) }
                 input .form-input #(var.key) name=(var.key) type="text" value=(value)
                     placeholder=(var.default);
                 @if !var.description.is_empty() {
-                    p .text-muted style="font-size:0.8rem;margin-top:0.25rem" { (var.description) }
+                    p .form-hint { (var.description) }
                 }
             }
         },
@@ -259,27 +255,25 @@ pub async fn render_sections(ctx: &dyn Context, sections: &[SettingsSection<'_>]
     html! {
         @for (i, section) in sections.iter().enumerate() {
             @if section.collapsible {
-                details style="margin-top:1rem;border:1px solid var(--border-color);border-radius:12px" {
-                    summary style="padding:.9rem 1rem;cursor:pointer;font-weight:600" { (section.icon) " " (section.title) }
-                    div style="padding:0 1rem 1rem" {
-                        @if !section.description.is_empty() {
-                            p .text-muted style="font-size:0.85rem;margin:0 0 1rem" { (section.description) }
-                        }
-                        @for var in section.vars {
-                            (render_field(var, values.get(&var.key).unwrap_or(&empty)))
-                        }
+                details .card .mt-4 {
+                    summary .summary-strong { (section.icon) " " (section.title) }
+                    @if !section.description.is_empty() {
+                        p .settings-section-desc { (section.description) }
+                    }
+                    @for var in section.vars {
+                        (render_field(var, values.get(&var.key).unwrap_or(&empty)))
                     }
                 }
             } @else {
-                h3 style=(format!(
-                    "font-size:1rem;font-weight:600;margin:{} 0 {};padding-bottom:0.5rem;border-bottom:1px solid var(--border-color)",
-                    if i == 0 { "0" } else { "1.5rem" },
-                    if section.description.is_empty() { "1rem" } else { "0.5rem" }
-                )) {
+                h3 class={
+                    "settings-section-heading"
+                    @if i == 0 { " settings-section-heading--first" }
+                    @if !section.description.is_empty() { " settings-section-heading--with-desc" }
+                } {
                     (section.icon) " " (section.title)
                 }
                 @if !section.description.is_empty() {
-                    p .text-muted style="font-size:0.85rem;margin:0 0 1rem" { (section.description) }
+                    p .settings-section-desc { (section.description) }
                 }
                 @for var in section.vars {
                     (render_field(var, values.get(&var.key).unwrap_or(&empty)))
@@ -308,7 +302,7 @@ pub async fn settings_form(
         form #settings-form onsubmit="return submitSettings(event)" {
             (fields)
             (extra)
-            button .btn .btn--primary type="submit" style="margin-top:1rem" { "Save settings" }
+            button .btn .btn--primary .mt-4 type="submit" { "Save settings" }
         }
         script { (PreEscaped(submit_js(post_url))) }
     }

@@ -305,6 +305,45 @@
  * default and flush with the content above it. */
 .details-heading { font-size: 1rem; margin-top: 0; }
 
+/* ===== Settings form (ui/settings_form.rs) =====
+ * Section heading between one ConfigVar group and the next. The first
+ * section in a form sits flush against the top of its container
+ * (`--first`); a section with a description tightens its own bottom margin
+ * so the description reads as attached to the heading, not the next one
+ * (`--with-desc`). A collapsible section skips this heading entirely and
+ * uses a bordered `.card` (see below) instead, so it doesn't need either
+ * modifier. */
+.settings-section-heading {
+	font-size: 1rem; font-weight: 600;
+	margin: 1.5rem 0 1rem;
+	padding-bottom: 0.5rem;
+	border-bottom: 1px solid var(--border-color);
+}
+.settings-section-heading--first { margin-top: 0; }
+.settings-section-heading--with-desc { margin-bottom: 0.5rem; }
+/* One-line explanation under a section heading or a collapsible section's
+ * summary — smaller and lighter than `.form-hint` (a per-field hint), since
+ * it introduces a whole group of fields rather than one. */
+.settings-section-desc { color: var(--text-muted); font-size: 0.85rem; margin: 0 0 1rem; }
+
+/* A collapsible settings section (`SettingsSection::collapsible`) renders as
+ * `details.card`, matching the bordered-box disclosure pattern already used
+ * by the tickets admin (`details .card .p-4 .mt-3`) — `.card`'s own padding
+ * wraps summary + fields uniformly, so no separate body wrapper is needed. */
+
+/* The reveal/hide password field pairs a text input with a color swatch —
+ * only ConfigVar's Color widget renders this shape, so it's a settings-form-
+ * specific row rather than a general-purpose utility. */
+.color-picker-row { display: flex; align-items: center; gap: 0.75rem; }
+.color-picker-row .form-input { flex: 1; }
+.color-swatch-input {
+	width: 40px; height: 36px;
+	border: 1px solid var(--border-color);
+	border-radius: 6px;
+	cursor: pointer;
+	padding: 2px;
+}
+
 @media (max-width: 720px) {
 	/* Forms: two-column form rows stack on narrow screens. */
 	.form-row { grid-template-columns: 1fr; }
@@ -313,11 +352,11 @@
 	.form-control,
 	.btn { min-height: 44px; }
 }
-/* ===== Email/form sensitive input wrapper =====
-   The Mailgun API Key field uses an inline `display:flex` row with the input
-   + an eye-toggle button. On narrow screens the wrapper collapsed because
-   the parent form-group's inline width wasn't enforced; the input could shrink
-   below its content. Force the wrapper to fill and let the input flex. */
-.form-group > div[style*="display:flex"] { width: 100%; }
-.form-group > div[style*="display:flex"] > .form-input { flex: 1 1 auto; min-width: 0; }
+/* Email/form sensitive input wrapper (e.g. the Mailgun API Key field, and
+ * every ConfigVar Password widget) — previously an inline `display:flex`
+ * row with the input + an eye-toggle button, which needed a narrow-screen
+ * width fix keyed off the inline `style` attribute itself. Migrated to
+ * `.value-reveal-wrapper` (button absolutely positioned over the input via
+ * `.btn-icon-right`, no flex row), which doesn't have that collapse
+ * failure mode — `.form-input`'s own `width: 100%` is enough. */
 
