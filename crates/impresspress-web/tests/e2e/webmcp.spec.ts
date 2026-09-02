@@ -75,10 +75,20 @@ test('refresh() re-registers the manifest without disturbing a tool it does not 
   // `dev.js` for ownership of tools it never registered. `stale_tool` here
   // stands in for exactly that: something else's tool, registered directly
   // — it must survive a webmcp.js refresh untouched.
+  //
+  // The manifest is identical across both loads, so "unregister then
+  // re-register the same set" and "do nothing" leave the polyfill's
+  // name-keyed Map in the same end state — `after === before` alone can't
+  // tell them apart. Two more assertions make it discriminating: (a)
+  // `generation()` must actually increment (proving a fresh `load()` ran,
+  // not a no-op), and (b) the polyfill's `__unregistered()` call log must
+  // show every manifest tool name dropped exactly once — proving the
+  // unregister half really fired — while `stale_tool` is never in it.
   await page.addInitScript(MODEL_CONTEXT_POLYFILL);
   await page.goto('/b/auth/login');
   await registeredTools(page, 1);
   const before = await page.evaluate(() => document.modelContext.__tools().map((t) => t.name).sort());
+  const generationBefore = await page.evaluate(() => window.__impresspressWebmcp.generation());
   await page.evaluate(() =>
     document.modelContext.registerTool({
       name: 'stale_tool',
@@ -89,6 +99,22 @@ test('refresh() re-registers the manifest without disturbing a tool it does not 
   );
   await page.evaluate(() => window.__impresspressWebmcp.refresh());
   const after = await page.evaluate(() => document.modelContext.__tools().map((t) => t.name).sort());
+  const generationAfter = await page.evaluate(() => window.__impresspressWebmcp.generation());
+  const unregistered = await page.evaluate(() => document.modelContext.__unregistered());
+
+  // (a) A real refresh happened, not a no-op that coincidentally left the
+  // same set behind.
+  expect(generationAfter).toBeGreaterThan(generationBefore);
+
+  // (b) Every manifest tool was actually dropped — exactly once each — and
+  // `stale_tool` was never touched by `unregisterTool` at all.
+  for (const name of before) {
+    expect(unregistered.filter((n: string) => n === name), name).toHaveLength(1);
+  }
+  expect(unregistered).not.toContain('stale_tool');
+
+  // End state: the manifest tools are back (re-registered) and the foreign
+  // tool survived untouched.
   expect(after).toEqual([...before, 'stale_tool'].sort());
 });
 
