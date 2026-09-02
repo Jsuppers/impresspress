@@ -1767,7 +1767,19 @@ Instead add a **second, separately-scoped guard**, and run this task **after 12d
 - Assert no `*_CSS: &str` constant (or equivalent page-local stylesheet const) exists outside `ui/styles/`.
 - Assert no `.style.` JS assignment carries a *literal* value — a template-interpolated one is the dynamic case and is legitimate.
 
-Then migrate `PRODUCTS_UI_CSS` into the appropriate `ui/styles/components/*.css` files, and convert the three `cssText` sites to classes.
+Then migrate `PRODUCTS_UI_CSS` into the appropriate `ui/styles/components/*.css` files, and convert the remaining `.style.` sites to classes or the `hidden` IDL property.
+
+**Remaining `.style.` inventory** (narrowed during 12c, which fixed the pairs that were coupled to inline styles it had to remove): `blocks/admin/pages/database.rs` (2), `blocks/userportal/pages/admin_buttons.rs` (2), `blocks/products/pages.rs` (3).
+
+#### One of these is a live bug, not cleanup
+
+`admin_buttons.rs:292,300` is **not** neutral tidying. The edit modal is rendered by `components::modal()`, which emits the boolean `hidden` attribute, and `base.css:10` carries `[hidden] { display: none !important; }`. The page then tries to reveal it with `document.getElementById('edit-btn-{id}').style.display='flex'` — a *plain* inline style, which `!important` beats. **The modal cannot open.**
+
+This is pre-existing, not introduced by this branch: `git log -S` places the `!important` at commit `b1ebb0ce` (2026-07-21), which is an ancestor of `origin/main`. So the user-portal "Edit Button" flow has been silently broken since then.
+
+Fixing it is the same one-line change the rest of 12e makes — `el.hidden = false` / `el.hidden = true` instead of `style.display` — but treat it as a **bug fix with a regression test**, not a refactor. The shared `openModal`/`closeModal` helpers in `ui/assets.rs` already do this correctly (`removeAttribute("hidden")`); this page hand-rolls its own toggle instead of using them, which is why it drifted. Prefer routing it through the shared helpers over fixing the hand-rolled version in place.
+
+**Verify by clicking**, not by reading: open the user portal's admin-buttons page, click Edit on a button, and confirm the modal appears. A static read is what let this survive six weeks.
 
 **One cascade detail to preserve:** `PRODUCTS_UI_CSS` renders as an inline `<style>` inside `<body>`, later in document order than the linked stylesheet, so its rules currently win ties against same-specificity utilities. 12a already had to work around this once with a compound `.products-advanced.mt-0` selector (0,2,0). Moving those rules into the linked stylesheet changes that ordering — check every rule that relied on it, and remove the compound-selector workaround once it is no longer needed.
 
