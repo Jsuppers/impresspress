@@ -115,6 +115,7 @@ fn capabilities_eq(
         collections,
         raw_sql,
         ddl,
+        schema,
         storage_folders,
         crypto,
         network,
@@ -132,6 +133,7 @@ fn capabilities_eq(
     *collections == right.collections
         && *raw_sql == right.raw_sql
         && *ddl == right.ddl
+        && *schema == right.schema
         && *storage_folders == right.storage_folders
         && *crypto == right.crypto
         && *network == right.network
