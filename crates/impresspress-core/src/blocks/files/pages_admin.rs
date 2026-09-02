@@ -126,8 +126,8 @@ pub fn render_admin_overview_quotas_hint(quotas_count: i64) -> Markup {
         return html! {};
     }
     html! {
-        div .card style="padding:1rem" {
-            p .text-muted style="font-size:0.875rem" {
+        div .card .p-4 {
+            p .text-muted .text-sm {
                 (quotas_count) " user(s) with custom quotas configured."
             }
         }

@@ -254,7 +254,7 @@ pub async fn object_list_page(
         // Hidden file input that the topbar Upload button triggers via
         // [data-action="open-upload"]. Multi-select so users can pick
         // many files at once. Same upload endpoint as drag-drop.
-        input #file-upload-input type="file" multiple style="display: none";
+        input #file-upload-input type="file" multiple hidden;
         (table)
         (super::render_bootstrap_script(bucket, current_prefix))
     };

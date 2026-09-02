@@ -36,7 +36,11 @@ where
                 thead { tr {
                     @for col in columns {
                         @match col.width {
-                            Some(w) => th style=(format!("width:{w}")) { (col.label) },
+                            // Caller-declared, per-instance column width -- a
+                            // genuine runtime value, so it's handed to CSS as
+                            // a custom property rather than a literal inline
+                            // width declaration.
+                            Some(w) => th .data-table__col-w style=(format!("--col-width:{w}")) { (col.label) },
                             None => th { (col.label) },
                         }
                     }
@@ -109,7 +113,7 @@ mod tests {
         assert!(s.contains("<thead>"));
         assert!(s.contains("<tbody>"));
         assert!(s.contains("alice"));
-        assert!(s.contains(r#"style="width:200px""#));
+        assert!(s.contains(r#"style="--col-width:200px""#));
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let current_hash = current_session_hash(msg);
 
     let body = html! {
-        p .text-muted style="margin:0 0 1rem;font-size:0.875rem" {
+        p .text-muted .m-0 .mb-4 .text-sm {
             "Sessions signed in to your account. Revoke any you don't recognize."
         }
         (render_table(&rows, current_hash.as_deref()))

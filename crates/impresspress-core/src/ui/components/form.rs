@@ -20,7 +20,7 @@ pub fn search_input_with_value(
 ) -> Markup {
     html! {
         @if !current_value.is_empty() {
-            div .flex .items-center .gap-2 .mb-2 style="font-size:0.875rem" {
+            div .flex .items-center .gap-2 .mb-2 .text-sm {
                 span .text-muted { "Results for " }
                 span .font-semibold { "\"" (current_value) "\"" }
                 a .btn .btn-ghost .btn-sm

@@ -89,6 +89,9 @@
     border-radius: 8px;
 }
 .data-table__empty { padding: var(--spacing-xl); }
+/* Caller-declared per-column width (ui/components/table.rs's `TableCol`) --
+   a genuine runtime value, handed to CSS as `--col-width`. */
+.data-table__col-w { width: var(--col-width); }
 
 /* ===== Empty state ===== */
 .empty { text-align: center; padding: var(--spacing-xl) var(--spacing-md); color: var(--text-secondary); }

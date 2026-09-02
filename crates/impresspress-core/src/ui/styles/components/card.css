@@ -654,6 +654,13 @@
 .model-progress-track { background: var(--bg-secondary); border-radius: 0.25rem; height: 6px; overflow: hidden; }
 .model-progress-fill { height: 100%; background: var(--primary-color); width: 0%; transition: width 0.3s; }
 
+/* ===== Storage quota bar (blocks/files/pages_user/cloudstorage.rs) =====
+   Same shape as .model-progress-track/-fill above; `--fill-pct` is a
+   per-render percentage computed in Rust, handed to CSS as a custom
+   property rather than a literal `width:`. */
+.quota-bar { background: var(--bg-secondary); border-radius: 0.25rem; height: 8px; overflow: hidden; }
+.quota-bar__fill { height: 100%; background: var(--primary-color); width: var(--fill-pct); transition: width 0.3s; }
+
 /* ===== LLM providers table (blocks/llm/ui.rs) =====
    Long endpoint/model-list cells truncate instead of wrapping and blowing
    out the table width. */

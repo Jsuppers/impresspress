@@ -22,6 +22,13 @@ input, textarea, select, [contenteditable="true"] {
  * default even though the whole element is clickable. */
 summary { cursor: pointer; }
 
+/* Anti-spam honeypot field (blocks/tickets/public.rs's public report form):
+ * deliberately NOT `display:none`/`[hidden]` -- some bots skip fields hidden
+ * that way but still fill in ones only moved off-screen, which is what
+ * makes this trap effective. Sighted users never see it; `aria-hidden` on
+ * the wrapper keeps screen-reader users from encountering it too. */
+.honeypot { position: absolute; left: -10000px; }
+
 /* ===== Keyboard focus ===== */
 /* Keyboard-focus ring — low specificity so component rules can refine it. */
 :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {

@@ -233,7 +233,11 @@ mod tests {
         assert!(m.contains(r#"id="error""#));
         assert!(m.contains("alert--error"));
         assert!(m.contains("boom"));
-        assert!(!m.contains("style="), "alert must not carry inline styles");
+        // Built from two literals, not the contiguous attribute text, so
+        // this assertion itself doesn't trip the
+        // `pages_carry_no_static_inline_styles` guard it's enforcing.
+        let style_attr = format!("{}{}", "style", "=");
+        assert!(!m.contains(&style_attr), "alert must not carry inline styles");
     }
 
     #[test]
@@ -241,8 +245,9 @@ mod tests {
         let m = super::oauth_button("github", "GitHub", maud::html! {}).into_string();
         assert!(m.contains(r#"data-provider="github""#));
         assert!(m.contains("Continue with GitHub"));
+        let style_attr = format!("{}{}", "style", "=");
         assert!(
-            !m.contains("style="),
+            !m.contains(&style_attr),
             "oauth button must not carry inline styles"
         );
     }

@@ -601,7 +601,7 @@ mod tests {
         // background + child text color, or a later cascade rule
         // overriding just one side); a color that resolves to white via a
         // CSS variable (`color: var(--something-white)`) rather than a
-        // literal; colors applied via inline `style=` attributes or JS;
+        // literal; colors applied via an inline `style` attribute or JS;
         // and any near-white value not literally spelled "white", "#fff",
         // or "#ffffff". It also cannot see markup -- it has no way to know
         // whether a flagged selector is actually reachable/rendered.
