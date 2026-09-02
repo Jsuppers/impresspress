@@ -254,7 +254,8 @@ fn rendered_block_info_parses_and_matches_the_typed_builder() {
     assert_eq!(subscribe.input_schema.as_ref().unwrap()["properties"]["email"]["type"], "string");
     let caps = parsed.capabilities.as_ref().unwrap();
     assert!(caps.allows_collection("site__newsletter__subscribers"));
-    assert!(caps.ddl);
+    assert!(caps.schema);
+    assert!(!caps.ddl);
     assert!(!caps.raw_sql);
 }
 
@@ -599,7 +600,7 @@ pub mod json {
 }
 ```
 
-`Schema`, `Block`, `Endpoint`, `Request::from_frame` (frame = `[message, bytes]`: `kind`, `meta` → fields; `http.query.*` → `query`; `http.header.*` → `headers`; `auth.user_roles` split on `,`), `Block::route(method, path)` (exact segment match with `{param}` capture, first declared wins), `dispatch` (route → handler; `None` → `Response::text(404, "not found")`; a handler that panics aborts — `panic = "abort"` — so the host sees a trap and the request fails, as the spec's §6.6 states), `render_result` (the `GuestResult` JSON with `data` as an integer array and `resp.status` / `resp.content_type` / `resp.header.*` meta), `render_block_info` (mirrors `wafer_block::BlockInfo`'s serde form — every field the parity test reads: `name`, `version`, `interface`, `summary`, `requires`, `capabilities` (the `BlockCapabilities` serde form with `Allowlist::Only([...])`, `ddl: true` whenever a collection is declared), `endpoints[]` with `method`, `path`, `summary`, `auth`, `input_schema`, `output_schema`, `agent_tool`). Host calls:
+`Schema`, `Block`, `Endpoint`, `Request::from_frame` (frame = `[message, bytes]`: `kind`, `meta` → fields; `http.query.*` → `query`; `http.header.*` → `headers`; `auth.user_roles` split on `,`), `Block::route(method, path)` (exact segment match with `{param}` capture, first declared wins), `dispatch` (route → handler; `None` → `Response::text(404, "not found")`; a handler that panics aborts — `panic = "abort"` — so the host sees a trap and the request fails, as the spec's §6.6 states), `render_result` (the `GuestResult` JSON with `data` as an integer array and `resp.status` / `resp.content_type` / `resp.header.*` meta), `render_block_info` (mirrors `wafer_block::BlockInfo`'s serde form — every field the parity test reads: `name`, `version`, `interface`, `summary`, `requires`, `capabilities` (the `BlockCapabilities` serde form with `Allowlist::Only([...])`, `schema: true` whenever a collection is declared, `ddl: false` always — spec amendment #10), `endpoints[]` with `method`, `path`, `summary`, `auth`, `input_schema`, `output_schema`, `agent_tool`). Host calls:
 
 ```rust
 pub fn call(target: &str, kind: &str, body: &json::Json) -> Result<json::Json, HostError> {

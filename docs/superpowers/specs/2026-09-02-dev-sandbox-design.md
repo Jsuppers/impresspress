@@ -805,6 +805,28 @@ and read together with this list.
    `frame-src 'self'` for `/b/dev`; `'unsafe-eval'` in the current constant is
    already stripped by the block and `'wasm-unsafe-eval'` survives.
 
+7. **§4.2 / Plan 2 — the preview iframe is same-origin.** `sandbox="allow-scripts
+   allow-same-origin allow-forms allow-popups"`: without `allow-same-origin`
+   the framed site's calls to `/b/products/*` would be cross-origin and
+   CORS-blocked. Isolation is "no tool is registered inside the frame and the
+   parent exposes nothing on `window`".
+8. **§8 / Plan 3 — `wafer_guest_version` comes from the page.** `BlockInfo`
+   has no such field; the page reads the `WAFER_GUEST_VERSION` line of the
+   vendored file and sends it in `StageBuildRequest`.
+9. **§10 — the data snapshot is `seed/data.json`, not `data.sql`.** Rows per
+   allowlisted table, applied through typed `upsert`/`create`/`delete_where`
+   calls; no SQL text is generated or executed by the sandbox.
+10. **§6.4 / §6.5 — a `schema` capability, not `ddl`.** wafer-run's raw
+    `database.ddl` is gated by `caps.ddl` and runs arbitrary SQL, so granting
+    `ddl` to a guest for `ensure_table` would also grant raw DDL. The producer
+    adds `BlockCapabilities.schema` (structured schema ops on the block's own
+    collections, sentinel `__schema__`) and the structured ops check
+    `(table, Db)` **and** `__schema__`. Guests declare `schema: true`,
+    `ddl: false`; validation refuses `ddl: true`. Storage-folder capabilities
+    are prefixes (`site/<name>` admits `site/<name>/…`), and resources with
+    `.`/`..` segments are refused at the capability layer and in the storage
+    handler.
+
 ## 21. Definition of done
 
 - `browser-devtools` is off by default and absent from a normal bundle; the
