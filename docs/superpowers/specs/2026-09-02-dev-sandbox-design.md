@@ -186,7 +186,8 @@ Changes against the existing plan:
       src/lib.rs            the user's code
       src/wafer_guest.rs    vendored support module (see 6.2)
 
-`<name>` is `[a-z][a-z0-9_]{1,31}`; the block's WAFER name is `site/<name>`;
+`<name>` is `^[a-z][a-z0-9-]{1,31}$` (no `--`, no trailing `-`; see amendment 11);
+the block's WAFER name is `site/<name>`;
 its routes live under `/b/<name>/`. `wafer-run/` and `impresspress/` names,
 and any route prefix a built-in block owns, are reserved and rejected.
 
@@ -832,11 +833,33 @@ and read together with this list.
     to `-`, so `<name>` is `^[a-z][a-z0-9-]{1,31}$` (collections stay
     `site__<name>__*` with the hyphenated name inside). Guest validation is
     exhaustive over `BlockCapabilities` (a new producer field fails the
-    build) and refuses any `headers` policy; extra routes whose block
+    build) and refuses any readable or writable `headers` policy (`masked`
+    only narrows what a guest sees and is allowed); extra routes whose block
     declares endpoints are refined by the declared endpoint auth exactly like
     built-in routes; the executable half of validation is split into
     `inspect` (metadata under no capabilities) and `probe` (lifecycle + one
     request under the accepted capabilities), with the static rules between.
+
+12. **§7.4 / Plan 1 Task 9 — the probe keys on host-call denials, not on
+    traps.** The producer gives the host no trap signal it can attribute to
+    a capability, so `probe` runs `Init`, `Start` and one request under a
+    deny-all context that counts denials: a failure with at least one
+    counted denial is reported as a capability problem, a failure with none
+    is fatal. The residual gap is a guest that makes one host call and then
+    traps in `Init` for an unrelated reason — it is excused as a capability
+    problem. Closing it needs a producer-side trap signal.
+
+13. **§7.3 / Plan 1 final review — restore reuses the retained runtime.**
+    A failed activation restores the previous `Rc<Wafer>` that `rebuild`
+    swapped out (`RuntimeControl::restore_previous`), never a second full
+    rebuild; the retention window is the 20 most recent generation rows
+    regardless of status, so an orphaned `Staged` row left by a crash
+    between insert and the first journal write occupies a slot until it ages
+    out. Seeded blocks pass the same capability and route rules as staged
+    ones (`validate_spec`); only the rules that read the guest's `BlockInfo`
+    (name mismatch, endpoint outside routes, duplicate tool name,
+    `cap-requires` mismatch) wait for the runtime and are listed in
+    `seed.rs`.
 
 ## 21. Definition of done
 
