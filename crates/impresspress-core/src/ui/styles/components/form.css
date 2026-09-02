@@ -113,11 +113,19 @@
 }
 
 /* Right-side icon variant (e.g. the reveal/hide button on a sensitive
- * variable's value field) — mirrors the left-icon rules above but on the
- * opposite edge, and the button stays clickable (`.input-icon` above is
+ * variable's value field) — a standalone wrapper, deliberately NOT composed
+ * with `.form-input-wrapper` above: that class's `.form-input` rule adds
+ * `padding-left: 2.5rem` unconditionally for its left-icon case, which has
+ * no "off" switch and no left icon exists here, so composing the two left
+ * this field with ~26px of dead space on its left edge (caught in review —
+ * see task-12c-report.md). `.form-input-wrapper` has no other caller
+ * (`grep -rln "form-input-wrapper" src --include=*.rs` returns only the one
+ * site this serves), so there's no reuse benefit to composing rather than
+ * standing alone. The button stays clickable (`.input-icon` above is
  * `pointer-events: none`, which a reveal button can't be). */
-.form-input-wrapper--icon-right .form-input { padding-right: 3rem; }
-.form-input-wrapper--icon-right .btn-icon-right {
+.value-reveal-wrapper { position: relative; }
+.value-reveal-wrapper .form-input { padding-right: 3rem; }
+.value-reveal-wrapper .btn-icon-right {
 	position: absolute; right: 0.25rem; top: 50%;
 	transform: translateY(-50%);
 }

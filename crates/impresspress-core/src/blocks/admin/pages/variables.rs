@@ -541,7 +541,7 @@ pub async fn handle_edit_variable_form(
                 div .form-group {
                     label .form-label for="edit-value" { "Value" }
                     @if sensitive {
-                        div .form-input-wrapper .form-input-wrapper--icon-right {
+                        div .value-reveal-wrapper {
                             input .form-input #edit-value
                                 type="password"
                                 name="value"
