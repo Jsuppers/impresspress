@@ -110,11 +110,10 @@ test('the default bundle has no dev block', async ({ page }) => {
   // has a `frame-src` too — and this assertion failed the first time it was
   // run against a real built `pkg/` (Plan 1 Task 10's fix round).
   //
-  // Honest about what these two lines currently prove: measured side by side,
-  // a `browser-devtools` + `[dev] enabled` bundle serves a byte-identical CSP,
-  // so neither line discriminates today. The factory's
-  // `wafer-run/security-headers` block config is not reaching the response —
-  // see the Task 10 fix report. Once that is fixed these assertions become
-  // real, which is why they are written for the intended behaviour rather
-  // than deleted.
+  // Both lines above really do discriminate: `dev-foundations.spec.ts`
+  // asserts the opposite of each on a `browser-devtools` + `[dev] enabled`
+  // bundle. They did not until `flows::register_site_main` stopped replacing
+  // the factory's whole `wafer-run/security-headers` config with the shared
+  // CSP directives — until then both bundles served the same policy and this
+  // test passed for the wrong reason.
 });

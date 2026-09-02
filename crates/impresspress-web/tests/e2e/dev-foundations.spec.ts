@@ -234,16 +234,23 @@ test('a fresh origin seeds itself, serves the seeded site, and keeps the sandbox
   const sandbox = await page.evaluate(async () => (await fetch('/b/dev/api/status')).status);
   expect(sandbox).toBe(403);
 
-  // NOT asserted here, deliberately: the CSP relaxation the sandbox is
-  // supposed to carry (`worker-src 'self' blob:` for the `/b/dev` compiler
-  // worker, `frame-ancestors 'self'` for its live-site preview iframe —
-  // `runtime_factory.rs::csp` and the `frame_ancestors` override beside it).
-  // Measured on this very bundle, the served header is byte-identical to the
-  // feature-OFF bundle's: no `worker-src`, and `frame-ancestors 'none'`. The
-  // `wafer-run/security-headers` block config the factory builds is not
-  // reaching the response at all, so there is nothing true to assert yet.
-  // Recorded in the Task 10 fix report; it belongs to Task 4's wiring, and
-  // Plan 2's page cannot spawn its worker until it is fixed.
+  // The CSP the sandbox relaxes, and the other half of `smoke.spec.ts`'s
+  // "the default bundle has no dev block": that one asserts the unrelaxed
+  // header on a feature-off bundle, this asserts the relaxation is really
+  // there when the sandbox is on. Neither means anything without the other —
+  // a constant satisfies either alone, which is exactly what happened before
+  // the fix round that added these: `flows::register_site_main` replaced the
+  // factory's whole `wafer-run/security-headers` config with the shared
+  // directives, so the two bundles served a byte-identical policy and the
+  // feature-off assertion passed for the wrong reason.
+  const csp = await page.evaluate(
+    async () => (await fetch('/b/auth/login')).headers.get('content-security-policy'),
+  );
+  // The `/b/dev` page's compiler worker is a module worker that spawns
+  // blob-URL subordinates; Plan 2 cannot start it without this.
+  expect(csp, `CSP was: ${csp}`).toContain("worker-src 'self' blob:");
+  // Its live-site preview is a same-origin iframe.
+  expect(csp, `CSP was: ${csp}`).toContain("frame-ancestors 'self'");
 });
 
 test('the dev sandbox stages a guest, survives a restart and rolls back', async ({ page }) => {
