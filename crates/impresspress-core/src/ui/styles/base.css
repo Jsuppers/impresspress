@@ -30,6 +30,25 @@ input, textarea, select, [contenteditable="true"] {
  * default even though the whole element is clickable. */
 summary { cursor: pointer; }
 
+/* Visually-hidden but still screen-reader-accessible content (e.g. a
+ * `<legend>` that exists for accessibility structure but would be visual
+ * clutter if shown, such as `blocks/products/pages.rs`'s template-picker
+ * fieldset legend). `display:none`/`visibility:hidden` are deliberately
+ * NOT used here -- both pull the element out of the accessibility tree,
+ * which defeats the point; this is the standard clip-rect pattern instead. */
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	clip-path: inset(50%);
+	white-space: nowrap;
+	border: 0;
+}
+
 /* Anti-spam honeypot field (blocks/tickets/public.rs's public report form):
  * deliberately NOT `display:none`/`[hidden]` -- some bots skip fields hidden
  * that way but still fill in ones only moved off-screen, which is what
