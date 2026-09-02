@@ -23,7 +23,7 @@ pub fn bar_chart_card(
         section .card {
             header .card__head {
                 div {
-                    h3 .card__title { (title) }
+                    h2 .card__title { (title) }
                     p .card__subtitle { (subtitle) }
                 }
                 a .btn .btn-ghost .btn-sm .card__actions href=(view_href) { "View" }
@@ -146,7 +146,7 @@ pub fn line_chart_card(
         section .card {
             header .card__head {
                 div {
-                    h3 .card__title { (title) }
+                    h2 .card__title { (title) }
                     p .card__subtitle { (subtitle) }
                 }
                 a .btn .btn-ghost .btn-sm .card__actions href=(view_href) { "View" }
