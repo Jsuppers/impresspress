@@ -120,101 +120,8 @@ use crate::{
     util::RecordExt,
 };
 
-const PRODUCTS_UI_CSS: &str = r#"
-.products-tabs{min-width:0;max-width:100%;margin:0 0 1.25rem;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-ms-overflow-style:none}
-.products-tabs::-webkit-scrollbar{display:none}
-.products-tabs>nav{min-width:max-content}
-/* The strip above is the single horizontal scroller: the inner .tabs
-   component must not become a second, nested one (its own mobile rule sets
-   overflow-x:auto), and fractional-zoom rounding must never turn the strip
-   into a vertical scroller that silently clips icon tops behind the hidden
-   scrollbars. */
-.products-tabs .tabs{overflow-x:visible}
-.products-tabs+header,.products-tabs+.page-header{margin-top:0}
-.products-guide{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem;margin:1.25rem 0}
-.products-guide__item{position:relative;padding:1.2rem 1.25rem;border:1px solid color-mix(in srgb,var(--border-color) 82%,transparent);border-radius:14px;background:linear-gradient(145deg,color-mix(in srgb,var(--surface-1) 96%,var(--primary-color) 4%),var(--surface-1));box-shadow:0 8px 26px rgba(15,23,42,.05)}
-.products-guide__number{display:grid;place-items:center;width:2rem;height:2rem;margin-bottom:.8rem;border-radius:999px;background:color-mix(in srgb,var(--primary-color) 14%,var(--surface-1));color:var(--primary-color);font-weight:750}
-.products-guide__item h3{font-size:1rem;margin:0 0 .35rem}
-.products-guide__item p{margin:0;line-height:1.55}
-.products-callout{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;padding:1rem 1.1rem;margin:0 0 1.25rem;border:1px solid color-mix(in srgb,var(--primary-color) 28%,var(--border-color));border-radius:14px;background:color-mix(in srgb,var(--primary-color) 6%,var(--surface-1))}
-.products-callout__copy{max-width:68ch}
-.products-callout__copy strong{display:block;margin-bottom:.2rem}
-.products-callout__copy p{margin:0}
-.products-callout__actions{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;flex:none}
-.products-section{margin-top:1.75rem}
-.products-section__head{display:flex;align-items:end;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:.75rem}
-.products-section__head h2,.products-section__head h3,.products-section__head p{margin:0}
-.products-section__head p{margin-top:.25rem}
-.products-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 1rem}
-.products-form-grid--compact{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
-.products-choice-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:.75rem}
-.products-choice{display:flex;gap:.7rem;align-items:flex-start;padding:.8rem .9rem;border:1px solid var(--border-color);border-radius:12px;background:var(--surface-1);cursor:pointer}
-.products-choice:has(input:checked){border-color:var(--primary-color);background:color-mix(in srgb,var(--primary-color) 5%,var(--surface-1));box-shadow:0 0 0 2px color-mix(in srgb,var(--primary-color) 10%,transparent)}
-.products-choice input{margin-top:.2rem;flex:none}
-.products-choice strong{display:block;font-size:.92rem}
-.products-choice small{display:block;margin-top:.15rem;line-height:1.45}
-.products-actions{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
-.products-status-stack{display:flex;align-items:center;gap:.35rem;flex-wrap:wrap}
-.products-advanced{margin-top:1rem;border:1px solid var(--border-color);border-radius:12px;background:color-mix(in srgb,var(--surface-1) 97%,var(--border-color) 3%)}
-.products-advanced>summary{cursor:pointer;padding:.85rem 1rem;font-weight:650;list-style-position:inside}
-.products-advanced[open]>summary{border-bottom:1px solid var(--border-color)}
-.products-advanced__body{padding:1rem}
-.products-plain-details{margin-top:.75rem}
-.products-plain-details>summary{cursor:pointer;color:var(--text-muted);font-size:.875rem;font-weight:600}
-.products-filter-label{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-right:.15rem}
-.products-checklist{list-style:none;padding:0;margin:0}
-.products-checklist li:last-child{margin-bottom:0!important}
-.products-code-block{display:block;width:100%;padding:.75rem .85rem;border:1px solid var(--border-color);border-radius:10px;background:var(--surface-2);overflow-wrap:anywhere}
-.products-settings-note{margin-bottom:1rem}
-body:has(.products-tabs) .shell__main,body:has(.products-tabs) .shell__body{min-width:0}
-body:has(.products-tabs) .shell__body{padding:1.1rem 1.4rem}
-@media(max-width:760px){body:has(.products-tabs) .shell__body{padding:.85rem .9rem}}
-body:has(.products-tabs) .page-header{padding-bottom:.35rem}
-body:has(.products-tabs) .stats-grid{gap:1rem;margin-top:1rem}
-body:has(.products-tabs) .stat-card{border-radius:14px;box-shadow:0 8px 24px rgba(15,23,42,.045)}
-body:has(.products-tabs) .card{border-radius:14px;box-shadow:0 8px 26px rgba(15,23,42,.045)}
-body:has(.products-tabs) .filter-bar{margin:1rem 0;padding:.75rem;border:1px solid var(--border-color);border-radius:14px;background:var(--surface-1)}
-.product-wizard-progress{margin:0 0 1.25rem}
-.product-wizard-progress ol{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:.55rem;list-style:none;padding:0;margin:0}
-.product-wizard-progress li{min-height:2.25rem;border-radius:999px}
-.wizard-step-check{display:inline-flex;margin-right:.3rem}
-.wizard-step-check svg{width:.75rem;height:.75rem}
-.product-wizard-actions{position:sticky;bottom:0;z-index:2;display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-top:1rem;padding:.75rem 0;border-top:1px solid var(--border-color);background:var(--surface-1)}
-.product-wizard-actions__buttons{display:flex;gap:.75rem;margin-left:auto}
-.product-template-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
-.product-template-card{display:grid;grid-template-columns:auto 1fr;gap:.35rem .75rem;align-items:start;padding:1rem;border:1px solid var(--border-color);border-radius:14px;cursor:pointer;transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}
-.product-template-card:hover{border-color:var(--primary-color);box-shadow:0 8px 22px rgba(15,23,42,.08);transform:translateY(-1px)}
-.product-template-card:has(input:checked){border-color:var(--primary-color);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary-color) 14%,transparent)}
-.product-template-card input{margin-top:.2rem}
-.product-template-card strong,.product-template-card span{grid-column:2}
-.product-template-card strong{margin:0!important}
-[data-wizard-step]>.card__head{background:color-mix(in srgb,var(--surface-1) 94%,var(--primary-color) 6%)}
-[data-offer-card]>.card__head{align-items:flex-start;background:linear-gradient(120deg,color-mix(in srgb,var(--surface-1) 94%,var(--primary-color) 6%),var(--surface-1))}
-@media(max-width:760px){
- .products-guide{grid-template-columns:1fr}
- .products-callout{flex-direction:column}
- .products-callout__actions,.products-actions{width:100%}
- .products-callout__actions .btn{flex:1}
- .product-template-grid{grid-template-columns:1fr}
- .product-wizard-progress{overflow:visible}
- .product-wizard-progress ol{min-width:0;gap:.35rem}
- .product-wizard-progress li{font-size:.72rem;white-space:nowrap}
- .product-wizard-actions{display:grid}
- .product-wizard-actions>.btn{width:100%}
- .product-wizard-actions__buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;margin-left:0}
- .product-wizard-actions__buttons:has(#wizard-next:not([hidden])){grid-template-columns:1fr}
- .product-wizard-actions__buttons .btn{width:100%}
- body:has(.products-tabs) .page-header{align-items:flex-start}
-}
-"#;
-
-fn products_styles() -> Markup {
-    html! { style { (maud::PreEscaped(PRODUCTS_UI_CSS)) } }
-}
-
 fn admin_tabs(active: &str) -> Markup {
     html! {
-        (products_styles())
         div .products-tabs {
             (components::tab_navigation(vec![
         components::Tab {
@@ -288,7 +195,6 @@ fn portal_tabs(active: &str, seller_enabled: bool) -> Markup {
         });
     }
     html! {
-        (products_styles())
         div .products-tabs { (components::tab_navigation(tabs)) }
     }
 }

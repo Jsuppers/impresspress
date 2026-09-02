@@ -52,6 +52,33 @@
 	height: 2px; background: var(--primary-color);
 }
 
+/* ===== Products admin tab strip =====
+ * Wraps the `.tabs` component (above) in a horizontally-scrolling shell —
+ * migrated from `blocks/products/pages.rs`'s page-local `PRODUCTS_UI_CSS`
+ * (task 12e). */
+.products-tabs { min-width: 0; max-width: 100%; margin: 0 0 1.25rem; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; -ms-overflow-style: none; }
+.products-tabs::-webkit-scrollbar { display: none; }
+.products-tabs > nav { min-width: max-content; }
+/* The strip above is the single horizontal scroller: the inner .tabs
+   component must not become a second, nested one (its own mobile rule sets
+   overflow-x:auto), and fractional-zoom rounding must never turn the strip
+   into a vertical scroller that silently clips icon tops behind the hidden
+   scrollbars. */
+.products-tabs .tabs { overflow-x: visible; }
+.products-tabs + header, .products-tabs + .page-header { margin-top: 0; }
+
+/* ===== Editor tab strip (blocks/legalpages/pages.rs) =====
+ * Migrated from that file's page-local `EDITOR_CSS` `<style>` block (task
+ * 12e). Pill-style tabs, visually distinct from `.tabs`/`.tab` above --
+ * kept as its own component rather than reusing those, matching the
+ * original CSS 1:1. Hex colors have no matching design token; carried over
+ * unchanged from the original page-local styles (same call 12a made for
+ * `.text-warning-strong`/`.var-warning-note`). */
+.editor-tabs { display: flex; gap: 4px; margin-bottom: -1px; border-bottom: 1px solid #e2e8f0; }
+.editor-tab { background: none; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; padding: 6px 14px; cursor: pointer; font-size: 0.875rem; color: #64748b; }
+.editor-tab:hover { background: #f1f5f9; color: #1e293b; }
+.editor-tab--active { background: white; border-color: #e2e8f0; color: #1e293b; font-weight: 600; }
+
 /* ===== Account card admin shortcut =====
    When the portal user is also an admin, dashboard renders an "Open admin"
    call-to-action above the nav list. Visually distinct from the regular nav

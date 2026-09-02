@@ -634,6 +634,10 @@
 	margin-bottom: 0.375rem; padding: 0.625rem 0.75rem;
 	transition: box-shadow 0.15s;
 }
+/* Was `onmouseover`/`onmouseout="this.style.boxShadow='…'"` in
+ * `messages/pages.rs` and `llm/pages.rs` (task 12e) -- an ordinary hover
+ * effect belongs in CSS, not a JS-assigned literal inline style. */
+.thread-card:hover { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1); }
 .thread-card__row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
 .thread-card__title {
 	font-weight: 500; font-size: var(--text-sm);
@@ -721,5 +725,40 @@
 	border-radius: 8px; padding: 0.75rem; margin-bottom: 1rem;
 	font-size: 0.813rem; color: #92400e;
 	display: flex; align-items: center; gap: 0.5rem;
+}
+
+/* ===== Products admin (cards) =====
+ * Migrated from `blocks/products/pages.rs`'s page-local `PRODUCTS_UI_CSS`
+ * `<style>` block (task 12e). The `body:has(.products-tabs) .card` override
+ * below is a compound selector (0,2,0) so it always beats the plain `.card`
+ * rule above regardless of which file loads first -- no source-order
+ * dependency to preserve here, unlike `.products-advanced`/`.mt-0` in
+ * form.css. */
+.products-guide { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: 1.25rem 0; }
+.products-guide__item { position: relative; padding: 1.2rem 1.25rem; border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent); border-radius: 14px; background: linear-gradient(145deg, color-mix(in srgb, var(--surface-1) 96%, var(--primary-color) 4%), var(--surface-1)); box-shadow: 0 8px 26px rgba(15, 23, 42, .05); }
+.products-guide__number { display: grid; place-items: center; width: 2rem; height: 2rem; margin-bottom: .8rem; border-radius: 999px; background: color-mix(in srgb, var(--primary-color) 14%, var(--surface-1)); color: var(--primary-color); font-weight: 750; }
+.products-guide__item h3 { font-size: 1rem; margin: 0 0 .35rem; }
+.products-guide__item p { margin: 0; line-height: 1.55; }
+.products-callout { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 1rem 1.1rem; margin: 0 0 1.25rem; border: 1px solid color-mix(in srgb, var(--primary-color) 28%, var(--border-color)); border-radius: 14px; background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); }
+.products-callout__copy { max-width: 68ch; }
+.products-callout__copy strong { display: block; margin-bottom: .2rem; }
+.products-callout__copy p { margin: 0; }
+.products-callout__actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; flex: none; }
+.product-template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.product-template-card { display: grid; grid-template-columns: auto 1fr; gap: .35rem .75rem; align-items: start; padding: 1rem; border: 1px solid var(--border-color); border-radius: 14px; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+.product-template-card:hover { border-color: var(--primary-color); box-shadow: 0 8px 22px rgba(15, 23, 42, .08); transform: translateY(-1px); }
+.product-template-card:has(input:checked) { border-color: var(--primary-color); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-color) 14%, transparent); }
+.product-template-card input { margin-top: .2rem; }
+.product-template-card strong, .product-template-card span { grid-column: 2; }
+.product-template-card strong { margin: 0 !important; }
+[data-wizard-step] > .card__head { background: color-mix(in srgb, var(--surface-1) 94%, var(--primary-color) 6%); }
+[data-offer-card] > .card__head { align-items: flex-start; background: linear-gradient(120deg, color-mix(in srgb, var(--surface-1) 94%, var(--primary-color) 6%), var(--surface-1)); }
+body:has(.products-tabs) .card { border-radius: 14px; box-shadow: 0 8px 26px rgba(15, 23, 42, .045); }
+@media (max-width: 760px) {
+	.products-guide { grid-template-columns: 1fr; }
+	.products-callout { flex-direction: column; }
+	.products-callout__actions { width: 100%; }
+	.products-callout__actions .btn { flex: 1; }
+	.product-template-grid { grid-template-columns: 1fr; }
 }
 

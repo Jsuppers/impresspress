@@ -114,6 +114,23 @@
 .chat-composer { border-top: 1px solid var(--border-light); padding: var(--spacing-md); background: var(--surface-1); }
 .chat-rail { background: var(--surface-3); border-left: 1px solid var(--border-light); overflow-y: auto; padding: var(--spacing-md); }
 
+/* ===== Products admin =====
+ * Migrated from `blocks/products/pages.rs`'s page-local `PRODUCTS_UI_CSS`
+ * `<style>` block (task 12e). The `body:has(.products-tabs)` rules are
+ * compound selectors so they always beat the plain `.page-header`/
+ * `.stats-grid` rules above, regardless of file load order; `.products-
+ * section*` are page-local classes with no conflicting utility, so
+ * placement here (vs. component files) is purely by "page chrome" concern. */
+.products-section { margin-top: 1.75rem; }
+.products-section__head { display: flex; align-items: end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .75rem; }
+.products-section__head h2, .products-section__head h3, .products-section__head p { margin: 0; }
+.products-section__head p { margin-top: .25rem; }
+body:has(.products-tabs) .page-header { padding-bottom: .35rem; }
+body:has(.products-tabs) .stats-grid { gap: 1rem; margin-top: 1rem; }
+@media (max-width: 760px) {
+	body:has(.products-tabs) .page-header { align-items: flex-start; }
+}
+
 /* ===== Status page ===== */
 .status-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: var(--spacing-xl); background: var(--surface-2); }
 .status-page__inner { text-align: center; max-width: 480px; display: flex; flex-direction: column; gap: var(--spacing-sm); align-items: center; }

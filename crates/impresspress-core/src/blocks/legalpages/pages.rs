@@ -197,7 +197,6 @@ pub(super) fn editor_markup_for_test(
         input #doc-version type="hidden" value=(version);
 
         // Tab strip
-        style { (PreEscaped(EDITOR_CSS)) }
         div .editor-tabs {
             button .editor-tab .editor-tab--active type="button"
                 data-tab="edit"
@@ -227,35 +226,6 @@ pub(super) fn editor_markup_for_test(
         script { (PreEscaped(EDITOR_JS)) }
     }
 }
-
-const EDITOR_CSS: &str = r#"
-.editor-tabs {
-    display: flex; gap: 4px; margin-bottom: -1px; border-bottom: 1px solid #e2e8f0;
-}
-.editor-tab {
-    background: none; border: 1px solid transparent; border-bottom: none;
-    border-radius: 6px 6px 0 0; padding: 6px 14px; cursor: pointer;
-    font-size: 0.875rem; color: #64748b;
-}
-.editor-tab:hover { background: #f1f5f9; color: #1e293b; }
-.editor-tab--active {
-    background: white; border-color: #e2e8f0; color: #1e293b; font-weight: 600;
-}
-.editor-pane {
-    background: white; border: 1px solid #e2e8f0; border-radius: 0 6px 6px 6px;
-    min-height: 500px;
-}
-.editor-textarea {
-    width: 100%; min-height: 500px; padding: 1rem;
-    border: none; outline: none; resize: vertical;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.9rem; line-height: 1.6; background: transparent;
-}
-.preview-content {
-    padding: 1.5rem; min-height: 500px; font-family: Georgia, 'Times New Roman', serif;
-    line-height: 1.8;
-}
-"#;
 
 const EDITOR_JS: &str = r#"
 (function() {
