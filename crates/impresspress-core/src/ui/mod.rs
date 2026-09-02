@@ -43,7 +43,7 @@ impl SiteConfig {
             // Blank = no wordmark image: templates render the app name as
             // text next to the (pixel-art) icon. Set to white-label with a
             // wordmark of your own.
-            logo_url: config::get_default(ctx, "WAFER_RUN_SHARED__LOGO_URL", "").await,
+            logo_url: config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await,
             logo_icon_url: config::get_default(
                 ctx,
                 "WAFER_RUN_SHARED__LOGO_ICON_URL",

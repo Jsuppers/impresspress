@@ -424,6 +424,25 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
         match existing.get(&var.key) {
             Some(record) => {
+                // A stored value that still points at the built-in raster
+                // wordmark is a stale pointer *this function wrote*: older
+                // releases seeded `LOGO_URL` with the wordmark's own
+                // content-hashed `/b/static/` URL, and that asset, its
+                // accessor and its route are gone. Left alone it renders a
+                // broken image on every page that shows the brand.
+                //
+                // Repaired here rather than in an admin migration because
+                // migrations are gated (`--run-migrations`, see RELEASE.md)
+                // and a broken logo gives an operator no signal to opt in,
+                // whereas `seed_defaults` runs on every boot's `Init`. It
+                // costs one `starts_with` per boot and is idempotent: once
+                // blank, the prefix no longer matches. Scoped to the built-in
+                // route, so a white-labelled URL is never touched.
+                let stale_builtin_wordmark = var.key == crate::config_vars::LOGO_URL_KEY
+                    && record
+                        .str_field("value")
+                        .starts_with(crate::config_vars::REMOVED_BUILTIN_WORDMARK_URL_PREFIX);
+
                 // Only refresh metadata when at least one declared field
                 // actually differs. Without this guard every isolate cold-start
                 // re-writes every shared config var (~80 vars × cold-starts/day
@@ -432,15 +451,25 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 let same_desc = record.str_field("description") == var.description;
                 let same_warn = record.str_field("warning") == var.warning;
                 let same_sens = record.i64_field("sensitive") == sensitive as i64;
-                if same_name && same_desc && same_warn && same_sens {
+                if same_name && same_desc && same_warn && same_sens && !stale_builtin_wordmark {
                     continue;
                 }
-                let data = json_map(serde_json::json!({
+                let mut fields = serde_json::json!({
                     "name": name,
                     "description": var.description,
                     "warning": var.warning,
                     "sensitive": sensitive,
-                }));
+                });
+                if stale_builtin_wordmark {
+                    tracing::warn!(
+                        key = %var.key,
+                        stale = %record.str_field("value"),
+                        "cleared a persisted URL for the removed built-in wordmark; \
+                         the app name now renders as text beside the brand icon"
+                    );
+                    fields["value"] = serde_json::Value::String(String::new());
+                }
+                let data = json_map(fields);
                 let _ = db::upsert_by_field(
                     ctx,
                     VARIABLES_TABLE,
@@ -834,6 +863,139 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(MASKED_VALUE),
             "a *_SECRET value must be masked even with the sensitive flag unset"
+        );
+    }
+
+    /// Read one variable row's `value` column.
+    async fn stored_value(ctx: &dyn Context, key: &str) -> Option<String> {
+        db::list_all(
+            ctx,
+            VARIABLES_TABLE,
+            vec![Filter {
+                field: "key".into(),
+                operator: FilterOp::Equal,
+                value: serde_json::Value::String(key.to_string()),
+            }],
+        )
+        .await
+        .expect("list variables")
+        .first()
+        .map(|r| r.str_field("value").to_string())
+    }
+
+    /// Releases before the pixel-art mark seeded `LOGO_URL` with the built-in
+    /// raster wordmark's content-hashed URL. That asset and its route are
+    /// gone, so a deployment still carrying the seeded value renders a broken
+    /// image on every auth card, sidebar and account card. `seed_defaults`
+    /// must clear it back to blank so the app-name fallback takes over.
+    #[tokio::test]
+    async fn seed_defaults_clears_the_removed_builtin_wordmark_url() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // Exactly what an older release's `seed_defaults` wrote: the route
+        // prefix plus that release's content hash.
+        seed_var(
+            &ctx,
+            crate::config_vars::LOGO_URL_KEY,
+            "/b/static/impresspress-logo-long-1f4c8ab2.png",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, crate::config_vars::LOGO_URL_KEY)
+                .await
+                .as_deref(),
+            Some(""),
+            "a persisted pointer at the removed built-in wordmark must be \
+             cleared so the app-name fallback renders"
+        );
+    }
+
+    /// The repair reaches a *real* upgrade, not just a blank slate.
+    ///
+    /// The seed short-circuits when the stamped `seed_defaults_hash` matches
+    /// the current declared vars, so the repair only ever runs if that gate
+    /// opens. It does: this release changed `LOGO_URL`'s declared default
+    /// *and* its description, both of which feed `seed_payload_hash`, so any
+    /// older release's stamped hash necessarily differs. This pins that —
+    /// stamp a prior release's hash, then assert the stale value is still
+    /// repaired.
+    #[tokio::test]
+    async fn stale_wordmark_is_repaired_through_a_prior_releases_stamped_hash() {
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // A prior release's declared LOGO_URL: the old description, and the
+        // built-in wordmark URL as the default. Its hash is what that release
+        // would have stamped.
+        let mut prior = crate::config_vars::shared_config_vars();
+        let logo = prior
+            .iter_mut()
+            .find(|v| v.key == crate::config_vars::LOGO_URL_KEY)
+            .expect("LOGO_URL must be a declared shared var");
+        logo.description = "Logo shown in header and emails".into();
+        logo.default = "/b/static/impresspress-logo-long-1f4c8ab2.png".into();
+        let prior_hash = seed_payload_hash(&prior);
+
+        ctx.set_config(
+            crate::features::BLOCK_SETTINGS_CONFIG_KEY,
+            &serde_json::json!({
+                ADMIN_BLOCK_NAME: { "enabled": true, "seed_defaults_hash": prior_hash }
+            })
+            .to_string(),
+        );
+        seed_var(
+            &ctx,
+            crate::config_vars::LOGO_URL_KEY,
+            "/b/static/impresspress-logo-long-1f4c8ab2.png",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, crate::config_vars::LOGO_URL_KEY)
+                .await
+                .as_deref(),
+            Some(""),
+            "the hash gate must open on upgrade so the repair runs"
+        );
+    }
+
+    /// The repair above is scoped to the built-in wordmark's own route. An
+    /// operator's white-label logo is their data and must survive untouched.
+    #[tokio::test]
+    async fn seed_defaults_keeps_an_operator_configured_logo_url() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        seed_var(
+            &ctx,
+            crate::config_vars::LOGO_URL_KEY,
+            "https://acme.example/wordmark.png",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, crate::config_vars::LOGO_URL_KEY)
+                .await
+                .as_deref(),
+            Some("https://acme.example/wordmark.png"),
+            "a white-labelled logo URL must not be cleared"
         );
     }
 }
