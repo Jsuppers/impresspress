@@ -285,15 +285,28 @@ fn no_write_escape_hatch_allowlist_entry_is_dead() {
 ///
 /// The scans above prove nothing *names the products table* outside
 /// `repo::products`, and the write list proves no new call site writes past
-/// the soft-delete filter. Neither says anything about the two functions in
-/// that module that deliberately *read* past it: `get_including_deleted` and
-/// `list_all_including_deleted`. Both are `pub(crate)`, both compile cleanly
-/// from anywhere in the block, and both return a soft-deleted product's row
-/// as if it were live — so a new handler reaching for either one puts a
-/// deleted product back in front of a customer while every other gate in
-/// this file stays green. That is the exact argument the write-side list
+/// the soft-delete filter. Neither says anything about the four functions in
+/// that module that deliberately *read* past it.
+///
+/// Two of them span both sets, handing back a soft-deleted product's row as
+/// if it were live: `get_including_deleted` and `list_all_including_deleted`.
+/// Two read the deleted set and only it: `get_deleted` and `list_deleted`.
+/// All four are `pub(crate)` and compile cleanly from anywhere in the block,
+/// and for this gate the two families are one hazard — a public catalog
+/// handler that reaches for `list_deleted` where it meant `list_page` serves
+/// a page of soft-deleted products just as surely as one reaching for
+/// `list_all_including_deleted` serves them mixed in with the live ones, and
+/// the two differ by a word. That is the exact argument the write-side list
 /// makes for itself; it applies at least as strongly here, because a leaked
 /// read is visible to a buyer whereas a stray write is visible to an admin.
+///
+/// This list is worth something only while it grows with the module. An
+/// escape hatch added to `repo::products` and left unnamed here leaves a gate
+/// that READS as coverage while covering nothing, which is worse than no gate
+/// at all — `get_deleted` and `list_deleted` arrived after the first two and
+/// went unlisted for exactly that stretch, during which the public catalog
+/// could have been pointed at the deleted set with every test in this file
+/// still green.
 ///
 /// Each call site is listed with its justification, and the same limits
 /// apply as above: other crates, non-Rust sources, aliases and re-exports are
@@ -344,6 +357,48 @@ const READ_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
             // asserts that suspension reached the deleted rows too, which it
             // can only do by reading the set that spans both.
             "blocks/products/tests/seller_governance_tests.rs",
+        ],
+    ),
+    (
+        // Reads one row and answers `NotFound` unless it is soft-deleted —
+        // `get`'s mirror image, so it never hands back a live row by
+        // accident, only a deleted one on purpose.
+        "products::get_deleted",
+        &[
+            // this file: needs the identifier in order to scan for it
+            "blocks/products/tests/repo_door_test.rs",
+            // `deleted_product_close`, the close-only admin page for a
+            // deleted product's money surface. It exists only for a deleted
+            // product — that is what this read decides — and the whole page
+            // archives offers and deactivates payment links, which soft
+            // delete leaves live in Stripe. Reading it through `get` would
+            // 404 the one page that can shut a deleted product's charging
+            // off. Admin tier is enforced centrally from the declared
+            // `/b/products/admin/*` endpoints, so no customer reaches it.
+            "blocks/products/pages.rs",
+            // `restore_slug_conflict`: after a restore write has already
+            // failed on migration 005's partial unique index, this reads the
+            // still-deleted row's own slug so the response can name the
+            // collision instead of being an opaque 500. Nothing about the row
+            // leaves the handler but that slug, and only to the admin who
+            // asked for the restore.
+            "blocks/products/handlers/product.rs",
+        ],
+    ),
+    (
+        // Lists the deleted set and only it — `list_page`'s mirror image,
+        // and a one-word slip away from it at every call site.
+        "products::list_deleted",
+        &[
+            // this file: needs the identifier in order to scan for it
+            "blocks/products/tests/repo_door_test.rs",
+            // `manage_products`' Deleted tab, and the only read in the crate
+            // that can find a deleted product at all: every other door
+            // refuses one by design, so without this the restore endpoint
+            // would exist with nothing able to reach it and soft delete would
+            // be permanent in practice. Same central Admin gate as the close
+            // page above.
+            "blocks/products/pages.rs",
         ],
     ),
 ];
