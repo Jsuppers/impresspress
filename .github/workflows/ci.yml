@@ -363,6 +363,10 @@ jobs:
         with:
           version: 'v0.15.0'
 
+      - name: Run storage_paths.mjs unit tests (node --test)
+        if: steps.browser-changes.outputs.skip != 'true'
+        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
+
       - name: Run impresspress-browser wasm tests (Node)
         if: steps.browser-changes.outputs.skip != 'true'
         run: wasm-pack test --node crates/impresspress-browser

@@ -226,6 +226,15 @@ jobs:
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
 
+      # Pure path-helper unit tests for the hierarchical OPFS storage keys
+      # (`storage.rs`'s `storagePut`/`storageGet`/`storageDelete`/`storageList`
+      # bridge functions). Unconditional here for the same reason as the
+      # conformance-wiring check above: the path-filtered `browser-wasm-test`
+      # job (ci.yml) would skip this on a wafer-run pin bump that doesn't
+      # touch crates/impresspress-browser/.
+      - name: Run storage_paths.mjs unit tests (node --test)
+        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
+
   products-browser:
     name: Products browser lifecycles
     runs-on: ubuntu-latest
