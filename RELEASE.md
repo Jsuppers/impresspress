@@ -40,21 +40,37 @@ action; the only signal is the generic `schema drift; redeploy with
 is no in-UI way to bring such a product back — see *deleting a product has no
 undo in the UI yet* below for the statement that does it.
 
-### Products API: internally-owned columns are now refused, not dropped
+### Products API: internally-owned columns are now refused
 
 The four product create/update endpoints (`POST`/`PATCH` under
-`/b/products/api/admin/products` and `/b/products/api/products`) used to drop
-`id`, `owner_kind`, `owner_id`, `created_by`, `seller_account_id`,
-`approval_status`, `stripe_product_id`, `current_version`, `submitted_at`,
-`published_at` and `deleted_at` from a request body and answer 200. They now
-answer **400** naming the offending fields, so a client is told which part of
-its write was not accepted instead of receiving a success for a write that
-was half discarded.
+`/b/products/api/admin/products` and `/b/products/api/products`) now answer
+**400** naming any of `id`, `owner_kind`, `owner_id`, `created_by`,
+`seller_account_id`, `approval_status`, `stripe_product_id`,
+`current_version`, `submitted_at`, `published_at` and `deleted_at` that a
+request body carries. Each of those columns has a dedicated writer that
+maintains its invariants; none of them is a caller-supplied value on any tier
+or verb.
 
-`id` is new to that list, and its omission was the reason for the change: a
-`PATCH` body carrying one rewrote the product's primary key and orphaned
-every `line_items` / `offers` / `product_versions` / `entitlements` row
-pointing at it, while answering "Product not found".
+**What each endpoint did before is not the same story, so check yours:**
+
+- **Admin create** (`POST /b/products/api/admin/products`) forwarded the body
+  to the database verbatim and applied its own defaults only for keys the
+  body omitted. Every one of the eleven fields was **honoured**, `id`
+  included — the database layer synthesizes a UUID only when `id` is absent.
+  A seeding client that POSTs chosen ids has been getting those ids, and will
+  now get a 400 for every such create. Drop `id` from the body and read the
+  server-assigned one out of the response.
+- **Seller create** (`POST /b/products/api/products`) overwrote `status`,
+  `approval_status`, `owner_kind`, `owner_id` and `created_by` with its own
+  values after parsing the body — those five were genuinely dropped, silently,
+  behind a 200. The other six, `id` among them, were honoured.
+- **Both PATCH paths** wrote every key in the body into the `UPDATE … SET`
+  list, `id` included. That is the reason `id` is on the list at all: a
+  `PATCH` body carrying one rewrote the product's primary key and orphaned
+  every `line_items` / `offers` / `product_versions` / `entitlements` row
+  pointing at it — and then the by-id re-read looked up an id that no longer
+  existed and answered **"Product not found"**, so the caller was told the
+  write had failed while the catalog had already been rewritten.
 
 The admin and seller UIs send only caller-owned fields and are unaffected. An
 API client that round-trips a whole product record back into a `PATCH` must
