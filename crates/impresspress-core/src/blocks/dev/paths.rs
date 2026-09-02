@@ -177,12 +177,18 @@ pub fn content_type_for(path: &str) -> &'static str {
         "txt" | "md" | "rs" | "toml" => "text/plain; charset=utf-8",
         "wasm" => "application/wasm",
         "woff2" => "font/woff2",
-        _ => "application/octet-stream",
+        _ => UNKNOWN_CONTENT_TYPE,
     }
 }
 
-/// Whether a content type describes text, so the read endpoint may hand the
-/// bytes back as a JSON string instead of base64.
+/// What [`content_type_for`] answers when the extension says nothing.
+///
+/// A fallback, not a claim: it means "this file's type is unknown", which is
+/// exactly why [`may_be_text`] treats it differently from a type that really
+/// does describe binary content.
+pub const UNKNOWN_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Whether a content type describes text.
 ///
 /// `image/svg+xml` and the `application/*` textual formats are the reason this
 /// is not `starts_with("text/")`: they are source a user edits.
@@ -191,6 +197,22 @@ pub fn is_textual(content_type: &str) -> bool {
         || content_type.starts_with("application/json")
         || content_type.starts_with("application/javascript")
         || content_type.starts_with("image/svg+xml")
+}
+
+/// Whether the read endpoint may offer a file as a JSON string rather than
+/// base64 — that is, whether its type is text or simply unknown.
+///
+/// [`UNKNOWN_CONTENT_TYPE`] counts, and that is the point: `.gitignore`,
+/// `README`, `LICENSE` and `Dockerfile` all have no extension the table
+/// recognizes, and all of them are text a user edits. Offering them as text —
+/// and falling back to base64 the moment the bytes turn out not to be valid
+/// UTF-8 — is what keeps them editable, while a type that really does describe
+/// binary content (`image/png`, `application/wasm`, `font/woff2`) is never
+/// offered as text. Nothing about the *stored* content type changes:
+/// [`content_type_for`] still answers `application/octet-stream`, which is
+/// what the site publisher serves.
+pub fn may_be_text(content_type: &str) -> bool {
+    is_textual(content_type) || content_type == UNKNOWN_CONTENT_TYPE
 }
 
 /// The lowercase extension of `path`'s last segment, or `""` when it has none.
@@ -369,16 +391,43 @@ mod tests {
             "blocks/hello/Cargo.toml",
         ] {
             assert!(is_textual(content_type_for(path)), "{path} must be textual");
+            assert!(may_be_text(content_type_for(path)));
         }
-        for path in [
-            "site/dot.png",
-            "site/font.woff2",
-            "site/mod.wasm",
-            "site/unknown.xyz",
-        ] {
+        for path in ["site/dot.png", "site/font.woff2", "site/mod.wasm"] {
             assert!(
                 !is_textual(content_type_for(path)),
                 "{path} must not be textual"
+            );
+            assert!(
+                !may_be_text(content_type_for(path)),
+                "{path} is known-binary and must never be offered as text"
+            );
+        }
+    }
+
+    /// A file the table cannot classify is not thereby binary. `.gitignore`,
+    /// `README` and `LICENSE` are the files a user is most likely to add
+    /// without an extension, and all of them are text.
+    #[test]
+    fn an_unknown_type_may_still_be_text_without_becoming_one() {
+        for path in [
+            "blocks/hello/.gitignore",
+            "blocks/hello/README",
+            "site/LICENSE",
+            "site/unknown.xyz",
+        ] {
+            assert_eq!(
+                content_type_for(path),
+                UNKNOWN_CONTENT_TYPE,
+                "{path} stores as octet-stream"
+            );
+            assert!(
+                !is_textual(content_type_for(path)),
+                "{path} is not a text media type"
+            );
+            assert!(
+                may_be_text(content_type_for(path)),
+                "{path} must still be offered as text when its bytes are UTF-8"
             );
         }
     }

@@ -55,18 +55,40 @@ pub struct FileEntry {
     pub content_type: String,
 }
 
-/// Every file the workspace holds, keyed by workspace-relative path.
+/// Every file the workspace holds, plus what its blob store has cost.
 ///
-/// A `BTreeMap` for two reasons that are both load-bearing: iteration is in
-/// path order, so every projection below is sorted without sorting; and
-/// serialization is key-ordered, so `workspace.json` is canonical by
-/// construction rather than by a serializer setting somebody could change.
+/// `files` is a `BTreeMap` for two reasons that are both load-bearing:
+/// iteration is in path order, so every projection below is sorted without
+/// sorting; and serialization is key-ordered, so the stored manifest is
+/// byte-for-byte deterministic for a given workspace.
+///
+/// # Why the blob totals live here
+///
+/// `files` describes what is *reachable*; it says nothing about what is
+/// *stored*. Content is never edited in place, so overwriting one 512 KiB
+/// page two hundred times leaves two hundred blobs behind — 100 MB of
+/// storage that `files` still reports as one 512 KiB entry. The quota that
+/// matters (design §6.6, "≤ 64 MiB of blobs per workspace") is on the store,
+/// so the store's size is tracked here rather than recomputed from `files`,
+/// which cannot see the difference.
+///
+/// Both counters are maintained by [`Workspace::record_blob_stored`] and
+/// [`Workspace::record_blob_freed`] only. Nothing else writes them, so
+/// "blobs written minus blobs reclaimed" is the whole of their definition.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     /// Entries by path. The key and [`FileEntry::path`] are always equal —
     /// [`Workspace::insert`] is the only thing that writes either.
     #[serde(default)]
     pub files: BTreeMap<String, FileEntry>,
+    /// Total bytes of blobs this workspace has stored and not yet had
+    /// reclaimed, including blobs no `files` entry names any more. This is
+    /// what [`super::paths::MAX_WORKSPACE_BYTES`] bounds.
+    #[serde(default)]
+    pub blob_bytes: u64,
+    /// How many blobs those bytes are spread over.
+    #[serde(default)]
+    pub blob_count: u32,
 }
 
 impl Workspace {
@@ -99,9 +121,42 @@ impl Workspace {
         self.files.remove(path)
     }
 
-    /// Total size of every file in the workspace, in bytes.
+    /// Total size of the files the workspace can currently reach, in bytes.
+    ///
+    /// NOT the quota: superseded and deleted content is still stored and still
+    /// costs, and only [`Self::blob_bytes`] counts it. This is the "how big is
+    /// my site" number, not the "how much have I used" one.
     pub fn total_bytes(&self) -> u64 {
         self.files.values().map(|entry| entry.size).sum()
+    }
+
+    /// Whether any entry names the blob `sha`.
+    ///
+    /// A referenced blob is necessarily still stored — the collector only
+    /// reclaims unreachable ones — so this answers "is this content already
+    /// paid for?" without a storage round trip.
+    pub fn references(&self, sha: &str) -> bool {
+        self.files.values().any(|entry| entry.sha256 == sha)
+    }
+
+    /// Charge the workspace for a blob of `bytes` that was just written.
+    ///
+    /// Call this only when the store actually grew — a deduplicated write
+    /// ([`super::blobs::Stored::Deduplicated`]) stored nothing and must not be
+    /// charged, or two paths holding one asset would count it twice.
+    pub fn record_blob_stored(&mut self, bytes: u64) {
+        self.blob_bytes = self.blob_bytes.saturating_add(bytes);
+        self.blob_count = self.blob_count.saturating_add(1);
+    }
+
+    /// Credit the workspace for a blob of `bytes` that was reclaimed.
+    ///
+    /// For Plan 4's garbage collector, which is the only thing that removes a
+    /// blob. Saturating, so a manifest whose counters were somehow lost cannot
+    /// underflow into a workspace that appears to have 16 exabytes of headroom.
+    pub fn record_blob_freed(&mut self, bytes: u64) {
+        self.blob_bytes = self.blob_bytes.saturating_sub(bytes);
+        self.blob_count = self.blob_count.saturating_sub(1);
     }
 
     /// Every distinct block name the workspace defines sources for, sorted.
@@ -181,12 +236,17 @@ pub async fn load(ctx: &dyn Context) -> Result<Workspace, WaferError> {
 
 /// Write the workspace manifest.
 ///
-/// Serialized compact from a [`BTreeMap`], so the stored bytes are canonical
-/// JSON — sorted keys, no whitespace — the same form design §11.3 requires of
-/// a generation manifest. The workspace file is never hashed, so pretty
-/// printing would also be correct; one rule for every stored manifest is
-/// simpler to keep true than one rule with an exception, and the compact form
-/// is what gets rewritten on every single file write.
+/// Serialized compact, with the file map in path order (it is a
+/// [`BTreeMap`]), so the bytes are deterministic for a given workspace. Note
+/// this is *deterministic*, not *canonical*: serde emits a struct's fields in
+/// declaration order, not sorted, so `workspace.json` is not the sorted-key
+/// form design §11.3 requires of a **generation** manifest. That is fine
+/// because this file is never hashed — but a generation manifest must be
+/// built through `serde_json::Value` (whose maps sort) rather than serialized
+/// straight from a struct, as `dev_status`'s fixture already does.
+///
+/// Compact rather than pretty because this is rewritten on every single file
+/// write.
 pub async fn save(ctx: &dyn Context, ws: &Workspace) -> Result<(), WaferError> {
     let bytes = serde_json::to_vec(ws).map_err(|e| {
         WaferError::new(
@@ -268,18 +328,79 @@ mod tests {
         assert!(ws.remove("site/a.css").is_none());
     }
 
-    /// The stored bytes are the canonical form: sorted keys, no whitespace.
+    /// The stored bytes are compact and path-ordered, so a given workspace
+    /// always serializes identically.
     #[test]
-    fn the_manifest_serializes_canonically() {
+    fn the_manifest_serializes_deterministically() {
         let mut ws = Workspace::default();
         ws.insert("site/z.css", "z".to_string(), 1);
         ws.insert("site/a.css", "a".to_string(), 2);
+        ws.record_blob_stored(1);
+        ws.record_blob_stored(2);
         let json = serde_json::to_string(&ws).expect("serialize");
         assert_eq!(
             json,
-            r#"{"files":{"site/a.css":{"path":"site/a.css","sha256":"a","size":2,"content_type":"text/css; charset=utf-8"},"site/z.css":{"path":"site/z.css","sha256":"z","size":1,"content_type":"text/css; charset=utf-8"}}}"#
+            r#"{"files":{"site/a.css":{"path":"site/a.css","sha256":"a","size":2,"content_type":"text/css; charset=utf-8"},"site/z.css":{"path":"site/z.css","sha256":"z","size":1,"content_type":"text/css; charset=utf-8"}},"blob_bytes":3,"blob_count":2}"#
         );
         assert!(!json.contains('\n'));
+    }
+
+    /// A manifest written before the blob counters existed must still load —
+    /// it describes a real workspace whose files are still reachable.
+    #[test]
+    fn a_manifest_without_the_blob_counters_loads_with_them_at_zero() {
+        let ws: Workspace = serde_json::from_str(
+            r#"{"files":{"site/a.css":{"path":"site/a.css","sha256":"a","size":2,"content_type":"text/css; charset=utf-8"}}}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(ws.files.len(), 1);
+        assert_eq!(ws.blob_bytes, 0);
+        assert_eq!(ws.blob_count, 0);
+    }
+
+    /// The two totals answer different questions, and the quota uses the
+    /// second: superseded content is unreachable but still stored.
+    #[test]
+    fn stored_blob_bytes_outlive_the_entries_that_named_them() {
+        let mut ws = Workspace::default();
+        ws.insert("site/a.css", "one".to_string(), 100);
+        ws.record_blob_stored(100);
+        // Overwrite: a new blob, the old one still stored.
+        ws.insert("site/a.css", "two".to_string(), 100);
+        ws.record_blob_stored(100);
+        assert_eq!(ws.total_bytes(), 100);
+        assert_eq!(ws.blob_bytes, 200);
+        assert_eq!(ws.blob_count, 2);
+
+        // Deleting the entry frees nothing; only the collector does.
+        ws.remove("site/a.css");
+        assert_eq!(ws.total_bytes(), 0);
+        assert_eq!(ws.blob_bytes, 200);
+
+        ws.record_blob_freed(100);
+        assert_eq!(ws.blob_bytes, 100);
+        assert_eq!(ws.blob_count, 1);
+    }
+
+    #[test]
+    fn freeing_more_than_was_stored_saturates_at_zero() {
+        let mut ws = Workspace::default();
+        ws.record_blob_freed(10);
+        assert_eq!(ws.blob_bytes, 0);
+        assert_eq!(ws.blob_count, 0);
+    }
+
+    #[test]
+    fn references_reports_whether_any_entry_names_a_blob() {
+        let mut ws = Workspace::default();
+        ws.insert("site/a.html", "shared".to_string(), 1);
+        ws.insert("site/b.html", "shared".to_string(), 1);
+        assert!(ws.references("shared"));
+        assert!(!ws.references("other"));
+        ws.remove("site/a.html");
+        assert!(ws.references("shared"), "the other path still names it");
+        ws.remove("site/b.html");
+        assert!(!ws.references("shared"));
     }
 
     #[tokio::test]

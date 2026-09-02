@@ -340,13 +340,18 @@ impl TestContext {
         // namespacing wrapper — that wrapper is what turns the block's own
         // `blobs` / `""` folders into `impresspress/dev/…`, and what would
         // refuse a cross-block reach that the grant list did not cover.
-        ctx.register_block(
-            "wafer-run/storage",
-            crate::blocks::storage::create(
-                Arc::new(InMemoryStorageService::new()),
-                Arc::from("impresspress/admin"),
-            ),
+        let storage = crate::blocks::storage::create(
+            Arc::new(InMemoryStorageService::new()),
+            Arc::from("impresspress/admin"),
         );
+        // The storage block runs its OWN cross-block check against a grant
+        // list the runtime injects after startup. Leaving it empty (the
+        // constructor's state) would refuse every `@`-prefixed reach
+        // regardless of grants, so a fixture that skipped this could not tell
+        // a missing grant from an unconfigured block — and the site publish
+        // Task 7 builds on would fail here for the wrong reason.
+        storage.update_wrap_grants(&dev::wrap_grants());
+        ctx.register_block("wafer-run/storage", storage);
         ctx.add_extra_route(ExtraRoute {
             prefix: dev::ROUTE_PREFIX.to_string(),
             access: crate::routing::RouteAccess::Admin,

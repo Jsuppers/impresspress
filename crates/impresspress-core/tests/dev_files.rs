@@ -7,7 +7,7 @@
 
 use base64ct::{Base64, Encoding};
 use impresspress_core::{
-    blocks::dev::{blobs, paths, test_support::FakeControl, DevBlock, DevShared},
+    blocks::dev::{blobs, paths, test_support::FakeControl, workspace, DevBlock, DevShared},
     test_support::{
         admin_msg, anon_msg, auth_msg, output_http_header, output_http_status, output_json,
         output_status, TestContext,
@@ -623,4 +623,224 @@ async fn the_block_count_quota_is_a_conflict_not_a_payload_error() {
     )
     .await;
     assert_eq!(output_status(out).await, 200);
+}
+
+// ---------------------------------------------------------------------------
+// The workspace quota bounds STORED blobs, not the live manifest
+// ---------------------------------------------------------------------------
+
+/// Content is never edited in place, so every overwrite leaves the previous
+/// blob behind. The quota has to see those bytes: a limit read off the live
+/// manifest would report one small file here while the store held six copies.
+#[tokio::test]
+async fn overwriting_one_path_accumulates_stored_blob_bytes() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let mut sha = write_new(&ctx, "site/a.css", "a0{}").await;
+    for i in 1..6 {
+        let body = format!("a{i}{{}}");
+        let out = dev_post(
+            &ctx,
+            "/b/dev/api/files/write",
+            json!({"path": "site/a.css", "content": body, "expected_sha256": sha}),
+        )
+        .await;
+        sha = output_json(out).await["sha256"]
+            .as_str()
+            .expect("sha256")
+            .to_string();
+    }
+
+    let ws = workspace::load(&ctx).await.expect("load workspace");
+    assert_eq!(ws.files.len(), 1, "one path is reachable");
+    assert_eq!(ws.total_bytes(), 4, "and it is four bytes long");
+    // Six distinct four-byte bodies were stored.
+    assert_eq!(ws.blob_count, 6);
+    assert_eq!(ws.blob_bytes, 24);
+    // Every superseded blob is still readable — that is what makes an earlier
+    // generation replayable.
+    assert_eq!(
+        blobs::get(&ctx, &blobs::sha256_hex(b"a0{}"))
+            .await
+            .expect("the first blob survives"),
+        b"a0{}".to_vec()
+    );
+}
+
+#[tokio::test]
+async fn identical_content_is_charged_once_however_many_paths_name_it() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    write_new(&ctx, "site/a.html", "<p>same</p>").await;
+    write_new(&ctx, "site/b.html", "<p>same</p>").await;
+
+    let ws = workspace::load(&ctx).await.expect("load workspace");
+    assert_eq!(ws.files.len(), 2);
+    assert_eq!(ws.total_bytes(), 22, "two entries of eleven bytes each");
+    assert_eq!(ws.blob_count, 1, "but only one blob was stored");
+    assert_eq!(ws.blob_bytes, 11);
+}
+
+/// The end of the accumulation above: a workspace whose stored blobs already
+/// fill the quota refuses the next write, even though nothing is reachable.
+/// Staged rather than driven through 128 real overwrites — the accumulation
+/// itself is covered above, and this pins the refusal without spending 64 MB.
+#[tokio::test]
+async fn a_workspace_full_of_unreachable_blobs_refuses_the_next_write() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let mut ws = workspace::Workspace::default();
+    ws.record_blob_stored(paths::MAX_WORKSPACE_BYTES);
+    workspace::save(&ctx, &ws)
+        .await
+        .expect("stage a full workspace");
+
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/a.css", "content": "a{}", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 413);
+
+    // Collecting one blob's worth makes room again — the accounting the GC
+    // will drive is the same one the quota reads.
+    ws.record_blob_freed(paths::MAX_FILE_BYTES as u64);
+    workspace::save(&ctx, &ws).await.expect("stage room");
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/a.css", "content": "a{}", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_status(out).await, 200);
+}
+
+/// Re-writing content the workspace already reaches stores nothing, so it
+/// needs no headroom — an undo must not be the write that hits the wall.
+#[tokio::test]
+async fn a_write_of_already_stored_content_needs_no_headroom() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let sha = write_new(&ctx, "site/a.html", "<p>same</p>").await;
+
+    // Fill the quota exactly, keeping the entry (and so its blob) reachable.
+    let mut ws = workspace::load(&ctx).await.expect("load");
+    ws.blob_bytes = paths::MAX_WORKSPACE_BYTES;
+    workspace::save(&ctx, &ws)
+        .await
+        .expect("stage a full workspace");
+
+    // The same bytes at a second path: already stored, so allowed.
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/b.html", "content": "<p>same</p>", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_status(out).await, 200);
+    assert_eq!(
+        output_json(
+            dev_post(
+                &ctx,
+                "/b/dev/api/files/read",
+                json!({"path": "site/b.html"})
+            )
+            .await
+        )
+        .await["sha256"],
+        serde_json::json!(sha)
+    );
+
+    // Anything new is still refused.
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/c.html", "content": "<p>different</p>", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 413);
+}
+
+/// A hostile body must be refused from its encoded length, before it is
+/// decoded into a second copy of itself.
+#[tokio::test]
+async fn an_oversized_body_is_refused_in_both_encodings() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let hostile = "x".repeat(paths::MAX_FILE_BYTES * 2);
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/big.txt", "content": hostile, "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 413);
+
+    let encoded = Base64::encode_string(&vec![b'x'; paths::MAX_FILE_BYTES * 2]);
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/big.bin", "content": encoded, "encoding": "base64", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 413);
+
+    // Nothing was stored on the way to either refusal.
+    let ws = workspace::load(&ctx).await.expect("load workspace");
+    assert_eq!(ws.blob_count, 0);
+    assert_eq!(ws.blob_bytes, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Files with no recognized extension
+// ---------------------------------------------------------------------------
+
+/// `.gitignore`, `README` and `LICENSE` are text a user edits, and the
+/// extension table cannot say so. They are stored as
+/// `application/octet-stream` — that is what the site publisher serves — but
+/// read back as `utf8`, because an unknown type is not a claim that the bytes
+/// are binary.
+#[tokio::test]
+async fn a_file_with_no_known_extension_reads_back_as_text() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    for (path, body) in [
+        ("blocks/hello/.gitignore", "target/\n"),
+        ("blocks/hello/README", "# hello\n"),
+        ("site/LICENSE", "MIT\n"),
+    ] {
+        write_new(&ctx, path, body).await;
+
+        let listed = output_json(ctx.dispatch(list_msg(Some(path))).await).await;
+        assert_eq!(
+            listed["files"][0]["content_type"], "application/octet-stream",
+            "{path} stores as octet-stream"
+        );
+
+        let r =
+            output_json(dev_post(&ctx, "/b/dev/api/files/read", json!({"path": path})).await).await;
+        assert_eq!(r["encoding"], "utf8", "{path}");
+        assert_eq!(r["content"], body, "{path}");
+    }
+}
+
+/// The other half of the same rule: a known-binary type is never offered as
+/// text, and neither is an unknown type whose bytes are not valid UTF-8.
+#[tokio::test]
+async fn unknown_types_that_are_not_utf8_still_come_back_as_base64() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let raw = [0xffu8, 0xfe, 0x00];
+    let encoded = Base64::encode_string(&raw);
+    dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "blocks/hello/blob.bin", "content": encoded, "encoding": "base64", "expected_sha256": null}),
+    )
+    .await;
+    let r = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "blocks/hello/blob.bin"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(r["encoding"], "base64");
+    assert_eq!(r["content"], serde_json::json!(encoded));
 }

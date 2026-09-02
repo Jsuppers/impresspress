@@ -32,18 +32,45 @@ const BLOB_CONTENT_TYPE: &str = "application/octet-stream";
 /// implementation is a second thing that can disagree with a stored key.
 pub use wafer_block::hash::sha256_hex;
 
-/// Store `bytes` and return their sha256.
+/// What a [`put`] did with the bytes it was given.
+///
+/// The caller needs to know: the workspace's blob-byte accounting
+/// ([`super::workspace::Workspace::blob_bytes`]) may only grow when the store
+/// actually grew, and a `Deduplicated` write costs the store nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The bytes were not in the store and were written.
+    New,
+    /// The bytes were already stored under this hash; nothing was written.
+    Deduplicated,
+}
+
+/// Store `bytes` and return their sha256 plus whether the store grew.
 ///
 /// Idempotent by construction — the key *is* the content — and skips the
 /// write when the blob is already present, which is the common case: a page
 /// saved twice, or two paths holding the same asset.
-pub async fn put(ctx: &dyn Context, bytes: &[u8]) -> Result<String, WaferError> {
+pub async fn put(ctx: &dyn Context, bytes: &[u8]) -> Result<(String, Stored), WaferError> {
     let sha = sha256_hex(bytes);
-    if exists(ctx, &sha).await? {
-        return Ok(sha);
+    let stored = put_hashed(ctx, &sha, bytes).await?;
+    Ok((sha, stored))
+}
+
+/// [`put`] for a caller that has already hashed `bytes`.
+///
+/// The write handler needs the hash *before* it stores, to decide how much
+/// quota headroom the write needs; hashing half a megabyte twice to get the
+/// same answer is the duplication this exists to avoid. `sha` must be
+/// [`sha256_hex`] of `bytes` — passing anything else would file the content
+/// under a key that does not describe it, and every later read would be a
+/// silent mismatch.
+pub async fn put_hashed(ctx: &dyn Context, sha: &str, bytes: &[u8]) -> Result<Stored, WaferError> {
+    debug_assert_eq!(sha, sha256_hex(bytes), "blob key must be the content hash");
+    if exists(ctx, sha).await? {
+        return Ok(Stored::Deduplicated);
     }
-    storage::put(ctx, FOLDER, &sha, bytes, BLOB_CONTENT_TYPE).await?;
-    Ok(sha)
+    storage::put(ctx, FOLDER, sha, bytes, BLOB_CONTENT_TYPE).await?;
+    Ok(Stored::New)
 }
 
 /// Fetch the blob stored under `sha`.
@@ -97,18 +124,24 @@ mod tests {
     #[tokio::test]
     async fn a_blob_round_trips_under_the_hash_of_its_content() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let sha = put(&ctx, b"hello").await.expect("put");
+        let (sha, stored) = put(&ctx, b"hello").await.expect("put");
         assert_eq!(sha, sha256_hex(b"hello"));
+        assert_eq!(stored, Stored::New);
         assert_eq!(get(&ctx, &sha).await.expect("get"), b"hello".to_vec());
         assert!(exists(&ctx, &sha).await.expect("exists"));
     }
 
+    /// The second put must report `Deduplicated`, not just return the same
+    /// hash: that flag is what stops the workspace's blob-byte accounting
+    /// from charging twice for one stored copy.
     #[tokio::test]
     async fn putting_the_same_bytes_twice_is_the_same_blob() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let first = put(&ctx, b"hello").await.expect("put");
-        let second = put(&ctx, b"hello").await.expect("put again");
+        let (first, first_stored) = put(&ctx, b"hello").await.expect("put");
+        let (second, second_stored) = put(&ctx, b"hello").await.expect("put again");
         assert_eq!(first, second);
+        assert_eq!(first_stored, Stored::New);
+        assert_eq!(second_stored, Stored::Deduplicated);
 
         let listing = storage::list(
             &ctx,
@@ -118,6 +151,21 @@ mod tests {
         .await
         .expect("list");
         assert_eq!(listing.objects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_hashed_is_put_without_the_second_hash() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let sha = sha256_hex(b"hello");
+        assert_eq!(
+            put_hashed(&ctx, &sha, b"hello").await.expect("store"),
+            Stored::New
+        );
+        assert_eq!(
+            put_hashed(&ctx, &sha, b"hello").await.expect("store again"),
+            Stored::Deduplicated
+        );
+        assert_eq!(get(&ctx, &sha).await.expect("get"), b"hello".to_vec());
     }
 
     #[tokio::test]
@@ -134,31 +182,88 @@ mod tests {
     #[tokio::test]
     async fn delete_is_idempotent() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let sha = put(&ctx, b"hello").await.expect("put");
+        let (sha, _) = put(&ctx, b"hello").await.expect("put");
         delete(&ctx, &sha).await.expect("delete");
         assert!(!exists(&ctx, &sha).await.expect("exists"));
         delete(&ctx, &sha).await.expect("delete again");
     }
 
-    /// The blob namespace belongs to the dev block, not to whoever asked. The
-    /// fixture drives the production `ImpresspressStorageBlock`, so this
-    /// pins that `blobs` really resolves under `impresspress/dev/`.
+    /// The blob namespace belongs to the dev block, not to whoever asked.
+    ///
+    /// The negative half has to name an object that REALLY EXISTS in the
+    /// foreign namespace, otherwise it proves nothing: a `get` of a key
+    /// nothing ever stored is `NotFound` whether or not WRAP is enforcing.
+    /// So another block's identity puts the object first — through the same
+    /// registered storage block, which namespaces it under
+    /// `impresspress/files/uploads` — and only then does the dev block reach
+    /// for it and get `PermissionDenied`.
     #[tokio::test]
-    async fn blobs_live_in_the_blocks_own_storage_namespace() {
+    async fn a_foreign_namespace_is_refused_even_when_the_object_is_there() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let sha = put(&ctx, b"hello").await.expect("put");
-        let folders = storage::list_folders(&ctx).await;
-        // `list_folders` is admin-only under WRAP, so the dev block cannot ask
-        // — assert through the cross-block read path instead, which the site
-        // grant does NOT cover and which therefore must be refused, while the
-        // block's own namespace resolves.
-        assert!(folders.is_err(), "list_folders is admin-only");
+
+        // Act as `impresspress/files`: a shallow clone of the fixture with a
+        // different WRAP identity, sharing the same storage block and the
+        // same backing store.
+        let files_block =
+            ctx.clone()
+                .with_wrap("impresspress/files", Vec::new(), "impresspress/admin");
+        storage::put(
+            &files_block,
+            "uploads",
+            "secret.txt",
+            b"private",
+            "text/plain",
+        )
+        .await
+        .expect("the owning block may write its own namespace");
+
+        // It is genuinely there — for its owner.
+        let (bytes, _info) = storage::get(&files_block, "uploads", "secret.txt")
+            .await
+            .expect("the owning block may read it back");
+        assert_eq!(bytes, b"private".to_vec());
+
+        // The dev block holds no grant on it, so the same object is refused —
+        // and refused as a permission failure, not as a miss.
+        let denied = storage::get(&ctx, "@impresspress/files/uploads", "secret.txt")
+            .await
+            .expect_err("cross-namespace read must be refused");
+        assert_eq!(denied.code, ErrorCode::PermissionDenied);
+
+        // The block's own namespace still resolves, so the refusal above is
+        // about the namespace and not about storage being broken.
+        let (sha, _) = put(&ctx, b"hello").await.expect("put");
         assert_eq!(get(&ctx, &sha).await.expect("own namespace"), b"hello");
-        assert!(
-            storage::get(&ctx, "@impresspress/files/uploads", &sha)
+
+        // A global folder enumeration is admin-only, so the sandbox cannot
+        // use it to discover what other blocks have stored.
+        assert_eq!(
+            storage::list_folders(&ctx)
                 .await
-                .is_err(),
-            "a namespace the block holds no grant for must stay unreachable"
+                .expect_err("list_folders is admin-only")
+                .code,
+            ErrorCode::PermissionDenied,
         );
+    }
+
+    /// The counterpart of the refusal above: the ONE namespace the sandbox is
+    /// granted — the published site — is reachable. Without this, the test
+    /// above would pass just as well if every cross-block reach were broken.
+    #[tokio::test]
+    async fn the_granted_site_namespace_is_reachable() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        storage::put(
+            &ctx,
+            "@wafer-run/web/site",
+            "index.html",
+            b"<h1>hi</h1>",
+            "text/html; charset=utf-8",
+        )
+        .await
+        .expect("the dev block is granted wafer-run/web/site/*");
+        let (bytes, _info) = storage::get(&ctx, "@wafer-run/web/site", "index.html")
+            .await
+            .expect("and may read it back");
+        assert_eq!(bytes, b"<h1>hi</h1>".to_vec());
     }
 }

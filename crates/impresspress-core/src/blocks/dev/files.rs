@@ -1,13 +1,29 @@
 //! `/b/dev/api/files*` — read, write, list and delete workspace files.
 //!
-//! # Lost updates
+//! # Lost updates, and how far the guard reaches
 //!
 //! Every mutation states the hash it believes the file currently has
 //! (`expected_sha256`, `null` for "no file yet"). A mismatch is a `409`
 //! carrying the hash it actually has, so the caller re-reads rather than
 //! silently overwriting an edit it never saw. The sandbox's clients are an
 //! agent and a human editing the same workspace at the same time; making the
-//! check optional would make the race invisible instead of impossible.
+//! check optional would make that race invisible.
+//!
+//! That guard is **per path**, and it is the only guard these handlers hold.
+//! A write is read-modify-write over the whole manifest — `workspace::load`,
+//! mutate one entry, `workspace::save` — so two writers interleaving between
+//! the load and the save would each save a manifest built from a snapshot
+//! that predates the other, and the later save would drop the earlier
+//! writer's entry even though both passed their own hash check. Nothing here
+//! prevents that.
+//!
+//! It does not happen on the sandbox's own target: the Service Worker is
+//! single-threaded and runs one request to completion, so the load and the
+//! save cannot interleave. On native and Cloudflare, where concurrent
+//! requests are real, the serialization has to come from above — Task 7's
+//! activation queue is what orders workspace mutations there, and any handler
+//! added to this module must go through it rather than assume the browser's
+//! scheduling.
 //!
 //! # Refusal shapes
 //!
@@ -103,20 +119,28 @@ pub async fn handle_write(ctx: &dyn Context, input: InputStream) -> OutputStream
         Ok(area) => area,
         Err(e) => return no_store_error(ErrorCode::InvalidArgument, &e.to_string()),
     };
+    // Refuse an over-large body BEFORE decoding it. `content` is already in
+    // memory as part of the parsed request; decoding would allocate the same
+    // payload a second time, so a hostile body must not get that far. The
+    // bound is a *lower* bound on the decoded length, so this only ever
+    // refuses what the exact check below would refuse anyway.
+    if min_decoded_len(request.encoding, &request.content) > paths::MAX_FILE_BYTES {
+        return too_large(&format!(
+            "the {} body decodes to more than the {}-byte file limit",
+            encoding_label(request.encoding),
+            paths::MAX_FILE_BYTES
+        ));
+    }
     let bytes = match decode_content(request.encoding, &request.content) {
         Ok(bytes) => bytes,
         Err(detail) => return no_store_error(ErrorCode::InvalidArgument, &detail),
     };
     if bytes.len() > paths::MAX_FILE_BYTES {
-        return no_store_error_status(
-            ErrorCode::ResourceExhausted,
-            413,
-            &format!(
-                "file is {} bytes; the limit is {} bytes",
-                bytes.len(),
-                paths::MAX_FILE_BYTES
-            ),
-        );
+        return too_large(&format!(
+            "file is {} bytes; the limit is {} bytes",
+            bytes.len(),
+            paths::MAX_FILE_BYTES
+        ));
     }
 
     let mut ws = match workspace::load(ctx).await {
@@ -127,14 +151,34 @@ pub async fn handle_write(ctx: &dyn Context, input: InputStream) -> OutputStream
     if !hash_matches(current, request.expected_sha256.as_deref()) {
         return conflict(&request.path, current);
     }
-    if let Err(e) = check_quotas(&ws, &request.path, &area, bytes.len() as u64) {
+
+    // How much the blob store would grow by. Content some entry already names
+    // is certainly stored (the collector only reclaims unreachable blobs), so
+    // re-writing it — an undo, or the same asset at a second path — needs no
+    // headroom. Content that is stored but unreferenced is treated as if it
+    // were new: those bytes are garbage awaiting collection, and refusing
+    // rather than assuming they will be there is the safe direction.
+    let sha = blobs::sha256_hex(&bytes);
+    let new_blob_bytes = if ws.references(&sha) {
+        0
+    } else {
+        bytes.len() as u64
+    };
+    if let Err(e) = check_quotas(&ws, &request.path, &area, new_blob_bytes) {
         return e.into_response();
     }
 
-    let sha = match blobs::put(ctx, &bytes).await {
-        Ok(sha) => sha,
+    // Store, then save. The other order would let a manifest name a blob that
+    // was never written, and every later read of that path would be a 500. In
+    // this order a save that fails leaves an uncharged blob behind — the
+    // workspace under-counts its own store until the collector reconciles it,
+    // which costs headroom rather than correctness.
+    match blobs::put_hashed(ctx, &sha, &bytes).await {
+        // Charge the workspace only when the store actually grew.
+        Ok(blobs::Stored::New) => ws.record_blob_stored(bytes.len() as u64),
+        Ok(blobs::Stored::Deduplicated) => {}
         Err(e) => return err_internal("dev workspace blob write", e),
-    };
+    }
     let entry = ws.insert(&request.path, sha, bytes.len() as u64);
     if let Err(e) = workspace::save(ctx, &ws).await {
         return err_internal("dev workspace save", e);
@@ -192,6 +236,28 @@ async fn read_body<T: serde::de::DeserializeOwned>(input: InputStream) -> Result
     .await
 }
 
+/// A lower bound on how many bytes `content` decodes to.
+///
+/// Used to refuse an over-large body before it is decoded into a second
+/// allocation. It must never over-estimate, or a legal write would be refused:
+/// utf8 is exact (a JSON string's UTF-8 bytes are the file's bytes), and
+/// padded standard base64 carries three bytes per four characters of which at
+/// most two are padding.
+fn min_decoded_len(encoding: FileEncoding, content: &str) -> usize {
+    match encoding {
+        FileEncoding::Utf8 => content.len(),
+        FileEncoding::Base64 => (content.len() / 4).saturating_mul(3).saturating_sub(2),
+    }
+}
+
+/// How an encoding is named in a refusal.
+fn encoding_label(encoding: FileEncoding) -> &'static str {
+    match encoding {
+        FileEncoding::Utf8 => "utf8",
+        FileEncoding::Base64 => "base64",
+    }
+}
+
 /// Decode a request's `content` field per its declared encoding.
 fn decode_content(encoding: FileEncoding, content: &str) -> Result<Vec<u8>, String> {
     match encoding {
@@ -204,12 +270,15 @@ fn decode_content(encoding: FileEncoding, content: &str) -> Result<Vec<u8>, Stri
 
 /// Choose how to hand `bytes` back to the caller.
 ///
-/// `utf8` only when the file is textual *and* the bytes really are UTF-8: a
-/// `.txt` holding latin-1 would otherwise be lossily re-encoded by the JSON
-/// serializer, and the caller would write back something other than what it
-/// read.
+/// `utf8` only when the type *could* be text ([`paths::may_be_text`], which
+/// includes the unknown-extension fallback so a `.gitignore` or a `README`
+/// comes back editable) **and** the bytes really are UTF-8: a `.txt` holding
+/// latin-1 would otherwise be lossily re-encoded by the JSON serializer, and
+/// the caller would write back something other than what it read. The stored
+/// content type is untouched either way — this decides the envelope, not the
+/// file's type.
 fn encode_content(content_type: &str, bytes: Vec<u8>) -> (FileEncoding, String) {
-    if !paths::is_textual(content_type) {
+    if !paths::may_be_text(content_type) {
         return (FileEncoding::Base64, Base64::encode_string(&bytes));
     }
     // `into_bytes` hands the buffer back on failure, so the UTF-8 check costs
@@ -233,6 +302,11 @@ fn hash_matches(current: Option<&FileEntry>, expected: Option<&str>) -> bool {
     }
 }
 
+/// The `413` every size refusal sends.
+fn too_large(message: &str) -> OutputStream {
+    no_store_error_status(ErrorCode::ResourceExhausted, 413, message)
+}
+
 /// The `409` for a hash that does not describe the file as it stands.
 fn conflict(path: &str, current: Option<&FileEntry>) -> OutputStream {
     no_store()
@@ -245,7 +319,7 @@ fn conflict(path: &str, current: Option<&FileEntry>) -> OutputStream {
 enum QuotaError {
     /// The workspace already holds [`paths::MAX_FILES`] files.
     TooManyFiles,
-    /// The write would take the workspace past
+    /// Storing the new blob would take the workspace's blob store past
     /// [`paths::MAX_WORKSPACE_BYTES`].
     WorkspaceFull { would_be: u64 },
     /// The write would define a [`paths::MAX_BLOCKS`]-plus-first block.
@@ -260,22 +334,16 @@ impl QuotaError {
     /// on how much the runtime can be asked to rebuild.
     fn into_response(self) -> OutputStream {
         match self {
-            Self::TooManyFiles => no_store_error_status(
-                ErrorCode::ResourceExhausted,
-                413,
-                &format!(
-                    "the workspace already holds {} files, which is the limit",
-                    paths::MAX_FILES
-                ),
-            ),
-            Self::WorkspaceFull { would_be } => no_store_error_status(
-                ErrorCode::ResourceExhausted,
-                413,
-                &format!(
-                    "the write would take the workspace to {would_be} bytes; the limit is {} bytes",
-                    paths::MAX_WORKSPACE_BYTES
-                ),
-            ),
+            Self::TooManyFiles => too_large(&format!(
+                "the workspace already holds {} files, which is the limit",
+                paths::MAX_FILES
+            )),
+            Self::WorkspaceFull { would_be } => too_large(&format!(
+                "the write would take the workspace's stored blobs to {would_be} bytes; the \
+                 limit is {} bytes. Superseded and deleted content still counts until it is \
+                 collected.",
+                paths::MAX_WORKSPACE_BYTES
+            )),
             Self::TooManyBlocks => no_store_error(
                 ErrorCode::AlreadyExists,
                 &format!(
@@ -287,24 +355,30 @@ impl QuotaError {
     }
 }
 
-/// Whether writing `size` bytes at `path` keeps the workspace inside every
-/// limit.
+/// Whether a write that adds `new_blob_bytes` to the blob store at `path`
+/// keeps the workspace inside every limit.
+///
+/// `new_blob_bytes` is what the *store* would grow by, not the file's size:
+/// re-writing content that is already stored grows nothing, and the 64 MiB
+/// limit is on stored blobs — including the ones no entry names any more —
+/// because that is what actually occupies the user's storage. A limit
+/// computed from the live manifest would let two hundred overwrites of one
+/// 512 KiB page consume 100 MB while reporting 512 KiB.
 ///
 /// Pure, and separate from the handler, because the interesting cases are the
-/// boundaries — a replacement that frees as much as it adds, a block that
-/// already exists — and driving 2 000 HTTP writes to reach one of them would
+/// boundaries — a workspace full of unreachable blobs, a block that already
+/// exists — and driving hundreds of HTTP writes to reach one of them would
 /// test the loop rather than the rule.
 fn check_quotas(
     ws: &Workspace,
     path: &str,
     area: &WorkspaceArea,
-    size: u64,
+    new_blob_bytes: u64,
 ) -> Result<(), QuotaError> {
-    let existing = ws.get(path);
-    if existing.is_none() && ws.files.len() >= paths::MAX_FILES {
+    if ws.get(path).is_none() && ws.files.len() >= paths::MAX_FILES {
         return Err(QuotaError::TooManyFiles);
     }
-    let would_be = ws.total_bytes() - existing.map_or(0, |entry| entry.size) + size;
+    let would_be = ws.blob_bytes.saturating_add(new_blob_bytes);
     if would_be > paths::MAX_WORKSPACE_BYTES {
         return Err(QuotaError::WorkspaceFull { would_be });
     }
@@ -361,6 +435,17 @@ mod tests {
             encode_content("text/plain; charset=utf-8", latin1.clone()),
             (FileEncoding::Base64, Base64::encode_string(&latin1))
         );
+        // Unknown type, valid UTF-8: still handed back as text. This is the
+        // `.gitignore` / `README` case.
+        assert_eq!(
+            encode_content(paths::UNKNOWN_CONTENT_TYPE, b"target/\n".to_vec()),
+            (FileEncoding::Utf8, "target/\n".to_string())
+        );
+        // Unknown type, not UTF-8: base64.
+        assert_eq!(
+            encode_content(paths::UNKNOWN_CONTENT_TYPE, latin1.clone()),
+            (FileEncoding::Base64, Base64::encode_string(&latin1))
+        );
     }
 
     #[test]
@@ -378,10 +463,13 @@ mod tests {
         );
     }
 
+    /// Build a workspace whose entries are `files`, charged as if each had
+    /// been stored once — the state a run of successful writes leaves behind.
     fn workspace_with(files: &[(&str, u64)]) -> Workspace {
         let mut ws = Workspace::default();
         for (path, size) in files {
             ws.insert(path, format!("sha-{path}"), *size);
+            ws.record_blob_stored(*size);
         }
         ws
     }
@@ -392,6 +480,66 @@ mod tests {
         assert_eq!(
             check_quotas(&ws, "site/b.css", &WorkspaceArea::Site, 10),
             Ok(())
+        );
+    }
+
+    /// A body far too large must be refused from its encoded length alone,
+    /// before it is decoded into a second copy. That is what the guard is
+    /// for — a hostile body, not a body one byte over.
+    #[test]
+    fn an_over_large_body_is_refused_from_its_encoded_length() {
+        let hostile = paths::MAX_FILE_BYTES * 2;
+        assert!(min_decoded_len(FileEncoding::Utf8, &"x".repeat(hostile)) > paths::MAX_FILE_BYTES);
+        // 4 base64 characters per 3 bytes.
+        let encoded = "A".repeat(hostile.div_ceil(3) * 4);
+        assert!(min_decoded_len(FileEncoding::Base64, &encoded) > paths::MAX_FILE_BYTES);
+
+        // utf8 is exact, so even one byte over is caught before decoding.
+        assert!(
+            min_decoded_len(FileEncoding::Utf8, &"x".repeat(paths::MAX_FILE_BYTES + 1))
+                > paths::MAX_FILE_BYTES
+        );
+        // base64's bound is short by up to two bytes (it cannot know how much
+        // of the tail is padding), so a body a byte or two over slips past
+        // this guard and is caught by the exact check after decoding. Both
+        // refuse; only the first avoids the allocation.
+        let just_over = vec![b'z'; paths::MAX_FILE_BYTES + 1];
+        assert!(
+            min_decoded_len(FileEncoding::Base64, &Base64::encode_string(&just_over))
+                <= paths::MAX_FILE_BYTES
+        );
+        assert_eq!(
+            decode_content(FileEncoding::Base64, &Base64::encode_string(&just_over))
+                .expect("decodes")
+                .len(),
+            paths::MAX_FILE_BYTES + 1
+        );
+    }
+
+    /// The bound must never over-estimate, or a legal write is refused before
+    /// anything looks at the real bytes.
+    #[test]
+    fn the_pre_decode_bound_never_exceeds_the_real_decoded_length() {
+        for len in 0..64usize {
+            let bytes = vec![b'z'; len];
+            let encoded = Base64::encode_string(&bytes);
+            assert!(
+                min_decoded_len(FileEncoding::Base64, &encoded) <= len,
+                "base64 bound over-estimated at len {len}"
+            );
+            let text = "z".repeat(len);
+            assert_eq!(min_decoded_len(FileEncoding::Utf8, &text), len);
+        }
+        // A file exactly at the limit must survive the pre-check in both
+        // encodings.
+        let at_limit = vec![b'z'; paths::MAX_FILE_BYTES];
+        assert!(
+            min_decoded_len(FileEncoding::Base64, &Base64::encode_string(&at_limit))
+                <= paths::MAX_FILE_BYTES
+        );
+        assert!(
+            min_decoded_len(FileEncoding::Utf8, &"z".repeat(paths::MAX_FILE_BYTES))
+                <= paths::MAX_FILE_BYTES
         );
     }
 
@@ -420,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn the_byte_limit_accounts_for_what_a_replacement_frees() {
+    fn the_byte_limit_bounds_stored_blobs_not_the_live_manifest() {
         let ws = workspace_with(&[("site/a.css", paths::MAX_WORKSPACE_BYTES)]);
         assert_eq!(
             check_quotas(&ws, "site/b.css", &WorkspaceArea::Site, 1),
@@ -428,20 +576,45 @@ mod tests {
                 would_be: paths::MAX_WORKSPACE_BYTES + 1
             })
         );
-        // Overwriting the offending file with the same size is not a growth.
+        // A write that stores nothing new — content some entry already names
+        // — needs no headroom even at the limit.
         assert_eq!(
-            check_quotas(
-                &ws,
-                "site/a.css",
-                &WorkspaceArea::Site,
-                paths::MAX_WORKSPACE_BYTES
-            ),
+            check_quotas(&ws, "site/a.css", &WorkspaceArea::Site, 0),
             Ok(())
         );
         // Exactly at the limit is allowed.
         let ws = workspace_with(&[("site/a.css", paths::MAX_WORKSPACE_BYTES - 1)]);
         assert_eq!(
             check_quotas(&ws, "site/b.css", &WorkspaceArea::Site, 1),
+            Ok(())
+        );
+    }
+
+    /// The regression this quota exists for: content that is stored but no
+    /// longer reachable still costs. A limit read off the live manifest would
+    /// see an empty workspace here and wave the write through.
+    #[test]
+    fn unreferenced_blobs_still_count_against_the_limit() {
+        let mut ws = Workspace::default();
+        // 128 overwrites of a 512 KiB page, then a delete: nothing reachable,
+        // 64 MiB stored.
+        for _ in 0..(paths::MAX_WORKSPACE_BYTES / paths::MAX_FILE_BYTES as u64) {
+            ws.record_blob_stored(paths::MAX_FILE_BYTES as u64);
+        }
+        assert!(ws.files.is_empty());
+        assert_eq!(ws.total_bytes(), 0);
+        assert_eq!(ws.blob_bytes, paths::MAX_WORKSPACE_BYTES);
+
+        assert_eq!(
+            check_quotas(&ws, "site/a.css", &WorkspaceArea::Site, 1),
+            Err(QuotaError::WorkspaceFull {
+                would_be: paths::MAX_WORKSPACE_BYTES + 1
+            })
+        );
+        // Collecting one blob makes room again.
+        ws.record_blob_freed(paths::MAX_FILE_BYTES as u64);
+        assert_eq!(
+            check_quotas(&ws, "site/a.css", &WorkspaceArea::Site, 1),
             Ok(())
         );
     }
