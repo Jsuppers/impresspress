@@ -46,7 +46,6 @@ pub use self::control::{
 use crate::{
     endpoint_match::{self, EndpointRoute},
     http::ResponseBuilder,
-    ui,
 };
 
 /// Registered block name.
@@ -82,10 +81,36 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[EndpointRoute::new(
 /// construction — rather than post-filtering the returned `OutputStream` — is
 /// what makes that unconditional: an `OutputStream`'s meta is fixed when it is
 /// built, so a wrapper would have to buffer the whole (possibly streaming)
-/// response, and would still not reach an error terminal, which carries no
-/// meta channel at all.
+/// response to change it.
 pub(crate) fn no_store() -> ResponseBuilder {
     ResponseBuilder::new().set_header("Cache-Control", "no-store")
+}
+
+/// The error-terminal counterpart of [`no_store`].
+///
+/// An error terminal is still a response on the wire: the HTTP boundary turns
+/// `WaferError::meta` into headers before rendering the
+/// `{"error", "message"}` body (`wafer_block::http_codec`'s
+/// `collect_http_response`). So a refusal from this block can carry the header
+/// too, which is what keeps "every `/b/dev` response is `no-store`" true for
+/// the 404 as well as the 200 — a cached 404 for a route a later generation
+/// adds would look permanently missing.
+///
+/// The one deliberate exception is [`crate::http::err_internal`]: it owns the
+/// correlation-id logging and message sanitizing that must not be reproduced
+/// here, and returns an already-sealed `OutputStream`. A 5xx is not cached by
+/// any client without explicit headers, so the block keeps the shared
+/// sanitizer rather than hand-rolling a header-carrying copy of it.
+pub(crate) fn no_store_error(code: wafer_run::ErrorCode, message: &str) -> OutputStream {
+    let mut error = WaferError::new(code, message);
+    error.meta.push(wafer_run::MetaEntry {
+        key: format!(
+            "{}Cache-Control",
+            wafer_block::meta::META_RESP_HEADER_PREFIX
+        ),
+        value: "no-store".to_string(),
+    });
+    OutputStream::error(error)
 }
 
 /// The WRAP grants the sandbox needs beyond its own namespace.
@@ -172,7 +197,7 @@ impl Block for DevBlock {
         _input: InputStream,
     ) -> OutputStream {
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
-            return ui::not_found_response(&msg);
+            return no_store_error(wafer_run::ErrorCode::NotFound, "endpoint not found");
         };
         // Every route is `RouteAccess::Admin` at the router; handlers do not
         // re-check the caller's role.

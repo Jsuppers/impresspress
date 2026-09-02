@@ -1245,6 +1245,25 @@ pub async fn output_header(out: OutputStream, name: &str) -> Option<String> {
         .map(|m| m.value.clone())
 }
 
+/// A named response header as the HTTP boundary would send it, **including**
+/// for error terminals.
+///
+/// The error-terminal sibling of [`output_header`], for the same reason
+/// [`output_http_status`] is [`output_status`]'s: a refusal carries its
+/// headers in `WaferError::meta`, which `collect_buffered` surfaces as an
+/// `Err` rather than a `BufferedResponse`. Reads through
+/// `wafer_block::http_codec`, so the answer is the header the caller actually
+/// receives. Header names are matched case-insensitively, as HTTP does.
+pub async fn output_http_header(out: OutputStream, name: &str) -> Option<String> {
+    let headers = wafer_block::http_codec::collect_http_response(out)
+        .await
+        .headers;
+    headers
+        .into_iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
 /// Read the body as a UTF-8 string. Panics if the body is not valid UTF-8.
 pub async fn output_html(out: OutputStream) -> String {
     let buf = collect_or_panic(out).await;

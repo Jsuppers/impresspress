@@ -102,14 +102,25 @@ impl Default for RuntimeState {
 /// version, and converging on it blind is how a half-swapped runtime becomes
 /// permanent.
 pub async fn read(ctx: &dyn Context) -> Result<RuntimeState, WaferError> {
-    let record = db::get_by_field(
-        ctx,
-        TABLE,
-        SINGLETON_COLUMN,
-        serde_json::json!(SINGLETON_ID),
+    decode(
+        &db::get_by_field(
+            ctx,
+            TABLE,
+            SINGLETON_COLUMN,
+            serde_json::json!(SINGLETON_ID),
+        )
+        .await?,
     )
-    .await?;
+}
 
+/// Decode the journal row.
+///
+/// Split out of [`read`] so the unknown-phase arm is reachable from a test:
+/// the column carries a `CHECK` constraint listing exactly the six phases, so
+/// a row holding anything else cannot be written through this schema at all —
+/// the arm exists for a row written by a *different build* of the block, which
+/// only a synthesized `Record` can stand in for.
+fn decode(record: &db::Record) -> Result<RuntimeState, WaferError> {
     let phase_text = record.str_field("activation_phase");
     let activation_phase = ActivationPhase::parse(phase_text).ok_or_else(|| {
         WaferError::new(
@@ -147,4 +158,100 @@ pub async fn write(ctx: &dyn Context, state: &RuntimeState) -> Result<(), WaferE
         data,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{blocks::dev::test_support::FakeControl, test_support::TestContext};
+
+    fn record(phase: &str) -> db::Record {
+        let mut data = HashMap::new();
+        data.insert("singleton_id".to_string(), serde_json::json!(1));
+        data.insert("active_generation_id".to_string(), serde_json::Value::Null);
+        data.insert("desired_generation_id".to_string(), serde_json::Value::Null);
+        data.insert("activation_phase".to_string(), serde_json::json!(phase));
+        data.insert("generation".to_string(), serde_json::json!(0));
+        db::Record {
+            id: String::new(),
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_seeds_the_journal_at_rest() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        assert_eq!(read(&ctx).await.expect("read"), RuntimeState::default());
+    }
+
+    #[tokio::test]
+    async fn write_then_read_round_trips_every_field() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let state = RuntimeState {
+            active_generation_id: Some("gen-active".to_string()),
+            desired_generation_id: Some("gen-desired".to_string()),
+            activation_phase: ActivationPhase::BuildingRuntime,
+            generation: 42,
+        };
+        write(&ctx, &state).await.expect("write");
+        assert_eq!(read(&ctx).await.expect("read"), state);
+    }
+
+    /// Clearing the journal must actually null the columns, not leave the
+    /// previous ids behind — a stale `desired_generation_id` reads as a
+    /// recovery owed on the next boot (design §7.3).
+    #[tokio::test]
+    async fn write_clears_the_ids_it_is_given_as_none() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        write(
+            &ctx,
+            &RuntimeState {
+                active_generation_id: Some("gen-1".to_string()),
+                desired_generation_id: Some("gen-2".to_string()),
+                activation_phase: ActivationPhase::Publishing,
+                generation: 1,
+            },
+        )
+        .await
+        .expect("write");
+
+        let cleared = RuntimeState {
+            active_generation_id: Some("gen-2".to_string()),
+            desired_generation_id: None,
+            activation_phase: ActivationPhase::Idle,
+            generation: 2,
+        };
+        write(&ctx, &cleared).await.expect("write");
+        assert_eq!(read(&ctx).await.expect("read"), cleared);
+    }
+
+    #[test]
+    fn decode_accepts_every_phase_the_column_allows() {
+        for phase in [
+            ActivationPhase::Idle,
+            ActivationPhase::Validating,
+            ActivationPhase::BuildingRuntime,
+            ActivationPhase::Publishing,
+            ActivationPhase::Active,
+            ActivationPhase::Failed,
+        ] {
+            let state = decode(&record(phase.as_str())).expect("decode");
+            assert_eq!(state.activation_phase, phase);
+        }
+    }
+
+    /// A phase this build cannot name is an error, never silently `Idle`:
+    /// converging on a half-swapped runtime is how it becomes permanent.
+    #[test]
+    fn decode_refuses_an_unknown_phase_rather_than_defaulting() {
+        let err = decode(&record("teleporting")).expect_err("unknown phase must fail");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("teleporting"),
+            "the message must name the value it could not read: {}",
+            err.message,
+        );
+    }
 }

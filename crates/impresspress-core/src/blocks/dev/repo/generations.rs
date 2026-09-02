@@ -296,3 +296,199 @@ fn unknown_value(column: &str, value: &str) -> WaferError {
         format!("{TABLE}: unknown {column} `{value}`"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{blocks::dev::test_support::FakeControl, test_support::TestContext};
+
+    /// A manifest pair in the canonical form design §11.3 mandates (sorted
+    /// keys, no whitespace) — the form `manifest_sha256` is a hash over.
+    ///
+    /// Both are JSON-shaped, which is the point: the SQLite backend sniffs
+    /// JSON-shaped `TEXT` back into a decoded value in `row_to_record`, so a
+    /// repo reading these columns with `str_field` would round-trip them to
+    /// `""` here while staying green on Postgres. `repo::json_text` is what
+    /// makes the round trip byte-exact, and only for canonical input — see
+    /// its own tests for the non-canonical case.
+    const SITE_MANIFEST: &str = r#"{"files":[{"content_type":"text/html; charset=utf-8","path":"index.html","sha256":"aa","size":5}]}"#;
+    const BLOCK_MANIFEST: &str = r#"[{"artifact_sha256":"bb","capabilities":{},"name":"site/newsletter","routes":[{"access":"Public","prefix":"/b/newsletter/"}],"wafer_guest_version":1}]"#;
+
+    fn new_generation(cause: GenerationCause) -> NewGeneration {
+        NewGeneration {
+            parent_id: None,
+            cause,
+            site_manifest_json: SITE_MANIFEST.to_string(),
+            block_manifest_json: BLOCK_MANIFEST.to_string(),
+            manifest_sha256: "cc".to_string(),
+        }
+    }
+
+    fn record(status: &str, cause: &str) -> db::Record {
+        let mut data = HashMap::new();
+        data.insert("id".to_string(), serde_json::json!("g1"));
+        data.insert("parent_id".to_string(), serde_json::Value::Null);
+        data.insert("status".to_string(), serde_json::json!(status));
+        data.insert("cause".to_string(), serde_json::json!(cause));
+        data.insert("site_manifest_json".to_string(), serde_json::json!("{}"));
+        data.insert("block_manifest_json".to_string(), serde_json::json!("[]"));
+        data.insert("manifest_sha256".to_string(), serde_json::json!("cc"));
+        data.insert("created_at".to_string(), serde_json::json!("1970-01-01"));
+        data.insert("activated_at".to_string(), serde_json::Value::Null);
+        data.insert("failure_message".to_string(), serde_json::Value::Null);
+        db::Record {
+            id: "g1".to_string(),
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_then_get_round_trips_every_column() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let inserted = insert(&ctx, &new_generation(GenerationCause::BlockCompile))
+            .await
+            .expect("insert");
+
+        assert_eq!(inserted.status, GenerationStatus::Staged);
+        assert!(inserted.activated_at.is_none());
+        assert!(inserted.failure_message.is_none());
+
+        let read_back = get(&ctx, &inserted.id).await.expect("get");
+        assert_eq!(read_back, inserted);
+        // The manifests must come back byte-identical, not as a re-serialized
+        // value: `manifest_sha256` is computed over the canonical text.
+        assert_eq!(read_back.site_manifest_json, SITE_MANIFEST);
+        assert_eq!(read_back.block_manifest_json, BLOCK_MANIFEST);
+        assert_eq!(read_back.cause, GenerationCause::BlockCompile);
+    }
+
+    #[tokio::test]
+    async fn set_status_records_the_failure_and_the_activation_time() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let row = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+            .await
+            .expect("insert");
+
+        set_status(
+            &ctx,
+            &row.id,
+            GenerationStatus::Active,
+            None,
+            Some("2026-09-03T00:00:00Z"),
+        )
+        .await
+        .expect("activate");
+        let active = get(&ctx, &row.id).await.expect("get");
+        assert_eq!(active.status, GenerationStatus::Active);
+        assert_eq!(active.activated_at.as_deref(), Some("2026-09-03T00:00:00Z"));
+
+        // A later status change with `None` must leave the earlier columns
+        // alone: a supersede that erased why a generation went live (or why
+        // an earlier one failed) would destroy the ledger's only record of it.
+        set_status(&ctx, &row.id, GenerationStatus::Superseded, None, None)
+            .await
+            .expect("supersede");
+        let superseded = get(&ctx, &row.id).await.expect("get");
+        assert_eq!(superseded.status, GenerationStatus::Superseded);
+        assert_eq!(
+            superseded.activated_at.as_deref(),
+            Some("2026-09-03T00:00:00Z")
+        );
+
+        set_status(
+            &ctx,
+            &row.id,
+            GenerationStatus::Failed,
+            Some("probe trapped"),
+            None,
+        )
+        .await
+        .expect("fail");
+        let failed = get(&ctx, &row.id).await.expect("get");
+        assert_eq!(failed.status, GenerationStatus::Failed);
+        assert_eq!(failed.failure_message.as_deref(), Some("probe trapped"));
+    }
+
+    #[tokio::test]
+    async fn list_recent_is_newest_first_and_honours_the_limit() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(
+                insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+                    .await
+                    .expect("insert"),
+            );
+        }
+
+        // Ordering is by `created_at`, so the fixture is only meaningful if
+        // the three stamps differ. Assert that first, so a clock too coarse
+        // to separate them fails here instead of as a confusing order
+        // mismatch below.
+        assert!(
+            ids[0].created_at < ids[1].created_at && ids[1].created_at < ids[2].created_at,
+            "insert must produce strictly increasing created_at: {:?}",
+            ids.iter().map(|r| &r.created_at).collect::<Vec<_>>(),
+        );
+
+        let listed = list_recent(&ctx, 10).await.expect("list");
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![ids[2].id.as_str(), ids[1].id.as_str(), ids[0].id.as_str()],
+        );
+
+        let capped = list_recent(&ctx, 2).await.expect("list");
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].id, ids[2].id);
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_before_keeps_the_newest_and_is_idempotent() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let mut rows = Vec::new();
+        for _ in 0..4 {
+            rows.push(
+                insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+                    .await
+                    .expect("insert"),
+            );
+        }
+
+        assert_eq!(mark_superseded_before(&ctx, 2).await.expect("retain"), 2);
+
+        let listed = list_recent(&ctx, 10).await.expect("list");
+        let statuses: Vec<GenerationStatus> = listed.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                GenerationStatus::Staged,
+                GenerationStatus::Staged,
+                GenerationStatus::Superseded,
+                GenerationStatus::Superseded,
+            ],
+        );
+
+        // Retention runs after every activation; re-running it must not
+        // re-write rows it already labelled.
+        assert_eq!(mark_superseded_before(&ctx, 2).await.expect("retain"), 0);
+    }
+
+    #[test]
+    fn decode_refuses_an_unknown_status_or_cause() {
+        assert_eq!(
+            decode(&record("staged", "site_write"))
+                .expect("decode")
+                .status,
+            GenerationStatus::Staged,
+        );
+
+        let bad_status = decode(&record("archived", "site_write")).expect_err("unknown status");
+        assert_eq!(bad_status.code, ErrorCode::Internal);
+        assert!(bad_status.message.contains("archived"), "{bad_status}");
+
+        let bad_cause = decode(&record("staged", "vibes")).expect_err("unknown cause");
+        assert!(bad_cause.message.contains("vibes"), "{bad_cause}");
+    }
+}

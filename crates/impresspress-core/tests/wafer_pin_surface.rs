@@ -14,7 +14,11 @@ fn producer_surface_is_pinned() {
     );
     let _ = wafer_block::wire::database::EnsureTableRequest {
         table: wafer_block::wire::database::TableDef {
-            name: String::new(), columns: vec![], indexes: vec![], primary_key: vec![], unique_keys: vec![],
+            name: String::new(),
+            columns: vec![],
+            indexes: vec![],
+            primary_key: vec![],
+            unique_keys: vec![],
         },
     };
     assert_eq!(wafer_block::abi::HOST_CODEC_JSON, 1);

@@ -24,17 +24,94 @@ pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// A JSON-encoded `TEXT` column read back as text on every backend.
+/// A JSON-encoded `TEXT` column, returned as **canonical** JSON (sorted keys,
+/// no whitespace) on every backend.
 ///
-/// The SQLite service sniffs JSON-shaped text in `row_to_record` and hands
-/// back an already-decoded value, while Postgres and D1 return the literal
-/// string. `RecordExt::str_field` would collapse the SQLite case to `""` —
-/// silently losing a whole manifest, `BlockInfo` or diagnostics list — so
-/// re-encode whatever came back instead of assuming one backend's shape.
+/// Two backend differences have to be flattened here, and the second is the
+/// one that matters:
+///
+/// * `wafer-block-sqlite`'s `row_to_record` sniffs JSON-shaped `TEXT` and
+///   hands back an already-decoded value, while Postgres and D1 return the
+///   literal string. `RecordExt::str_field` collapses the decoded case to
+///   `""`, which would silently lose a whole manifest on SQLite while working
+///   on Postgres.
+/// * Re-encoding the decoded value (`serde_json` orders object keys, having
+///   no `preserve_order`) yields canonical JSON, whereas the Postgres literal
+///   is whatever was stored. Left alone, the *same row* would read back
+///   differently per backend — and since `manifest_sha256` is a hash over the
+///   canonical manifest (design §11.3), that difference would make hash
+///   verification pass on one backend and fail on another.
+///
+/// So both arms are normalized to canonical JSON. A generation whose manifest
+/// was written non-canonically therefore fails its own hash check on every
+/// backend rather than on some of them — which is the correct outcome, and a
+/// loud one.
+///
+/// Text that does not parse as JSON is returned unchanged; the caller that
+/// asked for it is the one that knows whether that is a problem.
 pub(crate) fn json_text(record: &wafer_core::clients::database::Record, key: &str) -> String {
     match record.data.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
+        // Postgres / D1: the literal column text.
+        Some(serde_json::Value::String(text)) => serde_json::from_str::<serde_json::Value>(text)
+            .map_or_else(|_| text.clone(), |value| value.to_string()),
+        // SQLite / D1-with-sniffing: already decoded.
         Some(value) => value.to_string(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use wafer_core::clients::database::Record;
+
+    use super::json_text;
+
+    fn record(value: serde_json::Value) -> Record {
+        let mut data = HashMap::new();
+        data.insert("manifest".to_string(), value);
+        Record {
+            id: String::new(),
+            data,
+        }
+    }
+
+    const CANONICAL: &str = r#"{"a":1,"b":[{"x":true,"y":null}]}"#;
+
+    /// The two backend shapes of the same stored row must decode to the same
+    /// bytes — otherwise a `manifest_sha256` check would be backend-dependent.
+    #[test]
+    fn both_backend_shapes_yield_the_same_canonical_text() {
+        // Postgres / D1 hand back the literal string...
+        let literal = record(serde_json::json!(CANONICAL));
+        // ...SQLite hands back the decoded value.
+        let decoded = record(serde_json::from_str::<serde_json::Value>(CANONICAL).expect("parse"));
+
+        assert_eq!(json_text(&literal, "manifest"), CANONICAL);
+        assert_eq!(json_text(&decoded, "manifest"), CANONICAL);
+    }
+
+    /// Non-canonical input is canonicalized rather than passed through, so
+    /// the result does not depend on which backend stored it. This also pins
+    /// that `serde_json` has no `preserve_order`: were it ever enabled by
+    /// feature unification, object key order would survive and this fails.
+    #[test]
+    fn non_canonical_json_is_canonicalized_on_both_paths() {
+        let messy = r#"{ "b": [ { "y": null, "x": true } ], "a": 1 }"#;
+        let literal = record(serde_json::json!(messy));
+        let decoded = record(serde_json::from_str::<serde_json::Value>(messy).expect("parse"));
+
+        assert_eq!(json_text(&literal, "manifest"), CANONICAL);
+        assert_eq!(json_text(&decoded, "manifest"), CANONICAL);
+    }
+
+    #[test]
+    fn unparseable_text_and_absent_columns_degrade_predictably() {
+        assert_eq!(
+            json_text(&record(serde_json::json!("not json at all")), "manifest"),
+            "not json at all",
+        );
+        assert_eq!(json_text(&record(serde_json::json!("x")), "missing"), "");
     }
 }

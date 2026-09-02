@@ -195,3 +195,115 @@ fn decode(record: &db::Record) -> Result<BuildRow, WaferError> {
         created_at: record.str_field("created_at").to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{blocks::dev::test_support::FakeControl, test_support::TestContext};
+
+    /// JSON-shaped columns in canonical form — same round-trip hazard as the
+    /// generation manifests (see `repo::json_text`).
+    const BLOCK_INFO: &str = r#"{"name":"site/newsletter","version":"0.1.0"}"#;
+    const DIAGNOSTICS: &str = r#"[{"level":"warning","message":"unused import"}]"#;
+
+    fn new_build(block_name: &str) -> NewBuild {
+        NewBuild {
+            block_name: block_name.to_string(),
+            source_manifest_sha256: "src".to_string(),
+            artifact_sha256: "art".to_string(),
+            block_info_json: BLOCK_INFO.to_string(),
+            diagnostics_json: DIAGNOSTICS.to_string(),
+            compiler_version: "rubrc@pinned".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_then_get_round_trips_every_column() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let inserted = insert(&ctx, &new_build("site/newsletter"))
+            .await
+            .expect("insert");
+        assert_eq!(inserted.status, BuildStatus::Staged);
+
+        let read_back = get(&ctx, &inserted.id).await.expect("get");
+        assert_eq!(read_back, inserted);
+        assert_eq!(read_back.block_info_json, BLOCK_INFO);
+        assert_eq!(read_back.diagnostics_json, DIAGNOSTICS);
+        assert_eq!(read_back.compiler_version, "rubrc@pinned");
+    }
+
+    #[tokio::test]
+    async fn set_status_replaces_diagnostics_only_when_given_them() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let row = insert(&ctx, &new_build("site/newsletter"))
+            .await
+            .expect("insert");
+
+        // Accepting a build must not wipe the warnings the compile produced.
+        set_status(&ctx, &row.id, BuildStatus::Valid, None)
+            .await
+            .expect("accept");
+        let valid = get(&ctx, &row.id).await.expect("get");
+        assert_eq!(valid.status, BuildStatus::Valid);
+        assert_eq!(valid.diagnostics_json, DIAGNOSTICS);
+
+        let refusal = r#"[{"level":"error","message":"probe trapped"}]"#;
+        set_status(&ctx, &row.id, BuildStatus::Invalid, Some(refusal))
+            .await
+            .expect("refuse");
+        let invalid = get(&ctx, &row.id).await.expect("get");
+        assert_eq!(invalid.status, BuildStatus::Invalid);
+        assert_eq!(invalid.diagnostics_json, refusal);
+    }
+
+    #[tokio::test]
+    async fn list_recent_is_newest_first_and_honours_the_limit() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let mut rows = Vec::new();
+        for name in ["site/a", "site/b", "site/c"] {
+            rows.push(insert(&ctx, &new_build(name)).await.expect("insert"));
+        }
+        assert!(
+            rows[0].created_at < rows[1].created_at && rows[1].created_at < rows[2].created_at,
+            "insert must produce strictly increasing created_at: {:?}",
+            rows.iter().map(|r| &r.created_at).collect::<Vec<_>>(),
+        );
+
+        let listed = list_recent(&ctx, 10).await.expect("list");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| r.block_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["site/c", "site/b", "site/a"],
+        );
+        assert_eq!(list_recent(&ctx, 1).await.expect("list").len(), 1);
+    }
+
+    #[test]
+    fn decode_refuses_an_unknown_status() {
+        let mut data = HashMap::new();
+        data.insert("id".to_string(), serde_json::json!("b1"));
+        data.insert("block_name".to_string(), serde_json::json!("site/x"));
+        data.insert(
+            "source_manifest_sha256".to_string(),
+            serde_json::json!("src"),
+        );
+        data.insert("artifact_sha256".to_string(), serde_json::json!("art"));
+        data.insert("block_info_json".to_string(), serde_json::json!("null"));
+        data.insert("diagnostics_json".to_string(), serde_json::json!("[]"));
+        data.insert("compiler_version".to_string(), serde_json::json!("v"));
+        data.insert("status".to_string(), serde_json::json!("probably_fine"));
+        data.insert("created_at".to_string(), serde_json::json!("1970-01-01"));
+        let record = db::Record {
+            id: "b1".to_string(),
+            data,
+        };
+
+        let err = decode(&record).expect_err("unknown status must fail");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("probably_fine"), "{err}");
+    }
+}
