@@ -1,6 +1,6 @@
 //! Typed offer lifecycle handlers shared by administrators and seller owners.
 
-use wafer_core::clients::database::{self as db, Record};
+use wafer_core::clients::database::Record;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use super::seller_policy;
@@ -8,11 +8,10 @@ use crate::{
     blocks::products::{
         contracts::{OfferDefinitionRequest, PricingPreviewRequest},
         offer_pricing,
-        repo::offers,
-        stripe, PRODUCTS_TABLE,
+        repo::{offers, products},
+        stripe,
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthorized, ok_json},
-    util::RecordExt,
 };
 
 #[derive(Clone, Copy)]
@@ -38,7 +37,9 @@ pub(super) async fn verify_product(
     if product_id.is_empty() {
         return Err(err_bad_request("Missing product ID"));
     }
-    let product = match db::get(ctx, PRODUCTS_TABLE, product_id).await {
+    // `repo::products::get` carries the soft-delete filter, so a deleted
+    // product answers `NotFound` here exactly as it does everywhere else.
+    let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == ErrorCode::NotFound => {
             return Err(err_not_found("Product not found"));
@@ -50,9 +51,9 @@ pub(super) async fn verify_product(
         if user_id.is_empty() {
             return Err(err_unauthorized("Not authenticated"));
         }
-        let owner_id = product.str_field("owner_id");
-        let created_by = product.str_field("created_by");
-        if owner_id != user_id && created_by != user_id {
+        // The shared rule, so the offer routes and the product CRUD routes
+        // cannot disagree about who owns the same row again.
+        if !super::is_owned_by(&product, user_id) {
             return Err(err_not_found("Product not found"));
         }
     }

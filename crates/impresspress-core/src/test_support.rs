@@ -773,6 +773,13 @@ impl Context for TestContext {
 pub struct FailingDbOpContext {
     inner: TestContext,
     failing: Vec<(&'static str, &'static str)>,
+    /// The error the matched op answers with. `Internal` (via
+    /// [`FailingDbOpContext::new`]) for an infra outage;
+    /// [`FailingDbOpContext::failing_with`] picks another code so a test can
+    /// reproduce a *caller* error arriving from below — an
+    /// `InvalidArgument` a repository guard raised, say — and pin how the
+    /// handler above translates it.
+    error: WaferError,
 }
 
 /// Request-body shape shared by every `wafer-run/database` wire request:
@@ -789,7 +796,27 @@ impl FailingDbOpContext {
     /// with a simulated [`ErrorCode::Internal`] error. All other calls pass
     /// through untouched.
     pub fn new(inner: TestContext, failing: Vec<(&'static str, &'static str)>) -> Self {
-        Self { inner, failing }
+        Self::failing_with(
+            inner,
+            failing,
+            WaferError::new(ErrorCode::Internal, "simulated database outage"),
+        )
+    }
+
+    /// [`Self::new`] with the answered error chosen by the caller, for the
+    /// codes that are not an outage — a repository guard's `InvalidArgument`,
+    /// a `FailedPrecondition`, and so on. A handler that funnels every
+    /// non-`NotFound` error into a 500 discards exactly these.
+    pub fn failing_with(
+        inner: TestContext,
+        failing: Vec<(&'static str, &'static str)>,
+        error: WaferError,
+    ) -> Self {
+        Self {
+            inner,
+            failing,
+            error,
+        }
     }
 }
 
@@ -816,10 +843,7 @@ impl Context for FailingDbOpContext {
                 .iter()
                 .any(|(op, table)| *op == msg.action() && *table == collection)
             {
-                return OutputStream::error(WaferError::new(
-                    ErrorCode::Internal,
-                    "simulated database outage",
-                ));
+                return OutputStream::error(self.error.clone());
             }
             return self
                 .inner

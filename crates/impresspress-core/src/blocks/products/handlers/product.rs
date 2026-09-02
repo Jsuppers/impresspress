@@ -5,18 +5,152 @@ use std::collections::HashMap;
 
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::{config, database as db};
-use wafer_run::{context::Context, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::{
-    default_template_id, seller_policy, GROUPS_TABLE, PRODUCTS_TABLE, PRODUCT_TEMPLATES_TABLE,
-};
+use super::{default_template_id, seller_policy, GROUPS_TABLE, PRODUCT_TEMPLATES_TABLE};
 use crate::{
-    blocks::{crud, products::repo::offers as offer_repo},
+    blocks::products::repo::{self, offers as offer_repo},
     http::{
         err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
     },
-    util::{field_as_string, now_rfc3339, stamp_created, stamp_updated, RecordExt},
+    util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
 };
+
+// Columns the products table owns internally: the row's identity, ownership,
+// moderation state, the lifecycle stamps, and the Stripe/versioning linkage.
+// None of them is a caller-supplied value on any tier or verb — each has a
+// dedicated writer that maintains its invariants (`approve_product`/
+// `reject_product`/`suspend` for `approval_status`, the delete endpoints for
+// `deleted_at`, the Stripe sync for `stripe_product_id`, the
+// publish flow for `submitted_at`/`published_at`, seller onboarding for
+// `owner_*`/`seller_account_id`, versioning for `current_version`, and the
+// database layer's own UUID synthesis for `id`). A generic create or PATCH
+// that let a body through verbatim would write them behind those writers'
+// backs: an admin PATCH of `{"stripe_product_id": "prod_wrong"}` desyncs the
+// row from the Stripe catalog, `{"owner_kind":…,"owner_id":…}` re-parents a
+// seller's product, and a create carrying `deleted_at` lands a row that
+// `ensure_product_capacity`'s live-only count cannot see.
+//
+// `id` is on the list for both verbs, and is the one that bites hardest.
+// `line_items`, `offers`, `product_versions` and `entitlements` all carry a
+// `product_id` that is `TEXT NOT NULL`, so a PATCH that rewrites the key
+// orphans every one of them — the exact damage soft delete exists to
+// prevent — while the write still reports one row affected. On create the
+// field is not a rewrite, but it is still not the caller's to choose: the
+// database layer synthesizes a UUID when `id` is absent and honours it when
+// present, so a caller-supplied id means a public endpoint picking a primary
+// key, which can only collide (a 500) or claim the key of a row that was
+// purged. The products API therefore never takes an id from a body, on
+// either verb.
+//
+// One list, four handlers: admin/user × create/update. The admin tier is not
+// exempt — this is not a privilege boundary (an admin has other, deliberate
+// doors to each of these fields) but an integrity one, and the two update
+// handlers previously disagreeing about it is exactly the kind of drift a
+// single shared constant prevents.
+const UNSETTABLE_FIELDS: &[&str] = &[
+    "id",
+    "created_by",
+    "owner_kind",
+    "owner_id",
+    "seller_account_id",
+    "approval_status",
+    "stripe_product_id",
+    "current_version",
+    "submitted_at",
+    "published_at",
+    "deleted_at",
+];
+
+/// Refuse a caller-supplied request body that names any [`UNSETTABLE_FIELDS`]
+/// entry, naming the offending fields. `Ok(())` means the whole body is
+/// writable as it stands.
+///
+/// A refusal rather than a silent drop. Dropping answered 200 with a body in
+/// which the dropped field was plainly unchanged, so a client sending
+/// `{"approval_status":"approved","name":"X"}` was told its write had
+/// succeeded when half of it had been discarded — and, having no signal to
+/// act on, would keep re-sending it. 400 is the same shape the seller PATCH
+/// already uses for an unrecognized `status`, and it costs nothing the UI
+/// wants: every request the shipped admin and seller pages issue sends only
+/// caller-owned fields.
+///
+/// Handlers that legitimately write one of these fields do so *after* this
+/// call, from their own computed value — so this must run on the raw parsed
+/// body, before any server-supplied default or stamp is inserted.
+fn reject_unsettable_fields(data: &HashMap<String, serde_json::Value>) -> Result<(), OutputStream> {
+    let named: Vec<&str> = UNSETTABLE_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| data.contains_key(*field))
+        .collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    Err(err_bad_request(&format!(
+        "These fields are not settable through this endpoint: {}",
+        named.join(", ")
+    )))
+}
+
+/// Whether `user_id` may act on `product` through a user-facing (non-admin)
+/// product route.
+///
+/// The single definition of that rule, deliberately: it used to be written
+/// out at three separate doors onto the same product and one of them said
+/// something different. `verify_product_owner` compared `created_by` alone,
+/// while `offers::verify_product` and `pages::product_manager` accepted
+/// `owner_id` OR `created_by` — so a product with `owner_id = user_1` and
+/// `created_by = admin_1` (what an administrator creating a listing on a
+/// seller's behalf leaves behind) rendered on the seller's own page and
+/// accepted every offer and Payment Link route on it, while GET, PATCH,
+/// DELETE and duplicate all answered 404 for the same caller on the same row.
+///
+/// They agree on the wider rule rather than the narrower one. The routes that
+/// were already open are the ones that open a money surface — creating an
+/// offer, opening a Payment Link — so narrowing to `created_by` would have
+/// stranded a seller with a live money surface they could not read, edit or
+/// shut down. `owner_id` is also the field the rest of the system treats as
+/// authoritative for ownership: seller suspension and moderation scope on it,
+/// and checkout routes the charge to `owner_id`'s connected account.
+///
+/// An empty `user_id` is never an owner — an unauthenticated caller must not
+/// match a row whose `owner_id`/`created_by` happens to be blank, which is
+/// exactly what every platform-owned product carries.
+pub(in crate::blocks::products) fn is_owned_by(
+    product: &wafer_core::clients::database::Record,
+    user_id: &str,
+) -> bool {
+    !user_id.is_empty()
+        && (field_as_string(product, "owner_id") == user_id
+            || field_as_string(product, "created_by") == user_id)
+}
+
+/// Map a `repo::products` write failure onto a response.
+///
+/// `NotFound` is the 404 every product endpoint gives for a row that is
+/// missing *or* soft-deleted — for a filtered write it is also "zero rows
+/// matched", which is the same fact.
+///
+/// `InvalidArgument` is a CALLER error and carries a message saying what to
+/// change: `repo::products::reject_id_rewrite` raises it as the backstop for
+/// a caller that did not pass through [`reject_unsettable_fields`], and any
+/// future repository guard will arrive the same way. Matching only `NotFound`
+/// and funnelling the rest into `err_internal` answered 500 and threw the
+/// message away, so the caller got an opaque server error, a correlation id,
+/// and nothing to act on for a mistake that was entirely theirs.
+///
+/// Anything else is a genuine failure and keeps `context` for the log.
+pub(in crate::blocks::products) fn write_error(
+    error: wafer_run::WaferError,
+    context: &str,
+) -> OutputStream {
+    match error.code {
+        ErrorCode::NotFound => err_not_found("Product not found"),
+        ErrorCode::InvalidArgument => err_bad_request(&error.message),
+        _ => err_internal(context, error),
+    }
+}
 
 /// Escape SQL LIKE wildcards (`%`, `_`) and the escape char (`\`) in user
 /// input so a user searching for `100% off` doesn't also match arbitrary
@@ -77,29 +211,61 @@ fn product_filters(msg: &Message) -> Vec<Filter> {
     filters
 }
 
-/// User-owned product rows: `/b/products/products/{id}`, owned via `created_by`.
-const USER_PRODUCT: crud::OwnedResource<'static> = crud::OwnedResource {
-    collection: PRODUCTS_TABLE,
-    path_prefix: "/b/products/products/",
-    owner_field: "created_by",
-    label: "Product",
-};
+/// Fetch a product and verify the caller may act on it ([`is_owned_by`]),
+/// routing the lookup through `repo::products::get` so a soft-deleted product
+/// answers 404 the same as one that never existed — the generic
+/// `crud::verify_owner` reads its collection raw and would let an owner keep
+/// fetching/editing a soft-deleted row. Mirrors `crud::verify_owner`'s
+/// response shape: 401 unauthenticated, 404 for both "missing" and "not
+/// yours" (existence must not leak to a non-owner).
+async fn verify_product_owner(
+    ctx: &dyn Context,
+    id: &str,
+    user_id: &str,
+) -> Result<wafer_core::clients::database::Record, OutputStream> {
+    if user_id.is_empty() {
+        return Err(err_unauthorized("Not authenticated"));
+    }
+    match repo::products::get(ctx, id).await {
+        Ok(record) => {
+            if !is_owned_by(&record, user_id) {
+                return Err(err_not_found("Product not found"));
+            }
+            Ok(record)
+        }
+        Err(e) if e.code == ErrorCode::NotFound => Err(err_not_found("Product not found")),
+        Err(e) => Err(err_internal("Database error", e)),
+    }
+}
 
 // --- Product CRUD (admin) ---
 
 pub(super) async fn handle_list_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_list(ctx, msg, PRODUCTS_TABLE, product_filters(msg), None).await
+    let (page, page_size, _) = msg.pagination_params(20);
+    match repo::products::list_page(
+        ctx,
+        page as i64,
+        page_size as i64,
+        product_filters(msg),
+        None,
+    )
+    .await
+    {
+        Ok(result) => ok_json(&result),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 pub(super) async fn handle_get_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_get(
-        ctx,
-        msg,
-        PRODUCTS_TABLE,
-        "/admin/b/products/products/",
-        "Product",
-    )
-    .await
+    let id = path_param(msg, "id", "/admin/b/products/products/");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    match repo::products::get(ctx, id).await {
+        Ok(record) => ok_json(&record),
+        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 pub(super) async fn handle_create_product(
@@ -128,7 +294,26 @@ pub(super) async fn handle_create_product(
         "approval_status".to_string(),
         serde_json::Value::String("approved".to_string()),
     );
-    crud::crud_create(ctx, msg, input, PRODUCTS_TABLE, defaults).await
+
+    let raw = input.collect_to_bytes().await;
+    let mut data: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
+    // Runs before `defaults` is applied, so the `or_insert` below always
+    // inserts for the four internal fields it covers — a body can no longer
+    // pre-empt them, and it can no longer smuggle in the rest.
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
+    stamp_created(&mut data);
+    for (key, val) in defaults {
+        data.entry(key).or_insert(val);
+    }
+    match repo::products::create(ctx, data).await {
+        Ok(record) => ok_json(&record),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 pub(super) async fn handle_update_product(
@@ -136,26 +321,45 @@ pub(super) async fn handle_update_product(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    crud::crud_update(
-        ctx,
-        msg,
-        input,
-        PRODUCTS_TABLE,
-        "/admin/b/products/products/",
-        "Product",
-    )
-    .await
+    let id = path_param(msg, "id", "/admin/b/products/products/");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    let raw = input.collect_to_bytes().await;
+    let mut data: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
+    stamp_updated(&mut data);
+    // A soft-deleted product is not editable: the generic PATCH refuses one
+    // outright rather than silently applying unrelated field changes to a
+    // dead row. Until the restore endpoint ships, clearing `deleted_at` is an
+    // operator statement against the database — see the recovery note at the
+    // top of `repo::products`. The liveness test is the write's own `WHERE`,
+    // not a `get` before it: a separate read leaves a window in which a
+    // concurrent delete commits and the PATCH then writes to the dead row and
+    // answers 200 — precisely the outcome this guard exists to prevent.
+    // `NotFound` matches the response every other admin product endpoint
+    // gives for a soft-deleted row.
+    match repo::products::update_live(ctx, id, data).await {
+        Ok(record) => ok_json(&record),
+        Err(e) => write_error(e, "Database error"),
+    }
 }
 
 pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete(
-        ctx,
-        msg,
-        PRODUCTS_TABLE,
-        "/admin/b/products/products/",
-        "Product",
-    )
-    .await
+    let id = path_param(msg, "id", "/admin/b/products/products/");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    match repo::products::soft_delete(ctx, id).await {
+        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 fn copied_name(source: &wafer_core::clients::database::Record) -> String {
@@ -181,23 +385,14 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
         return err_bad_request("Missing product ID");
     }
     let source = if owner_only {
-        match crud::verify_owner(
-            ctx,
-            PRODUCTS_TABLE,
-            source_id,
-            "created_by",
-            msg.user_id(),
-            "Product",
-        )
-        .await
-        {
+        match verify_product_owner(ctx, source_id, msg.user_id()).await {
             Ok(source) => source,
             Err(response) => return response,
         }
     } else {
-        match db::get(ctx, PRODUCTS_TABLE, source_id).await {
+        match repo::products::get(ctx, source_id).await {
             Ok(source) => source,
-            Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
+            Err(error) if error.code == ErrorCode::NotFound => {
                 return err_not_found("Product not found");
             }
             Err(error) => return err_internal("Could not load product", error),
@@ -282,7 +477,7 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
         );
     }
     stamp_created(&mut data);
-    let created = match db::create(ctx, PRODUCTS_TABLE, data).await {
+    let created = match repo::products::create(ctx, data).await {
         Ok(created) => created,
         Err(error) => return err_internal("Could not duplicate product", error),
     };
@@ -299,7 +494,11 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
             if let Err(cleanup_error) = offer_repo::delete_for_product(ctx, &created.id).await {
                 tracing::error!(product_id = %created.id, error = %cleanup_error, "could not compensate duplicated offers");
             }
-            if let Err(cleanup_error) = db::delete(ctx, PRODUCTS_TABLE, &created.id).await {
+            // Hard-delete, not the door: this product was never visible to
+            // anyone (creation failed before returning), so a soft-deleted
+            // husk would needlessly consume its slug against the partial
+            // unique index instead of freeing it for retry.
+            if let Err(cleanup_error) = repo::products::purge(ctx, &created.id).await {
                 tracing::error!(product_id = %created.id, error = %cleanup_error, "could not compensate duplicated product");
             }
             return err_internal("Could not duplicate product pricing", error);
@@ -340,11 +539,22 @@ pub(super) async fn handle_user_list_products(ctx: &dyn Context, msg: &Message) 
     }];
     filters.extend(product_filters(msg));
 
-    crud::crud_list(ctx, msg, PRODUCTS_TABLE, filters, None).await
+    let (page, page_size, _) = msg.pagination_params(20);
+    match repo::products::list_page(ctx, page as i64, page_size as i64, filters, None).await {
+        Ok(result) => ok_json(&result),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 pub(super) async fn handle_user_get_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_get_owned(ctx, msg, &USER_PRODUCT).await
+    let id = path_param(msg, "id", "/b/products/products/");
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    match verify_product_owner(ctx, id, msg.user_id()).await {
+        Ok(record) => ok_json(&record),
+        Err(response) => response,
+    }
 }
 
 pub(super) async fn handle_user_create_product(
@@ -362,6 +572,13 @@ pub(super) async fn handle_user_create_product(
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
+    // Before the capacity check, not after: a body carrying `deleted_at`
+    // would otherwise create a row the check's live-only count cannot see,
+    // leaving the seller's slot free for the next create and the one after
+    // that.
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
+    }
     if let Err(response) = seller_policy::ensure_product_capacity(ctx, &user_id).await {
         return response;
     }
@@ -444,7 +661,7 @@ pub(super) async fn handle_user_create_product(
         return response;
     }
 
-    match db::create(ctx, PRODUCTS_TABLE, data).await {
+    match repo::products::create(ctx, data).await {
         Ok(record) => ok_json(&record),
         Err(e) => err_internal("Database error", e),
     }
@@ -459,16 +676,7 @@ pub(super) async fn handle_user_update_product(
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
-    let current = match crud::verify_owner(
-        ctx,
-        PRODUCTS_TABLE,
-        &id,
-        "created_by",
-        msg.user_id(),
-        "Product",
-    )
-    .await
-    {
+    let current = match verify_product_owner(ctx, &id, msg.user_id()).await {
         Ok(record) => record,
         Err(response) => return response,
     };
@@ -482,19 +690,8 @@ pub(super) async fn handle_user_update_product(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    for protected in [
-        "created_by",
-        "owner_kind",
-        "owner_id",
-        "seller_account_id",
-        "approval_status",
-        "stripe_product_id",
-        "current_version",
-        "submitted_at",
-        "published_at",
-        "deleted_at",
-    ] {
-        data.remove(protected);
+    if let Err(response) = reject_unsettable_fields(&data) {
+        return response;
     }
     if let Err(response) = seller_policy::validate_product_fields(ctx, &data).await {
         return response;
@@ -545,14 +742,29 @@ pub(super) async fn handle_user_update_product(
     }
 
     stamp_updated(&mut data);
-    match db::update(ctx, PRODUCTS_TABLE, &id, data).await {
+    // `update_live`, for the same reason the admin PATCH uses it: the
+    // ownership check above is a separate read, and the validation between it
+    // and this write only widens the window a concurrent delete can land in.
+    // The write itself has to be the thing that tests liveness.
+    match repo::products::update_live(ctx, &id, data).await {
         Ok(record) => ok_json(&record),
-        Err(error) => err_internal("Database error", error),
+        Err(error) => write_error(error, "Database error"),
     }
 }
 
 pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete_owned(ctx, msg, &USER_PRODUCT).await
+    let id = path_param(msg, "id", "/b/products/products/").to_string();
+    if id.is_empty() {
+        return err_bad_request("Missing product ID");
+    }
+    if let Err(response) = verify_product_owner(ctx, &id, msg.user_id()).await {
+        return response;
+    }
+    match repo::products::soft_delete(ctx, &id).await {
+        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
+        Err(e) => err_internal("Database error", e),
+    }
 }
 
 pub(super) async fn handle_user_duplicate_product(

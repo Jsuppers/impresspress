@@ -6,6 +6,7 @@ mod offer_management_tests;
 mod offer_pricing_tests;
 mod provider_tests;
 mod purchase_tests;
+mod repo_door_test;
 mod repo_tests;
 mod seller_governance_tests;
 mod storefront_tests;

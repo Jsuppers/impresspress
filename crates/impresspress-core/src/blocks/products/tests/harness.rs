@@ -110,7 +110,7 @@ pub fn admin_create_msg(path: &str, body: serde_json::Value) -> (Message, InputS
 /// path already in `req.resource`: the normalized sub-path is now an explicit
 /// argument (no `req.resource` rewrite), so here it equals `msg.path()`.
 pub async fn dispatch_admin(
-    ctx: &TestContext,
+    ctx: &dyn wafer_run::context::Context,
     mut msg: Message,
     input: InputStream,
 ) -> OutputStream {
@@ -121,7 +121,7 @@ pub async fn dispatch_admin(
 /// Dispatch a user request the same way (normalized `/b/products/...` path is
 /// already in `req.resource` for these tests).
 pub async fn dispatch_user(
-    ctx: &TestContext,
+    ctx: &dyn wafer_run::context::Context,
     mut msg: Message,
     input: InputStream,
 ) -> OutputStream {

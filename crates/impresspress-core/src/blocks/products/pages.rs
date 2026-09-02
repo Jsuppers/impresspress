@@ -13,7 +13,7 @@ use super::{
         SellerFailureSummary, StripeConnectionState, StripeConnectionStatus, VariableDefinition,
         VariableKind,
     },
-    money, repo, stripe_provider, GROUPS_TABLE, PRODUCTS_TABLE, PURCHASES_TABLE,
+    money, repo, stripe_provider, GROUPS_TABLE, PURCHASES_TABLE,
 };
 
 fn display_money(amount_minor: i64, currency: &str) -> String {
@@ -303,7 +303,7 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // false `products_count == 0` also trips `render_overview_empty_state`'s
     // "Add your first product" CTA during a real outage — actively
     // misleading, not just cosmetically wrong.
-    let products_count = match db::count(ctx, PRODUCTS_TABLE, &[]).await {
+    let products_count = match repo::products::count(ctx, &[]).await {
         Ok(n) => n,
         Err(e) => return crate::http::err_internal("Database error", e),
     };
@@ -423,11 +423,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
     let search = msg.query("search").to_string();
 
-    let mut filters = vec![Filter {
-        field: "deleted_at".into(),
-        operator: FilterOp::IsNull,
-        value: serde_json::Value::Null,
-    }];
+    let mut filters = Vec::new();
     if let Some(search) = super::handlers::name_like_filter(&search) {
         filters.push(search);
     }
@@ -436,15 +432,11 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         field: "created_at".into(),
         desc: true,
     }];
-    let result = db::paginated_list(
-        ctx,
-        PRODUCTS_TABLE,
-        page as i64,
-        page_size as i64,
-        filters,
-        sort,
-    )
-    .await;
+    // `list_page` appends the live-only filter onto this caller-supplied
+    // `filters`; the hand-written `deleted_at IS NULL` this used to carry is
+    // the repo door's job now.
+    let result =
+        repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await;
 
     let new_product_button = html! {
         a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ New Product" }
@@ -518,9 +510,8 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(sellers) => sellers,
         Err(error) => return crate::http::err_internal("Could not read seller status", error),
     };
-    let seller_products = match db::list_all(
+    let seller_products = match repo::products::list_all(
         ctx,
-        PRODUCTS_TABLE,
         vec![Filter {
             field: "owner_kind".into(),
             operator: FilterOp::Equal,
@@ -637,9 +628,8 @@ pub async fn admin_seller_detail(
         Ok(seller) => seller,
         Err(error) => return crate::http::err_internal("Could not read seller status", error),
     };
-    let products = match db::list_all(
+    let products = match repo::products::list_all(
         ctx,
-        PRODUCTS_TABLE,
         vec![Filter {
             field: "owner_id".into(),
             operator: FilterOp::Equal,
@@ -1891,28 +1881,19 @@ pub async fn product_manager(
     product_id: &str,
     admin: bool,
 ) -> OutputStream {
-    let product = match db::get(ctx, PRODUCTS_TABLE, product_id).await {
+    // `repo::products::get` already answers `NotFound` for a soft-deleted row,
+    // so the hand-written `deleted_at` check this used to need is gone too.
+    let product = match repo::products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
             return crate::http::err_not_found("Product not found");
         }
         Err(error) => return crate::http::err_internal("Could not load product", error),
     };
-    let deleted = product
-        .data
-        .get("deleted_at")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
-    if deleted {
+    if !admin && !super::handlers::is_owned_by(&product, msg.user_id()) {
+        // The shared rule again — this page and the API that backs its
+        // buttons must not disagree about who owns the product.
         return crate::http::err_not_found("Product not found");
-    }
-    if !admin {
-        let user_id = msg.user_id();
-        if user_id.is_empty()
-            || (product.str_field("owner_id") != user_id
-                && product.str_field("created_by") != user_id)
-        {
-            return crate::http::err_not_found("Product not found");
-        }
     }
     let offers = match repo::offers::list_for_product(ctx, product_id).await {
         Ok(offers) => offers,
@@ -2832,21 +2813,15 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let (product_count, seller_account, fee_basis_points) = if seller_enabled {
-        let count = match db::count(
+        // The soft-delete filter used to be hand-written above;
+        // `repo::products::count` now appends it.
+        let count = match repo::products::count(
             ctx,
-            PRODUCTS_TABLE,
-            &[
-                Filter {
-                    field: "created_by".to_string(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(&user_id),
-                },
-                Filter {
-                    field: "deleted_at".to_string(),
-                    operator: FilterOp::IsNull,
-                    value: serde_json::Value::Null,
-                },
-            ],
+            &[Filter {
+                field: "created_by".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(&user_id),
+            }],
         )
         .await
         {
@@ -3436,31 +3411,19 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
     let (page, page_size, _) = msg.pagination_params(20);
 
-    let filters = vec![
-        Filter {
-            field: "created_by".into(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(user_id),
-        },
-        Filter {
-            field: "deleted_at".into(),
-            operator: FilterOp::IsNull,
-            value: serde_json::Value::Null,
-        },
-    ];
+    // The soft-delete filter used to be hand-written above;
+    // `repo::products::list_page` now appends it.
+    let filters = vec![Filter {
+        field: "created_by".into(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(user_id),
+    }];
     let sort = vec![SortField {
         field: "created_at".into(),
         desc: true,
     }];
-    let result = db::paginated_list(
-        ctx,
-        PRODUCTS_TABLE,
-        page as i64,
-        page_size as i64,
-        filters,
-        sort,
-    )
-    .await;
+    let result =
+        repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await;
 
     let content = html! {
         (portal_tabs("selling", seller_enabled))
