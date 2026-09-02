@@ -198,7 +198,7 @@ async fn users_table(records: &[db::Record], ctx: &dyn Context, current_user_id:
                 tbody {
                     @if records.is_empty() {
                         tr {
-                            td colspan="5" .text-center .text-muted style="padding: 2rem;" { "No users found" }
+                            td colspan="5" .text-center .text-muted .p-8 { "No users found" }
                         }
                     }
                     @for record in records {
@@ -228,7 +228,7 @@ fn single_user_row(record: &db::Record, roles: &[String], current_uid: &str) -> 
             td { (email) }
             td {
                 @for role in roles {
-                    span .badge .badge-primary style="margin-right: 0.25rem;" { (role) }
+                    span .badge .badge-primary .mr-1 { (role) }
                 }
                 @if roles.is_empty() {
                     span .text-muted { "\u{2014}" }
@@ -482,7 +482,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                         tbody {
                             @if list.records.is_empty() {
                                 tr {
-                                    td colspan="6" .text-center .text-muted style="padding: 2rem;" { "No API keys" }
+                                    td colspan="6" .text-center .text-muted .p-8 { "No API keys" }
                                 }
                             }
                             @for record in &list.records {

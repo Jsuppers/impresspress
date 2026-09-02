@@ -91,7 +91,7 @@ async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
     .unwrap_or_default();
 
     html! {
-        p .text-muted style="margin-bottom:16px" {
+        p .text-muted .mb-4 {
             "Recent storage access by blocks. Each block is isolated to "
             code { "/storage/{block-name}/" }
             "."
@@ -111,7 +111,7 @@ async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
                 tbody {
                     @if logs.is_empty() {
                         tr {
-                            td colspan="5" .text-center .text-muted style="padding: 2rem;" {
+                            td colspan="5" .text-center .text-muted .p-8 {
                                 "No storage access logs yet."
                             }
                         }
@@ -128,8 +128,8 @@ async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
                                     span .badge .badge-info { (source) }
                                 }
                             }
-                            td .text-sm style="font-family:monospace" { (op) }
-                            td .text-sm style="font-family:monospace" { (path) }
+                            td .text-sm .font-mono { (op) }
+                            td .text-sm .font-mono { (path) }
                             td .text-sm {
                                 @if status.starts_with("BLOCKED") {
                                     span .badge .badge-danger { (status) }

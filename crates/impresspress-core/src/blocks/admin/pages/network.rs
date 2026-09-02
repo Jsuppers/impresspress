@@ -17,7 +17,7 @@ use crate::{
 /// read-only monitoring — it renders no `<form>` and has nothing to save.
 pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     html! {
-        div .filter-bar style="margin-bottom:0.5rem" {
+        div .filter-bar .mb-2 {
             button .btn .btn-secondary .btn-sm
                 hx-get="/b/admin/settings/network"
                 hx-target="#content"
@@ -124,7 +124,7 @@ async fn network_inbound_tab(ctx: &dyn Context, msg: &Message) -> Markup {
             table .table {
                 thead {
                     tr {
-                        th style="width:30px" { "" }
+                        th .w-30 { "" }
                         th { "Method" }
                         th { "Path" }
                         th { "Requests" }
@@ -136,7 +136,7 @@ async fn network_inbound_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                 tbody {
                     @if summary.is_empty() {
                         tr {
-                            td colspan="7" .text-center .text-muted style="padding: 2rem;" { "No inbound requests yet" }
+                            td colspan="7" .text-center .text-muted .p-8 { "No inbound requests yet" }
                         }
                     }
                     @for row in &summary {
@@ -197,7 +197,7 @@ fn inbound_row(
             td .text-muted .text-sm { (last_seen.get(..19).unwrap_or(last_seen)) }
         }
         tr .detail-rows hidden {
-            td colspan="7" style="padding:0" {
+            td colspan="7" .p-0 {
                 div id=(row_id) {}
             }
         }
@@ -256,7 +256,7 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
     };
 
     let markup = html! {
-        table .table style="margin:0" {
+        table .table .m-0 {
             thead {
                 tr {
                     th { "Status" }
@@ -293,7 +293,7 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
         }
         @if has_more {
             @let next_offset = offset + limit;
-            div style="text-align:center;padding:8px" {
+            div .text-center .p-2 {
                 button .btn .btn-secondary .btn-sm
                     hx-get={"/b/admin/network/detail/inbound?method=" (method) "&path=" (path) "&offset=" (next_offset)}
                     hx-target="closest div"

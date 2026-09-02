@@ -244,6 +244,7 @@
 .w-auto { width: auto; }
 .w-full { width: 100%; }
 /* Fixed narrow table column (e.g. a "Method"/"Auth" header cell). */
+.w-30 { width: 30px; }
 .w-50 { width: 50px; }
 .w-60 { width: 60px; }
 .w-70 { width: 70px; }
