@@ -8002,6 +8002,182 @@
       ]
     }
   },
+  "/b/products/api/products/{id}/restore": {
+    "post": {
+      "description": "Clears `deleted_at` on a product the caller owns, undoing their own delete. The admin route is `/b/products/api/admin/products/{id}/restore`; this one is scoped to the caller's own products and answers 404 for anyone else's.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "properties": {
+                      "approval_status": {
+                        "enum": [
+                          "draft",
+                          "pending_review",
+                          "approved",
+                          "rejected",
+                          "suspended"
+                        ],
+                        "type": "string"
+                      },
+                      "category": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "created_by": {
+                        "type": "string"
+                      },
+                      "currency": {
+                        "type": "string"
+                      },
+                      "current_version": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "deleted_at": {
+                        "description": "Null unless the product has been soft-deleted.",
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "fulfillment_kind": {
+                        "enum": [
+                          "none",
+                          "manual",
+                          "download",
+                          "entitlement",
+                          "webhook"
+                        ],
+                        "type": "string"
+                      },
+                      "group_id": {
+                        "type": "string"
+                      },
+                      "group_template_id": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "image_url": {
+                        "type": "string"
+                      },
+                      "metadata": {
+                        "type": "object"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "owner_id": {
+                        "type": "string"
+                      },
+                      "owner_kind": {
+                        "enum": [
+                          "platform",
+                          "user"
+                        ],
+                        "type": "string"
+                      },
+                      "product_template_id": {
+                        "type": "string"
+                      },
+                      "published_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "requires": {
+                        "type": "string"
+                      },
+                      "seller_account_id": {
+                        "type": "string"
+                      },
+                      "slug": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "description": "draft | active",
+                        "type": "string"
+                      },
+                      "stock": {
+                        "type": "integer"
+                      },
+                      "stripe_product_id": {
+                        "type": "string"
+                      },
+                      "submitted_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "tags": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "type_id": {
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Restore own soft-deleted product",
+      "tags": [
+        "products",
+        "seller"
+      ]
+    }
+  },
   "/b/products/api/products/{product_id}/offers": {
     "get": {
       "parameters": [
