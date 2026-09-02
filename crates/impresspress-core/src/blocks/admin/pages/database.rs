@@ -87,7 +87,7 @@ fn left_pane(tables: &[TableSummary], selected: Option<&str>, tab: Tab) -> Marku
                 input #db-filter type="text"
                     placeholder="Filter tables…"
                     autocomplete="off"
-                    oninput="(function(e){var q=e.target.value.toLowerCase();var visible=0;document.querySelectorAll('[data-db-table]').forEach(function(li){var n=li.getAttribute('data-db-table');var show=n.indexOf(q)>=0;li.style.display=show?'':'none';if(show)visible++;});document.querySelectorAll('[data-db-group]').forEach(function(g){var anyVisible=g.querySelector('[data-db-table]:not([style*=\"none\"])');g.style.display=anyVisible?'':'none';});var empty=document.getElementById('db-filter-empty');if(empty)empty.hidden=visible!==0;})(event)";
+                    oninput="(function(e){var q=e.target.value.toLowerCase();var visible=0;document.querySelectorAll('[data-db-table]').forEach(function(li){var n=li.getAttribute('data-db-table');var show=n.indexOf(q)>=0;li.hidden=!show;if(show)visible++;});document.querySelectorAll('[data-db-group]').forEach(function(g){var anyVisible=g.querySelector('[data-db-table]:not([hidden])');g.hidden=!anyVisible;});var empty=document.getElementById('db-filter-empty');if(empty)empty.hidden=visible!==0;})(event)";
             }
             div .db-table-groups {
                 @if tables.is_empty() {

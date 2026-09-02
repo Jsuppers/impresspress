@@ -289,15 +289,19 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                 }
                 div .flex .gap-2 .justify-end {
                     button .btn .btn-secondary type="button"
-                        onclick=(format!("document.getElementById('edit-btn-{id}').style.display='none'"))
+                        onclick=(format!("closeModal('edit-btn-{id}')"))
                     { "Cancel" }
                     button .btn .btn-primary type="submit" { "Save" }
                 }
             }
         }))
-        // Auto-show the modal
+        // Auto-show the modal. `components::modal()` renders the boolean
+        // `hidden` attribute (base.css: `[hidden] { display: none !important; }`),
+        // so revealing it needs `hidden = false` via the shared `openModal`
+        // helper (ui/assets.rs `modal_js()`), not a plain `style.display`
+        // assignment -- that loses to `!important` and the modal never opens.
         script { (maud::PreEscaped(format!(
-            "document.getElementById('edit-btn-{id}').style.display='flex';"
+            "openModal('edit-btn-{id}');"
         ))) }
     };
 

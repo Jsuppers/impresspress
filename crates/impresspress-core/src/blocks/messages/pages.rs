@@ -390,8 +390,6 @@ fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) ->
                             data-context-id=(id)
                             data-active=(if is_active { "true" } else { "false" })
                             aria-current=[is_active.then_some("page")]
-                            onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.1)'"
-                            onmouseout="this.style.boxShadow=''"
                         {
                             div .thread-card__row {
                                 span .thread-card__title {

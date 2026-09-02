@@ -234,8 +234,8 @@ const EDITOR_JS: &str = r#"
         document.querySelectorAll('.editor-tab').forEach(function(t) {
             t.classList.toggle('editor-tab--active', t.dataset.tab === name);
         });
-        document.getElementById('editor-edit-pane').style.display = (name === 'edit') ? '' : 'none';
-        document.getElementById('editor-preview-pane').style.display = (name === 'preview') ? '' : 'none';
+        document.getElementById('editor-edit-pane').classList.toggle('hidden', name !== 'edit');
+        document.getElementById('editor-preview-pane').classList.toggle('hidden', name !== 'preview');
         if (name === 'preview') {
             var content = document.getElementById('editor').value;
             fetch('/b/legalpages/admin/render-preview', {
