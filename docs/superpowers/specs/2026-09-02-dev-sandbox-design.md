@@ -827,6 +827,17 @@ and read together with this list.
     `.`/`..` segments are refused at the capability layer and in the storage
     handler.
 
+11. **§6.1 / Plan 1 Task 8 — block names have no underscores.** wafer-run
+    rejects `_` in a block-name segment and `wrap::resource_owner` maps `_`
+    to `-`, so `<name>` is `^[a-z][a-z0-9-]{1,31}$` (collections stay
+    `site__<name>__*` with the hyphenated name inside). Guest validation is
+    exhaustive over `BlockCapabilities` (a new producer field fails the
+    build) and refuses any `headers` policy; extra routes whose block
+    declares endpoints are refined by the declared endpoint auth exactly like
+    built-in routes; the executable half of validation is split into
+    `inspect` (metadata under no capabilities) and `probe` (lifecycle + one
+    request under the accepted capabilities), with the static rules between.
+
 ## 21. Definition of done
 
 - `browser-devtools` is off by default and absent from a normal bundle; the
