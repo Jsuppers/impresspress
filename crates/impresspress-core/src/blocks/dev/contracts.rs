@@ -15,6 +15,7 @@ use super::{
         generations::{GenerationCause, GenerationStatus},
         runtime_state::ActivationPhase,
     },
+    validation::Diagnostic,
     workspace::FileEntry,
 };
 
@@ -342,4 +343,74 @@ impl FileConflict {
             current_size: current.map(|entry| entry.size),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Staging and removing blocks (`/b/dev/api/builds/stage`, `/b/dev/api/blocks*`)
+// ---------------------------------------------------------------------------
+
+/// Request of `POST /b/dev/api/builds/stage`.
+///
+/// One compiled `wasm32-wasip1` module, with everything needed to explain it
+/// afterwards. Staging validates the artifact and, if it passes, activates a
+/// new generation carrying it — there is no separate "activate" call.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StageBuildRequest {
+    /// The block's short name, e.g. `hello` for the sources under
+    /// `blocks/hello/`. It is registered as `site/hello` and serves
+    /// `/b/hello/`; do not send either of those longer forms.
+    pub block_name: String,
+    /// The compiled module, standard base64 with padding. At most 4 MiB
+    /// decoded.
+    pub artifact_base64: String,
+    /// SHA-256 of the source manifest the compile ran against, so a stored
+    /// build can be traced back to the exact sources. Omit if the compiler
+    /// did not report one.
+    #[serde(default)]
+    pub source_manifest_sha256: Option<String>,
+    /// Pinned toolchain revision that produced the artifact.
+    pub compiler_version: String,
+    /// Diagnostics the compiler produced, warnings included. They are stored
+    /// with the build and returned alongside any the validator adds.
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Response of `POST /b/dev/api/builds/stage`.
+///
+/// A refused block is a result, not a transport failure: the status is `200`
+/// with `success: false` and the reasons in `diagnostics`. Only a malformed
+/// request — bad JSON, or `artifact_base64` that is not base64 — is a `4xx`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StageBuildResponse {
+    /// The stored build's id, or null when the request was refused before a
+    /// build could be recorded (an artifact over the size limit is never
+    /// stored, so there is nothing for a build row to point at).
+    pub build_id: Option<String>,
+    /// Whether the block was accepted and activated.
+    pub success: bool,
+    /// Everything known about this build: the diagnostics the compiler
+    /// reported, then any the validator added. `severity` tells them apart —
+    /// a refusal is always an `error`.
+    pub diagnostics: Vec<Diagnostic>,
+    /// The generation the accepted block went live in, or null when the
+    /// build was refused.
+    pub generation: Option<GenerationSummary>,
+    /// One entry per phase the activation passed through, with how long it
+    /// took. Empty when nothing was activated.
+    pub progress: Vec<ProgressStep>,
+}
+
+/// Path parameters of every `/b/dev/api/blocks/{name}*` route.
+///
+/// Declared as a type rather than a hand-written schema for the same reason
+/// [`GenerationPathParams`] is: `wafer_core::discovery` cross-checks the
+/// declared names against the path template's placeholders when it builds the
+/// agent tool for the endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BlockPathParams {
+    /// The block's short name, e.g. `hello` for the block registered as
+    /// `site/hello`.
+    pub name: String,
 }

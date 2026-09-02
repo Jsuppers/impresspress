@@ -147,6 +147,22 @@ pub fn block_name_is_valid(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
 }
 
+/// A lower bound on how many bytes `encoded` decodes to, for padded
+/// standard base64.
+///
+/// The one place the arithmetic lives, because two callers enforce two
+/// different limits with it: a workspace write against
+/// [`MAX_FILE_BYTES`], and a staged artifact against
+/// `validation::MAX_ARTIFACT_BYTES`. Both check it *before* decoding, so an
+/// over-large body is refused without a second allocation the size of the
+/// first.
+///
+/// It must never over-estimate, or a legal payload would be refused: base64
+/// carries three bytes per four characters, of which at most two are padding.
+pub fn min_base64_decoded_len(encoded: &str) -> usize {
+    (encoded.len() / 4).saturating_mul(3).saturating_sub(2)
+}
+
 /// The content type the site publisher serves `path` with, and the one the
 /// read endpoint consults to decide utf8 vs base64.
 ///
@@ -311,6 +327,27 @@ mod tests {
         let deep = format!("site/{}", vec!["ab"; 400].join("/"));
         assert!(deep.len() > MAX_PATH_BYTES);
         assert_eq!(validate_path(&deep), Err(PathError::TooLong));
+    }
+
+    #[test]
+    fn the_base64_bound_never_over_estimates() {
+        use base64ct::{Base64, Encoding};
+
+        // The bound backs two size limits, and over-estimating would refuse a
+        // legal payload — so check it against real encodings across every
+        // padding case.
+        for len in [0usize, 1, 2, 3, 4, 5, 6, 100, 4 * 1024 * 1024 + 1] {
+            let encoded = Base64::encode_string(&vec![0u8; len]);
+            let bound = min_base64_decoded_len(&encoded);
+            assert!(
+                bound <= len,
+                "bound {bound} over-estimates {len} bytes ({} chars)",
+                encoded.len(),
+            );
+            // And it is tight enough to be useful: never more than the two
+            // padding bytes short.
+            assert!(len - bound <= 2, "bound {bound} is loose for {len} bytes");
+        }
     }
 
     #[test]

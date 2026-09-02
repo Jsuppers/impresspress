@@ -1,0 +1,961 @@
+//! Static validation of a staged guest block (design §7.4, §6.5).
+//!
+//! Validation has two halves. The *executable* half —
+//! [`super::control::RuntimeControl::validate`] — loads the artifact, parses
+//! `BlockInfo`, runs `Init`/`Start` and one probe. This module is the other
+//! half: pure data rules over the `BlockInfo` the guest reported, the name it
+//! was compiled under, and the block set it is joining.
+//!
+//! # Why the rules live beside the spec and not in the host
+//!
+//! Every rule here is a statement about a [`DynamicBlockSpec`] and its
+//! neighbours — nothing needs a runtime to decide. Keeping them out of the
+//! `RuntimeControl` implementation means the browser host and the native host
+//! cannot come to different conclusions about the same guest, and it means
+//! the whole rule set is testable without wasmi.
+//!
+//! # Why a refusal is a value and not an error
+//!
+//! Every refusal is a [`Diagnostic`] with a stable `code`. The sandbox's
+//! caller is an agent: an HTTP error would tell it "something went wrong",
+//! and a coded diagnostic tells it what to change. So [`validate_static`]
+//! collects *every* rule that fires rather than stopping at the first, and
+//! the staging endpoint answers `200` with `success: false` (design §7.4:
+//! "refusals are structured diagnostics in the tool result, never a transport
+//! error").
+//!
+//! # Totality
+//!
+//! [`validate_static`] assumes nothing about its inputs — in particular it
+//! does not assume `name` is a legal block name, because the rule that says
+//! so ([`NAME_FORMAT`]) is one of its own. The staging handler refuses a
+//! malformed name *before* it executes the guest (see
+//! [`name_format_diagnostic`]); that is an ordering decision about running
+//! untrusted code, not a precondition this function may rely on.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+use wafer_block::{Allowlist, BlockCapabilities, BlockInfo};
+
+use super::{
+    control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind, ValidationFailure},
+    paths,
+};
+
+/// Largest guest artifact the sandbox accepts (design §6.6).
+///
+/// Checked before the artifact is stored or executed: an oversized module is
+/// refused as a diagnostic, so a compile that produced one costs nothing but
+/// the decode.
+pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Block-name prefixes a guest may never claim.
+///
+/// A guest is always registered as `site/{name}`, so nothing it *can* be
+/// named starts with one of these. The rule exists for what the guest
+/// *reports*: a `BlockInfo` naming itself `impresspress/admin` is a guest
+/// trying to be mistaken for a built-in, and saying so with its own code is
+/// more useful than the bare name mismatch that also fires.
+pub const RESERVED_NAME_PREFIXES: &[&str] = &["wafer-run/", "impresspress/"];
+
+/// The only blocks a guest may declare as callable (design §6.5).
+///
+/// Cross-block calls into feature blocks are out of scope for v1: a guest's
+/// *frontend* talks to `impresspress/products` over HTTP like any page, and
+/// the guest itself reaches only the four platform services.
+pub const ALLOWED_CALLABLE_BLOCKS: &[&str] = &[
+    "wafer-run/database",
+    "wafer-run/storage",
+    "wafer-run/config",
+    "wafer-run/logger",
+];
+
+// ---------------------------------------------------------------------------
+// Diagnostic codes
+// ---------------------------------------------------------------------------
+
+/// `name` is not a legal block name.
+pub const NAME_FORMAT: &str = "name-format";
+/// The reported `BlockInfo.name` claims a reserved namespace.
+pub const NAME_RESERVED: &str = "name-reserved";
+/// The reported `BlockInfo.name` is not `site/{name}`.
+pub const NAME_MISMATCH: &str = "name-mismatch";
+/// The route prefix the name produces is not a normalized prefix.
+pub const ROUTE_PREFIX_CODE: &str = "route-prefix";
+/// The route prefix overlaps a built-in route or another block's.
+pub const ROUTE_COLLISION: &str = "route-collision";
+/// A declared endpoint sits outside the block's own route prefix.
+pub const ENDPOINT_OUTSIDE_ROUTES: &str = "endpoint-outside-routes";
+/// An agent tool name is already claimed.
+pub const TOOL_NAME_DUPLICATE: &str = "tool-name-duplicate";
+/// A declared collection is outside `site__{name}__*`.
+pub const CAP_COLLECTION: &str = "cap-collection";
+/// A declared storage folder is outside `site/{name}`.
+pub const CAP_FOLDER: &str = "cap-folder";
+/// A declared config key is outside `SITE__{NAME}__*`.
+pub const CAP_CONFIG: &str = "cap-config";
+/// The guest declared `raw_sql`.
+pub const CAP_RAW_SQL: &str = "cap-raw-sql";
+/// The guest declared `ddl`.
+pub const CAP_DDL: &str = "cap-ddl";
+/// The guest declared network access.
+pub const CAP_NETWORK: &str = "cap-network";
+/// The guest declared crypto access.
+pub const CAP_CRYPTO: &str = "cap-crypto";
+/// The guest declared vector indexes.
+pub const CAP_VECTOR: &str = "cap-vector";
+/// The guest declared a callable block it may not call.
+pub const CAP_CALLABLE: &str = "cap-callable";
+/// `callable_blocks` and `requires` describe different sets.
+pub const CAP_REQUIRES_MISMATCH: &str = "cap-requires-mismatch";
+/// The artifact is over [`MAX_ARTIFACT_BYTES`].
+pub const ARTIFACT_TOO_LARGE: &str = "artifact-too-large";
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// How serious a [`Diagnostic`] is.
+///
+/// The four levels rustc emits, so a compiler diagnostic the `/b/dev` page
+/// forwards keeps the level it was produced with rather than being mapped
+/// onto a smaller ladder on the way in.
+///
+/// Unlike the block's other closed enums this has no `as_str`/`parse` pair:
+/// it is never a database column, a URL segment or a manifest key, so JSON is
+/// its only representation and serde is its only spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// The build is refused, or the compile failed.
+    Error,
+    /// The build stands; something is worth changing.
+    Warning,
+    /// Additional context for a nearby error or warning.
+    Note,
+    /// A suggested fix.
+    Help,
+}
+
+/// One thing the compiler or the validator has to say about a build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Diagnostic {
+    /// How serious it is. Anything `error` means the build was refused.
+    pub severity: Severity,
+    /// Stable machine-readable identifier, e.g. `cap-collection` for a
+    /// capability outside the block's namespace or `guest-init` for a trap
+    /// in the guest's `Init`. Match on this rather than on `message`.
+    pub code: String,
+    /// What is wrong, and what to change.
+    pub message: String,
+    /// Workspace-relative source file the diagnostic is about, when the
+    /// compiler reported one.
+    pub file: Option<String>,
+    /// 1-based line in `file`, when the compiler reported one.
+    pub line: Option<u32>,
+    /// 1-based column in `file`, when the compiler reported one.
+    pub column: Option<u32>,
+}
+
+impl Diagnostic {
+    /// A refusal with `code`, carrying no source position.
+    ///
+    /// Validation rules are statements about a block's declarations, not
+    /// about a span in a file: the compiler already accepted the source. The
+    /// `file`/`line`/`column` fields exist for the diagnostics the *compiler*
+    /// produced and the page forwards.
+    pub fn error(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            code: code.to_string(),
+            message: message.into(),
+            file: None,
+            line: None,
+            column: None,
+        }
+    }
+
+    /// The refusal an oversized artifact produces.
+    ///
+    /// Built here rather than at the call site so [`ARTIFACT_TOO_LARGE`] and
+    /// the limit it reports cannot drift apart from [`MAX_ARTIFACT_BYTES`].
+    ///
+    /// `len` is a *lower bound* on the artifact's size, not necessarily its
+    /// exact length: the staging handler refuses an over-large body before
+    /// decoding it, and at that point all it knows is what the encoding
+    /// guarantees. The message says so rather than reporting a number it
+    /// cannot stand behind.
+    pub fn artifact_too_large(len: usize) -> Self {
+        Self::error(
+            ARTIFACT_TOO_LARGE,
+            format!(
+                "the artifact is at least {len} bytes; the sandbox accepts at most \
+                 {MAX_ARTIFACT_BYTES}. Build with release size settings (opt-level = \"z\", \
+                 lto, strip)."
+            ),
+        )
+    }
+
+    /// The refusal a failed [`super::control::RuntimeControl::validate`]
+    /// produces.
+    ///
+    /// The code is `guest-{stage}` — `guest-load`, `guest-info`,
+    /// `guest-init`, `guest-start`, `guest-probe` — so the stage is machine
+    /// readable and the enum stays the single owner of its spelling.
+    pub fn guest(failure: &ValidationFailure) -> Self {
+        Self::error(
+            &format!("guest-{}", failure.stage.as_str()),
+            failure.message.clone(),
+        )
+    }
+}
+
+/// The refusal a malformed block name produces.
+///
+/// Exposed on its own because the staging handler refuses the name *before*
+/// it hands the artifact to [`super::control::RuntimeControl::validate`]: a
+/// name that can never be registered would otherwise have an untrusted module
+/// loaded and executed, and the provisional spec the host is handed would
+/// carry a route prefix built from a name the router could not serve.
+/// [`validate_static`] applies the same rule through this same function, so
+/// the two paths cannot describe the name differently.
+pub fn name_format_diagnostic(name: &str) -> Diagnostic {
+    Diagnostic::error(
+        NAME_FORMAT,
+        format!(
+            "{name:?} is not a legal block name: it must match \
+             ^[a-z][a-z0-9_]{{1,31}}$ (a block name is also a directory \
+             segment and a crate name)"
+        ),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Route prefixes
+// ---------------------------------------------------------------------------
+
+/// Every route prefix the built-in router already owns.
+///
+/// `crate::routing::ROUTES` plus the sandbox's own [`super::ROUTE_PREFIX`],
+/// which is registered as a `crate::routing::ExtraRoute` and so is absent
+/// from the built-in table. A deployment that adds further extra routes
+/// passes them alongside these — the caller owns that list because
+/// `Context` does not publish one.
+pub fn builtin_route_prefixes() -> Vec<&'static str> {
+    crate::routing::ROUTES
+        .iter()
+        .map(|route| route.prefix)
+        .chain(std::iter::once(super::ROUTE_PREFIX))
+        .collect()
+}
+
+/// Whether `prefix` is a normalized route prefix: absolute, `/`-terminated,
+/// and free of segments that would make prefix matching a statement about
+/// something other than whole path segments.
+///
+/// The router matches by `str::starts_with`, so an unnormalized prefix is not
+/// a cosmetic problem: `/b/a/../admin/` textually sits under `/b/a/` while
+/// naming somebody else's routes.
+fn is_normalized_prefix(prefix: &str) -> bool {
+    if !prefix.starts_with('/') || !prefix.ends_with('/') {
+        return false;
+    }
+    // `"/b/x/".split('/')` is `["", "b", "x", ""]`: the leading and trailing
+    // empties are the two `/`s that must be there, and every segment between
+    // them must be a real one.
+    let segments: Vec<&str> = prefix.split('/').collect();
+    segments.len() > 2
+        && segments[1..segments.len() - 1].iter().all(|segment| {
+            !segment.is_empty()
+                && *segment != "."
+                && *segment != ".."
+                && !segment.contains('\\')
+                && !segment.chars().any(char::is_control)
+        })
+}
+
+/// Whether two route prefixes can both be served.
+///
+/// The router picks the first prefix that `starts_with`-matches, so a prefix
+/// that is a prefix of another — in *either* direction — means one of the two
+/// blocks never sees some of its own requests. `/b/admin/` and `/b/admin`
+/// collide; `/b/hell/` and `/b/hello/` do not.
+fn prefixes_overlap(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+// ---------------------------------------------------------------------------
+// The rules
+// ---------------------------------------------------------------------------
+
+/// Check every static rule for a guest compiled as `name`, and build the spec
+/// the runtime is handed when they all pass.
+///
+/// * `name` — the short block name from the request (`hello`), *not* the
+///   registered `site/hello`.
+/// * `info` — what the guest reported through
+///   [`super::control::RuntimeControl::validate`].
+/// * `artifact_sha256` — the stored artifact's hash.
+/// * `builtin_routes` — every prefix the router already owns; see
+///   [`builtin_route_prefixes`].
+/// * `active` — the other blocks in the target generation, this one excluded.
+/// * `claimed_tool_names` — every `agent_tool` name already taken, by a
+///   built-in block or by one of `active`. The producer's manifest `seal()`
+///   is the last line against a duplicate; this is the first, and the only
+///   one that can still say *which* build to change.
+pub fn validate_static(
+    name: &str,
+    info: &BlockInfo,
+    artifact_sha256: &str,
+    builtin_routes: &[&str],
+    active: &[DynamicBlockSpec],
+    claimed_tool_names: &BTreeSet<String>,
+) -> Result<DynamicBlockSpec, Vec<Diagnostic>> {
+    let mut found = Vec::new();
+    let registered = format!("site/{name}");
+    let prefix = format!("/b/{name}/");
+
+    // --- Identity ---------------------------------------------------------
+    if !paths::block_name_is_valid(name) {
+        found.push(name_format_diagnostic(name));
+    }
+    if let Some(reserved) = RESERVED_NAME_PREFIXES
+        .iter()
+        .find(|reserved| info.name.starts_with(**reserved))
+    {
+        found.push(Diagnostic::error(
+            NAME_RESERVED,
+            format!(
+                "the guest reports its name as {:?}; {reserved:?} is reserved for built-in blocks",
+                info.name
+            ),
+        ));
+    }
+    if info.name != registered {
+        found.push(Diagnostic::error(
+            NAME_MISMATCH,
+            format!(
+                "the guest reports its name as {:?}; a block compiled as {name:?} must call \
+                 itself {registered:?}",
+                info.name
+            ),
+        ));
+    }
+
+    // --- Routes -----------------------------------------------------------
+    // The block serves exactly one prefix, derived from its name. So this
+    // rule is what a malformed name turns into once it reaches the router:
+    // `name-format` says the name is illegal, this says the route it would
+    // produce is unsafe to match by prefix.
+    if !is_normalized_prefix(&prefix) {
+        found.push(Diagnostic::error(
+            ROUTE_PREFIX_CODE,
+            format!("{prefix:?} is not a normalized route prefix"),
+        ));
+    }
+    for builtin in builtin_routes {
+        if prefixes_overlap(&prefix, builtin) {
+            found.push(Diagnostic::error(
+                ROUTE_COLLISION,
+                format!("{prefix:?} collides with the built-in route {builtin:?}"),
+            ));
+        }
+    }
+    for other in active {
+        for route in &other.routes {
+            if prefixes_overlap(&prefix, &route.prefix) {
+                found.push(Diagnostic::error(
+                    ROUTE_COLLISION,
+                    format!(
+                        "{prefix:?} collides with {:?}, served by {:?}",
+                        route.prefix, other.name
+                    ),
+                ));
+            }
+        }
+    }
+
+    // --- Endpoints --------------------------------------------------------
+    for endpoint in &info.endpoints {
+        if !endpoint.path.starts_with(&prefix) {
+            found.push(Diagnostic::error(
+                ENDPOINT_OUTSIDE_ROUTES,
+                format!(
+                    "the guest declares {} {:?}, which is outside its own route prefix {prefix:?}",
+                    endpoint.method, endpoint.path,
+                ),
+            ));
+        }
+    }
+
+    // --- Agent tool names -------------------------------------------------
+    let mut mine: BTreeSet<&str> = BTreeSet::new();
+    for endpoint in &info.endpoints {
+        let Some(tool) = endpoint.agent_tool.as_ref() else {
+            continue;
+        };
+        if claimed_tool_names.contains(&tool.name) {
+            found.push(Diagnostic::error(
+                TOOL_NAME_DUPLICATE,
+                format!(
+                    "the agent tool name {:?} is already registered by another block; an MCP \
+                     client shown two tools with one name drops one of them silently",
+                    tool.name
+                ),
+            ));
+        } else if !mine.insert(tool.name.as_str()) {
+            found.push(Diagnostic::error(
+                TOOL_NAME_DUPLICATE,
+                format!(
+                    "the guest declares the agent tool name {:?} on more than one endpoint",
+                    tool.name
+                ),
+            ));
+        }
+    }
+
+    // --- Capabilities -----------------------------------------------------
+    // A guest that declares nothing gets `none()`, and that is also what the
+    // spec it is loaded under carries: deny-by-default is the value, not an
+    // absence the host has to interpret.
+    let capabilities = info
+        .capabilities
+        .clone()
+        .unwrap_or_else(BlockCapabilities::none);
+    check_capabilities(name, info, &capabilities, &mut found);
+
+    if !found.is_empty() {
+        return Err(found);
+    }
+    Ok(DynamicBlockSpec {
+        name: registered,
+        artifact_sha256: artifact_sha256.to_string(),
+        // One prefix, `Public` at the router. The router still applies each
+        // declared endpoint's own `auth` on top (`routing::declared_access`),
+        // so a guest endpoint marked `Admin` is admin-only even though the
+        // prefix is not — this tier is the floor, not the decision.
+        routes: vec![DynamicRoute {
+            prefix,
+            access: RouteAccessKind::Public,
+        }],
+        capabilities,
+        // Plan 3 fills this from the `WAFER_GUEST_VERSION` line the page
+        // reads out of the vendored guest shim (spec amendment 8);
+        // `BlockInfo` has no such field to read it from here.
+        wafer_guest_version: 0,
+    })
+}
+
+/// The §6.5 capability rules.
+///
+/// Every one of them is "the guest may only name things inside its own
+/// namespace, and may not have the capability at all otherwise". The
+/// allowlists are three-state ([`Allowlist`]): `None` is the sandboxed
+/// default and always passes, `Any` never does — an unrestricted capability
+/// is by definition outside any namespace — and `Only` is checked entry by
+/// entry.
+fn check_capabilities(
+    name: &str,
+    info: &BlockInfo,
+    capabilities: &BlockCapabilities,
+    found: &mut Vec<Diagnostic>,
+) {
+    let collection_prefix = format!("site__{name}__");
+    let folder = format!("site/{name}");
+    let config_prefix = format!("SITE__{}__", name.to_uppercase());
+
+    check_allowlist(
+        &capabilities.collections,
+        CAP_COLLECTION,
+        "collection",
+        &format!("{collection_prefix}*"),
+        |entry| entry.starts_with(&collection_prefix),
+        found,
+    );
+    check_allowlist(
+        &capabilities.storage_folders,
+        CAP_FOLDER,
+        "storage folder",
+        &folder,
+        |entry| {
+            // An entry ending in `/` matches nothing upstream
+            // (`BlockCapabilities::allows_storage_folder`), so accepting one
+            // would hand back a capability that silently denies everything.
+            !entry.ends_with('/') && (entry == folder || entry.starts_with(&format!("{folder}/")))
+        },
+        found,
+    );
+    check_allowlist(
+        &capabilities.config,
+        CAP_CONFIG,
+        "config key",
+        &format!("{config_prefix}*"),
+        |entry| entry.starts_with(&config_prefix),
+        found,
+    );
+
+    if capabilities.raw_sql {
+        found.push(Diagnostic::error(
+            CAP_RAW_SQL,
+            "raw SQL is never granted to a guest; use the typed database ops",
+        ));
+    }
+    // `schema` is deliberately NOT refused (spec amendment 10): the
+    // structured schema ops are authorized on the table *and* on the schema
+    // sentinel, so they cannot reach outside `collections`. Raw `ddl` runs an
+    // arbitrary statement and can.
+    if capabilities.ddl {
+        found.push(Diagnostic::error(
+            CAP_DDL,
+            "raw DDL is never granted to a guest; declare `schema: true` for \
+             the structured table ops on your own collections",
+        ));
+    }
+    if capabilities.crypto {
+        found.push(Diagnostic::error(
+            CAP_CRYPTO,
+            "the crypto service is never granted to a guest",
+        ));
+    }
+    if capabilities.network.is_enabled() {
+        found.push(Diagnostic::error(
+            CAP_NETWORK,
+            "guests have no network access; a page talks to other origins, a block does not",
+        ));
+    }
+    if capabilities.vector_indexes.is_enabled() {
+        found.push(Diagnostic::error(
+            CAP_VECTOR,
+            "vector indexes are never granted to a guest",
+        ));
+    }
+
+    // `callable_blocks` and `requires` are two spellings of one fact — which
+    // platform services this guest uses. They must agree, so the registry's
+    // dependency view and the capability the runtime enforces cannot describe
+    // different blocks.
+    let allowed: BTreeSet<&str> = ALLOWED_CALLABLE_BLOCKS.iter().copied().collect();
+    let required: BTreeSet<&str> = info.requires.iter().map(String::as_str).collect();
+    match &capabilities.callable_blocks {
+        Allowlist::None => compare_requires(&BTreeSet::new(), &required, found),
+        Allowlist::Any => found.push(Diagnostic::error(
+            CAP_CALLABLE,
+            format!(
+                "`callable_blocks` must name exactly the services the guest uses; \
+                 allowed: {}",
+                ALLOWED_CALLABLE_BLOCKS.join(", ")
+            ),
+        )),
+        Allowlist::Only(entries) => {
+            let declared: BTreeSet<&str> = entries.iter().map(String::as_str).collect();
+            for entry in declared.difference(&allowed) {
+                found.push(Diagnostic::error(
+                    CAP_CALLABLE,
+                    format!(
+                        "a guest may not call {entry:?}; allowed: {}",
+                        ALLOWED_CALLABLE_BLOCKS.join(", ")
+                    ),
+                ));
+            }
+            compare_requires(&declared, &required, found);
+        }
+    }
+}
+
+/// Refuse an allowlist that is `Any`, or whose entries are not all inside the
+/// block's namespace.
+fn check_allowlist(
+    allowlist: &Allowlist,
+    code: &str,
+    noun: &str,
+    namespace: &str,
+    inside: impl Fn(&str) -> bool,
+    found: &mut Vec<Diagnostic>,
+) {
+    match allowlist {
+        Allowlist::None => {}
+        Allowlist::Any => found.push(Diagnostic::error(
+            code,
+            format!("every declared {noun} must be under {namespace:?}; `Any` is not a namespace"),
+        )),
+        Allowlist::Only(entries) => {
+            for entry in entries {
+                if !inside(entry) {
+                    found.push(Diagnostic::error(
+                        code,
+                        format!("the {noun} {entry:?} is outside {namespace:?}"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Refuse a `callable_blocks` set that does not equal `requires`.
+fn compare_requires(
+    declared: &BTreeSet<&str>,
+    required: &BTreeSet<&str>,
+    found: &mut Vec<Diagnostic>,
+) {
+    if declared != required {
+        found.push(Diagnostic::error(
+            CAP_REQUIRES_MISMATCH,
+            format!(
+                "`callable_blocks` is [{}] but `requires` is [{}]; they name the same services \
+                 and must match",
+                declared.iter().copied().collect::<Vec<_>>().join(", "),
+                required.iter().copied().collect::<Vec<_>>().join(", "),
+            ),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wafer_run::{AuthLevel, BlockEndpoint};
+
+    use super::*;
+
+    /// A guest that reports `name` and serves the one endpoint that name
+    /// implies, so a fixture never trips `endpoint-outside-routes` by
+    /// accident when a test changes the block's name.
+    fn info(name: &str) -> BlockInfo {
+        let short = name.strip_prefix("site/").unwrap_or(name);
+        BlockInfo::new(name, "0.1.0", "http-handler@v1", "hello").endpoints(vec![
+            BlockEndpoint::get(&format!("/b/{short}/"))
+                .auth(AuthLevel::Public)
+                .summary("hello"),
+        ])
+    }
+
+    fn run(name: &str, info: &BlockInfo) -> Result<DynamicBlockSpec, Vec<Diagnostic>> {
+        validate_static(
+            name,
+            info,
+            "sha",
+            &builtin_route_prefixes(),
+            &[],
+            &BTreeSet::new(),
+        )
+    }
+
+    fn codes(result: &Result<DynamicBlockSpec, Vec<Diagnostic>>) -> Vec<&str> {
+        result
+            .as_ref()
+            .err()
+            .map(|found| found.iter().map(|d| d.code.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_well_formed_guest_produces_the_spec_the_runtime_is_handed() {
+        let spec = run("hello", &info("site/hello")).expect("valid");
+        assert_eq!(spec.name, "site/hello");
+        assert_eq!(spec.artifact_sha256, "sha");
+        assert_eq!(spec.routes.len(), 1);
+        assert_eq!(spec.routes[0].prefix, "/b/hello/");
+        assert_eq!(spec.routes[0].access, RouteAccessKind::Public);
+        assert_eq!(spec.wafer_guest_version, 0);
+        // Declaring nothing means `none()`, not "the host decides".
+        assert!(!spec.capabilities.raw_sql);
+        assert!(!spec.capabilities.collections.is_enabled());
+    }
+
+    /// A malformed name fires both name rules: the name itself is illegal,
+    /// and the prefix it produces cannot be matched safely. Neither subsumes
+    /// the other — this is what keeps `route-prefix` a real check rather than
+    /// a comment.
+    #[test]
+    fn a_malformed_name_refuses_both_the_name_and_the_prefix_it_would_produce() {
+        let result = run("a/../admin", &info("site/a/../admin"));
+        let found = codes(&result);
+        assert!(found.contains(&NAME_FORMAT), "{found:?}");
+        assert!(found.contains(&ROUTE_PREFIX_CODE), "{found:?}");
+    }
+
+    #[test]
+    fn a_reserved_name_is_reported_as_reserved_as_well_as_mismatched() {
+        let result = run("hello", &info("impresspress/admin"));
+        let found = codes(&result);
+        assert!(found.contains(&NAME_RESERVED), "{found:?}");
+        assert!(found.contains(&NAME_MISMATCH), "{found:?}");
+    }
+
+    #[test]
+    fn every_builtin_prefix_is_defended_in_both_directions() {
+        // A block named after a built-in prefix's own segment.
+        let admin = run("admin", &info("site/admin"));
+        assert!(codes(&admin).contains(&ROUTE_COLLISION), "{admin:?}");
+        // And the sandbox's own prefix, which is an extra route rather than a
+        // member of `routing::ROUTES`.
+        let dev = run("dev", &info("site/dev"));
+        assert!(codes(&dev).contains(&ROUTE_COLLISION), "{dev:?}");
+        // `/b/admin` is a built-in prefix with NO trailing slash, and the
+        // router matches by `starts_with` rather than by whole segments — so
+        // it really does swallow `/b/admins/…`, and `admins` is not an
+        // available block name either. Refusing it at staging is the only
+        // place that can be said out loud.
+        let admins = run("admins", &info("site/admins"));
+        assert!(codes(&admins).contains(&ROUTE_COLLISION), "{admins:?}");
+        // A name that shares a leading substring with a slash-terminated
+        // built-in prefix does NOT collide: `/b/storag/` is not under
+        // `/b/storage/` and vice versa.
+        assert!(run("storag", &info("site/storag")).is_ok());
+    }
+
+    #[test]
+    fn a_prefix_nested_under_another_dynamic_block_is_refused() {
+        let other = DynamicBlockSpec {
+            name: "site/shop".to_string(),
+            artifact_sha256: "other".to_string(),
+            routes: vec![DynamicRoute {
+                prefix: "/b/shop/".to_string(),
+                access: RouteAccessKind::Public,
+            }],
+            capabilities: BlockCapabilities::none(),
+            wafer_guest_version: 0,
+        };
+        let result = validate_static(
+            "shop",
+            &info("site/shop"),
+            "sha",
+            &builtin_route_prefixes(),
+            std::slice::from_ref(&other),
+            &BTreeSet::new(),
+        );
+        assert!(codes(&result).contains(&ROUTE_COLLISION), "{result:?}");
+    }
+
+    #[test]
+    fn an_endpoint_outside_the_blocks_prefix_is_refused() {
+        let mut declared = info("site/hello");
+        declared.endpoints.push(
+            BlockEndpoint::post("/b/auth/api/reset-password")
+                .auth(AuthLevel::Public)
+                .summary("x"),
+        );
+        assert!(codes(&run("hello", &declared)).contains(&ENDPOINT_OUTSIDE_ROUTES));
+    }
+
+    #[test]
+    fn a_tool_name_is_refused_when_claimed_elsewhere_and_when_claimed_twice_here() {
+        let mut declared = info("site/hello");
+        declared.endpoints = vec![
+            BlockEndpoint::get("/b/hello/a")
+                .auth(AuthLevel::Public)
+                .summary("a")
+                .agent_tool("greet", "a"),
+            BlockEndpoint::get("/b/hello/b")
+                .auth(AuthLevel::Public)
+                .summary("b")
+                .agent_tool("greet", "b"),
+        ];
+        // Self-duplicate: one of the two endpoints has to change.
+        let result = run("hello", &declared);
+        let found = codes(&result);
+        assert_eq!(
+            found.iter().filter(|c| **c == TOOL_NAME_DUPLICATE).count(),
+            1,
+            "{found:?}"
+        );
+
+        // Claimed by somebody else: both endpoints are refused, because
+        // either one alone would still shadow the existing tool.
+        let claimed = BTreeSet::from(["greet".to_string()]);
+        let result = validate_static(
+            "hello",
+            &declared,
+            "sha",
+            &builtin_route_prefixes(),
+            &[],
+            &claimed,
+        );
+        assert_eq!(
+            codes(&result)
+                .iter()
+                .filter(|c| **c == TOOL_NAME_DUPLICATE)
+                .count(),
+            2,
+        );
+    }
+
+    #[test]
+    fn the_namespaced_capability_set_is_accepted_and_carried_verbatim() {
+        let mut declared = info("site/hello");
+        declared.requires = vec!["wafer-run/database".to_string()];
+        declared.capabilities = Some(BlockCapabilities {
+            collections: Allowlist::Only(BTreeSet::from(["site__hello__notes".to_string()])),
+            schema: true,
+            storage_folders: Allowlist::Only(BTreeSet::from(["site/hello".to_string()])),
+            config: Allowlist::Only(BTreeSet::from(["SITE__HELLO__GREETING".to_string()])),
+            callable_blocks: Allowlist::Only(BTreeSet::from(["wafer-run/database".to_string()])),
+            ..BlockCapabilities::none()
+        });
+        let spec = run("hello", &declared).expect("valid");
+        assert!(spec.capabilities.schema);
+        assert!(spec.capabilities.allows_collection("site__hello__notes"));
+        assert!(spec.capabilities.allows_storage_folder("site/hello/a.json"));
+    }
+
+    #[test]
+    fn a_capability_outside_the_namespace_is_refused_per_capability() {
+        let mut declared = info("site/hello");
+        declared.capabilities = Some(BlockCapabilities {
+            collections: Allowlist::Only(BTreeSet::from([
+                "impresspress__admin__variables".to_string()
+            ])),
+            storage_folders: Allowlist::Only(BTreeSet::from(["site/other".to_string()])),
+            config: Allowlist::Only(BTreeSet::from(["APP_NAME".to_string()])),
+            ..BlockCapabilities::none()
+        });
+        let result = run("hello", &declared);
+        let found = codes(&result);
+        assert!(found.contains(&CAP_COLLECTION), "{found:?}");
+        assert!(found.contains(&CAP_FOLDER), "{found:?}");
+        assert!(found.contains(&CAP_CONFIG), "{found:?}");
+    }
+
+    /// A storage-folder entry ending in `/` matches nothing upstream, so
+    /// granting it would hand the guest a capability that silently denies
+    /// every key it names.
+    #[test]
+    fn a_storage_folder_with_a_trailing_slash_is_refused() {
+        let mut declared = info("site/hello");
+        declared.capabilities = Some(BlockCapabilities {
+            storage_folders: Allowlist::Only(BTreeSet::from(["site/hello/".to_string()])),
+            ..BlockCapabilities::none()
+        });
+        assert!(codes(&run("hello", &declared)).contains(&CAP_FOLDER));
+    }
+
+    #[test]
+    fn an_unrestricted_allowlist_is_never_a_namespace() {
+        let mut declared = info("site/hello");
+        declared.capabilities = Some(BlockCapabilities::unrestricted());
+        let result = run("hello", &declared);
+        let found = codes(&result);
+        for expected in [
+            CAP_COLLECTION,
+            CAP_FOLDER,
+            CAP_CONFIG,
+            CAP_RAW_SQL,
+            CAP_DDL,
+            CAP_CRYPTO,
+            CAP_NETWORK,
+            CAP_VECTOR,
+            CAP_CALLABLE,
+        ] {
+            assert!(found.contains(&expected), "missing {expected}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn schema_alone_is_not_a_refusal() {
+        let mut declared = info("site/hello");
+        declared.capabilities = Some(BlockCapabilities {
+            schema: true,
+            ..BlockCapabilities::none()
+        });
+        assert!(run("hello", &declared).is_ok());
+    }
+
+    #[test]
+    fn callable_blocks_and_requires_must_name_the_same_services() {
+        let mut declared = info("site/hello");
+        declared.requires = vec!["wafer-run/database".to_string()];
+        assert!(codes(&run("hello", &declared)).contains(&CAP_REQUIRES_MISMATCH));
+
+        declared.capabilities = Some(BlockCapabilities {
+            callable_blocks: Allowlist::Only(BTreeSet::from(["wafer-run/database".to_string()])),
+            ..BlockCapabilities::none()
+        });
+        assert!(run("hello", &declared).is_ok());
+
+        // A service outside the four is refused even when `requires` agrees.
+        declared.requires = vec!["impresspress/products".to_string()];
+        declared.capabilities = Some(BlockCapabilities {
+            callable_blocks: Allowlist::Only(BTreeSet::from(["impresspress/products".to_string()])),
+            ..BlockCapabilities::none()
+        });
+        let result = run("hello", &declared);
+        let found = codes(&result);
+        assert!(found.contains(&CAP_CALLABLE), "{found:?}");
+        assert!(!found.contains(&CAP_REQUIRES_MISMATCH), "{found:?}");
+    }
+
+    #[test]
+    fn prefix_normalization_and_overlap_are_about_whole_segments() {
+        assert!(is_normalized_prefix("/b/hello/"));
+        assert!(!is_normalized_prefix("/b/hello"));
+        assert!(!is_normalized_prefix("b/hello/"));
+        assert!(!is_normalized_prefix("/b//hello/"));
+        assert!(!is_normalized_prefix("/b/../hello/"));
+        assert!(!is_normalized_prefix("/"));
+
+        assert!(prefixes_overlap("/b/admin/", "/b/admin"));
+        assert!(prefixes_overlap("/b/admin", "/b/admin/settings"));
+        assert!(!prefixes_overlap("/b/hell/", "/b/hello/"));
+    }
+
+    #[test]
+    fn a_guest_refusal_becomes_a_coded_diagnostic() {
+        let failure =
+            ValidationFailure::new(super::super::control::ValidationStage::Init, "trap: oops");
+        let diagnostic = Diagnostic::guest(&failure);
+        assert_eq!(diagnostic.code, "guest-init");
+        assert_eq!(diagnostic.message, "trap: oops");
+        assert_eq!(diagnostic.severity, Severity::Error);
+    }
+
+    #[test]
+    fn the_oversize_refusal_reports_the_limit_it_enforces() {
+        let diagnostic = Diagnostic::artifact_too_large(MAX_ARTIFACT_BYTES + 1);
+        assert_eq!(diagnostic.code, ARTIFACT_TOO_LARGE);
+        assert!(
+            diagnostic.message.contains(&MAX_ARTIFACT_BYTES.to_string()),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    /// The page sends compiler diagnostics, and rustc reports plenty that
+    /// have no span. Omitting `file`/`line`/`column` has to mean "no
+    /// position", not "malformed request" — the published input schema says
+    /// they are optional and serde must agree.
+    #[test]
+    fn a_diagnostic_without_a_source_position_deserializes() {
+        let parsed: Diagnostic = serde_json::from_str(
+            r#"{"severity":"warning","code":"unused_imports","message":"unused import"}"#,
+        )
+        .expect("a diagnostic with no span is well-formed");
+        assert_eq!(parsed.severity, Severity::Warning);
+        assert_eq!(parsed.file, None);
+        assert_eq!(parsed.line, None);
+        assert_eq!(parsed.column, None);
+    }
+
+    #[test]
+    fn severity_spells_itself_the_same_way_in_json_as_in_the_source() {
+        for (severity, spelling) in [
+            (Severity::Error, "error"),
+            (Severity::Warning, "warning"),
+            (Severity::Note, "note"),
+            (Severity::Help, "help"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(severity).expect("serialize"),
+                serde_json::json!(spelling),
+            );
+        }
+    }
+
+    #[test]
+    fn the_builtin_prefix_list_covers_the_router_and_the_sandbox_itself() {
+        let prefixes = builtin_route_prefixes();
+        assert_eq!(prefixes.len(), crate::routing::ROUTES.len() + 1);
+        assert!(prefixes.contains(&super::super::ROUTE_PREFIX));
+        assert!(prefixes.contains(&"/b/admin/"));
+    }
+}

@@ -1,4 +1,649 @@
 {
+  "/b/dev/api/blocks/{name}/remove": {
+    "post": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The block's short name, e.g. `hello` for the block registered as\n`site/hello`.",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of every endpoint whose whole job is to activate a generation.",
+                "properties": {
+                  "generation": {
+                    "additionalProperties": false,
+                    "description": "The generation that went live.",
+                    "properties": {
+                      "activated_at": {
+                        "description": "RFC 3339 time the generation went live, or null if it never did.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "blocks": {
+                        "description": "Number of blocks in the generation's block manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cause": {
+                        "description": "What created this generation.",
+                        "oneOf": [
+                          {
+                            "const": "site_write",
+                            "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "site_delete",
+                            "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_compile",
+                            "description": "A successful compile stage; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_remove",
+                            "description": "A block was removed; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "rollback",
+                            "description": "A republish of an earlier generation's manifests.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "seed",
+                            "description": "Generation 0, imported from the seed bundle on cold boot.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "description": "RFC 3339 creation time.",
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "Generation id.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "site_files": {
+                        "description": "Number of files in the generation's site manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "status": {
+                        "description": "Where the generation sits in its lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "staged",
+                            "description": "Recorded, not yet examined.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "validating",
+                            "description": "Blobs, artifacts and guests are being checked.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "activating",
+                            "description": "The runtime swap and site publish are in progress.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "active",
+                            "description": "Currently serving.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "failed",
+                            "description": "Abandoned; `failure_message` says why.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "superseded",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "parent_id",
+                      "cause",
+                      "status",
+                      "created_at",
+                      "activated_at",
+                      "site_files",
+                      "blocks"
+                    ],
+                    "type": "object"
+                  },
+                  "progress": {
+                    "description": "One entry per phase the activation passed through, with how long it\ntook. The last is always `active`.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One phase of an activation, with how long it took.\n\nPublished in every mutating tool result (design §7.5) so the page can show\nwhere the time went without a push channel.",
+                      "properties": {
+                        "detail": {
+                          "description": "Human-readable detail for the progress panel.",
+                          "type": "string"
+                        },
+                        "ms": {
+                          "description": "Milliseconds spent in it.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "phase": {
+                          "description": "The phase this step covers.",
+                          "oneOf": [
+                            {
+                              "const": "idle",
+                              "description": "Nothing in flight.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "validating",
+                              "description": "Hashes, manifests and guests are being checked.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "building_runtime",
+                              "description": "A candidate runtime is being constructed from the block set.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "publishing",
+                              "description": "The site files are being written into `wafer-run/web/site`.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "active",
+                              "description": "The generation is live.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "failed",
+                              "description": "The activation was abandoned; the previous generation is still live.",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "ms",
+                        "detail"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "generation",
+                  "progress"
+                ],
+                "title": "ActivationResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Remove a block from the runtime"
+    }
+  },
+  "/b/dev/api/builds/stage": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "Request of `POST /b/dev/api/builds/stage`.\n\nOne compiled `wasm32-wasip1` module, with everything needed to explain it\nafterwards. Staging validates the artifact and, if it passes, activates a\nnew generation carrying it — there is no separate \"activate\" call.",
+              "properties": {
+                "artifact_base64": {
+                  "description": "The compiled module, standard base64 with padding. At most 4 MiB\ndecoded.",
+                  "type": "string"
+                },
+                "block_name": {
+                  "description": "The block's short name, e.g. `hello` for the sources under\n`blocks/hello/`. It is registered as `site/hello` and serves\n`/b/hello/`; do not send either of those longer forms.",
+                  "type": "string"
+                },
+                "compiler_version": {
+                  "description": "Pinned toolchain revision that produced the artifact.",
+                  "type": "string"
+                },
+                "diagnostics": {
+                  "default": [],
+                  "description": "Diagnostics the compiler produced, warnings included. They are stored\nwith the build and returned alongside any the validator adds.",
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "One thing the compiler or the validator has to say about a build.",
+                    "properties": {
+                      "code": {
+                        "description": "Stable machine-readable identifier, e.g. `cap-collection` for a\ncapability outside the block's namespace or `guest-init` for a trap\nin the guest's `Init`. Match on this rather than on `message`.",
+                        "type": "string"
+                      },
+                      "column": {
+                        "description": "1-based column in `file`, when the compiler reported one.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "file": {
+                        "description": "Workspace-relative source file the diagnostic is about, when the\ncompiler reported one.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "line": {
+                        "description": "1-based line in `file`, when the compiler reported one.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "message": {
+                        "description": "What is wrong, and what to change.",
+                        "type": "string"
+                      },
+                      "severity": {
+                        "description": "How serious it is. Anything `error` means the build was refused.",
+                        "oneOf": [
+                          {
+                            "const": "error",
+                            "description": "The build is refused, or the compile failed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "warning",
+                            "description": "The build stands; something is worth changing.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "note",
+                            "description": "Additional context for a nearby error or warning.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "help",
+                            "description": "A suggested fix.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "severity",
+                      "code",
+                      "message"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "source_manifest_sha256": {
+                  "default": null,
+                  "description": "SHA-256 of the source manifest the compile ran against, so a stored\nbuild can be traced back to the exact sources. Omit if the compiler\ndid not report one.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "block_name",
+                "artifact_base64",
+                "compiler_version"
+              ],
+              "title": "StageBuildRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `POST /b/dev/api/builds/stage`.\n\nA refused block is a result, not a transport failure: the status is `200`\nwith `success: false` and the reasons in `diagnostics`. Only a malformed\nrequest — bad JSON, or `artifact_base64` that is not base64 — is a `4xx`.",
+                "properties": {
+                  "build_id": {
+                    "description": "The stored build's id, or null when the request was refused before a\nbuild could be recorded (an artifact over the size limit is never\nstored, so there is nothing for a build row to point at).",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "diagnostics": {
+                    "description": "Everything known about this build: the diagnostics the compiler\nreported, then any the validator added. `severity` tells them apart —\na refusal is always an `error`.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One thing the compiler or the validator has to say about a build.",
+                      "properties": {
+                        "code": {
+                          "description": "Stable machine-readable identifier, e.g. `cap-collection` for a\ncapability outside the block's namespace or `guest-init` for a trap\nin the guest's `Init`. Match on this rather than on `message`.",
+                          "type": "string"
+                        },
+                        "column": {
+                          "description": "1-based column in `file`, when the compiler reported one.",
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "file": {
+                          "description": "Workspace-relative source file the diagnostic is about, when the\ncompiler reported one.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "line": {
+                          "description": "1-based line in `file`, when the compiler reported one.",
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "message": {
+                          "description": "What is wrong, and what to change.",
+                          "type": "string"
+                        },
+                        "severity": {
+                          "description": "How serious it is. Anything `error` means the build was refused.",
+                          "oneOf": [
+                            {
+                              "const": "error",
+                              "description": "The build is refused, or the compile failed.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "warning",
+                              "description": "The build stands; something is worth changing.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "note",
+                              "description": "Additional context for a nearby error or warning.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "help",
+                              "description": "A suggested fix.",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "severity",
+                        "code",
+                        "message",
+                        "file",
+                        "line",
+                        "column"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "generation": {
+                    "additionalProperties": false,
+                    "description": "The generation the accepted block went live in, or null when the\nbuild was refused.",
+                    "properties": {
+                      "activated_at": {
+                        "description": "RFC 3339 time the generation went live, or null if it never did.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "blocks": {
+                        "description": "Number of blocks in the generation's block manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cause": {
+                        "description": "What created this generation.",
+                        "oneOf": [
+                          {
+                            "const": "site_write",
+                            "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "site_delete",
+                            "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_compile",
+                            "description": "A successful compile stage; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "block_remove",
+                            "description": "A block was removed; the block set changed.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "rollback",
+                            "description": "A republish of an earlier generation's manifests.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "seed",
+                            "description": "Generation 0, imported from the seed bundle on cold boot.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "description": "RFC 3339 creation time.",
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "Generation id.",
+                        "type": "string"
+                      },
+                      "parent_id": {
+                        "description": "The generation this one was derived from, or null for the first.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "site_files": {
+                        "description": "Number of files in the generation's site manifest.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "status": {
+                        "description": "Where the generation sits in its lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "staged",
+                            "description": "Recorded, not yet examined.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "validating",
+                            "description": "Blobs, artifacts and guests are being checked.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "activating",
+                            "description": "The runtime swap and site publish are in progress.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "active",
+                            "description": "Currently serving.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "failed",
+                            "description": "Abandoned; `failure_message` says why.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "superseded",
+                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "parent_id",
+                      "cause",
+                      "status",
+                      "created_at",
+                      "activated_at",
+                      "site_files",
+                      "blocks"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "progress": {
+                    "description": "One entry per phase the activation passed through, with how long it\ntook. Empty when nothing was activated.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One phase of an activation, with how long it took.\n\nPublished in every mutating tool result (design §7.5) so the page can show\nwhere the time went without a push channel.",
+                      "properties": {
+                        "detail": {
+                          "description": "Human-readable detail for the progress panel.",
+                          "type": "string"
+                        },
+                        "ms": {
+                          "description": "Milliseconds spent in it.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "phase": {
+                          "description": "The phase this step covers.",
+                          "oneOf": [
+                            {
+                              "const": "idle",
+                              "description": "Nothing in flight.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "validating",
+                              "description": "Hashes, manifests and guests are being checked.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "building_runtime",
+                              "description": "A candidate runtime is being constructed from the block set.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "publishing",
+                              "description": "The site files are being written into `wafer-run/web/site`.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "active",
+                              "description": "The generation is live.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "failed",
+                              "description": "The activation was abandoned; the previous generation is still live.",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "ms",
+                        "detail"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "success": {
+                    "description": "Whether the block was accepted and activated.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "build_id",
+                  "success",
+                  "diagnostics",
+                  "generation",
+                  "progress"
+                ],
+                "title": "StageBuildResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Stage and activate a compiled block"
+    }
+  },
   "/b/dev/api/files": {
     "get": {
       "parameters": [

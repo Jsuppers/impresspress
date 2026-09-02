@@ -308,14 +308,14 @@ async fn read_body<T: serde::de::DeserializeOwned>(input: InputStream) -> Result
 /// A lower bound on how many bytes `content` decodes to.
 ///
 /// Used to refuse an over-large body before it is decoded into a second
-/// allocation. It must never over-estimate, or a legal write would be refused:
-/// utf8 is exact (a JSON string's UTF-8 bytes are the file's bytes), and
-/// padded standard base64 carries three bytes per four characters of which at
-/// most two are padding.
+/// allocation. It must never over-estimate, or a legal write would be
+/// refused: utf8 is exact (a JSON string's UTF-8 bytes are the file's bytes),
+/// and the base64 bound is [`paths::min_base64_decoded_len`] — shared with
+/// the artifact-size guard so one formula backs both limits.
 fn min_decoded_len(encoding: FileEncoding, content: &str) -> usize {
     match encoding {
         FileEncoding::Utf8 => content.len(),
-        FileEncoding::Base64 => (content.len() / 4).saturating_mul(3).saturating_sub(2),
+        FileEncoding::Base64 => paths::min_base64_decoded_len(content),
     }
 }
 

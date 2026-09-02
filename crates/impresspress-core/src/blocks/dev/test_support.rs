@@ -22,9 +22,28 @@ use super::control::{
 pub struct FakeControl {
     /// Every block set handed to `rebuild`, oldest first.
     pub rebuilt: Mutex<Vec<Vec<DynamicBlockSpec>>>,
-    /// What the next `validate` call answers. `Ok(())` becomes a
-    /// [`ValidatedGuest`] carrying a `BlockInfo` named after the spec.
+    /// What every `validate` call answers, unless
+    /// [`Self::fail_next_validate`] has armed a one-shot refusal. `Ok(())`
+    /// becomes a [`ValidatedGuest`] carrying [`Self::validated_info`], or a
+    /// `BlockInfo` named after the spec when no test set one.
     pub validate_result: Mutex<Result<(), ValidationFailure>>,
+    /// The `BlockInfo` a successful `validate` reports, set by
+    /// [`Self::set_validated_info`].
+    ///
+    /// This is what makes the static rules testable without wasmi: the
+    /// executable half of validation is the seam, so a test that wants to
+    /// exercise "a guest that declares X" states X here rather than
+    /// compiling a guest that declares it.
+    validated_info: Mutex<Option<wafer_run::BlockInfo>>,
+    /// Set by [`Self::fail_next_validate`]: the refusal the next `validate`
+    /// answers with, consumed by that call.
+    ///
+    /// One-shot for the same reason [`Self::fail_rebuild`] is: the
+    /// interesting request is usually the one *after* a refusal.
+    fail_validate: Mutex<Option<ValidationFailure>>,
+    /// Bumped by every `validate` call, refusals included. A test that
+    /// asserts a request was refused *before* the guest ran reads this.
+    validations: AtomicU64,
     /// Set by [`Self::fail_next_rebuild`]: the message the next `rebuild`
     /// refuses with, consumed by that call.
     ///
@@ -52,6 +71,9 @@ impl FakeControl {
         Arc::new(Self {
             rebuilt: Mutex::new(Vec::new()),
             validate_result: Mutex::new(Ok(())),
+            validated_info: Mutex::new(None),
+            fail_validate: Mutex::new(None),
+            validations: AtomicU64::new(0),
             fail_rebuild: Mutex::new(None),
             gate_rebuild: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -66,6 +88,22 @@ impl FakeControl {
             .lock()
             .expect("validate_result mutex") = Err(ValidationFailure::new(stage, message));
         control
+    }
+
+    /// Make every successful `validate` report `info`.
+    pub fn set_validated_info(&self, info: wafer_run::BlockInfo) {
+        *self.validated_info.lock().expect("validated_info mutex") = Some(info);
+    }
+
+    /// Make the next `validate` refuse at `stage` with `message`.
+    pub fn fail_next_validate(&self, stage: ValidationStage, message: &str) {
+        *self.fail_validate.lock().expect("fail_validate mutex") =
+            Some(ValidationFailure::new(stage, message));
+    }
+
+    /// How many times `validate` has been called.
+    pub fn validations(&self) -> u64 {
+        self.validations.load(Ordering::SeqCst)
     }
 
     /// The block sets handed to `rebuild`, oldest first.
@@ -99,18 +137,33 @@ impl RuntimeControl for FakeControl {
         spec: &DynamicBlockSpec,
         _artifact: &[u8],
     ) -> Result<ValidatedGuest, ValidationFailure> {
+        self.validations.fetch_add(1, Ordering::SeqCst);
+        if let Some(failure) = self
+            .fail_validate
+            .lock()
+            .expect("fail_validate mutex")
+            .take()
+        {
+            return Err(failure);
+        }
         self.validate_result
             .lock()
             .expect("validate_result mutex")
+            .clone()?;
+        let info = self
+            .validated_info
+            .lock()
+            .expect("validated_info mutex")
             .clone()
-            .map(|()| ValidatedGuest {
-                info: wafer_run::BlockInfo::new(
+            .unwrap_or_else(|| {
+                wafer_run::BlockInfo::new(
                     &spec.name,
                     "0.0.0",
                     "http-handler@v1",
                     "fake validated guest",
-                ),
-            })
+                )
+            });
+        Ok(ValidatedGuest { info })
     }
 
     async fn rebuild(&self, blocks: &[DynamicBlockSpec]) -> Result<(), String> {

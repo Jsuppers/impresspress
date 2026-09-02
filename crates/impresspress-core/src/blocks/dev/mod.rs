@@ -26,6 +26,7 @@
 pub mod activation;
 pub mod artifacts;
 pub mod blobs;
+pub mod blocks_api;
 pub mod contracts;
 pub mod control;
 pub mod files;
@@ -36,6 +37,7 @@ pub mod paths;
 pub mod publisher;
 pub mod repo;
 pub mod status;
+pub mod validation;
 pub mod workspace;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -89,6 +91,10 @@ pub enum Route {
     ApiGenerationDetail,
     /// `POST /b/dev/api/generations/{id}/rollback`
     ApiGenerationRollback,
+    /// `POST /b/dev/api/builds/stage`
+    ApiBuildStage,
+    /// `POST /b/dev/api/blocks/{name}/remove`
+    ApiBlockRemove,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
@@ -130,6 +136,16 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         HttpMethod::Post,
         "/b/dev/api/generations/{id}/rollback",
         Route::ApiGenerationRollback,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/dev/api/builds/stage",
+        Route::ApiBuildStage,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Post,
+        "/b/dev/api/blocks/{name}/remove",
+        Route::ApiBlockRemove,
     ),
 ];
 
@@ -241,6 +257,27 @@ pub struct DevShared {
     /// the manifest only: it is released before the activation the mutation
     /// requests, so ordinary editing never waits behind a publish.
     pub workspace: futures::lock::Mutex<()>,
+    /// Serializes every change to the *block* set.
+    ///
+    /// A block change is resolved as a whole desired set —
+    /// `ActivationIntent::BlockSet` carries every block the generation runs,
+    /// not a delta — from the set that is active when the request is made.
+    /// Two of those interleaving between their read and their
+    /// `activation::request` would each compose a set from a snapshot that
+    /// predates the other, and the later one would drop the earlier block
+    /// without anything having failed.
+    ///
+    /// Design §6.6 allows one compile at a time, and this is what upholds it.
+    /// A future that lifts the restriction has to carry the block *delta* in
+    /// the intent instead; the lock is the cheaper half of that trade while
+    /// the sandbox has one agent and one page.
+    ///
+    /// An **async** mutex for the same reason [`Self::workspace`] is: the
+    /// critical section spans storage, the ledger and the runtime rebuild. It
+    /// is a separate lock because it guards a different thing — a site write
+    /// must never wait behind a compile, and `ActivationIntent::SiteOnly`
+    /// composes its block half at dequeue precisely so it does not have to.
+    pub compile: futures::lock::Mutex<()>,
 }
 
 impl DevShared {
@@ -250,6 +287,7 @@ impl DevShared {
             control,
             activation: activation::ActivationQueue::new(),
             workspace: futures::lock::Mutex::new(()),
+            compile: futures::lock::Mutex::new(()),
         })
     }
 }
@@ -329,6 +367,16 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin)
                 .path_params::<contracts::GenerationPathParams>()
                 .output::<contracts::ActivationResponse>(),
+            BlockEndpoint::post("/b/dev/api/builds/stage")
+                .summary("Stage and activate a compiled block")
+                .auth(AuthLevel::Admin)
+                .input::<contracts::StageBuildRequest>()
+                .output::<contracts::StageBuildResponse>(),
+            BlockEndpoint::post("/b/dev/api/blocks/{name}/remove")
+                .summary("Remove a block from the runtime")
+                .auth(AuthLevel::Admin)
+                .path_params::<contracts::BlockPathParams>()
+                .output::<contracts::ActivationResponse>(),
         ])
         .admin_url(ROUTE_PREFIX)
         // The sandbox is registered only where it is meant to exist; a
@@ -359,6 +407,8 @@ impl Block for DevBlock {
             Route::ApiGenerationRollback => {
                 generations_api::handle_rollback(ctx, &self.shared, &msg).await
             }
+            Route::ApiBuildStage => blocks_api::handle_stage(ctx, &self.shared, input).await,
+            Route::ApiBlockRemove => blocks_api::handle_remove(ctx, &self.shared, &msg).await,
         }
     }
 

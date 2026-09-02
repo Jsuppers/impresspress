@@ -5,7 +5,7 @@
 //! the reported `BlockInfo` and the compiler diagnostics, so a refusal can be
 //! explained after the fact without re-running the toolchain.
 
-use wafer_block::db::{ListOptions, SortField};
+use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -133,15 +133,19 @@ pub async fn get(ctx: &dyn Context, id: &str) -> Result<BuildRow, WaferError> {
     decode(&db::get(ctx, TABLE, id).await?)
 }
 
-/// Move a build to `status`, optionally replacing its diagnostics.
+/// Move a build to `status`, optionally replacing its diagnostics and the
+/// `BlockInfo` the guest reported.
 ///
-/// `diagnostics` is an `Option` write: `None` leaves the column alone rather
-/// than clearing the compiler output that explains the row.
+/// Both extras are `Option` writes: `None` leaves the column alone rather
+/// than clearing the compiler output that explains the row, or the info a
+/// later validation reads back. A row is inserted before the guest has run,
+/// so `block_info_json` is `"null"` until this call fills it in.
 pub async fn set_status(
     ctx: &dyn Context,
     id: &str,
     status: BuildStatus,
     diagnostics_json: Option<&str>,
+    block_info_json: Option<&str>,
 ) -> Result<(), WaferError> {
     let mut data = crate::util::json_map(serde_json::json!({
         "status": status.as_str(),
@@ -152,8 +156,51 @@ pub async fn set_status(
             serde_json::json!(diagnostics_json),
         );
     }
+    if let Some(block_info_json) = block_info_json {
+        data.insert("block_info_json".into(), serde_json::json!(block_info_json));
+    }
     db::update(ctx, TABLE, id, data).await?;
     Ok(())
+}
+
+/// The newest [`BuildStatus::Valid`] build for `artifact_sha256`, if any.
+///
+/// This is how a block already in the active set gets its `BlockInfo` back:
+/// a generation's block manifest carries the artifact hash and the routes but
+/// not the endpoints, and the duplicate-agent-tool rule needs the endpoints.
+/// Filtered in the query rather than by paging `list_recent` because the
+/// answer must not depend on how many builds have happened since.
+pub async fn latest_valid_for_artifact(
+    ctx: &dyn Context,
+    artifact_sha256: &str,
+) -> Result<Option<BuildRow>, WaferError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            filters: vec![
+                Filter {
+                    field: "artifact_sha256".into(),
+                    operator: FilterOp::Equal,
+                    value: serde_json::json!(artifact_sha256),
+                },
+                Filter {
+                    field: "status".into(),
+                    operator: FilterOp::Equal,
+                    value: serde_json::json!(BuildStatus::Valid.as_str()),
+                },
+            ],
+            sort: vec![SortField {
+                field: "created_at".into(),
+                desc: true,
+            }],
+            limit: 1,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    list.records.first().map(decode).transpose()
 }
 
 /// The `limit` newest builds, newest first.
@@ -242,7 +289,7 @@ mod tests {
             .expect("insert");
 
         // Accepting a build must not wipe the warnings the compile produced.
-        set_status(&ctx, &row.id, BuildStatus::Valid, None)
+        set_status(&ctx, &row.id, BuildStatus::Valid, None, None)
             .await
             .expect("accept");
         let valid = get(&ctx, &row.id).await.expect("get");
@@ -250,7 +297,7 @@ mod tests {
         assert_eq!(valid.diagnostics_json, DIAGNOSTICS);
 
         let refusal = r#"[{"level":"error","message":"probe trapped"}]"#;
-        set_status(&ctx, &row.id, BuildStatus::Invalid, Some(refusal))
+        set_status(&ctx, &row.id, BuildStatus::Invalid, Some(refusal), None)
             .await
             .expect("refuse");
         let invalid = get(&ctx, &row.id).await.expect("get");
@@ -280,6 +327,39 @@ mod tests {
             vec!["site/c", "site/b", "site/a"],
         );
         assert_eq!(list_recent(&ctx, 1).await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_reported_block_info_is_written_by_the_call_that_accepts_the_build() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let row = insert(&ctx, &new_build("site/newsletter"))
+            .await
+            .expect("insert");
+        // Nothing is filed under the artifact until a build is accepted.
+        assert_eq!(
+            latest_valid_for_artifact(&ctx, "art")
+                .await
+                .expect("lookup"),
+            None,
+        );
+
+        let reported = r#"{"name":"site/newsletter","version":"0.2.0"}"#;
+        set_status(&ctx, &row.id, BuildStatus::Valid, None, Some(reported))
+            .await
+            .expect("accept");
+        let found = latest_valid_for_artifact(&ctx, "art")
+            .await
+            .expect("lookup")
+            .expect("a valid build");
+        assert_eq!(found.id, row.id);
+        assert_eq!(found.block_info_json, reported);
+        // A different artifact is a different question.
+        assert_eq!(
+            latest_valid_for_artifact(&ctx, "other")
+                .await
+                .expect("lookup"),
+            None,
+        );
     }
 
     #[test]
