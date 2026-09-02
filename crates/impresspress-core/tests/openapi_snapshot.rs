@@ -32,6 +32,8 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("messages", &["/b/messages"]),
     ("admin", &["/b/admin"]),
     ("tickets", &["/b/tickets"]),
+    ("llm", &["/b/llm"]),
+    ("vector", &["/b/vector"]),
 ];
 
 /// Blocks that legitimately have no schema-carrying endpoints yet, so an
@@ -39,9 +41,9 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
 /// the document's block list is wrong.
 ///
 /// The list is now empty. `admin` left it when its four JSON API reads were
-/// typed, and `tickets` left it when its thirteen JSON endpoints were: both
-/// blocks' handlers now build `contracts` types, so both have a non-empty
-/// snapshot to guard.
+/// typed, `tickets` when its thirteen JSON endpoints were, and `llm` /
+/// `vector` when their thirteen and nine were: every block's handlers now
+/// build `contracts` types, so every block has a non-empty snapshot to guard.
 ///
 /// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
 /// any of them means the gate is vacuous — wrong prefix, or the block missing
@@ -470,6 +472,338 @@ async fn admin_openapi_publishes_no_credential_field() {
     }
 }
 
+/// `llm` declared 18 endpoints and zero schemas: every handler deserialized
+/// into a private in-function struct and answered with a `serde_json::json!`
+/// literal, so `has_schema()` filtered all of them out. The thirteen JSON
+/// endpoints below are the ones that carry a contract; the five HTML pages
+/// must stay absent, because a schema is what turns an endpoint into a tool.
+#[tokio::test]
+async fn llm_json_api_appears_in_openapi_and_its_pages_do_not() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    for (method, path) in [
+        ("post", "/b/llm/api/chat"),
+        ("post", "/b/llm/api/chat/stream"),
+        ("get", "/b/llm/api/providers"),
+        ("post", "/b/llm/api/providers"),
+        ("patch", "/b/llm/api/providers/{id}"),
+        ("delete", "/b/llm/api/providers/{id}"),
+        ("post", "/b/llm/api/providers/{id}/discover-models"),
+        ("get", "/b/llm/api/models"),
+        ("get", "/b/llm/api/models/{backend_id}/{model_id}/status"),
+        ("post", "/b/llm/api/models/{backend_id}/{model_id}/load"),
+        ("post", "/b/llm/api/models/{backend_id}/{model_id}/unload"),
+        ("get", "/b/llm/api/config"),
+        ("post", "/b/llm/api/config"),
+    ] {
+        assert!(
+            !doc["paths"][path][method].is_null(),
+            "{method} {path} must carry a schema and appear in /openapi.json"
+        );
+        assert_eq!(
+            doc["paths"][path][method]["security"],
+            serde_json::json!([{ "bearerAuth": [] }]),
+            "{method} {path} is Authenticated or Admin and must carry a security requirement"
+        );
+    }
+
+    for path in [
+        "/b/llm/",
+        "/b/llm/threads/{id}",
+        "/b/llm/settings",
+        "/b/llm/providers",
+        "/b/llm/models",
+    ] {
+        assert!(
+            doc["paths"][path].is_null(),
+            "{path} serves HTML and must carry no schema - a schema would make it \
+             a callable tool"
+        );
+    }
+
+    // The two SSE endpoints answer with `text/event-stream`, one frame per
+    // `ChatChunk` / `LoadProgress`. An `application/json` response schema
+    // there would describe a body that is never sent, so they carry their
+    // request/path contract only.
+    for (method, path) in [
+        ("post", "/b/llm/api/chat/stream"),
+        ("post", "/b/llm/api/models/{backend_id}/{model_id}/load"),
+    ] {
+        assert!(
+            doc["paths"][path][method]["responses"]["200"]["content"].is_null(),
+            "{method} {path} streams SSE and must not publish a JSON response schema"
+        );
+    }
+    assert!(
+        !doc["paths"]["/b/llm/api/chat/stream"]["post"]["requestBody"].is_null(),
+        "the streaming chat endpoint takes the same body as the buffered one and must say so"
+    );
+
+    // Both chat endpoints deserialize the same struct, so they must publish
+    // the same request schema; a divergence would mean one of them stopped
+    // going through the shared prelude.
+    assert_eq!(
+        doc["paths"]["/b/llm/api/chat"]["post"]["requestBody"],
+        doc["paths"]["/b/llm/api/chat/stream"]["post"]["requestBody"],
+        "chat and chat/stream must publish one request contract"
+    );
+
+    // The three provider writes publish the list's row projection, so a
+    // consumer reading one provider from any of them can rely on one shape.
+    let list_row = &doc["paths"]["/b/llm/api/providers"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["providers"]["items"];
+    assert!(
+        !list_row["properties"].is_null(),
+        "the provider list must publish a row projection: {doc}"
+    );
+    for (method, path) in [
+        ("post", "/b/llm/api/providers"),
+        ("patch", "/b/llm/api/providers/{id}"),
+    ] {
+        let written = &doc["paths"][path][method]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            written["properties"], list_row["properties"],
+            "{method} {path} must publish the same row projection as the list"
+        );
+        assert_eq!(
+            written["required"], list_row["required"],
+            "{method} {path} must publish the same row projection as the list"
+        );
+    }
+}
+
+/// Provider rows reference an API key by the *name* of the admin variable
+/// that holds it (`key_var`); the key itself is resolved into the in-memory
+/// router at reload time and lives on the very `ProviderConfig` the handlers
+/// hold. Every published field must therefore be an explicit projection, and
+/// this pins two things structurally:
+///
+/// 1. No published field name matches a credential pattern. `api_key` is the
+///    one this block could leak; the rest are the shared list.
+/// 2. `key_var` is the only `key`-bearing name, and it is a plain string (a
+///    variable *name*), never an object that could carry a value.
+#[tokio::test]
+async fn llm_openapi_publishes_no_credential_field() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let fields = published_field_names(&doc, &["/b/llm"]);
+
+    assert!(
+        !fields.is_empty(),
+        "no llm fields found - the walk is looking in the wrong place and this \
+         test would pass forever"
+    );
+
+    let mut saw_key_var = false;
+    for field in &fields {
+        let lower = field.to_lowercase();
+        for forbidden in [
+            "api_key",
+            "apikey",
+            "secret",
+            "password",
+            "hash",
+            "access_token",
+            "refresh_token",
+            "session_token",
+            "bearer",
+            "credential",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "llm publishes a field named `{field}`, which matches the \
+                 credential pattern `{forbidden}`"
+            );
+        }
+        if lower.contains("key") {
+            assert_eq!(
+                field, "key_var",
+                "the only key-bearing name llm may publish is `key_var`, the \
+                 admin variable *name*; got `{field}`"
+            );
+            saw_key_var = true;
+        }
+    }
+    assert!(
+        saw_key_var,
+        "`key_var` must be published (it is how an admin sees which variable a \
+         provider reads) - its absence means the walk missed the provider view"
+    );
+
+    for props in objects_with_property(&doc, &["/b/llm"], "responses", "key_var") {
+        assert_eq!(
+            props["key_var"]["type"],
+            serde_json::json!(["string", "null"]),
+            "`key_var` must stay a nullable string naming a variable, never a \
+             value-carrying object: {}",
+            props["key_var"]
+        );
+    }
+}
+
+/// `vector` declared 11 endpoints and zero schemas: every handler
+/// deserialized into a private in-function struct and answered with a
+/// `serde_json::json!` literal, so `has_schema()` filtered all of them out.
+/// The nine JSON endpoints below are the ones that carry a contract; the two
+/// HTML pages must stay absent, because a schema is what turns an endpoint
+/// into a tool.
+#[tokio::test]
+async fn vector_json_api_appears_in_openapi_and_its_pages_do_not() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    for (method, path) in [
+        ("post", "/b/vector/api/indexes"),
+        ("get", "/b/vector/api/indexes"),
+        ("delete", "/b/vector/api/indexes/{name}"),
+        ("post", "/b/vector/api/upsert"),
+        ("post", "/b/vector/api/query"),
+        ("post", "/b/vector/api/ingest"),
+        ("post", "/b/vector/api/embed"),
+        ("delete", "/b/vector/api/{index}/{id}"),
+        ("get", "/b/vector/api/stats"),
+    ] {
+        assert!(
+            !doc["paths"][path][method].is_null(),
+            "{method} {path} must carry a schema and appear in /openapi.json"
+        );
+        assert_eq!(
+            doc["paths"][path][method]["security"],
+            serde_json::json!([{ "bearerAuth": [] }]),
+            "{method} {path} is Authenticated and must carry a security requirement"
+        );
+    }
+
+    for path in ["/b/vector/", "/b/vector/{name}/"] {
+        assert!(
+            doc["paths"][path].is_null(),
+            "{path} serves HTML and must carry no schema - a schema would make it \
+             a callable tool"
+        );
+    }
+
+    // The create request is the one the admin modal also posts as a form,
+    // where the checkbox arrives as the string `on`. The JSON contract must
+    // type it as the boolean the handler stores, and require nothing but the
+    // name.
+    let create = &doc["paths"]["/b/vector/api/indexes"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(create["properties"]["keyword_search"]["type"], "boolean");
+    assert_eq!(create["required"], serde_json::json!(["name"]));
+    // The metric variants carry doc comments, so schemars publishes them as
+    // documented `const` alternatives rather than a bare `enum` list; the
+    // tokens must still be exactly the backend's.
+    let mut metric_tokens = const_strings(&create["properties"]["metric"]);
+    metric_tokens.sort_unstable();
+    assert_eq!(
+        metric_tokens,
+        ["cosine", "dotproduct", "euclidean"],
+        "metric must publish the backend's exact tokens: {}",
+        create["properties"]["metric"]
+    );
+
+    // A query is by text or by vector; the schema requires neither and the
+    // handler refuses a body carrying neither.
+    let query = &doc["paths"]["/b/vector/api/query"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(query["required"], serde_json::json!(["index"]));
+    for optional in ["text", "vector"] {
+        assert!(
+            query["properties"][optional]["type"]
+                .as_array()
+                .is_some_and(|t| t.contains(&serde_json::json!("null"))),
+            "`{optional}` must be optional on the query request: {}",
+            query["properties"][optional]
+        );
+    }
+    // The handler accepts both — `vector` is then the query vector and
+    // `text` only the keyword-query fallback — and refuses only neither.
+    // The description must say that, not claim exclusivity.
+    // Doc comments wrap at 80 columns, so compare with line breaks
+    // collapsed to single spaces.
+    let query_doc = query["description"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        query_doc.contains("At least one of `text` and `vector` is required"),
+        "the query description must state the real contract: {query_doc}"
+    );
+    assert!(
+        !query_doc.contains("Exactly one"),
+        "the query description must not claim exclusivity: {query_doc}"
+    );
+
+    // A hit carries exactly id, score and the stored metadata.
+    let hit = &doc["paths"]["/b/vector/api/query"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["matches"]["items"];
+    let mut hit_keys: Vec<&str> = hit["properties"]
+        .as_object()
+        .expect("match properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    hit_keys.sort_unstable();
+    assert_eq!(hit_keys, ["id", "metadata", "score"]);
+
+    // Both delete routes read their ids from the path and must say so.
+    let param_names = |path: &str| -> Vec<String> {
+        let mut names: Vec<String> = doc["paths"][path]["delete"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("delete {path} must declare path parameters"))
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(param_names("/b/vector/api/indexes/{name}"), ["name"]);
+    assert_eq!(param_names("/b/vector/api/{index}/{id}"), ["id", "index"]);
+}
+
+/// The vector API publishes index names, counts, caller-supplied metadata
+/// and raw embeddings — none of it credential material — but every field
+/// is still an explicit projection, and this pins that no name matching a
+/// credential pattern ever enters it. `keyword_search` / `keyword_query`
+/// are the reason the bare `key` pattern is not on the list.
+#[tokio::test]
+async fn vector_openapi_publishes_no_credential_field() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let fields = published_field_names(&doc, &["/b/vector"]);
+
+    assert!(
+        !fields.is_empty(),
+        "no vector fields found - the walk is looking in the wrong place and \
+         this test would pass forever"
+    );
+
+    for field in &fields {
+        let lower = field.to_lowercase();
+        for forbidden in [
+            "api_key",
+            "apikey",
+            "key_var",
+            "secret",
+            "password",
+            "hash",
+            "token",
+            "bearer",
+            "credential",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "vector publishes a field named `{field}`, which matches the \
+                 credential pattern `{forbidden}`"
+            );
+        }
+    }
+}
+
 /// `tickets` declared 21 endpoints and zero schemas, so `has_schema()` filtered
 /// every one of them out and its JSON API was absent from `/openapi.json`. The
 /// thirteen JSON endpoints below are the ones that carry a contract; the eight
@@ -598,6 +932,32 @@ async fn tickets_openapi_withholds_the_abuse_digest_and_groups_reporter_text() {
         "no untrusted-report group found - the walk is looking in the wrong place \
          and this test would pass forever"
     );
+}
+
+/// Every string `const` anywhere under `node` — the tokens a documented enum
+/// publishes, whichever `oneOf` / `anyOf` nesting schemars wrapped them in.
+fn const_strings(node: &serde_json::Value) -> Vec<String> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(token)) = map.get("const") {
+                    out.push(token.clone());
+                }
+                for value in map.values() {
+                    walk(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, &mut out);
+    out
 }
 
 /// Every `properties` map declaring `property` inside the `section` (e.g.
