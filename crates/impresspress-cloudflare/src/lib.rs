@@ -670,6 +670,20 @@ where
         Arc<dyn StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
+    // `std::env` is stubbed to always-empty on `wasm32-unknown-unknown`, so
+    // `impresspress_core::ui::assets::base_url()` can never observe
+    // `IMPRESSPRESS_ASSET_BASE_URL` through it here. `worker::Env::var` is
+    // the one channel that does carry a Worker `[vars]` entry, so read it
+    // and push it into `base_url()`'s platform override before any code
+    // path below can render a page (and therefore call `base_url()`).
+    // Idempotent (see `set_base_url_override`'s doc) — safe to call on
+    // every request, including the fresh-runtime `/_deploy/*` funnels.
+    impresspress_core::ui::assets::set_base_url_override(
+        env.var(impresspress_core::ui::assets::ASSET_BASE_URL_VAR)
+            .ok()
+            .map(|v| v.to_string()),
+    );
+
     if req.path() == "/_deploy/verify" {
         return prepared_verify_endpoint(&req, &env).await;
     }

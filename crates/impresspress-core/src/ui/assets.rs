@@ -28,11 +28,43 @@ pub const DEFAULT_CDN_BASE_TEMPLATE: &str = concat!(
     "/"
 );
 
+/// Worker var / process env var name resolved by [`base_url`]. Shared
+/// single source of truth between the writer (the CLI's `wrangler.toml`
+/// generator — `impresspress::cli::helpers::cloudflare::wrangler`) and every
+/// reader, so the name can never drift out from under either side.
+pub const ASSET_BASE_URL_VAR: &str = "IMPRESSPRESS_ASSET_BASE_URL";
+
+/// Platform-pushed override for [`base_url`], for adapters that cannot rely
+/// on `std::env` to see [`ASSET_BASE_URL_VAR`]. Cloudflare Workers stub
+/// `std::env` to always-empty on `wasm32-unknown-unknown` — the only channel
+/// that carries a Worker `[vars]` entry into Rust is `worker::Env::var`, which
+/// requires a live per-request `Env` handle `base_url()` doesn't have. The
+/// Cloudflare adapter (`impresspress-cloudflare::run_with_config`) reads the
+/// var itself and calls this once per isolate, before dispatching any
+/// request, so by the time a page render calls `base_url()` the value is
+/// already resolved. Native targets never call this: `std::env::var` already
+/// reads the real process environment there.
+static BASE_URL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Register the platform override described on [`BASE_URL_OVERRIDE`]. Must
+/// be called, if at all, before the first call to [`base_url`] — `base_url`
+/// caches its resolved value forever after its first call. Idempotent: later
+/// calls are silently ignored rather than panicking, because a Cloudflare
+/// isolate can build the runtime more than once per isolate lifetime (e.g.
+/// the `/_deploy/init` funnel always builds a fresh runtime); every call in
+/// a given isolate reads the same fixed Worker var, so only the first one
+/// needs to land.
+pub fn set_base_url_override(value: Option<String>) {
+    let _ = BASE_URL_OVERRIDE.set(value);
+}
+
 /// Resolve the asset base URL once.
 ///
 /// 1. `IMPRESSPRESS_ASSET_BASE_URL` (infrastructure config — `IMPRESSPRESS_*`,
 ///    no `__`, never stored in the DB) wins outright. The deployer sets this
-///    when assets live somewhere other than this origin.
+///    when assets live somewhere other than this origin. Read via
+///    [`BASE_URL_OVERRIDE`] when a platform adapter pushed one in, otherwise
+///    via `std::env::var` directly (the native target's real channel).
 /// 2. Otherwise `/b/static/`, served by the system block — from memory when
 ///    `embed-assets` is on, streamed from R2 when it is off.
 ///
@@ -40,12 +72,16 @@ pub const DEFAULT_CDN_BASE_TEMPLATE: &str = concat!(
 /// decision into the env var rather than the runtime sniffing for a backend.
 pub fn base_url() -> &'static str {
     static BASE: OnceLock<String> = OnceLock::new();
-    BASE.get_or_init(|| match std::env::var("IMPRESSPRESS_ASSET_BASE_URL") {
-        Ok(v) if !v.trim().is_empty() => {
-            let v = v.trim().to_string();
-            if v.ends_with('/') { v } else { format!("{v}/") }
+    BASE.get_or_init(|| {
+        let from_override = BASE_URL_OVERRIDE.get().cloned().flatten();
+        let resolved = from_override.or_else(|| std::env::var(ASSET_BASE_URL_VAR).ok());
+        match resolved {
+            Some(v) if !v.trim().is_empty() => {
+                let v = v.trim().to_string();
+                if v.ends_with('/') { v } else { format!("{v}/") }
+            }
+            _ => STATIC_PREFIX.to_string(),
         }
-        _ => STATIC_PREFIX.to_string(),
     })
 }
 
@@ -1123,6 +1159,22 @@ mod tests {
     fn base_url_defaults_to_static_prefix() {
         // No IMPRESSPRESS_ASSET_BASE_URL in the test environment.
         assert_eq!(super::base_url(), "/b/static/");
+    }
+
+    #[test]
+    fn set_base_url_override_is_idempotent() {
+        // Exercises `BASE_URL_OVERRIDE` in isolation — never calls
+        // `base_url()` itself, whose own `OnceLock` is claimed by
+        // `base_url_defaults_to_static_prefix` and must not be touched by
+        // any other test in this process (tests share one process and
+        // `base_url()`'s result is cached forever after its first call).
+        super::set_base_url_override(Some("https://first.example/".to_string()));
+        super::set_base_url_override(Some("https://second.example/".to_string()));
+        assert_eq!(
+            super::BASE_URL_OVERRIDE.get().cloned().flatten(),
+            Some("https://first.example/".to_string()),
+            "a later call must not clobber the first-set override"
+        );
     }
 
     #[test]

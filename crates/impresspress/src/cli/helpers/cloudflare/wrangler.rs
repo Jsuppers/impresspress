@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 pub use impresspress_core::{
-    PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR,
-    PREPARED_PLAN_MODULE_SHA256_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
-    RELEASE_ASSET_MANIFEST_SHA256_VAR,
+    ui::assets::ASSET_BASE_URL_VAR, PREPARED_APPLICATION_BUILD_SHA256_VAR,
+    PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
+    RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
 };
 
 use super::{
@@ -31,11 +31,6 @@ pub const RELEASE_ASSET_PREFIX_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_PREFIX";
 pub const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST";
 pub const PREPARED_WAFER_LOCK_IDENTITY_VAR: &str =
     impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR;
-
-/// Points a lean (no `embed-assets`) worker at wherever `impresspress deploy`
-/// published the UI asset set. The literal name must match exactly what
-/// `impresspress_core::ui::assets::base_url()` reads via `std::env::var`.
-pub const ASSET_BASE_URL_VAR: &str = "IMPRESSPRESS_ASSET_BASE_URL";
 
 #[derive(Debug, Clone)]
 pub struct CloudflareConfig {
