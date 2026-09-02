@@ -69,11 +69,15 @@ type ToolResult = {
 
 const PUBLIC_TOOLS = [
   'get_storefront_config',
+  'list_products',
   'get_product',
   'preview_price',
   'start_checkout',
   'get_order_status',
 ];
+
+/** Admin-tier read tools. Must never appear below the Admin tier. */
+const ADMIN_TOOLS = ['list_users', 'list_roles', 'get_site_settings', 'list_audit_log'];
 
 async function registeredTools(page: Page, atLeast: number): Promise<ToolRecord[]> {
   await page.waitForFunction(
@@ -300,8 +304,10 @@ test.describe('WebMCP registration for a signed-in admin', () => {
 
   test('adds the Authenticated tool on top of the Public set', async ({ page }) => {
     await page.goto('/b/admin/');
-    const tools = await registeredTools(page, PUBLIC_TOOLS.length + 1);
-    expect(tools.map((t) => t.name).sort()).toEqual([...PUBLIC_TOOLS, 'list_my_purchases'].sort());
+    const tools = await registeredTools(page, PUBLIC_TOOLS.length + 1 + ADMIN_TOOLS.length);
+    expect(tools.map((t) => t.name).sort()).toEqual(
+      [...PUBLIC_TOOLS, 'list_my_purchases', ...ADMIN_TOOLS].sort(),
+    );
   });
 
   test('the inspector shows the manifest at every auth level', async ({ page }) => {
@@ -330,6 +336,11 @@ test.describe('WebMCP registration for a signed-in admin', () => {
     for (const name of pub) expect(authed, 'monotone: public ⊆ authenticated').toContain(name);
     for (const name of authed) expect(admin, 'monotone: authenticated ⊆ admin').toContain(name);
     expect(authed).toContain('list_my_purchases');
+    for (const name of ADMIN_TOOLS) {
+      expect(admin, `admin tier publishes ${name}`).toContain(name);
+      expect(pub, `${name} must not reach an anonymous page`).not.toContain(name);
+      expect(authed, `${name} must not reach a signed-in non-admin`).not.toContain(name);
+    }
 
     // Every opted-in endpoint produced a tool at every level: nothing refused,
     // and the count the page reports is the count it publishes.
