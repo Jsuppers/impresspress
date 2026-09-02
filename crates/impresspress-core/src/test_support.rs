@@ -1088,25 +1088,79 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
     ]
 }
 
+/// The JWT secret every `handle_request` test call passes.
+pub const TEST_JWT_SECRET: &str = "test-jwt-secret";
+
+/// A `Bearer` access token carrying `roles`, signed the way `auth_ui` signs
+/// one (block-derived key from [`TEST_JWT_SECRET`], the default issuer), so
+/// `pipeline::handle_request`'s step 2 resolves it to a real identity with
+/// those roles. This is how a test asks for a document *as* an authenticated
+/// or admin caller.
+pub fn bearer_for_roles(roles: &[&str]) -> String {
+    use std::{collections::HashMap, time::Duration};
+
+    use wafer_block_crypto::primitives;
+
+    let derived = primitives::derive_block_key(
+        TEST_JWT_SECRET.as_bytes(),
+        crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+    );
+    let mut claims = HashMap::new();
+    claims.insert("sub".to_string(), serde_json::json!("user-test-1"));
+    claims.insert("type".to_string(), serde_json::json!("access"));
+    // Must match `expected_issuer`'s default
+    // (`crate::blocks::auth::helpers::expected_issuer`): a `TestContext` has
+    // no `WAFER_RUN_SHARED__FRONTEND_URL` configured.
+    claims.insert(
+        "iss".to_string(),
+        serde_json::json!("http://localhost:5173"),
+    );
+    claims.insert("roles".to_string(), serde_json::json!(roles));
+    let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+        .expect("test jwt_sign");
+    format!("Bearer {token}")
+}
+
 /// Fetch a discovery document (`/openapi.json` or `/.well-known/agent.json`)
-/// generated from [`real_block_infos`]. Shared by `pipeline.rs`'s discovery
-/// tests and the per-block openapi snapshot gate, so there is one
-/// implementation rather than two.
+/// generated from [`real_block_infos`], as the caller `roles` describes:
+/// `None` is anonymous, `Some(&["user"])` an authenticated user,
+/// `Some(&["admin"])` an admin. The documents are filtered by the caller's
+/// tier the same way the WebMCP manifest is, so which caller asks matters.
+///
+/// The identity is pre-resolved on the message (the same `auth.*` meta
+/// [`admin_msg`] sets), not minted as a JWT, so this works on a bare
+/// [`TestContext::new`] — no auth tables needed. What these tests check is
+/// the filter given a caller; that step 2 resolves a real bearer into that
+/// caller *before* the filter runs is pinned separately, through
+/// [`bearer_for_roles`] on a [`TestContext::with_auth`]
+/// (`pipeline::discovery_tests::openapi_describes_admin_endpoints_to_an_admin`).
 #[cfg(all(
     feature = "block-files",
     feature = "block-messages",
     feature = "block-products",
     feature = "block-tickets"
 ))]
-pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
-    let mut msg = anon_msg("retrieve", path);
+pub async fn discovery_json_as(
+    ctx: &TestContext,
+    path: &str,
+    host: &str,
+    roles: Option<&[&str]>,
+) -> serde_json::Value {
+    let mut msg = match roles {
+        None => anon_msg("retrieve", path),
+        Some(roles) => {
+            let mut msg = auth_msg("retrieve", path, "user-test-1");
+            msg.set_meta("auth.user_roles", roles.join(","));
+            msg
+        }
+    };
     msg.set_meta("http.header.host", host);
     let out = crate::pipeline::handle_request(
         ctx,
         msg,
         InputStream::from_bytes(Vec::new()),
         None,
-        "test-jwt-secret",
+        TEST_JWT_SECRET,
         false,
         &crate::features::AllEnabled,
         &real_block_infos(),
@@ -1115,6 +1169,21 @@ pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_
     .await;
     let buf = collect_or_panic(out).await;
     serde_json::from_slice(&buf.body).expect("discovery response is valid JSON")
+}
+
+/// The *complete* discovery document — fetched as an admin, the one caller
+/// who sees every endpoint. Shared by `pipeline.rs`'s discovery tests and the
+/// per-block openapi snapshot gate, both of which assert on privileged
+/// endpoints; a test about what a lower tier receives uses
+/// [`discovery_json_as`] directly.
+#[cfg(all(
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets"
+))]
+pub async fn discovery_json(ctx: &TestContext, path: &str, host: &str) -> serde_json::Value {
+    discovery_json_as(ctx, path, host, Some(&["admin"])).await
 }
 
 /// Fetch the generated `/openapi.json` document. Shared by pipeline tests

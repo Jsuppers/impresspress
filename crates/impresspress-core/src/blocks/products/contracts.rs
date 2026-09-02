@@ -620,10 +620,11 @@ pub struct CheckoutResponse {
     /// Returned once and never persisted in plaintext. Static storefronts use
     /// it to poll the minimal guest order-status endpoint after Stripe returns.
     ///
-    /// `writeOnly` marks it as a secret capability that must not be logged or
-    /// echoed. `pipeline.rs` asserts the flag, so it is carried on the
-    /// contract rather than left behind with the hand-written schema.
-    #[schemars(extend("writeOnly" = true))]
+    /// A bearer capability: whoever holds it can read the order's status.
+    /// Treat it like a session token — never log it, never put it in a URL
+    /// that gets shared. This response is its only delivery, which is why it
+    /// is not `writeOnly`: that keyword claims a field is never present in a
+    /// response, and this one is always present in this one.
     pub receipt_token: String,
     #[schemars(extend("format" = "date-time"))]
     pub receipt_token_expires_at: String,
@@ -632,9 +633,10 @@ pub struct CheckoutResponse {
     #[schemars(url)]
     pub checkout_url: Option<String>,
     /// Stripe Embedded Checkout client secret. Present only for the embedded
-    /// presentation, and `writeOnly` for the same reason as `receipt_token`.
+    /// presentation; it is how the browser opens the session, so it is
+    /// returned here and nowhere else. Same handling as `receipt_token`:
+    /// never log it.
     #[serde(default)]
-    #[schemars(extend("writeOnly" = true))]
     pub client_secret: Option<String>,
     #[serde(default)]
     #[schemars(url)]
