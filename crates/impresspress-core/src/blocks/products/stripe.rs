@@ -965,6 +965,15 @@ async fn handle_offer_checkout(
     };
     let product = match repo::products::get(ctx, &offer.product_id).await {
         Ok(product) => product,
+        // The same 404 the offer read above gives, and for the same reason:
+        // this read carries the soft-delete filter now, so a delete landing
+        // between the two reads answers `NotFound` — an ordinary outcome, not
+        // a server fault. Mapping it to `err_internal` showed a storefront
+        // buyer a 500 for the very state the neighbouring refusal calls
+        // "Offer not found".
+        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
+            return err_not_found("Offer not found");
+        }
         Err(error) => return err_internal("Could not load offer product", error),
     };
 

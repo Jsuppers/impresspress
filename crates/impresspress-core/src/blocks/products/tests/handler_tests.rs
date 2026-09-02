@@ -3012,3 +3012,116 @@ async fn update_live_refuses_to_rewrite_the_primary_key() {
         "the row must still answer to its original id"
     );
 }
+
+/// A `Context` that soft-deletes `product_id` the moment the FIRST by-id read
+/// of the products table has been answered, and forwards everything else
+/// untouched.
+///
+/// That is a concurrent delete landing between two reads inside one request,
+/// reproduced deterministically instead of raced for. `stripe::handle_checkout`
+/// reads the product twice — once inside `repo::offers::get_public`, once for
+/// the checkout itself — and only the gap between them can produce a
+/// `NotFound` from the second read.
+#[derive(Clone)]
+struct DeleteBetweenProductReads {
+    inner: std::sync::Arc<crate::test_support::TestContext>,
+    product_id: String,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl wafer_run::context::Context for DeleteBetweenProductReads {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), wafer_run::WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: wafer_run::Message,
+        input: wafer_run::InputStream,
+    ) -> wafer_run::OutputStream {
+        #[derive(serde::Deserialize)]
+        struct CollectionPeek {
+            collection: String,
+        }
+
+        if name != "wafer-run/database" || msg.action() != "database.get" {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|peek| peek.collection)
+            .unwrap_or_default();
+        let out = self
+            .inner
+            .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+            .await;
+        if collection == super::super::repo::products::TABLE
+            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            super::super::repo::products::soft_delete(self.inner.as_ref(), &self.product_id)
+                .await
+                .expect("the concurrent delete lands");
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+/// A product soft-deleted between checkout's two product reads must answer
+/// the storefront the same 404 its neighbouring refusals do — "Offer not
+/// found" — not a 500.
+///
+/// `NotFound` from that second read is a state this branch created: the read
+/// used to go straight to the table and could only fail for a row that was
+/// physically gone, so mapping every error to `err_internal` was right. Now
+/// it carries the soft-delete filter, so the ordinary outcome of a delete
+/// landing mid-request renders as a server error on a public storefront —
+/// while the identical condition observed a few microseconds earlier, inside
+/// `repo::offers::get_public`, answers a clean 404.
+#[tokio::test]
+async fn checkout_404s_for_a_product_deleted_between_its_two_reads() {
+    let ctx = std::sync::Arc::new(
+        ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await,
+    );
+    let offer_id = seed_published_offer(ctx.as_ref(), "racing").await;
+
+    let racing = DeleteBetweenProductReads {
+        inner: ctx.clone(),
+        product_id: "racing".to_string(),
+        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    let out = super::super::stripe::handle_checkout(&racing, &msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::NotFound).await,
+        "a product deleted mid-request must read as a missing offer, not a server error"
+    );
+}
