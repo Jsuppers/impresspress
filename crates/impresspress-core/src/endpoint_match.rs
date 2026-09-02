@@ -8,6 +8,21 @@
 //! per-block `path.starts_with(...)` / `strip_prefix(...)` guard chains and the
 //! manual single-segment param parsing that used to live in every `handle()`.
 //!
+//! ## Percent-encoding
+//!
+//! Every adapter hands this module the path **as it appeared on the wire**,
+//! still percent-encoded: axum's `Uri::path`, `url::Url::path` on Cloudflare,
+//! and `Url.pathname` in the Service Worker all preserve the escapes. That is
+//! what makes an id containing `/` addressable at all — `%2F` is one segment
+//! to the matcher, whereas a decoded `/` would split the route.
+//!
+//! Matching therefore happens on the encoded path (templates are literal ASCII
+//! and need no decoding), and [`dispatch_path`] decodes each bound variable
+//! before it lands in `req.param.*`, so a handler reads the value the caller
+//! encoded rather than the escape sequence. Without that decode the encoding a
+//! page must apply when it builds a URL has no inverse, and the round trip
+//! silently misses the record it names.
+//!
 //! ## Template syntax
 //!
 //! - A literal segment matches itself exactly.
@@ -52,6 +67,11 @@ pub fn action_for_method(method: HttpMethod) -> &'static str {
 /// Both inputs are split on `/`; a trailing slash therefore yields a trailing
 /// empty segment that must match on both sides. `{name...}` (rest) is only
 /// valid as the final template segment and greedily binds the remainder.
+///
+/// Values are returned **as they appear in `path`**, so still percent-encoded
+/// — matching must happen on the encoded form (see the module docs). Callers
+/// that hand a variable to a handler percent-decode it first;
+/// [`dispatch_path`] does that for every route it binds.
 pub fn match_template<'p>(template: &str, path: &'p str) -> Option<Vec<(String, &'p str)>> {
     let t_segs: Vec<&str> = template.split('/').collect();
     let p_segs: Vec<&str> = path.split('/').collect();
@@ -175,7 +195,7 @@ pub fn dispatch_path<H: Copy>(
         if let Some(params) = match_template(route.template, path) {
             let owned: Vec<(String, String)> = params
                 .into_iter()
-                .map(|(k, v)| (k, v.to_string()))
+                .map(|(k, v)| (k, decode_param(v)))
                 .collect();
             for (name, value) in owned {
                 msg.set_meta(
@@ -187,6 +207,27 @@ pub fn dispatch_path<H: Copy>(
         }
     }
     None
+}
+
+/// Percent-decode one matched path variable.
+///
+/// The inverse of `util::url_path_encode`, which is what a page applies when
+/// it interpolates a record id into an `href`/`hx-post`. Applied to rest
+/// (`{name...}`) variables too: an object key holding a space arrives as
+/// `%20` for exactly the same reason an id holding `/` arrives as `%2F`.
+///
+/// A sequence that does not decode to valid UTF-8 yields the raw segment
+/// unchanged. Bytes that are not text cannot be a record id or an object key
+/// here, so the alternatives are to lose them silently (`decode_utf8_lossy`
+/// substitutes U+FFFD) or to fail the whole match and turn a lookup that would
+/// have 404'd into a route that does not exist. Passing the segment through
+/// keeps the failure where the caller can read it: the handler looks the value
+/// up and answers "not found".
+fn decode_param(value: &str) -> String {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 /// The access policy a path resolves to for a single block, combining its
@@ -385,6 +426,68 @@ mod tests {
         let h = dispatch(&mut msg, &table);
         assert_eq!(h, Some(1u8));
         assert_eq!(msg.var("id"), "ctx-7");
+    }
+
+    /// A `{name}` binding is the inverse of `util::url_path_encode`, which is
+    /// what a page applies when it puts a record id in a URL. Matching happens
+    /// on the still-encoded path — `%2F` is one segment, which is the only
+    /// reason an id holding `/` is addressable at all — and the decode is owed
+    /// on the bound value.
+    #[test]
+    fn dispatch_percent_decodes_a_bound_param() {
+        let raw_id = "prod/1?x#y";
+        let path = format!(
+            "/b/messages/api/contexts/{}",
+            crate::util::url_path_encode(raw_id)
+        );
+        assert_eq!(path, "/b/messages/api/contexts/prod%2F1%3Fx%23y");
+
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", &path);
+        let table = [EndpointRoute::new(
+            HttpMethod::Get,
+            "/b/messages/api/contexts/{id}",
+            1u8,
+        )];
+        assert_eq!(dispatch(&mut msg, &table), Some(1u8));
+        assert_eq!(msg.var("id"), raw_id);
+    }
+
+    /// Rest params carry object keys, which have the same problem for the same
+    /// reason: a key holding a space reaches the wire as `%20`.
+    #[test]
+    fn dispatch_percent_decodes_a_bound_rest_param() {
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta(
+            "req.resource",
+            "/b/storage/api/buckets/photos/objects/holiday%20snaps/a%2Bb.txt",
+        );
+        let table = [EndpointRoute::new(
+            HttpMethod::Get,
+            "/b/storage/api/buckets/{name}/objects/{key...}",
+            1u8,
+        )];
+        assert_eq!(dispatch(&mut msg, &table), Some(1u8));
+        assert_eq!(msg.var("key"), "holiday snaps/a+b.txt");
+    }
+
+    /// An escape that is not valid UTF-8 passes through unchanged rather than
+    /// failing the match or being lossily substituted: the handler then looks
+    /// it up and answers "not found", which is a failure the caller can read.
+    #[test]
+    fn dispatch_leaves_an_undecodable_param_alone() {
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/messages/api/contexts/%FF%FE");
+        let table = [EndpointRoute::new(
+            HttpMethod::Get,
+            "/b/messages/api/contexts/{id}",
+            1u8,
+        )];
+        assert_eq!(dispatch(&mut msg, &table), Some(1u8));
+        assert_eq!(msg.var("id"), "%FF%FE");
     }
 
     #[test]

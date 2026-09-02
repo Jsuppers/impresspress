@@ -2588,25 +2588,42 @@ async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
     );
 }
 
-/// The Restore button's URL is built server-side by interpolating the row's
-/// id into a path segment, so the id has to be percent-encoded — every
-/// browser-side URL in this file already runs its ids through
-/// `encodeURIComponent`, and this one had nothing.
+// The Restore button's URL is built server-side by interpolating the row's id
+// into a path segment, so the id has to be percent-encoded — every
+// browser-side URL in this file already runs its ids through
+// `encodeURIComponent`, and this one had nothing. maud escapes HTML, not URLs.
+//
+// Ids containing `/`, `?` or `#` are reachable, not hypothetical: `db::create`
+// synthesizes a UUID only when the body omits `id`, and the admin create
+// endpoint forwarded the body verbatim until this branch began refusing `id`,
+// so any deployment that ever ran a seeding client against it can hold such a
+// row.
+//
+// Encoding alone is only half a round trip, and the half that is easy to
+// assert. The test below therefore asserts the WHOLE trip — render the URL,
+// send it through the real router, and check the product came back — because
+// an "the HTML contains %2F" assertion passes just as happily when the
+// endpoint on the other end 404s.
+
+/// The URL the Deleted view renders for `id` is the URL that restores `id`.
 ///
-/// Ids containing `/`, `?` or `#` are reachable, not hypothetical: `db::create`
-/// synthesizes a UUID only when the body omits `id`, and the admin create
-/// endpoint forwarded the body verbatim until this branch began refusing
-/// `id`, so any deployment that ever ran a seeding client against it can hold
-/// such a row. Unencoded, `prod/1` posts to
-/// `/b/products/api/admin/products/prod/1/restore` — a path matching no
-/// route — and the one door out of soft delete silently misses the product
-/// it names.
+/// Drives the real path: `manage_products` renders the row, the `hx-post`
+/// target is read back out of that HTML verbatim (no hand-built URL, so a
+/// change to either half of the encoding is caught), and it goes through
+/// `route_to_block` → `ProductsBlock::handle` → `endpoint_match::dispatch_path`
+/// → `handle_restore_product` → the repository.
+///
+/// The id carries `/`, `?` and `#`, which end a path segment for three
+/// different reasons: path separator, query start, fragment start. Every HTTP
+/// adapter hands impresspress the path still percent-encoded — axum's
+/// `Uri::path`, `url::Url::path` on Cloudflare, `Url.pathname` in the Service
+/// Worker — so `%2F` reaches the matcher intact and the route does not split;
+/// the decode owed is on the matched `{id}`, and that is what
+/// `dispatch_path` now does.
 #[tokio::test]
-async fn manage_products_deleted_view_percent_encodes_the_restore_url() {
+async fn the_restore_url_the_deleted_view_renders_restores_that_product() {
     let ctx = ctx().await;
 
-    // `/`, `?` and `#` each end a path segment for a different reason:
-    // path separator, query start, fragment start.
     let awkward_id = "prod/1?x#y";
 
     let mut gone = HashMap::new();
@@ -2615,18 +2632,42 @@ async fn manage_products_deleted_view_percent_encodes_the_restore_url() {
     seed(&ctx, "impresspress__products__products", awkward_id, gone).await;
     soft_delete_product(&ctx, awkward_id).await;
 
-    let (mut msg, _input) = admin_get_msg("/b/products/admin/manage");
-    msg.set_meta("req.query.view", "deleted");
-    let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
+    let (mut page_msg, _input) = admin_get_msg("/b/products/admin/manage");
+    page_msg.set_meta("req.query.view", "deleted");
+    let html = output_to_html(super::super::pages::manage_products(&ctx, &page_msg).await).await;
 
-    assert!(
-        html.contains("/b/products/api/admin/products/prod%2F1%3Fx%23y/restore"),
-        "the Restore action must percent-encode the product id into its path segment: {html}"
+    let restore_url = rendered_hx_post(&html)
+        .unwrap_or_else(|| panic!("the deleted row must render an hx-post Restore action: {html}"));
+    assert_eq!(
+        restore_url, "/b/products/api/admin/products/prod%2F1%3Fx%23y/restore",
+        "the Restore action must percent-encode the product id into its path segment"
     );
-    assert!(
-        !html.contains("/b/products/api/admin/products/prod/1"),
-        "an unencoded id splits the path and posts the restore somewhere else: {html}"
+
+    // The wire path, unmodified, through the real router.
+    let (msg, input) = admin_create_msg(&restore_url, serde_json::json!({}));
+    let out = dispatch_routed(&ctx, msg, input).await;
+    let body = output_to_json(out).await;
+    assert_eq!(
+        body["id"], awkward_id,
+        "posting the rendered Restore URL must reach the product it names"
     );
+
+    // And the product is actually live again, not merely answered about.
+    let restored = super::super::repo::products::get(&ctx, awkward_id)
+        .await
+        .expect("the restored product must be readable through the live-only door");
+    assert!(
+        crate::util::RecordExt::str_field(&restored, "deleted_at").is_empty(),
+        "restore must clear deleted_at: {restored:?}"
+    );
+}
+
+/// The value of the first `hx-post="..."` attribute in `html`.
+fn rendered_hx_post(html: &str) -> Option<String> {
+    let start = html.find("hx-post=\"")? + "hx-post=\"".len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// The Restore button reloads the page on success. Without an explicit
