@@ -16,6 +16,10 @@ crates/impresspress/data/
 test-results/
 playwright-report/
 playwright-report-products/
+# Playwright MCP scratch output (page snapshots, console logs, screenshots)
+# from driving the app in a browser during development. 177 of these had
+# accumulated untracked in a worktree, one `git add -A` away from the repo.
+.playwright-mcp/
 # Playwright globalSetup writes a real session token here (see
 # crates/impresspress-web/tests/e2e/fixtures/global-setup.ts). Never commit.
 crates/impresspress-web/tests/.auth/
