@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
 
 /**
  * Lightweight smoke test that doesn't rebuild mid-test. Catches regressions
@@ -116,4 +117,67 @@ test('the default bundle has no dev block', async ({ page }) => {
   // the factory's whole `wafer-run/security-headers` config with the shared
   // CSP directives — until then both bundles served the same policy and this
   // test passed for the wrong reason.
+});
+
+test('a cold visitor gets WebMCP tools without a reload', async ({ page }) => {
+  // The race this guards: `webmcp.js`'s deferred script runs while
+  // `navigator.serviceWorker.controller` is still null (the SW hasn't taken
+  // control of THIS document yet) — a cold visit to a production host with
+  // SPA-fallback routing lands here (see
+  // `docs/2026-08-28-browser-demo-design-note.md` §3). It is not
+  // reproducible by simply `goto`-ing a deep link on this harness:
+  // `python3 -m http.server -d pkg` (what this spec and CI's e2e-smoke job
+  // both serve `pkg/` with) has no SPA fallback, so a direct `goto` at
+  // `/b/auth/login` 404s before any script runs. And reaching the real page
+  // the only way this server allows — through `/`, like every other test
+  // above — proves nothing either: `impresspress-bundle`'s `loader.js`
+  // already reloads the tab once on first registration, and by the time
+  // that reload's navigation lands on `/b/auth/login` the SW is already
+  // active and controlling, so `controller` is non-null before `webmcp.js`
+  // ever runs (verified empirically — this harness's redirect chain closes
+  // the race on its own, fix or no fix).
+  //
+  // So: reach the real page normally, then shadow `navigator.serviceWorker`
+  // on it ONLY (the loader shell at `/` is untouched, so registration still
+  // happens for real) to force exactly the state the fix handles —
+  // `controller` reads null and `.ready` is a promise this test holds open
+  // — and prove `webmcp.js` waits for it instead of registering nothing.
+  await page.addInitScript(MODEL_CONTEXT_POLYFILL);
+  await page.addInitScript(() => {
+    if (location.pathname !== '/b/auth/login') return;
+    const real = navigator.serviceWorker;
+    let release = () => {};
+    const heldReady = new Promise((resolve) => {
+      release = () => resolve(real.controller);
+    });
+    (window as unknown as { __releaseWebmcpReady: () => void }).__releaseWebmcpReady = release;
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      get() {
+        return {
+          get controller() { return null; },
+          get ready() { return heldReady; },
+          getRegistration: real.getRegistration.bind(real),
+        };
+      },
+    });
+  });
+  await page.goto('/', { waitUntil: 'commit' });
+  await page.waitForURL(/\/b\/auth\/login/, { timeout: 30_000 });
+
+  // While `.ready` is held open, webmcp.js must not have registered
+  // anything — this is the assertion that fails (immediately, not a
+  // timeout) against the pre-fix script, which fetches the manifest
+  // unconditionally and ignores `navigator.serviceWorker` entirely.
+  await page.waitForTimeout(500);
+  expect(await page.evaluate(() => document.modelContext.__tools().length)).toBe(0);
+
+  // Releasing `.ready` (the SW finishing activation) lets it proceed —
+  // without a reload, and without the test navigating again.
+  await page.evaluate(() => (window as unknown as { __releaseWebmcpReady: () => void }).__releaseWebmcpReady());
+  const names = await page.waitForFunction(() => {
+    const t = document.modelContext.__tools();
+    return t.length > 0 ? t.map((x) => x.name) : null;
+  }, null, { timeout: 10_000 });
+  expect(await names.jsonValue()).toContain('list_products');
 });

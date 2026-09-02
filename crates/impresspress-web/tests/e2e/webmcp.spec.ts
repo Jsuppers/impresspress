@@ -1,58 +1,20 @@
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { ADMIN_STATE_PATH } from './fixtures/auth';
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from './fixtures/global-setup';
+import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
 
 /**
  * WebMCP end-to-end against the real native server (visual-baseline config:
  * port 8093 in CI, admin session via globalSetup).
  *
- * Chromium has no `document.modelContext` yet, so the WebMCP surface is
- * polyfilled with the smallest thing `ui/assets/webmcp.js` needs — a
- * `registerTool` that records what it was given — plus two test-only hooks
- * to read the registrations back and to invoke a tool's `execute`. Everything
- * on the other side of that boundary is real: the served manifest, the
- * registration script, the request `execute` builds, and the endpoint that
- * answers it. What this cannot test is whether an agent *chooses* the right
- * tool from its description; that needs a WebMCP-capable browser and a human
- * (plan 3, task 5).
+ * `MODEL_CONTEXT_POLYFILL` (shared with `smoke.spec.ts`) is the smallest
+ * `document.modelContext` shim `ui/assets/webmcp.js` and `webmcp-core.js`
+ * need. Everything on the other side of that boundary is real: the served
+ * manifest, the registration script, the request `execute` builds, and the
+ * endpoint that answers it. What this cannot test is whether an agent
+ * *chooses* the right tool from its description; that needs a WebMCP-capable
+ * browser and a human (plan 3, task 5).
  */
-
-const MODEL_CONTEXT_POLYFILL = `
-  (function () {
-    const tools = new Map();
-    Object.defineProperty(document, 'modelContext', {
-      configurable: false,
-      writable: false,
-      value: {
-        registerTool(options) {
-          if (!options || typeof options.name !== 'string') {
-            throw new TypeError('registerTool: name is required');
-          }
-          if (typeof options.execute !== 'function') {
-            throw new TypeError('registerTool: execute is required');
-          }
-          tools.set(options.name, options);
-        },
-        // Test hooks — not part of the WebMCP surface.
-        __tools() {
-          return Array.from(tools.values()).map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema,
-            outputSchema: t.outputSchema,
-          }));
-        },
-        __execute(name, args) {
-          const tool = tools.get(name);
-          if (!tool) {
-            throw new Error('no such tool: ' + name);
-          }
-          return tool.execute(args);
-        },
-      },
-    });
-  })();
-`;
 
 type ToolRecord = {
   name: string;
@@ -101,6 +63,34 @@ async function execute(page: Page, name: string, args: Record<string, unknown>):
     [name, args] as const,
   );
 }
+
+test('refresh() re-registers the manifest without disturbing a tool it does not own', async ({ page }) => {
+  // `refresh()` tracks and re-registers exactly the names webmcp.js itself
+  // added from the manifest (see `registered` in `webmcp.js`) — not
+  // everything `document.modelContext` currently knows about. That is
+  // deliberate: `dev.js` (plan 2, task 3) registers its own page-scoped
+  // tools directly against `document.modelContext` on `/b/dev`, and
+  // webmcp.js's `refresh()` runs independently on manifest-generation
+  // changes. If `refresh()` cleared every registered tool it would fight
+  // `dev.js` for ownership of tools it never registered. `stale_tool` here
+  // stands in for exactly that: something else's tool, registered directly
+  // — it must survive a webmcp.js refresh untouched.
+  await page.addInitScript(MODEL_CONTEXT_POLYFILL);
+  await page.goto('/b/auth/login');
+  await registeredTools(page, 1);
+  const before = await page.evaluate(() => document.modelContext.__tools().map((t) => t.name).sort());
+  await page.evaluate(() =>
+    document.modelContext.registerTool({
+      name: 'stale_tool',
+      description: 'x',
+      inputSchema: { type: 'object' },
+      execute: async () => ({ content: [] }),
+    }),
+  );
+  await page.evaluate(() => window.__impresspressWebmcp.refresh());
+  const after = await page.evaluate(() => document.modelContext.__tools().map((t) => t.name).sort());
+  expect(after).toEqual([...before, 'stale_tool'].sort());
+});
 
 /** Bearer for the bootstrap admin — bearer auth is exempt from the CSRF origin policy, cookies are not. */
 async function adminBearer(request: APIRequestContext): Promise<string> {
