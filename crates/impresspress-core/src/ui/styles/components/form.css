@@ -159,6 +159,7 @@
 .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .text-capitalize { text-transform: capitalize; }
 .nowrap { white-space: nowrap; }
+.pre-wrap { white-space: pre-wrap; }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Margin/gap scale follows the same 0.25rem step as the existing mt-1/mt-2/
  * mt-4 and gap-2/gap-4 utilities below (n * 0.25rem). */

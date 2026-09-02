@@ -667,3 +667,23 @@
 .editor-status__title { font-size: 1.25rem; font-weight: 600; margin: 0; }
 .editor-status__version { background: var(--bg-hover); color: var(--text-muted); }
 
+/* ===== Tickets admin (blocks/tickets/pages.rs) =====
+   The page's own `<style>` blocks (rendered via `html! { style { ... } }`)
+   already carry `max-width: 720px` media-query overrides for
+   `.ticket-filter-grid` / `.ticket-detail-grid` / `.ticket-note-form` — a
+   page-local stylesheet, the same drift pattern flagged for
+   `blocks/products/pages.rs`'s `PRODUCTS_UI_CSS` under task 12e. This section
+   supplies the base (non-media) rules those class names need, kept here
+   rather than folded into the page-local block so the audited stylesheet
+   stays the source of truth for the base declaration; 12e's page-local-style
+   sweep should also pick up these two page-local `<style>` blocks. */
+.ticket-filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.5rem; }
+.ticket-filter-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; max-width: 28rem; margin-top: 0.5rem; }
+.ticket-filter-actions .btn { flex: 1 1 7rem; }
+.ticket-detail-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr); gap: 1.25rem; }
+.ticket-note-form { display: flex; gap: 0.5rem; }
+.ticket-form-grid { display: grid; gap: 0.75rem; }
+.ticket-form-grid--create { margin-top: 1rem; max-width: 48rem; }
+.ticket-form-grid--type-create { margin: 1rem 0; max-width: 50rem; }
+.ticket-form-grid--type-edit { margin-top: 1rem; }
+
