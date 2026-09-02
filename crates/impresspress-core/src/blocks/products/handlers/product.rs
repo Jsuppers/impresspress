@@ -410,10 +410,7 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
         // the probe.
         Err(e) if e.code == ErrorCode::NotFound => write_error(e, RESTORE_FAILED),
         Err(e) => match restore_slug_conflict(ctx, id).await {
-            SlugProbe::Claimed(slug) => err_conflict(&format!(
-                "Another product already uses the slug \"{slug}\". Rename or delete that \
-                 product, then restore this one."
-            )),
+            SlugProbe::Claimed(slug) => slug_taken(&slug),
             // Nothing holds the slug, so nothing stands between this product
             // and the catalog — try again rather than reporting a failure the
             // database would no longer produce.
@@ -424,8 +421,23 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
             // nothing to blame, and a clear probe reported as-is would send
             // back the opaque 500 this whole branch exists to avoid — for a
             // restore that would now succeed. A clear probe is therefore a
-            // reason to retry, not an answer. Exactly one retry: it either
-            // lands, or the second failure is reported for what it is.
+            // reason to retry, not an answer.
+            //
+            // Exactly one retry, and its failure is CLASSIFIED rather than
+            // forwarded. The retry is itself a write, so the gap the probe
+            // closed reopens behind it: a claimant arriving between the clear
+            // probe and the retry violates the same index the first write
+            // did, and handing that second error to `write_error` gave back
+            // the very 500 this branch exists to avoid — on a request that is
+            // a slug conflict, whose slug the probe has right here. A retry
+            // LOOP is not the fix: a competing request is free to go on
+            // re-claiming the slug, and the answer worth giving (someone
+            // holds it; free it and restore again) is already known.
+            //
+            // One retry stays safe for the reason it always was: `restore`
+            // only clears `deleted_at` on the same already-deleted row, so
+            // repeating it creates no duplicate record and no ancillary
+            // state.
             //
             // (Retrying is the best available answer, not the ideal one. The
             // ideal is for the write's own error to say "unique constraint
@@ -433,9 +445,21 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
             // backend maps constraint violations to `ErrorCode::AlreadyExists`
             // today, and sniffing driver message text would be both magic and
             // backend-specific, so that fix belongs in wafer-run.)
-            SlugProbe::Clear => match repo::products::restore(ctx, id).await {
+            SlugProbe::Clear(slug) => match repo::products::restore(ctx, id).await {
                 Ok(record) => ok_json(&record),
-                Err(again) => write_error(again, RESTORE_FAILED),
+                // The row stopped being a deleted product in the meantime —
+                // a concurrent restore landed first, or it was purged. That
+                // is not this caller's slug conflict, and the 404 every other
+                // product endpoint gives for a row it cannot act on is the
+                // honest answer. Same reasoning as the first write's
+                // `NotFound` arm above.
+                Err(again) if again.code == ErrorCode::NotFound => {
+                    write_error(again, RESTORE_FAILED)
+                }
+                // Refused twice with a clear probe in between: the slug was
+                // free when it was read and is not free now, which is a
+                // claimant that arrived in the gap. Report the conflict.
+                Err(_) => slug_taken(&slug),
             },
             // The probe could not run. "Could not tell" is not "clear" — a
             // retry would be guessing — and it is not "conflict" either, so
@@ -449,17 +473,36 @@ pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> 
 /// Log context for a restore that could not be explained as a slug conflict.
 const RESTORE_FAILED: &str = "Database error";
 
+/// The 409 a restore answers when a live product of the same owner holds the
+/// slug it has to re-claim.
+///
+/// One definition, two callers: the collision probe that named the claimant,
+/// and the retry that a clear probe earned and a newcomer failed anyway. They
+/// are the same fact for the admin, so they say the same thing — and the
+/// advice is what makes the response actionable, which is the whole reason
+/// this is not a 500.
+fn slug_taken(slug: &str) -> OutputStream {
+    err_conflict(&format!(
+        "Another product already uses the slug \"{slug}\". Rename or delete that \
+         product, then restore this one."
+    ))
+}
+
 /// What [`restore_slug_conflict`] found. Three answers, not two: "no
-/// claimant" and "could not look" lead to opposite responses, and collapsing
-/// them into one `None` is how a transient read failure gets reported as a
-/// clear slug.
+/// claimant" and "no answer" lead to opposite responses — one retries, one
+/// gives up — and a probe that returned a plain "is it claimed?" boolean
+/// would fold them together, which is how a transient read failure gets
+/// reported as a clear slug.
 enum SlugProbe {
     /// A live product of the same owner holds the slug, named here so the
     /// admin can free it.
     Claimed(String),
-    /// Nothing holds the slug.
-    Clear,
-    /// The probe itself failed, so neither answer is available.
+    /// Nothing holds the slug. It is carried anyway, because the retry a
+    /// clear probe earns can be refused on that same slug — and then the slug
+    /// is exactly what the response has to name.
+    Clear(String),
+    /// Neither answer is available: the probe could not run, or the row
+    /// carries no slug and so cannot have collided on one at all.
     Unknown,
 }
 
@@ -470,36 +513,43 @@ enum SlugProbe {
 /// soft-deleted, so `get_deleted` can still read the slug in question. A
 /// `get_deleted` that comes back `NotFound` is [`SlugProbe::Unknown`] rather
 /// than [`SlugProbe::Clear`] — the row moved under us and there is nothing
-/// left to reason about.
+/// left to reason about. So is a row carrying no slug, which the index the
+/// write was refused by does not apply to at all.
 async fn restore_slug_conflict(ctx: &dyn Context, id: &str) -> SlugProbe {
     let Ok(deleted) = repo::products::get_deleted(ctx, id).await else {
         return SlugProbe::Unknown;
     };
-    match colliding_slug(ctx, &deleted).await {
-        Ok(Some(slug)) => SlugProbe::Claimed(slug),
-        Ok(None) => SlugProbe::Clear,
+    let slug = deleted.str_field("slug").to_string();
+    // Migration 005's index is partial on `slug <> ''` as well as on
+    // `deleted_at IS NULL`, so any number of rows may hold an empty slug and
+    // a row holding one cannot have been refused by that index. Neither
+    // "claimed" nor "clear" describes such a write's failure — it is not a
+    // slug question at all — so the write's own error is what the caller
+    // gets, and no retry is attempted for a collision that cannot exist.
+    if slug.is_empty() {
+        return SlugProbe::Unknown;
+    }
+    match slug_is_claimed(ctx, &deleted, &slug).await {
+        Ok(true) => SlugProbe::Claimed(slug),
+        Ok(false) => SlugProbe::Clear(slug),
         Err(_) => SlugProbe::Unknown,
     }
 }
 
-/// The slug `deleted` would re-claim on restore, when a LIVE product of the
-/// same owner already holds it — `Ok(None)` when the restore is clear to go.
+/// Whether a LIVE product of the same owner already holds `slug`, the
+/// non-empty slug `deleted` would re-claim on restore.
 ///
 /// Keyed on `(owner_kind, owner_id, slug)` because that is the unique index's
-/// own key. An empty slug never collides: the index is also partial on
-/// `slug <> ''`, so any number of rows may carry one.
+/// own key.
 ///
-/// A read failure is returned, not folded into `Ok(None)`: "no collision" and
-/// "could not tell" are different answers, and only the caller knows what to
-/// do with the second one.
-async fn colliding_slug(
+/// A read failure is returned, not folded into `Ok(false)`: "no collision"
+/// and "could not tell" are different answers, and only the caller knows what
+/// to do with the second one.
+async fn slug_is_claimed(
     ctx: &dyn Context,
     deleted: &db::Record,
-) -> Result<Option<String>, wafer_run::WaferError> {
-    let slug = deleted.str_field("slug");
-    if slug.is_empty() {
-        return Ok(None);
-    }
+    slug: &str,
+) -> Result<bool, wafer_run::WaferError> {
     let filters = vec![
         eq_filter("owner_kind", deleted.str_field("owner_kind")),
         eq_filter("owner_id", deleted.str_field("owner_id")),
@@ -507,8 +557,7 @@ async fn colliding_slug(
     ];
     // `list_all` appends the live-only filter, so a second soft-deleted row
     // sharing the slug is correctly not a collision.
-    let live = repo::products::list_all(ctx, filters).await?;
-    Ok((!live.is_empty()).then(|| slug.to_string()))
+    Ok(!repo::products::list_all(ctx, filters).await?.is_empty())
 }
 
 fn eq_filter(field: &str, value: &str) -> Filter {
