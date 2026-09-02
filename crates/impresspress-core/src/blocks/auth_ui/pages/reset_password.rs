@@ -58,8 +58,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             auth_panel(&config, Some("Reset your password.")),
             html! {
                 div .login-container {
-                    div #error .login-error style="display:none" {}
-                    div #success style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:.75rem;margin-bottom:1rem;font-size:.813rem;color:#059669;display:none" {}
+                    div #error .login-error hidden {}
+                    div #success .login-success hidden {}
 
                     form #form .login-form onsubmit="return handleReset(event)" {
                         input type="hidden" #reset-token name="token" value=(token);
@@ -84,17 +84,17 @@ async function handleReset(e){
   var pw=$('password').value,cf=$('confirm').value;
   var err=$('error'),suc=$('success'),btn=$('btn');
   var token=$('reset-token').value;
-  err.style.display='none';suc.style.display='none';
-  if(pw!==cf){err.textContent='Passwords do not match.';err.style.display='flex';return false;}
-  if(pw.length<8){err.textContent='Password must be at least 8 characters.';err.style.display='flex';return false;}
+  err.hidden=true;suc.hidden=true;
+  if(pw!==cf){err.textContent='Passwords do not match.';err.hidden=false;return false;}
+  if(pw.length<8){err.textContent='Password must be at least 8 characters.';err.hidden=false;return false;}
   btn.disabled=true;btn.textContent='Resetting...';
   try{
     var r=await fetch('/b/auth/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token,new_password:pw})});
     var d=await r.json();
-    if(d.error){err.textContent=d.error.message||d.error;err.style.display='flex';}
-    else{suc.textContent='Password reset successfully. You can now sign in.';suc.style.display='block';$('form').style.display='none';
+    if(d.error){err.textContent=d.error.message||d.error;err.hidden=false;}
+    else{suc.textContent='Password reset successfully. You can now sign in.';suc.hidden=false;$('form').hidden=true;
       setTimeout(function(){window.location.href='/b/auth/login';},2000);}
-  }catch(ex){err.textContent='Something went wrong.';err.style.display='flex';}
+  }catch(ex){err.textContent='Something went wrong.';err.hidden=false;}
   btn.disabled=false;btn.textContent='Reset Password';
   return false;
 }
@@ -134,13 +134,13 @@ fn html_respond(
             auth_panel(&config, Some("Reset your password.")),
             html! {
                 div .login-container {
-                    div style="text-align:center" {
-                        div style={"width:48px;height:48px;background:" (color) "15;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:" (color)} {
+                    div .auth-status {
+                        div .auth-status__icon .auth-status__icon--dynamic style={"--icon-color:" (color) ";--icon-bg:" (color) "15"} {
                             @if success { "✓" } @else { "✗" }
                         }
-                        h2 style="font-size:1.25rem;font-weight:700;margin:0 0 .5rem" { (title) }
-                        p .login-subtitle style="line-height:1.6;margin:0 0 1.5rem" { (message) }
-                        a .login-button href="/b/auth/login" style="display:inline-block;width:auto;padding:.625rem 1.25rem;text-decoration:none" {
+                        h2 .auth-status__title { (title) }
+                        p .auth-status__message { (message) }
+                        a .login-button .auth-status__action href="/b/auth/login" {
                             "Go to Sign In"
                         }
                     }
