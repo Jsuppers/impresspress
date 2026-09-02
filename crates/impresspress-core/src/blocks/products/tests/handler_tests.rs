@@ -1351,7 +1351,7 @@ async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
     let mut msg = msg;
     msg.set_meta("auth.user_roles", "admin");
 
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let out = dispatch_admin(ctx.as_ref(), msg, input).await;
     assert!(
         output_is_error(out, ErrorCode::NotFound).await,
         "a PATCH whose row was deleted before the write must 404, not report success"
@@ -3010,6 +3010,137 @@ async fn update_live_refuses_to_rewrite_the_primary_key() {
     assert!(
         super::super::repo::products::get(&ctx, "p1").await.is_ok(),
         "the row must still answer to its original id"
+    );
+}
+
+/// The repo's `id`-rewrite refusal is a backstop for a caller that did not go
+/// through `reject_unsettable_fields`, and it answers `InvalidArgument` with
+/// a message naming what to change ("a product's id is immutable"). Every
+/// product write handler matched only `NotFound` and funnelled the rest into
+/// `err_internal`, which throws that message away and answers 500 — an
+/// opaque server error for what is squarely a caller mistake, with nothing
+/// for the caller to act on and a correlation id pointing at a log line that
+/// says the same.
+///
+/// Reproduced by answering the write with `InvalidArgument` from below,
+/// which is the shape any repository-level guard has when it reaches these
+/// handlers. All three of them are driven, because each carried its own copy
+/// of the match.
+#[tokio::test]
+async fn a_repo_invalid_argument_reaches_the_caller_as_a_400_carrying_its_message() {
+    use crate::test_support::FailingDbOpContext;
+
+    const REFUSAL: &str = "a product's id is immutable";
+
+    async fn refusing(ctx: &crate::test_support::TestContext) -> FailingDbOpContext {
+        FailingDbOpContext::failing_with(
+            ctx.clone(),
+            vec![(
+                "database.update_where_count",
+                super::super::repo::products::TABLE,
+            )],
+            wafer_run::WaferError::new(ErrorCode::InvalidArgument, REFUSAL),
+        )
+    }
+
+    async fn refusal_message(out: wafer_run::OutputStream) -> String {
+        match out.collect_buffered().await {
+            Err(wafer_run::streams::output::TerminalNotResponse::Error(error)) => {
+                assert_eq!(
+                    error.code,
+                    ErrorCode::InvalidArgument,
+                    "a caller error from the repository must not become a 500: {error:?}"
+                );
+                error.message
+            }
+            other => panic!("the write must be refused: {other:?}"),
+        }
+    }
+
+    // 1. the admin PATCH
+    let ctx = ctx().await;
+    let mut row = HashMap::new();
+    row.insert("name".to_string(), serde_json::json!("Original"));
+    seed(&ctx, "impresspress__products__products", "p_admin", row).await;
+    let refusing_ctx = refusing(&ctx).await;
+    let (mut msg, input) = update_msg(
+        "/admin/b/products/products/p_admin",
+        "admin_1",
+        serde_json::json!({ "name": "Renamed" }),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    let message = refusal_message(dispatch_admin(&refusing_ctx, msg, input).await).await;
+    assert!(
+        message.contains(REFUSAL),
+        "the admin PATCH must pass the refusal's own message through: {message}"
+    );
+
+    // 2. the seller PATCH
+    let ctx = user_products_ctx().await;
+    let (create, create_input) = create_msg(
+        "/b/products/products",
+        "user_1",
+        serde_json::json!({ "name": "Original" }),
+    );
+    let id = output_to_json(dispatch_user(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refusing_ctx = refusing(&ctx).await;
+    let (msg, input) = update_msg(
+        &format!("/b/products/products/{id}"),
+        "user_1",
+        serde_json::json!({ "name": "Renamed" }),
+    );
+    let message = refusal_message(dispatch_user(&refusing_ctx, msg, input).await).await;
+    assert!(
+        message.contains(REFUSAL),
+        "the seller PATCH must pass the refusal's own message through: {message}"
+    );
+
+    // 3. admin moderation, which writes the product through the same door
+    let ctx = user_products_ctx().await;
+    let mut pending = HashMap::new();
+    pending.insert("name".to_string(), serde_json::json!("Pending"));
+    pending.insert("owner_kind".to_string(), serde_json::json!("user"));
+    pending.insert("owner_id".to_string(), serde_json::json!("seller_1"));
+    pending.insert("approval_status".to_string(), serde_json::json!("pending"));
+    pending.insert("status".to_string(), serde_json::json!("pending_review"));
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "p_pending",
+        pending,
+    )
+    .await;
+    seed(
+        &ctx,
+        super::super::repo::seller_accounts::TABLE,
+        "acct_1",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("seller_1")),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stripe_1"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("requirements_json".to_string(), serde_json::json!("{}")),
+            ("fee_basis_points".to_string(), serde_json::json!(250)),
+        ]),
+    )
+    .await;
+    let refusing_ctx = refusing(&ctx).await;
+    let (msg, input) = admin_create_msg(
+        "/admin/b/products/products/p_pending/approve",
+        serde_json::json!({}),
+    );
+    let message = refusal_message(dispatch_admin(&refusing_ctx, msg, input).await).await;
+    assert!(
+        message.contains(REFUSAL),
+        "product moderation must pass the refusal's own message through: {message}"
     );
 }
 

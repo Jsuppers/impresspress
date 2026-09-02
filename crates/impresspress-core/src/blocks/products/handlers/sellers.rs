@@ -149,8 +149,9 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     // same answer the `get` would have given a moment earlier.
     match repo::products::update_live(ctx, id, data).await {
         Ok(product) => ok_json(&product),
-        Err(error) if error.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(error) => err_internal("Could not moderate product", error),
+        // The shared mapper, so this site cannot drift back to answering 500
+        // for a repository refusal that names what the caller must change.
+        Err(error) => super::write_error(error, "Could not moderate product"),
     }
 }
 

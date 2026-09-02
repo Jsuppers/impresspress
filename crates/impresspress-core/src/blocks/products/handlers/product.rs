@@ -93,6 +93,32 @@ fn reject_unsettable_fields(data: &HashMap<String, serde_json::Value>) -> Result
     )))
 }
 
+/// Map a `repo::products` write failure onto a response.
+///
+/// `NotFound` is the 404 every product endpoint gives for a row that is
+/// missing *or* soft-deleted — for a filtered write it is also "zero rows
+/// matched", which is the same fact.
+///
+/// `InvalidArgument` is a CALLER error and carries a message saying what to
+/// change: `repo::products::reject_id_rewrite` raises it as the backstop for
+/// a caller that did not pass through [`reject_unsettable_fields`], and any
+/// future repository guard will arrive the same way. Matching only `NotFound`
+/// and funnelling the rest into `err_internal` answered 500 and threw the
+/// message away, so the caller got an opaque server error, a correlation id,
+/// and nothing to act on for a mistake that was entirely theirs.
+///
+/// Anything else is a genuine failure and keeps `context` for the log.
+pub(in crate::blocks::products) fn write_error(
+    error: wafer_run::WaferError,
+    context: &str,
+) -> OutputStream {
+    match error.code {
+        ErrorCode::NotFound => err_not_found("Product not found"),
+        ErrorCode::InvalidArgument => err_bad_request(&error.message),
+        _ => err_internal(context, error),
+    }
+}
+
 /// Escape SQL LIKE wildcards (`%`, `_`) and the escape char (`\`) in user
 /// input so a user searching for `100% off` doesn't also match arbitrary
 /// characters.
@@ -287,8 +313,7 @@ pub(super) async fn handle_update_product(
     // gives for a soft-deleted row.
     match repo::products::update_live(ctx, id, data).await {
         Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => write_error(e, "Database error"),
     }
 }
 
@@ -690,8 +715,7 @@ pub(super) async fn handle_user_update_product(
     // The write itself has to be the thing that tests liveness.
     match repo::products::update_live(ctx, &id, data).await {
         Ok(record) => ok_json(&record),
-        Err(error) if error.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(error) => err_internal("Database error", error),
+        Err(error) => write_error(error, "Database error"),
     }
 }
 
