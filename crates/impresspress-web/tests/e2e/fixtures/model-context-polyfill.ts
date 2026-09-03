@@ -10,6 +10,14 @@
  * manifest, the registration script, the request `execute` builds, and the
  * endpoint that answers it.
  *
+ * `registerTool` also honours the proposal's second argument, `{ signal }`:
+ * `blocks/dev/assets/dev.js` scopes every tool the `/b/dev` page registers to
+ * an `AbortController` so they go away with the page. It ALSO unregisters
+ * them by name on abort, because a browser that ignores the options bag would
+ * otherwise leave them live — supporting the signal here is what makes the
+ * two paths distinguishable at all: a signal-driven removal is NOT recorded
+ * in `__unregistered()`, so a test can tell which one a build actually took.
+ *
  * Shared by `smoke.spec.ts` (SW build) and `webmcp.spec.ts` (native server) —
  * install it with `page.addInitScript(MODEL_CONTEXT_POLYFILL)` before any
  * navigation so it exists before the page's own scripts run.
@@ -22,7 +30,7 @@ export const MODEL_CONTEXT_POLYFILL = `
       configurable: false,
       writable: false,
       value: {
-        registerTool(options) {
+        registerTool(options, registerOptions) {
           if (!options || typeof options.name !== 'string') {
             throw new TypeError('registerTool: name is required');
           }
@@ -30,6 +38,22 @@ export const MODEL_CONTEXT_POLYFILL = `
             throw new TypeError('registerTool: execute is required');
           }
           tools.set(options.name, options);
+          const signal = registerOptions && registerOptions.signal;
+          if (signal) {
+            const drop = () => {
+              // Only if this very registration is still the live one: a
+              // re-registration under the same name belongs to whoever
+              // registered it, not to this (now stale) signal.
+              if (tools.get(options.name) === options) {
+                tools.delete(options.name);
+              }
+            };
+            if (signal.aborted) {
+              drop();
+            } else {
+              signal.addEventListener('abort', drop);
+            }
+          }
         },
         unregisterTool(name) {
           unregistered.push(name);

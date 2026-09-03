@@ -14,15 +14,20 @@ const LAYOUT_CSS: &str = include_str!("assets/layout.css");
 const CHARTS_CSS: &str = include_str!("assets/charts.css");
 
 /// `buildRequest`/`toolOptions` — the request-building and tool-option-shaping
-/// logic shared by `webmcp.js` and (a later task) `dev.js`. A fragment, not a
-/// script: no IIFE, no `'use strict'`. Never served on its own — always
-/// composed into a caller's IIFE via [`with_core`].
+/// logic shared by `webmcp.js` and the `/b/dev` page's `dev.js`. A fragment,
+/// not a script: no IIFE, no `'use strict'`. Never served on its own — always
+/// composed into a caller's IIFE via [`compose_webmcp_script`].
 const WEBMCP_CORE: &str = include_str!("assets/webmcp-core.js");
 
 /// Wraps `WEBMCP_CORE` and a caller-specific `tail` in one IIFE, so the
 /// composed script reads exactly as if it had been written in one file:
 /// `(function () { 'use strict'; <core> <tail> })();`
-fn with_core(tail: &'static str) -> String {
+///
+/// `pub(crate)` because the second caller is a block's own asset module
+/// (`blocks::dev::assets`), not this one: a tail authored anywhere in the
+/// crate composes through the same function, so there is exactly one
+/// definition of what "a WebMCP script" is on the wire.
+pub(crate) fn compose_webmcp_script(tail: &'static str) -> String {
     format!("(function () {{\n  'use strict';\n{WEBMCP_CORE}\n{tail}\n}})();\n")
 }
 
@@ -171,9 +176,11 @@ pub fn htmx_js() -> &'static str {
 ///
 /// Composed at first use from [`WEBMCP_CORE`] (the `buildRequest`/
 /// `toolOptions` fragment) and `assets/webmcp.js` (the tail), via
-/// [`with_core`] — cached so repeat callers don't re-format the string.
+/// [`compose_webmcp_script`] — cached so repeat callers don't re-format the
+/// string.
 pub fn webmcp_js() -> &'static str {
-    static SCRIPT: LazyLock<String> = LazyLock::new(|| with_core(include_str!("assets/webmcp.js")));
+    static SCRIPT: LazyLock<String> =
+        LazyLock::new(|| compose_webmcp_script(include_str!("assets/webmcp.js")));
     &SCRIPT
 }
 

@@ -27,6 +27,7 @@
 
 pub mod activation;
 pub mod artifacts;
+pub mod assets;
 pub mod blobs;
 pub mod blocks_api;
 pub mod contracts;
@@ -35,6 +36,7 @@ pub mod files;
 pub mod generation;
 pub mod generations_api;
 pub mod migrations;
+pub mod page;
 pub mod paths;
 pub mod publisher;
 pub mod repo;
@@ -79,6 +81,12 @@ pub const WAFER_GUEST_VERSION: u32 = 1;
 /// In-block dispatch targets, one per declared HTTP endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
+    /// `GET /b/dev` — the workspace document.
+    Page,
+    /// `GET /b/dev/static/dev.js`
+    PageScript,
+    /// `GET /b/dev/static/dev.css`
+    PageStylesheet,
     /// `GET /b/dev/api/status`
     ApiStatus,
     /// `GET /b/dev/api/files`
@@ -111,6 +119,13 @@ pub enum Route {
 /// percent-encode it correctly to name a file in a subdirectory. The path
 /// travels in the JSON body, where it needs no encoding at all.
 pub const ROUTES: &[EndpointRoute<Route>] = &[
+    EndpointRoute::new(HttpMethod::Get, "/b/dev", Route::Page),
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/static/dev.js", Route::PageScript),
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/static/dev.css",
+        Route::PageStylesheet,
+    ),
     EndpointRoute::new(HttpMethod::Get, "/b/dev/api/status", Route::ApiStatus),
     EndpointRoute::new(HttpMethod::Get, "/b/dev/api/files", Route::ApiFilesList),
     EndpointRoute::new(
@@ -348,6 +363,27 @@ impl Block for DevBlock {
         ])
         .category(wafer_run::BlockCategory::Feature)
         .endpoints(vec![
+            // The document and its two assets carry no schemas — there is no
+            // JSON contract to describe, and `has_schema()` therefore keeps
+            // all three out of `/openapi.json` exactly as it keeps the HTML
+            // pages of every other block out. They are declared all the same:
+            // `routes_and_endpoints_stay_in_lockstep` requires the dispatch
+            // table and this list to be the same set, and the declaration is
+            // what pins their `Admin` tier where the router can enforce it.
+            BlockEndpoint::get("/b/dev")
+                .summary("The workspace document")
+                .description(
+                    "The sandbox's HTML workspace: file tree and editor, the live site in a \
+                     sandboxed iframe, the activation progress panel, and the page-scoped agent \
+                     tools registered from /b/dev/api/tools.json.",
+                )
+                .auth(AuthLevel::Admin),
+            BlockEndpoint::get("/b/dev/static/dev.js")
+                .summary("The workspace page's script")
+                .auth(AuthLevel::Admin),
+            BlockEndpoint::get("/b/dev/static/dev.css")
+                .summary("The workspace page's stylesheet")
+                .auth(AuthLevel::Admin),
             BlockEndpoint::get("/b/dev/api/status")
                 .summary("Sandbox status")
                 .auth(AuthLevel::Admin)
@@ -430,6 +466,9 @@ impl Block for DevBlock {
         // Every route is `RouteAccess::Admin` at the router; handlers do not
         // re-check the caller's role.
         match route {
+            Route::Page => page::handle(ctx, &msg).await,
+            Route::PageScript => page::handle_script(),
+            Route::PageStylesheet => page::handle_stylesheet(),
             Route::ApiStatus => status::handle(ctx, &self.shared).await,
             Route::ApiFilesList => files::handle_list(ctx, &msg).await,
             Route::ApiFilesRead => files::handle_read(ctx, input).await,
