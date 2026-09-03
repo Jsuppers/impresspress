@@ -44,6 +44,8 @@ const PRODUCTS_TABLE: &str = "impresspress__products__products";
 const OFFERS_TABLE: &str = "impresspress__products__offers";
 const OFFER_COMPONENTS_TABLE: &str = "impresspress__products__offer_components";
 const PRODUCT_VERSIONS_TABLE: &str = "impresspress__products__product_versions";
+const CHECKOUT_PRESETS_TABLE: &str = "impresspress__products__checkout_presets";
+const PRODUCTS_VARIABLES_TABLE: &str = "impresspress__products__variables";
 const PURCHASES_TABLE: &str = "impresspress__products__purchases";
 const ADMIN_USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
@@ -324,9 +326,15 @@ async fn export_carries_products_but_never_secrets_or_orders() {
 ///
 /// A soft-deleted product with an offer is the shape that breaks it: the
 /// product is filtered out by `list_live_products`, while `offers`,
-/// `offer_components` and `product_versions` were read whole. The imported
-/// shop then holds an offer whose `product_id` names no row — inert (the
-/// catalog reads active products) but data the export never decided to carry.
+/// `product_versions` and — two links down — `offer_components`, `variables`
+/// and `checkout_presets` were read whole. The imported shop then holds an
+/// offer whose `product_id` names no row, and inputs and presets naming that
+/// offer — inert (the catalog reads active products) but data the export
+/// never decided to carry.
+///
+/// A variable with a BLANK `offer_id` is the deliberate exception and is
+/// asserted here too: that column is `NOT NULL DEFAULT ''`, so an unowned
+/// variable is a legitimate row and not an orphan.
 #[tokio::test]
 async fn a_soft_deleted_products_offers_and_versions_do_not_travel() {
     let ctx = TestContext::with_products().await.with_auth_added().await;
@@ -374,6 +382,40 @@ async fn a_soft_deleted_products_offers_and_versions_do_not_travel() {
         json!({ "product_id": "prod_widget", "version": 1 }),
     )
     .await;
+    // Two links from the product: a preset and a typed input on the retired
+    // offer, the same pair on the live one, and one variable owned by no
+    // offer at all.
+    for (id, offer) in [
+        ("preset_retired", "offer_retired"),
+        ("preset_live", "offer_standard"),
+    ] {
+        seed_row(
+            &ctx,
+            CHECKOUT_PRESETS_TABLE,
+            id,
+            json!({ "offer_id": offer, "name": "Preset", "slug": id }),
+        )
+        .await;
+    }
+    for (id, offer) in [
+        ("var_retired", "offer_retired"),
+        ("var_live", "offer_standard"),
+    ] {
+        seed_row(
+            &ctx,
+            PRODUCTS_VARIABLES_TABLE,
+            id,
+            json!({ "offer_id": offer, "name": "pages", "var_type": "number" }),
+        )
+        .await;
+    }
+    seed_row(
+        &ctx,
+        PRODUCTS_VARIABLES_TABLE,
+        "var_global",
+        json!({ "offer_id": "", "name": "legacy", "var_type": "number" }),
+    )
+    .await;
     db::update(
         &ctx,
         PRODUCTS_TABLE,
@@ -385,22 +427,42 @@ async fn a_soft_deleted_products_offers_and_versions_do_not_travel() {
 
     let snap = data_snapshot::export(&ctx).await.unwrap();
 
+    // Sorted: which rows a table carries is the subject, and their order is
+    // the database's listing order rather than anything this asserts.
     let ids = |table: &str| -> Vec<String> {
-        snap.tables[table]
+        let mut ids: Vec<String> = snap.tables[table]
             .iter()
             .map(|row| row["id"].as_str().unwrap_or_default().to_string())
-            .collect()
+            .collect();
+        ids.sort();
+        ids
     };
     assert_eq!(ids(PRODUCTS_TABLE), vec!["prod_widget"]);
     // The live product's rows all travel…
     assert_eq!(ids(OFFERS_TABLE), vec!["offer_standard"]);
     assert_eq!(ids(OFFER_COMPONENTS_TABLE), vec!["component_base"]);
     assert_eq!(ids(PRODUCT_VERSIONS_TABLE), vec!["version_live"]);
-    // …and the retired one's — including the component, which is two links
-    // from the product it is orphaned by — travel with it or not at all.
-    assert!(!ids(OFFERS_TABLE).contains(&"offer_retired".to_string()));
-    assert!(!ids(OFFER_COMPONENTS_TABLE).contains(&"component_retired".to_string()));
-    assert!(!ids(PRODUCT_VERSIONS_TABLE).contains(&"version_retired".to_string()));
+    assert_eq!(ids(CHECKOUT_PRESETS_TABLE), vec!["preset_live"]);
+    // …the unowned variable travels beside the live offer's own…
+    assert_eq!(
+        ids(PRODUCTS_VARIABLES_TABLE),
+        vec!["var_global", "var_live"]
+    );
+    // …and the retired product's rows — including the three that are two
+    // links from the product that orphaned them — travel with it or not at
+    // all.
+    for (table, id) in [
+        (OFFERS_TABLE, "offer_retired"),
+        (OFFER_COMPONENTS_TABLE, "component_retired"),
+        (PRODUCT_VERSIONS_TABLE, "version_retired"),
+        (CHECKOUT_PRESETS_TABLE, "preset_retired"),
+        (PRODUCTS_VARIABLES_TABLE, "var_retired"),
+    ] {
+        assert!(
+            !ids(table).contains(&id.to_string()),
+            "{id} travelled in {table} without the product it belongs to"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +963,103 @@ fn every_upsert_target_is_a_unique_key_of_its_table() {
                  appears in the migrations — the upsert would insert and then collide"
             );
         }
+    }
+}
+
+/// The `product_id` / `offer_id` columns each allowlisted table declares,
+/// read off the migrations.
+///
+/// Both shapes count, because both are how the schema got here: a column in
+/// the `CREATE TABLE` body, and a later `ALTER TABLE … ADD COLUMN` (which is
+/// how `variables` got its `offer_id` in migration 005, and the reason a scan
+/// of `CREATE TABLE`s alone would have missed exactly the table this test
+/// exists to catch).
+fn owner_columns_declared_in_migrations() -> BTreeSet<(String, String)> {
+    const OWNER_COLUMNS: &[&str] = &["product_id", "offer_id"];
+    let sql: String = sqlite_migration_sql()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut found = BTreeSet::new();
+    for (table, _mode) in data_snapshot::TABLE_ALLOWLIST {
+        let create = format!("CREATE TABLE IF NOT EXISTS {table} (");
+        let body = sql
+            .split_once(&create)
+            .map(|(_, rest)| rest.split_once(");").map_or(rest, |(body, _)| body))
+            .unwrap_or_else(|| panic!("{table} has no CREATE TABLE in the migrations"));
+        // The column NAME is the first token of each comma-separated
+        // declaration, compared whole: `stripe_product_id` is not
+        // `product_id`, and a substring match would call it one.
+        for column in body.split(',') {
+            let name = column.split_whitespace().next().unwrap_or_default();
+            if OWNER_COLUMNS.contains(&name) {
+                found.insert((table.to_string(), name.to_string()));
+            }
+        }
+        let alter = format!("ALTER TABLE {table} ADD COLUMN ");
+        let mut rest = sql.as_str();
+        while let Some((_, tail)) = rest.split_once(&alter) {
+            let name = tail.split_whitespace().next().unwrap_or_default();
+            if OWNER_COLUMNS.contains(&name) {
+                found.insert((table.to_string(), name.to_string()));
+            }
+            rest = tail;
+        }
+    }
+    found
+}
+
+/// `OWNED_TABLES` is closed against the schema, in both directions.
+///
+/// The export filters an owned table's rows against the ids its owner
+/// actually exported, and products are read live-only — so a table with a
+/// `product_id`/`offer_id` that is NOT on that list exports rows pointing at
+/// products the archive does not carry. `M9` was three such tables; the point
+/// of this test is that the fourth one to be added to `TABLE_ALLOWLIST` fails
+/// the build instead of shipping orphans.
+///
+/// The reverse direction matters too: an entry naming a column its table does
+/// not have would filter every row of it out (`None` is dropped), silently
+/// emptying the table in every export.
+#[test]
+fn owned_tables_covers_every_allowlisted_table_with_an_owner_column() {
+    let declared = owner_columns_declared_in_migrations();
+    // The scan found something at all — a broken parser that found nothing
+    // would make both assertions below vacuous.
+    assert!(
+        declared.len() >= 5,
+        "the owner-column scan found {declared:?} — it lost its way"
+    );
+    let listed: BTreeSet<(String, String)> = data_snapshot::OWNED_TABLES
+        .iter()
+        .map(|(table, column, _)| (table.to_string(), column.to_string()))
+        .collect();
+
+    let unowned: Vec<&(String, String)> = declared.difference(&listed).collect();
+    assert!(
+        unowned.is_empty(),
+        "allowlisted tables with an owner column that OWNED_TABLES does not filter on: \
+         {unowned:?} — add each with its owner, or their rows travel orphaned when the owner \
+         is soft-deleted"
+    );
+    let imaginary: Vec<&(String, String)> = listed.difference(&declared).collect();
+    assert!(
+        imaginary.is_empty(),
+        "OWNED_TABLES filters on columns the schema does not declare: {imaginary:?} — every \
+         row of those tables would be dropped from every export"
+    );
+
+    // And each entry's OWNER is itself exported, or the filter reads against
+    // a set that is never filled.
+    let allowlisted: BTreeSet<&str> = data_snapshot::TABLE_ALLOWLIST
+        .iter()
+        .map(|(table, _)| *table)
+        .collect();
+    for (table, _column, owner) in data_snapshot::OWNED_TABLES {
+        assert!(
+            allowlisted.contains(owner),
+            "{table:?} is filtered against {owner:?}, which is not on TABLE_ALLOWLIST"
+        );
     }
 }
 

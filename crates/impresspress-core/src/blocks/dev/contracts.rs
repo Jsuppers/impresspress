@@ -44,10 +44,13 @@ pub struct StatusResponse {
     /// site and no other sign of it (`dev_runtime::install` logs and carries
     /// on, because a sandbox that refuses to boot is one whose `/b/dev` page
     /// — the only thing that could fix it — never comes up), so this is what
-    /// makes the cause reachable from the page and from `dev_status` instead
-    /// of only from the service worker's console. Read from the same row an
-    /// exported bundle's admin sees on `/b/admin/settings/variables`, which
-    /// is the only surface an exported site has (it has no `/b/dev`).
+    /// makes the cause readable through `dev_status` instead of only through
+    /// the service worker's console. Read from the same row an admin sees on
+    /// `/b/admin/settings/variables`, which is the only surface an exported
+    /// site has (it has no `/b/dev`). `dev.js` does not render it: the page
+    /// polls this endpoint several times a second, so a log line would need
+    /// its own "said this already" state, and the agent that would act on a
+    /// refused seed reads `dev_status` rather than the log.
     pub seed_error: Option<String>,
 }
 

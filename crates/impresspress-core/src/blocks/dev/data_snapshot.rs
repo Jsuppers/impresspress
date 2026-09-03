@@ -156,9 +156,16 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     (TYPES_TABLE, Mode::Upsert(BY_ID)),
     (GROUP_TEMPLATES_TABLE, Mode::Upsert(BY_ID)),
     (PRODUCT_TEMPLATES_TABLE, Mode::Upsert(BY_ID)),
-    (PRODUCTS_VARIABLES_TABLE, Mode::Upsert(BY_ID)),
     (PRODUCT_VERSIONS_TABLE, Mode::Upsert(BY_ID)),
     (OFFERS_TABLE, Mode::Upsert(BY_ID)),
+    // The four below hang off a row above them, and [`export`] filters each
+    // against the ids its owner actually exported — so the order here is
+    // load-bearing, not alphabetical: an owner listed after its dependents
+    // would be filtering against a set nothing had filled yet. `variables`
+    // sits here rather than beside the other product-shaped tables for
+    // exactly that reason. [`OWNED_TABLES`], and
+    // `every_owned_table_is_listed_after_its_owner`, are what keep it true.
+    (PRODUCTS_VARIABLES_TABLE, Mode::Upsert(BY_ID)),
     (OFFER_COMPONENTS_TABLE, Mode::Upsert(BY_ID)),
     (CHECKOUT_PRESETS_TABLE, Mode::Upsert(BY_ID)),
     // --- admin: IAM catalog plus config. `VARIABLES_TABLE` is filtered row
@@ -356,11 +363,11 @@ mod variable_is_exportable_tests {
 /// Read every [`TABLE_ALLOWLIST`] table's rows into a [`DataSnapshot`].
 pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
     let mut tables = BTreeMap::new();
-    // The ids the products table actually exported, and the offers that
-    // survived them. Products are read live-only ([`list_live_products`]);
-    // three tables below hold rows that belong to a product and mean nothing
-    // without it, so they are filtered against these sets rather than read
-    // whole — see [`OWNED_TABLES`].
+    // The ids each owning table actually exported: the live products, and the
+    // offers that survived them. Products are read live-only
+    // ([`list_live_products`]), and the tables below hold rows that belong to
+    // a product or an offer and mean nothing without it, so they are filtered
+    // against these sets rather than read whole — see [`OWNED_TABLES`].
     let mut exported: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for &(table, _mode) in TABLE_ALLOWLIST {
         // Products alone: read through the repo module's own live-only
@@ -395,30 +402,49 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
     })
 }
 
-/// The three tables whose rows hang off another exported table's row, as
-/// `(table, the column naming its owner, the owner's table)`.
+/// Every allowlisted table whose rows hang off another allowlisted table's
+/// row, as `(table, the column naming its owner, the owner's table)`.
 ///
 /// Products are exported live-only, so without this an offer whose product was
 /// soft-deleted would travel while its product did not, and land in the
-/// imported shop pointing at nothing. Inert (the catalog reads active
-/// products) but it is data the export would be carrying without having
-/// decided to.
+/// imported shop pointing at nothing — as would that offer's components, its
+/// typed input variables and its checkout presets, which are two links from
+/// the product that orphaned them. Inert (the catalog reads active products)
+/// but it is data the export would be carrying without having decided to.
 ///
-/// `variables` is deliberately NOT here even though it has an `offer_id`: the
-/// column is `NOT NULL DEFAULT ''` (products migration 005), so an unowned
-/// variable is a legitimate state and "no owner" is not evidence of an orphan
-/// the way it is for these three.
-const OWNED_TABLES: &[(&str, &str, &str)] = &[
+/// **This list is closed against the schema.** Every allowlisted table whose
+/// migrations declare a `product_id` or `offer_id` column must appear here
+/// with that column, and `owned_tables_covers_every_allowlisted_table_with_an_owner_column`
+/// (`tests/dev_data_snapshot.rs`) reads the migrations to prove it — the same
+/// discipline `every_declared_table_of_the_three_blocks_has_an_export_decision`
+/// applies to the allowlist itself. A table added to the allowlist with a
+/// dangling reference nobody thought about fails the build rather than
+/// exporting orphans.
+pub const OWNED_TABLES: &[(&str, &str, &str)] = &[
     (PRODUCT_VERSIONS_TABLE, "product_id", PRODUCTS_COLLECTION),
     (OFFERS_TABLE, "product_id", PRODUCTS_COLLECTION),
     (OFFER_COMPONENTS_TABLE, "offer_id", OFFERS_TABLE),
+    (PRODUCTS_VARIABLES_TABLE, "offer_id", OFFERS_TABLE),
+    (CHECKOUT_PRESETS_TABLE, "offer_id", OFFERS_TABLE),
 ];
 
-/// Whether one row's owner is in the export, for the [`OWNED_TABLES`]; every
-/// other table's rows pass unconditionally.
+/// Whether one row's owners are all in the export, for the [`OWNED_TABLES`];
+/// every other table's rows pass unconditionally.
+///
+/// EVERY entry naming `table` has to clear, not the first one found: a table
+/// that hangs off two rows (a `product_id` *and* an `offer_id`) is orphaned by
+/// either of them going missing, and the schema check above admits exactly
+/// that shape.
+///
+/// An EMPTY owner id is "unowned", and is kept. `variables.offer_id` is
+/// `TEXT NOT NULL DEFAULT ''` (products migration 005 adds the column to rows
+/// that predate offers entirely), so a blank there is a legitimate state and
+/// not evidence of an orphan; the other four declare the column `NOT NULL`
+/// with no default, so every row of theirs names a real owner and the rule
+/// costs them nothing.
 ///
 /// A row whose owner column is missing or is not a string is dropped: the
-/// schema declares all three `TEXT NOT NULL`, so a row this cannot read is one
+/// schema declares all five `TEXT NOT NULL`, so a row this cannot read is one
 /// this build does not understand, and carrying it would be exporting a
 /// dangling reference on the strength of not having looked.
 fn owner_was_exported(
@@ -426,20 +452,25 @@ fn owner_was_exported(
     row: &serde_json::Map<String, Value>,
     exported: &BTreeMap<&str, BTreeSet<String>>,
 ) -> bool {
-    let Some((_, column, owner)) = OWNED_TABLES.iter().find(|(name, _, _)| *name == table) else {
-        return true;
-    };
-    // Unreachable while `TABLE_ALLOWLIST` lists each owner before the tables
-    // that hang off it — which `every_owned_table_is_listed_after_its_owner`
-    // pins. Reading "no owner exported" from a set that has not been filled
-    // yet would silently empty the table, so the miss is treated as "keep the
-    // row" and the test is what makes it impossible.
-    let Some(ids) = exported.get(owner) else {
-        return true;
-    };
-    row.get(*column)
-        .and_then(Value::as_str)
-        .is_some_and(|id| ids.contains(id))
+    OWNED_TABLES
+        .iter()
+        .filter(|(name, _, _)| *name == table)
+        .all(|(_, column, owner)| {
+            // Unreachable while `TABLE_ALLOWLIST` lists each owner before the
+            // tables that hang off it — which
+            // `every_owned_table_is_listed_after_its_owner` pins. Reading "no
+            // owner exported" from a set that has not been filled yet would
+            // silently empty the table, so the miss is treated as "keep the
+            // row" and the test is what makes it impossible.
+            let Some(ids) = exported.get(owner) else {
+                return true;
+            };
+            match row.get(*column).and_then(Value::as_str) {
+                Some("") => true,
+                Some(id) => ids.contains(id),
+                None => false,
+            }
+        })
 }
 
 /// The `id` of every row in `rows`.

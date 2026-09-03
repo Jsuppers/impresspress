@@ -339,9 +339,14 @@ async fn import_bundle(
         // the manifest carries, not a reason to take it on trust.
         //
         // Zero is "no version reported", exactly as it is on the staging path:
-        // a compiler that could not read the file records `0` and nothing is
-        // checked. A bundle exported before this field existed carries the
-        // same `0` and must still import.
+        // a compile whose request carried no `wafer_guest_version` — a
+        // compiler that could not read the file — is recorded as `0` and
+        // nothing is checked. The generation manifest keeps that `0` and an
+        // export carries it forward, so a bundle whose block was built that
+        // way must still import. (Not a compatibility allowance for older
+        // bundles: `DynamicBlockSpec.wafer_guest_version` has no
+        // `serde(default)`, so a manifest predating the field fails to
+        // deserialize long before this line.)
         if spec.wafer_guest_version != 0 && spec.wafer_guest_version != super::WAFER_GUEST_VERSION {
             return Err(refusal(
                 &spec.name,
