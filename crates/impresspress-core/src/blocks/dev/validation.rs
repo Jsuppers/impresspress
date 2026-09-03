@@ -998,7 +998,10 @@ mod tests {
         };
         let found = validate_spec(&spec, &builtin_route_prefixes(), &[]).expect_err("refused");
         assert_eq!(
-            found.iter().map(|d| d.code.as_str()).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|d| d.code.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
             vec![NAME_MISMATCH]
         );
     }
