@@ -1,9 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { bootServiceWorker, WELCOME_PHRASE } from './fixtures/dev-sandbox';
-
-import { bootServiceWorker, loginAdmin } from './fixtures/dev-helpers';
+import { bootServiceWorker, loginAdmin, WELCOME_PHRASE } from './fixtures/dev-sandbox';
 
 /**
  * Plan 1 checkpoint for the browser development sandbox.

@@ -1,5 +1,11 @@
 import { test, expect, type Page } from '@playwright/test';
-import { bootServiceWorker, WELCOME_HEADING, WELCOME_PHRASE } from './fixtures/dev-sandbox';
+import {
+  ADMIN_EMAIL,
+  ADMIN_PASSWORD,
+  bootServiceWorker,
+  WELCOME_HEADING,
+  WELCOME_PHRASE,
+} from './fixtures/dev-sandbox';
 import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
 import { SHOP_OFFER, SHOP_PRODUCT } from './fixtures/shop-fixture';
 import {
@@ -105,10 +111,6 @@ const PAGE_TOOLS = [...DEV_TOOLS, ...SHOP_TOOLS].sort();
  */
 const MANIFEST_TOOLS = PAGE_TOOLS.filter((name) => !PAGE_LOCAL_TOOLS.includes(name));
 
-/** The sandbox's own credentials, printed on its welcome page. */
-const ADMIN_EMAIL = 'admin@example.com';
-const ADMIN_PASSWORD = 'admin123';
-
 /** The heading the agent's page carries; the proof a write reached the site. */
 const SHOP_HEADING = 'The print shop';
 
@@ -195,10 +197,12 @@ const PIXEL_PNG_PATH = 'site/pixel.png';
  * Sign in the way a first-time visitor does: from the welcome page's own
  * "Open workspace" link.
  *
- * Not `goto('/b/dev')` — that would skip the one navigation this deployment
- * actually ships to get a human into the workspace, which is a link the seed
- * site carries and a `?redirect=` the login page has to honour. Both are
- * part of Plan 2's surface, so both are walked.
+ * Not `loginToWorkspace` (`fixtures/dev-sandbox.ts`), and not `goto('/b/dev')`
+ * — either would skip the one navigation this deployment actually ships to get
+ * a human into the workspace, which is a link the seed site carries and a
+ * `?redirect=` the login page has to honour. Both are part of Plan 2's
+ * surface, so both are walked here; the shared helper is for the specs whose
+ * subject is what happens AFTER the workspace is open.
  */
 async function openWorkspace(page: Page) {
   await expect(page.locator('body')).toContainText(WELCOME_PHRASE, { timeout: 60_000 });

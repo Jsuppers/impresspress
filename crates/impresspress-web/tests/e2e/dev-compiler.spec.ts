@@ -4,7 +4,7 @@ import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loginToWorkspace } from './fixtures/dev-helpers';
+import { loginToWorkspace } from './fixtures/dev-sandbox';
 
 /**
  * `BrowserRustCompiler` — the page half of the compiler protocol.
