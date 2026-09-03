@@ -585,3 +585,269 @@ async fn seed_import_fails_when_data_json_does_not_verify() {
         0
     );
 }
+
+// ---------------------------------------------------------------------------
+// Identity: the destination mints its own ids for some allowlisted tables
+// ---------------------------------------------------------------------------
+
+const ADMIN_ROLES_TABLE: &str = "impresspress__admin__roles";
+
+/// `created_at`/`updated_at` are `TEXT NOT NULL` with no default on these
+/// tables, and a real exported row always carries them — it came out of
+/// `db::list_all`. A fixture row that omitted them would fail the insert for
+/// a reason that has nothing to do with what these tests are about.
+const STAMP: &str = "2026-09-03T00:00:00Z";
+
+/// An import into an instance that has ALREADY seeded its own copies of the
+/// rows the snapshot carries must succeed.
+///
+/// This is the case design §10.2 is entirely about — a bundle importing into
+/// a fresh instance — and "fresh" does not mean empty: by the time the seed
+/// import runs, admin's migration has seeded `roles` and the boot hook has
+/// seeded `variables`, each with an id this instance minted for itself. The
+/// exporting instance minted different ids for the same rows. Both tables
+/// mark their natural key `UNIQUE` (`roles.name`, `variables.key`), so an
+/// upsert keyed on `id` does not conflict on the id at all: it is an INSERT
+/// that then violates that index, and `import` fails wholesale with a bare
+/// "internal database error".
+///
+/// It is written with two rows per table on purpose — one whose natural key
+/// the destination already has (the collision) and one it does not (a plain
+/// insert) — because a fix that simply skipped conflicting rows would pass a
+/// test that only had the first.
+#[tokio::test]
+async fn an_import_lands_on_rows_the_destination_seeded_with_its_own_ids() {
+    let ctx = TestContext::with_products().await;
+
+    // What the DESTINATION seeded for itself, with its own ids.
+    seed_row(
+        &ctx,
+        ADMIN_ROLES_TABLE,
+        "role_minted_here",
+        json!({ "name": "admin", "description": "this instance's own admin role" }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        admin_schema::VARIABLES_TABLE,
+        "var_minted_here",
+        json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "value": "Untitled",
+            "sensitive": false,
+        }),
+    )
+    .await;
+
+    // What the SNAPSHOT carries: the same natural keys under the exporting
+    // instance's ids, plus one row of each that is genuinely new.
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        ADMIN_ROLES_TABLE.to_string(),
+        vec![
+            json_map(json!({
+                "id": "role_minted_over_there",
+                "name": "admin",
+                "description": "the exporting instance's admin role",
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect(),
+            json_map(json!({
+                "id": "role_editor",
+                "name": "editor",
+                "description": "a role the destination has never heard of",
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect(),
+        ],
+    );
+    tables.insert(
+        admin_schema::VARIABLES_TABLE.to_string(),
+        vec![
+            json_map(json!({
+                "id": "var_minted_over_there",
+                "key": "WAFER_RUN_SHARED__APP_NAME",
+                "value": "The print shop",
+                "sensitive": false,
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect(),
+            json_map(json!({
+                "id": "var_new",
+                "key": "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+                "value": "true",
+                "sensitive": false,
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect(),
+        ],
+    );
+    let snapshot = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snapshot)
+        .await
+        .expect("an import must land on rows the destination seeded for itself");
+
+    // One `admin` role, not two — and it carries the SNAPSHOT's description
+    // under the DESTINATION's id. Keeping the destination's id is what stops
+    // an import from orphaning every `user_roles.role_id` already pointing at
+    // it.
+    let roles = db::list_all(&ctx, ADMIN_ROLES_TABLE, Vec::new())
+        .await
+        .unwrap();
+    let admin_roles: Vec<_> = roles
+        .iter()
+        .filter(|r| r.data["name"] == json!("admin"))
+        .collect();
+    assert_eq!(admin_roles.len(), 1, "{roles:?}");
+    assert_eq!(admin_roles[0].id, "role_minted_here");
+    assert_eq!(
+        admin_roles[0].data["description"],
+        json!("the exporting instance's admin role")
+    );
+    // …and the role the destination had never heard of was inserted, under
+    // the id the snapshot gave it.
+    assert!(roles.iter().any(|r| r.id == "role_editor"), "{roles:?}");
+
+    let vars = db::list_all(&ctx, admin_schema::VARIABLES_TABLE, Vec::new())
+        .await
+        .unwrap();
+    let app_name: Vec<_> = vars
+        .iter()
+        .filter(|v| v.data["key"] == json!("WAFER_RUN_SHARED__APP_NAME"))
+        .collect();
+    assert_eq!(app_name.len(), 1, "{vars:?}");
+    assert_eq!(app_name[0].id, "var_minted_here");
+    assert_eq!(app_name[0].data["value"], json!("The print shop"));
+    assert!(vars.iter().any(|v| v.id == "var_new"), "{vars:?}");
+}
+
+/// Re-importing the SAME snapshot converges rather than duplicating — the
+/// idempotence the module docs claim, now that the conflict target is the
+/// natural key rather than the id.
+#[tokio::test]
+async fn re_importing_one_snapshot_converges_on_the_natural_key() {
+    let ctx = TestContext::with_products().await;
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        ADMIN_ROLES_TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "role_a",
+            "name": "admin",
+            "created_at": STAMP,
+            "updated_at": STAMP,
+        }))
+        .into_iter()
+        .collect()],
+    );
+    let snapshot = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snapshot).await.unwrap();
+    data_snapshot::import(&ctx, &snapshot).await.unwrap();
+
+    let roles = db::list_all(&ctx, ADMIN_ROLES_TABLE, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(roles.len(), 1, "{roles:?}");
+}
+
+/// Every `Upsert` table's declared conflict columns must be columns the table
+/// actually has a `UNIQUE` constraint on — an upsert whose conflict target is
+/// not unique is not an upsert, it is an insert that will one day collide.
+///
+/// Read off the migration SQL, like
+/// `every_declared_table_of_the_three_blocks_has_an_export_decision` above:
+/// the schema is the ground truth, and a `UNIQUE` added or dropped there
+/// without a matching change here should fail rather than wait for an export
+/// to fail in someone's browser.
+#[test]
+fn every_upsert_target_is_a_unique_key_of_its_table() {
+    // Whitespace-normalised so the checks below are about the SQL rather than
+    // about how it happens to be laid out.
+    let sql: String = sqlite_migration_sql()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (table, mode) in data_snapshot::TABLE_ALLOWLIST {
+        let data_snapshot::Mode::Upsert(conflict) = mode else {
+            continue;
+        };
+        for column in *conflict {
+            if *column == "id" {
+                // Every allowlisted table declares `id TEXT PRIMARY KEY`, so
+                // an id conflict target is unique by construction. Assert the
+                // table exists at all, which is what would break first.
+                assert!(
+                    sql.contains(&format!("CREATE TABLE IF NOT EXISTS {table} (")),
+                    "{table} has no CREATE TABLE in the migrations"
+                );
+                continue;
+            }
+            // Either an inline `<column> TEXT … UNIQUE` in the CREATE TABLE,
+            // or a `CREATE UNIQUE INDEX … ON <table>(<column>)`.
+            let create = format!("CREATE TABLE IF NOT EXISTS {table} (");
+            let body = sql
+                .split_once(&create)
+                .map(|(_, rest)| rest.split_once(");").map_or(rest, |(body, _)| body))
+                .unwrap_or_else(|| panic!("{table} has no CREATE TABLE in the migrations"));
+            let inline = body.split(',').any(|col| {
+                let col = col.trim();
+                col.starts_with(&format!("{column} ")) && col.contains("UNIQUE")
+            });
+            let indexed = sql.contains(&format!("ON {table}({column})"))
+                || sql.contains(&format!("ON {table} ({column})"));
+            assert!(
+                inline || indexed,
+                "{table}'s upsert conflicts on {column:?}, but no UNIQUE constraint on it \
+                 appears in the migrations — the upsert would insert and then collide"
+            );
+        }
+    }
+}
+
+/// Every SQLite migration of the three blocks, concatenated.
+///
+/// The same three directories `tables_created_in_migrations` reads, and for
+/// the same reason: the schema is the ground truth for what the import can
+/// actually do, and a Rust-side declaration of it is a second copy that can
+/// fall behind.
+fn sqlite_migration_sql() -> String {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = String::new();
+    for block in ["products", "admin", "auth"] {
+        let dir = manifest_dir
+            .join("src/blocks")
+            .join(block)
+            .join("migrations");
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql")
+                || !path.to_string_lossy().contains("sqlite")
+            {
+                continue;
+            }
+            out.push_str(
+                &std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+            );
+            out.push('\n');
+        }
+    }
+    out
+}

@@ -97,14 +97,38 @@ pub struct DataSnapshot {
     pub tables: BTreeMap<String, Vec<serde_json::Map<String, Value>>>,
 }
 
+/// The conflict target of a [`Mode::Upsert`] table whose identity is its `id`.
+///
+/// Most exported tables are like this: the row's id is the only thing that
+/// identifies it, and two instances never mint the same one.
+pub const BY_ID: &[&str] = &["id"];
+
 /// How [`import`] applies one allowlisted table's rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// `db::upsert` each row, keyed on `id`. Safe to run repeatedly — a
-    /// second import of the same snapshot updates the same rows rather than
-    /// duplicating them — and never removes a row the destination already
-    /// has that the snapshot doesn't mention.
-    Upsert,
+    /// `db::upsert` each row, with the named columns as the conflict target.
+    /// Safe to run repeatedly — a second import of the same snapshot updates
+    /// the same rows rather than duplicating them — and never removes a row
+    /// the destination already has that the snapshot doesn't mention.
+    ///
+    /// **The columns are the table's real identity, not always `id`.** For
+    /// most tables they are [`BY_ID`], and this is the same thing an upsert
+    /// keyed on the primary key has always done. For the handful whose rows
+    /// the DESTINATION mints for itself — `roles` and `permissions` come from
+    /// admin's own migration, `variables` from its boot seeder — the id is
+    /// per-install and the identity is a natural key the schema marks
+    /// `UNIQUE` (`roles.name`, `permissions.name`, `variables.key`). Keyed on
+    /// `id` those rows do not conflict on the id at all: they are INSERTs
+    /// that then violate the unique index on the natural key, and the whole
+    /// import fails with a bare "internal database error". Design §10.2's
+    /// promise that a bundle imports into a fresh instance is exactly the
+    /// case where the destination has already seeded its own copies of these
+    /// rows, so this is not a corner.
+    ///
+    /// On a conflict the destination keeps its OWN `id` (and its own value of
+    /// the conflict columns, which are equal by definition) and takes every
+    /// other column from the snapshot — see [`import_row`].
+    Upsert(&'static [&'static str]),
     /// Delete every row in the destination table first, then `db::create`
     /// each exported row. Reserved for the tables whose *set* must match the
     /// snapshot exactly: a fresh instance's own bootstrap admin (and its
@@ -127,23 +151,29 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     // `db::list_all`/`db::upsert` path below — this table alone carries a
     // soft-delete filter its own repo module's door tests enforce (see
     // `export`/`import_row`).
-    (PRODUCTS_COLLECTION, Mode::Upsert),
-    (GROUPS_TABLE, Mode::Upsert),
-    (TYPES_TABLE, Mode::Upsert),
-    (GROUP_TEMPLATES_TABLE, Mode::Upsert),
-    (PRODUCT_TEMPLATES_TABLE, Mode::Upsert),
-    (PRODUCTS_VARIABLES_TABLE, Mode::Upsert),
-    (PRODUCT_VERSIONS_TABLE, Mode::Upsert),
-    (OFFERS_TABLE, Mode::Upsert),
-    (OFFER_COMPONENTS_TABLE, Mode::Upsert),
-    (CHECKOUT_PRESETS_TABLE, Mode::Upsert),
+    (PRODUCTS_COLLECTION, Mode::Upsert(BY_ID)),
+    (GROUPS_TABLE, Mode::Upsert(BY_ID)),
+    (TYPES_TABLE, Mode::Upsert(BY_ID)),
+    (GROUP_TEMPLATES_TABLE, Mode::Upsert(BY_ID)),
+    (PRODUCT_TEMPLATES_TABLE, Mode::Upsert(BY_ID)),
+    (PRODUCTS_VARIABLES_TABLE, Mode::Upsert(BY_ID)),
+    (PRODUCT_VERSIONS_TABLE, Mode::Upsert(BY_ID)),
+    (OFFERS_TABLE, Mode::Upsert(BY_ID)),
+    (OFFER_COMPONENTS_TABLE, Mode::Upsert(BY_ID)),
+    (CHECKOUT_PRESETS_TABLE, Mode::Upsert(BY_ID)),
     // --- admin: IAM catalog plus config. `VARIABLES_TABLE` is filtered row
     // by row at export time (`variable_is_exportable`) rather than excluded
     // wholesale — most admin variables are ordinary site config (`APP_NAME`,
     // feature flags), exactly what a re-hosted copy needs to keep working.
-    (ROLES_TABLE, Mode::Upsert),
-    (PERMISSIONS_TABLE, Mode::Upsert),
-    (admin_schema::VARIABLES_TABLE, Mode::Upsert),
+    // These three are keyed on their NATURAL key, not on `id`: the
+    // destination seeds its own `roles`/`permissions` rows from admin's
+    // migration and its own `variables` rows from the boot seeder, each with
+    // a freshly minted id, and each table marks the natural key `UNIQUE`. An
+    // upsert keyed on `id` inserts a second `admin` role / a second
+    // `APP_NAME` variable and dies on that index. See [`Mode::Upsert`].
+    (ROLES_TABLE, Mode::Upsert(&["name"])),
+    (PERMISSIONS_TABLE, Mode::Upsert(&["name"])),
+    (admin_schema::VARIABLES_TABLE, Mode::Upsert(&["key"])),
     // --- identity: the owner's own account, `Replace`d as a set so a fresh
     // instance's bootstrap admin is gone once someone else's is imported —
     // every `owner_id`/`created_by` an imported product carries still
@@ -528,10 +558,21 @@ pub async fn import(
         if REPLACE_ORDER.contains(&table.as_str()) {
             continue; // already applied above, in dependency order
         }
-        // `Upsert` is the only mode left once `REPLACE_ORDER` is excluded —
-        // every `Mode::Replace` entry in `TABLE_ALLOWLIST` is named there.
+        // The mode comes from the allowlist rather than being assumed: it
+        // carries the table's conflict target, and every remaining entry is
+        // an `Upsert` (each `Mode::Replace` table is named in
+        // `REPLACE_ORDER`). The loop above already refused any table not on
+        // the list, so a lookup miss here is unreachable — and is reported
+        // rather than defaulted, because defaulting to `BY_ID` is precisely
+        // the assumption this field exists to stop making.
+        let Some((_, mode)) = TABLE_ALLOWLIST.iter().find(|(name, _)| name == table) else {
+            return Err(WaferError::new(
+                ErrorCode::Internal,
+                format!("{table:?} passed the allowlist check but has no import mode"),
+            ));
+        };
         for row in rows {
-            import_row(ctx, table, Mode::Upsert, row).await?;
+            import_row(ctx, table, *mode, row).await?;
         }
         report.tables.insert(table.clone(), rows.len());
     }
@@ -552,16 +593,24 @@ async fn import_row(
             let data: HashMap<String, Value> = row.clone().into_iter().collect();
             db::create(ctx, table, data).await?;
         }
-        Mode::Upsert => {
+        Mode::Upsert(conflict) => {
             let data: Vec<(String, Value)> = row.clone().into_iter().collect();
+            // Neither `id` nor the conflict columns are updated on a
+            // conflict. The conflict columns are equal by definition (that is
+            // what conflicted), and `id` must stay the DESTINATION's: an
+            // import that rewrote it would break every row already pointing
+            // at it — a `user_roles.role_id`, say — to graft on an id whose
+            // only merit is that another instance happened to mint it.
             let update_columns: Vec<String> = row
                 .keys()
-                .filter(|key| key.as_str() != "id")
+                .filter(|key| key.as_str() != "id" && !conflict.contains(&key.as_str()))
                 .cloned()
                 .collect();
+            let conflict: Vec<String> = conflict.iter().map(|c| (*c).to_string()).collect();
             // Products alone: written through the repo module's own
             // wholesale-upsert door, never the raw table name — see the
-            // comment on `TABLE_ALLOWLIST`'s products entry.
+            // comment on `TABLE_ALLOWLIST`'s products entry. That door is
+            // `BY_ID`, which is what the allowlist declares for it.
             if table == PRODUCTS_COLLECTION {
                 upsert_product_from_snapshot(ctx, data, update_columns).await?;
             } else {
@@ -569,7 +618,7 @@ async fn import_row(
                     ctx,
                     table,
                     data,
-                    vec!["id".to_string()],
+                    conflict,
                     OnConflict::SetColumns(update_columns),
                 )
                 .await?;

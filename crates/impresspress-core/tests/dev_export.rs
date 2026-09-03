@@ -39,7 +39,6 @@ use impresspress_core::{
         admin_msg, anon_msg, output_body, output_http_header, output_http_status, output_json,
         TestContext,
     },
-    util::json_map,
 };
 use serde_json::json;
 use wafer_core::clients::database as db;
@@ -86,17 +85,100 @@ fn b64(bytes: &[u8]) -> String {
     Base64::encode_string(bytes)
 }
 
-/// One active product, written straight into the table the snapshot exports.
-async fn seed_product(ctx: &TestContext) {
-    let mut row = json_map(json!({
-        "name": "Widget",
-        "status": "active",
-        "created_by": "user_owner",
-    }));
-    row.insert("id".to_string(), json!("prod_widget"));
-    db::create(ctx, PRODUCTS_TABLE, row)
-        .await
-        .expect("seed a product");
+/// Stock the shop the way an agent does — through the products admin API,
+/// not by writing rows.
+///
+/// The difference is not cosmetic. A hand-seeded row carries the handful of
+/// columns the test bothered to name; a real create/price/publish leaves rows
+/// across `products`, `offers` and `offer_components` with every column the
+/// schema declares, populated the way production populates them. The data
+/// snapshot exports THOSE, and a round trip that only ever moved a bare
+/// product row would pass while a real export failed to import — which is
+/// exactly what happened: the browser's export carried a real offer and its
+/// component, and importing them was where it broke.
+async fn seed_shop(ctx: &TestContext) {
+    let product = output_json(
+        ctx.dispatch_json(
+            admin_msg("create", "/b/products/api/admin/products"),
+            &json!({
+                "name": "Custom print",
+                "slug": "custom-print",
+                "description": "Made to order, priced by the page.",
+                "currency": "nzd",
+                "fulfillment_kind": "manual",
+            }),
+        )
+        .await,
+    )
+    .await;
+    let product_id = product["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create product: {product}"))
+        .to_string();
+
+    // A components offer with one typed input, the same shape
+    // `tests/e2e/fixtures/shop-fixture.ts` uses — a flat price would exercise
+    // neither `offer_components` nor the typed-variable columns.
+    let offer = output_json(
+        ctx.dispatch_json(
+            admin_msg(
+                "create",
+                &format!("/b/products/api/admin/products/{product_id}/offers"),
+            ),
+            &json!({
+                "name": "Custom print",
+                "mode": "payment",
+                "currency": "nzd",
+                "pricing_model": "components",
+                "usage_type": "licensed",
+                "billing_scheme": "per_unit",
+                "tax_behavior": "exclusive",
+                "variables": [{
+                    "key": "pages", "kind": "integer", "label": "Pages",
+                    "required": true, "minimum": "1", "maximum": "20",
+                    "step": "1", "sort_order": 0,
+                }],
+                "components": [{
+                    "key": "pages", "label": "Printed pages", "sort_order": 0,
+                    "required": true,
+                    "amount": { "type": "per_unit", "input": "pages", "unit_amount_minor": 1500 },
+                }],
+                "checkout": {},
+            }),
+        )
+        .await,
+    )
+    .await;
+    let offer_id = offer["offer"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create offer: {offer}"))
+        .to_string();
+
+    let published = output_json(
+        ctx.dispatch_json(
+            admin_msg(
+                "create",
+                &format!("/b/products/api/admin/products/{product_id}/offers/{offer_id}/publish"),
+            ),
+            &json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(published["status"], "active", "{published}");
+
+    let live = output_json(
+        ctx.dispatch_json(
+            admin_msg(
+                "update",
+                &format!("/b/products/api/admin/products/{product_id}"),
+            ),
+            &json!({ "status": "active" }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(live["status"], "active", "{live}");
 }
 
 /// Every entry of an archive, by path.
@@ -132,7 +214,15 @@ fn sorted(entries: &HashMap<String, Vec<u8>>) -> Vec<String> {
 /// product — the state the scenario in design §16 leaves behind.
 async fn shop_instance(control: &std::sync::Arc<FakeControl>) -> TestContext {
     control.set_validated_info(hello_info());
+    // `with_auth_added`: the data snapshot's allowlist spans products, admin
+    // AND auth (`users`, `local_credentials`, `user_roles` — the visitor's own
+    // accounts, `Mode::Replace`d as a set). A fixture without auth's tables
+    // exercises the export and import of every table EXCEPT those, which is
+    // exactly the half a real browser has and a weaker fixture would not —
+    // and `Mode::Replace` is the half that can fail.
     let ctx = TestContext::with_products()
+        .await
+        .with_auth_added()
         .await
         .with_dev_added_and_shell(control.clone(), std::sync::Arc::new(FakeShell::new()))
         .await;
@@ -164,7 +254,7 @@ async fn shop_instance(control: &std::sync::Arc<FakeControl>) -> TestContext {
     )
     .await;
     assert_eq!(staged["success"], true, "{staged}");
-    seed_product(&ctx).await;
+    seed_shop(&ctx).await;
     ctx
 }
 
@@ -829,6 +919,8 @@ async fn an_exported_seed_imports_into_a_fresh_instance() {
     b_control.set_validated_info(hello_info());
     let b = TestContext::with_products()
         .await
+        .with_auth_added()
+        .await
         .with_dev_added_and_shell(b_control.clone(), std::sync::Arc::new(FakeShell::new()))
         .await;
     let generation = seed::import(&b, b_control.as_ref(), &manifest, &fetch)
@@ -862,7 +954,7 @@ async fn an_exported_seed_imports_into_a_fresh_instance() {
         .await
         .expect("products");
     assert_eq!(products.len(), 1);
-    assert_eq!(products[0].id, "prod_widget");
+    assert_eq!(products[0].data["slug"], json!("custom-print"));
 }
 
 /// A [`seed::SeedFetch`] over the archive's own entries, keyed the way the

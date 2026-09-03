@@ -574,9 +574,11 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({
       unpacked,
     ]);
     const server = await serveDirectory(unpacked, EXPORT_PORT);
-    const exported = await browser.newContext({ baseURL: `http://127.0.0.1:${EXPORT_PORT}` });
+    const exportedContext = await browser.newContext({
+      baseURL: `http://127.0.0.1:${EXPORT_PORT}`,
+    });
     try {
-      const site = await exported.newPage();
+      const site = await exportedContext.newPage();
       await bootServiceWorker(site);
 
       // The site the agent wrote, served from a folder on a plain static
@@ -600,7 +602,7 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({
       expect(await site.evaluate(() => window.crossOriginIsolated)).toBe(false);
       console.log(`exported bundle: served, booted, shop renders: ${Date.now() - runStart} ms`);
     } finally {
-      await exported.close();
+      await exportedContext.close();
       server.kill('SIGKILL');
     }
   } finally {
