@@ -12,12 +12,18 @@
 //! needs three headers that page cannot carry:
 //!
 //! * `Cross-Origin-Opener-Policy: same-origin` and
-//!   `Cross-Origin-Embedder-Policy: require-corp` — together they make the
+//!   `Cross-Origin-Embedder-Policy: credentialless` — together they make the
 //!   document cross-origin isolated, which is what `SharedArrayBuffer` (and
-//!   so the in-browser Rust compiler) requires. They are set here, on this
-//!   document only, rather than block- or deployment-wide: isolating the JSON
-//!   API buys nothing, and a header on every response would read as a policy
-//!   the deployment does not actually have.
+//!   so the in-browser Rust compiler) requires. This document needs them
+//!   whatever the deployment's policy is, so it sets them itself. Note that a
+//!   COEP document can only embed nested documents that ALSO carry a
+//!   compatible COEP (the HTML spec's navigation-response adherence check is
+//!   origin-independent), so the preview iframe of `/` only renders when the
+//!   deployment serves the site with COEP too: the browser runtime sets the
+//!   security-headers block's `cross_origin_isolation` to `credentialless`
+//!   when the sandbox is active (design §20, amendment 14). `credentialless`
+//!   rather than `require-corp` so an agent-built site can still show a
+//!   cross-origin image without CORP on the third party.
 //! * `Cache-Control: no-store` — the block-wide rule (design §12).
 //!
 //! An `OutputStream`'s response meta is fixed when the stream is built, so
@@ -50,7 +56,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let markup = ui::shell_document(ctx, msg, shell, body()).await;
     no_store()
         .set_header("Cross-Origin-Opener-Policy", "same-origin")
-        .set_header("Cross-Origin-Embedder-Policy", "require-corp")
+        .set_header("Cross-Origin-Embedder-Policy", "credentialless")
         .body(
             markup.into_string().into_bytes(),
             "text/html; charset=utf-8",

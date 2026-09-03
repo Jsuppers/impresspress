@@ -227,6 +227,7 @@ mod tests {
                 "csp": "default-src 'self'; frame-ancestors 'none'; \
                         worker-src 'self' blob:; frame-src 'self'",
                 "frame_ancestors": "self",
+                "cross_origin_isolation": "credentialless",
             }),
         )]
     }
@@ -282,6 +283,12 @@ mod tests {
         // security-headers block rewrites that directive from the
         // `frame_ancestors` key at request time, whatever `csp` says.
         assert_eq!(merged["frame_ancestors"], serde_json::json!("self"));
+        // …including the isolation posture the preview iframe depends on: a
+        // COEP document only embeds documents that carry COEP themselves.
+        assert_eq!(
+            merged["cross_origin_isolation"],
+            serde_json::json!("credentialless")
+        );
     }
 
     /// With nothing declared, the result is what it always was.

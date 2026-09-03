@@ -291,6 +291,17 @@ impl RuntimeFactory {
                 );
             // The `/b/dev` page previews the live site in a same-origin iframe.
             security_headers["frame_ancestors"] = serde_json::json!("self");
+            // `/b/dev` is cross-origin isolated (COOP + COEP) for the
+            // compiler's `SharedArrayBuffer`, and a COEP document can only
+            // embed nested documents that carry a compatible COEP themselves
+            // — the HTML spec's check is origin-independent — so the SITE has
+            // to send it too or the preview iframe stays blank. Deployment-
+            // wide, through the block that owns response headers, and
+            // `credentialless` rather than `require-corp` so an agent-built
+            // page can still show a cross-origin image whose host never set
+            // CORP (design §20, amendment 14). `blocks::dev::page` sets the
+            // same pair on its own document and must agree with this value.
+            security_headers["cross_origin_isolation"] = serde_json::json!("credentialless");
 
             for (spec, block) in dynamic {
                 builder = builder.extra_block(spec.name.clone(), Arc::clone(block));

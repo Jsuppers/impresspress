@@ -63,7 +63,7 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
     // needs its own request.
     for (header, expected) in [
         ("cross-origin-opener-policy", "same-origin"),
-        ("cross-origin-embedder-policy", "require-corp"),
+        ("cross-origin-embedder-policy", "credentialless"),
         ("cache-control", "no-store"),
     ] {
         assert_eq!(

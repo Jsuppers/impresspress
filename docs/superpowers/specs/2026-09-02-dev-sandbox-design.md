@@ -659,7 +659,8 @@ under the cap, drops R2. Deploy config is `wrangler.toml` in the example, as
 
 `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` are set by the service worker on
-`/b/dev` responses only (the `coi-serviceworker` pattern); the compiler
+`/b/dev` responses only (the `coi-serviceworker` pattern; superseded by
+amendment 14 — deployment-wide `credentialless`); the compiler
 worker and its assets are same-origin, so no CORP headers are required. The
 static host must serve `index.html` for unknown paths so a direct navigation
 to `/b/dev` before the service worker exists still boots.
@@ -860,6 +861,20 @@ and read together with this list.
     (name mismatch, endpoint outside routes, duplicate tool name,
     `cap-requires` mismatch) wait for the runtime and are listed in
     `seed.rs`.
+
+14. **§15 / Plan 2 Task 3 — cross-origin isolation is deployment-wide and
+    `credentialless`.** A document whose COEP is not `unsafe-none` can only
+    embed nested documents that also carry a compatible COEP; the HTML
+    spec's navigation-response adherence check does not care about origin.
+    So "COOP/COEP on `/b/dev` only" leaves the preview iframe of `/` blank.
+    `wafer-run/security-headers` gains `cross_origin_isolation` ∈ {`none`
+    (default), `credentialless`, `require-corp`} (wafer-run#327,
+    `63891fac`); the browser runtime sets `credentialless` on every response
+    when the sandbox is active, and `/b/dev` sets the same pair on its own
+    document. `credentialless` rather than `require-corp` so an agent-built
+    page can still show a cross-origin image whose host never set CORP.
+    Safari does not implement `credentialless`, so it gets no isolation and
+    no threaded compiler; the WebMCP browsers are Chromium-based.
 
 ## 21. Definition of done
 
