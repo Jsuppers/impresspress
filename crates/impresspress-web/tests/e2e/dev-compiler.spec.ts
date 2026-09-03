@@ -286,10 +286,12 @@ test('the compiler adapter queues compiles, cancels one, and recovers from a bro
   expect(result.cancelled.success).toBe(false);
   expect(result.cancelled.cancelled).toBe(true);
   expect(result.cancelled.artifact).toBeNull();
-  expect(result.cancelled.stderr).toContain('cancelled');
-  // The adapter's own measurement of how long the human waited, not the
-  // worker's zero.
-  expect(result.cancelled.elapsedMs).toBeGreaterThan(0);
+  // The WORKER's own account of the cancelled build, not one the adapter
+  // made up: `cancel` names the compile's id, so the answer to it *is* that
+  // compile's one terminal message. If the adapter had invented an id, the
+  // worker would have answered `error: nothing in flight` instead and the
+  // page would be reading a synthesized result here.
+  expect(result.cancelled.stderr).toBe('cancelled');
   expect(result.cancelled.compilerVersion).toBe(FAKE_RUSTC_VERSION);
   // A fresh worker was built on demand: this is build #1 of the new one.
   expect(result.afterCancel.success).toBe(true);

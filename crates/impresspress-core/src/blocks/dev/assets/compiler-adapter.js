@@ -37,10 +37,19 @@
 //    queueing it.** The queue therefore lives here — see `compile`.
 //  * **`cancel` spends the worker.** Rubrc's shell runs a command on a
 //    session thread that nothing outside it can unwind, so a cancelled worker
-//    reports `{ cancelled: true }` and marks itself broken. The adapter must
-//    `terminate()` it and `init` a fresh one, which costs a re-instantiation
-//    (~7 s), not a re-download. That is why `cancel` and the compile timeout
-//    share one code path: both end in a destroyed worker.
+//    answers the compile with `{ cancelled: true }` and marks itself broken.
+//    The adapter must `terminate()` it and `init` a fresh one, which costs a
+//    re-instantiation (~7 s), not a re-download. That is why `cancel` and the
+//    compile timeout share one code path: both end in a destroyed worker.
+//    Note that a `cancel` carries the COMPILE's id, not one of its own, and a
+//    cancel naming anything else is answered `error` and changes nothing —
+//    which is the worker refusing to be bricked by a stray click, and the
+//    reason the adapter must never invent an id for it.
+//
+// The 120 s budget is the adapter's policy, not the worker's: the worker's own
+// ten-minute ceiling is a backstop for a wedged shell. A worker that answers
+// slowly is not misbehaving, it is compiling — so the timeout does not treat
+// it as a protocol violation, it cancels it.
 
 /**
  * The largest artifact this page will carry.
@@ -65,15 +74,15 @@ const MAX_ARTIFACT_BYTES = 4194304;
 const COMPILE_TIMEOUT_MS = 120000;
 
 /**
- * How long `cancel` waits for the worker to acknowledge it before killing it.
+ * How long `cancel` waits for the worker to answer before killing it.
  *
- * The acknowledgement carries nothing the page needs — the worker's `fail()`
- * sends an empty transcript — so this is a handshake, not a data dependency:
- * it is what makes `postMessage({ type: 'cancel' })` a message the worker
- * actually receives rather than one `terminate()` drops on the floor, and it
- * is what leaves the worker's own `state = "broken"` set before it dies. The
- * worker's message loop is the WASI farm, not the blocked session thread, so
- * it answers immediately or not at all; two seconds is generous.
+ * The answer is the cancelled compile's own terminal message — one `result`
+ * per request, cancel included — so this is a real wait, not a courtesy: it is
+ * what lets the page report the compile as the WORKER saw it rather than as
+ * the adapter guessed. Bounded, because a worker wedged badly enough not to
+ * answer is exactly what a cancel is for. The worker's message loop is the
+ * WASI farm, not the blocked session thread, so it answers immediately or not
+ * at all; two seconds is generous.
  */
 const CANCEL_GRACE_MS = 2000;
 
@@ -139,17 +148,6 @@ export class BrowserRustCompiler {
 
   /** Request id → `{ resolve, reject, onProgress, timer, startedAt }`. */
   #pending = new Map();
-
-  /**
-   * Ids the page has stopped tracking on purpose (a cancelled or timed-out
-   * build).
-   *
-   * A cancel does not stop the worker — it cannot — so the compile it
-   * abandoned may still post progress, or even its own `result`, during the
-   * acknowledgement grace. Those messages are stale, not wrong, and must not
-   * be mistaken for the worker answering something nobody asked.
-   */
-  #abandoned = new Set();
 
   /** Tail of the promise chain that serialises `compile` calls. */
   #queue = Promise.resolve();
@@ -386,13 +384,13 @@ export class BrowserRustCompiler {
    * @param {{ onProgress?: Function, timeoutMs?: number, onTimeout?: Function }} options
    */
   #request(id, message, options = {}) {
-    return new Promise((resolve, reject) => {
-      const worker = this.#worker;
-      if (!worker) {
-        reject(new Error('the compiler worker is gone'));
-        return;
-      }
-      this.#pending.set(id, {
+    const worker = this.#worker;
+    if (!worker) {
+      return Promise.reject(new Error('the compiler worker is gone'));
+    }
+    let entry;
+    const answered = new Promise((resolve, reject) => {
+      entry = {
         resolve,
         reject,
         onProgress: options.onProgress,
@@ -402,9 +400,17 @@ export class BrowserRustCompiler {
               options.onTimeout();
             }, options.timeoutMs)
           : null
-      });
-      worker.postMessage(message);
+      };
+      this.#pending.set(id, entry);
     });
+    // A settlement signal `#abandonInFlight` can wait on without competing
+    // for the answer itself — whoever asked for the compile still gets it.
+    entry.finished = answered.then(
+      () => {},
+      () => {}
+    );
+    worker.postMessage(message);
+    return answered;
   }
 
   /** Pop a pending request, clearing its timer. */
@@ -550,11 +556,6 @@ export class BrowserRustCompiler {
   }
 
   #unexpectedId(kind, id) {
-    if (this.#abandoned.has(id)) {
-      // The compile a `cancel` walked away from, answering after the fact.
-      // Expected, and already accounted for.
-      return;
-    }
     this.#violation(
       'the compiler worker answered ' + kind + ' for a request this page did not make: ' + id
     );
@@ -571,54 +572,50 @@ export class BrowserRustCompiler {
    */
   async #abandonInFlight(reason) {
     const buildId = this.#inFlight;
-    const build = buildId === null ? null : this.#take(buildId);
+    const build = buildId === null ? null : this.#pending.get(buildId);
     if (!build) {
       return;
     }
     this.#inFlight = null;
-    this.#abandoned.add(buildId);
-    const worker = this.#worker;
-    const compilerVersion = this.#rustcVersion;
-
-    if (worker) {
-      // Tell the worker before killing it — see `CANCEL_GRACE_MS`. The
-      // answer is discarded: `fail()` sends an empty transcript, so the
-      // result below is the adapter's own account of what happened, which is
-      // the only one that knows *why*.
-      const cancelId = this.#nextId('cancel');
-      const acknowledged = this.#request(
-        cancelId,
-        { type: 'cancel', id: cancelId },
-        {
-          timeoutMs: CANCEL_GRACE_MS,
-          onTimeout: () => {
-            const entry = this.#take(cancelId);
-            if (entry) {
-              entry.resolve(null);
-            }
-          }
-        }
-      );
-      // A violation or a worker error in the meantime rejects this; either
-      // way the next line is the same.
-      await acknowledged.catch(() => null);
+    // Whatever happens from here this build is over, so the 120 s timer must
+    // not fire again on the way out — a timeout that cancelled a compile
+    // would otherwise be free to cancel it a second time.
+    if (build.timer !== null) {
+      clearTimeout(build.timer);
+      build.timer = null;
     }
 
+    const worker = this.#worker;
+    if (worker) {
+      // The COMPILE's id, not one of ours: a `cancel` naming anything else is
+      // answered `error` and changes nothing, which would leave the build
+      // running under a worker about to be killed and the page holding a
+      // promise nobody will settle.
+      worker.postMessage({ type: 'cancel', id: buildId });
+      await Promise.race([
+        build.finished,
+        new Promise((resolve) => setTimeout(resolve, CANCEL_GRACE_MS))
+      ]);
+    }
+
+    // Still unanswered after the grace — or never asked, because there was no
+    // worker left to ask. The adapter says what the worker would not.
+    const stranded = this.#take(buildId);
+    if (stranded) {
+      stranded.resolve({
+        buildId,
+        success: false,
+        cancelled: true,
+        artifact: null,
+        artifactSha256: null,
+        stdout: '',
+        stderr: reason,
+        diagnostics: [],
+        elapsedMs: Date.now() - stranded.startedAt,
+        compilerVersion: this.#rustcVersion
+      });
+    }
     this.#destroy(new Error('the compiler worker was replaced: ' + reason));
-    build.resolve({
-      buildId,
-      success: false,
-      cancelled: true,
-      artifact: null,
-      artifactSha256: null,
-      stdout: '',
-      stderr: reason,
-      diagnostics: [],
-      // The worker's own figure is zero for a cancelled build, and how long
-      // the human waited is the number worth reporting.
-      elapsedMs: Date.now() - build.startedAt,
-      compilerVersion
-    });
   }
 
   /**
@@ -647,7 +644,6 @@ export class BrowserRustCompiler {
     this.#worker = null;
     this.#ready = null;
     this.#inFlight = null;
-    this.#abandoned.clear();
     const owed = Array.from(this.#pending.values());
     this.#pending.clear();
     if (worker) {
