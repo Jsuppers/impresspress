@@ -1008,6 +1008,73 @@ and read together with this list.
     when there is no asset for the pin. The correctness-CI jobs try the same
     asset first and fall back to a cache and then to a `--fast` composition.
 
+17. **§10 / Plan 4 Tasks 1–2 — the data snapshot's closed list, its
+    provider-linkage reset, and its import order.** `data_snapshot.rs`'s
+    `TABLE_ALLOWLIST`/`TABLE_EXCLUDED` between them must name every table
+    the products, admin and auth blocks declare, and
+    `every_declared_table_of_the_three_blocks_has_an_export_decision`
+    (`tests/dev_data_snapshot.rs`) checks that closure against every table a
+    `CREATE TABLE` statement in those blocks' migration directories actually
+    creates, not against `BlockInfo.collections` alone — that advisory list
+    had already fallen behind one real table
+    (`impresspress__products__stripe_events`) once. `block_settings`
+    (`admin_schema::BLOCK_SETTINGS_TABLE`) is on `TABLE_EXCLUDED`: it is this
+    instance's own per-block enable flags and migration-hash tracking, not
+    anything the visitor authored. On export, `reset_provider_linkage`
+    clears every Stripe/provider-linkage column the three exported tables
+    carry — `products.stripe_product_id`, `products.seller_account_id`,
+    `offers.stripe_product_id`, `offers.stripe_price_id`,
+    `offers.sync_status`, `offers.sync_error`, and
+    `offer_components.stripe_price_id` — back to the same "not yet synced"
+    defaults a brand-new row gets, because the importing instance has no
+    Stripe account the exported ids belong to. `Mode::Replace` tables
+    (`users`, `local_credentials`, `user_roles`) import in the fixed
+    `REPLACE_ORDER`, not the snapshot's own incidental alphabetical order —
+    `local_credentials.user_id` and `user_roles.user_id` are meaningful only
+    once the `users` row they name exists, and alphabetically
+    `"…user_roles"` sorts before `"…users"`. `import` is **not atomic**:
+    `wafer_core::clients::database` exposes no cross-call transaction, so a
+    crash partway through leaves whatever tables were already written in
+    their new state and the rest in their old one — worth a `wafer-run`
+    follow-up (a transaction/batch op), not a workaround here. It is
+    idempotent instead: every write is keyed on the snapshot's own row ids,
+    so re-importing the same snapshot converges rather than duplicates.
+    `seed/data.json` is not a bare path — `SeedManifest.data` is an
+    `Option<SeedFile>`, the same type every site file and block source entry
+    in the bundle uses, so `seed::import` verifies its hash, size and
+    content type exactly as it does for everything else instead of trusting
+    one file unchecked.
+
+18. **§7.2 / §7.3 / Plan 4 Task 4 — what retention keeps, and what "in
+    flight" means at boot.** `retention::retained` (superseding amendment
+    13's "a `Staged` row occupies a slot until it ages out") is the union of
+    three sets, deduplicated by id: the 20 newest generation rows
+    (`RETAINED_GENERATIONS`), the row that is currently `Active` however far
+    it has fallen down the ledger, and every row still in flight (`Staged`,
+    `Validating`, `Activating`) — because the activation journal may name
+    one and boot convergence re-runs it. Everything outside that union is
+    deleted, not relabelled; `Superseded` (`GenerationStatus::Superseded`,
+    written only by the activation that replaces a row) is the status of a
+    generation a later one supersedes, never an ageing marker — a `Failed`
+    generation still reads `Failed` for as long as the ledger keeps it.
+    `gc`'s reachability follows the same shape: a **blob** is reachable from
+    a retained generation's site manifest *or* from a live workspace entry
+    (a block's source tree lives in the workspace and in no generation at
+    all), and an **artifact** is reachable from a retained generation's
+    block manifest *or* from a build row still `Staged` — a compile that has
+    stored its bytes but not yet reached a generation. Both roots are read
+    only after the candidate listing, never before (`gc.rs`'s ordering
+    invariant), so nothing stored after the listing starts needs a root to
+    protect it. At boot, `activation::retire_abandoned` closes out what the
+    previous process left running: every in-flight generation row the
+    journal's `desired_generation_id` does not name is marked `Failed`
+    (`ABANDONED_AT_BOOT`), and `repo::builds::retire_in_flight` settles every
+    in-flight build row against the artifact hashes the active and
+    journalled generation manifests vouch for — a vouched-for row is
+    promoted (its `BlockInfo` is what a later collision check reads back),
+    everything else is retired. Left alone, either would pin content against
+    the workspace's 64 MiB quota (§6.6) for the life of the instance.
+
 ## 21. Definition of done
 
 - `browser-devtools` is off by default and absent from a normal bundle; the

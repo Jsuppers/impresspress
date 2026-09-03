@@ -15,6 +15,11 @@ the shop — reaches this repo, this build, or any other visitor. The only
 thing every visitor shares is the seed bundle itself, which is static files
 served by the host.
 
+For what a visitor can do with the sandbox once it's deployed — the
+workspace, backend blocks, stocking the shop, export, browser requirements —
+see [`docs/dev-sandbox.md`](../../docs/dev-sandbox.md). This README covers
+building, serving and deploying the bundle itself.
+
 ## Build
 
 ```sh
@@ -114,17 +119,25 @@ This is a throwaway per-browser instance with no data of any consequence
 behind it, which is why the credentials are public in the welcome page
 itself.
 
-## A later plan changes what `/seed/` carries — read this before adding rows
+## `seed/data.json` — read this before adding one to this bundle
 
-`seed/manifest.json`'s `data` field is reserved (design §10.1, amendment 9)
-for a `seed/data.json` snapshot a later plan will add, so an exported
-sandbox can carry its own users, not just its site and blocks. **`seed/**` is
-served by the static host as plain files, with no auth in front of it** —
-that is what lets a fresh service worker fetch it before anything else has
-booted. The day `seed/data.json` exists, it will carry password hashes for
-whatever `admin123`-style default this bundle ships, in a file anyone can
-`curl`. Do not add that file to this directory, or point one at a real
-account, without re-reading design §10.1's amendment and deciding how the
-exported hash is meant to be safe to publish (a disposable/rotated one, most
-likely) — "static file next to the site" is not a place to put a real
-credential.
+`seed/manifest.json`'s `data` field can carry a `seed/data.json` snapshot —
+rows for an explicit table allowlist, applied through typed database calls
+by `impresspress_core::blocks::dev::{data_snapshot,seed}` (design §10.1,
+amendments 9 and 17) — so an exported sandbox can carry its own products,
+offers and admin account, not just its site and blocks. This bundle's own
+welcome site carries none (`"data": null` in `seed/manifest.json`): the
+welcome site has no shop data of its own, and its bootstrap admin comes from
+`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`/`_PASSWORD` at build time,
+not from a seeded row.
+
+**`seed/**` is served by the static host as plain files, with no auth in
+front of it** — that is what lets a fresh service worker fetch it before
+anything else has booted. If a `data.json` is ever added to *this*
+directory's seed, it will carry password hashes in a file anyone can `curl`.
+Do not add one, or point one at a real account, without deciding how the
+hash it carries is meant to be safe to publish (a disposable/rotated one,
+most likely) — "static file next to the site" is not a place to put a real
+credential. This is exactly what an export's own `seed/data.json` does
+carry (the exporting visitor's own throwaway sandbox account) — see
+[`docs/dev-sandbox.md`](../../docs/dev-sandbox.md#export).
