@@ -38,7 +38,11 @@ impresspress-browser = { path = "../impresspress-browser" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
-    "Request", "Response", "ResponseInit",
+    # `RequestInit` + `RequestCache` are what let `dev_runtime`'s
+    # `BrowserShellSource` fetch the static shell with `cache: 'no-store'` —
+    # an export must never copy a previous deployment's bytes out of the HTTP
+    # cache under this build's content-hashed names.
+    "Request", "RequestInit", "RequestCache", "Response", "ResponseInit",
     "Headers", "ReadableStream",
     "Url",
     "console",

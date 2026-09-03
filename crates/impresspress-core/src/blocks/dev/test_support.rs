@@ -1,5 +1,5 @@
-//! Test doubles for the [`RuntimeControl`] seam and the [`seed::SeedFetch`]
-//! seam.
+//! Test doubles for the [`RuntimeControl`], [`ShellSource`] and
+//! [`seed::SeedFetch`] seams.
 //!
 //! Exposed under `test-support` (as well as `cfg(test)`) so the `tests/`
 //! integration crates and downstream consumers can drive the dev block without
@@ -15,7 +15,7 @@ use std::{
 
 use super::{
     blobs,
-    control::{DynamicBlockSpec, RuntimeControl, ValidationFailure, ValidationStage},
+    control::{DynamicBlockSpec, RuntimeControl, ShellSource, ValidationFailure, ValidationStage},
     paths, seed,
     seed::{SeedFetch, SeedFile},
 };
@@ -330,5 +330,108 @@ pub fn seed_file(path: &str, bytes: &[u8]) -> SeedFile {
         sha256: blobs::sha256_hex(bytes),
         size: bytes.len() as u64,
         content_type: paths::content_type_for(path).to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The static-shell seam
+// ---------------------------------------------------------------------------
+
+/// A [`ShellSource`] over an in-memory `path -> bytes` map — the same contract
+/// the browser's `/asset-manifest.json` reader (`impresspress-web`'s
+/// `BrowserShellSource`) satisfies, driveable here without a service worker.
+///
+/// [`Self::new`] carries a plausible shell: the three rendered templates, the
+/// hashed wasm-pack pair, `vendor/sql-wasm.wasm` and the asset manifest
+/// itself. Its `sw.js` is a dev bundle's — it declares
+/// `const DEV_ENABLED = true;` and reads that constant in the isolation-header
+/// passthrough, exactly as `impresspress-bundle`'s template renders it — so a
+/// test can assert that the export turned the sandbox off, which is the one
+/// edit the export makes to any shell file.
+pub struct FakeShell {
+    files: BTreeMap<String, Vec<u8>>,
+    /// Set by [`Self::failing_to_list`]: what `list` refuses with.
+    list_failure: Option<String>,
+}
+
+/// The `sw.js` [`FakeShell::new`] serves — a dev bundle's, trimmed to the two
+/// lines the export cares about plus one it must leave alone.
+pub const FAKE_SW_JS: &str = "const DEV_ENABLED = true;\n\
+     await initialize({ dev: DEV_ENABLED });\n\
+     if (DEV_ENABLED && url.pathname !== '/sw.js') { passthrough(); }\n\
+     if (url.pathname.startsWith('/seed/')) { return; }\n";
+
+impl Default for FakeShell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeShell {
+    /// A shell with the seven files a real bundle's `files` listing carries.
+    pub fn new() -> Self {
+        let mut files = BTreeMap::new();
+        files.insert("index.html".to_string(), b"<!doctype html>".to_vec());
+        files.insert("sw.js".to_string(), FAKE_SW_JS.as_bytes().to_vec());
+        files.insert("loader.js".to_string(), b"// loader".to_vec());
+        files.insert(
+            "impresspress_web-abc123.js".to_string(),
+            b"// glue".to_vec(),
+        );
+        files.insert(
+            "impresspress_web_bg-abc123.wasm".to_string(),
+            b"\0asm\x01\0\0\0".to_vec(),
+        );
+        files.insert(
+            "vendor/sql-wasm.wasm".to_string(),
+            b"\0asm\x01\0\0\0".to_vec(),
+        );
+        files.insert(
+            "asset-manifest.json".to_string(),
+            br#"{"buildId":"abc123","assets":{},"files":[]}"#.to_vec(),
+        );
+        Self {
+            files,
+            list_failure: None,
+        }
+    }
+
+    /// Add or replace one file, chainable.
+    pub fn with(mut self, path: &str, bytes: &[u8]) -> Self {
+        self.files.insert(path.to_string(), bytes.to_vec());
+        self
+    }
+
+    /// Drop one file, chainable — for the cases where what matters is what
+    /// the shell does NOT carry.
+    pub fn without(mut self, path: &str) -> Self {
+        self.files.remove(path);
+        self
+    }
+
+    /// A shell whose `list` refuses: what a deployment whose
+    /// `/asset-manifest.json` is missing, unparseable or `files`-less looks
+    /// like. An export must fail loudly rather than produce a folder with no
+    /// runtime in it.
+    pub fn failing_to_list(mut self, message: &str) -> Self {
+        self.list_failure = Some(message.to_string());
+        self
+    }
+}
+
+#[wafer_block::wafer_async_trait]
+impl ShellSource for FakeShell {
+    async fn list(&self) -> Result<Vec<String>, String> {
+        if let Some(message) = &self.list_failure {
+            return Err(message.clone());
+        }
+        Ok(self.files.keys().cloned().collect())
+    }
+
+    async fn fetch(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| format!("{path}: not served by this shell"))
     }
 }

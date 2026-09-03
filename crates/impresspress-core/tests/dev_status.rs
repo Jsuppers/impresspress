@@ -15,7 +15,7 @@ use impresspress_core::{
             generations::{self, GenerationCause, GenerationStatus, NewGeneration},
             runtime_state::{self, ActivationPhase, RuntimeState},
         },
-        test_support::FakeControl,
+        test_support::{FakeControl, FakeShell},
         DevBlock, DevShared, RuntimeControl, ROUTES, WAFER_GUEST_VERSION,
     },
     test_support::{
@@ -293,7 +293,11 @@ async fn every_response_is_never_cached() {
 /// `/openapi.json` (and registered as an agent tool) while 404-ing.
 #[test]
 fn routes_and_endpoints_stay_in_lockstep() {
-    let info = DevBlock::new(DevShared::new(FakeControl::new())).info();
+    let info = DevBlock::new(DevShared::new(
+        FakeControl::new(),
+        std::sync::Arc::new(FakeShell::new()),
+    ))
+    .info();
 
     assert_eq!(ROUTES.len(), info.endpoints.len());
 

@@ -161,9 +161,11 @@ fn body() -> Markup {
                 // compiler's manifest on load and enables Compile only when
                 // this deployment actually has one — a button that starts
                 // enabled would be a promise the page cannot keep on a build
-                // without the overlay. Export stays disabled until the
-                // exporter exists; the agent sees both names as tools that
-                // refuse honestly.
+                // without the overlay. Export ships disabled for a
+                // DIFFERENT reason with the same shape: an export is a
+                // snapshot of the live generation, and a fresh instance has
+                // none — `dev.js`'s `renderStatus` enables it the moment one
+                // exists, and `GET /b/dev/api/export` answers 400 until then.
 
                 // Which block Compile acts on. It ships EMPTY, and stays
                 // empty on a workspace with no blocks: the options are the

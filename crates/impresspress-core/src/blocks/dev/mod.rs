@@ -33,6 +33,7 @@ pub mod blocks_api;
 pub mod contracts;
 pub mod control;
 pub mod data_snapshot;
+pub mod export;
 pub mod files;
 pub mod gc;
 pub mod generation;
@@ -62,8 +63,8 @@ use wafer_run::{
 };
 
 pub use self::control::{
-    DynamicBlockSpec, DynamicRoute, RouteAccessKind, RuntimeControl, ValidationFailure,
-    ValidationStage,
+    DynamicBlockSpec, DynamicRoute, RouteAccessKind, RuntimeControl, ShellSource,
+    ValidationFailure, ValidationStage,
 };
 use crate::{
     endpoint_match::{self, EndpointRoute},
@@ -120,6 +121,10 @@ pub enum Route {
     ApiReference,
     /// `GET /b/dev/api/tools.json`
     ApiToolsJson,
+    /// `GET /b/dev/api/export/manifest`
+    ApiExportManifest,
+    /// `GET /b/dev/api/export`
+    ApiExport,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
@@ -191,6 +196,16 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/dev/api/tools.json",
         Route::ApiToolsJson,
     ),
+    // `/export/manifest` BEFORE `/export`: `endpoint_match` walks this table
+    // in order and `/b/dev/api/export` is a literal template, not a prefix,
+    // so the order is not load-bearing today — it is written this way so the
+    // more specific path stays first if either ever gains a `{…}` segment.
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/api/export/manifest",
+        Route::ApiExportManifest,
+    ),
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/api/export", Route::ApiExport),
 ];
 
 /// A response builder pre-seeded with `Cache-Control: no-store`.
@@ -293,6 +308,14 @@ pub fn wrap_grants() -> Vec<wafer_run::ResourceGrant> {
 pub struct DevShared {
     /// The host's half of activation: builds and swaps the live runtime.
     pub control: Arc<dyn RuntimeControl>,
+    /// The host's other half: the static shell this deployment is running
+    /// inside of, which [`export`] copies into the bundle it hands the user.
+    ///
+    /// Beside `control` rather than inside it because the two answer
+    /// different questions — one builds a runtime, the other reads files the
+    /// host was shipped as — and because a host may legitimately have one
+    /// without the other (an export is a read; a runtime rebuild is not).
+    pub shell: Arc<dyn ShellSource>,
     /// The one serialized path from a desired state to a live one.
     ///
     /// On the shared state rather than on [`DevBlock`] because activation is
@@ -338,7 +361,7 @@ pub struct DevShared {
 }
 
 impl DevShared {
-    /// Build the shared state around a [`RuntimeControl`] handle.
+    /// Build the shared state around the two host seams.
     ///
     /// `arc_with_non_send_sync`: [`RuntimeControl`] is bounded on
     /// `MaybeSend + MaybeSync`, which is unbounded on wasm32 — that is what
@@ -348,9 +371,10 @@ impl DevShared {
     /// bounds are `Send + Sync` and the lint does not fire at all. The same
     /// allowance the block registration path already carries.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new(control: Arc<dyn RuntimeControl>) -> Arc<Self> {
+    pub fn new(control: Arc<dyn RuntimeControl>, shell: Arc<dyn ShellSource>) -> Arc<Self> {
         Arc::new(Self {
             control,
+            shell,
             activation: activation::ActivationQueue::new(),
             workspace: futures::lock::Mutex::new(()),
             compile: futures::lock::Mutex::new(()),
@@ -500,6 +524,29 @@ impl Block for DevBlock {
                      at /b/webmcp/manifest.json.",
                 )
                 .auth(AuthLevel::Admin),
+            BlockEndpoint::get("/b/dev/api/export/manifest")
+                .summary("Preview the export bundle")
+                .description(
+                    "What `GET /b/dev/api/export` would produce, without producing it: every \
+                     entry of the zip with its size, the totals, and the rows of each data \
+                     table the snapshot carries. Read it to see what an export would contain \
+                     before downloading one.",
+                )
+                .auth(AuthLevel::Admin)
+                .output::<contracts::ExportManifest>(),
+            // No `.output::<..>()`: the body is a zip, not JSON. It is
+            // declared all the same because `routes_and_endpoints_stay_in_lockstep`
+            // requires the dispatch table and this list to be the same set,
+            // and the declaration is what pins its `Admin` tier where the
+            // router can enforce it.
+            BlockEndpoint::get("/b/dev/api/export")
+                .summary("Export the site as a runnable static bundle")
+                .description(
+                    "A zip of the runtime shell with the sandbox turned off, the site files, \
+                     every compiled block and its source, and a data snapshot — servable from \
+                     any static host and re-importable as a seed.",
+                )
+                .auth(AuthLevel::Admin),
         ])
         .admin_url(ROUTE_PREFIX)
         // The sandbox is registered only where it is meant to exist; a
@@ -539,6 +586,8 @@ impl Block for DevBlock {
             Route::ApiBlockRemove => blocks_api::handle_remove(ctx, &self.shared, &msg).await,
             Route::ApiReference => scaffold::handle_reference(ctx).await,
             Route::ApiToolsJson => tools::handle(ctx).await,
+            Route::ApiExportManifest => export::handle_manifest(ctx, &self.shared).await,
+            Route::ApiExport => export::handle_export(ctx, &self.shared).await,
         }
     }
 

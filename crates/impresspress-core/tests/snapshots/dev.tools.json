@@ -4338,6 +4338,99 @@
         ],
         "type": "object"
       }
+    },
+    {
+      "description": "What exporting the site right now would produce: every file of the bundle with its size, the totals, and the rows of each data table. A read — use `dev_export` to actually download it.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/export/manifest",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_export_manifest",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/export/manifest` — what\n`GET /b/dev/api/export` would produce, without producing it.",
+        "properties": {
+          "blocks": {
+            "description": "How many compiled blocks the export carries. Each contributes its\n`.wasm` plus its whole source tree.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "files": {
+            "description": "Every entry of the archive, in the order it is written.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One entry of the export bundle: where it lands in the zip, and how big it\nis.",
+              "properties": {
+                "bytes": {
+                  "description": "The entry's uncompressed size in bytes. The archive stores entries\nuncompressed, so this is also what it costs in the zip.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Path inside the archive (`sw.js`, `seed/site/index.html`).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "bytes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "generation_id": {
+            "description": "The generation the export is a snapshot of — the one that is live now.\nThe downloaded file is named after its first eight characters.",
+            "type": "string"
+          },
+          "shell_files": {
+            "description": "How many of `files` are the runtime shell (the service worker, the\nwasm, the loader — everything that makes the folder runnable).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "site_files": {
+            "description": "How many are the site's own files, under `seed/site/`.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tables": {
+            "additionalProperties": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Rows the data snapshot carries, per table — products, offers,\nsettings and accounts (`seed/data.json`).",
+            "type": "object"
+          },
+          "total_bytes": {
+            "description": "Total size of every entry's content. The archive itself is slightly\nlarger: each entry carries a local header and a central directory\nrecord naming it.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation_id",
+          "files",
+          "total_bytes",
+          "shell_files",
+          "site_files",
+          "blocks",
+          "tables"
+        ],
+        "type": "object"
+      }
     }
   ]
 }

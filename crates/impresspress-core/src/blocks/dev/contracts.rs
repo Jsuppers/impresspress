@@ -502,3 +502,42 @@ pub struct ReferenceResponse {
     /// in full.
     pub markdown: String,
 }
+
+/// One entry of the export bundle: where it lands in the zip, and how big it
+/// is.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportFile {
+    /// Path inside the archive (`sw.js`, `seed/site/index.html`).
+    pub path: String,
+    /// The entry's uncompressed size in bytes. The archive stores entries
+    /// uncompressed, so this is also what it costs in the zip.
+    pub bytes: u64,
+}
+
+/// Response of `GET /b/dev/api/export/manifest` — what
+/// `GET /b/dev/api/export` would produce, without producing it.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportManifest {
+    /// The generation the export is a snapshot of — the one that is live now.
+    /// The downloaded file is named after its first eight characters.
+    pub generation_id: String,
+    /// Every entry of the archive, in the order it is written.
+    pub files: Vec<ExportFile>,
+    /// Total size of every entry's content. The archive itself is slightly
+    /// larger: each entry carries a local header and a central directory
+    /// record naming it.
+    pub total_bytes: u64,
+    /// How many of `files` are the runtime shell (the service worker, the
+    /// wasm, the loader — everything that makes the folder runnable).
+    pub shell_files: u32,
+    /// How many are the site's own files, under `seed/site/`.
+    pub site_files: u32,
+    /// How many compiled blocks the export carries. Each contributes its
+    /// `.wasm` plus its whole source tree.
+    pub blocks: u32,
+    /// Rows the data snapshot carries, per table — products, offers,
+    /// settings and accounts (`seed/data.json`).
+    pub tables: std::collections::BTreeMap<String, usize>,
+}

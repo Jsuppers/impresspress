@@ -1248,7 +1248,10 @@ mod tests {
 
         adopt_site(
             &ctx,
-            &super::super::DevShared::new(FakeControl::new()),
+            &super::super::DevShared::new(
+                FakeControl::new(),
+                std::sync::Arc::new(super::super::test_support::FakeShell::new()),
+            ),
             &SiteManifest {
                 files: vec![entry("index.html", "old")],
             },

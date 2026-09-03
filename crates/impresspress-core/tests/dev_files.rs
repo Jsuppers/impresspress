@@ -7,7 +7,11 @@
 
 use base64ct::{Base64, Encoding};
 use impresspress_core::{
-    blocks::dev::{blobs, paths, test_support::FakeControl, workspace, DevBlock, DevShared},
+    blocks::dev::{
+        blobs, paths,
+        test_support::{FakeControl, FakeShell},
+        workspace, DevBlock, DevShared,
+    },
     test_support::{
         admin_msg, anon_msg, auth_msg, output_http_header, output_http_status, output_json,
         output_status, TestContext,
@@ -597,7 +601,11 @@ async fn every_files_response_is_never_cached() {
 /// client-side error, and one that is laxer turns it into a 400.
 #[test]
 fn the_write_schema_and_the_handler_agree_on_what_is_required() {
-    let info = DevBlock::new(DevShared::new(FakeControl::new())).info();
+    let info = DevBlock::new(DevShared::new(
+        FakeControl::new(),
+        std::sync::Arc::new(FakeShell::new()),
+    ))
+    .info();
     let write = info
         .endpoints
         .iter()

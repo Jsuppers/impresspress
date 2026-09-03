@@ -18,10 +18,11 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use wafer_block::{
-    db::{Filter, FilterOp, SortField},
-    wire::database::OnConflict,
-};
+use wafer_block::db::{Filter, FilterOp, SortField};
+// `upsert_from_snapshot`'s only import, and it is `block-dev`-gated with it:
+// nothing else in this module upserts.
+#[cfg(feature = "block-dev")]
+use wafer_block::wire::database::OnConflict;
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -383,7 +384,10 @@ pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, Wafer
 /// state; this one restores a row wholesale from a trusted export, which is
 /// a different operation from all of them and is not exposed more generally
 /// — `data`/`update_columns` come from the snapshot row verbatim, so this
-/// function does not itself decide what "wholesale" means.
+/// function does not itself decide what "wholesale" means — and it is
+/// `block-dev`-gated because that caller is the sandbox's, absent from every
+/// default build.
+#[cfg(feature = "block-dev")]
 pub(crate) async fn upsert_from_snapshot(
     ctx: &dyn Context,
     data: Vec<(String, Value)>,

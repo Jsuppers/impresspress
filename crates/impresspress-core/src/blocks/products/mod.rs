@@ -25,6 +25,14 @@ pub(crate) use handlers::{
 // an extra same-value constant under a different name. The two functions
 // alongside it are how it reads and writes the live set without a query
 // built directly on the name.
+//
+// `block-dev`-gated because `blocks::dev::data_snapshot` is the ONLY consumer
+// of all three, and the dev block is off in every default build: an
+// ungated re-export is three `unused_imports` warnings (and a dead
+// `upsert_from_snapshot`) in every build that does not compile the sandbox.
+// The gate says what the re-export is for as well as keeping the default
+// build warning-free.
+#[cfg(feature = "block-dev")]
 pub(crate) use repo::products::{
     list_all as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot, TABLE,
 };
@@ -35,7 +43,9 @@ pub(crate) use repo::products::{
 // without retyping a table's literal string a second time. Crate-scoped
 // (`pub(crate)`), matching the two re-export blocks above: still nobody
 // outside `impresspress-core` gets to depend on a products table name
-// directly.
+// directly. `block-dev`-gated for the same reason the block above is: the
+// data snapshot's closed-list bookkeeping is their only reader.
+#[cfg(feature = "block-dev")]
 pub(crate) use repo::{
     checkout_presets::TABLE as CHECKOUT_PRESETS_TABLE, disputes::TABLE as DISPUTES_TABLE,
     entitlements::TABLE as ENTITLEMENTS_TABLE, offer_components::TABLE as OFFER_COMPONENTS_TABLE,
