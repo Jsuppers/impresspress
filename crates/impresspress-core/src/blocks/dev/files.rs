@@ -268,6 +268,7 @@ pub async fn handle_delete(
         Ok(generation) => generation,
         Err(refusal) => return refusal,
     };
+    collect_if_unpublished(ctx, shared, &area).await;
     no_store().json(&FileDeleteResponse {
         path: request.path,
         generation,
@@ -303,6 +304,38 @@ async fn publish_if_site(
         Ok(outcome) => Ok(Some(outcome.generation)),
         Err(e) => Err(e.into_response()),
     }
+}
+
+/// Reclaim the blob a delete may have orphaned, when the delete published
+/// nothing.
+///
+/// A `site/` delete activates, and the activation prunes and collects. A
+/// `blocks/` delete does not activate at all (design §7.2: block source only
+/// reaches the runtime through a compile), and a block source is named by the
+/// workspace and by nothing else — no generation carries a crate, only the
+/// artifact compiled from it. So dropping the entry makes its blob garbage
+/// immediately, and without this it would stay charged against the workspace's
+/// quota until some unrelated site write happened to publish.
+///
+/// [`activation::maintain`] itself, not a bare `gc::collect`: the rule that
+/// pruning comes first and collection second is a property of the two steps,
+/// not of the caller that runs them, and this path was safe only for as long
+/// as every successful activation happened to leave the ledger inside the
+/// window — an invariant nothing stated and that a prune failure (which
+/// `maintain` logs and carries on from) breaks.
+///
+/// After the manifest is saved and outside the lock that saved it: the
+/// collector takes that lock itself, and it reads the workspace it is about to
+/// collect against rather than the one this handler was holding.
+///
+/// Failures are logged, not returned — `maintain`'s own contract: the file
+/// *is* deleted, and reporting the delete as failed because the reclaim did
+/// would be untrue. The next activation collects instead.
+async fn collect_if_unpublished(ctx: &dyn Context, shared: &DevShared, area: &WorkspaceArea) {
+    if matches!(area, WorkspaceArea::Site) {
+        return;
+    }
+    activation::maintain(ctx, shared).await;
 }
 
 // ---------------------------------------------------------------------------

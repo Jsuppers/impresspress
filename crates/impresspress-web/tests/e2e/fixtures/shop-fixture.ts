@@ -1,12 +1,13 @@
 /**
  * One product and one offer, as the products admin API takes them.
  *
- * Two specs stock a shop and they must stock the *same* shop: `webmcp.spec.ts`
- * seeds it over HTTP against the native server (to have something for
- * `get_product` / `preview_price` to answer with), and `dev-workspace.spec.ts`
- * has an in-page agent create it through the `shop_*` tools inside the browser
- * sandbox. Same wire shape, two very different transports — which is exactly
- * the pair that drifts if each keeps its own literal.
+ * Three specs stock a shop and they must stock the *same* shop:
+ * `webmcp.spec.ts` seeds it over HTTP against the native server (to have
+ * something for `get_product` / `preview_price` to answer with), and
+ * `dev-workspace.spec.ts` and `dev-scenario.spec.ts` have an in-page agent
+ * create it through the `shop_*` tools inside the browser sandbox. Same wire
+ * shape, two very different transports — which is exactly the set that drifts
+ * if each keeps its own literal.
  *
  * The offer is deliberately the interesting kind rather than a flat price:
  * `pricing_model: "components"` with one typed customer input (`pages`,
@@ -90,4 +91,85 @@ export function uniqueShopProduct(stamp: string) {
     slug: `${SHOP_PRODUCT.slug}-${stamp}`,
     status: 'active',
   };
+}
+
+/** The heading the agent's page carries; the proof a write reached the site. */
+export const SHOP_HEADING = 'The print shop';
+
+/**
+ * The page the agent writes over the welcome starter site.
+ *
+ * Shared by `dev-workspace.spec.ts` (one product) and `dev-scenario.spec.ts`
+ * (three): both specs have an agent publish THIS page and then assert on what
+ * a shopper sees, so a second copy of it would be a second storefront to keep
+ * in step with the catalog contract below.
+ *
+ * Deliberately what design §4.1's suggested prompt asks an agent for, not a
+ * placeholder: it reads the *public* catalog (`/b/products/catalog`, the
+ * anonymous surface — the `shop_*` tools are admin-only and a shopper has
+ * none of them) and mounts the shipped storefront widget for each product.
+ * `page.records` is the list field `CatalogProductListResponse` publishes
+ * (`products/contracts.rs`); a page that guessed `items` would render an
+ * empty shop, and a spec that only checked its own writes would still "pass"
+ * up to its last assertion.
+ *
+ * Built through the DOM rather than `innerHTML` so the product name is text,
+ * not markup — the shop is the boundary a prompt injection would cross, and a
+ * fixture that pasted names into HTML would be modelling the wrong thing.
+ *
+ * `.shop-product-name` rather than a bare `h2`: the storefront widget renders
+ * its own `h2` inside a shadow root, and Playwright's CSS engine pierces open
+ * shadow roots, so `locator('h2')` would match two elements and fail strict
+ * mode. Distinct class names keep the page's own markup addressable.
+ *
+ * # Why the page has to ask for `webmcp.js` itself
+ *
+ * `/b/webmcp/webmcp.js` is the deployment's WebMCP registration script at its
+ * stable path, and design §16 scenario 5 requires the shopper's own agent to
+ * have `list_products` on this page. Nothing puts that script here for it:
+ * `ui::layout` injects the content-hashed `/b/static/webmcp-{hash}.js` into
+ * every SSR-rendered ImpressPress page, but `/` on a sandbox is a file the
+ * agent wrote, served verbatim by `wafer-run/web`, which injects nothing into
+ * anybody's HTML. So a site that wants its visitors' agents to have tools has
+ * to include the script itself, exactly as it has to include `storefront.js`
+ * to get the purchase widget — and it does so at the stable path
+ * (`GET /b/webmcp/webmcp.js`, `pipeline.rs`, `ui::assets::
+ * WEBMCP_JS_STABLE_PATH`) rather than the content-hashed one, since a page
+ * the agent writes has no SSR document to read the current hash off. The
+ * guide and `SUGGESTED_PROMPT` on `/b/dev` tell the agent to write exactly
+ * this tag (`blocks/dev/page.rs`).
+ */
+export function shopPage(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>${SHOP_HEADING}</title>
+  <script src="/b/products/storefront.js" defer></script>
+  <script src="/b/webmcp/webmcp.js" defer></script>
+</head>
+<body>
+  <h1>${SHOP_HEADING}</h1>
+  <ul id="products"></ul>
+  <script>
+    fetch('/b/products/catalog')
+      .then(function (response) { return response.json(); })
+      .then(function (page) {
+        var list = document.getElementById('products');
+        page.records.forEach(function (product) {
+          var item = document.createElement('li');
+          var heading = document.createElement('h2');
+          heading.className = 'shop-product-name';
+          heading.textContent = product.name;
+          var widget = document.createElement('impresspress-product');
+          widget.setAttribute('product-id', product.id);
+          item.appendChild(heading);
+          item.appendChild(widget);
+          list.appendChild(item);
+        });
+      });
+  </script>
+</body>
+</html>
+`;
 }

@@ -127,6 +127,21 @@ pub const SELECTIONS: &[(&str, HttpMethod, &str, &str, &str)] = &[
          Its source under `blocks/<name>/` is untouched — this only takes the compiled block out \
          of what serves.",
     ),
+    // `dev_export` itself is NOT here: its result is a file the browser
+    // downloads, not a tool result, so `dev.js` registers it page-locally
+    // (there is no HTTP tool call whose answer is a 15 MB zip). Its manifest
+    // is a different matter — it is small JSON, it is a read, and it is the
+    // only way an agent can see what an export would contain before asking
+    // for one.
+    (
+        "impresspress/dev",
+        HttpMethod::Get,
+        "/b/dev/api/export/manifest",
+        "dev_export_manifest",
+        "What exporting the site right now would produce: every file of the bundle with its \
+         size, the totals, and the rows of each data table. A read — use `dev_export` to \
+         actually download it.",
+    ),
     // -- shop_* : the products admin API ------------------------------
     (
         "impresspress/products",

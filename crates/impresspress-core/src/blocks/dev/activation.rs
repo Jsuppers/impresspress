@@ -31,7 +31,7 @@
 //! returned futures `Send` on native, and what keeps a single-threaded browser
 //! runtime from deadlocking on its own queue.
 
-use std::sync::Mutex;
+use std::{collections::BTreeSet, sync::Mutex};
 
 use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ use super::{
     artifacts, blobs,
     contracts::{GenerationSummary, SiteManifest},
     control::DynamicBlockSpec,
+    gc,
     generation::{self, GenerationManifest},
     no_store_error_status,
     publisher::publish_site,
@@ -49,13 +50,9 @@ use super::{
         generations::{GenerationCause, GenerationRow, GenerationStatus, NewGeneration},
         runtime_state::{ActivationPhase, RuntimeState},
     },
-    workspace,
+    retention, workspace,
 };
 use crate::util::now_millis;
-
-/// How many generations the ledger keeps before older rows are labelled
-/// [`GenerationStatus::Superseded`] (design §7.3).
-pub const RETAINED_GENERATIONS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Outcomes
@@ -673,9 +670,7 @@ async fn activate_staged(
     )
     .await
     .map_err(storage_error)?;
-    repo::generations::mark_superseded_before(ctx, RETAINED_GENERATIONS)
-        .await
-        .map_err(storage_error)?;
+    maintain(ctx, shared).await;
     progress.record(ActivationPhase::Active, format!("generation {}", row.id));
 
     // Re-read rather than patch the local row: the summary the caller is
@@ -688,6 +683,58 @@ async fn activate_staged(
         generation: generation::summarize(&activated, manifest),
         progress: progress.steps,
     })
+}
+
+/// Retire the generations that have fallen out of the retention window, and
+/// reclaim what that made unreachable.
+///
+/// Runs after the commit, and reports nothing back. That is the point: by this
+/// line the generation is live and journalled, and returning a failure here
+/// would tell the caller its write did not land when it did. What a failure
+/// costs is storage the *next* activation collects instead — so it is logged
+/// at `error!` rather than swallowed, and nothing depends on it having run.
+///
+/// Pruning first, collection second, and never the other way round: the
+/// collector's reachability is read off the rows retention keeps, so a
+/// collection that ran before the prune would still be protecting the
+/// generations the prune is about to delete and would reclaim nothing.
+///
+/// Also the whole of what a `blocks/` delete does afterwards
+/// ([`super::files`]'s `collect_if_unpublished`), which publishes nothing and
+/// so never reaches this function through an activation. It is the same pair
+/// of steps in the same order for the same reason — a collection there that
+/// skipped the prune would be reading reachability off a window a *failed*
+/// prune had left too wide, which is the one case this ordering exists for —
+/// so it is one function, called from both, rather than a second collection
+/// site that has to remember the rule.
+pub(super) async fn maintain(ctx: &dyn Context, shared: &super::DevShared) {
+    let pruned = match retention::prune(ctx).await {
+        Ok(pruned) => pruned,
+        Err(e) => {
+            tracing::error!(
+                error = %e.message,
+                "dev sandbox: pruning the generation ledger failed; the window will be \
+                 re-applied on the next activation",
+            );
+            return;
+        }
+    };
+
+    match gc::collect(ctx, shared).await {
+        Ok(report) => tracing::debug!(
+            pruned = pruned.len(),
+            blobs_deleted = report.blobs_deleted,
+            artifacts_deleted = report.artifacts_deleted,
+            bytes_freed = report.bytes_freed,
+            "dev sandbox: retention and collection ran",
+        ),
+        Err(e) => tracing::error!(
+            error = %e.message,
+            pruned = pruned.len(),
+            "dev sandbox: collecting unreachable content failed; it will be collected on the \
+             next activation",
+        ),
+    }
 }
 
 /// Put the site back the way it was after a failed publish, and describe what
@@ -861,6 +908,7 @@ pub async fn converge_on_boot(
         .await
         .map_err(|e| e.message)?;
     let (previous, state) = active_or_clear(ctx, &state).await?;
+    retire_abandoned(ctx, &state, previous.as_ref()).await;
     if let Some(desired) = state.desired_generation_id.clone() {
         match generation::load(ctx, &desired).await {
             Ok((row, manifest)) => {
@@ -913,6 +961,114 @@ pub async fn converge_on_boot(
     Ok(active
         .map(|(_, manifest)| manifest.blocks)
         .unwrap_or_default())
+}
+
+/// The message an abandoned row is closed with.
+const ABANDONED_AT_BOOT: &str =
+    "abandoned at boot: the process ended before this activation finished";
+
+/// Close out the in-flight work the previous process did not finish.
+///
+/// A generation is `staged`/`validating`/`activating` because an activation is
+/// *running*, and a build is `staged` because a compile is. Nothing is running
+/// on a process that has just started, so every such row has to be settled —
+/// except the generation the journal names, which is the activation this boot
+/// is about to converge on and the only one that can still finish.
+///
+/// "Settled" is not the same as "abandoned". A build row whose artifact is
+/// named by the generation that is serving, or by the one being converged on,
+/// belongs to a compile that *arrived*: it is accepted rather than closed (see
+/// [`repo::builds::retire_in_flight`]), because that row is where the block's
+/// `BlockInfo` lives and the duplicate-agent-tool check reads it back.
+///
+/// Left alone they are not merely untidy. Retention keeps an in-flight
+/// generation whatever its age, and the collector keeps a staged build's
+/// artifact, so each abandoned row pins content against the workspace's 64 MiB
+/// quota (design §6.6) for the life of the instance — a crash loop would fill
+/// it with generations nothing can ever activate. An unbounded in-flight set
+/// also eventually outgrows the page `retention::retained` reads it through.
+///
+/// Best effort, like every other step of boot recovery: an instance that
+/// cannot tidy its ledger must still come up and serve.
+async fn retire_abandoned(
+    ctx: &dyn Context,
+    state: &RuntimeState,
+    previous: Option<&(GenerationRow, GenerationManifest)>,
+) {
+    let in_flight = match repo::generations::list_in_flight(ctx).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                error = %e.message,
+                "dev sandbox: could not read the in-flight generations at boot",
+            );
+            Vec::new()
+        }
+    };
+    for row in in_flight {
+        // The journalled one is the activation being converged on, not
+        // wreckage: `converge_on_boot` re-runs it a few lines below.
+        if state.desired_generation_id.as_deref() == Some(row.id.as_str()) {
+            continue;
+        }
+        if let Err(e) = repo::generations::set_status(
+            ctx,
+            &row.id,
+            GenerationStatus::Failed,
+            Some(ABANDONED_AT_BOOT),
+            None,
+        )
+        .await
+        {
+            tracing::error!(
+                generation_id = %row.id,
+                error = %e.message,
+                "dev sandbox: could not retire an abandoned generation at boot",
+            );
+        }
+    }
+
+    // Builds are settled the same way, against the manifests the journal
+    // vouches for rather than against the journal itself — a build row names
+    // an artifact, not a generation, so "is this compile still wanted?" is a
+    // question only the manifests can answer.
+    //
+    // Both halves are needed. The active manifest covers a compile whose
+    // activation committed before the process died (the row is one
+    // `set_status` short of `valid`); the desired manifest covers one whose
+    // activation is the very thing this boot is about to converge on. Closing
+    // either would leave a block live with no accepted build row recording its
+    // `BlockInfo`, and every later stage of *another* block refused for a
+    // collision check that cannot be run.
+    let mut vouched = BTreeSet::new();
+    if let Some((_row, manifest)) = previous {
+        vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
+    }
+    if let Some(desired) = state.desired_generation_id.as_deref() {
+        // A desired that cannot be loaded vouches for nothing; the
+        // dangling-desired arm in `converge_on_boot` deals with the row
+        // itself.
+        if let Ok((_row, manifest)) = generation::load(ctx, desired).await {
+            vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
+        }
+    }
+
+    let diagnostics = serde_json::to_string(&[super::validation::Diagnostic::error(
+        super::validation::BUILD_ABANDONED,
+        ABANDONED_AT_BOOT,
+    )])
+    .unwrap_or_else(|_| "[]".to_string());
+    match repo::builds::retire_in_flight(ctx, &vouched, &diagnostics).await {
+        Ok(settled) => tracing::debug!(
+            promoted = settled.promoted,
+            retired = settled.retired,
+            "dev sandbox: settled the builds left in flight",
+        ),
+        Err(e) => tracing::error!(
+            error = %e.message,
+            "dev sandbox: could not settle the builds left in flight at boot",
+        ),
+    }
 }
 
 /// The generation the journal says is live, or `None` after clearing a pointer
@@ -1101,7 +1257,10 @@ mod tests {
 
         adopt_site(
             &ctx,
-            &super::super::DevShared::new(FakeControl::new()),
+            &super::super::DevShared::new(
+                FakeControl::new(),
+                std::sync::Arc::new(super::super::test_support::FakeShell::new()),
+            ),
             &SiteManifest {
                 files: vec![entry("index.html", "old")],
             },

@@ -9,7 +9,7 @@ use wafer_run::{context::Context, OutputStream, WaferError};
 
 use super::{
     contracts::{ActivationView, ActiveBlockView, StatusResponse},
-    generation, no_store, repo, DevShared, WAFER_GUEST_VERSION,
+    gc, generation, no_store, repo, seed, DevShared, WAFER_GUEST_VERSION,
 };
 use crate::http::err_internal;
 
@@ -53,6 +53,15 @@ async fn build(ctx: &dyn Context, shared: &DevShared) -> Result<StatusResponse, 
             })
             .unwrap_or_default(),
         activation,
+        // From the workspace counters and the builds table on every poll, not
+        // from a walk of the stores (`gc::storage_usage` says why). The page
+        // polls this while a tool call is outstanding, so the figures move as
+        // the collector works rather than only after the panel is reopened.
+        storage: gc::storage_usage(ctx).await?,
         wafer_guest_version: WAFER_GUEST_VERSION,
+        // One indexed read of a `UNIQUE` column, on the same poll — cheap in
+        // the way a store listing is not, and the difference between an empty
+        // sandbox that says why and one that does not.
+        seed_error: seed::last_failure(ctx).await?,
     })
 }

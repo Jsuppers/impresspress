@@ -17,20 +17,24 @@ use std::{collections::HashMap, sync::Arc};
 
 use wafer_core::interfaces::database::service::DatabaseService;
 
+use crate::SandboxMode;
+
 /// Seed the browser-only default variables, auto-generate declared secrets,
 /// and return the full variable map. Browser-equivalent of the native
 /// `seed_and_load_variables()` — there are no process env vars in the browser,
 /// only the local defaults below plus auto-generated secrets.
-/// `dev_active` is the *resolved* verdict from
-/// [`crate::runtime_factory::resolve_dev_active`], never the raw
-/// `initialize({ dev })` request: on a build without `browser-devtools` the
-/// sandbox does not exist, so a feature-off boot must leave a database
+/// `mode` is the *resolved* verdict from [`SandboxMode::resolve`], never the
+/// raw `initialize({ dev })` request: on a build without `browser-devtools`
+/// the sandbox does not exist, so a feature-off boot must leave a database
 /// indistinguishable from one that never asked for a sandbox — which is why
-/// `WAFER_RUN_SHARED__HAS_LANDING_PAGE` below is written on BOTH verdicts
-/// rather than only on the affirmative one.
+/// `WAFER_RUN_SHARED__HAS_LANDING_PAGE` below is written on EVERY verdict
+/// rather than only on the affirmative one. It follows
+/// [`SandboxMode::runtime_present`]: an exported bundle always has a site (its
+/// `seed/` guarantees one), so `/` must serve it there exactly as it does in
+/// the workspace.
 pub async fn seed_and_load_variables(
     db: &Arc<dyn DatabaseService>,
-    dev_active: bool,
+    mode: SandboxMode,
 ) -> Result<HashMap<String, String>, String> {
     // Browser-only defaults. These are not declared `ConfigVar`s (so the
     // auto-gen pass won't seed them) and there's no env to source them from —
@@ -66,9 +70,10 @@ pub async fn seed_and_load_variables(
     )
     .await?;
 
-    // The sandbox owns `/` — an editable site is the point of it — so the
-    // router must serve `wafer-run/web` there instead of bouncing anonymous
-    // visitors to the login page (design §7.3).
+    // The sandbox owns `/` — an editable site is the point of it, and an
+    // exported one ships a site in its `seed/` — so the router must serve
+    // `wafer-run/web` there instead of bouncing anonymous visitors to the
+    // login page (design §7.3).
     //
     // FORCE-SET, not seeded, and force-set in BOTH directions.
     //
@@ -81,15 +86,15 @@ pub async fn seed_and_load_variables(
     // refused to serve.
     //
     // Both directions, because the browser database is keyed by ORIGIN and
-    // outlives the bundle that wrote it. Serving a `dev: false` build (or one
-    // compiled without `browser-devtools`) to an origin the sandbox bundle
-    // previously ran on would otherwise leave a stale `"true"` in OPFS, and
-    // `/` would keep serving a site nothing can publish to any more instead of
-    // redirecting anonymous visitors to the login page. That directly
-    // contradicts what `runtime_factory::resolve_dev_active` promises — "a
-    // build without the feature must produce a runtime indistinguishable from
-    // one that was never asked for a sandbox" — and a value only ever written
-    // in one direction cannot deliver it.
+    // outlives the bundle that wrote it. Serving a bundle without the
+    // sandbox's runtime (one compiled without `browser-devtools`) to an
+    // origin a sandbox bundle previously ran on would otherwise leave a stale
+    // `"true"` in OPFS, and `/` would keep serving a site nothing can publish
+    // to any more instead of redirecting anonymous visitors to the login
+    // page. That directly contradicts what `SandboxMode::resolve` promises —
+    // "a build without the feature must produce a runtime indistinguishable
+    // from one that was never asked for a sandbox" — and a value only ever
+    // written in one direction cannot deliver it.
     //
     // Writing `"false"` here overrides nothing an operator would have set: in
     // the browser target the sandbox is the ONLY producer of a landing page
@@ -100,7 +105,11 @@ pub async fn seed_and_load_variables(
     impresspress_core::boot::set_variable(
         db,
         "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
-        if dev_active { "true" } else { "false" },
+        if mode.runtime_present() {
+            "true"
+        } else {
+            "false"
+        },
         "Has Landing Page",
         "Serve a static landing page (wafer-run/web) at `/` instead of \
          redirecting anonymous visitors to the login page",

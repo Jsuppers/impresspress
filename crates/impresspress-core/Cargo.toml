@@ -115,7 +115,10 @@ block-products = []
 # not existing outside `examples/dev-sandbox`. Consumers that want it opt
 # in explicitly, and a second runtime gate (`IMPRESSPRESS__DEV__ENABLED`)
 # is checked before its routes are registered.
-block-dev = []
+#
+# Pulls in `crc32fast`, used solely by `blocks::dev::zip`'s stored-entry
+# writer (the export bundle's checksums) — no other block needs a CRC-32.
+block-dev = ["dep:crc32fast"]
 # `block-fastembed` pulls in `wafer-block-fastembed` (ONNX Runtime, ~100 MB
 # of native deps). The `native-embedding` feature implies this — leaving
 # this on without `native-embedding` is fine and just installs the block
@@ -158,6 +161,9 @@ wafer-block-fastembed = { workspace = true, optional = true }
 # `wafer-run/vector` block's EmbeddingService slot.
 wafer-block-sqlite = { workspace = true, optional = true, features = ["vectors"] }
 rusqlite = { workspace = true, optional = true }
+# CRC-32 for `blocks::dev::zip`'s stored-entry writer (gated behind
+# `block-dev` — see the feature comment above).
+crc32fast = { version = "1", optional = true }
 
 # Middleware blocks (always registered by the builder).
 wafer-block-cors = { workspace = true }
@@ -255,6 +261,10 @@ base64ct = { version = "1", features = ["alloc"] }
 axum = "0.8"
 # Mock upstream OAuth providers in integration tests.
 wiremock = "0.6"
+# Reads back `blocks::dev::zip`'s stored-entry archives in its own tests
+# (`default-features = false` — the writer needs no compression backend, so
+# the reader shouldn't pull one in either).
+zip = { version = "2", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

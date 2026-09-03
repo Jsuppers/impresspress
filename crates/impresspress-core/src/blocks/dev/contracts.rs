@@ -33,8 +33,52 @@ pub struct StatusResponse {
     pub blocks: Vec<ActiveBlockView>,
     /// The activation in progress, if any.
     pub activation: Option<ActivationView>,
+    /// What the sandbox's content stores hold right now.
+    pub storage: StorageUsage,
     /// `wafer_guest.rs` version the block scaffolder currently writes.
     pub wafer_guest_version: u32,
+    /// Why this instance's seed import was refused, if it was.
+    ///
+    /// `None` on every healthy instance — including one that never had a seed
+    /// bundle to import. A sandbox whose seed was refused boots with an empty
+    /// site and no other sign of it (`dev_runtime::install` logs and carries
+    /// on, because a sandbox that refuses to boot is one whose `/b/dev` page
+    /// — the only thing that could fix it — never comes up), so this is what
+    /// makes the cause readable through `dev_status` instead of only through
+    /// the service worker's console. Read from the same row an admin sees on
+    /// `/b/admin/settings/variables`, which is the only surface an exported
+    /// site has (it has no `/b/dev`). `dev.js` does not render it: the page
+    /// polls this endpoint several times a second, so a log line would need
+    /// its own "said this already" state, and the agent that would act on a
+    /// refused seed reads `dev_status` rather than the log.
+    pub seed_error: Option<String>,
+}
+
+/// What the sandbox's two content stores, its workspace and its ledger hold.
+///
+/// Read from the workspace's own counters and the builds table on every
+/// request, never by walking the stores — see [`super::gc::storage_usage`],
+/// which owns that decision and the reason for it (a storage `list` is
+/// `O(folder)` on the OPFS backend, and the page polls this three times a
+/// second while a tool call is outstanding). The one full listing belongs to
+/// the collector, which runs once per activation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageUsage {
+    /// How many content-addressed blobs are stored. Includes blobs no file
+    /// names any more but a retained generation still does.
+    pub blobs: u32,
+    /// Total size of those blobs, in bytes.
+    pub blobs_bytes: u64,
+    /// How many compiled block artifacts are stored.
+    pub artifacts: u32,
+    /// Total size of those artifacts, in bytes.
+    pub artifacts_bytes: u64,
+    /// How many files the workspace currently holds.
+    pub workspace_files: u32,
+    /// How many generations the ledger is keeping: the retention window, plus
+    /// anything older that is still serving or still in flight.
+    pub retained_generations: u32,
 }
 
 /// One entry in the publication ledger, as the status and generation views
@@ -474,4 +518,43 @@ pub struct ReferenceResponse {
     /// namespace rules, the limits, the diagnostic codes, and both templates
     /// in full.
     pub markdown: String,
+}
+
+/// One entry of the export bundle: where it lands in the zip, and how big it
+/// is.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportFile {
+    /// Path inside the archive (`sw.js`, `seed/site/index.html`).
+    pub path: String,
+    /// The entry's uncompressed size in bytes. The archive stores entries
+    /// uncompressed, so this is also what it costs in the zip.
+    pub bytes: u64,
+}
+
+/// Response of `GET /b/dev/api/export/manifest` — what
+/// `GET /b/dev/api/export` would produce, without producing it.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportManifest {
+    /// The generation the export is a snapshot of — the one that is live now.
+    /// The downloaded file is named after its first eight characters.
+    pub generation_id: String,
+    /// Every entry of the archive, in the order it is written.
+    pub files: Vec<ExportFile>,
+    /// Total size of every entry's content. The archive itself is slightly
+    /// larger: each entry carries a local header and a central directory
+    /// record naming it.
+    pub total_bytes: u64,
+    /// How many of `files` are the runtime shell (the service worker, the
+    /// wasm, the loader — everything that makes the folder runnable).
+    pub shell_files: u32,
+    /// How many are the site's own files, under `seed/site/`.
+    pub site_files: u32,
+    /// How many compiled blocks the export carries. Each contributes its
+    /// `.wasm` plus its whole source tree.
+    pub blocks: u32,
+    /// Rows the data snapshot carries, per table — products, offers,
+    /// settings and accounts (`seed/data.json`).
+    pub tables: std::collections::BTreeMap<String, usize>,
 }

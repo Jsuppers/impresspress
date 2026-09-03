@@ -38,13 +38,26 @@ pub fn namespaced_folder() -> String {
 /// Content type artifacts are stored under.
 const ARTIFACT_CONTENT_TYPE: &str = "application/wasm";
 
+/// Suffix every artifact key carries (design §11.2).
+const KEY_SUFFIX: &str = ".wasm";
+
 /// The storage key an artifact with hash `sha` is filed under.
 ///
 /// The `.wasm` suffix is part of the key design §11.2 specifies, so it is
 /// derived here rather than spelled out at each call site — a key built two
 /// ways is a key that can be built two *different* ways.
 pub fn key_for(sha: &str) -> String {
-    format!("{sha}.wasm")
+    format!("{sha}{KEY_SUFFIX}")
+}
+
+/// The artifact hash a storage key names — the inverse of [`key_for`].
+///
+/// `None` for a key this module did not write. The garbage collector reads a
+/// folder listing back into hashes, and it is the one caller that has to
+/// decide what to do with a key it cannot explain; sharing [`KEY_SUFFIX`] with
+/// `key_for` is what makes "wrote it" and "recognizes it" the same statement.
+pub fn sha_of_key(key: &str) -> Option<&str> {
+    key.strip_suffix(KEY_SUFFIX)
 }
 
 /// Store `bytes` and return their sha256.
@@ -103,6 +116,18 @@ pub async fn exists(ctx: &dyn Context, sha: &str) -> Result<bool, WaferError> {
     }
 }
 
+/// Remove the artifact stored under `sha`.
+///
+/// For [`super::gc`] only. A block leaving the active set does not delete its
+/// artifact: a retained generation can still be rolled back to it.
+pub async fn delete(ctx: &dyn Context, sha: &str) -> Result<(), WaferError> {
+    match storage::delete(ctx, FOLDER, &key_for(sha)).await {
+        // Already gone is the outcome the caller asked for.
+        Err(e) if e.code == ErrorCode::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +168,25 @@ mod tests {
                 .code,
             ErrorCode::NotFound
         );
+    }
+
+    /// The key grammar has to round-trip, or the collector would read a
+    /// folder listing back into hashes that name nothing.
+    #[test]
+    fn a_key_round_trips_through_the_hash_it_names() {
+        let sha = sha256_hex(b"module");
+        assert_eq!(sha_of_key(&key_for(&sha)), Some(sha.as_str()));
+        assert_eq!(sha_of_key(&sha), None, "a key with no suffix is not one");
+        assert_eq!(sha_of_key("workspace.json"), None);
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let sha = put(&ctx, b"\0asm\x01\0\0\0gone").await.expect("put");
+        delete(&ctx, &sha).await.expect("delete");
+        assert!(!exists(&ctx, &sha).await.expect("exists"));
+        delete(&ctx, &sha).await.expect("delete again");
     }
 
     #[tokio::test]

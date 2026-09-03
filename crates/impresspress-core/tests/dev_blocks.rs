@@ -19,10 +19,15 @@ use std::collections::BTreeSet;
 use base64ct::{Base64, Encoding};
 use impresspress_core::{
     blocks::dev::{
-        control::ValidationStage,
+        activation::{self, ActivationIntent},
+        control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind, ValidationStage},
         paths::MAX_BLOCKS,
-        repo::builds::{self, BuildStatus},
-        test_support::FakeControl,
+        repo::{
+            builds::{self, BuildStatus},
+            generations::GenerationCause,
+        },
+        seed::{self, SeedBlock, SeedManifest},
+        test_support::{seed_file, FakeControl, MapFetch},
         validation::MAX_ARTIFACT_BYTES,
     },
     test_support::{admin_msg, anon_msg, output_json, output_status, TestContext},
@@ -831,4 +836,133 @@ async fn the_staging_and_removal_routes_are_admin_only() {
             "{path} answered {status} to an anonymous caller"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Staging on top of a seeded block
+// ---------------------------------------------------------------------------
+
+/// The seed bundle a seeded instance below is built from: one block,
+/// `site/greeter`, claiming the agent tool name `greet`.
+fn greeter_bundle() -> (SeedManifest, MapFetch, BlockInfo) {
+    const LIB_RS: &[u8] = b"// a guest\n";
+    let info =
+        BlockInfo::new("site/greeter", "0.1.0", "http-handler@v1", "greets").endpoints(vec![
+            BlockEndpoint::get("/b/greeter/")
+                .auth(AuthLevel::Public)
+                .summary("greet")
+                .agent_tool("greet", "says hello"),
+        ]);
+    let manifest = SeedManifest {
+        schema_version: seed::SCHEMA_VERSION,
+        source_generation: None,
+        site: vec![seed_file("index.html", b"<h1>hi</h1>")],
+        blocks: vec![SeedBlock {
+            spec: DynamicBlockSpec {
+                name: "site/greeter".to_string(),
+                artifact_sha256: impresspress_core::blocks::dev::blobs::sha256_hex(ARTIFACT),
+                routes: vec![DynamicRoute {
+                    prefix: "/b/greeter/".to_string(),
+                    access: RouteAccessKind::Public,
+                }],
+                capabilities: BlockCapabilities::none(),
+                wafer_guest_version: 0,
+            },
+            sources: vec![seed_file("src/lib.rs", LIB_RS)],
+        }],
+        data: None,
+    };
+    let fetch = MapFetch::default()
+        .with(&seed::site_url("index.html"), b"<h1>hi</h1>")
+        .with(&seed::artifact_url("greeter"), ARTIFACT)
+        .with(&seed::source_url("greeter", "src/lib.rs"), LIB_RS);
+    (manifest, fetch, info)
+}
+
+/// Import [`greeter_bundle`] and activate it as generation 0, leaving an
+/// instance whose live block set is one SEEDED block.
+async fn seeded_instance(control: &std::sync::Arc<FakeControl>) -> TestContext {
+    let (manifest, fetch, info) = greeter_bundle();
+    control.set_validated_info(info);
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let generation = seed::import(&ctx, control.as_ref(), &manifest, &fetch)
+        .await
+        .expect("import")
+        .expect("fresh");
+    activation::request(
+        &ctx,
+        &ctx.dev_shared(),
+        GenerationCause::Seed,
+        ActivationIntent::Seed {
+            manifest: generation,
+        },
+    )
+    .await
+    .expect("activate the seed");
+    ctx
+}
+
+/// A seeded block does not block the next compile.
+///
+/// `claimed_tool_names` reads the stored `BlockInfo` of every block in the
+/// active generation and refuses the WHOLE stage when one cannot be read
+/// (`build-row-missing`). A seed used to record `"null"` there, so the very
+/// first `dev_compile_block` on a seeded instance — which is every instance
+/// of `dev.impresspress.org` that ships a starter block — was refused for a
+/// reason the agent could do nothing about.
+#[tokio::test]
+async fn staging_a_block_beside_a_seeded_one_succeeds() {
+    let control = FakeControl::new();
+    let ctx = seeded_instance(&control).await;
+
+    control.set_validated_info(
+        BlockInfo::new("site/notes", "0.1.0", "http-handler@v1", "notes").endpoints(vec![
+            BlockEndpoint::get("/b/notes/")
+                .auth(AuthLevel::Public)
+                .summary("notes")
+                .agent_tool("list_notes", "lists notes"),
+        ]),
+    );
+    let r = stage(&ctx, "notes", b"\0asm\x01\0\0\0notes").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(codes(&r).is_empty(), "{r}");
+
+    // Both blocks are live: the seeded one was carried into the new
+    // generation, not replaced by it.
+    let live: Vec<String> = control
+        .live_blocks()
+        .expect("a live set")
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert_eq!(
+        live,
+        vec!["site/greeter".to_string(), "site/notes".to_string()]
+    );
+}
+
+/// And the rule the recorded `BlockInfo` exists to make applicable: a block
+/// staged next to a seeded one may not claim the seeded block's agent tool
+/// name. Nothing but that stored report knows the name is taken — the
+/// generation manifest carries routes and capabilities, not endpoints.
+#[tokio::test]
+async fn staging_a_block_that_collides_with_a_seeded_tool_name_is_refused() {
+    let control = FakeControl::new();
+    let ctx = seeded_instance(&control).await;
+
+    control.set_validated_info(
+        BlockInfo::new("site/notes", "0.1.0", "http-handler@v1", "notes").endpoints(vec![
+            BlockEndpoint::get("/b/notes/")
+                .auth(AuthLevel::Public)
+                .summary("notes")
+                .agent_tool("greet", "steals the seeded block's tool name"),
+        ]),
+    );
+    let r = stage(&ctx, "notes", b"\0asm\x01\0\0\0notes").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert!(codes(&r).contains(&"tool-name-duplicate"), "{r}");
+    // The seeded block is still the whole live set.
+    let live = control.live_blocks().expect("a live set");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].name, "site/greeter");
 }

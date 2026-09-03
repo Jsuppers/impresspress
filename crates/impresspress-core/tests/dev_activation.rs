@@ -594,8 +594,9 @@ async fn boot_reports_the_active_block_set_when_nothing_is_owed() {
 // Retention
 // ---------------------------------------------------------------------------
 
-/// A generation that was staged and never activated — a refused compile, or a
-/// crash before the swap. Retention is the only thing that ever labels one.
+/// A generation that was staged and never activated — the row a crash between
+/// the insert and the swap leaves behind, and the row boot convergence would
+/// re-run. Retention keeps it however old it gets.
 async fn stage_only(ctx: &TestContext) -> String {
     let id = repo::new_id();
     let manifest = {
@@ -619,13 +620,23 @@ async fn stage_only(ctx: &TestContext) -> String {
     id
 }
 
-/// The status of `id`, read back through the API.
-async fn status_of_generation(ctx: &TestContext, id: &str) -> String {
-    let detail = output_json(dev_get(ctx, &format!("/b/dev/api/generations/{id}")).await).await;
-    detail["summary"]["status"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no status for {id}: {detail}"))
-        .to_string()
+/// The status of `id`, read back through the API, or `None` once retention
+/// has deleted the row — which the endpoint answers as a `404`.
+///
+/// Two requests: an `OutputStream` is consumed by reading it, so the status
+/// code and the body cannot both come off one response.
+async fn status_of_generation(ctx: &TestContext, id: &str) -> Option<String> {
+    let path = format!("/b/dev/api/generations/{id}");
+    if output_http_status(dev_get(ctx, &path).await).await == 404 {
+        return None;
+    }
+    let detail = output_json(dev_get(ctx, &path).await).await;
+    Some(
+        detail["summary"]["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no status for {id}: {detail}"))
+            .to_string(),
+    )
 }
 
 /// `GET /b/dev/api/generations?limit=n`, with the query where the HTTP
@@ -653,33 +664,35 @@ async fn write_repeatedly(
     sha
 }
 
+/// Retention deletes the rows that fall out of the window — it does not
+/// relabel them. Rewritten from the labelling version this replaces: nothing
+/// rewrites a row's status because it got old, so the observable effect is a
+/// row that is *gone*, and the one thing that must never go is the generation
+/// that is serving.
 #[tokio::test]
 async fn only_the_last_twenty_generations_are_retained() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
 
-    // Three stagings that never activated. They are the rows retention has
-    // work to do on: an activation supersedes the generation it replaces by
-    // itself, so without these the retention pass would be unobservable.
-    let mut staged = Vec::new();
-    for _ in 0..3 {
-        staged.push(stage_only(&ctx).await);
-    }
-
-    // 3 + 10 = 13 rows: everything is still inside the window.
+    // Ten writes, ten generations: everything is still inside the window.
     let sha = write_repeatedly(&ctx, 10, 0, None).await;
-    for id in &staged {
-        assert_eq!(
-            status_of_generation(&ctx, id).await,
-            "staged",
-            "a generation inside the retention window keeps its own status"
-        );
-    }
+    let inside = list_generations(&ctx, Some(100)).await;
+    let oldest = inside["generations"][9]["id"]
+        .as_str()
+        .expect("the tenth-newest id")
+        .to_string();
+    assert_eq!(
+        status_of_generation(&ctx, &oldest).await.as_deref(),
+        Some("superseded"),
+        "a replaced generation is superseded by the activation that replaced it",
+    );
 
-    // 3 + 21 = 24 rows: the four oldest fall out.
-    write_repeatedly(&ctx, 11, 10, sha).await;
-    for id in &staged {
-        assert_eq!(status_of_generation(&ctx, id).await, "superseded");
-    }
+    // 24 writes: the four oldest fall out of the window and are deleted.
+    write_repeatedly(&ctx, 14, 10, sha).await;
+    assert_eq!(
+        status_of_generation(&ctx, &oldest).await,
+        None,
+        "a generation past the window is deleted, not relabelled",
+    );
 
     let l = list_generations(&ctx, Some(100)).await;
     let statuses: Vec<&str> = l["generations"]
@@ -690,18 +703,13 @@ async fn only_the_last_twenty_generations_are_retained() {
         .collect();
     assert_eq!(
         statuses.len(),
-        24,
-        "the ledger is append-only: {statuses:?}"
+        20,
+        "24 published, 20 kept — the ledger is bounded: {statuses:?}"
     );
     assert_eq!(
         statuses.iter().filter(|s| **s == "active").count(),
         1,
         "exactly one generation is serving: {statuses:?}"
-    );
-    assert_eq!(
-        statuses.iter().filter(|s| **s == "staged").count(),
-        0,
-        "24 made, 20 retained: {statuses:?}"
     );
     // The default page size is the retention window, so the default listing
     // is exactly the set that can still be rolled back to.
@@ -711,6 +719,58 @@ async fn only_the_last_twenty_generations_are_retained() {
             .expect("generations")
             .len(),
         20
+    );
+}
+
+/// A generation that never activated is a recovery target, not an old row: the
+/// journal may name it and boot convergence re-runs it (design §7.3), so
+/// retention keeps it however far down the ledger it falls.
+#[tokio::test]
+async fn a_staged_generation_survives_past_the_retention_window() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let staged = stage_only(&ctx).await;
+
+    // 24 activations on top of it, so it is well outside the newest twenty.
+    write_repeatedly(&ctx, 24, 0, None).await;
+
+    assert_eq!(
+        status_of_generation(&ctx, &staged).await.as_deref(),
+        Some("staged"),
+        "an in-flight generation is not retention's to delete",
+    );
+    // It is kept *in addition to* the window, not instead of one of its rows.
+    assert_eq!(
+        list_generations(&ctx, Some(100)).await["generations"]
+            .as_array()
+            .expect("generations")
+            .len(),
+        21,
+    );
+}
+
+/// The oldest generation the window keeps has a parent that retention has
+/// deleted. Its detail view still answers — a diff against nothing, exactly as
+/// the first generation's is — rather than 404-ing over a row that is
+/// perfectly readable.
+#[tokio::test]
+async fn the_oldest_retained_generation_reads_back_without_its_parent() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    write_repeatedly(&ctx, 24, 0, None).await;
+
+    let listed = list_generations(&ctx, Some(100)).await;
+    let oldest = &listed["generations"][19];
+    let id = oldest["id"].as_str().expect("id");
+    assert!(
+        oldest["parent_id"].is_string(),
+        "the fixture needs a generation whose parent is gone: {oldest}"
+    );
+
+    let detail = output_json(dev_get(&ctx, &format!("/b/dev/api/generations/{id}")).await).await;
+    assert_eq!(detail["summary"]["id"], json!(id));
+    assert_eq!(
+        detail["diff_from_parent"]["added_paths"],
+        json!(["index.html"]),
+        "with no parent to diff against, the generation adds everything it holds: {detail}",
     );
 }
 
@@ -1196,7 +1256,10 @@ async fn converging_on_the_generation_that_is_already_live_leaves_it_live() {
     let after = runtime_state::read(&ctx).await.expect("read journal");
     assert_eq!(after.active_generation_id.as_deref(), Some(active.as_str()));
     assert_eq!(after.desired_generation_id, None);
-    assert_eq!(status_of_generation(&ctx, &active).await, "active");
+    assert_eq!(
+        status_of_generation(&ctx, &active).await.as_deref(),
+        Some("active")
+    );
     assert_eq!(
         served(&ctx, "index.html").await.as_deref(),
         Some(&b"v1"[..])
@@ -1251,7 +1314,10 @@ async fn boot_clears_a_journal_that_names_a_generation_that_is_gone() {
     activation::converge_on_boot(&ctx, &ctx.dev_shared())
         .await
         .expect("the second boot has nothing owed");
-    assert_eq!(status_of_generation(&ctx, &active).await, "active");
+    assert_eq!(
+        status_of_generation(&ctx, &active).await.as_deref(),
+        Some("active")
+    );
 }
 
 /// The same, for a row that exists but cannot be read: its manifest columns do
@@ -1448,5 +1514,8 @@ async fn an_unreadable_active_pointer_still_converges_on_a_loadable_desired() {
     );
     assert_eq!(state.desired_generation_id, None);
     assert_eq!(state.activation_phase, ActivationPhase::Idle);
-    assert_eq!(status_of_generation(&ctx, &desired).await, "active");
+    assert_eq!(
+        status_of_generation(&ctx, &desired).await.as_deref(),
+        Some("active")
+    );
 }

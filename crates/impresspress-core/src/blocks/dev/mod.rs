@@ -17,9 +17,10 @@
 //! # Why it is not in the block manifest
 //!
 //! Registration happens from the consumer, via `ImpresspressBuilder::extra_block`
-//! and `add_route`, gated on `impresspress-web`'s `resolve_dev_active` — the
-//! `browser-devtools` feature AND the `initialize({ dev })` request, never a
-//! stored variable.
+//! and `add_route`, gated on the `browser-devtools` feature — the block is
+//! registered wherever the feature is compiled in, and only its `/b/dev`
+//! ROUTE is keyed on the deployment being a workspace rather than an exported
+//! bundle (`SandboxMode`, spec amendment 19) — never on a stored variable.
 //! `feature_block_manifest!` only enumerates blocks whose constructors take no
 //! arguments, and — more to the point — the sandbox's security model
 //! (design §13) depends on this block being absent from every normal
@@ -32,7 +33,10 @@ pub mod blobs;
 pub mod blocks_api;
 pub mod contracts;
 pub mod control;
+pub mod data_snapshot;
+pub mod export;
 pub mod files;
+pub mod gc;
 pub mod generation;
 pub mod generations_api;
 pub mod migrations;
@@ -40,12 +44,14 @@ pub mod page;
 pub mod paths;
 pub mod publisher;
 pub mod repo;
+pub mod retention;
 pub mod scaffold;
 pub mod seed;
 pub mod status;
 pub mod tools;
 pub mod validation;
 pub mod workspace;
+pub mod zip;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -58,8 +64,8 @@ use wafer_run::{
 };
 
 pub use self::control::{
-    DynamicBlockSpec, DynamicRoute, RouteAccessKind, RuntimeControl, ValidationFailure,
-    ValidationStage,
+    DynamicBlockSpec, DynamicRoute, RouteAccessKind, RuntimeControl, ShellSource,
+    ValidationFailure, ValidationStage,
 };
 use crate::{
     endpoint_match::{self, EndpointRoute},
@@ -116,6 +122,10 @@ pub enum Route {
     ApiReference,
     /// `GET /b/dev/api/tools.json`
     ApiToolsJson,
+    /// `GET /b/dev/api/export/manifest`
+    ApiExportManifest,
+    /// `GET /b/dev/api/export`
+    ApiExport,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
@@ -187,6 +197,16 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/dev/api/tools.json",
         Route::ApiToolsJson,
     ),
+    // `/export/manifest` BEFORE `/export`: `endpoint_match` walks this table
+    // in order and `/b/dev/api/export` is a literal template, not a prefix,
+    // so the order is not load-bearing today — it is written this way so the
+    // more specific path stays first if either ever gains a `{…}` segment.
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/api/export/manifest",
+        Route::ApiExportManifest,
+    ),
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/api/export", Route::ApiExport),
 ];
 
 /// A response builder pre-seeded with `Cache-Control: no-store`.
@@ -257,15 +277,28 @@ fn no_store_wafer_error(code: wafer_run::ErrorCode, message: &str) -> WaferError
 ///
 /// The dev block's tables (`impresspress__dev__*`) self-admit under the
 /// own-namespace rule, and its blobs and artifacts live under its own storage
-/// prefix. The one resource it must be *granted* is the published site, which
-/// `wafer-run/web` owns — so this grant cannot be declared in
-/// `BlockInfo::grants` (a block may only grant what it owns) and is handed to
-/// the runtime by whoever registers the block.
+/// prefix. Two kinds of resource it must be *granted* instead, because it
+/// does not own them — so neither grant can be declared in
+/// `BlockInfo::grants` (a block may only grant what it owns) and both are
+/// handed to the runtime by whoever registers the block:
+///
+/// - the published site, which `wafer-run/web` owns;
+/// - every [`data_snapshot::TABLE_ALLOWLIST`] table, one exact grant each
+///   (never a `{org}__{block}__*` prefix) so the grant set says exactly what
+///   [`data_snapshot::export`]/[`data_snapshot::import`] actually touch — the
+///   same closed-list discipline the allowlist itself exists for. This is
+///   the dev block's own control-plane logic reading and writing another
+///   block's rows directly, not a delegated call through that block's own
+///   authorized handler, so WRAP has no other way to see it as legitimate.
 pub fn wrap_grants() -> Vec<wafer_run::ResourceGrant> {
-    vec![
+    let mut grants = vec![
         wafer_run::ResourceGrant::read_write(BLOCK_NAME, "wafer-run/web/site/*")
             .typed(wafer_run::ResourceType::Storage),
-    ]
+    ];
+    grants.extend(data_snapshot::TABLE_ALLOWLIST.iter().map(|(table, _mode)| {
+        wafer_run::ResourceGrant::read_write(BLOCK_NAME, table).typed(wafer_run::ResourceType::Db)
+    }));
+    grants
 }
 
 /// State shared by every `/b/dev` handler.
@@ -276,6 +309,14 @@ pub fn wrap_grants() -> Vec<wafer_run::ResourceGrant> {
 pub struct DevShared {
     /// The host's half of activation: builds and swaps the live runtime.
     pub control: Arc<dyn RuntimeControl>,
+    /// The host's other half: the static shell this deployment is running
+    /// inside of, which [`export`] copies into the bundle it hands the user.
+    ///
+    /// Beside `control` rather than inside it because the two answer
+    /// different questions — one builds a runtime, the other reads files the
+    /// host was shipped as — and because a host may legitimately have one
+    /// without the other (an export is a read; a runtime rebuild is not).
+    pub shell: Arc<dyn ShellSource>,
     /// The one serialized path from a desired state to a live one.
     ///
     /// On the shared state rather than on [`DevBlock`] because activation is
@@ -321,7 +362,7 @@ pub struct DevShared {
 }
 
 impl DevShared {
-    /// Build the shared state around a [`RuntimeControl`] handle.
+    /// Build the shared state around the two host seams.
     ///
     /// `arc_with_non_send_sync`: [`RuntimeControl`] is bounded on
     /// `MaybeSend + MaybeSync`, which is unbounded on wasm32 — that is what
@@ -331,9 +372,10 @@ impl DevShared {
     /// bounds are `Send + Sync` and the lint does not fire at all. The same
     /// allowance the block registration path already carries.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new(control: Arc<dyn RuntimeControl>) -> Arc<Self> {
+    pub fn new(control: Arc<dyn RuntimeControl>, shell: Arc<dyn ShellSource>) -> Arc<Self> {
         Arc::new(Self {
             control,
+            shell,
             activation: activation::ActivationQueue::new(),
             workspace: futures::lock::Mutex::new(()),
             compile: futures::lock::Mutex::new(()),
@@ -344,19 +386,55 @@ impl DevShared {
 /// The browser development sandbox control plane (`impresspress/dev`).
 pub struct DevBlock {
     shared: Arc<DevShared>,
+    /// Whether the runtime that registered this block also routed
+    /// [`ROUTE_PREFIX`] — the workspace half of the sandbox.
+    ///
+    /// The block is registered in BOTH of `SandboxMode`'s compiled-in modes,
+    /// because its `lifecycle(Init)` is what creates the ledger tables the
+    /// seed import and the generation history write to. Only the workspace
+    /// mode routes it. What this field carries is that difference, into the
+    /// one place that would otherwise describe a surface that is not there:
+    /// [`Block::info`] — whose `endpoints` become `/openapi.json` and whose
+    /// `admin_url` becomes an "Open" button on `/b/admin/blocks`, for every
+    /// registered block, routed or not.
+    workspace: bool,
 }
 
 impl DevBlock {
-    /// Construct a [`DevBlock`] over shared state.
-    pub fn new(shared: Arc<DevShared>) -> Self {
-        Self { shared }
+    /// The sandbox with its workspace half: this runtime routes
+    /// [`ROUTE_PREFIX`], so the endpoints below are real and `/b/dev` is
+    /// where an admin goes to reach them.
+    pub fn with_workspace(shared: Arc<DevShared>) -> Self {
+        Self {
+            shared,
+            workspace: true,
+        }
+    }
+
+    /// The runtime half alone — **an exported bundle**.
+    ///
+    /// Registered for its migrations, its ledger and its seed import, with no
+    /// `/b/dev` route (design amendment 19). Declaring the endpoints anyway
+    /// would publish a dozen 404s in the exported site's `/openapi.json` and
+    /// put an "Open" link to a page that does not exist on its admin's own
+    /// blocks page — the exact drift
+    /// `routes_and_endpoints_stay_in_lockstep` exists to catch, one level up
+    /// from where that test can see it.
+    pub fn runtime_only(shared: Arc<DevShared>) -> Self {
+        Self {
+            shared,
+            workspace: false,
+        }
     }
 }
 
 #[wafer_block::wafer_async_trait]
 impl Block for DevBlock {
     fn info(&self) -> BlockInfo {
-        BlockInfo::new(
+        // The half that is true in both modes: the block exists, it owns
+        // these tables, and its migrations ran. An exported bundle's ledger
+        // is as real as a workspace's.
+        let base = BlockInfo::new(
             BLOCK_NAME,
             "0.1.0",
             "http-handler@v1",
@@ -376,7 +454,18 @@ impl Block for DevBlock {
             CollectionSchema::new(repo::runtime_state::TABLE),
         ])
         .category(wafer_run::BlockCategory::Feature)
-        .endpoints(vec![
+        // The sandbox is registered only where it is meant to exist; a
+        // deployment turns it off by not building it, not by an admin toggle
+        // that would leave a half-live control plane behind.
+        .can_disable(false);
+
+        // The half that depends on a route existing. An exported bundle has
+        // none of it — see `Self::runtime_only`.
+        if !self.workspace {
+            return base;
+        }
+
+        base.endpoints(vec![
             // The document and its three assets carry no schemas — there is no
             // JSON contract to describe, and `has_schema()` therefore keeps
             // all four out of `/openapi.json` exactly as it keeps the HTML
@@ -483,12 +572,31 @@ impl Block for DevBlock {
                      at /b/webmcp/manifest.json.",
                 )
                 .auth(AuthLevel::Admin),
+            BlockEndpoint::get("/b/dev/api/export/manifest")
+                .summary("Preview the export bundle")
+                .description(
+                    "What `GET /b/dev/api/export` would produce, without producing it: every \
+                     entry of the zip with its size, the totals, and the rows of each data \
+                     table the snapshot carries. Read it to see what an export would contain \
+                     before downloading one.",
+                )
+                .auth(AuthLevel::Admin)
+                .output::<contracts::ExportManifest>(),
+            // No `.output::<..>()`: the body is a zip, not JSON. It is
+            // declared all the same because `routes_and_endpoints_stay_in_lockstep`
+            // requires the dispatch table and this list to be the same set,
+            // and the declaration is what pins its `Admin` tier where the
+            // router can enforce it.
+            BlockEndpoint::get("/b/dev/api/export")
+                .summary("Export the site as a runnable static bundle")
+                .description(
+                    "A zip of the runtime shell with the sandbox turned off, the site files, \
+                     every compiled block and its source, and a data snapshot — servable from \
+                     any static host and re-importable as a seed.",
+                )
+                .auth(AuthLevel::Admin),
         ])
         .admin_url(ROUTE_PREFIX)
-        // The sandbox is registered only where it is meant to exist; a
-        // deployment turns it off by not building it, not by an admin toggle
-        // that would leave a half-live control plane behind.
-        .can_disable(false)
     }
 
     async fn handle(
@@ -522,6 +630,8 @@ impl Block for DevBlock {
             Route::ApiBlockRemove => blocks_api::handle_remove(ctx, &self.shared, &msg).await,
             Route::ApiReference => scaffold::handle_reference(ctx).await,
             Route::ApiToolsJson => tools::handle(ctx).await,
+            Route::ApiExportManifest => export::handle_manifest(ctx, &self.shared).await,
+            Route::ApiExport => export::handle_export(ctx, &self.shared).await,
         }
     }
 
@@ -685,18 +795,43 @@ mod tests {
     }
 
     #[test]
-    fn wrap_grants_cover_only_the_published_site() {
+    fn wrap_grants_cover_the_published_site_and_the_data_snapshot_allowlist() {
         let grants = wrap_grants();
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].grantee, BLOCK_NAME);
-        assert_eq!(grants[0].resource, "wafer-run/web/site/*");
-        assert!(grants[0].write);
+        let site_grant = &grants[0];
+        assert_eq!(site_grant.grantee, BLOCK_NAME);
+        assert_eq!(site_grant.resource, "wafer-run/web/site/*");
+        assert!(site_grant.write);
         // Typed to Storage: an untyped grant would also admit a database
         // collection or config key that happened to match the pattern.
         assert_eq!(
-            grants[0].resource_type,
+            site_grant.resource_type,
             Some(wafer_run::ResourceType::Storage)
         );
+
+        // Every other grant is one exact, `Db`-typed, read-write entry per
+        // `TABLE_ALLOWLIST` table — never a `{org}__{block}__*` prefix, which
+        // would also admit a table `TABLE_EXCLUDED` deliberately keeps this
+        // block off, and never untyped, which would also admit a Config key
+        // or Vector collection that happened to share the name.
+        let db_grants = &grants[1..];
+        assert_eq!(db_grants.len(), data_snapshot::TABLE_ALLOWLIST.len());
+        for grant in db_grants {
+            assert_eq!(grant.grantee, BLOCK_NAME);
+            assert!(grant.write);
+            assert_eq!(grant.resource_type, Some(wafer_run::ResourceType::Db));
+            assert!(
+                !grant.resource.ends_with('*'),
+                "{:?} is a prefix grant, not an exact table name",
+                grant.resource
+            );
+            assert!(
+                data_snapshot::TABLE_ALLOWLIST
+                    .iter()
+                    .any(|(table, _)| *table == grant.resource),
+                "{:?} is not on TABLE_ALLOWLIST",
+                grant.resource
+            );
+        }
     }
 
     #[tokio::test]

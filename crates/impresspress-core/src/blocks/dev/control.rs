@@ -315,3 +315,43 @@ pub trait RuntimeControl: wafer_run::MaybeSend + wafer_run::MaybeSync {
     /// changes.
     fn runtime_generation(&self) -> u64;
 }
+
+/// The static shell the sandbox is running inside, as the export reads it.
+///
+/// `impresspress-core` describes what an export bundle should contain, but it
+/// cannot read the deployment's own `index.html`, `sw.js` or wasm: those are
+/// static files the host serves, and the only thing that can fetch them is
+/// whatever is running the runtime — the service worker's own `fetch` in the
+/// browser, an in-memory map in the host tests. This is that seam, and it is
+/// the mirror of [`RuntimeControl`]: one describes the runtime the host
+/// builds, the other the files the host was shipped as.
+///
+/// # Why a listing and not a fixed set of names
+///
+/// The shell's filenames are content-hashed and change with every build
+/// (`impresspress-bundle`'s `rename`), and the wasm-bindgen glue pulls in a
+/// `snippets/` tree whose shape depends on the crate. Nothing in this crate
+/// can know them. `impresspress-bundle` writes them all into
+/// `/asset-manifest.json`'s `files` for exactly this reason, and
+/// [`Self::list`] is what reads it back — so a file the bundler produced is
+/// a file the export ships, with no list to keep in step by hand.
+///
+/// `MaybeSend + MaybeSync` for the same reason [`RuntimeControl`] is: the
+/// browser implementation resolves through a `JsFuture`, which is not `Send`,
+/// and the sandbox is single-threaded on every target it runs on.
+#[wafer_block::wafer_async_trait]
+pub trait ShellSource: wafer_run::MaybeSend + wafer_run::MaybeSync {
+    /// Every file of the running static shell, relative to the site root
+    /// (`index.html`, `vendor/sql-wasm.wasm`), as `/asset-manifest.json`'s
+    /// `files` lists them.
+    ///
+    /// `Err` — rather than an empty list — when the manifest cannot be read
+    /// or carries no `files`: an export with no runtime in it is a folder
+    /// that cannot be served, and it must fail loudly rather than quietly
+    /// produce one.
+    async fn list(&self) -> Result<Vec<String>, String>;
+
+    /// The bytes of one file [`Self::list`] named, by that same relative
+    /// path.
+    async fn fetch(&self, path: &str) -> Result<Vec<u8>, String>;
+}

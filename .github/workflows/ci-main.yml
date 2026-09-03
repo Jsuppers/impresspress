@@ -434,6 +434,12 @@ jobs:
           done
           curl -sf http://localhost:8082/seed/manifest.json > /dev/null
 
+      # Teed to a file (not just printed) so the timing-baseline step below can
+      # grep the `console.log(...elapsed...)` lines dev-foundations.spec.ts
+      # and dev-workspace.spec.ts print. `set -o pipefail` is not optional:
+      # GitHub runs `run:` steps as `bash -e {0}` unless the step names a
+      # `shell:`, so without it the step exits with `tee`'s status and a
+      # failing spec passes the job.
       - name: Run dev sandbox e2e (browser WASM, port 8082)
         working-directory: crates/impresspress-web
         env:
@@ -443,7 +449,10 @@ jobs:
         # because it needs the packaged worker only to prove it STARTS under
         # the isolation headers — it compiles nothing, so it costs ~35 s and
         # belongs with the other fake-worker specs.
-        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts 2>&1 \
+            | tee /tmp/dev-sandbox-e2e.log
 
       - name: Stop server
         if: always()
@@ -459,6 +468,29 @@ jobs:
           name: playwright-report-dev-sandbox
           path: crates/impresspress-web/playwright-report/
           retention-days: 7
+
+      # `pkg/` (downloaded above) and `pkg-dev/` (built by build.sh, above)
+      # both already exist at this point, so this only measures — it never
+      # rebuilds. Fails the job on a size-threshold breach; see measure.sh's
+      # header for what's gated and why.
+      - name: Measure dev-sandbox bundle sizes
+        run: examples/dev-sandbox/measure.sh >> "$GITHUB_STEP_SUMMARY"
+
+      # Baseline only — no thresholds (see measure.sh's header for the sizes
+      # that DO gate). `always()` so this still records whatever timing lines
+      # made it into the log even if the e2e run or the size gate above
+      # failed.
+      - name: Record dev-sandbox timing baseline
+        if: always()
+        run: |
+          {
+            echo
+            echo '## Dev-sandbox timing baseline (no thresholds)'
+            echo
+            echo '```'
+            grep -E ': [0-9]+ ms$' /tmp/dev-sandbox-e2e.log || echo 'no timing lines captured'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   e2e-dev-compile:
     name: E2E dev sandbox (Rubrc compiles a block in the browser)
@@ -483,9 +515,10 @@ jobs:
     # separate cache key per job, not dropping the `needs`.
     needs: [build-wasm, e2e-dev-sandbox]
     runs-on: ubuntu-latest
-    # The e2e itself is ~2-4 minutes. The ceiling is for the cache miss below:
-    # composing the toolchain is the slow phase, and a job that gets killed at
-    # the default 6 hours after spending an hour composing has cached nothing.
+    # The two e2es are ~5-10 minutes between them (three real compiles and
+    # four cold boots). The ceiling is for the cache miss below: composing the
+    # toolchain is the slow phase, and a job that gets killed at the default 6
+    # hours after spending an hour composing has cached nothing.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -662,6 +695,38 @@ jobs:
             echo '```'
             grep 'dev-compile:' /tmp/dev-compile.log \
               || echo '(no dev-compile: lines — the run did not reach the compile)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The definition of done (design §21), as one test: the seven-step
+      # scenario of §16, on the bundle already being served. It belongs in THIS
+      # job rather than `e2e-dev-sandbox` for the same reason the spec above
+      # does — its second step compiles a Rust block with the real toolchain —
+      # and it runs AFTER that spec on purpose: the two share this server and
+      # this browser install, and a compiler already known to be broken would
+      # make the scenario's failure say nothing the step above has not said
+      # already. Each spec boots its own fresh origin, so neither can leave
+      # state for the other.
+      - name: Run the full scenario e2e (port 8083)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8083
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-scenario.spec.ts 2>&1 \
+            | tee /tmp/dev-scenario.log
+
+      # One `dev-scenario:` line per step, printed as that step finishes — so
+      # the last line in the summary is also how far the scenario got.
+      - name: Report the scenario timings
+        if: always()
+        run: |
+          {
+            echo '### The seven-step scenario'
+            echo
+            echo '```'
+            grep 'dev-scenario:' /tmp/dev-scenario.log \
+              || echo '(no dev-scenario: lines — the run did not reach the scenario)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

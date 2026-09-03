@@ -206,6 +206,28 @@ impl TestContext {
         ctx
     }
 
+    /// Add auth's migrations to an EXISTING fixture — the same
+    /// `wafer_run__auth__*` schema [`Self::with_auth`] applies to a fresh
+    /// context, layered instead on top of whatever `self` already carries.
+    ///
+    /// Mirrors [`Self::with_dev_added`]'s shape for the same reason: a caller
+    /// that needs auth's tables *alongside* another block's own fixture —
+    /// e.g. `TestContext::with_products().await.with_auth_added().await`, for
+    /// a scenario that seeds a real owner account next to a product — has no
+    /// way to reach `with_auth`'s migrations without also re-running
+    /// `with_products`'s from scratch. Admin's migrations are idempotent
+    /// (`CREATE TABLE IF NOT EXISTS`) but re-registering a block is not
+    /// something either constructor needs to redo here.
+    pub async fn with_auth_added(self) -> Self {
+        self.apply_block_migrations(
+            "wafer-run/auth",
+            crate::blocks::auth::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::auth::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        self
+    }
+
     /// Build a `TestContext` with admin migrations applied (only).
     ///
     /// Use this for tests that exercise a block's own `init()` / migration
@@ -360,8 +382,33 @@ impl TestContext {
     /// existing block set does, so this is not a fixture-only shortcut.
     #[cfg(feature = "block-dev")]
     pub async fn with_dev_added(
+        self,
+        control: Arc<dyn crate::blocks::dev::RuntimeControl>,
+    ) -> Self {
+        // The default shell is a plausible one rather than an empty one: a
+        // fixture that had no shell at all could not tell "this test does not
+        // exercise the export" apart from "the export produced a folder with
+        // no runtime in it", and the second is precisely what
+        // `blocks::dev::export` refuses.
+        self.with_dev_added_and_shell(
+            control,
+            Arc::new(crate::blocks::dev::test_support::FakeShell::new()),
+        )
+        .await
+    }
+
+    /// [`Self::with_dev_added`] with an explicit [`crate::blocks::dev::ShellSource`].
+    ///
+    /// For the export tests, whose subject IS the shell: which files it
+    /// carries, what its `sw.js` says, and what happens when it cannot be
+    /// listed. Everything else about the fixture is identical — this is the
+    /// one function that wires the dev block, and `with_dev_added` is a call
+    /// to it with the default shell.
+    #[cfg(feature = "block-dev")]
+    pub async fn with_dev_added_and_shell(
         mut self,
         control: Arc<dyn crate::blocks::dev::RuntimeControl>,
+        shell: Arc<dyn crate::blocks::dev::ShellSource>,
     ) -> Self {
         use crate::blocks::dev;
 
@@ -371,9 +418,12 @@ impl TestContext {
             dev::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        let shared = dev::DevShared::new(control);
+        let shared = dev::DevShared::new(control, shell);
         self.dev_shared = Some(shared.clone());
-        self.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
+        self.register_block(
+            dev::BLOCK_NAME,
+            Arc::new(dev::DevBlock::with_workspace(shared)),
+        );
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // namespacing wrapper — that wrapper is what turns the block's own
@@ -1491,12 +1541,14 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
 
     // The dev sandbox ships only under its own (non-default) feature, so its
     // `BlockInfo` joins the document only when the block is compiled in. Like
-    // `llm` above, `info()` is declarative — the `RuntimeControl` handle it is
-    // built with is never called here, so the test double suffices.
+    // `llm` above, `info()` is declarative — neither the `RuntimeControl` nor
+    // the `ShellSource` handle it is built with is ever called here, so the
+    // test doubles suffice.
     #[cfg(feature = "block-dev")]
     infos.push(
-        crate::blocks::dev::DevBlock::new(crate::blocks::dev::DevShared::new(
+        crate::blocks::dev::DevBlock::with_workspace(crate::blocks::dev::DevShared::new(
             crate::blocks::dev::test_support::FakeControl::new(),
+            Arc::new(crate::blocks::dev::test_support::FakeShell::new()),
         ))
         .info(),
     );

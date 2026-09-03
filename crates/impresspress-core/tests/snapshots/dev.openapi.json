@@ -232,7 +232,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -661,7 +661,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -769,6 +769,105 @@
         }
       ],
       "summary": "Stage and activate a compiled block"
+    }
+  },
+  "/b/dev/api/export/manifest": {
+    "get": {
+      "description": "What `GET /b/dev/api/export` would produce, without producing it: every entry of the zip with its size, the totals, and the rows of each data table the snapshot carries. Read it to see what an export would contain before downloading one.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Response of `GET /b/dev/api/export/manifest` — what\n`GET /b/dev/api/export` would produce, without producing it.",
+                "properties": {
+                  "blocks": {
+                    "description": "How many compiled blocks the export carries. Each contributes its\n`.wasm` plus its whole source tree.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "files": {
+                    "description": "Every entry of the archive, in the order it is written.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One entry of the export bundle: where it lands in the zip, and how big it\nis.",
+                      "properties": {
+                        "bytes": {
+                          "description": "The entry's uncompressed size in bytes. The archive stores entries\nuncompressed, so this is also what it costs in the zip.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "path": {
+                          "description": "Path inside the archive (`sw.js`, `seed/site/index.html`).",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "bytes"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "generation_id": {
+                    "description": "The generation the export is a snapshot of — the one that is live now.\nThe downloaded file is named after its first eight characters.",
+                    "type": "string"
+                  },
+                  "shell_files": {
+                    "description": "How many of `files` are the runtime shell (the service worker, the\nwasm, the loader — everything that makes the folder runnable).",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "site_files": {
+                    "description": "How many are the site's own files, under `seed/site/`.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "tables": {
+                    "additionalProperties": {
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "description": "Rows the data snapshot carries, per table — products, offers,\nsettings and accounts (`seed/data.json`).",
+                    "type": "object"
+                  },
+                  "total_bytes": {
+                    "description": "Total size of every entry's content. The archive itself is slightly\nlarger: each entry carries a local header and a central directory\nrecord naming it.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "generation_id",
+                  "files",
+                  "total_bytes",
+                  "shell_files",
+                  "site_files",
+                  "blocks",
+                  "tables"
+                ],
+                "title": "ExportManifest",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Preview the export bundle"
     }
   },
   "/b/dev/api/files": {
@@ -989,7 +1088,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -1286,7 +1385,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -1475,7 +1574,7 @@
                             },
                             {
                               "const": "superseded",
-                              "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                              "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                               "type": "string"
                             }
                           ]
@@ -1845,7 +1944,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -2009,7 +2108,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -2322,7 +2421,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -2411,6 +2510,64 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "seed_error": {
+                    "description": "Why this instance's seed import was refused, if it was.\n\n`None` on every healthy instance — including one that never had a seed\nbundle to import. A sandbox whose seed was refused boots with an empty\nsite and no other sign of it (`dev_runtime::install` logs and carries\non, because a sandbox that refuses to boot is one whose `/b/dev` page\n— the only thing that could fix it — never comes up), so this is what\nmakes the cause readable through `dev_status` instead of only through\nthe service worker's console. Read from the same row an admin sees on\n`/b/admin/settings/variables`, which is the only surface an exported\nsite has (it has no `/b/dev`). `dev.js` does not render it: the page\npolls this endpoint several times a second, so a log line would need\nits own \"said this already\" state, and the agent that would act on a\nrefused seed reads `dev_status` rather than the log.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "storage": {
+                    "additionalProperties": false,
+                    "description": "What the sandbox's content stores hold right now.",
+                    "properties": {
+                      "artifacts": {
+                        "description": "How many compiled block artifacts are stored.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "artifacts_bytes": {
+                        "description": "Total size of those artifacts, in bytes.",
+                        "format": "uint64",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "blobs": {
+                        "description": "How many content-addressed blobs are stored. Includes blobs no file\nnames any more but a retained generation still does.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "blobs_bytes": {
+                        "description": "Total size of those blobs, in bytes.",
+                        "format": "uint64",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "retained_generations": {
+                        "description": "How many generations the ledger is keeping: the retention window, plus\nanything older that is still serving or still in flight.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "workspace_files": {
+                        "description": "How many files the workspace currently holds.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "blobs",
+                      "blobs_bytes",
+                      "artifacts",
+                      "artifacts_bytes",
+                      "workspace_files",
+                      "retained_generations"
+                    ],
+                    "type": "object"
+                  },
                   "wafer_guest_version": {
                     "description": "`wafer_guest.rs` version the block scaffolder currently writes.",
                     "format": "uint32",
@@ -2423,7 +2580,9 @@
                   "runtime_generation",
                   "blocks",
                   "activation",
-                  "wafer_guest_version"
+                  "storage",
+                  "wafer_guest_version",
+                  "seed_error"
                 ],
                 "title": "StatusResponse",
                 "type": "object"

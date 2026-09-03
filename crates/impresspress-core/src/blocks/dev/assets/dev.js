@@ -206,6 +206,10 @@ function renderStatus(status) {
     log('live generation: ' + (activeId || 'none'));
     lastActiveGeneration = activeId;
   }
+  // One of the two facts the Export button's state is decided from — the
+  // other is whether an export is already running. `updateExportButton` is
+  // the only writer of either; see it for why.
+  updateExportButton();
 }
 
 var polling = null;
@@ -355,7 +359,9 @@ function reloadPreview() {
 // reads. `compileBlock` opens the panel around the STAGING call instead,
 // which is the half the host does and the only half the journal describes,
 // and the compiler's own progress reaches the log through `onProgress`.
-// `dev_export` writes nothing and is not here either.
+// `dev_export` is not here either, for its own reason: it writes nothing — it
+// reads the live generation and hands the browser a file — so an export must
+// not reload the preview or re-fetch the file tree.
 var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_rollback|dev_remove_block|shop_(?!list_))/;
 
 // Every name this page registered. `registerTool`'s options bag takes an
@@ -451,29 +457,17 @@ function registerFromManifest(manifest) {
   log('registered ' + registered.length + ' workspace tools');
 }
 
-// `dev_compile_block` and `dev_export` are the two tools with no HTTP
-// endpoint behind them: compiling happens in a worker on this page, and
-// exporting writes a bundle from it. `dev_compile_block` is real below;
-// `dev_export` is still a stub, and is registered anyway as an honest
-// refusal — an agent that discovers it gets `isError` and a reason, which is
-// what stops it inventing its own way to export.
-function notAvailable(name) {
-  return {
-    isError: true,
-    content: [{ type: 'text', text: name + ' is not available in this build.' }]
-  };
-}
-
+// `dev_compile_block` and `dev_export` are the two tools with no HTTP tool
+// call behind them, for opposite reasons: compiling happens in a worker on
+// this page and never reaches the server as one request, while exporting
+// DOES have an endpoint (`GET /b/dev/api/export`) whose answer is a 15 MB zip
+// — a file for the browser to download, not a tool result to hand an agent.
+// Both are therefore registered here rather than projected from
+// `/b/dev/api/tools.json`. (`dev_export_manifest`, which IS small JSON, is in
+// that manifest — an agent inspects what an export would contain there.)
 function registerPageLocal() {
   registerCompileTool();
-  registerPageTool({
-    name: 'dev_export',
-    description: 'Export the site as a runnable static bundle. Not available in this build yet.',
-    inputSchema: { type: 'object', properties: {} },
-    execute: async function () {
-      return notAvailable('dev_export');
-    }
-  });
+  registerExportTool();
 }
 
 if ('modelContext' in document && typeof document.modelContext.registerTool === 'function') {
@@ -1449,6 +1443,193 @@ Only one compile runs at a time.',
     }
   });
 }
+
+// ---- exporting the site ---------------------------------------------------
+
+// The Export button. Ships `disabled` in the markup (`page.rs`) and is
+// enabled by `renderStatus` once there is a live generation — an export is a
+// snapshot of what is LIVE, and `GET /b/dev/api/export` answers 400 on an
+// instance that has published nothing, so a button offered before then is a
+// promise the page cannot keep.
+//
+// Declared here rather than beside `renderStatus`, which reads it, for the
+// same reason `compileButton` is declared beside the compiler: `var` hoists
+// the binding, and the first `renderStatus` runs from the status fetch at the
+// bottom of this file — after every line of it, including this one.
+var exportButton = document.getElementById('dev-export');
+
+// The running export's promise, or `null` when none is running.
+//
+// An export reads the whole runtime shell twice and builds a multi-megabyte
+// archive in memory; a second one started on top of the first would do all of
+// that again for a download the browser is about to replace anyway. The
+// button is taken away for the duration — and, because the button is not the
+// only caller, `exportSite` returns THIS promise rather than starting a
+// second export (a `dev_export` tool call racing a click is two callers, and
+// only one of them is a button).
+var exportInFlight = null;
+
+// Whether Export can be pressed, and why not when it cannot.
+//
+// TWO facts, arriving from different places and in no fixed order — is
+// anything published (from `renderStatus`, which polls) and is an export
+// already running (from `exportSite`) — so this is the single owner of the
+// button's state, exactly as `updateCompileButton` is for Compile. Two call
+// sites each setting `disabled` would race, and whichever landed second would
+// win regardless of what it knew: a status poll landing mid-export would
+// re-enable the button under the running call.
+//
+// A disabled button with a reason on it, rather than an enabled one that
+// explains itself after the click: the page already knows.
+function updateExportButton() {
+  if (exportInFlight) {
+    exportButton.disabled = true;
+    exportButton.title = 'Export in progress…';
+    return;
+  }
+  // An export is a snapshot of the LIVE generation, and there is nothing to
+  // snapshot until something has been published. The endpoint says the same
+  // thing with a 400; the button says it without making anyone click to find
+  // out.
+  if (lastActiveGeneration === null) {
+    exportButton.disabled = true;
+    exportButton.title = 'Nothing published yet — write a site file first';
+    return;
+  }
+  exportButton.disabled = false;
+  exportButton.title = '';
+}
+
+// How long the object URL is kept alive after the click.
+//
+// Revoking it immediately is the classic bug: `a.click()` starts the download
+// asynchronously, and a URL revoked in the same turn can be gone before the
+// browser has read a byte of it. A minute is far longer than any local read
+// of a blob already in memory needs, and the URL is released rather than
+// leaked for the life of the page.
+var OBJECT_URL_TTL_MS = 60000;
+
+// Export once, no matter how many callers ask.
+//
+// A second call while one is running returns the RUNNING export's promise —
+// the same object, resolving to the same manifest, having made no second
+// request and started no second download. Not `null`, and not a throw: the
+// tool's `execute` reads `manifest.generation_id` off whatever this returns,
+// and the honest answer to "export the site" while an export of that same
+// site is in flight is that export.
+//
+// A plain function rather than an `async` one so the promise a second caller
+// gets is IDENTICAL to the first's; an `async` wrapper would adopt it into a
+// new one and the no-op would be observable only by counting requests.
+function exportSite() {
+  if (exportInFlight) {
+    return exportInFlight;
+  }
+  // Assigned before anything awaits — `runExport()` returns its promise
+  // synchronously — so two calls in the same turn cannot both get past the
+  // check above. Released on EVERY exit, including the failures: a refused
+  // export that left the button disabled would take the feature away for the
+  // life of the page, which is a worse outcome than the refusal itself.
+  exportInFlight = runExport().finally(function () {
+    exportInFlight = null;
+    updateExportButton();
+  });
+  updateExportButton();
+  return exportInFlight;
+}
+
+// Fetch the manifest, fetch the zip, hand it to the browser as a download.
+//
+// The manifest first, and not only for the filename: it is what the tool
+// returns as `structuredContent`, so an agent that called `dev_export` learns
+// what it just downloaded — how many files, how big, how many product rows —
+// without a second call. It is a summary of the very entry list the archive
+// is built from (`blocks/dev/export.rs`), so the two cannot disagree.
+async function runExport() {
+  var manifest = await json(await api.get('/b/dev/api/export/manifest'));
+  var response = await api.get('/b/dev/api/export');
+  if (!response.ok) {
+    throw new Error('export failed: HTTP ' + response.status + ': ' + (await response.text()));
+  }
+  var blob = await response.blob();
+  var url = URL.createObjectURL(blob);
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = 'impresspress-site-' + manifest.generation_id.slice(0, 8) + '.zip';
+  // Appended to the document before the click and removed after: a detached
+  // anchor's `click()` is honoured by Chromium but not by every engine, and
+  // this is the one line that makes the download work everywhere.
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(function () {
+    URL.revokeObjectURL(url);
+  }, OBJECT_URL_TTL_MS);
+  log(
+    'exported generation ' +
+      manifest.generation_id.slice(0, 8) +
+      ' — ' +
+      manifest.files.length +
+      ' files, ' +
+      (manifest.total_bytes / 1048576).toFixed(1) +
+      ' MiB'
+  );
+  return manifest;
+}
+
+function registerExportTool() {
+  registerPageTool({
+    name: 'dev_export',
+    description:
+      'Export the current site as a runnable static bundle (zip) and hand it to the browser as \
+a download: the runtime, the site files, compiled blocks and their source, and a data snapshot of \
+products, offers and settings. Serve the unzipped folder over http to view it. Returns what the \
+bundle contains; use dev_export_manifest to see that without downloading.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        generation_id: { type: 'string' },
+        files: { type: 'array' },
+        total_bytes: { type: 'integer' },
+        shell_files: { type: 'integer' },
+        site_files: { type: 'integer' },
+        blocks: { type: 'integer' },
+        tables: { type: 'object' }
+      },
+      required: ['generation_id', 'files', 'total_bytes']
+    },
+    execute: async function () {
+      try {
+        var manifest = await exportSite();
+        return {
+          content: [{ type: 'text', text: JSON.stringify(manifest) }],
+          structuredContent: manifest
+        };
+      } catch (error) {
+        // Everything here is a failure of the machinery — nothing published
+        // yet, a shell the runtime could not read, a download the browser
+        // refused. None of them is an answer ABOUT the site, so all of them
+        // are `isError` rather than a result with diagnostics (the split
+        // `dev_compile_block` makes for the same reason).
+        logError(error);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: 'dev_export: ' + (error && error.message ? error.message : String(error))
+            }
+          ]
+        };
+      }
+    }
+  });
+}
+
+exportButton.addEventListener('click', function () {
+  exportSite().catch(logError);
+});
 
 // The button runs the same function on the same block, and reports the same
 // way: the panel is the human's copy of what the agent would have been told.
