@@ -70,6 +70,7 @@
 //! activation.
 
 use serde::{Deserialize, Serialize};
+use wafer_core::clients::database as db;
 use wafer_run::context::Context;
 
 use super::{
@@ -265,6 +266,27 @@ pub async fn is_fresh(ctx: &dyn Context) -> Result<bool, String> {
 /// those is [`super::activation::request`]'s job, exactly as for every other
 /// generation.
 pub async fn import(
+    ctx: &dyn Context,
+    control: &dyn RuntimeControl,
+    manifest: &SeedManifest,
+    fetch: &dyn SeedFetch,
+) -> Result<Option<GenerationManifest>, String> {
+    let outcome = import_bundle(ctx, control, manifest, fetch).await;
+    match &outcome {
+        // An attempt that ran and failed, and an attempt that ran and worked:
+        // both are facts about THIS instance, and the second has to clear the
+        // first or a fixed bundle would boot into a stale complaint. A
+        // `Ok(None)` made no attempt at all (this instance is not fresh) and
+        // writes nothing.
+        Err(message) => record_failure(ctx, message).await,
+        Ok(Some(_)) => clear_failure(ctx).await,
+        Ok(None) => {}
+    }
+    outcome
+}
+
+/// [`import`] proper — everything the refusal recorder above wraps.
+async fn import_bundle(
     ctx: &dyn Context,
     control: &dyn RuntimeControl,
     manifest: &SeedManifest,
@@ -647,6 +669,141 @@ async fn record_seeded_build(
 /// What a seeded build records where a compile would record its toolchain: the
 /// bundle produced the bytes, and no toolchain ran here.
 const SEEDED_COMPILER_VERSION: &str = "seed-bundle";
+
+// ---------------------------------------------------------------------------
+// Recording a refused import where someone can see it
+// ---------------------------------------------------------------------------
+
+/// Admin variable a refused seed import writes its message to.
+///
+/// Block-scoped (`{ORG}__{BLOCK}__*`), not `WAFER_RUN_SHARED__*`: this is the
+/// dev block's own record of what happened on this instance's first boot, not
+/// a setting an operator configures, and the block-scoped prefix is what keeps
+/// it out of every deployment that does not carry the block. It is also what
+/// keeps it out of every EXPORT — `data_snapshot::variable_is_exportable`
+/// refuses an `IMPRESSPRESS_`-prefixed key outright, so one instance's seed
+/// failure can never travel into another instance's bundle.
+///
+/// The variables table rather than the console because of where the failure
+/// lands: an exported bundle has no `/b/dev` (design amendment 19), so the
+/// page that would otherwise show a refused import does not exist there. What
+/// the owner of an exported site does have is `/b/admin/settings/variables`.
+pub const SEED_ERROR_KEY: &str = "IMPRESSPRESS__DEV__SEED_ERROR";
+
+/// Name and description the row carries when this creates it, so the
+/// variables page shows a sentence rather than a bare key.
+const SEED_ERROR_NAME: &str = "Seed import error";
+const SEED_ERROR_DESCRIPTION: &str =
+    "The last seed import on this instance refused the bundle served at /seed/, and this is \
+     why. The site is empty because nothing was imported. Fix the bundle and load the site in \
+     a fresh browser profile (or clear this site's data) to retry; the row clears itself on \
+     the next import that succeeds.";
+
+/// Record a refused import.
+///
+/// Best-effort by construction, and logged rather than returned: the caller is
+/// already returning a failure, and a write that could turn "the seed was
+/// refused" into "the seed was refused AND the ledger is broken" would replace
+/// the diagnosis with a worse one.
+///
+/// Public for the one other failure with the same symptom and the same
+/// permanence: the boot caller activates the generation [`import`] hands back,
+/// and a seed that imported but would not activate leaves an equally empty
+/// site that no later boot retries (the failed generation is in the ledger, so
+/// `is_fresh` is false from then on).
+pub async fn record_failure(ctx: &dyn Context, message: &str) {
+    let now = crate::util::now_rfc3339();
+    let row: Vec<(String, serde_json::Value)> = vec![
+        ("key".to_string(), SEED_ERROR_KEY.into()),
+        ("value".to_string(), message.into()),
+        ("name".to_string(), SEED_ERROR_NAME.into()),
+        ("description".to_string(), SEED_ERROR_DESCRIPTION.into()),
+        (
+            "block".to_string(),
+            crate::config_vars::key_block_prefix(SEED_ERROR_KEY).into(),
+        ),
+        // Not a secret: it is a diagnostic about this instance's own boot, and
+        // masking it would hide the one thing it exists to say.
+        ("sensitive".to_string(), 0.into()),
+        ("created_at".to_string(), now.clone().into()),
+        ("updated_at".to_string(), now.into()),
+    ];
+    // `key` is the table's `UNIQUE` column, so this is the atomic upsert and
+    // not the get-then-create race: a boot that fails twice updates one row.
+    // `created_at` is deliberately not in the update set — the row's age is
+    // when the first refusal happened.
+    let written = db::upsert(
+        ctx,
+        crate::admin_schema::VARIABLES_TABLE,
+        row,
+        vec!["key".to_string()],
+        wafer_block::wire::database::OnConflict::SetColumns(vec![
+            "value".to_string(),
+            "name".to_string(),
+            "description".to_string(),
+            "updated_at".to_string(),
+        ]),
+    )
+    .await;
+    if let Err(e) = written {
+        tracing::error!(
+            error = %e.message,
+            "dev sandbox: the seed import was refused and the refusal could not be recorded in \
+             {SEED_ERROR_KEY}",
+        );
+    }
+}
+
+/// Clear the row a previous refusal left, after an import that worked.
+///
+/// Deleted rather than blanked: a healthy instance's variables page should not
+/// carry an empty explanation of a failure that is over. Deleting a key with
+/// no row affects nothing, which is what makes this callable unconditionally.
+async fn clear_failure(ctx: &dyn Context) {
+    let cleared = db::delete_by_filters(
+        ctx,
+        crate::admin_schema::VARIABLES_TABLE,
+        vec![wafer_block::db::Filter {
+            field: "key".to_string(),
+            operator: wafer_block::db::FilterOp::Equal,
+            value: serde_json::Value::String(SEED_ERROR_KEY.to_string()),
+        }],
+    )
+    .await;
+    if let Err(e) = cleared {
+        tracing::error!(
+            error = %e.message,
+            "dev sandbox: the seed imported, but a previous refusal recorded in \
+             {SEED_ERROR_KEY} could not be cleared",
+        );
+    }
+}
+
+/// The message a refused import left, if there is one.
+///
+/// Read from the row rather than through [`Context::config_get`]: the config
+/// snapshot a runtime resolves is built at boot, *before* the import that
+/// writes this runs, so a config read would answer with the previous boot's
+/// answer to a question about this one.
+pub async fn last_failure(ctx: &dyn Context) -> Result<Option<String>, wafer_run::WaferError> {
+    match db::get_by_field(
+        ctx,
+        crate::admin_schema::VARIABLES_TABLE,
+        "key",
+        serde_json::Value::String(SEED_ERROR_KEY.to_string()),
+    )
+    .await
+    {
+        Ok(record) => Ok(record
+            .data
+            .get("value")
+            .and_then(|value| value.as_str())
+            .filter(|message| !message.is_empty())
+            .map(str::to_string)),
+        Err(e) if e.code == wafer_run::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
 
 /// Store one verified file's bytes and record it in the workspace under
 /// construction.

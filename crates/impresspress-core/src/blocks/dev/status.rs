@@ -9,7 +9,7 @@ use wafer_run::{context::Context, OutputStream, WaferError};
 
 use super::{
     contracts::{ActivationView, ActiveBlockView, StatusResponse},
-    gc, generation, no_store, repo, DevShared, WAFER_GUEST_VERSION,
+    gc, generation, no_store, repo, seed, DevShared, WAFER_GUEST_VERSION,
 };
 use crate::http::err_internal;
 
@@ -58,5 +58,9 @@ async fn build(ctx: &dyn Context, shared: &DevShared) -> Result<StatusResponse, 
         // works rather than only after the panel is reopened.
         storage: gc::storage_usage(ctx).await?,
         wafer_guest_version: WAFER_GUEST_VERSION,
+        // One indexed read of a `UNIQUE` column, on the same poll — cheap in
+        // the way a store listing is not, and the difference between an empty
+        // sandbox that says why and one that does not.
+        seed_error: seed::last_failure(ctx).await?,
     })
 }

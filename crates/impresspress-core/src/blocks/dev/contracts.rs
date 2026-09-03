@@ -37,6 +37,18 @@ pub struct StatusResponse {
     pub storage: StorageUsage,
     /// `wafer_guest.rs` version the block scaffolder currently writes.
     pub wafer_guest_version: u32,
+    /// Why this instance's seed import was refused, if it was.
+    ///
+    /// `None` on every healthy instance — including one that never had a seed
+    /// bundle to import. A sandbox whose seed was refused boots with an empty
+    /// site and no other sign of it (`dev_runtime::install` logs and carries
+    /// on, because a sandbox that refuses to boot is one whose `/b/dev` page
+    /// — the only thing that could fix it — never comes up), so this is what
+    /// makes the cause reachable from the page and from `dev_status` instead
+    /// of only from the service worker's console. Read from the same row an
+    /// exported bundle's admin sees on `/b/admin/settings/variables`, which
+    /// is the only surface an exported site has (it has no `/b/dev`).
+    pub seed_error: Option<String>,
 }
 
 /// What the sandbox's two content stores, its workspace and its ledger hold.

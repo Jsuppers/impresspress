@@ -223,6 +223,22 @@ Then open the printed URL and sign in with your account. The exported
 bundle always boots with the in-browser workspace turned off — there is no
 `/b/dev` on it, and no in-browser compiler.
 
+**Change the admin password before serving an export anywhere but
+localhost.** The starter credentials above are printed in this file and on
+every sandbox's own welcome page, and the export carries the account that
+uses them — so until you change it, anyone who gets the folder, or who can
+reach the host you serve it from, is an admin of the exported site. Sign in
+as `admin@example.com` and change it at `/b/auth/change-password`. The
+"they're throwaway because this is a per-browser instance with nothing of
+consequence behind it" premise stops holding the moment a copy of the
+instance leaves the browser.
+
+`seed/data.json` carries the user accounts, including their password
+hashes — PBKDF2-HMAC-SHA256, since the sandbox is a browser deployment (the
+native binary's Argon2id is too slow in wasm). They are in there so signing
+in to the copy works with the same credentials; treat the folder the way you
+would treat any export of an account table.
+
 ## Browser requirements
 
 `/b/dev` has to be cross-origin isolated: the sandbox sets

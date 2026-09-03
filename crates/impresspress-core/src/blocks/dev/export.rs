@@ -770,6 +770,45 @@ mod tests {
         );
     }
 
+    /// The README's disclosure about `data.json` is the archive's only
+    /// statement about the one secret it deliberately carries, so it has to
+    /// name the hash that is actually in there. Every export is produced by
+    /// the browser sandbox, whose `CryptoService` is
+    /// `impresspress_browser::crypto::BrowserCryptoService` — PBKDF2-HMAC-SHA256,
+    /// because Argon2id is too slow in wasm. This crate cannot depend on that
+    /// one (the dependency runs the other way), so what is pinned here is the
+    /// property that goes wrong on its own: the template may mention Argon2
+    /// only to say it is NOT what ran.
+    #[test]
+    fn the_readme_names_the_hash_the_browser_actually_writes() {
+        assert!(
+            README_TEMPLATE.contains("PBKDF2-HMAC-SHA256"),
+            "the disclosure must name the hash the sandbox writes"
+        );
+        for (index, _) in README_TEMPLATE.match_indices("Argon2") {
+            assert!(
+                README_TEMPLATE[index..].starts_with("Argon2id is too slow"),
+                "the README may name Argon2 only to say the sandbox does not use it"
+            );
+        }
+    }
+
+    /// The starter password is printed in `docs/dev-sandbox.md` and on the
+    /// sandbox's own welcome page, so an export made with it still set ships a
+    /// working admin login whose password is public knowledge. The README has
+    /// to say so, and say where to fix it.
+    #[test]
+    fn the_readme_says_to_change_the_public_starter_password() {
+        assert!(
+            README_TEMPLATE.contains("Change the admin password"),
+            "the README must tell its holder to change the admin password"
+        );
+        assert!(
+            README_TEMPLATE.contains("/b/auth/change-password"),
+            "…and where: the auth block's own change-password page"
+        );
+    }
+
     /// The one thing this must never do is pass a shell through unchanged.
     #[test]
     fn a_shell_without_the_marker_is_refused() {

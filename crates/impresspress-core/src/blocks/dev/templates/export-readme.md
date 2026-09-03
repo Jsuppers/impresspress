@@ -67,13 +67,19 @@ the exporting instance's Stripe account, not to yours.
 Deliberately included, and worth knowing about: **`seed/data.json` carries
 your user accounts, including their password hashes.** They are yours — you
 created them in your own browser-local sandbox — and they are in here so that
-signing in to this copy works with the same credentials. They are Argon2
-hashes, not plaintext, but treat this folder the way you would treat any
-export of an account table: do not publish it anywhere you would not publish
-a password database.
+signing in to this copy works with the same credentials. They are
+PBKDF2-HMAC-SHA256 hashes (600,000 iterations), not plaintext — the sandbox
+runs in a browser, where Argon2id is too slow — but treat this folder the way
+you would treat any export of an account table: do not publish it anywhere you
+would not publish a password database.
 
-Sign in at `/b/auth/login`. The sandbox's own starter account is
-`{{ADMIN_EMAIL}}` with the password you used there.
+**Change the admin password before serving this anywhere but localhost.** Sign
+in at `/b/auth/login` as `{{ADMIN_EMAIL}}`, then change it at
+`/b/auth/change-password`. The sandbox seeds every instance with the same
+starter password and the documentation prints it, so until you change it,
+anyone who gets this folder — or who can reach the host you serve it from — is
+an admin of this site. That was fine in the sandbox, which is a throwaway
+instance in one browser; it stops being fine the moment this folder leaves it.
 
 ## Re-importing it
 

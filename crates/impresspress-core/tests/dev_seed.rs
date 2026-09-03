@@ -25,6 +25,7 @@ use impresspress_core::{
     test_support::TestContext,
 };
 use wafer_block::{Allowlist, BlockCapabilities};
+use wafer_core::clients::database as db;
 use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo};
 
 // ---------------------------------------------------------------------------
@@ -783,4 +784,84 @@ async fn a_block_that_reports_no_guest_version_still_imports() {
         .await
         .expect("a bundle that reports no version must still import")
         .expect("fresh");
+}
+
+// ---------------------------------------------------------------------------
+// A refused import, where the site's own admin can see it
+// ---------------------------------------------------------------------------
+
+/// The message the variables row carries, if there is one.
+async fn recorded_seed_error(ctx: &TestContext) -> Option<String> {
+    let rows = db::list_all(ctx, "impresspress__admin__variables", vec![])
+        .await
+        .expect("list variables");
+    rows.into_iter()
+        .find(|row| row.data.get("key").and_then(|v| v.as_str()) == Some(seed::SEED_ERROR_KEY))
+        .map(|row| {
+            row.data
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+}
+
+/// A refused seed leaves an empty site and, until this, nothing but a console
+/// line to say why — which an EXPORTED bundle's owner cannot reach at all:
+/// there is no `/b/dev` there. The admin variables page is the surface every
+/// instance has, so the refusal is written where it shows up.
+#[tokio::test]
+async fn a_refused_import_records_its_reason_for_the_admin() {
+    let (ctx, control) = fixture().await;
+    let tampered = bundle().with(&seed::site_url("assets/app.js"), b"alert('gotcha')");
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &tampered)
+        .await
+        .expect_err("a hash mismatch must refuse the import");
+
+    let recorded = recorded_seed_error(&ctx)
+        .await
+        .expect("the refusal is recorded in the admin variables table");
+    assert_eq!(recorded, error, "the row carries the refusal verbatim");
+    // …and the status endpoint reads the same row, so the workspace half sees
+    // it without an admin having to go looking.
+    assert_eq!(
+        seed::last_failure(&ctx).await.expect("read"),
+        Some(error.clone())
+    );
+    // Never exportable: the key is `IMPRESSPRESS_`-prefixed, so one instance's
+    // seed failure can never travel into another instance's bundle.
+    assert!(
+        !impresspress_core::blocks::dev::data_snapshot::variable_is_exportable(
+            &serde_json::json!({ "key": seed::SEED_ERROR_KEY, "sensitive": 0 })
+                .as_object()
+                .expect("object")
+                .clone()
+        )
+    );
+}
+
+/// An instance that is not fresh makes no attempt, so it records nothing —
+/// and an import that works clears what an earlier refusal left, or a fixed
+/// bundle would boot into a stale complaint.
+#[tokio::test]
+async fn an_import_that_works_clears_an_earlier_refusal() {
+    let (ctx, control) = fixture().await;
+    seed::import(
+        &ctx,
+        control.as_ref(),
+        &manifest(),
+        &bundle().with(&seed::site_url("assets/app.js"), b"alert('gotcha')"),
+    )
+    .await
+    .expect_err("the tampered bundle is refused");
+    assert!(recorded_seed_error(&ctx).await.is_some());
+
+    seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
+        .await
+        .expect("the intact bundle imports")
+        .expect("still fresh — the refusal stored nothing");
+
+    assert_eq!(recorded_seed_error(&ctx).await, None);
+    assert_eq!(seed::last_failure(&ctx).await.expect("read"), None);
 }

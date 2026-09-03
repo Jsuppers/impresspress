@@ -880,7 +880,24 @@ pub async fn install(sandbox: &Sandbox) {
     let shared = &sandbox.shared;
 
     if let Err(e) = seed_on_boot(&ctx, shared).await {
-        web_sys::console::error_1(&format!("impresspress: dev sandbox seed import: {e}").into());
+        // What happened, and what to do about it. This is the whole of the
+        // failure's visibility on an EXPORTED bundle's first boot — the site
+        // is empty, there is no `/b/dev` to ask, and a visitor sees a blank
+        // page — so the line says where the same message is recorded for the
+        // site's own admin, and that the instance stays in this state until
+        // it is thrown away.
+        web_sys::console::error_1(
+            &format!(
+                "impresspress: the seed bundle at {} was not imported: {e}\nThis site will \
+                 stay empty. The same message is recorded as {} on \
+                 /b/admin/settings/variables. Fix the bundle under /seed/, then load the site \
+                 in a fresh browser profile (or clear this site's data) to retry — an instance \
+                 only ever seeds once.",
+                seed::MANIFEST_URL,
+                seed::SEED_ERROR_KEY,
+            )
+            .into(),
+        );
     }
 
     let blocks = match activation::converge_on_boot(&ctx, shared).await {
@@ -953,7 +970,13 @@ async fn seed_on_boot(ctx: &dyn Context, shared: &Arc<DevShared>) -> Result<(), 
     else {
         return Ok(());
     };
-    let outcome = activation::request(
+    // A seed that imported but could not be activated leaves exactly the
+    // symptom the import path records — an empty site — and leaves it
+    // permanently: the failed generation is in the ledger, so `is_fresh` is
+    // false on every later boot and nothing retries. The importer's own
+    // recorder is what the admin reads, so this failure is written there too
+    // rather than to the console alone.
+    let outcome = match activation::request(
         ctx,
         shared,
         GenerationCause::Seed,
@@ -962,7 +985,14 @@ async fn seed_on_boot(ctx: &dyn Context, shared: &Arc<DevShared>) -> Result<(), 
         },
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let message = format!("the seed imported but could not be activated: {e}");
+            seed::record_failure(ctx, &message).await;
+            return Err(message);
+        }
+    };
     web_sys::console::log_1(
         &format!(
             "impresspress: dev sandbox imported the seed as generation {} ({} site files, {} \

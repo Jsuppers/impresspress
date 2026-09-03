@@ -2510,6 +2510,13 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "seed_error": {
+                    "description": "Why this instance's seed import was refused, if it was.\n\n`None` on every healthy instance — including one that never had a seed\nbundle to import. A sandbox whose seed was refused boots with an empty\nsite and no other sign of it (`dev_runtime::install` logs and carries\non, because a sandbox that refuses to boot is one whose `/b/dev` page\n— the only thing that could fix it — never comes up), so this is what\nmakes the cause reachable from the page and from `dev_status` instead\nof only from the service worker's console. Read from the same row an\nexported bundle's admin sees on `/b/admin/settings/variables`, which\nis the only surface an exported site has (it has no `/b/dev`).",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "storage": {
                     "additionalProperties": false,
                     "description": "What the sandbox's content stores hold right now.",
@@ -2574,7 +2581,8 @@
                   "blocks",
                   "activation",
                   "storage",
-                  "wafer_guest_version"
+                  "wafer_guest_version",
+                  "seed_error"
                 ],
                 "title": "StatusResponse",
                 "type": "object"
