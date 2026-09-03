@@ -16,6 +16,10 @@ crates/impresspress/data/
 test-results/
 playwright-report/
 playwright-report-products/
+# Playwright MCP scratch output (page snapshots, console logs, screenshots)
+# from driving the app in a browser during development. Test baselines must
+# never live here — see crates/impresspress-web/tests/playwright.config.ts.
+.playwright-mcp/
 # Playwright globalSetup writes a real session token here (see
 # crates/impresspress-web/tests/e2e/fixtures/global-setup.ts). Never commit.
 crates/impresspress-web/tests/.auth/

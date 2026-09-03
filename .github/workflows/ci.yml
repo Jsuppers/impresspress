@@ -11,10 +11,6 @@ on:
       - 'Cargo.lock'
       - 'scripts/**'
       - '.github/workflows/ci.yml'
-      # Visual-baseline PNGs live outside crates/. Without this, baseline-only
-      # commits (e.g. from regen-visual-baselines.yml) skip CI and the PR
-      # shows "no checks" — blocking merge.
-      - '.playwright-mcp/**'
 
 concurrency:
   group: ci-${{ github.ref }}
