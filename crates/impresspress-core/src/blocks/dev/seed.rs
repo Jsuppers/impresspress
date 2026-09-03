@@ -719,6 +719,12 @@ const SEED_ERROR_DESCRIPTION: &str =
 pub async fn record_failure(ctx: &dyn Context, message: &str) {
     let now = crate::util::now_rfc3339();
     let row: Vec<(String, serde_json::Value)> = vec![
+        // `db::upsert` writes `data` verbatim — unlike `db::create` it
+        // synthesizes no `id` — and `id` is this table's `TEXT PRIMARY KEY`,
+        // so the row has to carry one or the INSERT writes a NULL key (or is
+        // refused outright on Postgres). Discarded on the conflict path: `id`
+        // is not in the update set, so a second refusal keeps the first row's.
+        ("id".to_string(), uuid::Uuid::new_v4().to_string().into()),
         ("key".to_string(), SEED_ERROR_KEY.into()),
         ("value".to_string(), message.into()),
         ("name".to_string(), SEED_ERROR_NAME.into()),

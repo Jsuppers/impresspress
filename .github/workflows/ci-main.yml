@@ -436,8 +436,10 @@ jobs:
 
       # Teed to a file (not just printed) so the timing-baseline step below can
       # grep the `console.log(...elapsed...)` lines dev-foundations.spec.ts
-      # and dev-workspace.spec.ts print — pipefail is on by default for `run:`
-      # steps on Linux runners, so `tee` does not swallow a test failure here.
+      # and dev-workspace.spec.ts print. `set -o pipefail` is not optional:
+      # GitHub runs `run:` steps as `bash -e {0}` unless the step names a
+      # `shell:`, so without it the step exits with `tee`'s status and a
+      # failing spec passes the job.
       - name: Run dev sandbox e2e (browser WASM, port 8082)
         working-directory: crates/impresspress-web
         env:
@@ -447,7 +449,10 @@ jobs:
         # because it needs the packaged worker only to prove it STARTS under
         # the isolation headers — it compiles nothing, so it costs ~35 s and
         # belongs with the other fake-worker specs.
-        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts | tee /tmp/dev-sandbox-e2e.log
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts 2>&1 \
+            | tee /tmp/dev-sandbox-e2e.log
 
       - name: Stop server
         if: always()

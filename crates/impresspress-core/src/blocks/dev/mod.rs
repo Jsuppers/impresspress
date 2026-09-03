@@ -386,19 +386,55 @@ impl DevShared {
 /// The browser development sandbox control plane (`impresspress/dev`).
 pub struct DevBlock {
     shared: Arc<DevShared>,
+    /// Whether the runtime that registered this block also routed
+    /// [`ROUTE_PREFIX`] — the workspace half of the sandbox.
+    ///
+    /// The block is registered in BOTH of `SandboxMode`'s compiled-in modes,
+    /// because its `lifecycle(Init)` is what creates the ledger tables the
+    /// seed import and the generation history write to. Only the workspace
+    /// mode routes it. What this field carries is that difference, into the
+    /// one place that would otherwise describe a surface that is not there:
+    /// [`Block::info`] — whose `endpoints` become `/openapi.json` and whose
+    /// `admin_url` becomes an "Open" button on `/b/admin/blocks`, for every
+    /// registered block, routed or not.
+    workspace: bool,
 }
 
 impl DevBlock {
-    /// Construct a [`DevBlock`] over shared state.
-    pub fn new(shared: Arc<DevShared>) -> Self {
-        Self { shared }
+    /// The sandbox with its workspace half: this runtime routes
+    /// [`ROUTE_PREFIX`], so the endpoints below are real and `/b/dev` is
+    /// where an admin goes to reach them.
+    pub fn with_workspace(shared: Arc<DevShared>) -> Self {
+        Self {
+            shared,
+            workspace: true,
+        }
+    }
+
+    /// The runtime half alone — **an exported bundle**.
+    ///
+    /// Registered for its migrations, its ledger and its seed import, with no
+    /// `/b/dev` route (design amendment 19). Declaring the endpoints anyway
+    /// would publish a dozen 404s in the exported site's `/openapi.json` and
+    /// put an "Open" link to a page that does not exist on its admin's own
+    /// blocks page — the exact drift
+    /// `routes_and_endpoints_stay_in_lockstep` exists to catch, one level up
+    /// from where that test can see it.
+    pub fn runtime_only(shared: Arc<DevShared>) -> Self {
+        Self {
+            shared,
+            workspace: false,
+        }
     }
 }
 
 #[wafer_block::wafer_async_trait]
 impl Block for DevBlock {
     fn info(&self) -> BlockInfo {
-        BlockInfo::new(
+        // The half that is true in both modes: the block exists, it owns
+        // these tables, and its migrations ran. An exported bundle's ledger
+        // is as real as a workspace's.
+        let base = BlockInfo::new(
             BLOCK_NAME,
             "0.1.0",
             "http-handler@v1",
@@ -418,7 +454,18 @@ impl Block for DevBlock {
             CollectionSchema::new(repo::runtime_state::TABLE),
         ])
         .category(wafer_run::BlockCategory::Feature)
-        .endpoints(vec![
+        // The sandbox is registered only where it is meant to exist; a
+        // deployment turns it off by not building it, not by an admin toggle
+        // that would leave a half-live control plane behind.
+        .can_disable(false);
+
+        // The half that depends on a route existing. An exported bundle has
+        // none of it — see `Self::runtime_only`.
+        if !self.workspace {
+            return base;
+        }
+
+        base.endpoints(vec![
             // The document and its three assets carry no schemas — there is no
             // JSON contract to describe, and `has_schema()` therefore keeps
             // all four out of `/openapi.json` exactly as it keeps the HTML
@@ -550,10 +597,6 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin),
         ])
         .admin_url(ROUTE_PREFIX)
-        // The sandbox is registered only where it is meant to exist; a
-        // deployment turns it off by not building it, not by an admin toggle
-        // that would leave a half-live control plane behind.
-        .can_disable(false)
     }
 
     async fn handle(

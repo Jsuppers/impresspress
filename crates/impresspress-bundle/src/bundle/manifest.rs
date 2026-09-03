@@ -32,12 +32,23 @@ pub struct AssetManifest {
 }
 
 /// Every file under `dir`, relative to it, `/`-separated and sorted, skipping
-/// unrendered `*.tmpl` templates.
+/// unrendered `*.tmpl` templates and wasm-pack's npm-package metadata.
 ///
 /// A `.tmpl` in the output directory is a template `run` had no renderer for
 /// (`render_if_exists` deletes the ones it renders): it is bundler input, not
 /// a file any browser should ever be served, and shipping one into an export
 /// would ship an un-substituted `__WASM_JS__` alongside the real script.
+///
+/// [`is_package_metadata`] holds back the other files that are in the
+/// directory without being part of the shell, for the same reason. The
+/// `embed × web` flow bundles IN PLACE in wasm-pack's own `--out-dir`
+/// (`flows::embed_web::build`), so `package.json`, the `*.d.ts` declarations,
+/// `.gitignore` and the copied `README.md` sit beside the real assets by the
+/// time this listing is taken. They are how npm consumes a wasm-pack package,
+/// not how a browser boots one — and because `files` is exactly what the
+/// development sandbox's export copies, anything listed here is a file every
+/// exported site carries. (The `sealed × web` flow assembles a fresh `dist/`
+/// and never has them, which is why this only shows up on one path.)
 pub fn list_dist_files(dir: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     collect_files(dir, "", &mut out)?;
@@ -61,11 +72,22 @@ fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> 
             .with_context(|| format!("stat {}", entry.path().display()))?;
         if file_type.is_dir() {
             collect_files(&entry.path(), &relative, out)?;
-        } else if !name.ends_with(".tmpl") {
+        } else if !name.ends_with(".tmpl") && !is_package_metadata(&name) {
             out.push(relative);
         }
     }
     Ok(())
+}
+
+/// Whether `name` is wasm-pack's npm-package metadata rather than part of the
+/// shell a browser is served — see [`list_dist_files`].
+///
+/// Matched by exact name (or the `.d.ts` suffix), never by extension: a
+/// `manifest.json` or a `vendor/*.json` the bundler really does ship is
+/// untouched, and so is anything an overlay lays down later (overlays run
+/// after the listing is taken, so they were never in it).
+fn is_package_metadata(name: &str) -> bool {
+    matches!(name, "package.json" | ".gitignore" | "README.md") || name.ends_with(".d.ts")
 }
 
 impl AssetManifest {
@@ -138,6 +160,34 @@ mod tests {
                 "sw.js",
                 "vendor/sql-wasm.wasm",
             ]
+        );
+    }
+
+    /// `embed × web` bundles in place in wasm-pack's `--out-dir`, so the
+    /// package metadata is right there when the listing is taken — and every
+    /// name in this list is copied into every exported site.
+    #[test]
+    fn wasm_pack_package_metadata_is_not_part_of_the_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("app.js"), "x").unwrap();
+        std::fs::write(root.join("app_bg.wasm"), "x").unwrap();
+        std::fs::write(root.join("manifest.json"), "x").unwrap();
+        for metadata in [
+            "package.json",
+            ".gitignore",
+            "README.md",
+            "app.d.ts",
+            "app_bg.wasm.d.ts",
+        ] {
+            std::fs::write(root.join(metadata), "x").unwrap();
+        }
+
+        assert_eq!(
+            list_dist_files(root).unwrap(),
+            // `manifest.json` is the web app manifest the bundler ships, and
+            // stays: the rule is by name, not by extension.
+            vec!["app.js", "app_bg.wasm", "manifest.json"]
         );
     }
 

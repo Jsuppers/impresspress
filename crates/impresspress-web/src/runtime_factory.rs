@@ -406,8 +406,17 @@ impl RuntimeFactory {
             // `Rc<Wafer>`. `extra_block` takes an `Arc<dyn Block>` regardless,
             // and wasm32 is single-threaded — the same allowance the rest of
             // the block registration path carries.
+            //
+            // Which constructor is the mode itself: both register the block,
+            // but only the workspace one routes `/b/dev` below, and only it
+            // may therefore declare that surface in its `BlockInfo` — see
+            // `DevBlock::runtime_only`.
             #[allow(clippy::arc_with_non_send_sync)]
-            let dev_block: Arc<dyn wafer_run::Block> = Arc::new(dev::DevBlock::new(dev.clone()));
+            let dev_block: Arc<dyn wafer_run::Block> = Arc::new(if self.mode.workspace() {
+                dev::DevBlock::with_workspace(dev.clone())
+            } else {
+                dev::DevBlock::runtime_only(dev.clone())
+            });
             builder = builder
                 .extra_block(dev::BLOCK_NAME, dev_block)
                 // The published site is owned by `wafer-run/web`, so the dev

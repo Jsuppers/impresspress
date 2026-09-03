@@ -249,11 +249,15 @@ pub fn run(pkg_dir: &Path, repo_dir: &Path, app: AppConfig) -> Result<()> {
     //    and costs nothing: the listing is of NAMES, taken before the file
     //    is written, and the name is fixed — so a consumer copying every
     //    listed file gets the manifest too, which is what a faithful copy of
-    //    the shell means. `run` is also the only writer here, so nothing an
-    //    overlay adds afterwards (`impresspress`'s `apply_overlays`, which
-    //    lays the sandbox's `seed/` and compiler tree down after this
-    //    returns) is listed — the shell is what the bundler produced, not
-    //    whatever else ends up in the directory.
+    //    the shell means. Nothing an overlay adds afterwards
+    //    (`impresspress`'s `apply_overlays`, which lays the sandbox's `seed/`
+    //    and compiler tree down after this returns) is listed either — it is
+    //    not there yet when the listing is taken.
+    //
+    //    `run` is NOT the only writer into this directory, though: `embed ×
+    //    web` bundles in place in wasm-pack's own `--out-dir`, so the npm
+    //    metadata wasm-pack wrote is already sitting beside the assets.
+    //    `list_dist_files` holds those back — see `is_package_metadata`.
     let mut files = manifest::list_dist_files(pkg_dir)?;
     let manifest_name = "asset-manifest.json".to_string();
     if !files.contains(&manifest_name) {

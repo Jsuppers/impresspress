@@ -420,7 +420,10 @@ impl TestContext {
         .await;
         let shared = dev::DevShared::new(control, shell);
         self.dev_shared = Some(shared.clone());
-        self.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
+        self.register_block(
+            dev::BLOCK_NAME,
+            Arc::new(dev::DevBlock::with_workspace(shared)),
+        );
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // namespacing wrapper — that wrapper is what turns the block's own
@@ -1543,7 +1546,7 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
     // test doubles suffice.
     #[cfg(feature = "block-dev")]
     infos.push(
-        crate::blocks::dev::DevBlock::new(crate::blocks::dev::DevShared::new(
+        crate::blocks::dev::DevBlock::with_workspace(crate::blocks::dev::DevShared::new(
             crate::blocks::dev::test_support::FakeControl::new(),
             Arc::new(crate::blocks::dev::test_support::FakeShell::new()),
         ))

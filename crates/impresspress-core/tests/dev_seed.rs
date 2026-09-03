@@ -790,20 +790,26 @@ async fn a_block_that_reports_no_guest_version_still_imports() {
 // A refused import, where the site's own admin can see it
 // ---------------------------------------------------------------------------
 
-/// The message the variables row carries, if there is one.
-async fn recorded_seed_error(ctx: &TestContext) -> Option<String> {
+/// The variables row the refusal wrote, if there is one.
+async fn recorded_seed_error_row(
+    ctx: &TestContext,
+) -> Option<wafer_core::clients::database::Record> {
     let rows = db::list_all(ctx, "impresspress__admin__variables", vec![])
         .await
         .expect("list variables");
     rows.into_iter()
         .find(|row| row.data.get("key").and_then(|v| v.as_str()) == Some(seed::SEED_ERROR_KEY))
-        .map(|row| {
-            row.data
-                .get("value")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
-        })
+}
+
+/// The message the variables row carries, if there is one.
+async fn recorded_seed_error(ctx: &TestContext) -> Option<String> {
+    recorded_seed_error_row(ctx).await.map(|row| {
+        row.data
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    })
 }
 
 /// A refused seed leaves an empty site and, until this, nothing but a console
@@ -819,10 +825,27 @@ async fn a_refused_import_records_its_reason_for_the_admin() {
         .await
         .expect_err("a hash mismatch must refuse the import");
 
-    let recorded = recorded_seed_error(&ctx)
+    let row = recorded_seed_error_row(&ctx)
         .await
         .expect("the refusal is recorded in the admin variables table");
-    assert_eq!(recorded, error, "the row carries the refusal verbatim");
+    assert_eq!(
+        row.data.get("value").and_then(|v| v.as_str()),
+        Some(error.as_str()),
+        "the row carries the refusal verbatim"
+    );
+    // Addressable, or the page that exists to show this cannot edit or delete
+    // it: `id` is the table's PRIMARY KEY and `db::upsert` writes `data`
+    // verbatim, so the caller has to supply one. SQLite takes a NULL there
+    // without complaint, which is exactly why this is asserted rather than
+    // left to the backend.
+    assert!(
+        row.data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| !id.is_empty()),
+        "the recorded refusal must carry a primary key: {:?}",
+        row.data.get("id")
+    );
     // …and the status endpoint reads the same row, so the workspace half sees
     // it without an admin having to go looking.
     assert_eq!(

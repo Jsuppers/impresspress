@@ -249,11 +249,29 @@ pub const TABLE_EXCLUDED: &[&str] = &[
 /// second, weaker sensitivity check here would be exactly the kind of
 /// disagreement that rule exists to prevent. Called with the flag already
 /// pinned to "clean false" (checked below), so it only evaluates the suffix
-/// half. The `IMPRESSPRESS_` prefix check is this module's own, additional
-/// rule: `CLAUDE.md` reserves that prefix for infrastructure config that
-/// must never reach the database at all, so a row like that appearing here
-/// would already be a bug upstream — this is the export's own backstop
-/// against it leaving anyway.
+/// half.
+///
+/// The `IMPRESSPRESS_` prefix check is this module's own, additional rule,
+/// and it is deliberately the *broad* prefix — it matches both shapes
+/// `CLAUDE.md` spells with it, for two different reasons:
+///
+/// - `IMPRESSPRESS_*` (single underscore) is infrastructure config, reserved
+///   never to reach the database at all. A row like that appearing here is
+///   already a bug upstream; this is the export's backstop against it
+///   leaving anyway.
+/// - `IMPRESSPRESS__{BLOCK}__*` (double underscore) is block-scoped config,
+///   which does live in the database and is perfectly ordinary — but it is
+///   *this instance's*, and the destination is someone else's deployment.
+///   `IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS` names origins the
+///   importing site does not have, `IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN` a
+///   sender it cannot send as, and [`crate::blocks::dev::seed::SEED_ERROR_KEY`]
+///   a boot failure that happened somewhere else entirely. Shared config
+///   (`WAFER_RUN_SHARED__*`) is the half that describes the *site* rather
+///   than the instance hosting it, and that is the half that travels.
+///
+/// So an importing site starts with its block-scoped config unset and
+/// configures it on its own admin page, rather than starting with another
+/// deployment's and having to notice.
 pub fn variable_is_exportable(row: &serde_json::Map<String, Value>) -> bool {
     let Some(key) = row.get("key").and_then(Value::as_str) else {
         return false;
@@ -326,6 +344,41 @@ mod variable_is_exportable_tests {
     fn an_impresspress_prefixed_key_never_exports_even_when_the_flag_is_clear() {
         assert!(!variable_is_exportable(&row(serde_json::json!({
             "key": "IMPRESSPRESS_INTERNAL_FLAG",
+            "sensitive": false,
+        }))));
+    }
+
+    /// The double-underscore half of the prefix rule, pinned on purpose: these
+    /// are ordinary database-backed block config, not infrastructure, and they
+    /// are held back because they describe THIS instance — see the function's
+    /// docs. Asserted separately from the single-underscore case above so that
+    /// narrowing the check to infrastructure alone fails here rather than
+    /// silently shipping one deployment's origins, sender domain and seed
+    /// diagnostics to another.
+    #[test]
+    fn block_scoped_config_stays_with_the_instance_that_configured_it() {
+        for key in [
+            "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS",
+            "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
+            "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN",
+            crate::blocks::dev::seed::SEED_ERROR_KEY,
+        ] {
+            assert!(
+                !variable_is_exportable(&row(serde_json::json!({
+                    "key": key,
+                    "sensitive": false,
+                }))),
+                "{key} must not travel into another instance's bundle"
+            );
+        }
+    }
+
+    /// The other half of the same rule: shared config describes the site, not
+    /// the instance, so it is what an export is FOR.
+    #[test]
+    fn shared_config_travels() {
+        assert!(variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
             "sensitive": false,
         }))));
     }
