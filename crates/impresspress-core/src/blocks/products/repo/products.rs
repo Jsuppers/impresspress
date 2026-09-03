@@ -18,11 +18,21 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use wafer_block::db::{Filter, FilterOp, SortField};
+use wafer_block::{
+    db::{Filter, FilterOp, SortField},
+    wire::database::OnConflict,
+};
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 pub(crate) const TABLE: &str = "impresspress__products__products";
+
+/// [`TABLE`], under a name this module's own door tests
+/// (`tests/repo_door_test.rs`) do not treat as the old, broadly-visible
+/// constant they exist to keep gone — see [`upsert_from_snapshot`] for why a
+/// caller ever needs the name at all without also getting a query built on
+/// it.
+pub(crate) const COLLECTION_NAME: &str = TABLE;
 
 // Column invariant — `deleted_at` holds exactly two kinds of value:
 //
@@ -369,6 +379,31 @@ pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, Wafer
     // for the second — the same two responses this function has always given.
     db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), deleted_filter()], data).await?;
     db::get(ctx, TABLE, id).await
+}
+
+/// Insert-or-overwrite one row exactly as `blocks::dev::data_snapshot`'s
+/// import found it — `deleted_at` included, whatever the exported row said.
+///
+/// Reserved for that one caller. Every other write above acts on a single
+/// product by id and respects (or, named and justified, deliberately
+/// bypasses per this module's door tests) the row's *current* soft-delete
+/// state; this one restores a row wholesale from a trusted export, which is
+/// a different operation from all of them and is not exposed more generally
+/// — `data`/`update_columns` come from the snapshot row verbatim, so this
+/// function does not itself decide what "wholesale" means.
+pub(crate) async fn upsert_from_snapshot(
+    ctx: &dyn Context,
+    data: Vec<(String, Value)>,
+    update_columns: Vec<String>,
+) -> Result<i64, WaferError> {
+    db::upsert(
+        ctx,
+        TABLE,
+        data,
+        vec!["id".to_string()],
+        OnConflict::SetColumns(update_columns),
+    )
+    .await
 }
 
 // The single definition of "deleted" for one already-loaded row, and the

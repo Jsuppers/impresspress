@@ -32,6 +32,7 @@ pub mod blobs;
 pub mod blocks_api;
 pub mod contracts;
 pub mod control;
+pub mod data_snapshot;
 pub mod files;
 pub mod generation;
 pub mod generations_api;
@@ -258,15 +259,30 @@ fn no_store_wafer_error(code: wafer_run::ErrorCode, message: &str) -> WaferError
 ///
 /// The dev block's tables (`impresspress__dev__*`) self-admit under the
 /// own-namespace rule, and its blobs and artifacts live under its own storage
-/// prefix. The one resource it must be *granted* is the published site, which
-/// `wafer-run/web` owns — so this grant cannot be declared in
-/// `BlockInfo::grants` (a block may only grant what it owns) and is handed to
-/// the runtime by whoever registers the block.
+/// prefix. Two kinds of resource it must be *granted* instead, because it
+/// does not own them — so neither grant can be declared in
+/// `BlockInfo::grants` (a block may only grant what it owns) and both are
+/// handed to the runtime by whoever registers the block:
+///
+/// - the published site, which `wafer-run/web` owns;
+/// - every [`data_snapshot::TABLE_ALLOWLIST`] table, one exact grant each
+///   (never a `{org}__{block}__*` prefix) so the grant set says exactly what
+///   [`data_snapshot::export`]/[`data_snapshot::import`] actually touch — the
+///   same closed-list discipline the allowlist itself exists for. This is
+///   the dev block's own control-plane logic reading and writing another
+///   block's rows directly, not a delegated call through that block's own
+///   authorized handler, so WRAP has no other way to see it as legitimate.
 pub fn wrap_grants() -> Vec<wafer_run::ResourceGrant> {
-    vec![
+    let mut grants = vec![
         wafer_run::ResourceGrant::read_write(BLOCK_NAME, "wafer-run/web/site/*")
             .typed(wafer_run::ResourceType::Storage),
-    ]
+    ];
+    grants.extend(
+        data_snapshot::TABLE_ALLOWLIST
+            .iter()
+            .map(|(table, _mode)| wafer_run::ResourceGrant::read_write(BLOCK_NAME, table)),
+    );
+    grants
 }
 
 /// State shared by every `/b/dev` handler.
@@ -686,18 +702,42 @@ mod tests {
     }
 
     #[test]
-    fn wrap_grants_cover_only_the_published_site() {
+    fn wrap_grants_cover_the_published_site_and_the_data_snapshot_allowlist() {
         let grants = wrap_grants();
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].grantee, BLOCK_NAME);
-        assert_eq!(grants[0].resource, "wafer-run/web/site/*");
-        assert!(grants[0].write);
+        let site_grant = &grants[0];
+        assert_eq!(site_grant.grantee, BLOCK_NAME);
+        assert_eq!(site_grant.resource, "wafer-run/web/site/*");
+        assert!(site_grant.write);
         // Typed to Storage: an untyped grant would also admit a database
         // collection or config key that happened to match the pattern.
         assert_eq!(
-            grants[0].resource_type,
+            site_grant.resource_type,
             Some(wafer_run::ResourceType::Storage)
         );
+
+        // Every other grant is one exact, untyped (Db), read-write entry per
+        // `TABLE_ALLOWLIST` table — never a `{org}__{block}__*` prefix, which
+        // would also admit a table `TABLE_EXCLUDED` deliberately keeps this
+        // block off.
+        let db_grants = &grants[1..];
+        assert_eq!(db_grants.len(), data_snapshot::TABLE_ALLOWLIST.len());
+        for grant in db_grants {
+            assert_eq!(grant.grantee, BLOCK_NAME);
+            assert!(grant.write);
+            assert_eq!(grant.resource_type, None);
+            assert!(
+                !grant.resource.ends_with('*'),
+                "{:?} is a prefix grant, not an exact table name",
+                grant.resource
+            );
+            assert!(
+                data_snapshot::TABLE_ALLOWLIST
+                    .iter()
+                    .any(|(table, _)| *table == grant.resource),
+                "{:?} is not on TABLE_ALLOWLIST",
+                grant.resource
+            );
+        }
     }
 
     #[tokio::test]

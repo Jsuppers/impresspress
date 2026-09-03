@@ -16,6 +16,36 @@ mod tests;
 pub(crate) use handlers::{
     GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
 };
+// The products table's own door tests (`tests/repo_door_test.rs`) refuse a
+// call site outside `repo::products` that names the table directly — even a
+// re-exported alias under the old, broadly-visible name they exist to keep
+// gone. The data snapshot's export allowlist still needs the name (for its
+// `TABLE_ALLOWLIST`/`TABLE_EXCLUDED` bookkeeping and as the `DataSnapshot`
+// JSON key) and needs to read and write the live set — so it gets those
+// through this dedicated, differently-named trio instead: `COLLECTION_NAME`
+// carries the name without a query attached, and the two functions carry a
+// query without ever exposing the name they query on.
+pub(crate) use repo::products::{
+    list_all as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot,
+    COLLECTION_NAME as PRODUCTS_COLLECTION,
+};
+// `repo` is private to this module (unlike `auth`'s `pub mod repo`, whose
+// table constants are meant to be named from anywhere in the crate) — these
+// re-exports are the curated exception list, extended here so
+// `blocks::dev::data_snapshot` can name every collection this block declares
+// without retyping a table's literal string a second time. Crate-scoped
+// (`pub(crate)`), matching the two re-export blocks above: still nobody
+// outside `impresspress-core` gets to depend on a products table name
+// directly.
+pub(crate) use repo::{
+    checkout_presets::TABLE as CHECKOUT_PRESETS_TABLE, disputes::TABLE as DISPUTES_TABLE,
+    entitlements::TABLE as ENTITLEMENTS_TABLE, offer_components::TABLE as OFFER_COMPONENTS_TABLE,
+    offers::TABLE as OFFERS_TABLE, payment_links::TABLE as PAYMENT_LINKS_TABLE,
+    product_versions::TABLE as PRODUCT_VERSIONS_TABLE,
+    provider_operations::TABLE as PROVIDER_OPERATIONS_TABLE, refunds::TABLE as REFUNDS_TABLE,
+    seller_accounts::TABLE as SELLER_ACCOUNTS_TABLE,
+    subscription_items::TABLE as SUBSCRIPTION_ITEMS_TABLE, subscriptions::SUBSCRIPTIONS_TABLE,
+};
 pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
     variables::TABLE as VARIABLES_TABLE,

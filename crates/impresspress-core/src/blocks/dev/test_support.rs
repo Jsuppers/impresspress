@@ -1,15 +1,24 @@
-//! Test doubles for the [`RuntimeControl`] seam.
+//! Test doubles for the [`RuntimeControl`] seam and the [`seed::SeedFetch`]
+//! seam.
 //!
 //! Exposed under `test-support` (as well as `cfg(test)`) so the `tests/`
 //! integration crates and downstream consumers can drive the dev block without
 //! a real runtime behind it.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
-use super::control::{DynamicBlockSpec, RuntimeControl, ValidationFailure, ValidationStage};
+use super::{
+    blobs,
+    control::{DynamicBlockSpec, RuntimeControl, ValidationFailure, ValidationStage},
+    paths, seed,
+    seed::{SeedFetch, SeedFile},
+};
 
 /// A [`RuntimeControl`] that records what it was asked to do instead of
 /// building anything.
@@ -273,5 +282,53 @@ impl RuntimeControl for FakeControl {
 
     fn runtime_generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The seed-bundle fetch seam
+// ---------------------------------------------------------------------------
+
+/// A [`SeedFetch`] over an in-memory `url -> bytes` map — the same contract
+/// the browser's `fetch` wrapper (`impresspress-web`'s `SwFetch`) satisfies,
+/// driveable here without a browser. Shared by `tests/dev_seed.rs` and
+/// `tests/dev_data_snapshot.rs` rather than defined twice.
+#[derive(Default)]
+pub struct MapFetch {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl MapFetch {
+    /// Add one `url -> bytes` entry, chainable for building a bundle
+    /// fixture inline.
+    pub fn with(mut self, url: &str, bytes: &[u8]) -> Self {
+        self.files.insert(url.to_string(), bytes.to_vec());
+        self
+    }
+}
+
+impl SeedFetch for MapFetch {
+    fn get<'a>(&'a self, url: &'a str) -> seed::FetchFuture<'a> {
+        Box::pin(async move {
+            self.files
+                .get(url)
+                .cloned()
+                .ok_or_else(|| format!("{url}: not in the bundle"))
+        })
+    }
+}
+
+/// A [`SeedFile`] for `path`, with `sha256`/`size`/`content_type` derived
+/// from `bytes` the same way a real exporter would.
+///
+/// [`seed::import`] checks all three against what the *path* is served as,
+/// so a fixture built any other way would fail verification for reasons
+/// unrelated to what a test using this means to exercise.
+pub fn seed_file(path: &str, bytes: &[u8]) -> SeedFile {
+    SeedFile {
+        path: path.to_string(),
+        sha256: blobs::sha256_hex(bytes),
+        size: bytes.len() as u64,
+        content_type: paths::content_type_for(path).to_string(),
     }
 }

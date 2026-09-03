@@ -206,6 +206,28 @@ impl TestContext {
         ctx
     }
 
+    /// Add auth's migrations to an EXISTING fixture — the same
+    /// `wafer_run__auth__*` schema [`Self::with_auth`] applies to a fresh
+    /// context, layered instead on top of whatever `self` already carries.
+    ///
+    /// Mirrors [`Self::with_dev_added`]'s shape for the same reason: a caller
+    /// that needs auth's tables *alongside* another block's own fixture —
+    /// e.g. `TestContext::with_products().await.with_auth_added().await`, for
+    /// a scenario that seeds a real owner account next to a product — has no
+    /// way to reach `with_auth`'s migrations without also re-running
+    /// `with_products`'s from scratch. Admin's migrations are idempotent
+    /// (`CREATE TABLE IF NOT EXISTS`) but re-registering a block is not
+    /// something either constructor needs to redo here.
+    pub async fn with_auth_added(self) -> Self {
+        self.apply_block_migrations(
+            "wafer-run/auth",
+            crate::blocks::auth::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::auth::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        self
+    }
+
     /// Build a `TestContext` with admin migrations applied (only).
     ///
     /// Use this for tests that exercise a block's own `init()` / migration

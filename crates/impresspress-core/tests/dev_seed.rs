@@ -5,54 +5,26 @@
 //! there.
 //!
 //! The fetch seam is what makes this host-testable at all — the real source is
-//! the service worker's own `fetch`, and [`MapFetch`] below is the same
-//! contract backed by a `BTreeMap`.
+//! the service worker's own `fetch`, and `MapFetch` (from `dev::test_support`)
+//! is the same contract backed by a `BTreeMap`, shared with
+//! `tests/dev_data_snapshot.rs`.
 #![cfg(feature = "block-dev")]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use impresspress_core::{
     blocks::dev::{
         activation::{self, ActivationIntent},
         artifacts, blobs,
         control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind},
-        paths,
         repo::{self, generations::GenerationCause, runtime_state},
-        seed::{self, SeedBlock, SeedFetch, SeedFile, SeedManifest},
-        test_support::FakeControl,
+        seed::{self, SeedBlock, SeedManifest},
+        test_support::{seed_file as file, FakeControl, MapFetch},
         validation, workspace,
     },
     test_support::TestContext,
 };
 use wafer_block::{Allowlist, BlockCapabilities};
-
-// ---------------------------------------------------------------------------
-// The fetch seam
-// ---------------------------------------------------------------------------
-
-/// A [`SeedFetch`] over an in-memory `url -> bytes` map.
-#[derive(Default)]
-struct MapFetch {
-    files: BTreeMap<String, Vec<u8>>,
-}
-
-impl MapFetch {
-    fn with(mut self, url: &str, bytes: &[u8]) -> Self {
-        self.files.insert(url.to_string(), bytes.to_vec());
-        self
-    }
-}
-
-impl SeedFetch for MapFetch {
-    fn get<'a>(&'a self, url: &'a str) -> seed::FetchFuture<'a> {
-        Box::pin(async move {
-            self.files
-                .get(url)
-                .cloned()
-                .ok_or_else(|| format!("{url}: not in the bundle"))
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -62,17 +34,6 @@ const INDEX: &[u8] = b"<h1>welcome</h1>";
 const APP_JS: &[u8] = b"console.log('hi');\n";
 const LIB_RS: &[u8] = b"// a guest\n";
 const ARTIFACT: &[u8] = b"\0asm\x01\0\0\0";
-
-fn file(path: &str, bytes: &[u8]) -> SeedFile {
-    SeedFile {
-        path: path.to_string(),
-        sha256: blobs::sha256_hex(bytes),
-        size: bytes.len() as u64,
-        // The importer checks this against what the *path* is served as, so
-        // the fixture derives it the same way an exporter would.
-        content_type: paths::content_type_for(path).to_string(),
-    }
-}
 
 fn hello_spec() -> DynamicBlockSpec {
     DynamicBlockSpec {

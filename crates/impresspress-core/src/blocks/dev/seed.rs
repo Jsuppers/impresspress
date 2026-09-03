@@ -57,6 +57,7 @@ use super::{
     artifacts, blobs,
     contracts::SiteManifest,
     control::DynamicBlockSpec,
+    data_snapshot,
     generation::GenerationManifest,
     paths,
     repo::{self, runtime_state},
@@ -121,12 +122,13 @@ pub struct SeedManifest {
     pub site: Vec<SeedFile>,
     /// Blocks the seeded generation runs.
     pub blocks: Vec<SeedBlock>,
-    /// Relative URL of the data snapshot (design §10.1, amendment 9:
-    /// `seed/data.json`), or `None` when the bundle carries no rows.
+    /// The data snapshot's path within the bundle (design §10.1, amendment
+    /// 9: `seed/data.json`), or `None` when the bundle carries no rows.
     ///
-    /// Declared now so the format is fixed while there is exactly one reader;
-    /// **this build ignores it**. Applying the snapshot is Plan 4's, and it
-    /// happens after admin init rather than as part of the workspace import.
+    /// A bundle-relative path, not a full [`SeedFetch`] URL — [`import`]
+    /// fetches it the same way every other bundle path becomes a URL,
+    /// prefixed with `/` (matching [`ROOT`], which already carries the
+    /// leading slash and the `seed/` this path itself starts with).
     pub data: Option<String>,
 }
 
@@ -330,6 +332,20 @@ pub async fn import(
     }
 
     workspace::save(ctx, &ws).await.map_err(|e| e.message)?;
+
+    // The data snapshot, if the bundle carries one — after every file and
+    // block artifact is stored (so a snapshot referencing this generation's
+    // own content lands on a workspace that already has it), before the
+    // staged manifest is handed back for activation.
+    if let Some(data_path) = &manifest.data {
+        let url = format!("/{data_path}");
+        let bytes = fetch.get(&url).await?;
+        let snapshot: data_snapshot::DataSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?;
+        data_snapshot::import(ctx, &snapshot)
+            .await
+            .map_err(|e| format!("{url}: {}", e.message))?;
+    }
 
     Ok(Some(GenerationManifest::staged(
         SiteManifest {

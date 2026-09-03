@@ -1,0 +1,349 @@
+//! The data snapshot — `seed/data.json` (design §10.1, amendment 9).
+//!
+//! An export is not just files and blocks: a shop has rows — products,
+//! offers, the owner's own account. [`export`] reads an explicit table
+//! allowlist into a [`DataSnapshot`]; [`import`] applies it back through the
+//! typed database client. **No SQL text is generated or executed anywhere in
+//! this module** — every write is `db::create`, `db::upsert` or
+//! `db::delete_by_filters`, exactly as amendment 9 requires and as
+//! `CLAUDE.md`'s "no raw SQL in block code" rule already demands of every
+//! other block.
+//!
+//! # The allowlist is closed, not additive
+//!
+//! [`TABLE_ALLOWLIST`] and [`TABLE_EXCLUDED`] between them must name every
+//! collection the products, admin and auth blocks declare — a new table that
+//! lands in neither is a decision nobody made, and
+//! `every_declared_table_of_the_three_blocks_has_an_export_decision`
+//! (`tests/dev_data_snapshot.rs`) fails the build the moment that happens.
+//! [`import`] enforces the same closure from the other direction: a snapshot
+//! naming a table outside [`TABLE_ALLOWLIST`] is refused rather than applied,
+//! so a hand-edited bundle (or one produced by a build with a wider
+//! allowlist) cannot smuggle a write into a table this build never decided
+//! to trust.
+//!
+//! # What never leaves
+//!
+//! `impresspress__admin__variables` is filtered row-by-row through
+//! [`variable_is_exportable`] as it is read, so a sensitive value or an
+//! `IMPRESSPRESS_`-prefixed infrastructure key never enters the snapshot in
+//! the first place — there is no later redaction step for a bug to skip.
+//! Every session, token, audit-log and payment/provider-state table is kept
+//! off [`TABLE_ALLOWLIST`] entirely (see the comments there): those describe
+//! *this running instance*, not the shop, and are excluded by name rather
+//! than by any runtime check.
+//!
+//! The one deliberate exception is the owner's own login: `users` and
+//! `wafer_run__auth__local_credentials` (their password hash) travel
+//! together, `Replace`d as a pair, because the export exists so the owner can
+//! re-host their own shop and log back into it — design §10.1 calls this out
+//! explicitly, and the exported bundle's README discloses it.
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use wafer_block::wire::database::OnConflict;
+use wafer_core::clients::database as db;
+use wafer_run::{context::Context, ErrorCode, WaferError};
+
+use crate::{
+    admin_schema,
+    blocks::{
+        admin::{
+            AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE,
+            USER_ROLES_TABLE, WRAP_GRANTS_TABLE,
+        },
+        auth::repo::{
+            api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, oauth_pkce, orgs, pats,
+            provider_links, rate_limits, sessions, tokens, users,
+        },
+        products::{
+            list_live_products, upsert_product_from_snapshot, CHECKOUT_PRESETS_TABLE,
+            DISPUTES_TABLE, ENTITLEMENTS_TABLE, GROUPS_TABLE, GROUP_TEMPLATES_TABLE,
+            LINE_ITEMS_TABLE, OFFERS_TABLE, OFFER_COMPONENTS_TABLE, PAYMENT_LINKS_TABLE,
+            PRODUCTS_COLLECTION, PRODUCT_TEMPLATES_TABLE, PRODUCT_VERSIONS_TABLE,
+            PROVIDER_OPERATIONS_TABLE, PURCHASES_TABLE, REFUNDS_TABLE, SELLER_ACCOUNTS_TABLE,
+            SUBSCRIPTIONS_TABLE, SUBSCRIPTION_ITEMS_TABLE, TYPES_TABLE,
+            VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
+        },
+    },
+};
+
+/// Schema version this build's [`DataSnapshot`] reads and writes.
+///
+/// Separate from [`super::seed::SCHEMA_VERSION`] and
+/// [`super::generation::SCHEMA_VERSION`] for the reason those two are
+/// separate from each other: this is the shape of one interchange format
+/// (rows per allowlisted table), free to move at its own pace.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The on-disk shape of `seed/data.json`: every allowlisted table's rows,
+/// keyed by table name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSnapshot {
+    /// Must equal [`SCHEMA_VERSION`] for [`import`] to accept it.
+    pub schema_version: u32,
+    /// `BTreeMap`, not `HashMap`: table order is incidental to what an
+    /// export means, so sorting it is free reproducibility — two exports of
+    /// the same data serialize to the same bytes, the same reason
+    /// [`super::zip::ZipWriter`]'s archives are byte-identical across runs.
+    pub tables: BTreeMap<String, Vec<serde_json::Map<String, Value>>>,
+}
+
+/// How [`import`] applies one allowlisted table's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// `db::upsert` each row, keyed on `id`. Safe to run repeatedly — a
+    /// second import of the same snapshot updates the same rows rather than
+    /// duplicating them — and never removes a row the destination already
+    /// has that the snapshot doesn't mention.
+    Upsert,
+    /// Delete every row in the destination table first, then `db::create`
+    /// each exported row. Reserved for the tables whose *set* must match the
+    /// snapshot exactly: a fresh instance's own bootstrap admin (and its
+    /// role assignment, and its local credentials) must be gone once someone
+    /// else's account is imported, not merged alongside it.
+    Replace,
+}
+
+/// Every table this build exports, and how [`import`] applies its rows.
+///
+/// See the module docs for why this list — together with [`TABLE_EXCLUDED`]
+/// — is a closed set, and for the one exception ([`local_credentials`])
+/// among the tables usually thought of as "secrets".
+pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
+    // --- products: catalog structure. No money moved, nothing tied to a
+    // specific buyer, subscription or provider account — the shop's shape,
+    // not its history. ---
+    // Read and written through `products::list_live_products`/
+    // `upsert_product_from_snapshot`, never through the generic
+    // `db::list_all`/`db::upsert` path below — this table alone carries a
+    // soft-delete filter its own repo module's door tests enforce (see
+    // `export`/`import_row`).
+    (PRODUCTS_COLLECTION, Mode::Upsert),
+    (GROUPS_TABLE, Mode::Upsert),
+    (TYPES_TABLE, Mode::Upsert),
+    (GROUP_TEMPLATES_TABLE, Mode::Upsert),
+    (PRODUCT_TEMPLATES_TABLE, Mode::Upsert),
+    (PRODUCTS_VARIABLES_TABLE, Mode::Upsert),
+    (PRODUCT_VERSIONS_TABLE, Mode::Upsert),
+    (OFFERS_TABLE, Mode::Upsert),
+    (OFFER_COMPONENTS_TABLE, Mode::Upsert),
+    (CHECKOUT_PRESETS_TABLE, Mode::Upsert),
+    // --- admin: IAM catalog plus config. `VARIABLES_TABLE` is filtered row
+    // by row at export time (`variable_is_exportable`) rather than excluded
+    // wholesale — most admin variables are ordinary site config (`APP_NAME`,
+    // feature flags), exactly what a re-hosted copy needs to keep working.
+    (ROLES_TABLE, Mode::Upsert),
+    (PERMISSIONS_TABLE, Mode::Upsert),
+    (admin_schema::VARIABLES_TABLE, Mode::Upsert),
+    // --- identity: the owner's own account, `Replace`d as a set so a fresh
+    // instance's bootstrap admin is gone once someone else's is imported —
+    // every `owner_id`/`created_by` an imported product carries still
+    // resolves, and the instance never ends up with two admins. See the
+    // module docs for why `local_credentials` travels with `users`. ---
+    (users::TABLE, Mode::Replace),
+    (local_credentials::TABLE, Mode::Replace),
+    (USER_ROLES_TABLE, Mode::Replace),
+];
+
+/// Every table the products, admin and auth blocks declare that
+/// [`TABLE_ALLOWLIST`] deliberately leaves out of every export.
+pub const TABLE_EXCLUDED: &[&str] = &[
+    // --- products: money moved, a specific order, or per-instance Stripe
+    // state — none of it portable to a different deployment. ---
+    PURCHASES_TABLE,
+    LINE_ITEMS_TABLE,
+    SUBSCRIPTIONS_TABLE,
+    SUBSCRIPTION_ITEMS_TABLE,
+    ENTITLEMENTS_TABLE,
+    PAYMENT_LINKS_TABLE,
+    SELLER_ACCOUNTS_TABLE,
+    PROVIDER_OPERATIONS_TABLE,
+    REFUNDS_TABLE,
+    DISPUTES_TABLE,
+    // --- admin: operational logs, and infrastructure state the runtime
+    // re-derives at every boot rather than something anyone authored. ---
+    admin_schema::BLOCK_SETTINGS_TABLE, // per-block enable flag + migration-hash tracking
+    admin_schema::REQUEST_LOGS_TABLE,
+    AUDIT_LOGS_TABLE,
+    STORAGE_ACCESS_LOGS_TABLE,
+    WRAP_GRANTS_TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot
+    // --- auth: session/credential plumbing scoped to this running
+    // instance (bearer material this instance issued, not the owner's own
+    // login — see `local_credentials` above), plus multi-tenant org
+    // records a single-owner sandbox shop has no use for. ---
+    sessions::TABLE,
+    tokens::TABLE,
+    api_keys::TABLE,
+    bootstrap_tokens::TABLE,
+    jwt_blocklist::TABLE,
+    oauth_pkce::TABLE,
+    pats::TABLE,
+    provider_links::TABLE,
+    rate_limits::TABLE,
+    orgs::TABLE,
+];
+
+/// Whether one row of `impresspress__admin__variables` may leave in an
+/// export.
+///
+/// Reuses [`crate::util::is_sensitive_key`] — the same SEC-060 rule the
+/// admin Variables page masks display values with (explicit `sensitive` flag
+/// **or** a `_SECRET`/`_KEY` suffix) — rather than checking the flag alone: a
+/// second, weaker sensitivity check here would be exactly the kind of
+/// disagreement that rule exists to prevent. The `IMPRESSPRESS_` prefix check
+/// is this module's own, additional rule: `CLAUDE.md` reserves that prefix
+/// for infrastructure config that must never reach the database at all, so a
+/// row like that appearing here would already be a bug upstream — this is
+/// the export's own backstop against it leaving anyway.
+pub fn variable_is_exportable(row: &serde_json::Map<String, Value>) -> bool {
+    let key = row.get("key").and_then(Value::as_str).unwrap_or("");
+    let sensitive_flag = row
+        .get("sensitive")
+        .and_then(crate::util::json_as_i64)
+        .unwrap_or(0);
+    !crate::util::is_sensitive_key(key, sensitive_flag) && !key.starts_with("IMPRESSPRESS_")
+}
+
+/// Read every [`TABLE_ALLOWLIST`] table's rows into a [`DataSnapshot`].
+pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
+    let mut tables = BTreeMap::new();
+    for &(table, _mode) in TABLE_ALLOWLIST {
+        // Products alone: read through the repo module's own live-only
+        // lister, never the raw table name — see the comment on
+        // `TABLE_ALLOWLIST`'s products entry.
+        let records = if table == PRODUCTS_COLLECTION {
+            list_live_products(ctx, Vec::new()).await?
+        } else {
+            db::list_all(ctx, table, Vec::new()).await?
+        };
+        let rows: Vec<serde_json::Map<String, Value>> = records
+            .into_iter()
+            .map(record_to_row)
+            // The one table with a per-row export decision — see
+            // `variable_is_exportable`'s docs for why the check lives there
+            // and not as a second `Mode`.
+            .filter(|row| table != admin_schema::VARIABLES_TABLE || variable_is_exportable(row))
+            .collect();
+        tables.insert(table.to_string(), rows);
+    }
+    Ok(DataSnapshot {
+        schema_version: SCHEMA_VERSION,
+        tables,
+    })
+}
+
+/// A database [`db::Record`] as the JSON object [`DataSnapshot`] stores.
+/// `record.data` already carries an `"id"` entry read back off the row (every
+/// backend echoes the primary key as an ordinary column), but this sets it
+/// explicitly from `record.id` anyway — the field the typed client treats as
+/// authoritative should be the one the snapshot is built from, not whatever
+/// a backend happened to also put in `data`.
+fn record_to_row(record: db::Record) -> serde_json::Map<String, Value> {
+    let mut row: serde_json::Map<String, Value> = record.data.into_iter().collect();
+    row.insert("id".to_string(), Value::String(record.id));
+    row
+}
+
+/// Rows written per table, keyed by table name — only tables `snapshot`
+/// actually carried rows for appear here, so a table the export decided to
+/// include but that happened to be empty is present with `0`, and a table
+/// the snapshot never mentions at all is simply absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub tables: BTreeMap<String, usize>,
+}
+
+/// Apply `snapshot`'s rows through typed database writes.
+///
+/// Every table `snapshot.tables` names must be on [`TABLE_ALLOWLIST`] — see
+/// the module docs for why a name outside it is refused (`InvalidArgument`)
+/// rather than silently skipped or written anyway.
+pub async fn import(
+    ctx: &dyn Context,
+    snapshot: &DataSnapshot,
+) -> Result<ImportReport, WaferError> {
+    if snapshot.schema_version != SCHEMA_VERSION {
+        return Err(WaferError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "the data snapshot declares schema_version {}; this build reads {SCHEMA_VERSION}",
+                snapshot.schema_version
+            ),
+        ));
+    }
+
+    let mut report = ImportReport::default();
+    for (table, rows) in &snapshot.tables {
+        let mode = TABLE_ALLOWLIST
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|(_, mode)| *mode)
+            .ok_or_else(|| {
+                WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "the data snapshot names {table:?}, which is not on this build's export \
+                         allowlist"
+                    ),
+                )
+            })?;
+
+        // `Replace` clears the whole table exactly once, ahead of every row
+        // — not per row — so a snapshot with zero rows for a `Replace` table
+        // still empties the destination (an owner who deleted their only
+        // product before exporting gets an empty products table, not a
+        // no-op).
+        if mode == Mode::Replace {
+            db::delete_by_filters(ctx, table, Vec::new()).await?;
+        }
+        for row in rows {
+            import_row(ctx, table, mode, row).await?;
+        }
+        report.tables.insert(table.clone(), rows.len());
+    }
+    Ok(report)
+}
+
+/// Write one row into `table` under `mode`. Split out of [`import`] because
+/// the two modes' typed calls take different shapes (`create`'s owned
+/// `HashMap` vs. `upsert`'s ordered pair list) that don't share a body.
+async fn import_row(
+    ctx: &dyn Context,
+    table: &str,
+    mode: Mode,
+    row: &serde_json::Map<String, Value>,
+) -> Result<(), WaferError> {
+    match mode {
+        Mode::Replace => {
+            let data: HashMap<String, Value> = row.clone().into_iter().collect();
+            db::create(ctx, table, data).await?;
+        }
+        Mode::Upsert => {
+            let data: Vec<(String, Value)> = row.clone().into_iter().collect();
+            let update_columns: Vec<String> = row
+                .keys()
+                .filter(|key| key.as_str() != "id")
+                .cloned()
+                .collect();
+            // Products alone: written through the repo module's own
+            // wholesale-upsert door, never the raw table name — see the
+            // comment on `TABLE_ALLOWLIST`'s products entry.
+            if table == PRODUCTS_COLLECTION {
+                upsert_product_from_snapshot(ctx, data, update_columns).await?;
+            } else {
+                db::upsert(
+                    ctx,
+                    table,
+                    data,
+                    vec!["id".to_string()],
+                    OnConflict::SetColumns(update_columns),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
