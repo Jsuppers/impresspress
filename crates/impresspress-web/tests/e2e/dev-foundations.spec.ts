@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { bootServiceWorker, WELCOME_PHRASE } from './fixtures/dev-sandbox';
 
+import { bootServiceWorker, loginAdmin } from './fixtures/dev-helpers';
+
 /**
  * Plan 1 checkpoint for the browser development sandbox.
  *
@@ -116,21 +118,6 @@ if (!seedIndexHtml) {
   throw new Error(`${seedManifestPath} has no "index.html" entry in "site"`);
 }
 const SEED_SHA256 = seedIndexHtml.sha256;
-
-/** Sign in as the seeded admin and land anywhere but the login page. */
-async function loginAdmin(page: Page) {
-  await page.goto('/b/auth/login?redirect=/b/dev/api/status', { waitUntil: 'commit' });
-  await page.locator('input#email').fill('admin@example.com');
-  await page.locator('input#password').fill('admin123');
-  await page.getByRole('button', { name: /sign in/i }).click();
-  // The login script honours `?redirect=`, but falls back to the role-aware
-  // `default_redirect` the API computed. Either lands a session; which one it
-  // is says nothing about the sandbox, so this waits only for "off the login
-  // page" and reads the API through `fetch` afterwards.
-  await page.waitForURL((url) => !url.pathname.startsWith('/b/auth/login'), {
-    timeout: 60_000,
-  });
-}
 
 /** `GET` a sandbox endpoint as JSON from inside the page. */
 function getJson(page: Page, path: string) {

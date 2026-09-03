@@ -162,7 +162,14 @@ fn body() -> Markup {
             }
         }
         link rel="stylesheet" href="/b/dev/static/dev.css";
-        script src="/b/dev/static/dev.js" defer {}
+        // `type="module"`, not `defer`: the script imports
+        // `BrowserRustCompiler` from `/b/dev/static/compiler-adapter.js`, and
+        // an `import` only resolves in a module. A module script defers by
+        // itself — it runs after parsing, in document order with the deferred
+        // classic scripts — so `dev.js` still runs before the `webmcp.js`
+        // that `ui/layout.rs` puts at the end of the body, which is the
+        // ordering the tail's `refreshSiteTools` guard is written for.
+        script type="module" src="/b/dev/static/dev.js" {}
     }
 }
 
@@ -186,7 +193,23 @@ pub fn handle_stylesheet(msg: &Message) -> OutputStream {
     )
 }
 
-/// The two page assets are the block's only responses that are not
+/// Serve `/b/dev/static/compiler-adapter.js`.
+///
+/// Its own URL rather than bytes folded into `dev.js` because it is a
+/// separate ES module: `dev.js` imports it by this path, and the browser
+/// fetches it as a module of its own. Same tier, same headers, same
+/// `no-cache` reasoning as the other two — it is one more file whose content
+/// is fixed for a build and carries no hash to prove it.
+pub fn handle_compiler_adapter(msg: &Message) -> OutputStream {
+    asset(
+        msg,
+        assets::compiler_adapter_js().as_bytes(),
+        "application/javascript; charset=utf-8",
+        assets::compiler_adapter_js_hash(),
+    )
+}
+
+/// The three page assets are the block's only responses that are not
 /// `no-store`.
 ///
 /// `no-cache` still means "revalidate before every use", so a rebuilt bundle
@@ -268,6 +291,33 @@ mod tests {
         assert!(
             js.contains("setEditorEnabled(file.encoding === 'utf8');"),
             "opening a file is what decides whether the editor is usable"
+        );
+    }
+
+    /// The script tag is a module, and is not `defer`.
+    ///
+    /// `assets::dev_js()` opens with an `import` of the compiler adapter,
+    /// which a classic script cannot parse: a `defer` here — the shape this
+    /// tag had before the adapter existed — makes the browser drop the whole
+    /// script with nothing but a console message, and every pane on the page
+    /// stays empty. The two attributes are also mutually exclusive on a
+    /// module (a module defers by itself, and `defer` on it is ignored), so
+    /// finding both would mean somebody added one back without reading why
+    /// the other is there.
+    #[test]
+    fn the_script_tag_is_a_module() {
+        let html = body().into_string();
+        assert!(
+            html.contains(r#"<script type="module" src="/b/dev/static/dev.js">"#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("dev.js\" defer"),
+            "a module script must not also be marked defer"
+        );
+        assert!(
+            assets::dev_js().starts_with("import "),
+            "the composed script must be the module this tag promises"
         );
     }
 

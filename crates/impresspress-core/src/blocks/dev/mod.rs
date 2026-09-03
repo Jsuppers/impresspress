@@ -88,6 +88,8 @@ pub enum Route {
     PageScript,
     /// `GET /b/dev/static/dev.css`
     PageStylesheet,
+    /// `GET /b/dev/static/compiler-adapter.js`
+    PageCompilerAdapter,
     /// `GET /b/dev/api/status`
     ApiStatus,
     /// `GET /b/dev/api/files`
@@ -130,6 +132,11 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         HttpMethod::Get,
         "/b/dev/static/dev.css",
         Route::PageStylesheet,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/static/compiler-adapter.js",
+        Route::PageCompilerAdapter,
     ),
     EndpointRoute::new(HttpMethod::Get, "/b/dev/api/status", Route::ApiStatus),
     EndpointRoute::new(HttpMethod::Get, "/b/dev/api/files", Route::ApiFilesList),
@@ -370,9 +377,9 @@ impl Block for DevBlock {
         ])
         .category(wafer_run::BlockCategory::Feature)
         .endpoints(vec![
-            // The document and its two assets carry no schemas — there is no
+            // The document and its three assets carry no schemas — there is no
             // JSON contract to describe, and `has_schema()` therefore keeps
-            // all three out of `/openapi.json` exactly as it keeps the HTML
+            // all four out of `/openapi.json` exactly as it keeps the HTML
             // pages of every other block out. They are declared all the same:
             // `routes_and_endpoints_stay_in_lockstep` requires the dispatch
             // table and this list to be the same set, and the declaration is
@@ -390,6 +397,9 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin),
             BlockEndpoint::get("/b/dev/static/dev.css")
                 .summary("The workspace page's stylesheet")
+                .auth(AuthLevel::Admin),
+            BlockEndpoint::get("/b/dev/static/compiler-adapter.js")
+                .summary("The page half of the in-browser compiler protocol")
                 .auth(AuthLevel::Admin),
             BlockEndpoint::get("/b/dev/api/status")
                 .summary("Sandbox status")
@@ -496,6 +506,7 @@ impl Block for DevBlock {
             Route::Page => page::handle(ctx, &msg).await,
             Route::PageScript => page::handle_script(&msg),
             Route::PageStylesheet => page::handle_stylesheet(&msg),
+            Route::PageCompilerAdapter => page::handle_compiler_adapter(&msg),
             Route::ApiStatus => status::handle(ctx, &self.shared).await,
             Route::ApiFilesList => files::handle_list(ctx, &msg).await,
             Route::ApiFilesRead => files::handle_read(ctx, input).await,

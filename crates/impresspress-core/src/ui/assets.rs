@@ -31,6 +31,31 @@ pub(crate) fn compose_webmcp_script(tail: &'static str) -> String {
     format!("(function () {{\n  'use strict';\n{WEBMCP_CORE}\n{tail}\n}})();\n")
 }
 
+/// The same composition, for a tail that has to be served as an ES **module**.
+///
+/// `imports` is emitted verbatim ahead of the IIFE — the only place an
+/// `import` declaration may stand, since it must be at a module's top level.
+/// Everything after it is byte-identical to [`compose_webmcp_script`]: the
+/// same IIFE, the same `'use strict'`, the same core, the same tail. The tail
+/// is therefore written once and reads the same whichever wrapper it goes
+/// through; what changes is only that the bindings `imports` introduces are in
+/// scope inside the closure.
+///
+/// A separate function rather than an `Option` on the existing one because the
+/// two produce different KINDS of script — a classic script and a module —
+/// and the caller has to know which it is serving anyway (a module needs
+/// `<script type="module">`, gets no `document.currentScript`, and defers by
+/// default). Naming the difference at the call site is cheaper than a flag
+/// whose meaning has to be looked up.
+///
+/// Gated on `block-dev` — the same way `block-llm`'s assets are gated below —
+/// because the sandbox page is its only caller: a build without the block has
+/// no module to compose, and an ungated helper would be dead code there.
+#[cfg(feature = "block-dev")]
+pub(crate) fn compose_webmcp_module(imports: &'static str, tail: &'static str) -> String {
+    format!("{imports}\n(function () {{\n  'use strict';\n{WEBMCP_CORE}\n{tail}\n}})();\n")
+}
+
 /// Itim font binaries, sourced from `impresspress/site-kit`'s `/fonts/` mirror
 /// and committed here so every impresspress deployment ships its own glyphs
 /// (no cross-origin runtime dependency, no `https://impresspress.org/fonts/` 404).
@@ -772,6 +797,34 @@ mod tests {
             js.trim_end().ends_with("})();"),
             "composed script must end with the IIFE close: {js}"
         );
+    }
+
+    /// The module variant puts the imports first and leaves the IIFE alone.
+    ///
+    /// Composed here from a stub tail rather than through `dev_js()`, so this
+    /// pins the FUNCTION's contract: whatever a caller passes as `imports`
+    /// comes out ahead of an IIFE that is byte-identical to the classic
+    /// composition's. `tests/dev_page.rs` pins the other end — that the
+    /// `/b/dev` script really is composed this way and really is served as a
+    /// module.
+    #[test]
+    #[cfg(feature = "block-dev")]
+    fn compose_webmcp_module_puts_the_imports_before_an_unchanged_iife() {
+        let module = super::compose_webmcp_module("import { X } from '/x.js';", "var used = X;");
+        assert!(
+            module.starts_with("import { X } from '/x.js';\n(function () {\n  'use strict';\n"),
+            "imports must precede the IIFE: {module:.80}"
+        );
+        assert!(module.trim_end().ends_with("})();"));
+        // The wrapper is the same one `compose_webmcp_script` produces — the
+        // core fragment inside, the tail after it, one strict directive.
+        let classic = super::compose_webmcp_script("var used = X;");
+        assert_eq!(
+            module,
+            format!("import {{ X }} from '/x.js';\n{classic}"),
+            "the module variant must differ from the classic one only by its imports"
+        );
+        assert_eq!(module.matches("'use strict';").count(), 1);
     }
 
     #[test]

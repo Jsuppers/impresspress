@@ -8,6 +8,17 @@
 // nothing declared below reaches `window`. No outer IIFE and no
 // `'use strict'` — the wrapper supplies both.
 //
+// The composed script is an ES MODULE (`<script type="module">`), because it
+// imports `BrowserRustCompiler` from `/b/dev/static/compiler-adapter.js` —
+// the class that drives the in-browser Rust toolchain. The import declaration
+// lives in `assets.rs` (`DEV_JS_IMPORTS`), since an `import` may only stand
+// at a module's top level and everything in this file is inside the wrapper's
+// function body. The binding is in scope here; the Compile button is what
+// will use it. Two consequences for anything written below: a module's top
+// level is already strict (the wrapper's directive is now belt and braces),
+// and a module has no currentScript — the `document` property that names the
+// running script tag is null in one — which is why nothing here reads it.
+//
 // Every tool registered here is PAGE-scoped: the list comes from
 // `/b/dev/api/tools.json` (the curated `dev_*` / `shop_*` allowlist), never
 // from the deployment-wide manifest `webmcp.js` owns, and it is torn down

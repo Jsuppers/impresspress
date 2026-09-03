@@ -6,7 +6,7 @@
 #![cfg(feature = "block-dev")]
 
 use impresspress_core::{
-    blocks::dev::{assets, test_support::FakeControl},
+    blocks::dev::{assets, test_support::FakeControl, validation::MAX_ARTIFACT_BYTES},
     test_support::{
         admin_msg, anon_msg, auth_msg, output_html, output_http_header, output_http_status,
         TestContext,
@@ -93,7 +93,14 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
     assert!(html.contains(
         r#"<iframe id="dev-preview-frame" src="/" sandbox="allow-scripts allow-same-origin allow-forms allow-popups""#
     ));
-    assert!(html.contains("/b/dev/static/dev.js"));
+    // `type="module"` is load-bearing, not decoration: the composed script
+    // opens with an `import` of the compiler adapter, which a classic script
+    // cannot parse at all. A `defer` here (the shape this tag had before the
+    // adapter existed) would take the whole workspace page down.
+    assert!(
+        html.contains(r#"<script type="module" src="/b/dev/static/dev.js">"#),
+        "the page must load dev.js as a module: {html}"
+    );
     assert!(html.contains("/b/dev/static/dev.css"));
     assert!(
         html.contains("admin@example.com"),
@@ -138,6 +145,10 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
             "application/javascript; charset=utf-8",
         ),
         ("/b/dev/static/dev.css", "text/css; charset=utf-8"),
+        (
+            "/b/dev/static/compiler-adapter.js",
+            "application/javascript; charset=utf-8",
+        ),
     ] {
         assert_eq!(
             output_http_status(ctx.dispatch(anon_msg("retrieve", path)).await).await,
@@ -190,6 +201,14 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
         )
         .await,
         assets::dev_css()
+    );
+    assert_eq!(
+        output_html(
+            ctx.dispatch(admin_msg("retrieve", "/b/dev/static/compiler-adapter.js"))
+                .await
+        )
+        .await,
+        assets::compiler_adapter_js()
     );
 }
 
@@ -256,15 +275,32 @@ fn dev_js_registers_only_from_tools_json_and_never_touches_the_global_manifest()
 
 /// The tail is authored as a fragment and only ever served composed with
 /// `webmcp-core.js` inside one IIFE — so `buildRequest`/`toolOptions` are in
-/// scope, and nothing the tail declares leaks onto `window`.
+/// scope, and nothing the tail declares leaks onto `window`. Since the
+/// compiler adapter landed the whole thing is a MODULE: one `import`
+/// declaration, which may only stand at the top level, and then the same IIFE
+/// the classic `webmcp.js` composition produces.
 #[test]
 fn dev_js_is_one_composed_iife_over_the_shared_webmcp_core() {
     let js = assets::dev_js();
     assert!(
-        js.starts_with("(function () {\n  'use strict';\n"),
-        "{js:.40}"
+        js.starts_with(
+            "import { BrowserRustCompiler } from '/b/dev/static/compiler-adapter.js';\n"
+        ),
+        "the import must come first — nothing may precede a module's imports: {js:.120}"
+    );
+    let after_imports = js
+        .split_once('\n')
+        .expect("the composed module has more than one line")
+        .1;
+    assert!(
+        after_imports.starts_with("(function () {\n  'use strict';\n"),
+        "the IIFE must follow the imports unchanged: {after_imports:.60}"
     );
     assert!(js.ends_with("})();\n"));
+    // Exactly one import — the leading one `starts_with` just pinned. An
+    // `import` further down would be a declaration smuggled into the tail,
+    // where it cannot legally stand.
+    assert_eq!(js.matches("\nimport ").count(), 0);
     // The core half…
     assert!(js.contains("function buildRequest(invocation, args)"));
     assert!(js.contains("function toolOptions(tool)"));
@@ -273,4 +309,86 @@ fn dev_js_is_one_composed_iife_over_the_shared_webmcp_core() {
     // `'use strict'` in prose, and only the wrapper emits the statement.
     assert!(js.contains("'/b/dev/api/files/write'"));
     assert_eq!(js.matches("'use strict';").count(), 1);
+}
+
+/// Everything a module changes about the tail, checked on the bytes that ship.
+///
+/// A module's top level is strict, has no `arguments`, and — the one that
+/// actually bites — gives `document.currentScript` as `null`, so a script
+/// that located its own tag would break silently on the way from `defer` to
+/// `type="module"`. The composed bytes are also parsed as a module by
+/// `node --check --input-type=module` in the same run that produced this
+/// test; this is the cheap standing guard.
+#[test]
+fn the_composed_module_relies_on_nothing_a_module_takes_away() {
+    let js = assets::dev_js();
+    assert!(
+        !js.contains("document.currentScript"),
+        "currentScript is null in a module"
+    );
+    // `arguments` outside a function, and `with`, are both illegal in strict
+    // code; the tail was already strict inside the IIFE, so this only pins
+    // that nobody reintroduces them along with a module rewrite.
+    assert!(!js.contains("with ("), "`with` is illegal in a module");
+}
+
+/// The adapter is a standalone module, not a second WebMCP tail.
+#[test]
+fn the_compiler_adapter_is_a_bare_module_that_exports_the_class() {
+    let js = assets::compiler_adapter_js();
+    assert!(
+        js.contains("export class BrowserRustCompiler {"),
+        "the class must be the module's named export"
+    );
+    // It imports nothing. `webmcp-core.js` is about calling HTTP tools; a
+    // worker session has no HTTP in it, and an import here would tie the
+    // adapter to a fragment it does not use.
+    assert!(!js.contains("\nimport "), "the adapter imports nothing");
+    assert!(!js.starts_with("import "), "the adapter imports nothing");
+    // No global. A `window.` anything would put the compiler where the
+    // preview iframe's contents could reach it.
+    assert!(
+        !js.contains("window."),
+        "the adapter must not reach for a global"
+    );
+    // Nor is it composed: the IIFE wrapper belongs to the WebMCP scripts.
+    assert!(!js.contains("'use strict';"), "a module is already strict");
+}
+
+/// The artifact ceiling the adapter enforces on the page is the one
+/// `POST /b/dev/api/builds/stage` enforces on the other side.
+///
+/// Two limits that could drift apart would mean either a compile the page
+/// refuses and the server would have taken, or — the bad direction — a
+/// multi-megabyte base64 body built up in the browser only to be refused.
+#[test]
+fn the_adapter_and_the_stage_endpoint_agree_on_the_artifact_ceiling() {
+    let js = assets::compiler_adapter_js();
+    assert!(
+        js.contains(&format!("const MAX_ARTIFACT_BYTES = {MAX_ARTIFACT_BYTES};")),
+        "compiler-adapter.js must spell out validation::MAX_ARTIFACT_BYTES ({MAX_ARTIFACT_BYTES})"
+    );
+}
+
+/// The protocol the adapter speaks is the one `compiler/src/protocol.ts`
+/// defines. The two halves are in the same repo but not the same crate — the
+/// worker is built by `examples/dev-sandbox/compiler/build-compiler.sh` — so
+/// nothing but a test like this notices a message name that drifted.
+#[test]
+fn the_adapter_speaks_every_message_the_protocol_defines() {
+    let js = assets::compiler_adapter_js();
+    for sent in ["type: 'init'", "type: 'compile'", "type: 'cancel'"] {
+        assert!(js.contains(sent), "the adapter never sends {sent}");
+    }
+    for received in [
+        "case 'progress':",
+        "case 'ready':",
+        "case 'result':",
+        "case 'error':",
+    ] {
+        assert!(
+            js.contains(received),
+            "the adapter never handles {received}"
+        );
+    }
 }
