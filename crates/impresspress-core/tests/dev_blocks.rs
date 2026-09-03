@@ -295,6 +295,96 @@ async fn a_tool_name_another_dynamic_block_already_claims_is_refused() {
     assert_eq!(control.rebuilds().len(), 1);
 }
 
+/// The `BlockInfo` a `hello` guest with one agent tool reports.
+fn hello_with_tool() -> BlockInfo {
+    BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "x").endpoints(vec![
+        BlockEndpoint::get("/b/hello/")
+            .auth(AuthLevel::Public)
+            .summary("x")
+            .agent_tool("hello_tool", "greets"),
+    ])
+}
+
+/// Recompiling a block must not collide with its OWN agent tool names.
+///
+/// The bug this pins: `claimed_tool_names` seeded the "already taken" set
+/// from `ctx.registered_blocks()`, which on a rebuilt runtime carries the
+/// LIVE dynamic blocks as well as the built-ins — including the previous
+/// version of the very block being recompiled. So the second
+/// `dev_compile_block` for a block that declares any agent tool came back
+/// `tool-name-duplicate`, naming a tool only that block has ever declared,
+/// and the only way forward was `dev_remove_block` + a full compile from
+/// nothing, with the block offline in between.
+///
+/// The fixture has to say what a rebuilt runtime looks like for the rule to
+/// be exercised at all — `FakeControl::rebuild` records the spec set but has
+/// no runtime to register it into — which is why the whole thing went
+/// unnoticed: `TestContext::registered_blocks()` held nothing but built-ins.
+#[tokio::test]
+async fn recompiling_a_block_keeps_its_own_agent_tool_names() {
+    let control = FakeControl::new();
+    control.set_validated_info(hello_with_tool());
+    let mut ctx = TestContext::with_dev(control.clone()).await;
+
+    assert_eq!(stage(&ctx, "hello", ARTIFACT).await["success"], true);
+
+    // What the activation's rebuild does in a real runtime: the accepted
+    // block is registered through `ImpresspressBuilder::extra_block`, so from
+    // here on it is in the sealed snapshot `registered_blocks()` returns.
+    ctx.register_block_info("site/hello", hello_with_tool());
+
+    // The same block, one harmless source edit later — same tool, new bytes.
+    control.set_validated_info(hello_with_tool());
+    let r = stage(&ctx, "hello", b"\0asm\x01\0\0\0edited").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(codes(&r).is_empty(), "{r}");
+    assert_eq!(r["generation"]["blocks"], 1);
+
+    // A second generation, carrying the new artifact — not the old one.
+    let rebuilds = control.rebuilds();
+    assert_eq!(rebuilds.len(), 2, "{rebuilds:?}");
+    assert_eq!(rebuilds[1].len(), 1);
+    assert_eq!(rebuilds[1][0].name, "site/hello");
+    assert_eq!(
+        rebuilds[1][0].artifact_sha256,
+        impresspress_core::blocks::dev::blobs::sha256_hex(b"\0asm\x01\0\0\0edited"),
+    );
+}
+
+/// And the rule that must survive the fix: a DIFFERENT block may still not
+/// claim a live block's tool name, including when the live block is in the
+/// runtime's registered set. Post-fix that refusal comes from the
+/// authoritative half of the claimed set — the live block's stored
+/// `BlockInfo`, read back through `others` — rather than from the registered
+/// list, so this is the test that says the rule is still applied at all.
+///
+/// (The built-in half has its own guard in
+/// `a_tool_name_a_builtin_block_already_claims_is_refused`, which registers
+/// the real products block and stages a guest claiming `list_products`.)
+#[tokio::test]
+async fn a_live_blocks_tool_name_is_still_refused_to_another_block() {
+    let control = FakeControl::new();
+    control.set_validated_info(hello_with_tool());
+    let mut ctx = TestContext::with_dev(control.clone()).await;
+
+    assert_eq!(stage(&ctx, "hello", ARTIFACT).await["success"], true);
+    ctx.register_block_info("site/hello", hello_with_tool());
+
+    control.set_validated_info(
+        BlockInfo::new("site/notes", "0.1.0", "http-handler@v1", "x").endpoints(vec![
+            BlockEndpoint::get("/b/notes/")
+                .auth(AuthLevel::Public)
+                .summary("x")
+                .agent_tool("hello_tool", "steals the live block's tool name"),
+        ]),
+    );
+    let r = stage(&ctx, "notes", b"\0asm\x01\0\0\0notes").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert!(codes(&r).contains(&"tool-name-duplicate"), "{r}");
+    // `hello` is still the whole live set.
+    assert_eq!(control.rebuilds().len(), 1);
+}
+
 #[tokio::test]
 async fn declared_capabilities_outside_the_namespace_are_refused() {
     let control = FakeControl::new();

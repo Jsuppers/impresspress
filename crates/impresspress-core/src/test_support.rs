@@ -593,6 +593,30 @@ impl TestContext {
             .insert(name.to_string(), block);
     }
 
+    /// Put a `BlockInfo` into `Context::registered_blocks()` without a block
+    /// behind it.
+    ///
+    /// [`Self::register_block`]'s snapshot half, for the one registration a
+    /// fixture cannot express through it: a *dynamic* sandbox block. Those
+    /// are compiled guests — the fixture drives them through
+    /// `blocks::dev::test_support::FakeControl`, which has no `dyn Block` to
+    /// hand over — yet the real runtime registers each live one via
+    /// `ImpresspressBuilder::extra_block` on every rebuild, so its `BlockInfo`
+    /// IS in the sealed snapshot that `registered_blocks()` returns. A test
+    /// that wants to reason about what a *rebuilt* runtime looks like has to
+    /// be able to say so; without this it can only ever see the built-ins,
+    /// which is precisely how the sandbox shipped a rule that refused a block
+    /// its own agent tool names on recompile.
+    ///
+    /// Same de-duplication as `register_block`, and the same authority: the
+    /// name passed in wins over whatever `info.name` says, so a re-registered
+    /// block replaces its entry instead of appending a second one.
+    pub fn register_block_info(&mut self, name: &str, mut info: wafer_run::BlockInfo) {
+        self.block_infos.retain(|b| b.name != name);
+        info.name = name.to_string();
+        self.block_infos.push(info);
+    }
+
     /// Replace the database backing this context with one whose mutating
     /// operations (`create`/`update`/`delete`/`upsert`) always fail with a
     /// simulated operational error, while every read (`get`/`list`/`count`/

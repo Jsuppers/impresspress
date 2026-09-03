@@ -109,6 +109,18 @@ const BROKEN = 'protocol-error';
 /** What the `hello` template's one endpoint answers with, verbatim. */
 const GREETING = 'Hello from site/hello — a block compiled in your browser.';
 
+/** What it answers with once step 5 has given it an agent tool. */
+const GREETING_WITH_TOOL = 'Hello from site/hello — now with an agent tool.';
+
+/** …and after the one-literal edit step 5 recompiles. */
+const GREETING_EDITED = 'Hello from site/hello — edited, recompiled, same tool.';
+
+/** The block's source file every edit below goes through. */
+const LIB_RS = `blocks/${BLOCK}/src/lib.rs`;
+
+/** The three files `dev_create_block` scaffolds, in the order it reports them. */
+const CRATE_FILES = [`blocks/${BLOCK}/Cargo.toml`, LIB_RS, `blocks/${BLOCK}/src/wafer_guest.rs`];
+
 test.beforeAll(() => {
   mkdirSync(TOOL_COMPILER_DIR, { recursive: true });
   copyFileSync(FAKE_WORKER, path.join(TOOL_COMPILER_DIR, 'worker.js'));
@@ -173,6 +185,62 @@ type Compile = {
   progress: Array<{ phase: string; ms: number }>;
 };
 
+/**
+ * Build the workspace's CURRENT `blocks/<BLOCK>/` on the host, and drop the
+ * module where the fake worker serves its output from.
+ *
+ * Read back through `dev_read_file` — the tool an agent would use — and not
+ * off the host's copy of the templates: what gets compiled has to be what the
+ * WORKSPACE holds, or this proves nothing about the round trip the sandbox
+ * actually makes. Which also makes it the way an edit reaches the artifact:
+ * write the file through the tool, call this, compile.
+ *
+ * `--offline` because a sandbox block has an empty `[dependencies]` by
+ * construction (the browser toolchain has no registry access, so the whole SDK
+ * is the vendored `src/wafer_guest.rs`) — a build that needed the network here
+ * would mean the template had grown a dependency it cannot have.
+ */
+async function buildOnHost(page: Page, files: string[]) {
+  const crate = mkdtempSync(path.join(tmpdir(), 'dev-compile-'));
+  for (const entryPath of files) {
+    const file = structured<FileRead>(await execute(page, 'dev_read_file', { path: entryPath }));
+    expect(file.encoding).toBe('utf8');
+    const target = path.join(crate, entryPath.slice(`blocks/${BLOCK}/`.length));
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, file.content);
+  }
+  execFileSync('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '--offline'], {
+    cwd: crate,
+    stdio: 'inherit',
+  });
+  copyFileSync(
+    path.join(crate, 'target', 'wasm32-wasip1', 'release', `${BLOCK}.wasm`),
+    path.join(TOOL_COMPILER_DIR, `${BLOCK}.wasm`),
+  );
+  rmSync(crate, { recursive: true, force: true });
+}
+
+/**
+ * Replace `blocks/<BLOCK>/src/lib.rs` with `edit(current)`, through the tool
+ * (so the compare-and-swap on the digest is the real one), and rebuild the
+ * host artifact from it.
+ */
+async function editAndBuild(page: Page, edit: (source: string) => string) {
+  const current = structured<FileRead>(await execute(page, 'dev_read_file', { path: LIB_RS }));
+  const content = edit(current.content);
+  expect(content, 'the edit matched nothing — the hello template has drifted').not.toBe(
+    current.content,
+  );
+  structured(
+    await execute(page, 'dev_write_file', {
+      path: LIB_RS,
+      content,
+      expected_sha256: current.sha256,
+    }),
+  );
+  await buildOnHost(page, CRATE_FILES);
+}
+
 /** What `GET /b/<name>/` answers right now, read from inside the document. */
 async function fetchBlock(page: Page, name: string) {
   return page.evaluate(async (blockName) => {
@@ -210,37 +278,8 @@ test('dev_compile_block compiles a scaffolded block, stages it and puts it live;
   // halves of `updateCompileButton`, in the order a first-time visitor meets
   // them.
   await expect(page.locator('#dev-compile')).toBeEnabled();
-  expect(created.files.map((f) => f.path)).toEqual([
-    `blocks/${BLOCK}/Cargo.toml`,
-    `blocks/${BLOCK}/src/lib.rs`,
-    `blocks/${BLOCK}/src/wafer_guest.rs`,
-  ]);
-
-  // Read back through the tool an agent would use, not off the host's copy of
-  // the templates: what gets compiled has to be what the WORKSPACE holds, or
-  // this proves nothing about the round trip the sandbox actually makes.
-  const crate = mkdtempSync(path.join(tmpdir(), 'dev-compile-'));
-  for (const entry of created.files) {
-    const file = structured<FileRead>(await execute(page, 'dev_read_file', { path: entry.path }));
-    expect(file.encoding).toBe('utf8');
-    const target = path.join(crate, entry.path.slice(`blocks/${BLOCK}/`.length));
-    mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, file.content);
-  }
-  // `--offline` because a sandbox block has an empty `[dependencies]` by
-  // construction (the browser toolchain has no registry access, so the whole
-  // SDK is the vendored `src/wafer_guest.rs`) — a build that needed the
-  // network here would mean the template had grown a dependency it cannot
-  // have.
-  execFileSync('cargo', ['build', '--release', '--target', 'wasm32-wasip1', '--offline'], {
-    cwd: crate,
-    stdio: 'inherit',
-  });
-  copyFileSync(
-    path.join(crate, 'target', 'wasm32-wasip1', 'release', `${BLOCK}.wasm`),
-    path.join(TOOL_COMPILER_DIR, `${BLOCK}.wasm`),
-  );
-  rmSync(crate, { recursive: true, force: true });
+  expect(created.files.map((f) => f.path)).toEqual(CRATE_FILES);
+  await buildOnHost(page, CRATE_FILES);
 
   // --- 2. Compile: the block is validated and live when the call returns ---
   const built = structured<Compile>(await execute(page, 'dev_compile_block', { name: BLOCK }));
@@ -312,13 +351,52 @@ test('dev_compile_block compiles a scaffolded block, stages it and puts it live;
   await expect.poll(activeGeneration, { timeout: 120_000 }).not.toBe(before);
   expect(await fetchBlock(page, BLOCK)).toEqual({ status: 200, body: GREETING });
 
-  // --- 5. A crate that does not compile is an ANSWER ----------------------
-  const source = structured<FileRead>(
-    await execute(page, 'dev_read_file', { path: `blocks/${BLOCK}/src/lib.rs` }),
+  // --- 5. Recompiling a block that declares an agent tool -----------------
+  //
+  // The case a browser agent hit and nothing here covered. Every compile above
+  // is either a block's FIRST, or a recompile of a block with no agent tool —
+  // and the duplicate-tool-name rule has nothing to say about a block that
+  // declares none, so `site/hello` as the template ships it could never
+  // exercise it. Staging seeded "already claimed" from the runtime's
+  // registered blocks, which after the rebuild in step 2 INCLUDE the live
+  // `site/hello`, so the second compile of a block with a tool was refused
+  // `tool-name-duplicate` naming a tool only that block had ever declared. The
+  // agent's only way forward was `dev_remove_block` and a compile from
+  // nothing, with the block offline in between.
+  //
+  // First give it a tool, which is itself a compile of a NEW declaration…
+  await editAndBuild(page, (source) =>
+    source
+      .replace(
+        '.summary("Say hello"),',
+        '.summary("Say hello")\n            .agent_tool("hello_tool", "Says hello."),',
+      )
+      .replace(`"${GREETING}"`, `"${GREETING_WITH_TOOL}"`),
   );
+  const tooled = structured<Compile>(await execute(page, 'dev_compile_block', { name: BLOCK }));
+  expect(tooled.success, JSON.stringify(tooled.diagnostics)).toBe(true);
+  expect(await fetchBlock(page, BLOCK)).toEqual({ status: 200, body: GREETING_WITH_TOOL });
+
+  // …and now the recompile itself: the same block, the same tool, one string
+  // literal changed — the smallest edit a developer makes, and the one that
+  // used to take the block down.
+  await editAndBuild(page, (source) =>
+    source.replace(`"${GREETING_WITH_TOOL}"`, `"${GREETING_EDITED}"`),
+  );
+  const recompiled = structured<Compile>(await execute(page, 'dev_compile_block', { name: BLOCK }));
+  expect(recompiled.success, JSON.stringify(recompiled.diagnostics)).toBe(true);
+  expect(recompiled.diagnostics).toEqual([]);
+  // A new generation, active, and the block still one of one: a recompile
+  // REPLACES the block rather than joining the set beside itself.
+  expect(recompiled.generation?.status).toBe('active');
+  expect(recompiled.generation?.id).not.toBe(tooled.generation?.id);
+  expect(await fetchBlock(page, BLOCK)).toEqual({ status: 200, body: GREETING_EDITED });
+
+  // --- 6. A crate that does not compile is an ANSWER ----------------------
+  const source = structured<FileRead>(await execute(page, 'dev_read_file', { path: LIB_RS }));
   structured(
     await execute(page, 'dev_write_file', {
-      path: `blocks/${BLOCK}/src/lib.rs`,
+      path: LIB_RS,
       content: `${source.content}\nFAIL`,
       expected_sha256: source.sha256,
     }),
@@ -332,5 +410,5 @@ test('dev_compile_block compiles a scaffolded block, stages it and puts it live;
   expect(failed.diagnostics[0]).toMatchObject({ file: 'src/lib.rs', severity: 'error' });
   // …and the block that WAS compiled is still serving. A failed compile is not
   // a deployment.
-  expect(await fetchBlock(page, BLOCK)).toEqual({ status: 200, body: GREETING });
+  expect(await fetchBlock(page, BLOCK)).toEqual({ status: 200, body: GREETING_EDITED });
 });
