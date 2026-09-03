@@ -130,8 +130,9 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
         // 32-cell mark. There is no raster wordmark: brand text is rendered
         // as text next to the mark (see `templates::brand_lockup`) -- the
         // old `impresspress-logo-long.png` wordmark was dark-ink artwork
-        // illegible on the navy chrome and has been removed outright (see
-        // `config_vars::REMOVED_BUILTIN_WORDMARK_URL_PREFIX`).
+        // illegible on the navy chrome and has been removed outright; rows
+        // still pointing at it are repaired by `seed_defaults` via
+        // `is_stale_builtin_asset_url`.
         "impresspress-logo-2x.png" => include_bytes!("assets/impresspress-logo-2x.png"),
         // Impresspress favicon — bundled so every deployment ships its own
         // `<link rel="icon">` target without depending on a per-deployment
@@ -208,6 +209,29 @@ pub fn logo_icon_2x_url() -> String {
 /// Favicon URL with content hash, e.g. `/b/static/favicon-a1b2c3d4.ico`.
 pub fn favicon_url() -> String {
     url("favicon.ico")
+}
+
+/// True when `value` points at this deployment's own `/b/static/` route but
+/// names a file this build does not serve.
+///
+/// Every built-in asset URL carries a content hash, so changing the artwork
+/// changes the URL. Those URLs are also *seeded into the database* as config
+/// defaults (`LOGO_ICON_URL`, `FAVICON_URL`, historically `LOGO_URL`), which
+/// means an upgrade that touches an asset leaves every existing deployment
+/// pointing at a hash that 404s — a broken image on every page showing the
+/// brand. `seed_defaults` uses this to repair those rows back to the current
+/// default.
+///
+/// The manifest is the oracle rather than a per-asset prefix list: a URL
+/// under our own static route naming a file we do not serve is dead by
+/// definition, whatever asset it once referred to. Scoped to `STATIC_PREFIX`,
+/// so an operator's white-labelled URL — any absolute URL, or a CDN base,
+/// which is version-pinned and therefore never goes stale — is never touched.
+pub fn is_stale_builtin_asset_url(value: &str) -> bool {
+    match value.strip_prefix(STATIC_PREFIX) {
+        Some(filename) => !filename.is_empty() && !ASSETS.iter().any(|e| e.filename == filename),
+        None => false,
+    }
 }
 
 /// The assembled CSS bundle, built by `build.rs` from `CSS_ORDER`.
@@ -581,6 +605,29 @@ mod tests {
                 "frame {i} is a 1:1 PNG"
             );
         }
+    }
+
+    #[test]
+    fn stale_builtin_asset_url_matches_only_dead_local_assets() {
+        // The URL this build actually serves is current, not stale.
+        assert!(!super::is_stale_builtin_asset_url(&super::logo_icon_url()));
+        assert!(!super::is_stale_builtin_asset_url(&super::favicon_url()));
+        // A prior release's content hash under our own route is dead.
+        assert!(super::is_stale_builtin_asset_url(
+            "/b/static/impresspress-logo-5e884a3a.png"
+        ));
+        // The removed raster wordmark: route gone entirely.
+        assert!(super::is_stale_builtin_asset_url(
+            "/b/static/impresspress-logo-long-1f4c8ab2.png"
+        ));
+        // An operator's white-labelled artwork is their data.
+        assert!(!super::is_stale_builtin_asset_url(
+            "https://acme.example/wordmark.png"
+        ));
+        // Blank (the "no wordmark" default) and the bare route are not URLs
+        // at a missing file.
+        assert!(!super::is_stale_builtin_asset_url(""));
+        assert!(!super::is_stale_builtin_asset_url("/b/static/"));
     }
 
     #[test]

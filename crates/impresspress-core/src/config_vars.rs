@@ -26,20 +26,10 @@ pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 /// Named because two other places have to agree with the declaration below:
 /// [`crate::ui::SiteConfig::load`] reads it, and
 /// [`crate::blocks::admin::settings::seed_defaults`] repairs rows that still
-/// carry the removed built-in wordmark's URL.
+/// carry a built-in asset URL this build no longer serves — the removed
+/// raster wordmark included (see
+/// [`crate::ui::assets::is_stale_builtin_asset_url`]).
 pub const LOGO_URL_KEY: &str = "WAFER_RUN_SHARED__LOGO_URL";
-
-/// URL prefix of the built-in raster wordmark that releases up to and
-/// including 0.1.x served at `/b/static/impresspress-logo-long-{hash}.png`.
-///
-/// The asset, its accessor and its route are all gone — brand text is text
-/// now, and only the square mark is art. The prefix survives here for exactly
-/// one reason: older releases *seeded this URL into the database* as
-/// `LOGO_URL_KEY`'s default, so an upgraded deployment still points at a route
-/// that no longer exists. `seed_defaults` matches on this prefix (the trailing
-/// segment is a content hash that varied per release, so only the prefix is
-/// stable) and clears those rows back to blank.
-pub const REMOVED_BUILTIN_WORDMARK_URL_PREFIX: &str = "/b/static/impresspress-logo-long-";
 
 /// Shared config key: cross-origin origins allowed to call the API.
 ///
