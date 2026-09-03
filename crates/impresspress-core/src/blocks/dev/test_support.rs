@@ -345,21 +345,28 @@ pub fn seed_file(path: &str, bytes: &[u8]) -> SeedFile {
 /// hashed wasm-pack pair, `vendor/sql-wasm.wasm` and the asset manifest
 /// itself. Its `sw.js` is a dev bundle's — it declares
 /// `const DEV_ENABLED = true;` and reads that constant in the isolation-header
-/// passthrough, exactly as `impresspress-bundle`'s template renders it — so a
-/// test can assert that the export turned the sandbox off, which is the one
-/// edit the export makes to any shell file.
+/// passthrough, exactly as `impresspress-bundle`'s template renders it — and
+/// its bypass list carries the compiler prefix the way a deployment that
+/// ships the in-browser toolchain does. So a test can assert BOTH edits the
+/// export makes to a shell file: the dev flag turned off, and the bypass for
+/// a compiler tree the export does not copy removed.
 pub struct FakeShell {
     files: BTreeMap<String, Vec<u8>>,
     /// Set by [`Self::failing_to_list`]: what `list` refuses with.
     list_failure: Option<String>,
 }
 
-/// The `sw.js` [`FakeShell::new`] serves — a dev bundle's, trimmed to the two
-/// lines the export cares about plus one it must leave alone.
+/// The `sw.js` [`FakeShell::new`] serves — a dev bundle's, trimmed to the
+/// lines the export acts on (the `DEV_ENABLED` declaration and the compiler's
+/// bypass clause) plus the ones it must leave exactly alone (the constant's
+/// two readers and the `/seed/` bypass, without which an exported folder
+/// could never import the seed shipped beside it).
 pub const FAKE_SW_JS: &str = "const DEV_ENABLED = true;\n\
      await initialize({ dev: DEV_ENABLED });\n\
      if (DEV_ENABLED && url.pathname !== '/sw.js') { passthrough(); }\n\
-     if (url.pathname.startsWith('/seed/')) { return; }\n";
+     if (url.pathname.startsWith('/sql-') \
+     || url.pathname.startsWith('/__impresspress_dev/compiler/') \
+     || url.pathname.startsWith('/seed/')) { return; }\n";
 
 impl Default for FakeShell {
     fn default() -> Self {

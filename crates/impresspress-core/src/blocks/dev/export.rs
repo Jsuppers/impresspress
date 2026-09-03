@@ -50,9 +50,7 @@ use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 use super::{
     artifacts, blobs,
     contracts::{ExportFile, ExportManifest},
-    data_snapshot,
-    generation::{self, GenerationManifest},
-    no_store, no_store_error_status,
+    data_snapshot, generation, no_store, no_store_error_status, repo,
     seed::{self, SeedBlock, SeedManifest},
     workspace,
     zip::ZipWriter,
@@ -82,6 +80,17 @@ const DATA_PATH: &str = "data.json";
 /// The content type the importer checks `seed/data.json` against.
 const DATA_CONTENT_TYPE: &str = "application/json";
 
+/// URL prefix the in-browser Rust toolchain's static assets are served under.
+///
+/// Two things in the exported bundle refer to it and both have to go: the
+/// files themselves (excluded from the shell listing by
+/// [`SHELL_EXCLUDED_PREFIXES`]) and the service worker's bypass clause for
+/// them ([`strip_compiler_bypass`]). Restated here rather than imported from
+/// the bundle's `impresspress.toml`, which is a deployment's file and not
+/// something this crate can read — `page.rs` and `dev.js` state the same
+/// prefix for the same reason.
+const COMPILER_ROOT: &str = "/__impresspress_dev/compiler/";
+
 /// Shell paths the export never copies, by prefix.
 ///
 /// Both are things a DEPLOYMENT overlays on top of the bundler's output
@@ -108,6 +117,24 @@ const README_PATH: &str = "README.md";
 struct Entry {
     path: String,
     bytes: Vec<u8>,
+}
+
+/// Everything the README template has a hole for.
+///
+/// A struct rather than eight positional arguments: they are all numbers and
+/// short strings from the same assembly, and a caller that swapped
+/// `site_files` for `shell_files` would produce a plausible, wrong README
+/// that no type would catch.
+struct ReadmeFacts<'a> {
+    generation_id: &'a str,
+    /// The ACTIVE GENERATION's `created_at`, never the wall clock — see
+    /// [`render_readme`].
+    created_at: &'a str,
+    shell_files: u32,
+    site_files: u32,
+    blocks: u32,
+    tables: &'a BTreeMap<String, usize>,
+    source_verdicts: &'a [(String, SourcesMatch)],
 }
 
 /// What [`assemble`] produced: the archive's entries, plus the counts the
@@ -186,7 +213,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     // whose source has been edited since it was compiled exports the compiled
     // one, because that is what the exported folder will run. The workspace
     // supplies only the sources that go alongside it.
-    let Some((_row, manifest)) = generation::active(ctx).await.map_err(Refusal::Internal)? else {
+    let Some((row, manifest)) = generation::active(ctx).await.map_err(Refusal::Internal)? else {
         return Err(Refusal::NothingPublished);
     };
     let ws = workspace::load(ctx).await.map_err(Refusal::Internal)?;
@@ -207,7 +234,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
             .await
             .map_err(|e| Refusal::Shell(format!("{path}: {e}")))?;
         let bytes = if path == SW_PATH {
-            sw_with_dev_off(&bytes)?
+            strip_compiler_bypass(sw_with_dev_off(&bytes)?)
         } else {
             bytes
         };
@@ -245,6 +272,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     }
 
     let mut blocks: Vec<SeedBlock> = Vec::new();
+    let mut source_verdicts: Vec<(String, SourcesMatch)> = Vec::new();
     for spec in &manifest.blocks {
         let name = seed::short_name(&spec.name);
         let artifact = artifacts::get(ctx, &spec.artifact_sha256)
@@ -269,6 +297,21 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
                 bytes,
             });
         }
+        // …which is exactly why the README says, per block, whether the
+        // sources it ships are the ones the artifact was built from. The two
+        // halves come from different places on purpose (the artifact from the
+        // generation, the sources from the live workspace), so they CAN
+        // disagree — an agent that edited `blocks/hello/src/lib.rs` and did
+        // not recompile leaves an export whose `.wasm` and `src/` describe
+        // different programs. Silent is the one thing that must not be.
+        let recorded = repo::builds::latest_valid_for_artifact(ctx, &spec.artifact_sha256)
+            .await
+            .map_err(Refusal::Internal)?
+            .map(|build| build.source_manifest_sha256);
+        source_verdicts.push((
+            spec.name.clone(),
+            sources_match(&sources, recorded.as_deref()),
+        ));
         blocks.push(SeedBlock {
             spec: spec.clone(),
             sources,
@@ -302,11 +345,15 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     let block_count = manifest.blocks.len() as u32;
     let readme = render_readme(
         ctx,
-        &manifest,
-        shell_files,
-        site_files,
-        block_count,
-        &tables,
+        &ReadmeFacts {
+            generation_id: &manifest.generation_id,
+            created_at: &row.created_at,
+            shell_files,
+            site_files,
+            blocks: block_count,
+            tables: &tables,
+            source_verdicts: &source_verdicts,
+        },
     );
 
     let mut entries = Vec::with_capacity(shell.len() + seed_entries.len() + 3);
@@ -417,6 +464,38 @@ fn sw_with_dev_off(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
     Ok(text.replace(SW_DEV_ON, SW_DEV_OFF).into_bytes())
 }
 
+/// `sw.js` with the compiler's bypass clause removed, if it has one.
+///
+/// A deployment that ships the in-browser toolchain adds
+/// `/__impresspress_dev/compiler/` to the service worker's bypass list (the
+/// bundle's `extra_bypass_prefix`, rendered by `impresspress-bundle`'s
+/// `build_template_vars` as one ` || url.pathname.startsWith('…')` clause).
+/// The export does not copy those assets — there is no `/b/dev` in an
+/// exported site to load them — so the clause would be a bypass for a tree
+/// that is not there: every request under the prefix waved past the runtime
+/// to a 404 from the static host, instead of the runtime's own answer.
+///
+/// Unlike the dev flag this is OPTIONAL and its absence is not an error: the
+/// prefix is an app's own bypass entry (CI's foundations bundle ships no
+/// compiler and never adds it), so a shell without the clause is an ordinary
+/// shell, not a mismatched one. Removing the whole rendered clause rather
+/// than editing the prefix keeps the remaining expression exactly as the
+/// bundler would have rendered it for a bundle that never asked.
+fn strip_compiler_bypass(bytes: Vec<u8>) -> Vec<u8> {
+    // The exact text `build_template_vars` emits per `extra_bypass_prefix`
+    // entry. Built here rather than matched loosely so a clause this does not
+    // recognise is left alone instead of half-edited.
+    let clause = format!(" || url.pathname.startsWith('{COMPILER_ROOT}')");
+    match String::from_utf8(bytes) {
+        Ok(text) if text.contains(&clause) => text.replace(&clause, "").into_bytes(),
+        Ok(text) => text.into_bytes(),
+        // Unreachable in practice — `sw_with_dev_off` has already parsed the
+        // same bytes as UTF-8 and would have refused otherwise. Returning
+        // them untouched rather than panicking keeps this function total.
+        Err(e) => e.into_bytes(),
+    }
+}
+
 /// The first eight characters of a generation id — what the downloaded file
 /// is named after.
 fn short_id(generation_id: &str) -> String {
@@ -424,14 +503,16 @@ fn short_id(generation_id: &str) -> String {
 }
 
 /// The README, with this export's own numbers substituted in.
-fn render_readme(
-    ctx: &dyn Context,
-    manifest: &GenerationManifest,
-    shell_files: u32,
-    site_files: u32,
-    blocks: u32,
-    tables: &BTreeMap<String, usize>,
-) -> String {
+///
+/// `created_at` is the ACTIVE GENERATION's timestamp, not the wall clock. An
+/// export is a function of what is live, and `ZipWriter` already fixes every
+/// entry's timestamp for the same reason — dating the README by when the
+/// download happened would have made the one entry that changes between two
+/// otherwise identical exports the README, which is both useless and the
+/// exact thing `two_exports_of_the_same_generation_are_identical` exists to
+/// deny. The generation's own creation time is also the more useful fact: it
+/// is when the site being exported came to be.
+fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
     // The literal, as every other reader of this shared variable spells it
     // (`blocks::auth_ui::pages`, `pipeline`): `config_vars` declares it in
     // `shared_config_vars()` without exporting a constant for the key.
@@ -443,19 +524,102 @@ fn render_readme(
         .config_get(crate::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY)
         .filter(|email| !email.is_empty())
         .unwrap_or("the account you signed in with");
-    let rows: usize = tables.values().sum();
-    // A plain textual substitution, not a template engine: the README has six
-    // holes and every value is a number or a short string this function
-    // produced.
+    let rows: usize = facts.tables.values().sum();
+    // A plain textual substitution, not a template engine: every value is a
+    // number or a short string this function produced, and
+    // `export_zip_contains_shell_seed_sources_and_data_with_dev_off` asserts
+    // no `{{` survives.
     README_TEMPLATE
         .replace("{{TITLE}}", title)
-        .replace("{{DATE}}", &crate::util::now_rfc3339())
-        .replace("{{GENERATION_ID}}", &manifest.generation_id)
-        .replace("{{SHELL_FILES}}", &shell_files.to_string())
-        .replace("{{SITE_FILES}}", &site_files.to_string())
-        .replace("{{BLOCKS}}", &blocks.to_string())
+        .replace("{{DATE}}", facts.created_at)
+        .replace("{{GENERATION_ID}}", facts.generation_id)
+        .replace("{{SHELL_FILES}}", &facts.shell_files.to_string())
+        .replace("{{SITE_FILES}}", &facts.site_files.to_string())
+        .replace("{{BLOCKS}}", &facts.blocks.to_string())
         .replace("{{TABLE_ROWS}}", &rows.to_string())
         .replace("{{ADMIN_EMAIL}}", admin_email)
+        .replace(
+            "{{BLOCK_SOURCES}}",
+            &render_source_verdicts(facts.source_verdicts),
+        )
+}
+
+/// Whether the sources an export ships for one block are the ones its
+/// artifact was compiled from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourcesMatch {
+    /// The workspace's current source digest equals the one recorded on the
+    /// build row that produced this artifact.
+    Current,
+    /// They differ: the sources have been edited since the block was last
+    /// compiled, so the `.wasm` in this bundle is not built from the `src/`
+    /// beside it. Re-compile before exporting to make them agree.
+    Stale,
+    /// There is no digest to compare against. Either the block was SEEDED
+    /// (a seeded build row records no source digest — the bundle it came from
+    /// carried the sources, and no compile ran here), or its build row is
+    /// gone. Not a verdict either way, and reported as such rather than
+    /// guessed at.
+    Unknown,
+}
+
+impl SourcesMatch {
+    /// The README line for this verdict.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Current => "sources match the compiled artifact",
+            Self::Stale => {
+                "SOURCES DIFFER from the compiled artifact — the .wasm here was built from an                  earlier version of src/; recompile and re-export to make them agree"
+            }
+            Self::Unknown => {
+                "no source digest recorded (a seeded block, or one whose build record is gone)                  — the sources are shipped as found and were not checked against the artifact"
+            }
+        }
+    }
+}
+
+/// The digest a compile records for a block's sources, recomputed from what
+/// the workspace holds now.
+///
+/// One `"<crate-relative path>\0<sha256>\n"` line per file, sorted, hashed —
+/// byte for byte what `dev.js`'s `snapshotBlock` computes and sends as
+/// `source_manifest_sha256`. The two definitions have to agree or every
+/// comparison below reads "stale"; NUL is the separator on both sides because
+/// a path may contain anything but that, and the paths are crate-relative on
+/// both sides because that is what the compiler was given.
+fn source_digest(sources: &[workspace::FileEntry]) -> String {
+    let mut lines: Vec<String> = sources
+        .iter()
+        .map(|entry| format!("{}\0{}\n", entry.path, entry.sha256))
+        .collect();
+    lines.sort();
+    blobs::sha256_hex(lines.concat().as_bytes())
+}
+
+/// Compare the workspace's current sources against the digest the build row
+/// recorded, if there is one.
+fn sources_match(sources: &[workspace::FileEntry], recorded: Option<&str>) -> SourcesMatch {
+    // A seeded build row records the empty string, and so does a stage
+    // request that reported no digest — neither is something to compare
+    // against, and treating "" as a digest would call every seeded block
+    // stale.
+    match recorded.filter(|digest| !digest.is_empty()) {
+        None => SourcesMatch::Unknown,
+        Some(recorded) if recorded == source_digest(sources) => SourcesMatch::Current,
+        Some(_) => SourcesMatch::Stale,
+    }
+}
+
+/// The README's per-block source verdicts, one line each.
+fn render_source_verdicts(verdicts: &[(String, SourcesMatch)]) -> String {
+    if verdicts.is_empty() {
+        return "    (this site has no backend blocks)".to_string();
+    }
+    verdicts
+        .iter()
+        .map(|(name, verdict)| format!("    {name}: {}", verdict.describe()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A `serde_json` failure encoding one of the bundle's own JSON files.

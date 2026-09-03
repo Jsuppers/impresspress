@@ -44,6 +44,13 @@ imports `seed/`, so it takes a few seconds; every load after that is instant.
         source under `seed/blocks/<name>/`. The source is included so this
         export can be edited and recompiled, not just run.
 
+        The compiled artifact comes from the generation that is live; the
+        source comes from the workspace as it stands, so the two can in
+        principle disagree — if a block was edited and not recompiled before
+        this export was taken. Per block, as checked at export time:
+
+{{BLOCK_SOURCES}}
+
     seed/data.json
         A snapshot of the data the sandbox held: products, offers and their
         components, product groups, types and presets, non-sensitive site

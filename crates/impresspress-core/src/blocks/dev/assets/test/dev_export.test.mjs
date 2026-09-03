@@ -151,6 +151,81 @@ test('a failed export reaches the agent as isError, never as a silent success', 
   assert.match(result.content[0].text, /^dev_export: /);
 });
 
+test('a second export cannot start while one is in flight', async () => {
+  // The archive request parks on this until the test releases it, which is
+  // the only way to observe the page mid-export — nothing else in the harness
+  // yields for long enough.
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const { handle, elements, fetchCalls, downloads } = instantiate({
+    exportManifest: MANIFEST,
+    exportGate: gate,
+    status: {
+      runtime_generation: 0,
+      blocks: [],
+      active_generation: { id: 'gen_1', cause: 'site_write', status: 'active' }
+    }
+  });
+  await settle();
+
+  const button = elements.get('dev-export');
+  // Enabled to begin with: something is published.
+  assert.equal(button.disabled, false);
+
+  const first = handle.exportSite();
+  await settle();
+
+  // An export reads the whole shell twice and builds a multi-megabyte archive
+  // in memory; a second one on top of it would do all that again for a
+  // download the browser is about to replace anyway.
+  assert.equal(handle.exportInFlight, true);
+  assert.equal(button.disabled, true);
+  assert.match(button.title, /in progress/i);
+
+  // A status poll landing mid-export must NOT re-enable the button — one
+  // owner decides, and it knows about both facts.
+  handle.updateExportButton();
+  assert.equal(button.disabled, true);
+
+  release();
+  await first;
+
+  assert.equal(handle.exportInFlight, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.title, '');
+  assert.equal(downloads.length, 1);
+  // One manifest request and one archive request, not two of each.
+  const exportCalls = fetchCalls
+    .map(([url]) => String(url))
+    .filter((url) => url.startsWith('/b/dev/api/export'));
+  assert.deepEqual(exportCalls, ['/b/dev/api/export/manifest', '/b/dev/api/export']);
+});
+
+test('a failed export gives the button back', async () => {
+  // The guard must be released on EVERY exit. A refusal that left the button
+  // disabled would take the feature away for the life of the page — a worse
+  // outcome than the refusal itself.
+  const { handle, elements } = instantiate({
+    exportManifest: MANIFEST,
+    exportZip: { status: 500, body: 'the static shell could not be read' },
+    status: {
+      runtime_generation: 0,
+      blocks: [],
+      active_generation: { id: 'gen_1', cause: 'site_write', status: 'active' }
+    }
+  });
+  await settle();
+
+  await assert.rejects(() => handle.exportSite());
+
+  assert.equal(handle.exportInFlight, false);
+  const button = elements.get('dev-export');
+  assert.equal(button.disabled, false);
+  assert.equal(button.title, '');
+});
+
 test('the Export button is disabled until a generation is live', async () => {
   // A fresh instance: the status carries no `active_generation`, and
   // `renderStatus` is what decides — the endpoint would answer 400.

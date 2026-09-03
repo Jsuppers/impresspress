@@ -48,6 +48,9 @@ const tail = fs.readFileSync(path.join(here, '..', 'dev.js'), 'utf8');
  *   what `/b/dev/api/export` answers with. The body is opaque to the page —
  *   it only ever calls `.blob()` on it — so a short string stands in for the
  *   archive.
+ * @param {Promise<void>|null} [options.exportGate]  when set, the archive
+ *   request parks on this promise, so a test can observe the page WHILE an
+ *   export is in flight.
  * @param {object|(() => object)} [options.status]  what `/b/dev/api/status`
  *   answers with — a `StatusResponse`. A function, for a test whose subject
  *   is what the page does when the answer CHANGES: the page polls it, and
@@ -93,7 +96,8 @@ export function instantiate({
   // care about the status wants: no `activation`, no `active_generation`.
   status = {},
   exportManifest = null,
-  exportZip = { status: 200, body: 'PK\u0003\u0004zip' }
+  exportZip = { status: 200, body: 'PK\u0003\u0004zip' },
+  exportGate = null
 } = {}) {
   // Everything `exportSite` handed the browser: one entry per download it
   // started, with the anchor's `download` name and the object URL it built.
@@ -287,6 +291,18 @@ export function instantiate({
       }
       if (url === '/b/dev/api/export') {
         const { status: code = 200, body = '' } = exportZip;
+        // `exportGate`, when given, holds the archive request open so a test
+        // can observe what the page looks like WHILE an export is running —
+        // the only way to see the in-flight guard, since nothing else in this
+        // harness yields.
+        if (exportGate) {
+          return exportGate.then(() => ({
+            ok: code < 400,
+            status: code,
+            text: async () => body,
+            blob: async () => ({ size: body.length, type: 'application/zip' })
+          }));
+        }
         return Promise.resolve({
           ok: code < 400,
           status: code,
@@ -353,6 +369,8 @@ return {
   snapshotBlock,
   compileBlock,
   exportSite,
+  updateExportButton,
+  get exportInFlight() { return exportInFlight },
   get compilerManifest() { return compilerManifest }
 };`
   );

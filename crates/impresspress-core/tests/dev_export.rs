@@ -403,9 +403,15 @@ async fn a_shell_that_cannot_be_listed_is_refused() {
     assert_eq!(status, 500);
 }
 
-/// Two exports of one generation are byte-identical: `ZipWriter` fixes every
-/// timestamp and `assemble` fixes the entry order, so an export is a function
-/// of what is live rather than of when it ran.
+/// Two exports of one generation are byte-identical — the WHOLE archive,
+/// README included.
+///
+/// `ZipWriter` fixes every entry's timestamp, `assemble` fixes the entry
+/// order, and the README is dated from the ACTIVE GENERATION's `created_at`
+/// rather than the wall clock. That last one is the point: an export is a
+/// function of what is live, and a README carrying the download's own
+/// timestamp would have made the one entry that differs between two otherwise
+/// identical exports the one entry nobody diffing them cares about.
 #[tokio::test]
 async fn two_exports_of_the_same_generation_are_identical() {
     let control = FakeControl::new();
@@ -420,15 +426,263 @@ async fn two_exports_of_the_same_generation_are_identical() {
             .await,
     )
     .await;
-    // The README carries the wall-clock date, which is the one thing that can
-    // legitimately differ between two runs — compare everything else.
-    let (mut a, mut b) = (entries(first), entries(second));
-    a.remove("README.md");
-    b.remove("README.md");
-    assert_eq!(sorted(&a), sorted(&b));
-    for (path, bytes) in &a {
-        assert_eq!(b.get(path), Some(bytes), "{path} differs between exports");
-    }
+    assert_eq!(
+        first, second,
+        "two exports of one generation must be identical, README included"
+    );
+}
+
+/// And the date the README carries is the generation's own, so it says when
+/// the site came to be rather than when someone pressed the button.
+#[tokio::test]
+async fn the_readme_is_dated_by_the_generation_not_the_download() {
+    let control = FakeControl::new();
+    let ctx = shop_instance(&control).await;
+    let archive = entries(
+        output_body(
+            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                .await,
+        )
+        .await,
+    );
+    let status = output_json(
+        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/status"))
+            .await,
+    )
+    .await;
+    let created_at = status["active_generation"]["created_at"]
+        .as_str()
+        .expect("created_at")
+        .to_string();
+    assert!(
+        text(&archive, "README.md").contains(&created_at),
+        "the README must carry the generation's own timestamp"
+    );
+}
+
+/// The exported `sw.js` keeps `/seed/` on the bypass list — without it the
+/// folder could never import the seed shipped beside it — and DROPS the
+/// compiler's, because the export copies none of those assets. A bypass for a
+/// tree that is not there waves every request under the prefix past the
+/// runtime to a 404 from the static host.
+#[tokio::test]
+async fn the_exported_sw_drops_the_compiler_bypass_and_keeps_the_seed_one() {
+    let control = FakeControl::new();
+    let ctx = shop_instance(&control).await;
+    let archive = entries(
+        output_body(
+            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                .await,
+        )
+        .await,
+    );
+    let sw = text(&archive, "sw.js");
+
+    assert!(
+        !sw.contains("__impresspress_dev"),
+        "the compiler bypass must be gone; {sw}"
+    );
+    assert!(sw.contains("url.pathname.startsWith('/seed/')"), "{sw}");
+    // Only that one clause: the app's other bypasses are untouched, and the
+    // expression still reads the way the bundler would have rendered it for a
+    // bundle that never asked for the compiler.
+    assert!(sw.contains("url.pathname.startsWith('/sql-')"), "{sw}");
+    assert!(
+        sw.contains(
+            "if (url.pathname.startsWith('/sql-') || url.pathname.startsWith('/seed/')) \
+             { return; }"
+        ),
+        "the remaining expression must be exactly what a compiler-less bundle renders; {sw}"
+    );
+}
+
+/// A shell with no compiler bypass to begin with is left alone — CI's
+/// foundations bundle ships no compiler, and its absence is an ordinary
+/// build rather than a mismatched one.
+#[tokio::test]
+async fn a_shell_with_no_compiler_bypass_is_exported_unchanged() {
+    let control = FakeControl::new();
+    control.set_validated_info(hello_info());
+    let plain_sw = "const DEV_ENABLED = true;\n\
+                    if (url.pathname.startsWith('/seed/')) { return; }\n";
+    let shell = FakeShell::new().with("sw.js", plain_sw.as_bytes());
+    let ctx = TestContext::with_admin()
+        .await
+        .with_dev_added_and_shell(control, std::sync::Arc::new(shell))
+        .await;
+    dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/index.html", "content": "x", "expected_sha256": null}),
+    )
+    .await;
+
+    let archive = entries(
+        output_body(
+            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                .await,
+        )
+        .await,
+    );
+    assert_eq!(
+        text(&archive, "sw.js"),
+        plain_sw.replace("= true;", "= false;"),
+        "only the dev flag may change on a shell with no compiler bypass"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Source provenance
+// ---------------------------------------------------------------------------
+
+/// The artifact comes from the live generation and the sources come from the
+/// workspace as it stands, so the two CAN disagree — an agent that edited
+/// `blocks/hello/src/lib.rs` and did not recompile leaves an export whose
+/// `.wasm` and `src/` describe different programs. The README says which,
+/// per block, so it is never silent.
+#[tokio::test]
+async fn the_readme_says_whether_each_blocks_sources_match_its_artifact() {
+    let control = FakeControl::new();
+    let ctx = shop_instance(&control).await;
+
+    // `shop_instance` staged without a `source_manifest_sha256`, so the build
+    // row records none and the verdict is honestly "unknown" rather than a
+    // guess in either direction.
+    let archive = entries(
+        output_body(
+            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                .await,
+        )
+        .await,
+    );
+    let readme = text(&archive, "README.md");
+    assert!(
+        readme.contains("site/hello: no source digest recorded"),
+        "{readme}"
+    );
+}
+
+/// And when the compile DID record a digest, the verdict is a real
+/// comparison: matching sources read "current", and one edited byte reads
+/// "SOURCES DIFFER".
+#[tokio::test]
+async fn a_recorded_source_digest_is_compared_against_the_workspace() {
+    let control = FakeControl::new();
+    control.set_validated_info(hello_info());
+    let ctx = TestContext::with_admin()
+        .await
+        .with_dev_added_and_shell(control.clone(), std::sync::Arc::new(FakeShell::new()))
+        .await;
+    dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/index.html", "content": "<h1>shop</h1>", "expected_sha256": null}),
+    )
+    .await;
+    dev_post(
+        &ctx,
+        "/b/dev/api/blocks",
+        json!({"name": "hello", "template": "hello"}),
+    )
+    .await;
+
+    // The digest the page computes: sorted `"<crate-relative path>\0<sha>\n"`
+    // lines over the block's sources, exactly as `dev.js`'s `snapshotBlock`
+    // builds it. Restated here rather than reached for, because the whole
+    // point of the check is that two independent computations of it agree.
+    let listed = output_json(
+        ctx.dispatch({
+            let mut msg = admin_msg("retrieve", "/b/dev/api/files");
+            msg.set_meta("req.query.prefix", "blocks/hello/");
+            msg
+        })
+        .await,
+    )
+    .await;
+    let mut lines: Vec<String> = listed["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| {
+            format!(
+                "{}\0{}\n",
+                f["path"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("blocks/hello/"),
+                f["sha256"].as_str().unwrap()
+            )
+        })
+        .collect();
+    lines.sort();
+    let digest = impresspress_core::blocks::dev::blobs::sha256_hex(lines.concat().as_bytes());
+
+    let staged = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/builds/stage",
+            json!({
+                "block_name": "hello",
+                "artifact_base64": b64(ARTIFACT),
+                "source_manifest_sha256": digest,
+                "compiler_version": "t",
+                "diagnostics": [],
+                "wafer_guest_version": 1,
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(staged["success"], true, "{staged}");
+
+    let readme = text(
+        &entries(
+            output_body(
+                ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                    .await,
+            )
+            .await,
+        ),
+        "README.md",
+    );
+    assert!(
+        readme.contains("site/hello: sources match the compiled artifact"),
+        "{readme}"
+    );
+
+    // Now edit a source without recompiling. The artifact in the generation is
+    // unchanged; the workspace is not.
+    let read = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "blocks/hello/src/lib.rs"}),
+        )
+        .await,
+    )
+    .await;
+    dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({
+            "path": "blocks/hello/src/lib.rs",
+            "content": format!("{}\n// edited\n", read["content"].as_str().unwrap()),
+            "expected_sha256": read["sha256"],
+        }),
+    )
+    .await;
+
+    let readme = text(
+        &entries(
+            output_body(
+                ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                    .await,
+            )
+            .await,
+        ),
+        "README.md",
+    );
+    assert!(readme.contains("site/hello: SOURCES DIFFER"), "{readme}");
 }
 
 // ---------------------------------------------------------------------------

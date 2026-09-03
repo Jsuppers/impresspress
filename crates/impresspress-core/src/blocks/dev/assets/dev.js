@@ -206,13 +206,10 @@ function renderStatus(status) {
     log('live generation: ' + (activeId || 'none'));
     lastActiveGeneration = activeId;
   }
-  // The Export button's one condition, decided here because this is where
-  // the page learns it: an export is a snapshot of the LIVE generation, and
-  // there is nothing to snapshot until something has been published. The
-  // endpoint says the same thing with a 400; the button says it without
-  // making anyone click to find out.
-  exportButton.disabled = activeId === null;
-  exportButton.title = activeId === null ? 'Nothing published yet — write a site file first' : '';
+  // One of the two facts the Export button's state is decided from — the
+  // other is whether an export is already running. `updateExportButton` is
+  // the only writer of either; see it for why.
+  updateExportButton();
 }
 
 var polling = null;
@@ -1461,6 +1458,45 @@ Only one compile runs at a time.',
 // bottom of this file — after every line of it, including this one.
 var exportButton = document.getElementById('dev-export');
 
+// Whether an export is running right now.
+//
+// An export reads the whole runtime shell twice and builds a multi-megabyte
+// archive in memory; a second one started on top of the first would do all of
+// that again for a download the browser is about to replace anyway. The
+// button is therefore taken away for the duration.
+var exportInFlight = false;
+
+// Whether Export can be pressed, and why not when it cannot.
+//
+// TWO facts, arriving from different places and in no fixed order — is
+// anything published (from `renderStatus`, which polls) and is an export
+// already running (from `exportSite`) — so this is the single owner of the
+// button's state, exactly as `updateCompileButton` is for Compile. Two call
+// sites each setting `disabled` would race, and whichever landed second would
+// win regardless of what it knew: a status poll landing mid-export would
+// re-enable the button under the running call.
+//
+// A disabled button with a reason on it, rather than an enabled one that
+// explains itself after the click: the page already knows.
+function updateExportButton() {
+  if (exportInFlight) {
+    exportButton.disabled = true;
+    exportButton.title = 'Export in progress…';
+    return;
+  }
+  // An export is a snapshot of the LIVE generation, and there is nothing to
+  // snapshot until something has been published. The endpoint says the same
+  // thing with a 400; the button says it without making anyone click to find
+  // out.
+  if (lastActiveGeneration === null) {
+    exportButton.disabled = true;
+    exportButton.title = 'Nothing published yet — write a site file first';
+    return;
+  }
+  exportButton.disabled = false;
+  exportButton.title = '';
+}
+
 // How long the object URL is kept alive after the click.
 //
 // Revoking it immediately is the classic bug: `a.click()` starts the download
@@ -1478,35 +1514,47 @@ var OBJECT_URL_TTL_MS = 60000;
 // without a second call. It is a summary of the very entry list the archive
 // is built from (`blocks/dev/export.rs`), so the two cannot disagree.
 async function exportSite() {
-  var manifest = await json(await api.get('/b/dev/api/export/manifest'));
-  var response = await api.get('/b/dev/api/export');
-  if (!response.ok) {
-    throw new Error('export failed: HTTP ' + response.status + ': ' + (await response.text()));
+  // Guarded on EVERY exit, including the failures — a refused export that
+  // left the button disabled would take the feature away for the life of the
+  // page, which is a worse outcome than the refusal itself. The flag is set
+  // before the first await so two calls that start in the same turn cannot
+  // both get past it.
+  exportInFlight = true;
+  updateExportButton();
+  try {
+    var manifest = await json(await api.get('/b/dev/api/export/manifest'));
+    var response = await api.get('/b/dev/api/export');
+    if (!response.ok) {
+      throw new Error('export failed: HTTP ' + response.status + ': ' + (await response.text()));
+    }
+    var blob = await response.blob();
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = 'impresspress-site-' + manifest.generation_id.slice(0, 8) + '.zip';
+    // Appended to the document before the click and removed after: a detached
+    // anchor's `click()` is honoured by Chromium but not by every engine, and
+    // this is the one line that makes the download work everywhere.
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () {
+      URL.revokeObjectURL(url);
+    }, OBJECT_URL_TTL_MS);
+    log(
+      'exported generation ' +
+        manifest.generation_id.slice(0, 8) +
+        ' — ' +
+        manifest.files.length +
+        ' files, ' +
+        (manifest.total_bytes / 1048576).toFixed(1) +
+        ' MiB'
+    );
+    return manifest;
+  } finally {
+    exportInFlight = false;
+    updateExportButton();
   }
-  var blob = await response.blob();
-  var url = URL.createObjectURL(blob);
-  var link = document.createElement('a');
-  link.href = url;
-  link.download = 'impresspress-site-' + manifest.generation_id.slice(0, 8) + '.zip';
-  // Appended to the document before the click and removed after: a detached
-  // anchor's `click()` is honoured by Chromium but not by every engine, and
-  // this is the one line that makes the download work everywhere.
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(function () {
-    URL.revokeObjectURL(url);
-  }, OBJECT_URL_TTL_MS);
-  log(
-    'exported generation ' +
-      manifest.generation_id.slice(0, 8) +
-      ' — ' +
-      manifest.files.length +
-      ' files, ' +
-      (manifest.total_bytes / 1048576).toFixed(1) +
-      ' MiB'
-  );
-  return manifest;
 }
 
 function registerExportTool() {
