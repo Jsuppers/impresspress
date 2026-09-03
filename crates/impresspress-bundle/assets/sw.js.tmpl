@@ -1,6 +1,20 @@
 // @generated build: __BUILD_ID__ — Service Worker that runs Impresspress via WASM
 import init, { initialize, handle_request } from '__WASM_JS__';
 
+// Whether this bundle carries the browser development sandbox, rendered from
+// `[dev] enabled` at BUILD time (`impresspress-bundle`'s `DEV_ENABLED` var).
+//
+// ONE constant, read by BOTH places the flag decides something: the
+// `initialize({ dev: DEV_ENABLED })` below, and the isolation-header
+// passthrough in the fetch handler. It used to be the placeholder itself
+// substituted at both sites, which meant a shipped `sw.js` stated the same
+// fact twice — and the dev sandbox's export (`blocks/dev/export.rs`), which
+// ships the runtime shell with the sandbox turned OFF, then had to find and
+// rewrite two different renderings and assert both. One line, one rewrite,
+// one assertion: `const DEV_ENABLED = true;` → `const DEV_ENABLED = false;`
+// is the whole of turning a dev bundle into a plain one.
+const DEV_ENABLED = __DEV_ENABLED__;
+
 let initialized = false;
 let initPromise = null;
 // Set after a fatal wasm error (init failure or runtime trap). A poisoned SW
@@ -53,7 +67,7 @@ async function ensureInitialized() {
         }
         console.log('[__APP_NAME__] Initializing runtime...');
         try {
-            await initialize({ dev: __DEV_ENABLED__ });
+            await initialize({ dev: DEV_ENABLED });
         } catch (e) {
             await selfDestruct(`runtime initialize() failed: ${e}`);
             throw e;
@@ -205,14 +219,16 @@ self.addEventListener('fetch', (event) => {
         // from inside the worker being replaced is how an update check gets a
         // stale script.
         //
-        // The condition below is rendered from `[dev] enabled` at BUILD time
-        // (`impresspress-bundle`'s `DEV_ENABLED` var, the same one
-        // `initialize()` reads above), so a shipped `sw.js` reads either
-        // `if (true && …)` or `if (false && …)` — the difference is visible in
-        // the file rather than decided at runtime, and a non-dev bundle keeps
-        // the plain early return it always had.
+        // The condition below reads `DEV_ENABLED`, the single build-time
+        // constant declared at the top of this file (the same one
+        // `initialize()` is passed), so the difference between a dev bundle
+        // and a plain one is visible in ONE line of the shipped file rather
+        // than decided at runtime — and a non-dev bundle keeps the plain
+        // early return it always had. Flipping that one line is also exactly
+        // what the sandbox's export rewrites to ship the shell with the
+        // sandbox off (`blocks/dev/export.rs`).
         // ------------------------------------------------------------------
-        if (__DEV_ENABLED__ && url.pathname !== '/sw.js') {
+        if (DEV_ENABLED && url.pathname !== '/sw.js') {
             event.respondWith(passthrough(event.request));
         }
         return;

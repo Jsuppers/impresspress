@@ -98,6 +98,67 @@ fn end_to_end_renames_rewrites_and_templates() {
     assert!(!glue.contains("'app_bg.wasm'"));
 }
 
+/// `files` is the whole shell, and it is what the development sandbox's
+/// export copies into the bundle it hands the user. Three properties have to
+/// hold, and each has a way of failing silently:
+///
+///  * the RENDERED templates are listed, not the `*.tmpl` inputs — a listing
+///    taken before rendering would name three files that no longer exist and
+///    omit the three a browser actually loads;
+///  * the hashed wasm-pack pair is listed under the names it was RENAMED to,
+///    since the un-hashed originals are gone by then;
+///  * nested directories are walked, `/`-separated and sorted — the
+///    wasm-bindgen `snippets/` tree lives one level down and a shell missing
+///    it cannot load its own module.
+#[test]
+fn the_manifest_lists_every_file_of_the_rendered_shell() {
+    let tmp = pkg_copy();
+    std::fs::create_dir_all(tmp.path().join("snippets/inner")).unwrap();
+    std::fs::write(tmp.path().join("snippets/inner/glue.js"), "export {};").unwrap();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let body = fs::read_to_string(tmp.path().join("asset-manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let files: Vec<String> = manifest["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    assert!(files.contains(&"sw.js".to_string()), "{files:?}");
+    assert!(files.contains(&"index.html".to_string()), "{files:?}");
+    assert!(
+        files.contains(&"snippets/inner/glue.js".to_string()),
+        "the walk must recurse; {files:?}"
+    );
+    assert!(
+        files.contains(&"asset-manifest.json".to_string()),
+        "the manifest names itself, so copying every listed file copies the \
+         whole shell; {files:?}"
+    );
+    // The inputs, not the outputs: `render_if_exists` deletes each template
+    // it renders, and anything still ending in `.tmpl` is bundler input.
+    assert!(!files.iter().any(|f| f.ends_with(".tmpl")), "{files:?}");
+    // The hashed pair, under the names the rename produced.
+    assert!(
+        files
+            .iter()
+            .any(|f| f.starts_with("app-") && f.ends_with(".js")),
+        "{files:?}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.starts_with("app_bg-") && f.ends_with(".wasm")),
+        "{files:?}"
+    );
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(files, sorted, "the listing must be sorted");
+}
+
 #[test]
 fn deterministic_across_runs() {
     let tmp1 = pkg_copy();
@@ -155,9 +216,16 @@ fn sw_passes_the_dev_flag_to_initialize() {
     run(tmp.path(), tmp.path(), app).expect("bundler ok");
 
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    // ONE rendered constant, read by `initialize()` and by the passthrough
+    // branch alike — see `sw.js.tmpl`'s header for why the flag is stated
+    // once rather than substituted at each use.
     assert!(
-        sw.contains("initialize({ dev: true })"),
+        sw.contains("const DEV_ENABLED = true;"),
         "sw.js did not receive the dev flag; sw.js = {sw}"
+    );
+    assert!(
+        sw.contains("initialize({ dev: DEV_ENABLED })"),
+        "initialize() must read the one constant; sw.js = {sw}"
     );
 }
 
@@ -171,7 +239,11 @@ fn sw_defaults_the_dev_flag_to_false() {
     // The sandbox is off unless a bundle asks for it: an app that never sets
     // `[dev] enabled` must ship a service worker that boots the runtime with
     // the flag explicitly false, not merely absent.
-    assert!(sw.contains("initialize({ dev: false })"), "sw.js = {sw}");
+    assert!(sw.contains("const DEV_ENABLED = false;"), "sw.js = {sw}");
+    assert!(
+        sw.contains("initialize({ dev: DEV_ENABLED })"),
+        "initialize() must read the one constant; sw.js = {sw}"
+    );
     assert!(
         !sw.contains("__DEV_ENABLED__"),
         "placeholder not substituted in sw.js"
@@ -235,9 +307,12 @@ fn a_dev_bundle_adds_the_isolation_headers_to_bypassed_responses() {
     run(tmp.path(), tmp.path(), app).expect("bundler ok");
 
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
-    // Rendered from the build-time flag, not decided at runtime.
+    // Gated on the one build-time constant, not decided at runtime — the
+    // same constant `initialize()` is passed, so a bundle cannot be dev in
+    // one half of this file and not in the other.
     assert!(
-        sw.contains("if (true && url.pathname !== '/sw.js') {"),
+        sw.contains("const DEV_ENABLED = true;")
+            && sw.contains("if (DEV_ENABLED && url.pathname !== '/sw.js') {"),
         "the dev rendering must take the passthrough branch; sw.js = {sw}"
     );
     assert!(
@@ -280,7 +355,8 @@ fn a_non_dev_bundle_leaves_bypassed_responses_to_the_network() {
 
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
     assert!(
-        sw.contains("if (false && url.pathname !== '/sw.js') {"),
+        sw.contains("const DEV_ENABLED = false;")
+            && sw.contains("if (DEV_ENABLED && url.pathname !== '/sw.js') {"),
         "the non-dev rendering must not take the passthrough branch; sw.js = {sw}"
     );
     // The early return is still the last statement of the bypass branch.
