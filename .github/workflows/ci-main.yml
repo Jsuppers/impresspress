@@ -370,7 +370,7 @@ jobs:
         env:
           TEST_PORT: 8082
           PROOF_GUEST_WASM: ${{ github.workspace }}/experiments/browser-service-worker-blocks/guest/target/wasm32-wasip1/release/browser_compiled_wafer_block.wasm
-        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts
+        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts
 
       - name: Stop server
         if: always()

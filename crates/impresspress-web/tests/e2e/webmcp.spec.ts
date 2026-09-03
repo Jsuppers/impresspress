@@ -1,7 +1,9 @@
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext } from '@playwright/test';
 import { ADMIN_STATE_PATH } from './fixtures/auth';
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from './fixtures/global-setup';
 import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
+import { SHOP_OFFER, uniqueShopProduct } from './fixtures/shop-fixture';
+import { execute, registeredTools } from './fixtures/webmcp-helpers';
 
 /**
  * WebMCP end-to-end against the real native server (visual-baseline config:
@@ -16,19 +18,6 @@ import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
  * browser and a human (plan 3, task 5).
  */
 
-type ToolRecord = {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  outputSchema?: Record<string, unknown>;
-};
-
-type ToolResult = {
-  isError?: boolean;
-  content: Array<{ type: string; text: string }>;
-  structuredContent?: Record<string, unknown>;
-};
-
 const PUBLIC_TOOLS = [
   'get_storefront_config',
   'list_products',
@@ -40,29 +29,6 @@ const PUBLIC_TOOLS = [
 
 /** Admin-tier read tools. Must never appear below the Admin tier. */
 const ADMIN_TOOLS = ['list_users', 'list_roles', 'get_site_settings', 'list_audit_log'];
-
-async function registeredTools(page: Page, atLeast: number): Promise<ToolRecord[]> {
-  await page.waitForFunction(
-    (n) => (document as unknown as { modelContext: { __tools(): unknown[] } }).modelContext.__tools().length >= n,
-    atLeast,
-    { timeout: 15_000 },
-  );
-  return page.evaluate(
-    () => (document as unknown as { modelContext: { __tools(): ToolRecord[] } }).modelContext.__tools(),
-  );
-}
-
-async function execute(page: Page, name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  return page.evaluate(
-    ([toolName, toolArgs]) =>
-      (
-        document as unknown as {
-          modelContext: { __execute(n: string, a: unknown): Promise<ToolResult> };
-        }
-      ).modelContext.__execute(toolName as string, toolArgs),
-    [name, args] as const,
-  );
-}
 
 test('refresh() re-registers the manifest without disturbing a tool it does not own', async ({ page }) => {
   // `refresh()` tracks and re-registers exactly the names webmcp.js itself
@@ -130,9 +96,11 @@ async function adminBearer(request: APIRequestContext): Promise<string> {
 }
 
 /**
- * One product with one published, component-priced offer: `pages` (integer)
- * at 1500 minor units per page. Unique slug per run so re-running against the
- * same database never collides.
+ * One product with one published, component-priced offer — the shared
+ * `fixtures/shop-fixture.ts` payload, which `dev-workspace.spec.ts` creates
+ * through the `shop_*` tools instead. `uniqueShopProduct` gives it a
+ * per-run-unique slug so re-running against the same database never collides,
+ * and makes it `active` so the Public tools below can see it.
  */
 async function seedProductWithOffer(
   request: APIRequestContext,
@@ -142,14 +110,7 @@ async function seedProductWithOffer(
 
   const productRes = await request.post('/b/products/api/admin/products', {
     headers: auth,
-    data: {
-      name: `WebMCP e2e print ${stamp}`,
-      slug: `webmcp-e2e-print-${stamp}`,
-      description: 'Seeded by webmcp.spec.ts',
-      currency: 'nzd',
-      status: 'active',
-      fulfillment_kind: 'manual',
-    },
+    data: uniqueShopProduct(stamp),
   });
   expect(productRes.status(), await productRes.text()).toBe(200);
   const productBody = (await productRes.json()) as { id?: string; data?: { id?: string } };
@@ -158,37 +119,7 @@ async function seedProductWithOffer(
 
   const offerRes = await request.post(`/b/products/api/admin/products/${productId}/offers`, {
     headers: auth,
-    data: {
-      name: 'Custom print',
-      mode: 'payment',
-      currency: 'nzd',
-      pricing_model: 'components',
-      usage_type: 'licensed',
-      billing_scheme: 'per_unit',
-      tax_behavior: 'exclusive',
-      variables: [
-        {
-          key: 'pages',
-          kind: 'integer',
-          label: 'Pages',
-          required: true,
-          minimum: '1',
-          maximum: '20',
-          step: '1',
-          sort_order: 0,
-        },
-      ],
-      components: [
-        {
-          key: 'pages',
-          label: 'Printed pages',
-          sort_order: 0,
-          required: true,
-          amount: { type: 'per_unit', input: 'pages', unit_amount_minor: 1500 },
-        },
-      ],
-      checkout: {},
-    },
+    data: SHOP_OFFER,
   });
   expect(offerRes.status(), await offerRes.text()).toBe(200);
   const offerBody = (await offerRes.json()) as { offer?: { id?: string }; id?: string };

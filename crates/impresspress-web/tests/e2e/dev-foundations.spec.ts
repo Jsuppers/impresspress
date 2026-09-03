@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { bootServiceWorker, WELCOME_PHRASE } from './fixtures/dev-sandbox';
 
 /**
  * Plan 1 checkpoint for the browser development sandbox.
@@ -97,14 +98,6 @@ const PATCHED_B64 = Buffer.from(
 const GUEST_GREETING = 'Hello from a browser-compiled WAFER block!';
 
 /**
- * A stable phrase from the real welcome page
- * (`examples/dev-sandbox/seed/site/index.html`) — the "Open workspace" link
- * text, present on every render regardless of copy edits elsewhere on the
- * page.
- */
-const WELCOME_PHRASE = 'Open workspace';
-
-/**
  * SHA-256 of `seed/site/index.html`, read from `examples/dev-sandbox/seed/
  * manifest.json` at test time rather than pinned here — it is what the
  * *first* write has to send as `expected_sha256`: the seed already published
@@ -123,48 +116,6 @@ if (!seedIndexHtml) {
   throw new Error(`${seedManifestPath} has no "index.html" entry in "site"`);
 }
 const SEED_SHA256 = seedIndexHtml.sha256;
-
-/**
- * Load `/` and wait until the service worker is serving it.
- *
- * The first load of an origin gets the static boot shell: `loader.js`
- * registers `sw.js`, the worker claims the page and the loader reloads, and
- * only the *second* document comes from the wasm runtime. The worker
- * initialises lazily on its first fetch, so by the time it controls a page it
- * has already run `initialize()` — wasm boot, migrations, seed import and
- * boot convergence included.
- *
- * Deliberately a *neutral* signal, not "the page renders X": what `/` serves
- * is itself under test below, and a boot helper that asserted it would abort
- * every test on one defect instead of reporting each on its own line.
- *
- * `waitUntil: 'commit'` for the same reason `smoke.spec.ts` uses it — the boot
- * shell pulls `/webllm-engine.js` and `/embed-engine.js` as modules, and
- * neither `load` nor `domcontentloaded` fires promptly behind them.
- */
-async function bootServiceWorker(page: Page) {
-  await page.goto('/', { waitUntil: 'commit' });
-  await page.waitForFunction(() => navigator.serviceWorker.controller !== null, null, {
-    timeout: 120_000,
-  });
-  // `controller !== null` says a worker claimed the page; it does not say the
-  // worker has finished `initialize()`, because `sw.js` initialises lazily on
-  // its first fetch. One round trip through a route only the runtime can
-  // answer (the static host would 404 it) is what makes the wait mean "the
-  // sandbox is up" — and it is what the timings printed below measure.
-  await page.waitForFunction(async () => (await fetch('/b/auth/login')).status === 200, null, {
-    timeout: 120_000,
-  });
-  // …and wait for the boot shell to be replaced. `loader.js` reloads the page
-  // once the worker controls it, on a `setTimeout(…, 0)` this function cannot
-  // see; navigating on top of that pending reload is the
-  // `net::ERR_ABORTED at /` a caller would otherwise hit. `#status` is the
-  // shell's own progress line (`index.html.tmpl`) and exists on no page the
-  // runtime serves, so its absence means the reload has landed.
-  await page.waitForFunction(() => document.getElementById('status') === null, null, {
-    timeout: 120_000,
-  });
-}
 
 /** Sign in as the seeded admin and land anywhere but the login page. */
 async function loginAdmin(page: Page) {
