@@ -574,6 +574,11 @@ jobs:
     name: E2E dev sandbox (browser WASM + wasmi guest)
     needs: build-wasm
     runs-on: ubuntu-latest
+    # The e2e itself is a few minutes. The ceiling is for the case where
+    # neither the release asset nor the cache is there and this job composes
+    # the toolchain: the same reasoning as `e2e-dev-compile`, which carried a
+    # budget while this one — running the identical step — did not.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -638,21 +643,38 @@ jobs:
       # every dev-sandbox bundle, so `build.sh` builds it when it is missing —
       # which is the ~55 minute, 12.6 GB composition that would OOM this runner.
       # `dev-compiler.spec.ts` and `dev-compile-tool.spec.ts` both read the
-      # manifest it produces, too. Same key as `e2e-dev-compile`, so the two
-      # jobs share one cache entry; see that job for why there are no
-      # `restore-keys` and what `--fast` costs.
+      # manifest it produces, too. Same key as `e2e-dev-compile`, which `needs`
+      # this job so the two never compose in parallel and race to upload one
+      # entry; see that job for why there are no `restore-keys` and what
+      # `--fast` costs. Skipped entirely when the release asset was fetched:
+      # that tree is the same for every job and needs no cache.
+      # The optimized tree the developer published for this pin, and the only
+      # source of one: composing it costs ~35 minutes and 12.6 GB of RSS, which
+      # this runner does not have. `continue-on-error` because a branch that
+      # has moved `PIN.json` has no asset yet, and this job only needs to know
+      # whether the compiler still WORKS — the cache and the `--fast`
+      # composition below are what make such a branch testable. The DEPLOY
+      # workflow runs the same script without a fallback.
+      - name: Fetch the published compiler dist
+        id: compiler-fetch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: examples/dev-sandbox/compiler/fetch-dist.sh
+
       - name: Cache the packaged compiler
         id: compiler-dist
+        if: steps.compiler-fetch.outcome != 'success'
         uses: actions/cache@v4
         with:
           path: examples/dev-sandbox/compiler/dist
-          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package-lock.json') }}
+          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package.json', 'examples/dev-sandbox/compiler/package-lock.json', 'examples/dev-sandbox/compiler/tsconfig.json', 'examples/dev-sandbox/compiler/vite.config.ts', 'examples/dev-sandbox/compiler/build-compiler.sh') }}
 
       - name: Allow a --fast compiler tree in this job only
         run: echo "IMPRESSPRESS_COMPILER_ALLOW_FAST=1" >> "$GITHUB_ENV"
 
-      - name: Build the packaged compiler (cache miss only, unoptimized)
-        if: steps.compiler-dist.outputs.cache-hit != 'true'
+      - name: Build the packaged compiler (no asset and no cache, unoptimized)
+        if: steps.compiler-fetch.outcome != 'success' && steps.compiler-dist.outputs.cache-hit != 'true'
         run: examples/dev-sandbox/compiler/build-compiler.sh --fast
 
       # `--check` fails fast on a seed/manifest.json that has drifted from
@@ -727,7 +749,13 @@ jobs:
     name: E2E dev sandbox (Rubrc compiles a block in the browser)
     # The same wasm this repo's other browser jobs run against — the sandbox
     # bundle is built from `pkg/` the way `e2e-dev-sandbox` builds it.
-    needs: build-wasm
+    #
+    # `e2e-dev-sandbox` as well, and not for its result: the two jobs share one
+    # compiler cache key, so on a cold cache they would otherwise compose the
+    # toolchain twice in parallel and one of the two uploads would lose the
+    # race with a warning. Serialised, the first job seeds the entry and this
+    # one restores it.
+    needs: [build-wasm, e2e-dev-sandbox]
     runs-on: ubuntu-latest
     # The e2e itself is ~2-4 minutes. The ceiling is for the cache miss below:
     # composing the toolchain is the slow phase, and a job that gets killed at
@@ -784,17 +812,36 @@ jobs:
           node-version: 22
 
       # `compiler/dist/` is ~72 MB of packaged toolchain and is fully
-      # determined by the four inputs in this key: the pin (rubrc's commit,
-      # the composer, Binaryen, the sysroot), the worker sources bundled
-      # against it, the packaging scripts, and the lockfile that pins vite and
-      # bun. No `restore-keys`: a near-miss restore would be a tree built from
-      # a different pin, and the only honest thing to do with it is rebuild.
+      # determined by the inputs in this key: the pin (rubrc's commit, the
+      # composer, Binaryen, the sysroot), the worker sources bundled against
+      # it, the packaging scripts, `build-compiler.sh` itself, and everything
+      # that decides what vite emits and what it is called — `vite.config.ts`,
+      # `tsconfig.json`, `package.json` and the lockfile that pins vite and
+      # bun. A key missing any of those restores a stale tree that both e2e
+      # jobs then test while reporting green. No `restore-keys`: a near-miss
+      # restore would be a tree built from a different pin, and the only
+      # honest thing to do with it is rebuild.
+      # The optimized tree the developer published for this pin, and the only
+      # source of one: composing it costs ~35 minutes and 12.6 GB of RSS, which
+      # this runner does not have. `continue-on-error` because a branch that
+      # has moved `PIN.json` has no asset yet, and this job only needs to know
+      # whether the compiler still WORKS — the cache and the `--fast`
+      # composition below are what make such a branch testable. The DEPLOY
+      # workflow runs the same script without a fallback.
+      - name: Fetch the published compiler dist
+        id: compiler-fetch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: examples/dev-sandbox/compiler/fetch-dist.sh
+
       - name: Cache the packaged compiler
         id: compiler-dist
+        if: steps.compiler-fetch.outcome != 'success'
         uses: actions/cache@v4
         with:
           path: examples/dev-sandbox/compiler/dist
-          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package-lock.json') }}
+          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package.json', 'examples/dev-sandbox/compiler/package-lock.json', 'examples/dev-sandbox/compiler/tsconfig.json', 'examples/dev-sandbox/compiler/vite.config.ts', 'examples/dev-sandbox/compiler/build-compiler.sh') }}
 
       # This job — and ONLY this job — may run against a component composed
       # without `wasm-opt`. `verify-compiler-assets.mjs` refuses a `--fast`
@@ -819,8 +866,8 @@ jobs:
       # `npm ci`, the sha256-checked `wasi_virt_layer-cli` and Binaryen
       # releases, `wasm32-wasip1-threads` on both toolchains and a nightly with
       # `rust-src`), so there is nothing to add here beyond node and rustup.
-      - name: Build the packaged compiler (cache miss only, unoptimized)
-        if: steps.compiler-dist.outputs.cache-hit != 'true'
+      - name: Build the packaged compiler (no asset and no cache, unoptimized)
+        if: steps.compiler-fetch.outcome != 'success' && steps.compiler-dist.outputs.cache-hit != 'true'
         run: examples/dev-sandbox/compiler/build-compiler.sh --fast
 
       # Both halves of `--check`: the seed manifest, and the compiler tree —
