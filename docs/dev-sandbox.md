@@ -171,7 +171,9 @@ honest error instead of pretending to take payment.
 ## Export
 
 The Export button — or the `dev_export` tool — downloads a zip you can
-serve from any ordinary static file host:
+serve from any ordinary static file host. (`dev_export_manifest` answers the
+same question without downloading anything: every file the bundle would
+carry, with its size, and how many rows of each data table.) The zip holds:
 
 - the runtime shell (the same files the sandbox itself serves, with the
   developer-mode flag turned off and the in-browser compiler's assets left
