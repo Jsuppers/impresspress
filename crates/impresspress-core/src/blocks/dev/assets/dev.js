@@ -273,14 +273,14 @@ function reloadPreview() {
 // writes would otherwise flicker the iframe and re-fetch the file tree for
 // nothing.
 //
-// The four `dev_` names are the mutating half of the control plane — its
+// The five `dev_` names are the mutating half of the control plane — its
 // reads (`dev_status`, `dev_list_files`, `dev_read_file`,
-// `dev_list_generations`, `dev_get_generation`) change nothing. `shop_`
-// covers the products family except its three listers
+// `dev_list_generations`, `dev_get_generation`, `dev_read_reference`) change
+// nothing. `shop_` covers the products family except its three listers
 // (`shop_list_products`, `shop_list_groups`, `shop_list_offers`), which the
-// negative lookahead excludes. Plan 3 adds `dev_create_block` and
-// `dev_compile_block`; both mutate and belong in this list.
-var MUTATING = /^(dev_write_file|dev_delete_file|dev_rollback|dev_remove_block|shop_(?!list_))/;
+// negative lookahead excludes. `dev_compile_block` joins the list when it
+// lands; it mutates too.
+var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_rollback|dev_remove_block|shop_(?!list_))/;
 
 // Every name this page registered. `registerTool`'s options bag takes an
 // `AbortSignal`, but a browser (or a polyfill) that ignores it would leave

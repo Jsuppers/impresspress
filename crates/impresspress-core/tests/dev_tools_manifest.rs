@@ -64,7 +64,7 @@ async fn tools_json_publishes_every_selection_with_zero_refusals() {
 /// `$ref`/`$defs`-carrying schema would embed a pointer that resolves
 /// against the wrong root once it is copied into an OpenAPI document).
 /// Generating `/b/dev/api/tools.json` from the real `SELECTIONS` confirms
-/// it: `$defs` appears in none of the 21 published tools (checked against
+/// it: `$defs` appears in none of the 23 published tools (checked against
 /// `tests/snapshots/dev.tools.json`). Asserting `$defs.is_object()` here
 /// would therefore either fail against a correct implementation or have to
 /// be satisfied by giving `offer_definition_schema` a real `$defs` table —

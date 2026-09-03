@@ -123,6 +123,9 @@ pub const TOO_MANY_BLOCKS: &str = "too-many-blocks";
 pub const BUILD_ROW_MISSING: &str = "build-row-missing";
 /// The artifact is over [`MAX_ARTIFACT_BYTES`].
 pub const ARTIFACT_TOO_LARGE: &str = "artifact-too-large";
+/// The artifact was compiled against a `wafer_guest.rs` that is not the one
+/// the sandbox scaffolds.
+pub const WAFER_GUEST_VERSION_CODE: &str = "wafer-guest-version";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -206,6 +209,28 @@ impl Diagnostic {
                 "the artifact is at least {len} bytes; the sandbox accepts at most \
                  {MAX_ARTIFACT_BYTES}. Build with release size settings (opt-level = \"z\", \
                  lto, strip)."
+            ),
+        )
+    }
+
+    /// The refusal a stale vendored guest module produces.
+    ///
+    /// The module IS the ABI: it renders the `BlockInfo` the validator reads,
+    /// decodes the request frame and writes the response frame. A block built
+    /// against an older copy is therefore speaking a contract this runtime no
+    /// longer guarantees, and the failure that would surface — a trap, or a
+    /// `BlockInfo` that does not parse — says nothing about the cause.
+    ///
+    /// Refused before the artifact is stored or executed: the version is
+    /// knowable without running anything, and the fix ("rescaffold, then
+    /// recompile") does not depend on what the module would have reported.
+    pub fn stale_guest_module(reported: u32, current: u32) -> Self {
+        Self::error(
+            WAFER_GUEST_VERSION_CODE,
+            format!(
+                "the artifact was compiled against wafer_guest.rs version {reported}; this \
+                 sandbox writes and speaks version {current}. Re-create the block with \
+                 `dev_create_block` (it rewrites src/wafer_guest.rs) and compile again."
             ),
         )
     }
@@ -483,9 +508,10 @@ pub fn validate_static(
             access: RouteAccessKind::Public,
         }],
         capabilities,
-        // Plan 3 fills this from the `WAFER_GUEST_VERSION` line the page
-        // reads out of the vendored guest shim (spec amendment 8);
-        // `BlockInfo` has no such field to read it from here.
+        // Filled by the staging handler from the version the *request*
+        // reported (spec amendment 8), which it has already checked against
+        // the sandbox's own. `BlockInfo` carries no such field, so there is
+        // nothing here to read it from; `0` is "not reported".
         wafer_guest_version: 0,
     })
 }

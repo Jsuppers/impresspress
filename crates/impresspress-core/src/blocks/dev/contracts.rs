@@ -15,6 +15,7 @@ use super::{
         generations::{GenerationCause, GenerationStatus},
         runtime_state::ActivationPhase,
     },
+    scaffold::Template,
     validation::Diagnostic,
     workspace::FileEntry,
 };
@@ -375,6 +376,19 @@ pub struct StageBuildRequest {
     /// with the build and returned alongside any the validator adds.
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    /// The `WAFER_GUEST_VERSION` of the `src/wafer_guest.rs` the artifact was
+    /// compiled against, read out of that file by whoever ran the compile.
+    ///
+    /// A value that is not the sandbox's own is refused with a
+    /// `wafer-guest-version` diagnostic: the vendored module IS the ABI, so a
+    /// block built against an older copy is talking a contract this runtime
+    /// no longer speaks. Rescaffold the block (`dev_create_block` rewrites
+    /// the module) and compile again.
+    ///
+    /// Omit it only if the compiler genuinely could not read the file. It is
+    /// then recorded as `0` — "unknown" — and nothing is checked.
+    #[serde(default)]
+    pub wafer_guest_version: Option<u32>,
 }
 
 /// Response of `POST /b/dev/api/builds/stage`.
@@ -415,4 +429,49 @@ pub struct BlockPathParams {
     /// The block's short name, e.g. `hello` for the block registered as
     /// `site/hello`.
     pub name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Scaffolding a block (`/b/dev/api/blocks`, `/b/dev/api/reference`)
+// ---------------------------------------------------------------------------
+
+/// Request of `POST /b/dev/api/blocks`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateBlockRequest {
+    /// The block's short name, e.g. `newsletter`. It becomes the directory
+    /// `blocks/<name>/`, the crate name, the block id `site/<name>`, the
+    /// route prefix `/b/<name>/` and the collection prefix `site__<name>__`.
+    /// 2 to 32 characters: a lowercase letter followed by lowercase letters,
+    /// digits and hyphens, with no doubled hyphen and no trailing hyphen.
+    pub name: String,
+    /// Which starting point to write. `hello` is one public `GET` and
+    /// nothing else; `table` is a newsletter block with a database table, an
+    /// agent tool and two admin reads — start there for anything that stores
+    /// data.
+    pub template: Template,
+}
+
+/// Response of `POST /b/dev/api/blocks`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateBlockResponse {
+    /// The block's short name, as written.
+    pub name: String,
+    /// The files that were written, in path order. Read or edit them through
+    /// the files API; the block does not serve until it is compiled.
+    pub files: Vec<FileEntry>,
+}
+
+/// Response of `GET /b/dev/api/reference`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceResponse {
+    /// The `WAFER_GUEST_VERSION` of the support module this reference
+    /// documents and `POST /b/dev/api/blocks` writes.
+    pub wafer_guest_version: u32,
+    /// The authoring guide, as Markdown: the API, the host services, the
+    /// namespace rules, the limits, the diagnostic codes, and both templates
+    /// in full.
+    pub markdown: String,
 }

@@ -40,6 +40,7 @@ pub mod page;
 pub mod paths;
 pub mod publisher;
 pub mod repo;
+pub mod scaffold;
 pub mod seed;
 pub mod status;
 pub mod tools;
@@ -105,8 +106,12 @@ pub enum Route {
     ApiGenerationRollback,
     /// `POST /b/dev/api/builds/stage`
     ApiBuildStage,
+    /// `POST /b/dev/api/blocks`
+    ApiBlockCreate,
     /// `POST /b/dev/api/blocks/{name}/remove`
     ApiBlockRemove,
+    /// `GET /b/dev/api/reference`
+    ApiReference,
     /// `GET /b/dev/api/tools.json`
     ApiToolsJson,
 }
@@ -163,11 +168,13 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/dev/api/builds/stage",
         Route::ApiBuildStage,
     ),
+    EndpointRoute::new(HttpMethod::Post, "/b/dev/api/blocks", Route::ApiBlockCreate),
     EndpointRoute::new(
         HttpMethod::Post,
         "/b/dev/api/blocks/{name}/remove",
         Route::ApiBlockRemove,
     ),
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/api/reference", Route::ApiReference),
     EndpointRoute::new(
         HttpMethod::Get,
         "/b/dev/api/tools.json",
@@ -428,11 +435,31 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin)
                 .input::<contracts::StageBuildRequest>()
                 .output::<contracts::StageBuildResponse>(),
+            BlockEndpoint::post("/b/dev/api/blocks")
+                .summary("Scaffold a new block from a template")
+                .description(
+                    "Writes blocks/<name>/{Cargo.toml, src/lib.rs, src/wafer_guest.rs}. The \
+                     support module is written verbatim — it is the guest ABI and must not be \
+                     hand-written or edited. Writing source activates nothing; compile the \
+                     block to make it serve.",
+                )
+                .auth(AuthLevel::Admin)
+                .input::<contracts::CreateBlockRequest>()
+                .output::<contracts::CreateBlockResponse>(),
             BlockEndpoint::post("/b/dev/api/blocks/{name}/remove")
                 .summary("Remove a block from the runtime")
                 .auth(AuthLevel::Admin)
                 .path_params::<contracts::BlockPathParams>()
                 .output::<contracts::ActivationResponse>(),
+            BlockEndpoint::get("/b/dev/api/reference")
+                .summary("The backend-block authoring reference")
+                .description(
+                    "The guide for writing a block: the wafer_guest.rs API, the database / \
+                     storage / config services, the namespace and capability rules, the limits, \
+                     the diagnostic codes, and both templates in full.",
+                )
+                .auth(AuthLevel::Admin)
+                .output::<contracts::ReferenceResponse>(),
             // Deliberately carries no `.agent_tool(..)`: this endpoint IS a
             // tool manifest, and a tool that named itself in its own output
             // is exactly the leak
@@ -480,7 +507,9 @@ impl Block for DevBlock {
                 generations_api::handle_rollback(ctx, &self.shared, &msg).await
             }
             Route::ApiBuildStage => blocks_api::handle_stage(ctx, &self.shared, input).await,
+            Route::ApiBlockCreate => scaffold::handle_create(ctx, &self.shared, input).await,
             Route::ApiBlockRemove => blocks_api::handle_remove(ctx, &self.shared, &msg).await,
+            Route::ApiReference => scaffold::handle_reference(ctx).await,
             Route::ApiToolsJson => tools::handle(ctx).await,
         }
     }
