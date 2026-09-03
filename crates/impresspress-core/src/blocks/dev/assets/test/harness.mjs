@@ -19,7 +19,16 @@ const tail = fs.readFileSync(path.join(here, '..', 'dev.js'), 'utf8');
 // Builds one fresh, isolated instance of the tail's closure. Each instance
 // gets its own stub `document`/`window`/`fetch` so tests can't leak state
 // (in particular `outstanding`/`polling`) into one another.
-export function instantiate({ hasModelContext = false } = {}) {
+/**
+ * @param {object} [options]
+ * @param {boolean} [options.hasModelContext]  give the stub document a WebMCP
+ *   registrar, as a browser that supports it would.
+ * @param {object|null} [options.compilerManifest]  what
+ *   `/__impresspress_dev/compiler/manifest.json` answers with: an object for a
+ *   bundle that shipped the browser toolchain, `null` for one that did not
+ *   (the host 404s, which is a normal build — see `discoverCompiler`).
+ */
+export function instantiate({ hasModelContext = false, compilerManifest = null } = {}) {
   const fetchCalls = [];
   // Every `window.addEventListener` the tail makes, so a test can fire the
   // real handler — `pagehide`'s `event.persisted` branch is a decision the
@@ -30,6 +39,7 @@ export function instantiate({ hasModelContext = false } = {}) {
     textContent: '',
     innerHTML: '',
     disabled: false,
+    title: '',
     scrollTop: 0,
     scrollHeight: 0,
     setAttribute() {},
@@ -40,9 +50,31 @@ export function instantiate({ hasModelContext = false } = {}) {
     addEventListener() {}
   });
 
+  // The attributes `blocks/dev/page.rs` actually ships on an element, for the
+  // ids where the INITIAL state is load-bearing rather than incidental.
+  // `#dev-compile` is `disabled` in the markup and only the compiler manifest
+  // may clear it, so a stub that started it enabled would let a
+  // `discoverCompiler` that did nothing at all pass.
+  const MARKUP = {
+    'dev-compile': { disabled: true },
+    'dev-export': { disabled: true }
+  };
+
+  // Memoised by id, unlike `createElement`: the tail looks an element up once
+  // and keeps it, so a stub that handed out a fresh object per call would let
+  // a test read an element the code under test never touched. The map is
+  // returned so a test can assert on what the tail did to the document.
+  const elements = new Map();
+  const elementById = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, Object.assign(fakeElement(), MARKUP[id]));
+    }
+    return elements.get(id);
+  };
+
   const sandbox = {
     document: {
-      getElementById: fakeElement,
+      getElementById: elementById,
       createElement: fakeElement,
       addEventListener() {},
       ...(hasModelContext
@@ -61,6 +93,22 @@ export function instantiate({ hasModelContext = false } = {}) {
     },
     fetch(...args) {
       fetchCalls.push(args);
+      // The tail makes two kinds of request on load and they cannot share one
+      // canned answer, so the stub routes by URL — the same split the real
+      // page has: `api.*` calls go to the block's JSON API and read
+      // `response.text()`, while the compiler manifest is a STATIC file read
+      // with `response.json()` whose absence (404) is a normal build.
+      const url = String(args[0]);
+      if (url === '/__impresspress_dev/compiler/manifest.json') {
+        if (compilerManifest === null) {
+          return Promise.resolve({ ok: false, status: 404 });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => compilerManifest
+        });
+      }
       // `loadFiles()` (bottom of the tail) awaits this on load; an empty
       // file list is enough for every test using this harness, none of
       // which assert on the file pane.
@@ -95,7 +143,9 @@ return {
   get registered() { return registered.slice() },
   isFileConflict,
   refusalBody,
-  refusalMessage
+  refusalMessage,
+  describeCompiler,
+  get compilerManifest() { return compilerManifest }
 };`
   );
   const handle = factory(...Object.values(sandbox));
@@ -106,5 +156,5 @@ return {
       .filter((l) => l.type === type)
       .forEach((l) => l.listener(event));
   };
-  return { handle, fetchCalls, fireWindow };
+  return { handle, fetchCalls, fireWindow, elements };
 }

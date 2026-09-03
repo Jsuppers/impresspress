@@ -152,13 +152,26 @@ fn body() -> Markup {
                 pre #dev-log {}
             }
             section #dev-actions .dev-pane {
-                // Both stay `disabled` until the compiler and the exporter
-                // exist. The buttons ship anyway so the page's shape is the
-                // final one and the human can see what is coming; the agent
-                // sees the same two names as tools that refuse honestly.
+                // Both ship `disabled`, and that is the honest default: this
+                // markup is the same in every build, and whether a build
+                // carries the browser toolchain is a property of the BUNDLE
+                // (`examples/dev-sandbox/impresspress.toml` overlays
+                // `compiler/dist/` onto `/__impresspress_dev/compiler/`),
+                // which no Rust code here can see. So `dev.js` fetches the
+                // compiler's manifest on load and enables Compile only when
+                // this deployment actually has one — a button that starts
+                // enabled would be a promise the page cannot keep on a build
+                // without the overlay. Export stays disabled until the
+                // exporter exists; the agent sees both names as tools that
+                // refuse honestly.
                 button #dev-compile .btn .btn-secondary type="button" disabled { "Compile block" }
                 button #dev-export .btn .btn-secondary type="button" disabled { "Export" }
                 button #dev-refresh-tools .btn .btn-secondary type="button" { "Refresh tools" }
+                // Filled in by `dev.js` from the compiler manifest, and left
+                // empty when there is none — the version is the pinned rubrc
+                // sha every compiler URL carries, so it is what a bug report
+                // about a build needs to quote.
+                span #dev-compiler-version .dev-compiler-version {}
             }
         }
         link rel="stylesheet" href="/b/dev/static/dev.css";
@@ -256,6 +269,8 @@ mod tests {
             "dev-delete",
             "dev-new-file",
             "dev-refresh-tools",
+            "dev-compile",
+            "dev-compiler-version",
         ] {
             assert!(
                 assets::dev_js().contains(&format!("'{id}'")),
@@ -318,6 +333,46 @@ mod tests {
         assert!(
             assets::dev_js().starts_with("import "),
             "the composed script must be the module this tag promises"
+        );
+    }
+
+    /// The Compile button ships disabled, and only the compiler manifest
+    /// turns it on.
+    ///
+    /// The markup is identical in every build; whether the browser toolchain
+    /// is present is a property of the bundle's asset overlay, which nothing
+    /// in this crate can see. So an enabled-by-default button would be a
+    /// promise a build without the overlay cannot keep — and the 404 path has
+    /// to say so on the button rather than fail on click. Both halves are
+    /// pinned here because the behaviour itself needs a browser
+    /// (`dev-workspace.spec.ts`) and a source assertion that fails loudly on a
+    /// rewrite is worth more than nothing in between.
+    #[test]
+    fn the_compile_button_is_enabled_only_by_the_compiler_manifest() {
+        let html = body().into_string();
+        assert!(
+            html.contains(
+                r#"<button class="btn btn-secondary" id="dev-compile" type="button" disabled>"#
+            ),
+            "the Compile button must ship disabled; {html}"
+        );
+        let js = assets::dev_js();
+        assert!(
+            js.contains("'/__impresspress_dev/compiler/manifest.json'"),
+            "dev.js must discover the compiler at the path the bundle overlays it to"
+        );
+        assert!(
+            js.contains("{ cache: 'no-store' }"),
+            "the manifest is the one compiler file whose URL carries no version, so it \
+             must not be served from a cache"
+        );
+        assert!(
+            js.contains("compileButton.disabled = false;"),
+            "something must enable the button once a manifest is found"
+        );
+        assert!(
+            js.contains("compileButton.title = 'No compiler in this build';"),
+            "a build with no compiler must say so on the button"
         );
     }
 

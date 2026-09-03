@@ -221,6 +221,19 @@
 	gap: var(--spacing-sm);
 }
 
+/* Which toolchain this build carries, written by `dev.js` from the compiler
+   manifest. Secondary text: it is provenance a bug report needs to quote, not
+   an action — and it is EMPTY on a build with no compiler, where the flex gap
+   would otherwise leave a hole after the buttons. */
+#dev-compiler-version {
+	color: var(--text-secondary);
+	font-size: 0.85em;
+}
+
+#dev-compiler-version:empty {
+	display: none;
+}
+
 /* One column below the admin's own breakpoint: the editor and the preview
    are both full-width-or-useless, and the tree is short. */
 @media (max-width: 900px) {

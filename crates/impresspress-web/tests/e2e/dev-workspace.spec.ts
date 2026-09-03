@@ -3,6 +3,7 @@ import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
   bootServiceWorker,
+  loginToWorkspace,
   WELCOME_HEADING,
   WELCOME_PHRASE,
 } from './fixtures/dev-sandbox';
@@ -58,25 +59,32 @@ import {
  */
 
 /**
- * The nine `dev_*` tools `/b/dev/api/tools.json` projects, plus the two
+ * The eleven `dev_*` tools `/b/dev/api/tools.json` projects, plus the two
  * `dev.js` registers itself.
  *
- * `dev_compile_block` and `dev_export` have no HTTP endpoint behind them in
- * this build — compiling happens in a page worker (Plan 3) and exporting
- * writes a bundle from it (Plan 4). `dev.js` registers them anyway so an
- * agent that discovers them gets an honest refusal instead of inventing its
- * own way to compile, which is why they belong in this list rather than in
- * `tools.json`.
+ * `dev_read_reference` and `dev_create_block` are Plan 3's — the guest-API
+ * reference an agent reads before writing Rust, and the scaffolder that lays
+ * a block down from a template. Both are ordinary HTTP tools
+ * (`blocks/dev/tools.rs`'s `SELECTIONS`), so both are in `tools.json`.
+ *
+ * `dev_compile_block` and `dev_export` are not: they have no HTTP endpoint
+ * behind them in this build — compiling happens in a page worker (Plan 3
+ * Task 5) and exporting writes a bundle from it (Plan 4). `dev.js` registers
+ * them anyway so an agent that discovers them gets an honest refusal instead
+ * of inventing its own way to compile, which is why they belong in this list
+ * rather than in `tools.json`.
  */
 const DEV_TOOLS = [
   'dev_status',
   'dev_list_files',
   'dev_read_file',
+  'dev_read_reference',
   'dev_write_file',
   'dev_delete_file',
   'dev_list_generations',
   'dev_get_generation',
   'dev_rollback',
+  'dev_create_block',
   'dev_remove_block',
   'dev_compile_block',
   'dev_export',
@@ -483,6 +491,70 @@ test('the workspace is cross-origin isolated and its preview frames the live sit
   await expect(page.frameLocator('#dev-preview-frame').locator('body')).toContainText(
     WELCOME_PHRASE,
   );
+});
+
+/**
+ * The workspace finds the toolchain this build shipped, and the isolation the
+ * toolchain needs reaches the whole deployment.
+ *
+ * Two facts, tested together because each is the other's precondition. A
+ * cross-origin-isolated document is the only place `SharedArrayBuffer` exists,
+ * and Rubrc's threads need it; a compiler manifest is the only way the page
+ * learns which worker to start. Either one alone would leave `#dev-compile` a
+ * button that cannot work.
+ *
+ * # Why `/` is isolated too, when the design once said it must not be
+ *
+ * Spec amendment 14. A document with any non-`unsafe-none` COEP may only
+ * embed nested documents that carry a compatible COEP, and that check is
+ * origin-independent — so as long as `/b/dev` frames the live site, `/` has to
+ * carry the pair as well, and the browser then reports it as isolated. The
+ * earlier reading ("the published site is NOT isolated") described a
+ * deployment whose preview pane rendered blank. `credentialless` rather than
+ * `require-corp` is what keeps the cost of that bounded: a site an agent built
+ * here can still show a cross-origin image with no CORP header.
+ *
+ * On this bundle those headers reach `/` from `wafer-run/security-headers`
+ * (`runtime_factory.rs`), and reach the compiler's own static files from the
+ * service worker (`impresspress-bundle`'s `sw.js.tmpl`) — the static host is
+ * `python3 -m http.server` and sends neither.
+ */
+test('the workspace discovers the packaged compiler on a cross-origin-isolated deployment', async ({
+  page,
+}) => {
+  test.setTimeout(300_000);
+  await loginToWorkspace(page);
+
+  // The header is `blocks/dev/page.rs`'s; this is the capability the browser
+  // computed from it, which no Rust test can observe.
+  expect(await page.evaluate(() => crossOriginIsolated)).toBe(true);
+  // …and the one thing that capability is FOR. Rubrc's rustc runs threaded.
+  expect(await page.evaluate(() => typeof SharedArrayBuffer)).toBe('function');
+
+  // `dev.js` fetches this on load. A build with no compiler overlay 404s here
+  // and leaves the button disabled with a reason on it — the branch
+  // `dev_compiler_discovery.test.mjs` covers, since `build.sh` refuses to
+  // produce a bundle this spec could drive it with.
+  const manifest = await page.evaluate(
+    async () => (await fetch('/__impresspress_dev/compiler/manifest.json')).json(),
+  );
+  expect(manifest.schema_version).toBe(1);
+  expect(manifest.entry).toBe(`/__impresspress_dev/compiler/${manifest.version}/worker.js`);
+
+  // The two halves of what the page did with it: the button it enabled, and
+  // the provenance it wrote out. The version is the pinned rubrc sha every
+  // compiler URL carries, so a page showing the wrong one is a page that would
+  // start the wrong worker.
+  await expect(page.locator('#dev-compile')).toBeEnabled();
+  await expect(page.locator('#dev-compiler-version')).toHaveText(
+    new RegExp(`^Compiler v${manifest.version} · \\d+\\.\\d MiB$`),
+  );
+
+  // The published site, which the preview pane frames — isolated for the
+  // reason in this test's header, not as an accident.
+  await page.goto('/', { waitUntil: 'commit' });
+  await expect(page.locator('body')).toContainText(WELCOME_PHRASE, { timeout: 60_000 });
+  expect(await page.evaluate(() => crossOriginIsolated)).toBe(true);
 });
 
 test('the editor refuses to save a binary file over itself', async ({ page }) => {

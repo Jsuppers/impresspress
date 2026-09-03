@@ -683,7 +683,66 @@ document.getElementById('dev-refresh-tools').addEventListener('click', function 
   refreshSiteTools();
 });
 
+// ---- the packaged compiler -------------------------------------------------
+
+// Where the browser Rust toolchain announces itself.
+//
+// It is a STATIC file, not an API route: `examples/dev-sandbox/impresspress
+// .toml` overlays `compiler/dist/` onto `/__impresspress_dev/compiler/` and
+// puts that prefix on the service worker's bypass list, because it is ~72 MiB
+// of composed wasm that must never go through the runtime. So the page asks
+// the host for it directly (plain `fetch`, not `api.get` — there is no session
+// to carry and no 401/403 to react to), and a build that never ran the
+// compiler overlay simply 404s.
+var COMPILER_MANIFEST_URL = '/__impresspress_dev/compiler/manifest.json';
+
+var compileButton = document.getElementById('dev-compile');
+var compilerVersionEl = document.getElementById('dev-compiler-version');
+
+// The manifest this build shipped, or `null` while there is none. What the
+// Compile button will hand to `new BrowserRustCompiler(...)`; the page never
+// guesses a worker URL, because `manifest.entry` is the only path that
+// carries the pinned toolchain's version.
+var compilerManifest = null;
+
+// MiB, not MB, and `1048576` rather than a round million: `total_bytes` is a
+// byte count, and every other figure published about this toolchain — the
+// build script's own summary, the README's, the 24 MiB per-file asset limit
+// the verifier enforces — is binary. Labelling 71.6 MiB as "75.1 MB" would be
+// the same number told two ways on one page.
+function describeCompiler(manifest) {
+  return 'Compiler v' + manifest.version + ' · ' + (manifest.total_bytes / 1048576).toFixed(1) + ' MiB';
+}
+
+// Ask the host what toolchain this build carries, and say so on the page.
+//
+// `cache: 'no-store'` because the manifest is the one file in the compiler
+// tree whose URL does NOT carry the version — every other one does, which is
+// what makes them immutable. A cached manifest is a page pointing at a
+// toolchain this build does not ship, and the failure it produces (a 404 on a
+// worker script) is a long way from its cause. It is a few hundred bytes once
+// per page load.
+async function discoverCompiler() {
+  var response = await fetch(COMPILER_MANIFEST_URL, { cache: 'no-store' });
+  // Not an error: a bundle built without the compiler overlay is a legitimate
+  // build — CI's foundations run is one — and the honest thing is a button
+  // that says why it cannot be pressed rather than one that fails on click.
+  if (response.status === 404) {
+    compileButton.title = 'No compiler in this build';
+    log('no compiler in this build');
+    return;
+  }
+  if (!response.ok) {
+    throw new Error('HTTP ' + response.status + ' for ' + COMPILER_MANIFEST_URL);
+  }
+  compilerManifest = await response.json();
+  compilerVersionEl.textContent = describeCompiler(compilerManifest);
+  compileButton.disabled = false;
+  log('compiler ' + compilerManifest.version + ' available');
+}
+
 // ---- first paint ----------------------------------------------------------
 
 loadFiles().catch(logError);
 api.get('/b/dev/api/status').then(json).then(observe).catch(logError);
+discoverCompiler().catch(logError);
