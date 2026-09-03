@@ -53,6 +53,43 @@ Open `http://localhost:8080/` — the welcome page (generation 0, seeded).
 Sign in at `http://localhost:8080/b/auth/login?redirect=/b/dev` to reach the
 workspace.
 
+## Deploying
+
+The bundle is deployed as a Cloudflare Worker, `impresspress-dev-sandbox`,
+serving `dist/` as static assets with SPA fallback (`wrangler.toml`).
+`worker.js` is a pass-through (`env.ASSETS.fetch(req)`) so response headers
+can be added later without moving off static assets.
+
+**One-time setup**, done by hand, not by any workflow:
+
+1. `impresspress.org` added as a zone on the Cloudflare account these
+   secrets belong to.
+2. A custom domain `dev.impresspress.org` attached to the
+   `impresspress-dev-sandbox` worker (`wrangler.toml`'s `routes` declares
+   this; Cloudflare still needs the domain provisioned once against the
+   zone).
+3. Two repository secrets — `CLOUDFLARE_API_TOKEN` and
+   `CLOUDFLARE_ACCOUNT_ID` — set on this repo for the
+   [`deploy-dev-sandbox`](/.github/workflows/deploy-dev-sandbox.yml) workflow
+   to use.
+
+**Automatic deploys**: the `deploy-dev-sandbox` workflow runs on every push
+to `main` that touches `examples/dev-sandbox/**`,
+`crates/impresspress-web/**`, `crates/impresspress-core/**`,
+`crates/impresspress-browser/**`, `crates/impresspress-bundle/**`, or the
+workflow file itself, plus on manual `workflow_dispatch`. It builds this
+bundle the same way `build.sh` does locally, then runs `wrangler deploy`.
+
+**Manual deploy**, from a machine with `wrangler` logged in to the same
+Cloudflare account:
+
+```sh
+examples/dev-sandbox/build.sh
+cd examples/dev-sandbox && wrangler deploy
+```
+
+Live URL (once deployed): `https://dev.impresspress.org`
+
 ## Credentials
 
 The seeded admin account (`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` /

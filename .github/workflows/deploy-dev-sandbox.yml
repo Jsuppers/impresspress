@@ -1,0 +1,61 @@
+name: Deploy dev-sandbox
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/dev-sandbox/**'
+      - 'crates/impresspress-web/**'
+      - 'crates/impresspress-core/**'
+      - 'crates/impresspress-browser/**'
+      - 'crates/impresspress-bundle/**'
+      - '.github/workflows/deploy-dev-sandbox.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev-sandbox
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pin explicitly — unpinned "latest" falls back to v0.9.1 on a GitHub
+          # API flake, and v0.9.1 can't parse `license.workspace = true`.
+          # This is live push-to-main infra; matches ci.yml's pin.
+          version: 'v0.15.0'
+
+      # `cargo install --path crates/impresspress` runs the impresspress build.rs,
+      # which `include_bytes!`s the impresspress-web wasm. Build it first so
+      # build.rs finds it in the canonical pkg/ location. This is the ordinary
+      # (feature-off) pkg/ the CLI itself needs to compile — the dev-sandbox's
+      # own feature-on wasm goes into pkg-dev/, built separately by build.sh below.
+      - name: Pre-build impresspress-web wasm (build.rs prereq)
+        working-directory: crates/impresspress-web
+        run: wasm-pack build --target web --release --out-dir pkg
+
+      - name: Install impresspress CLI
+        run: cargo install --path crates/impresspress --locked
+
+      - name: Build examples/dev-sandbox
+        run: examples/dev-sandbox/build.sh
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          workingDirectory: examples/dev-sandbox
+          command: deploy
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
