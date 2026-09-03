@@ -3940,6 +3940,99 @@
       }
     },
     {
+      "description": "Scaffold a new backend block from a template (`hello` or `table`) under blocks/<name>/. Compile it with dev_compile_block.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "The block's short name, e.g. `newsletter`. It becomes the directory\n`blocks/<name>/`, the crate name, the block id `site/<name>`, the\nroute prefix `/b/<name>/` and the collection prefix `site__<name>__`.\n2 to 32 characters: a lowercase letter followed by lowercase letters,\ndigits and hyphens, with no doubled hyphen and no trailing hyphen.",
+            "type": "string"
+          },
+          "template": {
+            "description": "Which starting point to write. `hello` is one public `GET` and\nnothing else; `table` is a newsletter block with a database table, an\nagent tool and two admin reads — start there for anything that stores\ndata.",
+            "oneOf": [
+              {
+                "const": "hello",
+                "description": "One public `GET` and nothing else — the smallest block that serves.",
+                "type": "string"
+              },
+              {
+                "const": "table",
+                "description": "A newsletter block: a claimed collection, a table created in `init`,\na public write endpoint with an agent tool, and two admin reads.",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "template"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "name",
+          "template"
+        ],
+        "method": "post",
+        "path": "/b/dev/api/blocks",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_create_block",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `POST /b/dev/api/blocks`.",
+        "properties": {
+          "files": {
+            "description": "The files that were written, in path order. Read or edit them through\nthe files API; the block does not serve until it is compiled.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One file in the workspace: where it is, which blob holds it, how big it is\nand what it is served as.\n\nThe same type is what a generation's site manifest is made of — a\ngeneration *is* the workspace's `site/` entries, frozen — so there is one\ndefinition rather than a wire type and a stored type that have to be kept\nin step.",
+              "properties": {
+                "content_type": {
+                  "description": "Content type the file is served with.",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Where the file lives. Workspace-relative (`site/index.html`) in the\nfiles API; relative to its area's root (`index.html`) in a\ngeneration's site manifest and in a block's source listing.",
+                  "type": "string"
+                },
+                "sha256": {
+                  "description": "SHA-256 of the file's content-addressed blob, hex-encoded.",
+                  "type": "string"
+                },
+                "size": {
+                  "description": "Size in bytes.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "size",
+                "content_type"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "The block's short name, as written.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "description": "Remove a compiled block from the running site and activate the resulting generation. Its source under `blocks/<name>/` is untouched — this only takes the compiled block out of what serves.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4154,6 +4247,42 @@
         "required": [
           "generation",
           "progress"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "The authoring reference for backend blocks: API, host services, limits, and the two templates. Read it before writing Rust.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/reference",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_read_reference",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/reference`.",
+        "properties": {
+          "markdown": {
+            "description": "The authoring guide, as Markdown: the API, the host services, the\nnamespace rules, the limits, the diagnostic codes, and both templates\nin full.",
+            "type": "string"
+          },
+          "wafer_guest_version": {
+            "description": "The `WAFER_GUEST_VERSION` of the support module this reference\ndocuments and `POST /b/dev/api/blocks` writes.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "wafer_guest_version",
+          "markdown"
         ],
         "type": "object"
       }

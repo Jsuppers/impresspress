@@ -221,6 +221,33 @@
 	gap: var(--spacing-sm);
 }
 
+/* Which block Compile acts on. Sits immediately before the button it feeds,
+   sized to its content rather than stretched by the flex row — an empty
+   workspace has no options, and a select stretched across the pane to say so
+   would read as a broken control rather than an unused one. */
+#dev-compile-block {
+	font-size: var(--text-xs);
+	padding: 2px 6px;
+	max-width: 12rem;
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-sm);
+	background: var(--surface-1);
+	color: var(--text-primary);
+}
+
+/* Which toolchain this build carries, written by `dev.js` from the compiler
+   manifest. Secondary text: it is provenance a bug report needs to quote, not
+   an action — and it is EMPTY on a build with no compiler, where the flex gap
+   would otherwise leave a hole after the buttons. */
+#dev-compiler-version {
+	color: var(--text-secondary);
+	font-size: 0.85em;
+}
+
+#dev-compiler-version:empty {
+	display: none;
+}
+
 /* One column below the admin's own breakpoint: the editor and the preview
    are both full-width-or-useless, and the tree is short. */
 @media (max-width: 900px) {

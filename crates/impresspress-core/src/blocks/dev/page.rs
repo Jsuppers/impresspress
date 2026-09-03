@@ -152,17 +152,50 @@ fn body() -> Markup {
                 pre #dev-log {}
             }
             section #dev-actions .dev-pane {
-                // Both stay `disabled` until the compiler and the exporter
-                // exist. The buttons ship anyway so the page's shape is the
-                // final one and the human can see what is coming; the agent
-                // sees the same two names as tools that refuse honestly.
+                // Both ship `disabled`, and that is the honest default: this
+                // markup is the same in every build, and whether a build
+                // carries the browser toolchain is a property of the BUNDLE
+                // (`examples/dev-sandbox/impresspress.toml` overlays
+                // `compiler/dist/` onto `/__impresspress_dev/compiler/`),
+                // which no Rust code here can see. So `dev.js` fetches the
+                // compiler's manifest on load and enables Compile only when
+                // this deployment actually has one — a button that starts
+                // enabled would be a promise the page cannot keep on a build
+                // without the overlay. Export stays disabled until the
+                // exporter exists; the agent sees both names as tools that
+                // refuse honestly.
+
+                // Which block Compile acts on. It ships EMPTY, and stays
+                // empty on a workspace with no blocks: the options are the
+                // `blocks/<name>/` prefixes in the file listing (`dev.js`'s
+                // `renderBlockChoices`, refreshed with the file pane), and
+                // a block only exists as files under such a prefix — there
+                // is no block record until one compiles, so there is
+                // nothing this markup could have known to pre-render. The
+                // label is on the control rather than beside it because the
+                // pane is a row of buttons with no space for one, and a
+                // select whose only clue is its first option is
+                // unreachable by anything that is not looking at it.
+                select #dev-compile-block aria-label="Block to compile" {}
                 button #dev-compile .btn .btn-secondary type="button" disabled { "Compile block" }
                 button #dev-export .btn .btn-secondary type="button" disabled { "Export" }
                 button #dev-refresh-tools .btn .btn-secondary type="button" { "Refresh tools" }
+                // Filled in by `dev.js` from the compiler manifest, and left
+                // empty when there is none — the version is the pinned rubrc
+                // sha every compiler URL carries, so it is what a bug report
+                // about a build needs to quote.
+                span #dev-compiler-version .dev-compiler-version {}
             }
         }
         link rel="stylesheet" href="/b/dev/static/dev.css";
-        script src="/b/dev/static/dev.js" defer {}
+        // `type="module"`, not `defer`: the script imports
+        // `BrowserRustCompiler` from `/b/dev/static/compiler-adapter.js`, and
+        // an `import` only resolves in a module. A module script defers by
+        // itself — it runs after parsing, in document order with the deferred
+        // classic scripts — so `dev.js` still runs before the `webmcp.js`
+        // that `ui/layout.rs` puts at the end of the body, which is the
+        // ordering the tail's `refreshSiteTools` guard is written for.
+        script type="module" src="/b/dev/static/dev.js" {}
     }
 }
 
@@ -186,7 +219,23 @@ pub fn handle_stylesheet(msg: &Message) -> OutputStream {
     )
 }
 
-/// The two page assets are the block's only responses that are not
+/// Serve `/b/dev/static/compiler-adapter.js`.
+///
+/// Its own URL rather than bytes folded into `dev.js` because it is a
+/// separate ES module: `dev.js` imports it by this path, and the browser
+/// fetches it as a module of its own. Same tier, same headers, same
+/// `no-cache` reasoning as the other two — it is one more file whose content
+/// is fixed for a build and carries no hash to prove it.
+pub fn handle_compiler_adapter(msg: &Message) -> OutputStream {
+    asset(
+        msg,
+        assets::compiler_adapter_js().as_bytes(),
+        "application/javascript; charset=utf-8",
+        assets::compiler_adapter_js_hash(),
+    )
+}
+
+/// The three page assets are the block's only responses that are not
 /// `no-store`.
 ///
 /// `no-cache` still means "revalidate before every use", so a rebuilt bundle
@@ -233,6 +282,9 @@ mod tests {
             "dev-delete",
             "dev-new-file",
             "dev-refresh-tools",
+            "dev-compile",
+            "dev-compile-block",
+            "dev-compiler-version",
         ] {
             assert!(
                 assets::dev_js().contains(&format!("'{id}'")),
@@ -268,6 +320,156 @@ mod tests {
         assert!(
             js.contains("setEditorEnabled(file.encoding === 'utf8');"),
             "opening a file is what decides whether the editor is usable"
+        );
+    }
+
+    /// The script tag is a module, and is not `defer`.
+    ///
+    /// `assets::dev_js()` opens with an `import` of the compiler adapter,
+    /// which a classic script cannot parse: a `defer` here — the shape this
+    /// tag had before the adapter existed — makes the browser drop the whole
+    /// script with nothing but a console message, and every pane on the page
+    /// stays empty. The two attributes are also mutually exclusive on a
+    /// module (a module defers by itself, and `defer` on it is ignored), so
+    /// finding both would mean somebody added one back without reading why
+    /// the other is there.
+    #[test]
+    fn the_script_tag_is_a_module() {
+        let html = body().into_string();
+        assert!(
+            html.contains(r#"<script type="module" src="/b/dev/static/dev.js">"#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("dev.js\" defer"),
+            "a module script must not also be marked defer"
+        );
+        assert!(
+            assets::dev_js().starts_with("import "),
+            "the composed script must be the module this tag promises"
+        );
+    }
+
+    /// The Compile button ships disabled, and two facts have to arrive
+    /// before it turns on.
+    ///
+    /// The markup is identical in every build; whether the browser toolchain
+    /// is present is a property of the bundle's asset overlay, which nothing
+    /// in this crate can see. So an enabled-by-default button would be a
+    /// promise a build without the overlay cannot keep — and the 404 path has
+    /// to say so on the button rather than fail on click. The second fact is
+    /// the workspace's: a block only exists as files under `blocks/<name>/`,
+    /// so a fresh instance has nothing to compile and the button says which
+    /// half is missing rather than offering a click it can only answer with
+    /// an alert. All of it is pinned here because the behaviour itself needs
+    /// a browser (`dev-workspace.spec.ts`, `dev-compile-tool.spec.ts`) and a
+    /// source assertion that fails loudly on a rewrite is worth more than
+    /// nothing in between.
+    #[test]
+    fn the_compile_button_is_enabled_only_by_a_toolchain_and_a_block() {
+        let html = body().into_string();
+        assert!(
+            html.contains(
+                r#"<button class="btn btn-secondary" id="dev-compile" type="button" disabled>"#
+            ),
+            "the Compile button must ship disabled; {html}"
+        );
+        let js = assets::dev_js();
+        assert!(
+            js.contains("'/__impresspress_dev/compiler/manifest.json'"),
+            "dev.js must discover the compiler at the path the bundle overlays it to"
+        );
+        assert!(
+            js.contains("{ cache: 'no-store' }"),
+            "the manifest is the one compiler file whose URL carries no version, so it \
+             must not be served from a cache"
+        );
+        assert!(
+            js.contains("compileButton.disabled = false;"),
+            "something must enable the button once a manifest is found"
+        );
+        assert!(
+            js.contains("compileButton.title = 'No compiler in this build';"),
+            "a build with no compiler must say so on the button"
+        );
+        assert!(
+            js.contains("if (!blockNames.length) {"),
+            "a workspace with no blocks must leave the button disabled too"
+        );
+        // One owner for the button's state. The two facts arrive from
+        // separate fetches in no fixed order — and a third, whether a compile
+        // is running, arrives from the compile itself — so a second place
+        // setting `disabled` would race and whichever landed later would win
+        // regardless of what it knew.
+        assert!(
+            js.contains("if (compileInFlight) {"),
+            "a compile in flight must leave the button disabled too"
+        );
+        assert_eq!(
+            js.matches("compileButton.disabled =").count(),
+            4,
+            "`disabled` must be set only by updateCompileButton's four arms"
+        );
+    }
+
+    /// Every `/b/dev/api/…` URL the page calls is a route this block serves.
+    ///
+    /// `dev.js` reaches four endpoints that no Rust caller does — the file
+    /// list, the file read, the staging endpoint and the status poll — and
+    /// nothing but a running browser would notice a typo in one of them: a
+    /// misspelled path is a 404 the page logs and swallows, so the Compile
+    /// button would simply stop working with a line in a panel to say why.
+    /// The URLs are scraped out of the script rather than listed here, so a
+    /// new endpoint the page starts calling is checked without this test
+    /// being edited.
+    #[test]
+    fn the_page_only_calls_endpoints_this_block_routes() {
+        let js = assets::dev_js();
+        let mut found = 0;
+        for (index, _) in js.match_indices("'/b/dev/api") {
+            let rest = &js[index + 1..];
+            let end = rest.find('\'').expect("an unterminated string literal");
+            // The query string is not part of a route template: the files
+            // list is `/b/dev/api/files?prefix=…` at the call site and
+            // `/b/dev/api/files` in the table.
+            let url = &rest[..end];
+            let path = url.split('?').next().unwrap();
+            assert!(
+                super::super::ROUTES
+                    .iter()
+                    .any(|route| route.template == path),
+                "dev.js calls {url}, which this block does not route"
+            );
+            found += 1;
+        }
+        // A scrape that matched nothing would pass the loop above silently.
+        assert!(found >= 4, "only {found} api URLs found in dev.js");
+    }
+
+    /// The page reads the guest ABI version out of the module the scaffolder
+    /// writes, in the spelling that module actually uses.
+    ///
+    /// `dev.js` parses `WAFER_GUEST_VERSION` out of the block's own copy of
+    /// `src/wafer_guest.rs` and reports it with the staged build, and
+    /// `blocks_api.rs` refuses anything that is not the sandbox's own. A
+    /// vendored module whose constant were reformatted — a type annotation
+    /// dropped, the spacing changed — would stop matching, the page would
+    /// report `null`, and every compiled block would be recorded as guest
+    /// version `0` ("unknown") with the check silently disabled. This is the
+    /// only place the regex and the file it is aimed at are both in scope.
+    #[test]
+    fn the_page_can_read_the_version_out_of_the_vendored_guest_module() {
+        assert!(
+            assets::dev_js().contains(r"/WAFER_GUEST_VERSION: u32 = (\d+)/"),
+            "dev.js must read the block's own guest version, not assume one"
+        );
+        let expected = format!(
+            "WAFER_GUEST_VERSION: u32 = {}",
+            super::super::WAFER_GUEST_VERSION
+        );
+        assert!(
+            super::super::scaffold::Template::WAFER_GUEST.contains(&expected),
+            "the vendored module must state `{expected}` for dev.js's regex to find it"
         );
     }
 

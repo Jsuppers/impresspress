@@ -104,6 +104,22 @@ pub const SELECTIONS: &[(&str, HttpMethod, &str, &str, &str)] = &[
     ),
     (
         "impresspress/dev",
+        HttpMethod::Get,
+        "/b/dev/api/reference",
+        "dev_read_reference",
+        "The authoring reference for backend blocks: API, host services, limits, and the two \
+         templates. Read it before writing Rust.",
+    ),
+    (
+        "impresspress/dev",
+        HttpMethod::Post,
+        "/b/dev/api/blocks",
+        "dev_create_block",
+        "Scaffold a new backend block from a template (`hello` or `table`) under \
+         blocks/<name>/. Compile it with dev_compile_block.",
+    ),
+    (
+        "impresspress/dev",
         HttpMethod::Post,
         "/b/dev/api/blocks/{name}/remove",
         "dev_remove_block",

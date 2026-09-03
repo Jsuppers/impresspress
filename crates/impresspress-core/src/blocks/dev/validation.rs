@@ -123,6 +123,9 @@ pub const TOO_MANY_BLOCKS: &str = "too-many-blocks";
 pub const BUILD_ROW_MISSING: &str = "build-row-missing";
 /// The artifact is over [`MAX_ARTIFACT_BYTES`].
 pub const ARTIFACT_TOO_LARGE: &str = "artifact-too-large";
+/// The artifact was compiled against a `wafer_guest.rs` that is not the one
+/// the sandbox scaffolds.
+pub const WAFER_GUEST_VERSION_CODE: &str = "wafer-guest-version";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -159,7 +162,17 @@ pub struct Diagnostic {
     /// Stable machine-readable identifier, e.g. `cap-collection` for a
     /// capability outside the block's namespace or `guest-init` for a trap
     /// in the guest's `Init`. Match on this rather than on `message`.
-    pub code: String,
+    ///
+    /// `null` when whoever produced the diagnostic had no code for it. Every
+    /// diagnostic this crate produces has one — they are the constants above
+    /// — but a *compiler* diagnostic forwarded by `/b/dev` need not: rustc
+    /// numbers some of what it says (`E0425`) and not the rest, and the page
+    /// forwards what the compiler gave it. This field is optional for the
+    /// same reason `file`/`line`/`column` are: "when the compiler reported
+    /// one". Inventing a placeholder on the way in would put a value in the
+    /// build's stored record that nothing ever said.
+    #[serde(default)]
+    pub code: Option<String>,
     /// What is wrong, and what to change.
     pub message: String,
     /// Workspace-relative source file the diagnostic is about, when the
@@ -181,7 +194,7 @@ impl Diagnostic {
     pub fn error(code: &str, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Error,
-            code: code.to_string(),
+            code: Some(code.to_string()),
             message: message.into(),
             file: None,
             line: None,
@@ -206,6 +219,28 @@ impl Diagnostic {
                 "the artifact is at least {len} bytes; the sandbox accepts at most \
                  {MAX_ARTIFACT_BYTES}. Build with release size settings (opt-level = \"z\", \
                  lto, strip)."
+            ),
+        )
+    }
+
+    /// The refusal a stale vendored guest module produces.
+    ///
+    /// The module IS the ABI: it renders the `BlockInfo` the validator reads,
+    /// decodes the request frame and writes the response frame. A block built
+    /// against an older copy is therefore speaking a contract this runtime no
+    /// longer guarantees, and the failure that would surface — a trap, or a
+    /// `BlockInfo` that does not parse — says nothing about the cause.
+    ///
+    /// Refused before the artifact is stored or executed: the version is
+    /// knowable without running anything, and the fix ("rescaffold, then
+    /// recompile") does not depend on what the module would have reported.
+    pub fn stale_guest_module(reported: u32, current: u32) -> Self {
+        Self::error(
+            WAFER_GUEST_VERSION_CODE,
+            format!(
+                "the artifact was compiled against wafer_guest.rs version {reported}; this \
+                 sandbox writes and speaks version {current}. Re-create the block with \
+                 `dev_create_block` (it rewrites src/wafer_guest.rs) and compile again."
             ),
         )
     }
@@ -483,9 +518,10 @@ pub fn validate_static(
             access: RouteAccessKind::Public,
         }],
         capabilities,
-        // Plan 3 fills this from the `WAFER_GUEST_VERSION` line the page
-        // reads out of the vendored guest shim (spec amendment 8);
-        // `BlockInfo` has no such field to read it from here.
+        // Filled by the staging handler from the version the *request*
+        // reported (spec amendment 8), which it has already checked against
+        // the sandbox's own. `BlockInfo` carries no such field, so there is
+        // nothing here to read it from; `0` is "not reported".
         wafer_guest_version: 0,
     })
 }
@@ -893,7 +929,16 @@ mod tests {
         result
             .as_ref()
             .err()
-            .map(|found| found.iter().map(|d| d.code.as_str()).collect())
+            .map(|found| {
+                found
+                    .iter()
+                    // Every diagnostic this crate produces carries a code, so
+                    // a `None` here is a producer that forgot one rather than
+                    // a compiler diagnostic — and it must fail the assertion
+                    // it lands in, not silently match nothing.
+                    .map(|d| d.code.as_deref().unwrap_or("<no code>"))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -953,7 +998,10 @@ mod tests {
         };
         let found = validate_spec(&spec, &builtin_route_prefixes(), &[]).expect_err("refused");
         assert_eq!(
-            found.iter().map(|d| d.code.as_str()).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|d| d.code.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
             vec![NAME_MISMATCH]
         );
     }
@@ -1187,7 +1235,7 @@ mod tests {
         let failure =
             ValidationFailure::new(super::super::control::ValidationStage::Init, "trap: oops");
         let diagnostic = Diagnostic::guest(&failure);
-        assert_eq!(diagnostic.code, "guest-init");
+        assert_eq!(diagnostic.code.as_deref(), Some("guest-init"));
         assert_eq!(diagnostic.message, "trap: oops");
         assert_eq!(diagnostic.severity, Severity::Error);
     }
@@ -1195,7 +1243,7 @@ mod tests {
     #[test]
     fn the_oversize_refusal_reports_the_limit_it_enforces() {
         let diagnostic = Diagnostic::artifact_too_large(MAX_ARTIFACT_BYTES + 1);
-        assert_eq!(diagnostic.code, ARTIFACT_TOO_LARGE);
+        assert_eq!(diagnostic.code.as_deref(), Some(ARTIFACT_TOO_LARGE));
         assert!(
             diagnostic.message.contains(&MAX_ARTIFACT_BYTES.to_string()),
             "{}",

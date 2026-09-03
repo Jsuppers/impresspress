@@ -18,7 +18,7 @@
 #
 # Usage:
 #   examples/dev-sandbox/build.sh            # build dist/
-#   examples/dev-sandbox/build.sh --check     # verify seed/manifest.json only
+#   examples/dev-sandbox/build.sh --check     # verify what is already built
 #
 # `IMPRESSPRESS=/path/to/impresspress` overrides which CLI binary assembles
 # the bundle. Default is whatever is on `PATH`, which is the trap this
@@ -30,11 +30,15 @@
 # `--root ./out` to keep it out of `~/.cargo/bin`) and point this at it.
 #
 # `--check` verifies every `seed/site/**` file against the hash and size
-# `seed/manifest.json` declares for it and exits non-zero on drift, WITHOUT
+# `seed/manifest.json` declares for it — and, when `compiler/dist/` has been
+# built, that its files match `compiler/dist/manifest.json` and none of them
+# is over Cloudflare's asset limit — exiting non-zero on drift, WITHOUT
 # building anything — this is what CI runs to catch a seed file edited
-# without regenerating the manifest. A plain build runs the same check first,
-# so a stale manifest fails fast rather than shipping a bundle
-# `seed::import` will refuse at runtime.
+# without regenerating the manifest. A plain build runs both of those checks
+# too — the seed's before it builds anything, so a stale manifest fails fast
+# rather than shipping a bundle `seed::import` will refuse at runtime, and the
+# compiler's once the toolchain is in place, over whatever `dist/` the build
+# is about to overlay.
 #
 # The whole wasm-pack output is bundled, not just the wasm + JS pair: the JS
 # glue imports from `snippets/`, and a pkg dir missing that tree cannot load
@@ -105,12 +109,77 @@ print("seed/manifest.json matches seed/site/**", file=sys.stderr)
 PY
 }
 
+# The browser toolchain (`compiler/`) is 365 MiB of composed wasm and takes
+# ~55 minutes to build from cold — and its `wasm-opt` pass peaked at 12.6 GB
+# RSS when it was measured, so it CANNOT run on a 7 GB CI runner: cache
+# `compiler/dist/` on `compiler/PIN.json` (which fully determines it) or use a
+# large runner. It is therefore built only when it is missing or when
+# `PIN.json` has moved since the tree in `compiler/dist/` was produced.
+# Everything about that tree — the rubrc commit, the sysroot, the tools —
+# comes from that one file, so comparing it against the built manifest is the
+# whole staleness test.
+compiler_is_current() {
+  python3 - "$HERE" <<'COMPILERPIN'
+import json, pathlib, sys
+
+compiler = pathlib.Path(sys.argv[1], "compiler")
+manifest = compiler / "dist" / "manifest.json"
+if not manifest.is_file():
+    raise SystemExit(1)
+pin = json.loads((compiler / "PIN.json").read_text())
+built = json.loads(manifest.read_text())
+if built.get("version") != pin["version"]:
+    raise SystemExit(1)
+if built.get("rubrc", {}).get("sha") != pin["rubrc"]["sha"]:
+    raise SystemExit(1)
+COMPILERPIN
+}
+
+# The compiler is only checked when it has been built: a tree that has never
+# run `build-compiler.sh` is a normal state for anyone working on the seed or
+# the wasm, and `--check` is meant to be cheap.
+#
+# The environment reaches the verifier untouched, which is how
+# `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` gets through: a CI job that only wants
+# to know whether the compiler still works may build it with
+# `build-compiler.sh --fast` and set that variable. The deploy workflow must
+# never set it — a `--fast` component skips `wasm-opt` entirely.
+check_compiler() {
+  if [ ! -d "$HERE/compiler/dist" ]; then
+    log "compiler/dist is not built — nothing to check"
+    return 0
+  fi
+  log "verifying compiler/dist against its manifest and the 24 MiB asset limit"
+  node "$HERE/compiler/scripts/verify-compiler-assets.mjs"
+}
+
 if [ "${1:-}" = "--check" ]; then
   check_seed
+  check_compiler
   exit 0
 fi
 
 check_seed
+
+# 0. The browser toolchain, overlaid onto the bundle at
+#    `/__impresspress_dev/compiler/` (see `impresspress.toml`).
+if compiler_is_current; then
+  log "compiler/dist is current for compiler/PIN.json"
+else
+  log "compiler/build-compiler.sh (dist is missing or built from another pin)"
+  "$HERE/compiler/build-compiler.sh"
+fi
+# `compiler_is_current` answers one question — was this tree built from the
+# pin in the file? — off two manifest fields, and never looks at the bytes
+# beside it or at `manifest.build`. A `--fast` component is therefore
+# "current" forever: `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` is needed for the
+# run of `build-compiler.sh` that PRODUCES one, and not for any later build
+# that picks it up. So the verifier runs here as well, over whatever `dist/`
+# is about to be overlaid — without it a plain build would quietly assemble an
+# unoptimized toolchain, and an edited or truncated file under `dist/` would
+# ship unhashed. This is the check every other file in this directory says is
+# what keeps a `--fast` tree out of a deploy.
+check_compiler
 
 # 1. The feature-on wasm. `--out-dir pkg-dev` keeps it away from `pkg/`, which
 #    is the ordinary (feature-off) bundle every other consumer serves — a
@@ -148,6 +217,10 @@ grep -q 'dev: true' "$DIST/sw.js" || {
   echo "build.sh: $DIST/seed/manifest.json was not overlaid — check impresspress.toml's [[assets.overlay]]," >&2
   echo "  or an impresspress CLI older than the recursive-directory overlay (cli/helpers/overlays.rs):" >&2
   echo "  $IMPRESSPRESS_BIN" >&2
+  exit 1
+}
+[ -f "$DIST/__impresspress_dev/compiler/manifest.json" ] || {
+  echo "build.sh: $DIST/__impresspress_dev/compiler/manifest.json was not overlaid — check impresspress.toml's [[assets.overlay]]" >&2
   exit 1
 }
 

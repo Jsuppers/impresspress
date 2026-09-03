@@ -1,0 +1,9 @@
+# The packaged compiler: ~230 MB of composed wasm, rebuilt from PIN.json by
+# build-compiler.sh and cached in CI on that file's hash.
+/dist/
+# The pinned rubrc checkout the vite aliases point into.
+/.rubrc/
+# Downloaded, sha256-checked build inputs: wasi_virt_layer-cli, Binaryen, the
+# sysroot tarball.
+/.cache/
+/node_modules/

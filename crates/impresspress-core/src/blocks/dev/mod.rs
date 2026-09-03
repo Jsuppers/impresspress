@@ -40,6 +40,7 @@ pub mod page;
 pub mod paths;
 pub mod publisher;
 pub mod repo;
+pub mod scaffold;
 pub mod seed;
 pub mod status;
 pub mod tools;
@@ -87,6 +88,8 @@ pub enum Route {
     PageScript,
     /// `GET /b/dev/static/dev.css`
     PageStylesheet,
+    /// `GET /b/dev/static/compiler-adapter.js`
+    PageCompilerAdapter,
     /// `GET /b/dev/api/status`
     ApiStatus,
     /// `GET /b/dev/api/files`
@@ -105,8 +108,12 @@ pub enum Route {
     ApiGenerationRollback,
     /// `POST /b/dev/api/builds/stage`
     ApiBuildStage,
+    /// `POST /b/dev/api/blocks`
+    ApiBlockCreate,
     /// `POST /b/dev/api/blocks/{name}/remove`
     ApiBlockRemove,
+    /// `GET /b/dev/api/reference`
+    ApiReference,
     /// `GET /b/dev/api/tools.json`
     ApiToolsJson,
 }
@@ -125,6 +132,11 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         HttpMethod::Get,
         "/b/dev/static/dev.css",
         Route::PageStylesheet,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/static/compiler-adapter.js",
+        Route::PageCompilerAdapter,
     ),
     EndpointRoute::new(HttpMethod::Get, "/b/dev/api/status", Route::ApiStatus),
     EndpointRoute::new(HttpMethod::Get, "/b/dev/api/files", Route::ApiFilesList),
@@ -163,11 +175,13 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/dev/api/builds/stage",
         Route::ApiBuildStage,
     ),
+    EndpointRoute::new(HttpMethod::Post, "/b/dev/api/blocks", Route::ApiBlockCreate),
     EndpointRoute::new(
         HttpMethod::Post,
         "/b/dev/api/blocks/{name}/remove",
         Route::ApiBlockRemove,
     ),
+    EndpointRoute::new(HttpMethod::Get, "/b/dev/api/reference", Route::ApiReference),
     EndpointRoute::new(
         HttpMethod::Get,
         "/b/dev/api/tools.json",
@@ -363,9 +377,9 @@ impl Block for DevBlock {
         ])
         .category(wafer_run::BlockCategory::Feature)
         .endpoints(vec![
-            // The document and its two assets carry no schemas — there is no
+            // The document and its three assets carry no schemas — there is no
             // JSON contract to describe, and `has_schema()` therefore keeps
-            // all three out of `/openapi.json` exactly as it keeps the HTML
+            // all four out of `/openapi.json` exactly as it keeps the HTML
             // pages of every other block out. They are declared all the same:
             // `routes_and_endpoints_stay_in_lockstep` requires the dispatch
             // table and this list to be the same set, and the declaration is
@@ -383,6 +397,9 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin),
             BlockEndpoint::get("/b/dev/static/dev.css")
                 .summary("The workspace page's stylesheet")
+                .auth(AuthLevel::Admin),
+            BlockEndpoint::get("/b/dev/static/compiler-adapter.js")
+                .summary("The page half of the in-browser compiler protocol")
                 .auth(AuthLevel::Admin),
             BlockEndpoint::get("/b/dev/api/status")
                 .summary("Sandbox status")
@@ -428,11 +445,31 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin)
                 .input::<contracts::StageBuildRequest>()
                 .output::<contracts::StageBuildResponse>(),
+            BlockEndpoint::post("/b/dev/api/blocks")
+                .summary("Scaffold a new block from a template")
+                .description(
+                    "Writes blocks/<name>/{Cargo.toml, src/lib.rs, src/wafer_guest.rs}. The \
+                     support module is written verbatim — it is the guest ABI and must not be \
+                     hand-written or edited. Writing source activates nothing; compile the \
+                     block to make it serve.",
+                )
+                .auth(AuthLevel::Admin)
+                .input::<contracts::CreateBlockRequest>()
+                .output::<contracts::CreateBlockResponse>(),
             BlockEndpoint::post("/b/dev/api/blocks/{name}/remove")
                 .summary("Remove a block from the runtime")
                 .auth(AuthLevel::Admin)
                 .path_params::<contracts::BlockPathParams>()
                 .output::<contracts::ActivationResponse>(),
+            BlockEndpoint::get("/b/dev/api/reference")
+                .summary("The backend-block authoring reference")
+                .description(
+                    "The guide for writing a block: the wafer_guest.rs API, the database / \
+                     storage / config services, the namespace and capability rules, the limits, \
+                     the diagnostic codes, and both templates in full.",
+                )
+                .auth(AuthLevel::Admin)
+                .output::<contracts::ReferenceResponse>(),
             // Deliberately carries no `.agent_tool(..)`: this endpoint IS a
             // tool manifest, and a tool that named itself in its own output
             // is exactly the leak
@@ -469,6 +506,7 @@ impl Block for DevBlock {
             Route::Page => page::handle(ctx, &msg).await,
             Route::PageScript => page::handle_script(&msg),
             Route::PageStylesheet => page::handle_stylesheet(&msg),
+            Route::PageCompilerAdapter => page::handle_compiler_adapter(&msg),
             Route::ApiStatus => status::handle(ctx, &self.shared).await,
             Route::ApiFilesList => files::handle_list(ctx, &msg).await,
             Route::ApiFilesRead => files::handle_read(ctx, input).await,
@@ -480,7 +518,9 @@ impl Block for DevBlock {
                 generations_api::handle_rollback(ctx, &self.shared, &msg).await
             }
             Route::ApiBuildStage => blocks_api::handle_stage(ctx, &self.shared, input).await,
+            Route::ApiBlockCreate => scaffold::handle_create(ctx, &self.shared, input).await,
             Route::ApiBlockRemove => blocks_api::handle_remove(ctx, &self.shared, &msg).await,
+            Route::ApiReference => scaffold::handle_reference(ctx).await,
             Route::ApiToolsJson => tools::handle(ctx).await,
         }
     }

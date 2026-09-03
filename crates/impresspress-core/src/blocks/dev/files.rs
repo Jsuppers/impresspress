@@ -399,8 +399,13 @@ fn conflict(path: &str, current: Option<&FileEntry>) -> OutputStream {
 }
 
 /// A workspace-wide limit a write would have crossed.
+///
+/// `pub(super)` because [`super::scaffold`] writes into the same workspace
+/// through the same manifest and must be held to the same limits — one
+/// definition of the rules, not a second copy that could disagree about what
+/// a full workspace is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuotaError {
+pub(super) enum QuotaError {
     /// The workspace already holds [`paths::MAX_FILES`] files.
     TooManyFiles,
     /// Storing the new blob would take the workspace's blob store past
@@ -416,7 +421,7 @@ impl QuotaError {
     /// Size limits are `413`; the block count is `409`, because nothing about
     /// the request is too large — the workspace's shape conflicts with a limit
     /// on how much the runtime can be asked to rebuild.
-    fn into_response(self) -> OutputStream {
+    pub(super) fn into_response(self) -> OutputStream {
         match self {
             Self::TooManyFiles => too_large(&format!(
                 "the workspace already holds {} files, which is the limit",
@@ -453,7 +458,7 @@ impl QuotaError {
 /// boundaries — a workspace full of unreachable blobs, a block that already
 /// exists — and driving hundreds of HTTP writes to reach one of them would
 /// test the loop rather than the rule.
-fn check_quotas(
+pub(super) fn check_quotas(
     ws: &Workspace,
     path: &str,
     area: &WorkspaceArea,

@@ -123,6 +123,21 @@ pub async fn handle_stage(
             validation::name_format_diagnostic(&request.block_name),
         );
     }
+    // The third pre-execution refusal, for the same reason as the other two:
+    // a module built against a different `wafer_guest.rs` is not a module
+    // this runtime's ABI describes, and loading it would turn a one-line
+    // "rescaffold and recompile" into a trap inside wasmi. A request that
+    // reports no version at all is a compiler that could not read the file;
+    // it is recorded as `0` further down and nothing is checked.
+    if let Some(reported) = request.wafer_guest_version {
+        if reported != super::WAFER_GUEST_VERSION {
+            return refused(
+                None,
+                request.diagnostics,
+                Diagnostic::stale_guest_module(reported, super::WAFER_GUEST_VERSION),
+            );
+        }
+    }
 
     match stage(ctx, shared, &request, &artifact).await {
         Ok(response) => response,
@@ -198,7 +213,7 @@ async fn stage(
 
     // Step 2: the rules, against the block set this one is joining. What they
     // return IS the authority the guest gets — nothing else grants any.
-    let spec = match validation::validate_static(
+    let mut spec = match validation::validate_static(
         name,
         &info,
         &artifact_sha256,
@@ -213,6 +228,10 @@ async fn stage(
             return Ok(refusal_response(Some(build.id), diagnostics));
         }
     };
+    // `BlockInfo` has no field for it, so the version cannot come out of
+    // `validate_static` — it is what the *request* reported, checked equal to
+    // the sandbox's own above. `0` records "the compiler did not report one".
+    spec.wafer_guest_version = request.wafer_guest_version.unwrap_or(0);
 
     // Step 3: run the guest, under the accepted spec. This is the same value
     // `rebuild` is handed below, so a guest that traps here would have

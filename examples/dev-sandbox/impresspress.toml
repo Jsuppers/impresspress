@@ -34,5 +34,19 @@ opfs_wipe_on_recovery = false
 from = "seed"
 to = "seed"
 
+# The browser toolchain, built by `compiler/build-compiler.sh` and versioned
+# by the rubrc commit `compiler/PIN.json` pins.
+#
+# `dist/` holds EXACTLY ONE version directory plus the `manifest.json` that
+# names it, and this overlay copies all of it: a second version left behind by
+# a pin bump would be deployed too, and nothing would have checked it.
+# `build-compiler.sh` removes the old one and
+# `compiler/scripts/verify-compiler-assets.mjs` (which `build.sh --check`
+# runs) fails on anything else under `dist/`. Bumping the pin therefore
+# changes every URL, so no cache can serve a stale worker.
+[[assets.overlay]]
+from = "compiler/dist"
+to = "__impresspress_dev/compiler"
+
 [dev]
 enabled = true

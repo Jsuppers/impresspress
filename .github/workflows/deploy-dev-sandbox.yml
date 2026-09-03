@@ -62,6 +62,38 @@ jobs:
       - name: Install impresspress CLI
         run: cargo install --path crates/impresspress --locked
 
+      # `build.sh` and the verifier both run through node, and
+      # `verify-compiler-assets.mjs` is what proves the toolchain this deploy
+      # is about to serve is the one that was built. 22 because
+      # `build-compiler.sh` refuses anything older and the scripts share a
+      # floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The compiler is NOT built here, and cannot be: composing it is ~35
+      # minutes of `wasm-opt -Oz` peaking at 12.6 GB of RSS, and this runner
+      # has 7 GB. The optimized tree is built once per pin by a developer and
+      # published as a release asset (`compiler/pack-dist.sh` prints the
+      # command; `compiler/README.md` § "Publishing the compiler" is the
+      # procedure), and this fetches it and verifies every byte of it against
+      # the manifest inside.
+      #
+      # No cache and no fallback on purpose. There is exactly one tree this
+      # deploy may serve — the one that was verified and published for
+      # `compiler/PIN.json`'s version — so a missing asset stops the deploy
+      # with instructions rather than composing something new, restoring
+      # something older, or shipping a `--fast` component. This job never sets
+      # `IMPRESSPRESS_COMPILER_ALLOW_FAST`, and `fetch-dist.sh` would refuse a
+      # `--fast` tree even if it were set.
+      - name: Fetch the published compiler dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: examples/dev-sandbox/compiler/fetch-dist.sh
+
+      # `compiler_is_current` matches `compiler/PIN.json` against the tree the
+      # step above put in place, so this builds the wasm and assembles the
+      # bundle without touching the compiler.
       - name: Build examples/dev-sandbox
         run: examples/dev-sandbox/build.sh
 

@@ -19,37 +19,166 @@ const tail = fs.readFileSync(path.join(here, '..', 'dev.js'), 'utf8');
 // Builds one fresh, isolated instance of the tail's closure. Each instance
 // gets its own stub `document`/`window`/`fetch` so tests can't leak state
 // (in particular `outstanding`/`polling`) into one another.
-export function instantiate({ hasModelContext = false } = {}) {
+/**
+ * @param {object} [options]
+ * @param {boolean} [options.hasModelContext]  give the stub document a WebMCP
+ *   registrar, as a browser that supports it would.
+ * @param {object|null} [options.compilerManifest]  what
+ *   `/__impresspress_dev/compiler/manifest.json` answers with: an object for a
+ *   bundle that shipped the browser toolchain, `null` for one that did not
+ *   (the host 404s, which is a normal build — see `discoverCompiler`).
+ * @param {Array<{path: string, sha256: string, content: string,
+ *                encoding?: string, size?: number, content_type?: string}>}
+ *   [options.workspace]  the files `/b/dev/api/files` lists and
+ *   `/b/dev/api/files/read` answers with. `encoding` defaults to `utf8`;
+ *   `base64` is how the real endpoint reports a file that is not text, which
+ *   is the case `snapshotBlock` has to refuse.
+ * @param {Function} [options.compiler]  what the tail's
+ *   `new BrowserRustCompiler(manifest)` builds. In the shipped page this
+ *   binding comes from the module import `assets.rs` emits ahead of the IIFE
+ *   (`DEV_JS_IMPORTS`); the harness reads the TAIL, which has no import, so it
+ *   is supplied here instead.
+ * @param {(request: object) => object} [options.stage]  what
+ *   `POST /b/dev/api/builds/stage` answers with, given the decoded request
+ *   body — a `StageBuildResponse` (`contracts.rs`).
+ * @param {object|(() => object)} [options.status]  what `/b/dev/api/status`
+ *   answers with — a `StatusResponse`. A function, for a test whose subject
+ *   is what the page does when the answer CHANGES: the page polls it, and
+ *   every mutating call ends with one more read of it.
+ */
+export function instantiate({
+  hasModelContext = false,
+  compilerManifest = null,
+  workspace = [],
+  compiler = class {
+    constructor() {
+      throw new Error('this harness instance was not given a compiler');
+    }
+  },
+  // A refusal rather than a throw or a success: an instance that was never
+  // given a staging endpoint must not be able to look like one that staged
+  // something, and the code says which instance it was.
+  stage = () => ({
+    build_id: null,
+    success: false,
+    diagnostics: [
+      {
+        severity: 'error',
+        code: 'harness',
+        message: 'this harness instance was not given a staging endpoint',
+        file: null,
+        line: null,
+        column: null
+      }
+    ],
+    generation: null,
+    progress: []
+  }),
+  // An idle sandbox with nothing live, which is what every test that does not
+  // care about the status wants: no `activation`, no `active_generation`.
+  status = {}
+} = {}) {
   const fetchCalls = [];
   // Every `window.addEventListener` the tail makes, so a test can fire the
   // real handler — `pagehide`'s `event.persisted` branch is a decision the
   // handler owns, and there is no other way to reach it.
   const windowListeners = [];
-  const fakeElement = () => ({
-    value: '',
-    textContent: '',
-    innerHTML: '',
-    disabled: false,
-    scrollTop: 0,
-    scrollHeight: 0,
-    setAttribute() {},
-    getAttribute() {
-      return null;
-    },
-    appendChild() {},
-    addEventListener() {}
+  // Enough of an element for the tail to build a list out of: the tail's only
+  // DOM verbs are `innerHTML = ''` to empty a container and `appendChild` to
+  // refill it, so `children` plus an `innerHTML` setter that clears it is a
+  // faithful model of both — and it is what lets a test read the options the
+  // Compile select was actually given, rather than trusting that a function
+  // that appended into a black hole did the right thing.
+  const fakeElement = () => {
+    const element = {
+      value: '',
+      textContent: '',
+      className: '',
+      disabled: false,
+      title: '',
+      scrollTop: 0,
+      scrollHeight: 0,
+      children: [],
+      attributes: {},
+      setAttribute(name, value) {
+        this.attributes[name] = value;
+      },
+      getAttribute(name) {
+        return name in this.attributes ? this.attributes[name] : null;
+      },
+      appendChild(child) {
+        this.children.push(child);
+        return child;
+      },
+      addEventListener() {}
+    };
+    Object.defineProperty(element, 'innerHTML', {
+      enumerable: true,
+      configurable: true,
+      get: () => '',
+      set: (value) => {
+        if (value === '') {
+          element.children.length = 0;
+        }
+      }
+    });
+    return element;
+  };
+
+  // The attributes `blocks/dev/page.rs` actually ships on an element, for the
+  // ids where the INITIAL state is load-bearing rather than incidental.
+  // `#dev-compile` is `disabled` in the markup and only the compiler manifest
+  // may clear it, so a stub that started it enabled would let a
+  // `discoverCompiler` that did nothing at all pass.
+  const MARKUP = {
+    'dev-compile': { disabled: true },
+    'dev-export': { disabled: true }
+  };
+
+  // Memoised by id, unlike `createElement`: the tail looks an element up once
+  // and keeps it, so a stub that handed out a fresh object per call would let
+  // a test read an element the code under test never touched. The map is
+  // returned so a test can assert on what the tail did to the document.
+  const elements = new Map();
+  const elementById = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, Object.assign(fakeElement(), MARKUP[id]));
+    }
+    return elements.get(id);
+  };
+
+  // Everything the stub `document.modelContext` was handed, by name. The
+  // shipped file registers `dev_compile_block` and `dev_export` itself
+  // (`registerPageLocal`), and their `execute` is the only way to reach the
+  // tool's own error handling — the split between a compiler failure, which
+  // is a RESULT, and a machinery failure, which is an `isError`.
+  const tools = new Map();
+
+  /** One JSON body, as `api.get`/`api.post` read it (`response.text()`). */
+  const answer = (body, status = 200) =>
+    Promise.resolve({ ok: status < 400, status, text: async () => JSON.stringify(body) });
+
+  const entry = (file) => ({
+    path: file.path,
+    sha256: file.sha256,
+    size: file.size ?? file.content.length,
+    content_type: file.content_type ?? 'text/plain; charset=utf-8'
   });
 
   const sandbox = {
     document: {
-      getElementById: fakeElement,
+      getElementById: elementById,
       createElement: fakeElement,
       addEventListener() {},
       ...(hasModelContext
         ? {
             modelContext: {
-              registerTool() {},
-              unregisterTool() {}
+              registerTool(options) {
+                tools.set(options.name, options);
+              },
+              unregisterTool(name) {
+                tools.delete(name);
+              }
             }
           }
         : {})
@@ -61,11 +190,66 @@ export function instantiate({ hasModelContext = false } = {}) {
     },
     fetch(...args) {
       fetchCalls.push(args);
-      // `loadFiles()` (bottom of the tail) awaits this on load; an empty
-      // file list is enough for every test using this harness, none of
-      // which assert on the file pane.
-      return Promise.resolve({ ok: true, status: 200, text: async () => '{"files":[]}' });
+      // The tail makes two kinds of request on load and they cannot share one
+      // canned answer, so the stub routes by URL — the same split the real
+      // page has: `api.*` calls go to the block's JSON API and read
+      // `response.text()`, while the compiler manifest is a STATIC file read
+      // with `response.json()` whose absence (404) is a normal build.
+      const url = String(args[0]);
+      if (url === '/__impresspress_dev/compiler/manifest.json') {
+        if (compilerManifest === null) {
+          return Promise.resolve({ ok: false, status: 404 });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => compilerManifest
+        });
+      }
+      // The two file endpoints, answered from `workspace` — enough of the
+      // real `files.rs` for `loadFiles` and `snapshotBlock` to run against:
+      // the list filters on `?prefix=`, and the read is by exact path and
+      // reports the file's own encoding.
+      if (url === '/b/dev/api/files' || url.startsWith('/b/dev/api/files?')) {
+        // `URLSearchParams` percent-decodes, which is what the runtime does
+        // too (`wafer-block`'s `http_codec` runs the raw query through
+        // `form_urlencoded::parse` before a block ever sees it) — so the
+        // `blocks%2Fhello%2F` the tail sends arrives here as `blocks/hello/`,
+        // exactly as it does on the server.
+        const prefix = url.includes('?')
+          ? (new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('prefix') ?? '')
+          : '';
+        return answer({ files: workspace.filter((f) => f.path.startsWith(prefix)).map(entry) });
+      }
+      if (url === '/b/dev/api/files/read') {
+        const { path: wanted } = JSON.parse(args[1].body);
+        const file = workspace.find((f) => f.path === wanted);
+        if (!file) {
+          return answer({ error: 'not_found', message: `no file at ${wanted}` }, 404);
+        }
+        // `FileReadResponse`'s own five fields — no `content_type`, which
+        // only the listing carries.
+        return answer({
+          path: file.path,
+          sha256: file.sha256,
+          size: file.size ?? file.content.length,
+          encoding: file.encoding ?? 'utf8',
+          content: file.content
+        });
+      }
+      if (url === '/b/dev/api/builds/stage') {
+        return answer(stage(JSON.parse(args[1].body)));
+      }
+      if (url === '/b/dev/api/status') {
+        return answer(typeof status === 'function' ? status() : status);
+      }
+      // `/b/dev/api/tools.json`. A body with no `tools` array is a manifest
+      // with nothing to register, which is what every test that is not about
+      // registration wants.
+      return answer({ files: [] });
     },
+    // The tail's own name for the class `assets.rs` imports into the module.
+    BrowserRustCompiler: compiler,
     AbortController,
     console,
     Promise,
@@ -95,7 +279,11 @@ return {
   get registered() { return registered.slice() },
   isFileConflict,
   refusalBody,
-  refusalMessage
+  refusalMessage,
+  describeCompiler,
+  snapshotBlock,
+  compileBlock,
+  get compilerManifest() { return compilerManifest }
 };`
   );
   const handle = factory(...Object.values(sandbox));
@@ -106,5 +294,5 @@ return {
       .filter((l) => l.type === type)
       .forEach((l) => l.listener(event));
   };
-  return { handle, fetchCalls, fireWindow };
+  return { handle, fetchCalls, fireWindow, elements, tools };
 }

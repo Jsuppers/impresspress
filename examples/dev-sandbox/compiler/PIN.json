@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "version": "807ace9e",
+  "target": "wasm32-wasip1",
+  "license": "MIT OR Apache-2.0",
+  "licenses": {
+    "rubrc": "MIT OR Apache-2.0 (root, lib and page package.json; the repo carries no LICENSE file)",
+    "rustc_cargo_rust_analyzer_wasm": "MIT OR Apache-2.0, inherited by the prebuilt rustc_opt.wasm / cargo_opt.wasm / lsp_opt.wasm",
+    "llvm_wasm": "Apache-2.0 WITH LLVM-exception \u2014 llvm_opt.wasm is a build of LLVM",
+    "wasi_virt_layer_cli": "MIT OR Apache-2.0 (LICENSE in the release tarball)",
+    "sysroot": "MIT OR Apache-2.0 \u2014 a build of the rust standard library",
+    "note": "`license` above is what dist/manifest.json reports for the package as a whole; the LLVM exception applies to the LLVM inside the composed component."
+  },
+  "part_bytes": 25165824,
+  "rubrc": {
+    "repo": "https://github.com/oligamiq/rubrc",
+    "sha": "807ace9e9cf266b1b1004372abdefc2152785d69",
+    "dist_branch": null,
+    "dist_sha": null
+  },
+  "wasi_virt_layer_cli": {
+    "version": "0.6.1",
+    "url": "https://github.com/oligamiq/wasi_virt_layer/releases/download/v0.6.1/wasi_virt_layer-cli-x86_64-unknown-linux-gnu.tar.xz",
+    "sha256": "bea30db2ee5c3404251e7569c4d1dd2f96785f06b2e554cbd1606538437ff02e"
+  },
+  "sysroot": {
+    "triple": "wasm32-wasip1",
+    "url": "https://oligamiq.github.io/rust_wasm/v0.2.0/wasm32-wasip1.tar.br",
+    "bytes": 18940938,
+    "sha256": "5c579477e831574ce3fa6abddaa1b9c29543625cd961b298883b5bdeed4191cd"
+  },
+  "toolchain": {
+    "bun": "1.4.0",
+    "note": "wasm-opt >= 122 is required for --enable-shared-everything, so Binaryen is pinned to its own upstream release rather than taken from PATH or from the 0.116.1 that wasi_virt_layer vendors; the composition runs cargo on both the default and the nightly toolchain (-Zbuild-std=std,panic_unwind), so both need the wasm32-wasip1-threads target and nightly needs rust-src."
+  },
+  "binaryen": {
+    "version": "132",
+    "url": "https://github.com/WebAssembly/binaryen/releases/download/version_132/binaryen-version_132-x86_64-linux.tar.gz",
+    "sha256": "195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572"
+  }
+}
