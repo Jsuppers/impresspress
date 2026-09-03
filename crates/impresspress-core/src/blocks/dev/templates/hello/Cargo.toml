@@ -1,0 +1,28 @@
+# A sandbox block: one crate, no dependencies.
+#
+# The browser toolchain that compiles this has no registry access, so
+# `[dependencies]` stays empty — everything a block needs is in
+# `src/wafer_guest.rs`, which the scaffolder wrote beside this file.
+
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# `cdylib` is what produces a `.wasm` module with the ABI exports the
+# runtime looks for. Do not change it.
+crate-type = ["cdylib"]
+
+[dependencies]
+
+# The sandbox accepts an artifact of at most 4 MiB, and these five settings
+# are what keep a block well under it. `panic = "abort"` also means a panic
+# in a handler traps the instance instead of unwinding — return an error
+# response rather than panicking on anything a caller can cause.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

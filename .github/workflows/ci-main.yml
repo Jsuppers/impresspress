@@ -141,12 +141,23 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
 
+      # `tests/wafer_guest_golden.rs` builds both block templates with plain
+      # `cargo build --target wasm32-wasip1 --offline` and runs the resulting
+      # modules under wasmi. Without the target installed it would skip, so
+      # install it here and set IMPRESSPRESS_GUEST_GOLDEN below, which turns
+      # that skip into a failure.
+      - name: Install the wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
       # The other half of the `block-dev` gap: `--workspace` above skips every
       # `dev_*.rs` integration test, because all five are `#![cfg]`-gated on a
       # feature nothing turns on. `wasm` is load-bearing rather than
       # incidental — `tests/lockfile_e2e.rs` needs wafer-run built with wasmi,
+      # `tests/wafer_guest_golden.rs` runs the compiled templates through it,
       # and `-p impresspress-core --features block-dev` alone leaves it red.
       - name: Run the block-dev suite
+        env:
+          IMPRESSPRESS_GUEST_GOLDEN: "1"
         run: cargo test --locked -p impresspress-core --features block-dev,wasm
 
       # `dev.js` is a TAIL composed into an IIFE with nothing on `window`
