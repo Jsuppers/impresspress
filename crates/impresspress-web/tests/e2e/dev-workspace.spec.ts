@@ -261,13 +261,20 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({ p
   // Two registrars share `document.modelContext` here: `dev.js` adds the
   // page-scoped allowlist, `webmcp.js` adds the deployment-wide manifest for
   // the caller's tier, and they finish in whichever order their two fetches
-  // complete. So both are waited for before anything is read: `waitForTool`
-  // for one name `webmcp.js` publishes, and `registeredTools`' own count wait
-  // for `dev.js`. Waiting on a name rather than a total is what keeps this
-  // from pinning the *other* file's contract — the admin manifest's size is
-  // `webmcp.spec.ts`'s subject, not this one's.
+  // complete. So both are waited for before anything is read, each by a name
+  // it alone publishes: `list_products` for `webmcp.js`, and `dev_export`
+  // for `dev.js` — the last tool `registerPageLocal` adds, after
+  // `registerFromManifest` has finished with everything `tools.json`
+  // returned. Waiting on names rather than a total (`PAGE_TOOLS.length`) is
+  // what keeps this from pinning the *other* file's contract — the admin
+  // manifest's size is `webmcp.spec.ts`'s subject, not this one's — and from
+  // going silently racy if that manifest ever grows to `PAGE_TOOLS.length`
+  // tools at the admin tier, at which point `waitForFunction`'s count could
+  // be satisfied by `webmcp.js` alone, before `dev.js` had registered
+  // anything.
   await waitForTool(page, 'list_products');
-  const tools = (await registeredTools(page, PAGE_TOOLS.length)).map((t) => t.name);
+  await waitForTool(page, 'dev_export');
+  const tools = (await registeredTools(page, 1)).map((t) => t.name);
 
   expect(tools.filter((n) => n.startsWith('dev_') || n.startsWith('shop_')).sort()).toEqual(
     PAGE_TOOLS,
@@ -490,7 +497,10 @@ test('the editor refuses to save a binary file over itself', async ({ page }) =>
   await page.addInitScript(MODEL_CONTEXT_POLYFILL);
   await bootServiceWorker(page);
   await openWorkspace(page);
-  await registeredTools(page, PAGE_TOOLS.length);
+  // `dev_export` is the last tool `dev.js` registers (see the wait above) —
+  // this is a readiness barrier, not a read, so waiting by name rather than
+  // `PAGE_TOOLS.length` is what it needs, not what it happens to satisfy.
+  await waitForTool(page, 'dev_export');
 
   // A `.png` is binary whatever its bytes: `paths::content_type_for` maps the
   // extension to `image/png`, `may_be_text` says no, and so `dev_read_file`
