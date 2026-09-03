@@ -144,17 +144,30 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           # Playwright writes each spec's baselines to `<spec>-snapshots/` beside
           # the spec; the examples suite keeps its own under `examples/tests/`.
-          # The glob covers any spec that gains baselines later.
-          BASELINES="crates/impresspress-web/tests/e2e/*-snapshots/ examples/tests/"
+          # `:(glob)` leaves the matching to git instead of the shell, so `**`
+          # crosses directory boundaries and covers specs nested under `e2e/`
+          # as well as ones added directly beside today's.
+          BASELINES=(
+            ':(glob)crates/impresspress-web/tests/e2e/**/*-snapshots/**'
+            'examples/tests/'
+          )
           # Use `git status --porcelain` instead of `git diff` so this also
           # picks up untracked baselines — i.e. ones that were deleted in
           # the PR's prior commit and recreated by --update-snapshots.
-          if [ -z "$(git status --porcelain -- $BASELINES)" ]; then
+          # `git status` tolerates a pathspec that matches nothing but `git add`
+          # exits 128 on one, so narrow the list to the paths that drifted.
+          CHANGED=()
+          for spec in "${BASELINES[@]}"; do
+            if [ -n "$(git status --porcelain -- "$spec")" ]; then
+              CHANGED+=("$spec")
+            fi
+          done
+          if [ ${#CHANGED[@]} -eq 0 ]; then
             echo "::notice::No baseline drift — nothing to commit."
             exit 0
           fi
           echo "Baseline diff detected:"
-          git status --porcelain -- $BASELINES
-          git add -- $BASELINES
+          git status --porcelain -- "${CHANGED[@]}"
+          git add -- "${CHANGED[@]}"
           git commit -m "test(ui): regen visual baselines from CI render (auto-committed by regen-visual-baselines.yml against ${TARGET_BRANCH})"
           git push origin "HEAD:${TARGET_BRANCH}"
