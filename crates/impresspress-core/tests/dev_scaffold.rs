@@ -9,7 +9,8 @@
 use base64ct::{Base64, Encoding};
 use impresspress_core::{
     blocks::dev::{
-        scaffold::Template, test_support::FakeControl, RuntimeControl, WAFER_GUEST_VERSION,
+        blobs, paths, scaffold::Template, test_support::FakeControl, workspace, RuntimeControl,
+        WAFER_GUEST_VERSION,
     },
     test_support::{admin_msg, output_http_status, output_json, TestContext},
 };
@@ -183,6 +184,74 @@ async fn an_unknown_template_is_refused() {
     )
     .await;
     assert!(listed["files"].as_array().expect("files").is_empty());
+}
+
+/// A create that runs out of quota part-way stores nothing at all.
+///
+/// The endpoint writes three files, and the quota is a running total: a
+/// workspace with room for the first and not the second used to store the
+/// first blob and then return without saving, so the bytes it had just put in
+/// the store were never charged for. `check_quotas` bounds on `blob_bytes`
+/// exactly because an unreferenced blob still occupies the author's storage,
+/// so every such refusal left a permanent hole — and a caller sitting on the
+/// limit could retry its way past `MAX_WORKSPACE_BYTES`.
+#[tokio::test]
+async fn a_create_that_runs_out_of_quota_part_way_stores_nothing() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let files = Template::Hello.files("cramped");
+    let (first_path, first_content) = &files[0];
+    let headroom = first_content.len() as u64;
+
+    // Room for the FIRST template file exactly, and for nothing after it.
+    // Staged rather than written, for the reason `dev_files.rs` stages the
+    // same shape: the accumulation itself is covered there, and this pins the
+    // refusal without spending 64 MB.
+    let ws = workspace::Workspace {
+        blob_bytes: paths::MAX_WORKSPACE_BYTES - headroom,
+        ..Default::default()
+    };
+    workspace::save(&ctx, &ws)
+        .await
+        .expect("stage a nearly full workspace");
+
+    let refused = dev_post(
+        &ctx,
+        "/b/dev/api/blocks",
+        json!({"name": "cramped", "template": "hello"}),
+    )
+    .await;
+    assert_eq!(output_http_status(refused).await, 413);
+
+    let after = workspace::load(&ctx).await.expect("load workspace");
+    assert!(after.files.is_empty(), "no entry survives the refusal");
+    assert_eq!(
+        after.blob_bytes,
+        paths::MAX_WORKSPACE_BYTES - headroom,
+        "and the accounting is exactly where it was"
+    );
+    assert_eq!(after.blob_count, 0);
+    // The real check: the file the old code had already put in the store
+    // before it looked at the second one is not there.
+    assert!(
+        !blobs::exists(&ctx, &blobs::sha256_hex(first_content.as_bytes()))
+            .await
+            .expect("probe the blob store"),
+        "{first_path} was stored despite the refusal, so its bytes are unaccounted for"
+    );
+
+    // Which is what keeps the limit a limit: retrying gets the same refusal
+    // and never eats into the headroom.
+    let again = dev_post(
+        &ctx,
+        "/b/dev/api/blocks",
+        json!({"name": "cramped", "template": "hello"}),
+    )
+    .await;
+    assert_eq!(output_http_status(again).await, 413);
+    assert_eq!(
+        workspace::load(&ctx).await.expect("reload").blob_bytes,
+        paths::MAX_WORKSPACE_BYTES - headroom
+    );
 }
 
 /// Scaffolding does not publish: block source reaches the runtime only

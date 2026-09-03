@@ -24,12 +24,14 @@ half of a block id all at once, so the alphabet is the intersection of what
 all three accept. There is no underscore: the runtime refuses one in a block
 id.
 
-**`src/` is flat.** Put every module beside `lib.rs` — `src/handlers.rs`, not
-`src/handlers/mod.rs`. The sandbox refuses a nested path with a
-`nested-source` diagnostic: the browser toolchain writes each file into its
-VFS by path, and whether that creates the intermediate directories has not
-been verified, so a crate laid out that way would fail somewhere inside
-rustc rather than here.
+**The crate is flat: `Cargo.toml` at the root, every source file directly in
+`src/`, and no other directory.** Put every module beside `lib.rs` —
+`src/handlers.rs`, not `src/handlers/mod.rs` — and keep `tests/`, `assets/`
+and the like out of `blocks/<name>/` entirely. The sandbox refuses any path
+that needs a directory it does not have, with a `nested-source` diagnostic:
+the browser toolchain writes each file into its VFS by path, and whether that
+creates the intermediate directories has not been verified, so a crate laid
+out that way would fail somewhere inside rustc rather than here.
 
 A block named `<name>` is registered as `site/<name>` and everything else
 follows from that:
@@ -422,7 +424,7 @@ The codes you are most likely to see:
 | `route-collision` | Another block, or a built-in route, already serves that prefix |
 | `binary-source` | A file under `blocks/<name>/` the toolchain cannot read as text |
 | `package-name` | `Cargo.toml`'s `[package] name` must be the block's directory name |
-| `nested-source` | A file in a subdirectory of `src/` — the layout is flat |
+| `nested-source` | A file in any subdirectory — the crate is `Cargo.toml` plus a flat `src/` |
 | `artifact-too-large` | Restore the `[profile.release]` size settings |
 | `wafer-guest-version` | Rescaffold: the block was built against an older `wafer_guest.rs` |
 | `guest-load` / `guest-info` / `guest-init` / `guest-probe` | The module was loaded and something failed at that stage — the message is the host's |

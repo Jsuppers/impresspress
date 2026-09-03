@@ -232,36 +232,81 @@ pub async fn handle_create(
             .json(&FileConflict::new(existing, ws.get(existing)));
     }
 
-    let mut written = Vec::with_capacity(files.len());
+    // EVERY file's quota is checked before ANY of them is stored. Checking
+    // one and storing it before checking the next means a refusal on the
+    // second returns without ever reaching `workspace::save` below — leaving
+    // the first one's blob in the store while the `record_blob_stored` that
+    // charges for it is discarded with `ws`. `check_quotas` bounds on
+    // `blob_bytes` precisely because a blob no entry names still occupies the
+    // author's storage, so each such refusal would open a permanent hole in
+    // the accounting, and a caller sitting on the limit could widen it past
+    // `MAX_WORKSPACE_BYTES` by retrying. `files::handle_write` cannot reach
+    // this shape — it writes one file — and nothing forces the interleave
+    // here: every size and hash is known before the first store.
+    //
+    // `planned` is checked against a projection rather than against `ws`, so
+    // each file is counted on top of the ones ahead of it in this same
+    // request — including their content, which is what makes two identical
+    // template files cost what the store will actually charge for them.
+    let mut planned = Vec::with_capacity(files.len());
+    let mut projected = ws.clone();
     for (path, content) in &files {
         let bytes = content.as_bytes();
         let sha = blobs::sha256_hex(bytes);
         // What the blob store would grow by. Content some entry already
         // names is certainly stored, so writing the same `wafer_guest.rs`
         // into a second block costs nothing — which is the common case.
-        let new_blob_bytes = if ws.references(&sha) {
+        let new_blob_bytes = if projected.references(&sha) {
             0
         } else {
             bytes.len() as u64
         };
         if let Err(e) = files::check_quotas(
-            &ws,
+            &projected,
             path,
             &WorkspaceArea::Block(request.name.clone()),
             new_blob_bytes,
         ) {
             return e.into_response();
         }
-        // Store, then record — the order `files::handle_write` uses, and for
-        // the same reason: a manifest naming a blob that was never written
-        // would 500 on every later read of that path.
-        match blobs::put_hashed(ctx, &sha, bytes).await {
+        projected.insert(path, sha.clone(), bytes.len() as u64);
+        if new_blob_bytes > 0 {
+            projected.record_blob_stored(new_blob_bytes);
+        }
+        planned.push((path, sha, bytes));
+    }
+
+    // Store, then record — the order `files::handle_write` uses, and for the
+    // same reason: a manifest naming a blob that was never written would 500
+    // on every later read of that path. Which is also why no entry is
+    // inserted until every blob is down: a store that fails on the second
+    // file must not leave the first one named by a half-written block.
+    for (_, sha, bytes) in &planned {
+        match blobs::put_hashed(ctx, sha, bytes).await {
             Ok(blobs::Stored::New) => ws.record_blob_stored(bytes.len() as u64),
             Ok(blobs::Stored::Deduplicated) => {}
-            Err(e) => return err_internal("dev workspace blob write", e),
+            Err(e) => {
+                // The blobs already written are charged for even though this
+                // request is over and no entry will ever name them. They are
+                // in the store, `blob_bytes` is defined as what has been
+                // written and not yet reclaimed, and the collector credits
+                // them back when it reaches them — a workspace saved without
+                // them would under-report storage for good.
+                if let Err(save) = workspace::save(ctx, &ws).await {
+                    tracing::error!(
+                        error = %save,
+                        "dev workspace: a blob write failed and the bytes already stored \
+                         could not be recorded — blob_bytes now under-reports the store"
+                    );
+                }
+                return err_internal("dev workspace blob write", e);
+            }
         }
-        written.push(ws.insert(path, sha, bytes.len() as u64));
     }
+    let written: Vec<_> = planned
+        .into_iter()
+        .map(|(path, sha, bytes)| ws.insert(path, sha, bytes.len() as u64))
+        .collect();
     if let Err(e) = workspace::save(ctx, &ws).await {
         return err_internal("dev workspace save", e);
     }

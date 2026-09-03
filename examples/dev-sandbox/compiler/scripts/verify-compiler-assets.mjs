@@ -3,7 +3,8 @@
  *
  * `examples/dev-sandbox/build.sh --check` runs this, so a tree that would be
  * rejected at deploy time — or, worse, half-served — fails in CI instead. The
- * four things that can go wrong here have all actually gone wrong once:
+ * things that can go wrong here, all but the last of which have actually gone
+ * wrong once:
  *
  *   * a file over the 24 MiB (25 165 824 byte) cap this package holds itself
  *     to — deliberately under Cloudflare's 25 MiB static-asset limit, and why
@@ -20,7 +21,10 @@
  *   * a component composed by `--fast`, which skips `wasm-opt` and is for
  *     local iteration only — unless `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` is
  *     set, which is how a CI job that only wants to know whether the compiler
- *     still WORKS can use a cheap build. The deploy path never sets it.
+ *     still WORKS can use a cheap build. The deploy path never sets it, and
+ *   * a `manifest.json` with no version directory beside it — an interrupted
+ *     build or a partial extraction — which is reported like everything else
+ *     here rather than crashing the walk that would otherwise hit it first.
  *
  * Usage: node scripts/verify-compiler-assets.mjs
  */
@@ -35,6 +39,20 @@ const MAX_ASSET_BYTES = 25165824;
 const here = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const dist = path.join(here, "dist");
 const problems = [];
+
+/**
+ * Print everything found so far and exit non-zero.
+ *
+ * Called from the end of the run, and from the one place that cannot go on:
+ * a `dist/` whose version directory is missing, where the walk below would
+ * throw an ENOENT traceback over the top of the list this script exists to
+ * print.
+ */
+const reportAndExit = () => {
+  for (const problem of problems) console.error(`  ${problem}`);
+  console.error(`verify-compiler-assets.mjs: ${problems.length} problem(s) in ${dist}`);
+  process.exit(1);
+};
 
 const pin = JSON.parse(fs.readFileSync(path.join(here, "PIN.json"), "utf8"));
 const manifestPath = path.join(dist, "manifest.json");
@@ -80,6 +98,20 @@ for (const entry of fs.readdirSync(dist, { withFileTypes: true })) {
   );
 }
 
+// The loop above catches a version directory that should not be there; this
+// catches the one that should. `dist/` reaches this state from an interrupted
+// `build-compiler.sh` or a partial extraction in `fetch-dist.sh` — the
+// manifest lands and the tree it names does not — and the walk below would
+// die with an ENOENT traceback instead of saying so.
+const versionDir = path.join(dist, manifest.version);
+if (!fs.existsSync(versionDir)) {
+  problems.push(
+    `dist/${manifest.version}: manifest.json names this version but the directory is not ` +
+      "there — rebuild with build-compiler.sh, or re-fetch with fetch-dist.sh",
+  );
+  reportAndExit();
+}
+
 const walk = (dir) =>
   fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const full = path.join(dir, entry.name);
@@ -87,7 +119,7 @@ const walk = (dir) =>
   });
 
 const onDisk = new Map(
-  walk(path.join(dist, manifest.version)).map((file) => [
+  walk(versionDir).map((file) => [
     path.relative(dist, file).split(path.sep).join("/"),
     file,
   ]),
@@ -121,9 +153,7 @@ for (const orphan of onDisk.keys()) {
 }
 
 if (problems.length > 0) {
-  for (const problem of problems) console.error(`  ${problem}`);
-  console.error(`verify-compiler-assets.mjs: ${problems.length} problem(s) in ${dist}`);
-  process.exit(1);
+  reportAndExit();
 }
 
 console.log(

@@ -831,10 +831,13 @@ var blockNames = [];
 // Whether a compile is running, whoever started it.
 //
 // Both entries into `compileBlock` — the button and `dev_compile_block` —
-// set it, because a second build is the same waste however it was asked for:
-// the worker refuses a concurrent `compile` outright, so the page would spend
-// another snapshot and another eighty seconds to be told what it already
-// knew. `updateCompileButton` is the only reader; see there.
+// set it, and both are REFUSED by it while it is set, because a second build
+// is the same waste however it was asked for. Nothing below this line refuses
+// one: the WORKER rejects a concurrent `compile`, but the adapter never lets
+// it see one (`compiler-adapter.js`: "the queue therefore lives here"), so a
+// second call would queue up a whole second snapshot and eighty more seconds
+// of rustc for an answer the first one is already producing. Read by
+// `updateCompileButton` and by `compileBlock`; see both.
 var compileInFlight = false;
 
 // Whether Compile can be pressed, and why not when it cannot.
@@ -1063,7 +1066,9 @@ function cargoArtifactStem(text) {
 //     skip would let the crate compile without it, quietly producing a block
 //     whose sources are not the sources on disk; `include_bytes!` of an image
 //     is the shape that gets a human here.
-//   * `nested-source` — a path under a subdirectory of `src/`.
+//   * `nested-source` — a path in any subdirectory the flat crate the worker
+//     writes does not have: anything below `src/`, and anything below a
+//     directory of its own beside `Cargo.toml`.
 //   * `package-name` — a `Cargo.toml` whose package is not this block.
 async function snapshotBlock(name) {
   var prefix = BLOCKS_PREFIX + name + '/';
@@ -1090,20 +1095,29 @@ async function snapshotBlock(name) {
   for (var i = 0; i < listed.files.length; i += 1) {
     var entry = listed.files[i];
     var rel = entry.path.slice(prefix.length);
-    // A flat `src/` is the limit, and this is where it is enforced. The
-    // worker writes every file into the VFS by path, and whether rubrc's
-    // write-file event creates the intermediate directories has never been
-    // verified — so a crate laid out with `src/routes/mod.rs` would fail
-    // somewhere inside rustc, with a message about a module it could not
-    // find, instead of failing here with the path in it. Refused before the
-    // read, because nothing about the contents changes the answer.
-    if (rel.indexOf('src/') === 0 && rel.indexOf('/', 4) >= 0) {
+    // A manifest at the root and a flat `src/` is the whole shape the worker
+    // can write, and this is where that is enforced. It writes every file
+    // into the VFS by path, and whether rubrc's write-file event creates the
+    // intermediate directories has never been verified — so ANY path that
+    // needs one would fail somewhere inside rustc or the VFS forty seconds
+    // later, with a message about a module it could not find, instead of
+    // failing here with the path in it. That is as true of `tests/smoke.rs`
+    // and `assets/logo.svg` as it is of `src/routes/mod.rs`, so the test is
+    // "a directory separator this layout does not have" rather than "a
+    // second one under `src/`". Refused before the read, because nothing
+    // about the contents changes the answer.
+    var firstSlash = rel.indexOf('/');
+    var nested =
+      firstSlash >= 0 &&
+      (rel.slice(0, firstSlash + 1) !== 'src/' || rel.indexOf('/', firstSlash + 1) >= 0);
+    if (nested) {
       diagnostics.push({
         severity: 'error',
         code: 'nested-source',
         message:
           entry.path +
-          ' is in a subdirectory of src/, and the browser toolchain compiles a flat src/. ' +
+          ' is in a subdirectory, and the browser toolchain compiles a flat crate: ' +
+          'Cargo.toml at the root and every source file directly in src/. ' +
           'Move it beside lib.rs.',
         file: rel,
         line: null,
@@ -1187,6 +1201,18 @@ async function snapshotBlock(name) {
 // and it comes back however the build ended — including a throw, which is
 // why this is a `finally` and not a line at each exit.
 async function compileBlock(name) {
+  // The flag is a lock, not just a button state. Two builds may genuinely
+  // overlap — `dev_compile_block` while the button's compile runs, or an
+  // agent issuing the tool twice — and letting the second through would run
+  // it to completion behind the first in the adapter's queue, with the FIRST
+  // one's `finally` clearing this flag and re-enabling `#dev-compile` while
+  // the second was still going: a button offering a third build over a
+  // running one. A throw rather than a `success: false`, per the split
+  // `runCompile` documents — a refused request is a failure of the
+  // machinery, not a verdict on the block, and reaches an agent as `isError`.
+  if (compileInFlight) {
+    throw new Error('a compile is already running — wait for it to finish');
+  }
   compileInFlight = true;
   updateCompileButton();
   try {

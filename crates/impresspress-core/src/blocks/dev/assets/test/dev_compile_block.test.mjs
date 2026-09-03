@@ -141,6 +141,42 @@ test('snapshotBlock refuses a nested source directory with a nested-source diagn
   );
 });
 
+test('a subdirectory that is not under src/ is refused by the same rule', async () => {
+  const { handle, fetchCalls } = instantiate({
+    workspace: [
+      ...HELLO,
+      file('blocks/hello/tests/smoke.rs', '#[test] fn t() {}\n'),
+      file('blocks/hello/assets/logo.svg', '<svg/>\n')
+    ]
+  });
+  const snapshot = await handle.snapshotBlock('hello');
+
+  // The reason the rule exists is the VFS write, not the `src/` prefix: a
+  // crate-relative path with a directory in it needs an intermediate
+  // directory wherever it sits, and `tests/smoke.rs` used to sail past the
+  // guard and fail inside the worker forty seconds later instead.
+  // Sorted, because the order is the file listing's and not this rule's.
+  assert.deepEqual(
+    snapshot.diagnostics.map((d) => `${d.code} ${d.file}`).sort(),
+    ['nested-source assets/logo.svg', 'nested-source tests/smoke.rs']
+  );
+  assert.ok(!('tests/smoke.rs' in snapshot.files));
+  assert.ok(!('assets/logo.svg' in snapshot.files));
+  // The flat crate itself is untouched by the widened rule.
+  assert.deepEqual(Object.keys(snapshot.files).sort(), [
+    'Cargo.toml',
+    'src/lib.rs',
+    'src/wafer_guest.rs'
+  ]);
+  assert.ok(
+    !fetchCalls.some(
+      (call) =>
+        String(call[0]) === '/b/dev/api/files/read' &&
+        JSON.parse(call[1].body).path === 'blocks/hello/tests/smoke.rs'
+    )
+  );
+});
+
 test('snapshotBlock refuses a Cargo.toml whose package is not the block', async () => {
   const { handle } = instantiate({
     workspace: [
@@ -525,6 +561,50 @@ test('the status is not polled while the worker compiles, only while the sandbox
   // Staging DID open the window — the ladder the panel shows comes from the
   // catch-up that closing it runs.
   assert.ok(statusReads > readsBeforeCompile);
+});
+
+test('a second compile is refused while one is running, not queued behind it', async () => {
+  // A compile that does not finish until this test says so, which is the only
+  // way to have two of them in flight at once.
+  let release;
+  const running = new Promise((resolve) => {
+    release = resolve;
+  });
+  let compiles = 0;
+  const { tools, handle, elements } = instantiate({
+    hasModelContext: true,
+    compilerManifest: MANIFEST,
+    workspace: HELLO,
+    compiler: fakeCompiler(async () => {
+      compiles += 1;
+      await running;
+      return { ...BUILT, success: false, artifact: null };
+    })
+  });
+  await settle();
+
+  const first = tools.get('dev_compile_block').execute({ name: 'hello' });
+  await settle();
+  assert.equal(elements.get('dev-compile').disabled, true);
+
+  // The adapter would QUEUE this one — the worker is what refuses a
+  // concurrent compile, and the page never lets it see one — so without the
+  // guard this runs a second snapshot and a second build, and the first
+  // one's `finally` re-enables the button while it is still going.
+  const second = await tools.get('dev_compile_block').execute({ name: 'hello' });
+  assert.equal(second.isError, true);
+  assert.match(second.content[0].text, /a compile is already running/);
+  assert.equal(compiles, 1, 'the second call never reached the compiler');
+  // Refused, so the button state still belongs to the compile that is running.
+  assert.equal(elements.get('dev-compile').disabled, true);
+
+  // And a refusal does not clear the first compile's flag on the way out:
+  // the button comes back only when the build it belongs to ends.
+  release();
+  await first;
+  assert.equal(elements.get('dev-compile').disabled, false);
+  // Which is also when the next one is accepted.
+  await assert.doesNotReject(handle.compileBlock('hello'));
 });
 
 test('a failed compile still releases the Compile button', async () => {

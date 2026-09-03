@@ -34,9 +34,11 @@
 # built, that its files match `compiler/dist/manifest.json` and none of them
 # is over Cloudflare's asset limit — exiting non-zero on drift, WITHOUT
 # building anything — this is what CI runs to catch a seed file edited
-# without regenerating the manifest. A plain build runs the same check first,
-# so a stale manifest fails fast rather than shipping a bundle
-# `seed::import` will refuse at runtime.
+# without regenerating the manifest. A plain build runs both of those checks
+# too — the seed's before it builds anything, so a stale manifest fails fast
+# rather than shipping a bundle `seed::import` will refuse at runtime, and the
+# compiler's once the toolchain is in place, over whatever `dist/` the build
+# is about to overlay.
 #
 # The whole wasm-pack output is bundled, not just the wasm + JS pair: the JS
 # glue imports from `snippets/`, and a pkg dir missing that tree cannot load
@@ -167,6 +169,17 @@ else
   log "compiler/build-compiler.sh (dist is missing or built from another pin)"
   "$HERE/compiler/build-compiler.sh"
 fi
+# `compiler_is_current` answers one question — was this tree built from the
+# pin in the file? — off two manifest fields, and never looks at the bytes
+# beside it or at `manifest.build`. A `--fast` component is therefore
+# "current" forever: `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` is needed for the
+# run of `build-compiler.sh` that PRODUCES one, and not for any later build
+# that picks it up. So the verifier runs here as well, over whatever `dist/`
+# is about to be overlaid — without it a plain build would quietly assemble an
+# unoptimized toolchain, and an edited or truncated file under `dist/` would
+# ship unhashed. This is the check every other file in this directory says is
+# what keeps a `--fast` tree out of a deploy.
+check_compiler
 
 # 1. The feature-on wasm. `--out-dir pkg-dev` keeps it away from `pkg/`, which
 #    is the ordinary (feature-off) bundle every other consumer serves — a
