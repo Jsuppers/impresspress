@@ -103,6 +103,13 @@ pub struct RuntimeFactory {
     /// for it" on a build where the sandbox does not exist.
     pub(crate) dev_active: bool,
     pub(crate) config_svc: Arc<dyn ConfigService>,
+    /// The runtime's per-block [`wafer_run::ConfigSource`]. Built empty and
+    /// filled by [`crate::BrowserBootHooks`] once the variables table exists
+    /// — see `SharedConfigSource` for why the browser is the one target that
+    /// cannot supply this at build time. Held on the factory (like
+    /// `config_svc` and `crypto`) so a rebuild reuses the same allocation and
+    /// the blocks of the new runtime see the config the old one resolved.
+    pub(crate) config_source: Arc<impresspress_core::config_source::SharedConfigSource>,
     /// Held as the concrete type (not `Arc<dyn CryptoService>`) so
     /// [`crate::BrowserBootHooks`] can rotate the JWT secret through
     /// `set_jwt_secret` after admin's migration seeds it.
@@ -126,6 +133,12 @@ impl RuntimeFactory {
 
         let config_svc: Arc<dyn ConfigService> =
             Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());
+
+        // Empty until `seed_after_admin_init` publishes into it. See the field
+        // comment: this is the browser's answer to "build first, learn the
+        // config second", and without it every block that declares a required
+        // key with an empty default fails init permanently.
+        let config_source = Arc::new(impresspress_core::config_source::SharedConfigSource::new());
 
         // JWT secret can't be loaded yet (the variables table doesn't exist
         // until admin's migration runs). Construct the concrete
@@ -158,6 +171,7 @@ impl RuntimeFactory {
         Ok(Self {
             dev_active,
             config_svc,
+            config_source,
             crypto,
             llm,
             image,
@@ -219,14 +233,23 @@ impl RuntimeFactory {
         // settings are loaded.
         let initial_block_settings =
             impresspress_core::features::BlockSettings::from_map(HashMap::new());
-        // Empty StaticConfigSource: blocks that look up their declared keys via
-        // the runtime's ConfigSource at lifecycle(Init) payload-build time will
-        // see nothing. That's fine because impresspress blocks read their keys
-        // via `config_client::get` (which hits `wafer-run/config` →
-        // ConfigService) rather than the Init payload, and the boot hook
-        // populates `config_svc` before triggering any block's Init.
-        let cfg_source: Arc<dyn wafer_run::ConfigSource> =
-            Arc::new(wafer_run::StaticConfigSource::default());
+        // The factory's own `SharedConfigSource`, EMPTY at this point and
+        // filled by the boot hook below once admin's migration has created the
+        // variables table.
+        //
+        // It used to be a permanently-empty `StaticConfigSource`, on the
+        // premise that impresspress blocks read their keys through
+        // `config_client::get` (`wafer-run/config` → ConfigService) rather
+        // than the Init payload, so the source did not matter. The premise is
+        // true and the conclusion was wrong: the runtime resolves a block's
+        // DECLARED keys through this source *before* calling its
+        // `lifecycle(Init)` at all, and a required key it cannot resolve is
+        // `InitError::Permanent`. `impresspress/products` declares one
+        // (`IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET`, auto-generated, no
+        // default), so every browser bundle answered `412
+        // FailedPrecondition` on every products route — the block never
+        // reached the code that would have read the value.
+        let cfg_source: Arc<dyn wafer_run::ConfigSource> = self.config_source.clone();
         let crypto_svc: Arc<dyn CryptoService> = self.crypto.clone();
 
         // `add_block_config` is a map insert, not a merge — the last
@@ -352,6 +375,7 @@ impl RuntimeFactory {
         let hooks = crate::BrowserBootHooks {
             db: impresspress_browser::make_database_service(),
             config_svc: self.config_svc.clone(),
+            config_source: self.config_source.clone(),
             block_settings_handle,
             jwt_secret_handle,
             crypto: self.crypto.clone(),

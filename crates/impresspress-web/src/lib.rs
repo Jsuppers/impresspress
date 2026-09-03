@@ -110,6 +110,8 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
 /// defaults) and the #222 block-settings hash-gate, then publishes the loaded
 /// state into the services the wafer already holds:
 ///  - `config_svc` — the same `Arc<dyn ConfigService>` (mutated via `.set()`).
+///  - `config_source` — the `SharedConfigSource` the runtime resolves every
+///    block's declared `ConfigVar`s from at its first `lifecycle(Init)`.
 ///  - `block_settings_handle` — the same `Arc<RwLock<BlockSettings>>` the
 ///    router's `FeatureConfig` reads, so the write is visible to the
 ///    subsequent `init_all_blocks()` and every later request.
@@ -122,6 +124,8 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
 struct BrowserBootHooks {
     db: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
     config_svc: Arc<dyn ConfigService>,
+    /// The runtime's per-block config source, empty until this hook fills it.
+    config_source: Arc<impresspress_core::config_source::SharedConfigSource>,
     block_settings_handle: Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>>,
     jwt_secret_handle: Arc<std::sync::RwLock<String>>,
     crypto: Arc<impresspress_browser::crypto::BrowserCryptoService>,
@@ -146,6 +150,14 @@ impl builder::BootHooks for BrowserBootHooks {
         for (key, value) in &vars {
             self.config_svc.set(key, value);
         }
+        // The runtime resolves every block's DECLARED `ConfigVar`s through the
+        // config source before it calls that block's `lifecycle(Init)` — a
+        // required key it cannot resolve is `InitError::Permanent`, and the
+        // block is then dead for the life of the runtime however well its
+        // handlers would have coped with the value being absent. So the
+        // seeded map goes here as well as into the ConfigService: this is the
+        // half `init_all_blocks()` below actually consults.
+        self.config_source.publish(vars.clone());
         // This adapter executes inside an end user's browser. Set the marker
         // after persisted variables are published so a database/admin value
         // cannot accidentally enable Stripe secret-key operations locally.
