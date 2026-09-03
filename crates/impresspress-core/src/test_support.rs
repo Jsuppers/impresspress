@@ -365,11 +365,11 @@ impl TestContext {
         // Task 7 builds on would fail here for the wrong reason.
         storage.update_wrap_grants(&dev::wrap_grants());
         ctx.register_block("wafer-run/storage", storage);
-        ctx.add_extra_route(ExtraRoute {
-            prefix: dev::ROUTE_PREFIX.to_string(),
-            access: crate::routing::RouteAccess::Admin,
-            block_name: dev::BLOCK_NAME.to_string(),
-        });
+        ctx.add_extra_route(ExtraRoute::new(
+            dev::ROUTE_PREFIX.to_string(),
+            dev::BLOCK_NAME.to_string(),
+            crate::routing::RouteAccess::Admin,
+        ));
         ctx.with_wrap(dev::BLOCK_NAME, dev::wrap_grants(), "impresspress/admin")
     }
 

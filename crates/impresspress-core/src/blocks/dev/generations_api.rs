@@ -73,8 +73,20 @@ pub async fn handle_detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 async fn detail(ctx: &dyn Context, id: &str) -> Result<GenerationDetail, WaferError> {
     let (row, manifest) = generation::load(ctx, id).await?;
+    // A parent that is no longer in the ledger is a MISSING BASELINE, not a
+    // missing generation. Propagating its `NotFound` through the same `?` as
+    // the row above would surface at `handle_detail` as `"no generation {id}"`
+    // naming the CHILD — a 404 for a generation the list response is still
+    // showing, sending the caller after the wrong id. Retention is bounded, so
+    // a parent outliving its child is expected rather than exceptional: the
+    // diff simply has nothing to be a diff from, exactly as for a generation
+    // that never had a parent.
     let parent = match row.parent_id.as_deref() {
-        Some(parent_id) => Some(generation::load(ctx, parent_id).await?.1),
+        Some(parent_id) => match generation::load(ctx, parent_id).await {
+            Ok((_row, manifest)) => Some(manifest),
+            Err(e) if e.code == ErrorCode::NotFound => None,
+            Err(e) => return Err(e),
+        },
         None => None,
     };
     Ok(GenerationDetail {

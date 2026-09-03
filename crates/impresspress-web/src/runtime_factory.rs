@@ -295,7 +295,16 @@ impl RuntimeFactory {
             for (spec, block) in dynamic {
                 builder = builder.extra_block(spec.name.clone(), Arc::clone(block));
                 for route in &spec.routes {
-                    builder = builder.add_route(
+                    // `add_refined_route`, NOT `add_route`: a guest's accepted
+                    // spec carries one `Public` prefix as a FLOOR, on the
+                    // understanding that every path it actually serves is
+                    // governed by the endpoint the guest declared for it. With
+                    // `add_route` that floor would be the whole answer for any
+                    // path the guest did not declare — including EVERY path,
+                    // for a guest that declares no endpoints at all — and the
+                    // sandbox would serve host-compiled third-party code to
+                    // anonymous callers. See `routing::ExtraRoute`.
+                    builder = builder.add_refined_route(
                         route.prefix.clone(),
                         spec.name.clone(),
                         route.access.to_route_access(),

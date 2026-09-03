@@ -159,6 +159,60 @@ impl Workspace {
         self.blob_count = self.blob_count.saturating_sub(1);
     }
 
+    /// The existing path that stops `path` from being stored, if any.
+    ///
+    /// # Why a set of paths can be invalid when every path in it is valid
+    ///
+    /// [`super::paths::validate_path`] judges one path on its own, which is
+    /// all it can do — but the workspace is written to a *hierarchical* store,
+    /// where a name is a file or a directory and never both. Two individually
+    /// legal paths can therefore disagree about one name:
+    ///
+    /// ```text
+    /// site/blog/index.html   `blog` is a directory
+    /// site/blog              `blog` is a file
+    /// ```
+    ///
+    /// Whichever is written second fails inside the storage backend — OPFS
+    /// answers `getFileHandle(…, {create: true})` on a directory (and
+    /// `getDirectoryHandle` on a file) with `TypeMismatchError`, and a native
+    /// filesystem answers `IsADirectory`. That failure arrives at *publish*
+    /// time, long after `workspace.json` accepted both paths, and it recurs on
+    /// every later publish: the generation is marked `Failed`, so the
+    /// published manifest never advances and the next publish attempts the
+    /// same pair of writes. The sandbox wedges permanently, with a message
+    /// that names a storage type mismatch rather than the two files that
+    /// caused it.
+    ///
+    /// This is the same reasoning that puts the [`super::paths::META_SUFFIX`]
+    /// rule in `validate_path` rather than in the backend, applied to the one
+    /// shape a single path cannot reveal. Refusing it on the way in is what
+    /// makes it a 400 naming both paths instead.
+    ///
+    /// Returns the offending existing path, in either direction: `path` is a
+    /// directory prefix of something stored, or something stored is a
+    /// directory prefix of `path`.
+    pub fn path_collision(&self, path: &str) -> Option<&str> {
+        // `path` used as a directory by an existing entry. `files` is ordered,
+        // so the first key at or after `path/` is the only candidate.
+        let as_dir = format!("{path}/");
+        if let Some((stored, _)) = self.files.range(as_dir.clone()..).next() {
+            if stored.starts_with(&as_dir) {
+                return Some(stored.as_str());
+            }
+        }
+        // An existing entry used as a directory by `path`. Bounded by path
+        // depth, which `validate_path` has already capped.
+        let mut cursor = path;
+        while let Some((parent, _)) = cursor.rsplit_once('/') {
+            if let Some(entry) = self.files.get(parent) {
+                return Some(entry.path.as_str());
+            }
+            cursor = parent;
+        }
+        None
+    }
+
     /// Every distinct block name the workspace defines sources for, sorted.
     pub fn block_names(&self) -> Vec<String> {
         self.files
@@ -388,6 +442,40 @@ mod tests {
         ws.record_blob_freed(10);
         assert_eq!(ws.blob_bytes, 0);
         assert_eq!(ws.blob_count, 0);
+    }
+
+    /// Both directions of the file/directory clash, and the near misses that
+    /// must NOT be refused (a shared prefix that stops mid-segment).
+    #[test]
+    fn path_collision_reports_the_entry_that_claims_the_name() {
+        let mut ws = Workspace::default();
+        ws.insert("site/blog/index.html", "a".to_string(), 1);
+        ws.insert("site/style.css", "b".to_string(), 1);
+
+        // `site/blog` is a directory here, so it cannot also be a file.
+        assert_eq!(ws.path_collision("site/blog"), Some("site/blog/index.html"));
+        // `site` too, however deep the existing entry is.
+        assert_eq!(ws.path_collision("site"), Some("site/blog/index.html"));
+        // The reverse: `site/style.css` is a file, so nothing lives under it.
+        assert_eq!(
+            ws.path_collision("site/style.css/extra"),
+            Some("site/style.css")
+        );
+        assert_eq!(
+            ws.path_collision("site/style.css/a/b"),
+            Some("site/style.css")
+        );
+
+        // A path that merely shares a textual prefix is fine — the clash is
+        // about whole segments, which is why the check appends the separator.
+        assert!(ws.path_collision("site/blogroll").is_none());
+        assert!(ws.path_collision("site/style.css.map").is_none());
+        // A sibling, and the entry itself (an overwrite is not a collision).
+        assert!(ws.path_collision("site/blog/about.html").is_none());
+        assert!(ws.path_collision("site/blog/index.html").is_none());
+        assert!(Workspace::default()
+            .path_collision("site/anything")
+            .is_none());
     }
 
     #[test]

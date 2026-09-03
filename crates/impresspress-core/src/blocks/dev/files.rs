@@ -164,6 +164,21 @@ pub async fn handle_write(
             return conflict(&request.path, current);
         }
 
+        // One name cannot be both a file and a directory in the store the
+        // workspace is published to. Refused here, with both paths named,
+        // rather than at publish time as an opaque backend type mismatch that
+        // then recurs on every later publish — see
+        // [`workspace::Workspace::path_collision`].
+        if let Some(clash) = ws.path_collision(&request.path) {
+            return no_store_error(
+                ErrorCode::InvalidArgument,
+                &format!(
+                    "{:?} cannot be stored: {clash:?} already uses part of that path as a                      directory, or is a file this path would need as one. A name is a file or a                      directory, never both — rename one of them.",
+                    request.path
+                ),
+            );
+        }
+
         // How much the blob store would grow by. Content some entry already
         // names is certainly stored (the collector only reclaims unreachable
         // blobs), so re-writing it — an undo, or the same asset at a second

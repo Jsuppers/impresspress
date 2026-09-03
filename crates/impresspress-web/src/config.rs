@@ -17,14 +17,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use wafer_core::interfaces::database::service::DatabaseService;
 
-/// Config key recording that this bundle booted with the development sandbox.
-///
-/// `IMPRESSPRESS_*` with single underscores: infrastructure, not a
-/// `WAFER_RUN_SHARED__*` app setting and not a `{ORG}__{BLOCK}__*` block-scoped
-/// one. The same spelling is used in the database, the config service and the
-/// wafer config snapshot — there is no second representation of it anywhere.
-pub const DEV_ENABLED_KEY: &str = "IMPRESSPRESS_DEV_ENABLED";
-
 /// Seed the browser-only default variables, auto-generate declared secrets,
 /// and return the full variable map. Browser-equivalent of the native
 /// `seed_and_load_variables()` — there are no process env vars in the browser,
@@ -32,9 +24,10 @@ pub const DEV_ENABLED_KEY: &str = "IMPRESSPRESS_DEV_ENABLED";
 /// `dev_active` is the *resolved* verdict from
 /// [`crate::runtime_factory::resolve_dev_active`], never the raw
 /// `initialize({ dev })` request: on a build without `browser-devtools` the
-/// sandbox does not exist, so neither of the two variables below may be
-/// seeded — a feature-off boot must leave a database indistinguishable from
-/// one that never asked for a sandbox.
+/// sandbox does not exist, so a feature-off boot must leave a database
+/// indistinguishable from one that never asked for a sandbox — which is why
+/// `WAFER_RUN_SHARED__HAS_LANDING_PAGE` below is written on BOTH verdicts
+/// rather than only on the affirmative one.
 pub async fn seed_and_load_variables(
     db: &Arc<dyn DatabaseService>,
     dev_active: bool,
@@ -73,49 +66,47 @@ pub async fn seed_and_load_variables(
     )
     .await?;
 
-    if dev_active {
-        // The sandbox owns `/` — an editable site is the point of it — so the
-        // router must serve `wafer-run/web` there instead of bouncing
-        // anonymous visitors to the login page (design §7.3).
-        //
-        // FORCE-SET, not seeded. This hook runs *after* the admin block's
-        // `lifecycle(Init)`, which has already written every declared
-        // `config_vars` default — and `WAFER_RUN_SHARED__HAS_LANDING_PAGE` is
-        // declared, defaulting to `"false"`. `seed_variable_if_absent` is
-        // therefore a guaranteed no-op on this key, which is precisely the
-        // bug Plan 1 Task 10's e2e caught: the sandbox published a site that
-        // `/` then refused to serve. It is also not merely an ordering
-        // accident to be worked around — a sandbox bundle ALWAYS has a site
-        // (the seed guarantees one), so this is a fact about the deployment
-        // rather than a default anyone should be able to leave at `"false"`,
-        // and re-asserting it on every boot is the honest expression of that.
-        // `set_variable` writes nothing when the value already matches.
-        impresspress_core::boot::set_variable(
-            db,
-            "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
-            "true",
-            "Has Landing Page",
-            "Serve a static landing page (wafer-run/web) at `/` instead of \
-             redirecting anonymous visitors to the login page",
-            false,
-        )
-        .await?;
-        // Infrastructure naming (`IMPRESSPRESS_*`, single underscores): this
-        // records what the *bundle* was built and booted with, so the admin UI
-        // and the `/b/dev` page can both see that the sandbox is live without
-        // either of them re-deriving it. Seeded rather than set, so an
-        // operator edit survives the next boot.
-        impresspress_core::boot::seed_variable_if_absent(
-            db,
-            DEV_ENABLED_KEY,
-            "true",
-            "Development Sandbox",
-            "Whether this bundle booted with the browser development sandbox \
-             (`impresspress/dev`, `/b/dev`) enabled",
-            false,
-        )
-        .await?;
-    }
+    // The sandbox owns `/` — an editable site is the point of it — so the
+    // router must serve `wafer-run/web` there instead of bouncing anonymous
+    // visitors to the login page (design §7.3).
+    //
+    // FORCE-SET, not seeded, and force-set in BOTH directions.
+    //
+    // Not seeded, because this hook runs *after* the admin block's
+    // `lifecycle(Init)`, which has already written every declared
+    // `config_vars` default — and `WAFER_RUN_SHARED__HAS_LANDING_PAGE` is
+    // declared, defaulting to `"false"`. `seed_variable_if_absent` is
+    // therefore a guaranteed no-op on this key, which is precisely the bug
+    // Plan 1 Task 10's e2e caught: the sandbox published a site that `/` then
+    // refused to serve.
+    //
+    // Both directions, because the browser database is keyed by ORIGIN and
+    // outlives the bundle that wrote it. Serving a `dev: false` build (or one
+    // compiled without `browser-devtools`) to an origin the sandbox bundle
+    // previously ran on would otherwise leave a stale `"true"` in OPFS, and
+    // `/` would keep serving a site nothing can publish to any more instead of
+    // redirecting anonymous visitors to the login page. That directly
+    // contradicts what `runtime_factory::resolve_dev_active` promises — "a
+    // build without the feature must produce a runtime indistinguishable from
+    // one that was never asked for a sandbox" — and a value only ever written
+    // in one direction cannot deliver it.
+    //
+    // Writing `"false"` here overrides nothing an operator would have set: in
+    // the browser target the sandbox is the ONLY producer of a landing page
+    // (no web flow publishes a site — see `cli/flows/{sealed,embed}_web.rs`,
+    // unlike their native counterparts), so without it there is nothing at `/`
+    // to serve. `set_variable` writes nothing when the value already matches,
+    // so the common case is a read.
+    impresspress_core::boot::set_variable(
+        db,
+        "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+        if dev_active { "true" } else { "false" },
+        "Has Landing Page",
+        "Serve a static landing page (wafer-run/web) at `/` instead of \
+         redirecting anonymous visitors to the login page",
+        false,
+    )
+    .await?;
 
     // Auto-generate declared secrets (incl. the auth JWT secret) and load the
     // full set back — the shared core path, over BrowserDatabaseService.

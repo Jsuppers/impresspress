@@ -161,6 +161,15 @@ export function validateSegments(segments) {
         if (INVALID_SEGMENT_CHARS.test(s)) {
             throw new TypeError(`storage path segment contains an invalid character: ${JSON.stringify(s)}`);
         }
+        // EVERY segment, not just the leaf: a DIRECTORY named `page.html.__meta__`
+        // lands in the same OPFS directory as the sidecar of a sibling file
+        // named `page.html`, and the two then fight over one name. The Rust
+        // producer refuses the suffix on every segment for exactly this reason
+        // (`paths.rs::validate_path`); this is the same rule at the boundary
+        // that owns the sidecars.
+        if (s.endsWith(META_SUFFIX)) {
+            throw new TypeError(`storage path segment may not name a metadata sidecar: ${JSON.stringify(s)}`);
+        }
     }
     return segments;
 }
@@ -170,12 +179,10 @@ export function splitKey(key) {
     if (typeof key !== 'string' || key === '' || key.endsWith('/')) {
         throw new TypeError(`invalid storage key: ${JSON.stringify(key)}`);
     }
+    // `validateSegments` refuses META_SUFFIX on every segment, the leaf
+    // included, so there is no separate leaf check here.
     const segments = validateSegments(key.split('/'));
-    const leaf = segments[segments.length - 1];
-    if (leaf.endsWith(META_SUFFIX)) {
-        throw new TypeError(`storage key may not name a metadata sidecar: ${key}`);
-    }
-    return { dirs: segments.slice(0, -1), leaf };
+    return { dirs: segments.slice(0, -1), leaf: segments[segments.length - 1] };
 }
 
 export function joinKey(dirs, leaf) {
@@ -314,6 +321,43 @@ export async function storageDelete(folder, key) {
         await parent.removeEntry(metaName(leaf));
     } catch (_e) {
         // Metadata may not exist
+    }
+    await pruneEmptyDirs(folderHandle, dirs);
+}
+
+/**
+ * Drop the directories `dirs` names, deepest first, for as long as they are
+ * empty. Stops at `folderHandle`, which is the storage folder itself and is
+ * never removed.
+ *
+ * A storage key namespace is flat to its callers — `blog/post.html` is a key,
+ * not a file in a directory — but OPFS makes `blog` a real directory, and a
+ * directory OUTLIVES the last key under it. That leftover is not merely
+ * untidy: a name is a directory or a file and never both, so an empty `blog`
+ * makes `storagePut(folder, 'blog', …)` throw `TypeMismatchError` at
+ * `getFileHandle(…, {create: true})` forever. The dev sandbox reaches that
+ * state by publishing a site where a path stops being a directory and becomes
+ * a page — see `publisher.rs`, which orders such a deletion before the write
+ * precisely so this prune can free the name in time.
+ *
+ * Best-effort by construction: `removeEntry` without `recursive` throws
+ * `InvalidModificationError` on a directory that is not empty, which is the
+ * normal case (a sibling key still lives there) and the signal to stop
+ * walking up.
+ */
+async function pruneEmptyDirs(folderHandle, dirs) {
+    for (let depth = dirs.length; depth > 0; depth -= 1) {
+        let parent = folderHandle;
+        try {
+            for (const segment of dirs.slice(0, depth - 1)) {
+                parent = await parent.getDirectoryHandle(segment, { create: false });
+            }
+            await parent.removeEntry(dirs[depth - 1]);
+        } catch (_e) {
+            // Not empty, or already gone. Either way nothing above it can be
+            // empty either, so stop.
+            return;
+        }
     }
 }
 

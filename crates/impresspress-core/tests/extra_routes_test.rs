@@ -160,11 +160,11 @@ async fn built_in_route_wins_over_extra_with_same_prefix() {
     let features = AllEnabled;
 
     // Extra route tries to steal /b/auth/ — must lose to the built-in.
-    let extras = vec![ExtraRoute {
-        prefix: "/b/auth/".into(),
-        access: RouteAccess::Public,
-        block_name: "gizza-ai/stolen-auth".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/auth/",
+        "gizza-ai/stolen-auth",
+        RouteAccess::Public,
+    )];
 
     // Authenticated so the request clears the deny-by-default gate for
     // undeclared paths (this test drives `route_to_block` with empty
@@ -189,11 +189,11 @@ async fn public_extra_route_dispatches_without_auth() {
     let ctx = RecordingContext::new();
     let features = AllEnabled;
 
-    let extras = vec![ExtraRoute {
-        prefix: "/b/chat/".into(),
-        access: RouteAccess::Public,
-        block_name: "gizza-ai/chat".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Public,
+    )];
 
     // No user_id set on the message — Public access should allow it through.
     let msg = make_msg("/b/chat/hello");
@@ -211,11 +211,11 @@ async fn authenticated_extra_route_forbids_empty_user_id() {
     let ctx = RecordingContext::new();
     let features = AllEnabled;
 
-    let extras = vec![ExtraRoute {
-        prefix: "/b/chat/".into(),
-        access: RouteAccess::Authenticated,
-        block_name: "gizza-ai/chat".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Authenticated,
+    )];
 
     let msg = make_msg("/b/chat/hello"); // no user_id
     let input = InputStream::empty();
@@ -234,11 +234,11 @@ async fn authenticated_extra_route_allows_user() {
     let ctx = RecordingContext::new();
     let features = AllEnabled;
 
-    let extras = vec![ExtraRoute {
-        prefix: "/b/chat/".into(),
-        access: RouteAccess::Authenticated,
-        block_name: "gizza-ai/chat".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Authenticated,
+    )];
 
     let msg = make_msg_with_user("/b/chat/hello", "user-123");
     let input = InputStream::empty();
@@ -254,11 +254,11 @@ async fn admin_extra_route_forbids_non_admin() {
     let ctx = RecordingContext::new();
     let features = AllEnabled;
 
-    let extras = vec![ExtraRoute {
-        prefix: "/b/gizza-admin/".into(),
-        access: RouteAccess::Admin,
-        block_name: "gizza-ai/admin".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/gizza-admin/",
+        "gizza-ai/admin",
+        RouteAccess::Admin,
+    )];
 
     // User is authenticated but lacks the admin role.
     let msg = make_msg_with_user("/b/gizza-admin/dash", "user-123");
@@ -275,11 +275,11 @@ async fn admin_extra_route_allows_admin() {
     let ctx = RecordingContext::new();
     let features = AllEnabled;
 
-    let extras = vec![ExtraRoute {
-        prefix: "/b/gizza-admin/".into(),
-        access: RouteAccess::Admin,
-        block_name: "gizza-ai/admin".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/gizza-admin/",
+        "gizza-ai/admin",
+        RouteAccess::Admin,
+    )];
 
     let msg = make_msg_with_admin("/b/gizza-admin/dash", "admin-1");
     let input = InputStream::empty();
@@ -305,11 +305,11 @@ async fn admin_extra_route_allows_admin() {
 #[tokio::test]
 async fn anonymous_html_request_on_authenticated_route_redirects_to_login() {
     let ctx = RecordingContext::new();
-    let extras = vec![ExtraRoute {
-        prefix: "/b/chat/".into(),
-        access: RouteAccess::Authenticated,
-        block_name: "gizza-ai/chat".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Authenticated,
+    )];
     let mut msg = make_msg("/b/chat/hello");
     msg.set_meta("http.header.accept", "text/html,application/xhtml+xml");
     let stream =
@@ -326,11 +326,11 @@ async fn anonymous_html_request_on_authenticated_route_redirects_to_login() {
 #[tokio::test]
 async fn authenticated_non_admin_html_request_on_admin_route_still_403s() {
     let ctx = RecordingContext::new();
-    let extras = vec![ExtraRoute {
-        prefix: "/b/gizza-admin/".into(),
-        access: RouteAccess::Admin,
-        block_name: "gizza-ai/admin".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/gizza-admin/",
+        "gizza-ai/admin",
+        RouteAccess::Admin,
+    )];
     // Authenticated (user_id set) but lacking the admin role, asking for HTML.
     // The role-failure case is a genuine 403 — it must NOT redirect to login.
     let mut msg = make_msg_with_user("/b/gizza-admin/dash", "user-123");
@@ -351,11 +351,11 @@ async fn unmatched_path_falls_through_to_not_found() {
     let ctx = RecordingContext::new();
     let features = AllEnabled;
 
-    let extras = vec![ExtraRoute {
-        prefix: "/b/chat/".into(),
-        access: RouteAccess::Public,
-        block_name: "gizza-ai/chat".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Public,
+    )];
 
     let msg = make_msg("/some/other/path");
     let input = InputStream::empty();
@@ -951,11 +951,13 @@ fn guest_block_infos() -> Vec<BlockInfo> {
 }
 
 fn guest_extra() -> Vec<ExtraRoute> {
-    vec![ExtraRoute {
-        prefix: "/b/hello/".into(),
-        access: RouteAccess::Public,
-        block_name: "site/hello".into(),
-    }]
+    // `refined`, as `runtime_factory` registers a sandbox guest: the `Public`
+    // tier is a floor and every path the guest did not declare needs a session.
+    vec![ExtraRoute::refined(
+        "/b/hello/",
+        "site/hello",
+        RouteAccess::Public,
+    )]
 }
 
 #[tokio::test]
@@ -1036,6 +1038,82 @@ async fn an_undeclared_path_under_a_declaring_block_falls_back_to_authenticated(
     assert!(ctx.calls().is_empty());
 }
 
+/// The hole this constructor split closes: a guest that declares NOTHING used
+/// to be indistinguishable from a downstream catch-all, so every path under
+/// its `Public` prefix was served to anonymous callers. A refined route does
+/// not consult how many endpoints the block declared.
+#[tokio::test]
+async fn a_refined_route_to_a_block_that_declares_no_endpoints_is_not_public() {
+    let ctx = RecordingContext::new();
+    let infos = vec![BlockInfo::new(
+        "site/hello",
+        "0.1.0",
+        "http-handler@v1",
+        "a guest that declared no endpoints",
+    )];
+    let extras = vec![ExtraRoute::refined(
+        "/b/hello/",
+        "site/hello",
+        RouteAccess::Public,
+    )];
+    let stream = routing::route_to_block(
+        &ctx,
+        make_msg("/b/hello/anything"),
+        InputStream::empty(),
+        &AllEnabled,
+        &infos,
+        &extras,
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 403);
+    assert!(ctx.calls().is_empty(), "must not dispatch to the block");
+}
+
+/// The other half of the split: declaring a FIRST endpoint on a catch-all
+/// block must not silently lock every other path that block serves.
+#[tokio::test]
+async fn declaring_one_endpoint_does_not_lock_a_plain_extra_route() {
+    let ctx = RecordingContext::new();
+    let infos = vec![
+        BlockInfo::new("gizza-ai/chat", "0.0.1", "http-handler@v1", "chat").endpoints(vec![
+            BlockEndpoint::post("/b/chat/api/admin").auth(AuthLevel::Admin),
+        ]),
+    ];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Public,
+    )];
+
+    // The declared path is still refined upward...
+    let mut msg = make_msg("/b/chat/api/admin");
+    msg.set_meta(wafer_run::META_REQ_ACTION, "create");
+    let stream = routing::route_to_block(
+        &ctx,
+        msg,
+        InputStream::empty(),
+        &AllEnabled,
+        &infos,
+        &extras,
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 403);
+
+    // ...while every OTHER path keeps the tier the route was registered with.
+    let ctx = RecordingContext::new();
+    let stream = routing::route_to_block(
+        &ctx,
+        make_msg("/b/chat/anything"),
+        InputStream::empty(),
+        &AllEnabled,
+        &infos,
+        &extras,
+    )
+    .await;
+    assert_eq!(response_status(stream).await, 200);
+    assert_eq!(ctx.calls(), vec!["gizza-ai/chat".to_string()]);
+}
+
 #[tokio::test]
 async fn an_extra_route_to_a_block_that_declares_no_endpoints_keeps_its_tier() {
     // The compatibility case: every existing `add_route` consumer registers a
@@ -1047,11 +1125,11 @@ async fn an_extra_route_to_a_block_that_declares_no_endpoints_keeps_its_tier() {
         "http-handler@v1",
         "chat",
     )];
-    let extras = vec![ExtraRoute {
-        prefix: "/b/chat/".into(),
-        access: RouteAccess::Public,
-        block_name: "gizza-ai/chat".into(),
-    }];
+    let extras = vec![ExtraRoute::new(
+        "/b/chat/",
+        "gizza-ai/chat",
+        RouteAccess::Public,
+    )];
 
     let stream = routing::route_to_block(
         &ctx,

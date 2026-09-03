@@ -400,6 +400,15 @@ async fn store(
             paths::MAX_FILES
         ));
     }
+    // The same file/directory rule the files API enforces. A bundle is a set
+    // of paths from another instance, and nothing about crossing the wire
+    // makes a pair of them agree about whether a name is a directory — while
+    // a bundle that got in would wedge this instance's publisher for good.
+    if let Some(clash) = ws.path_collision(workspace_path) {
+        return Err(format!(
+            "the seed bundle carries both {workspace_path:?} and {clash:?}; one name cannot be              a file in one entry and a directory in the other"
+        ));
+    }
     let sha = blobs::sha256_hex(bytes);
     let grows_by = if ws.references(&sha) {
         0

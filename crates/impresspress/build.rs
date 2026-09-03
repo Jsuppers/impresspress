@@ -85,9 +85,26 @@ fn main() {
     // Emitted as a generated `&[(&str, &[u8])]` of (path relative to
     // `snippets/`, contents) so `include_bytes!` still does the embedding and
     // no file list is written by hand.
+    //
+    // Absence is checked here, exactly as for the wasm and the glue above,
+    // because the three are one artifact: `impresspress-browser` declares its
+    // bridge with `#[wasm_bindgen(module = "/js/bridge.js")]`, so a correct
+    // wasm-pack run ALWAYS emits this tree. An empty one means a stale or
+    // half-written `pkg/`, never a legitimate build with no inline JS — and
+    // baking it silently moves the failure above into a browser, minutes
+    // later, instead of stopping the build.
     let snippets_root = workspace_root.join("crates/impresspress-web/pkg/snippets");
     let mut snippets: Vec<(String, PathBuf)> = Vec::new();
     collect_files(&snippets_root, &snippets_root, &mut snippets);
+    if snippets.is_empty() {
+        eprintln!(
+            "\nerror: impresspress-web inline-JS snippets not found under {}.\nThe JS glue \
+             imports from `./snippets/…`, so a bundle baked without them cannot load its own \
+             module.\nRun \"just build\" first.\n",
+            snippets_root.display()
+        );
+        std::process::exit(1);
+    }
     // Sorted so the generated file — and therefore the build — is
     // deterministic regardless of directory iteration order.
     snippets.sort();
@@ -101,8 +118,8 @@ fn main() {
 /// The CLI's sealed x web flow writes these into `dist/snippets/`. The JS glue
 /// imports from there, so a bundle without them cannot load its own module.
 ///
-/// Empty only when `crates/impresspress-web/pkg/snippets` did not exist at
-/// build time (a wasm-pack output with no inline JS modules).
+/// Never empty: `build.rs` refuses to bake an empty list, because a bundle
+/// missing this tree cannot load its own module.
 pub static IMPRESSPRESS_WEB_SNIPPETS: &[(&str, &[u8])] = &[
 "#,
     );
@@ -131,8 +148,9 @@ pub static IMPRESSPRESS_WEB_SNIPPETS: &[(&str, &[u8])] = &[
 
 /// Collect every file under `dir` as `(path relative to `root`, absolute path)`.
 ///
-/// A missing directory is not an error: a wasm-pack output with no inline JS
-/// modules has no `snippets/` at all, and that is a legal (if unusual) build.
+/// A missing directory yields nothing rather than failing here; the caller is
+/// what decides that nothing is an error, because the caller is what knows
+/// this crate's `pkg/` always has one.
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;

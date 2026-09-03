@@ -89,6 +89,8 @@ pub const ROUTE_PREFIX_CODE: &str = "route-prefix";
 pub const ROUTE_COLLISION: &str = "route-collision";
 /// A declared endpoint sits outside the block's own route prefix.
 pub const ENDPOINT_OUTSIDE_ROUTES: &str = "endpoint-outside-routes";
+/// The guest declares no endpoints at all.
+pub const ENDPOINTS_EMPTY: &str = "endpoints-empty";
 /// An agent tool name is already claimed.
 pub const TOOL_NAME_DUPLICATE: &str = "tool-name-duplicate";
 /// A declared collection is outside `site__{name}__*`.
@@ -362,6 +364,28 @@ pub fn validate_static(
     check_route_prefix(&prefix, builtin_routes, active, &mut found);
 
     // --- Endpoints --------------------------------------------------------
+    // A guest that declares NO endpoint is refused outright, and the reason is
+    // authorization rather than tidiness. The accepted spec below carries one
+    // `Public` prefix as a floor, on the understanding that what a caller may
+    // actually reach is decided per endpoint by the guest's own declarations
+    // (`routing::extra_route_access`). A guest with an empty endpoint list
+    // declares nothing to decide with, so every path it serves would rest on
+    // the floor alone.
+    //
+    // The routing layer no longer *depends* on this — a refined extra route
+    // sends an undeclared path to `Authenticated` whether or not the block
+    // declared anything — but a block whose every route 403s a logged-out
+    // visitor is not what the agent asked for either. Saying so here turns a
+    // silently-inert block into one line the agent can act on, which is the
+    // whole point of the staging diagnostics.
+    if info.endpoints.is_empty() {
+        found.push(Diagnostic::error(
+            ENDPOINTS_EMPTY,
+            format!(
+                "the guest declares no endpoints; a block serves {prefix:?} through the endpoints                  it declares in `BlockInfo::endpoints`, and one with none is unreachable —                  declare at least one, with the `auth` level each path is meant to have (a                  genuinely public page must say `Public` explicitly)"
+            ),
+        ));
+    }
     for endpoint in &info.endpoints {
         if !endpoint.path.starts_with(&prefix) {
             found.push(Diagnostic::error(
@@ -439,15 +463,21 @@ pub fn validate_static(
         // The sandbox is registered as a `routing::ExtraRoute`, and until the
         // fix that landed with these rules an extra route enforced its own
         // tier alone: a guest endpoint declared `Admin` was served to
-        // anonymous callers. `routing::extra_route_access` now refines an
-        // extra route with `declared_access` whenever the target block
-        // declares endpoints — which a guest block always does — so a guest's
-        // `Admin` endpoint really is admin-only, and an UNDECLARED path under
-        // its prefix falls back to `Authenticated` rather than to this tier.
+        // anonymous callers. A guest's routes are registered with
+        // `add_refined_route`, so `routing::extra_route_access` combines this
+        // floor with the endpoint the guest declared for the path — and sends
+        // a path it declared NOTHING for to `Authenticated` rather than to
+        // this tier.
         //
-        // That is why `Public` here is safe *and* why it is right: a guest
-        // that wants a genuinely public route has to declare the endpoint
-        // `Public`, which is the same bargain every built-in block makes.
+        // That refinement is unconditional: it does not ask whether the block
+        // declared any endpoint, which is what makes the floor safe even for
+        // a spec this function never saw (the seed importer admits specs with
+        // no `BlockInfo` in hand). The `ENDPOINTS_EMPTY` rule above is the
+        // agent-facing half of the same concern, not the security half.
+        //
+        // So `Public` here is safe *and* right: a guest that wants a
+        // genuinely public route has to declare the endpoint `Public`, which
+        // is the same bargain every built-in block makes.
         routes: vec![DynamicRoute {
             prefix,
             access: RouteAccessKind::Public,
@@ -491,7 +521,24 @@ pub fn validate_spec(
     others: &[DynamicBlockSpec],
 ) -> Result<(), Vec<Diagnostic>> {
     let mut found = Vec::new();
-    let name = spec.name.strip_prefix("site/").unwrap_or(&spec.name);
+    // `strip_prefix` with no fallback: a spec whose name is not `site/{name}`
+    // has no short name, and inventing one by falling back to `spec.name`
+    // validates the WRONG namespace. `"hello"` would then pass every rule
+    // below — the format check, the route-prefix check, the collision check —
+    // and be refused only by `wafer_run::runtime::validate_block_name` inside
+    // the rebuild, long after the seed importer has written its blobs, its
+    // artifacts and a generation row. `seed::is_fresh` is false from that row
+    // onwards, so the instance can never seed again and the operator is left
+    // with an opaque rebuild failure instead of this diagnostic.
+    let Some(name) = spec.name.strip_prefix("site/") else {
+        return Err(vec![Diagnostic::error(
+            NAME_MISMATCH,
+            format!(
+                "the block is registered as {:?}; a dynamically-registered block must be named                  `site/{{name}}`",
+                spec.name
+            ),
+        )]);
+    };
 
     // --- Identity ---------------------------------------------------------
     if !paths::block_name_is_valid(name) {
@@ -864,6 +911,18 @@ mod tests {
         assert!(!spec.capabilities.collections.is_enabled());
     }
 
+    /// A guest that declares nothing is refused, and refused with a message
+    /// that says what to declare. The accepted spec's one `Public` prefix is a
+    /// floor that only the guest's own endpoint declarations can lift, so a
+    /// guest with none has said nothing about what any of its paths are for.
+    #[test]
+    fn a_guest_that_declares_no_endpoints_is_refused() {
+        let bare = BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "hello");
+        let result = run("hello", &bare);
+        let found = codes(&result);
+        assert!(found.contains(&ENDPOINTS_EMPTY), "{found:?}");
+    }
+
     /// A malformed name fires both name rules: the name itself is illegal,
     /// and the prefix it produces cannot be matched safely. Neither subsumes
     /// the other — this is what keeps `route-prefix` a real check rather than
@@ -874,6 +933,29 @@ mod tests {
         let found = codes(&result);
         assert!(found.contains(&NAME_FORMAT), "{found:?}");
         assert!(found.contains(&ROUTE_PREFIX_CODE), "{found:?}");
+    }
+
+    /// A seed spec whose name is not `site/{name}` is refused HERE, by the
+    /// rules, rather than by `wafer_run`'s registration inside a rebuild —
+    /// which happens after the importer has written its blobs, its artifacts
+    /// and a generation row, leaving the instance unable to seed again.
+    #[test]
+    fn a_spec_outside_the_site_namespace_is_refused_rather_than_validated_as_a_short_name() {
+        let spec = DynamicBlockSpec {
+            name: "hello".to_string(),
+            artifact_sha256: "sha".to_string(),
+            routes: vec![DynamicRoute {
+                prefix: "/b/hello/".to_string(),
+                access: RouteAccessKind::Public,
+            }],
+            capabilities: wafer_block::BlockCapabilities::none(),
+            wafer_guest_version: 0,
+        };
+        let found = validate_spec(&spec, &builtin_route_prefixes(), &[]).expect_err("refused");
+        assert_eq!(
+            found.iter().map(|d| d.code.as_str()).collect::<Vec<_>>(),
+            vec![NAME_MISMATCH]
+        );
     }
 
     #[test]

@@ -270,6 +270,52 @@ async fn block_sources_read_back_as_utf8_text() {
 // Path validation
 // ---------------------------------------------------------------------------
 
+/// A name is a file or a directory, never both, in the store the workspace is
+/// published to. Two paths that disagree about that are refused on the way in
+/// — where the message can name both of them — rather than at publish time,
+/// where the backend's type mismatch would recur on every later publish and
+/// wedge the sandbox for good.
+#[tokio::test]
+async fn a_path_that_clashes_with_an_existing_file_or_directory_is_rejected() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    write_new(&ctx, "site/blog/index.html", "<h1>hi</h1>").await;
+
+    // `site/blog` is a directory, so it cannot also be a file.
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/blog", "content": "x", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 400);
+
+    // And the reverse, on a path that is already a file.
+    write_new(&ctx, "site/style.css", "a{}").await;
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/style.css/extra", "content": "x", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 400);
+
+    // A merely textual prefix is not a clash, and must still be accepted.
+    write_new(&ctx, "site/blogroll", "ok").await;
+
+    // Nothing the refusals touched went missing.
+    let l = output_json(ctx.dispatch(list_msg(Some("site/"))).await).await;
+    let paths: Vec<&str> = l["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| f["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["site/blog/index.html", "site/blogroll", "site/style.css"]
+    );
+}
+
 #[tokio::test]
 async fn paths_outside_site_and_blocks_are_rejected() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;

@@ -149,17 +149,33 @@ pub fn resolve_impresspress_web_js() -> Result<Cow<'static, [u8]>> {
 /// its wasm-bindgen-assigned `<crate>-<hash>` directory, so naming one in
 /// isolation could only ever be a guess at which build it belongs to.
 ///
-/// An override directory with no `snippets/` yields an empty list rather than
-/// an error — that is a legal wasm-pack output (no inline JS modules), and the
-/// glue of such a build imports nothing.
+/// An override directory with no `snippets/` — or an empty one — is an error,
+/// not an empty list. `impresspress-browser` declares its bridge with
+/// `#[wasm_bindgen(module = "/js/bridge.js")]`, so every wasm-pack output this
+/// override can legitimately point at has that tree; one without it is stale
+/// or half-written, and a `dist/` built from it cannot load its own module.
+/// `build.rs` applies the same rule to the baked list.
 pub fn resolve_impresspress_web_snippets() -> Result<Vec<(String, Cow<'static, [u8]>)>> {
     if let Some(pkg) = pkg_dir()? {
         let root = pkg.dir.join("snippets");
-        if !root.is_dir() {
-            return Ok(Vec::new());
-        }
         let mut out = Vec::new();
-        collect_snippets(&root, &root, &mut out)?;
+        if root.is_dir() {
+            collect_snippets(&root, &root, &mut out)?;
+        }
+        // Same rule as `build.rs`'s bake, at the override that bypasses it: the
+        // JS glue's first statement imports from `./snippets/…`, so a `pkg/`
+        // without that tree produces a `dist/` that cannot load its own module.
+        // An override pointing at a stale or half-written directory is the one
+        // way to reach this, and failing here names it.
+        if out.is_empty() {
+            return Err(anyhow!(
+                "{} has no inline-JS snippets under `snippets/`; the JS glue imports from there, \
+                 so a bundle built from this directory cannot load its own module. Re-run the \
+                 wasm-pack build for `impresspress-web`, or unset the pkg-dir override to use \
+                 the snippets baked into this binary.",
+                pkg.dir.display()
+            ));
+        }
         // Sorted so a bundle's contents do not depend on directory iteration
         // order — the same reason `build.rs` sorts the baked list.
         out.sort_by(|a, b| a.0.cmp(&b.0));

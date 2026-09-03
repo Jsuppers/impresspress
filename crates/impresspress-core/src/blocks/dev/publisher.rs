@@ -11,14 +11,42 @@
 //! asset write would get the new document referencing assets that are still
 //! the old ones (or, for a newly added asset, are not there at all).
 //!
-//! So the publisher writes in three passes: every changed non-entrypoint file,
-//! then the deletions, then `index.html`. A reader in the middle of the window
-//! sees the *previous* document with assets that are already the new ones —
-//! which is only a stale page, and only until the entrypoint lands.
+//! So the publisher writes in four passes: the deletions that a write in this
+//! same publish would otherwise collide with, every changed non-entrypoint
+//! file, the remaining deletions, then `index.html`. A reader in the middle of
+//! the window sees the *previous* document with assets that are already the
+//! new ones — which is only a stale page, and only until the entrypoint lands.
 //!
 //! Deletions sit before the entrypoint for the same reason and are *not*
 //! reordered with it: a file the new manifest dropped is a file the new
 //! `index.html` does not reference.
+//!
+//! # Why some deletions jump the queue
+//!
+//! The published folder is hierarchical: `blog` is a file or a directory and
+//! never both. Within one workspace that clash cannot arise —
+//! `workspace::Workspace::path_collision` refuses it on the way in — but
+//! *across* generations it can, because the two paths never coexist:
+//!
+//! ```text
+//! generation 3   site/blog/index.html      `blog` is a directory
+//! generation 4   site/blog                 `blog` is a file
+//! ```
+//!
+//! Publishing generation 4 in path order would write the file `blog` while the
+//! directory `blog` is still there, and the backend answers with a type
+//! mismatch. The publish fails, the generation is marked `Failed`, the
+//! published manifest never advances — and the next publish attempts exactly
+//! the same pair, forever.
+//!
+//! A colliding deletion therefore runs before the write it collides with. This
+//! is the *only* reordering, and it is safe on the reader argument above:
+//! those two paths are the same name, so the old file was already unreachable
+//! the moment the new one was meant to exist.
+//!
+//! The backend must also drop a directory the deletions have emptied
+//! (`bridge.js::storageDelete` prunes upward), or the emptied `blog` would
+//! still be occupying the name.
 //!
 //! # Why only changed files
 //!
@@ -53,7 +81,18 @@ pub async fn publish_site(
     let prev_by_path = by_path(prev.map(|m| m.files.as_slice()).unwrap_or_default());
     let next_by_path = by_path(&next.files);
 
-    // 1. Every changed non-entrypoint file.
+    let (colliding, rest): (Vec<&str>, Vec<&str>) = prev_by_path
+        .keys()
+        .filter(|path| !next_by_path.contains_key(*path))
+        .copied()
+        .partition(|path| collides_with_any(path, &next_by_path));
+
+    // 1. Deletions that stand in the way of a write below.
+    for path in &colliding {
+        remove(ctx, path).await?;
+    }
+
+    // 2. Every changed non-entrypoint file.
     for (path, entry) in &next_by_path {
         if *path == ENTRYPOINT || is_unchanged(&prev_by_path, path, entry) {
             continue;
@@ -61,20 +100,46 @@ pub async fn publish_site(
         write(ctx, entry).await?;
     }
 
-    // 2. Files the new manifest no longer holds.
-    for path in prev_by_path.keys() {
-        if !next_by_path.contains_key(path) {
-            remove(ctx, path).await?;
-        }
+    // 3. The remaining files the new manifest no longer holds.
+    for path in &rest {
+        remove(ctx, path).await?;
     }
 
-    // 3. The entrypoint, last.
+    // 4. The entrypoint, last.
     if let Some(entry) = next_by_path.get(ENTRYPOINT) {
         if !is_unchanged(&prev_by_path, ENTRYPOINT, entry) {
             write(ctx, entry).await?;
         }
     }
     Ok(())
+}
+
+/// Whether `removed` shares a name with any path the new manifest holds — one
+/// being a directory prefix of the other, in either direction.
+///
+/// The two are never equal here: `removed` is a path the new manifest does not
+/// have.
+fn collides_with_any(removed: &str, next_by_path: &BTreeMap<&str, &FileEntry>) -> bool {
+    // A path being written that lives under `removed/`: `removed` is a file
+    // in the old manifest and a directory in the new one.
+    let as_dir = format!("{removed}/");
+    if next_by_path
+        .range(as_dir.as_str()..)
+        .next()
+        .is_some_and(|(path, _)| path.starts_with(&as_dir))
+    {
+        return true;
+    }
+    // A path being written that `removed` lives under: `removed` is a
+    // directory in the old manifest and a file in the new one.
+    let mut cursor = removed;
+    while let Some((parent, _)) = cursor.rsplit_once('/') {
+        if next_by_path.contains_key(parent) {
+            return true;
+        }
+        cursor = parent;
+    }
+    false
 }
 
 /// Write one manifest entry into the published folder, reading its bytes from
@@ -238,6 +303,107 @@ mod tests {
         assert_eq!(
             site_ops(&ctx)[before..],
             ["put wafer-run/web/site/index.html"]
+        );
+    }
+
+    /// A path that was a directory in the previous generation and is a file in
+    /// this one: the deletion under it has to land before the write, or the
+    /// backend refuses the write and the publisher wedges for good.
+    #[tokio::test]
+    async fn a_deletion_that_frees_a_name_for_a_write_lands_first() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let prev = SiteManifest {
+            files: vec![
+                entry(&ctx, "index.html", b"one").await,
+                entry(&ctx, "blog/post.html", b"p").await,
+            ],
+        };
+        publish_site(&ctx, None, &prev).await.expect("publish");
+        let before = site_ops(&ctx).len();
+
+        // `blog` stops being a directory and becomes a file.
+        let next = SiteManifest {
+            files: vec![
+                entry(&ctx, "index.html", b"two").await,
+                entry(&ctx, "blog", b"b").await,
+            ],
+        };
+        publish_site(&ctx, Some(&prev), &next)
+            .await
+            .expect("republish");
+        assert_eq!(
+            site_ops(&ctx)[before..],
+            [
+                "delete wafer-run/web/site/blog/post.html",
+                "put wafer-run/web/site/blog",
+                "put wafer-run/web/site/index.html",
+            ]
+        );
+    }
+
+    /// The reverse direction: a file becomes a directory.
+    #[tokio::test]
+    async fn a_file_that_becomes_a_directory_is_deleted_before_the_children_land() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let prev = SiteManifest {
+            files: vec![
+                entry(&ctx, "index.html", b"one").await,
+                entry(&ctx, "blog", b"b").await,
+            ],
+        };
+        publish_site(&ctx, None, &prev).await.expect("publish");
+        let before = site_ops(&ctx).len();
+
+        let next = SiteManifest {
+            files: vec![
+                entry(&ctx, "index.html", b"two").await,
+                entry(&ctx, "blog/post.html", b"p").await,
+            ],
+        };
+        publish_site(&ctx, Some(&prev), &next)
+            .await
+            .expect("republish");
+        assert_eq!(
+            site_ops(&ctx)[before..],
+            [
+                "delete wafer-run/web/site/blog",
+                "put wafer-run/web/site/blog/post.html",
+                "put wafer-run/web/site/index.html",
+            ]
+        );
+    }
+
+    /// A deletion that collides with nothing keeps its place AFTER the writes
+    /// — that ordering is what keeps a reader in the publish window on a stale
+    /// page rather than a broken one.
+    #[tokio::test]
+    async fn an_unrelated_deletion_still_lands_after_the_writes() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let prev = SiteManifest {
+            files: vec![
+                entry(&ctx, "index.html", b"one").await,
+                entry(&ctx, "gone.css", b"g{}").await,
+            ],
+        };
+        publish_site(&ctx, None, &prev).await.expect("publish");
+        let before = site_ops(&ctx).len();
+
+        let next = SiteManifest {
+            files: vec![
+                entry(&ctx, "index.html", b"two").await,
+                entry(&ctx, "new.css", b"n{}").await,
+            ],
+        };
+        publish_site(&ctx, Some(&prev), &next)
+            .await
+            .expect("republish");
+        assert_eq!(
+            site_ops(&ctx)[before..],
+            [
+                "put wafer-run/web/site/new.css",
+                "delete wafer-run/web/site/gone.css",
+                "put wafer-run/web/site/index.html",
+            ]
         );
     }
 

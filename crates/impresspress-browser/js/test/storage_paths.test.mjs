@@ -35,3 +35,13 @@ test('validateSegments accepts unicode file names and spaces, rejects separators
   assert.throws(() => validateSegments(['a\x00b']), TypeError);
   assert.throws(() => validateSegments(['a\x7fb']), TypeError);
 });
+
+test('the sidecar suffix is refused on every segment, not just the leaf', () => {
+  // A DIRECTORY named `page.html.__meta__` would collide with the sidecar of
+  // a sibling file named `page.html`. The Rust producer refuses the suffix on
+  // every segment (`paths.rs::validate_path`); so must this.
+  assert.throws(() => splitKey('a.__meta__/c'), TypeError);
+  assert.throws(() => validateSegments(['a.__meta__', 'c']), TypeError);
+  // Only as a suffix, and only on a whole segment.
+  assert.doesNotThrow(() => validateSegments(['a.__meta__b', 'c']));
+});
