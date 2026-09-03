@@ -11,8 +11,11 @@ import init, { initialize, handle_request } from '__WASM_JS__';
 // fact twice — and the dev sandbox's export (`blocks/dev/export.rs`), which
 // ships the runtime shell with the sandbox turned OFF, then had to find and
 // rewrite two different renderings and assert both. One line, one rewrite,
-// one assertion: `const DEV_ENABLED = true;` → `const DEV_ENABLED = false;`
-// is the whole of turning a dev bundle into a plain one.
+// one assertion: flipping the declaration below from true to false is the
+// whole of turning a dev bundle into a plain one. (Deliberately NOT spelled
+// out here as a literal: the export finds the declaration by exact text and
+// requires it to occur exactly once, so a comment quoting it would be a
+// second, ambiguous match.)
 const DEV_ENABLED = __DEV_ENABLED__;
 
 let initialized = false;

@@ -396,13 +396,21 @@ fn sw_with_dev_off(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
             "the deployment's sw.js is not valid UTF-8, so its dev flag cannot be turned off",
         ))
     })?;
-    if !text.contains(SW_DEV_ON) {
+    // EXACTLY one occurrence, not "at least one". Two would mean the marker
+    // is ambiguous — a comment quoting the declaration, say — and a blanket
+    // `replace` would edit both, leaving a file whose prose contradicts its
+    // code and, worse, no longer telling this function which line it is
+    // meant to own. `sw.js.tmpl` is written so the declaration is the only
+    // occurrence; this is what keeps that true.
+    let occurrences = text.matches(SW_DEV_ON).count();
+    if occurrences != 1 {
         return Err(Refusal::Internal(WaferError::new(
             ErrorCode::Internal,
             format!(
-                "the deployment's sw.js does not contain {SW_DEV_ON:?}, so the export cannot \
-                 turn development mode off; the bundle was built by a different \
-                 impresspress-bundle than this runtime expects"
+                "the deployment's sw.js contains {occurrences} occurrences of {SW_DEV_ON:?} \
+                 and the export needs exactly one, so it cannot turn development mode off; \
+                 the bundle was built by a different impresspress-bundle than this runtime \
+                 expects"
             ),
         )));
     }
@@ -543,6 +551,20 @@ mod tests {
         // the bundler renders one constant instead of two literals.
         assert!(text.contains("if (DEV_ENABLED && x) {}"), "{text}");
         assert!(!text.contains("= true;"), "{text}");
+    }
+
+    /// A second occurrence — a comment quoting the declaration, most likely
+    /// — makes the marker ambiguous, and a blanket replace would edit both.
+    #[test]
+    fn a_shell_with_two_markers_is_refused() {
+        let sw = b"// flip const DEV_ENABLED = true; to false\nconst DEV_ENABLED = true;\n";
+        let Err(refusal) = sw_with_dev_off(sw) else {
+            panic!("an ambiguous marker must be refused");
+        };
+        assert!(
+            refusal.into_error().message.contains("2 occurrences"),
+            "the refusal must say how many it found"
+        );
     }
 
     /// The one thing this must never do is pass a shell through unchanged.

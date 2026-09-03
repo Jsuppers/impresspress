@@ -1,4 +1,8 @@
 import { test, expect, type Page } from '@playwright/test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
@@ -59,7 +63,7 @@ import {
  */
 
 /**
- * The eleven `dev_*` tools `/b/dev/api/tools.json` projects, plus the two
+ * The twelve `dev_*` tools `/b/dev/api/tools.json` projects, plus the two
  * `dev.js` registers itself.
  *
  * `dev_read_reference` and `dev_create_block` are Plan 3's — the guest-API
@@ -67,12 +71,13 @@ import {
  * a block down from a template. Both are ordinary HTTP tools
  * (`blocks/dev/tools.rs`'s `SELECTIONS`), so both are in `tools.json`.
  *
- * `dev_compile_block` and `dev_export` are not: they have no HTTP endpoint
- * behind them in this build — compiling happens in a page worker (Plan 3
- * Task 5) and exporting writes a bundle from it (Plan 4). `dev.js` registers
- * them anyway so an agent that discovers them gets an honest refusal instead
- * of inventing its own way to compile, which is why they belong in this list
- * rather than in `tools.json`.
+ * `dev_compile_block` and `dev_export` are not, for opposite reasons:
+ * compiling happens in a page worker and never reaches the server as one
+ * request, while exporting DOES have an endpoint whose answer is a multi-
+ * megabyte zip — a file for the browser to download, not a tool result. Both
+ * are page-local, which is why they belong in this list rather than in
+ * `tools.json`. `dev_export_manifest` — what an export WOULD contain, as
+ * small JSON — is an ordinary HTTP tool and is in the manifest.
  */
 const DEV_TOOLS = [
   'dev_status',
@@ -86,6 +91,7 @@ const DEV_TOOLS = [
   'dev_rollback',
   'dev_create_block',
   'dev_remove_block',
+  'dev_export_manifest',
   'dev_compile_block',
   'dev_export',
 ];
@@ -247,6 +253,17 @@ function structured<T>(result: ToolResult): T {
   return result.structuredContent as unknown as T;
 }
 
+/** `contracts::ExportManifest`, trimmed to what this spec reads. */
+type ExportManifest = {
+  generation_id: string;
+  files: { path: string; bytes: number }[];
+  total_bytes: number;
+  shell_files: number;
+  site_files: number;
+  blocks: number;
+  tables: Record<string, number>;
+};
+
 type FileRead = { path: string; sha256: string; size: number; encoding: string; content: string };
 type FileWrite = { path: string; sha256: string; size: number; generation: Generation | null };
 type Generation = { id: string; cause: string; status: string };
@@ -395,7 +412,110 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({ p
     page.frameLocator('#dev-preview-frame').locator('.shop-product-name'),
   ).toHaveText(SHOP_PRODUCT.name, { timeout: 60_000 });
 
-  // --- 5. The shopper ----------------------------------------------------
+  // --- 5. Export the shop ------------------------------------------------
+  //
+  // Design §1's fourth and last step: "the user exports the shop and it runs
+  // from a local static server". Everything about what the archive CONTAINS
+  // is pinned by `impresspress-core/tests/dev_export.rs`, which reads a real
+  // zip back with the `zip` crate — what only a browser can prove is that
+  // `dev_export` actually hands the user a file: an object URL over a blob,
+  // an anchor click, and a real download the browser wrote to disk.
+  //
+  // Before it: `dev_export_manifest`, the read an agent makes to see what an
+  // export would contain. It is an ordinary HTTP tool from `tools.json`, so
+  // this also proves the new selection is projected and callable.
+  const exportStart = Date.now();
+  const preview = structured<ExportManifest>(await execute(page, 'dev_export_manifest', {}));
+  // The site the agent wrote, the runtime shell it needs to run, and the one
+  // product the shop was stocked with.
+  expect(preview.site_files).toBeGreaterThan(0);
+  expect(preview.shell_files).toBeGreaterThan(3);
+  expect(preview.total_bytes).toBeGreaterThan(0);
+  expect(preview.tables['impresspress__products__products']).toBe(1);
+  expect(preview.files.map((f) => f.path)).toContain('seed/manifest.json');
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 120_000 });
+  const exported = structured<ExportManifest>(await execute(page, 'dev_export', {}));
+  const download = await downloadPromise;
+  // The same generation both calls describe: the export is a snapshot of what
+  // is live, and nothing published between the two.
+  expect(exported.generation_id).toBe(preview.generation_id);
+  expect(download.suggestedFilename()).toBe(
+    `impresspress-site-${exported.generation_id.slice(0, 8)}.zip`,
+  );
+
+  const scratch = mkdtempSync(path.join(tmpdir(), 'dev-export-'));
+  try {
+    const zipPath = path.join(scratch, 'export.zip');
+    await download.saveAs(zipPath);
+
+    // Read the archive with Python's `zipfile` rather than a JS zip library:
+    // it is in the standard library of an interpreter this repo's tooling
+    // already requires (`examples/dev-sandbox/build.sh`), and reading the
+    // sandbox's own writer back with an INDEPENDENT implementation is the
+    // whole point — a reader that shared its code would prove nothing.
+    const inspected = JSON.parse(
+      execFileSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import json, sys, zipfile',
+            'z = zipfile.ZipFile(sys.argv[1])',
+            'bad = z.testzip()',
+            'assert bad is None, bad',
+            'print(json.dumps({',
+            '  "names": sorted(z.namelist()),',
+            '  "sw": z.read("sw.js").decode("utf-8"),',
+            '  "seed": json.loads(z.read("seed/manifest.json")),',
+            '  "data": json.loads(z.read("seed/data.json")),',
+            '  "index": z.read("seed/site/index.html").decode("utf-8"),',
+            '}))',
+          ].join('\n'),
+          zipPath,
+        ],
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+      ),
+    ) as {
+      names: string[];
+      sw: string;
+      seed: { schema_version: number; source_generation: string; site: { path: string }[] };
+      data: { schema_version: number; tables: Record<string, unknown[]> };
+      index: string;
+    };
+
+    // Every entry the manifest promised, and nothing the archive invented.
+    expect(inspected.names).toEqual(preview.files.map((f) => f.path).sort());
+    for (const expected of ['README.md', 'index.html', 'sw.js', 'loader.js', 'seed/manifest.json']) {
+      expect(inspected.names).toContain(expected);
+    }
+    // The compiler tree is 72 MiB of toolchain for a `/b/dev` the exported
+    // site does not have. Nothing under it may be in here.
+    expect(inspected.names.filter((n) => n.startsWith('__impresspress_dev/'))).toEqual([]);
+
+    // Development mode is OFF, in the one line that decides it — which is
+    // also what turns off the isolation-header passthrough, since both read
+    // the same constant.
+    expect(inspected.sw).toContain('const DEV_ENABLED = false;');
+    expect(inspected.sw).not.toContain('const DEV_ENABLED = true;');
+    // …and `/seed/` is still bypassed, or the exported folder could never
+    // import the seed shipped beside it.
+    expect(inspected.sw).toContain("url.pathname.startsWith('/seed/')");
+
+    // `seed/manifest.json` parses as the very format `seed::import` reads,
+    // and it describes the site the agent wrote.
+    expect(inspected.seed.schema_version).toBe(1);
+    expect(inspected.seed.source_generation).toBe(exported.generation_id);
+    expect(inspected.seed.site.map((f) => f.path)).toContain('index.html');
+    expect(inspected.index).toContain(SHOP_HEADING);
+    // And the shop's data came with it.
+    expect(inspected.data.tables['impresspress__products__products']).toHaveLength(1);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  console.log(`export → download → verified archive: ${Date.now() - exportStart} ms`);
+
+  // --- 6. The shopper ----------------------------------------------------
   //
   // A NEW PAGE IN THE SAME CONTEXT, not `browser.newContext()`. A Playwright
   // context is an isolated storage partition: its own OPFS and its own
