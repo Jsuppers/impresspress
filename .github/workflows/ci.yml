@@ -625,6 +625,36 @@ jobs:
       - name: Build the proof guest (wasm32-wasip1)
         run: cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
 
+      # Ahead of `build.sh`, and 22 rather than the 20 this job installed after
+      # it: `build-compiler.sh` refuses anything older, and `build.sh --check`
+      # runs `verify-compiler-assets.mjs` through node as well.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # This job needs the packaged compiler even though nothing in it compiles
+      # Rust in the browser: `impresspress.toml` overlays `compiler/dist/` into
+      # every dev-sandbox bundle, so `build.sh` builds it when it is missing —
+      # which is the ~55 minute, 12.6 GB composition that would OOM this runner.
+      # `dev-compiler.spec.ts` and `dev-compile-tool.spec.ts` both read the
+      # manifest it produces, too. Same key as `e2e-dev-compile`, so the two
+      # jobs share one cache entry; see that job for why there are no
+      # `restore-keys` and what `--fast` costs.
+      - name: Cache the packaged compiler
+        id: compiler-dist
+        uses: actions/cache@v4
+        with:
+          path: examples/dev-sandbox/compiler/dist
+          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package-lock.json') }}
+
+      - name: Allow a --fast compiler tree in this job only
+        run: echo "IMPRESSPRESS_COMPILER_ALLOW_FAST=1" >> "$GITHUB_ENV"
+
+      - name: Build the packaged compiler (cache miss only, unoptimized)
+        if: steps.compiler-dist.outputs.cache-hit != 'true'
+        run: examples/dev-sandbox/compiler/build-compiler.sh --fast
+
       # `--check` fails fast on a seed/manifest.json that has drifted from
       # seed/site/** — the same check `build.sh`'s normal path runs before it
       # builds anything, surfaced as its own step so a stale manifest is
@@ -639,11 +669,6 @@ jobs:
         run: |
           DIST="$(examples/dev-sandbox/build.sh | tail -1)"
           echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
@@ -677,7 +702,11 @@ jobs:
         env:
           TEST_PORT: 8082
           PROOF_GUEST_WASM: ${{ github.workspace }}/experiments/browser-service-worker-blocks/guest/target/wasm32-wasip1/release/browser_compiled_wafer_block.wasm
-        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compile-tool.spec.ts
+        # `dev-compiler.spec.ts` is here rather than in `e2e-dev-compile`
+        # because it needs the packaged worker only to prove it STARTS under
+        # the isolation headers — it compiles nothing, so it costs ~35 s and
+        # belongs with the other fake-worker specs.
+        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts
 
       - name: Stop server
         if: always()
@@ -691,6 +720,190 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report-dev-sandbox
+          path: crates/impresspress-web/playwright-report/
+          retention-days: 7
+
+  e2e-dev-compile:
+    name: E2E dev sandbox (Rubrc compiles a block in the browser)
+    # The same wasm this repo's other browser jobs run against — the sandbox
+    # bundle is built from `pkg/` the way `e2e-dev-sandbox` builds it.
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    # The e2e itself is ~2-4 minutes. The ceiling is for the cache miss below:
+    # composing the toolchain is the slow phase, and a job that gets killed at
+    # the default 6 hours after spending an hour composing has cached nothing.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # wasm32-unknown-unknown builds the `browser-devtools` bundle;
+          # wasm32-wasip1 is what `build-compiler.sh` composes against.
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: e2e-dev
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pinned for the same reason as `build-wasm` — see the note there.
+          version: 'v0.15.0'
+
+      # build.rs prereq: the impresspress crate `include_bytes!`s pkg/. What the
+      # tests actually serve is built from `pkg-dev/` (the feature-on wasm),
+      # substituted through IMPRESSPRESS_WEB_WASM / IMPRESSPRESS_WEB_JS by the
+      # sealed web flow — but the CLI does not compile without pkg/ present.
+      - name: Download impresspress-web pkg/
+        uses: actions/download-artifact@v4
+        with:
+          name: impresspress-web-pkg
+          path: crates/impresspress-web/pkg
+
+      # Debug build, as `e2e-dev-sandbox` does: the CLI only assembles static
+      # files here, so its runtime speed is irrelevant.
+      - name: Install impresspress CLI (debug)
+        run: cargo install --path crates/impresspress --locked --debug --root "$GITHUB_WORKSPACE/out"
+
+      - name: Put impresspress on PATH
+        run: echo "$GITHUB_WORKSPACE/out/bin" >> "$GITHUB_PATH"
+
+      # 22, not the 20 the other browser jobs use: `build-compiler.sh` refuses
+      # anything older, and it fetches `bun` through its own `npm ci` rather
+      # than through a setup action.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `compiler/dist/` is ~72 MB of packaged toolchain and is fully
+      # determined by the four inputs in this key: the pin (rubrc's commit,
+      # the composer, Binaryen, the sysroot), the worker sources bundled
+      # against it, the packaging scripts, and the lockfile that pins vite and
+      # bun. No `restore-keys`: a near-miss restore would be a tree built from
+      # a different pin, and the only honest thing to do with it is rebuild.
+      - name: Cache the packaged compiler
+        id: compiler-dist
+        uses: actions/cache@v4
+        with:
+          path: examples/dev-sandbox/compiler/dist
+          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package-lock.json') }}
+
+      # This job — and ONLY this job — may run against a component composed
+      # without `wasm-opt`. `verify-compiler-assets.mjs` refuses a `--fast`
+      # tree unless this is set, which is what keeps such a tree out of a
+      # deploy: the deploy workflow never sets it and builds (or restores) the
+      # optimized tree a developer produced. Exported for the whole job because
+      # both `build.sh --check` and `build.sh` run the verifier.
+      - name: Allow a --fast compiler tree in this job only
+        run: echo "IMPRESSPRESS_COMPILER_ALLOW_FAST=1" >> "$GITHUB_ENV"
+
+      # Only on a cache miss, and with `--fast`, which swaps rubrc's
+      # `vfs:build:prod` for `vfs:build:prod:no-opt`: minutes instead of the
+      # ~35 that `wasm-opt -Oz` costs, at the price of a much larger component
+      # to download in the browser. That matters here only as minutes of test
+      # time. **The memory this path needs has not been measured** — the 12.6
+      # GB peak in `compiler/README.md` is the OPTIMIZED composition's, which
+      # would OOM a 7 GB runner; skipping `wasm-opt` is what is expected to
+      # avoid it, not something observed. If this step is ever OOM-killed, the
+      # answer is a larger runner, not a smaller component.
+      #
+      # `build-compiler.sh` installs what it needs itself (bun through
+      # `npm ci`, the sha256-checked `wasi_virt_layer-cli` and Binaryen
+      # releases, `wasm32-wasip1-threads` on both toolchains and a nightly with
+      # `rust-src`), so there is nothing to add here beyond node and rustup.
+      - name: Build the packaged compiler (cache miss only, unoptimized)
+        if: steps.compiler-dist.outputs.cache-hit != 'true'
+        run: examples/dev-sandbox/compiler/build-compiler.sh --fast
+
+      # Both halves of `--check`: the seed manifest, and the compiler tree —
+      # every file against `compiler/dist/manifest.json`'s hashes, and nothing
+      # over Cloudflare's asset limit. On a cache hit this is what proves the
+      # restored tree is intact rather than assuming it.
+      - name: Check the seed manifest and the compiler tree
+        run: examples/dev-sandbox/build.sh --check
+
+      # `compiler_is_current` matches PIN.json against the tree above, so this
+      # does not rebuild the compiler; it builds the wasm and assembles the
+      # bundle, with `compiler/dist/` overlaid at `/__impresspress_dev/compiler/`.
+      - name: Build the dev-sandbox bundle
+        run: |
+          DIST="$(examples/dev-sandbox/build.sh | tail -1)"
+          echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/impresspress-web/package-lock.json') }}
+
+      - name: Install Playwright
+        working-directory: crates/impresspress-web
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+
+      # A plain static host is enough: the service worker adds the COOP/COEP
+      # the compiler worker needs, and the compiler assets are ordinary files
+      # on the bypass list.
+      - name: Serve the dev bundle in background (port 8083)
+        run: |
+          python3 -m http.server 8083 -d "$DEV_DIST" &
+          echo $! > /tmp/dev-compile-http-pid
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8083/sw.js > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:8083/seed/manifest.json > /dev/null
+          curl -sf http://localhost:8083/__impresspress_dev/compiler/manifest.json > /dev/null
+
+      - name: Run the in-browser compile e2e (port 8083)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8083
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-compile.spec.ts 2>&1 \
+            | tee /tmp/dev-compile.log
+
+      # The spec prints its measurements as `dev-compile:` lines precisely so
+      # they can be lifted out of the log: toolchain start-up, the build, and
+      # the size of the module the browser produced. `always()` because a
+      # failure that still reached the compile is exactly when the numbers are
+      # worth reading.
+      - name: Report the compile timings
+        if: always()
+        run: |
+          {
+            echo '### Rubrc, in the browser'
+            echo
+            echo '```'
+            grep 'dev-compile:' /tmp/dev-compile.log \
+              || echo '(no dev-compile: lines — the run did not reach the compile)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/dev-compile-http-pid ]; then
+            kill "$(cat /tmp/dev-compile-http-pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-dev-compile
           path: crates/impresspress-web/playwright-report/
           retention-days: 7
 
