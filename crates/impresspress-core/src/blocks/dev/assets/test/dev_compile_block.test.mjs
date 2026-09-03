@@ -594,7 +594,14 @@ test('a second compile is refused while one is running, not queued behind it', a
   const second = await tools.get('dev_compile_block').execute({ name: 'hello' });
   assert.equal(second.isError, true);
   assert.match(second.content[0].text, /a compile is already running/);
-  assert.equal(compiles, 1, 'the second call never reached the compiler');
+  // The first call may still be inside its snapshot fetches at this point —
+  // the guard is set before any of them, which is the whole point, but how
+  // far the first call has got by now is a scheduling detail (one macrotask
+  // on a loaded CI runner is not always enough for it to reach the
+  // compiler). What must hold HERE is that the refused call never started a
+  // build of its own; how many builds ran in total is asserted once the
+  // first call has finished.
+  assert.ok(compiles <= 1, 'the refused call started a build');
   // Refused, so the button state still belongs to the compile that is running.
   assert.equal(elements.get('dev-compile').disabled, true);
 
@@ -602,6 +609,7 @@ test('a second compile is refused while one is running, not queued behind it', a
   // the button comes back only when the build it belongs to ends.
   release();
   await first;
+  assert.equal(compiles, 1, 'exactly one build ran: the second call never reached the compiler');
   assert.equal(elements.get('dev-compile').disabled, false);
   // Which is also when the next one is accepted.
   await assert.doesNotReject(handle.compileBlock('hello'));
