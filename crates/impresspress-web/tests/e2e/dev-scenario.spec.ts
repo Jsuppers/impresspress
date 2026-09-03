@@ -7,10 +7,10 @@ import path from 'node:path';
 import {
   ADMIN_EMAIL,
   bootServiceWorker,
-  EXPORT_PORT,
   loginAdmin,
   loginToWorkspace,
   PAGE_TOOLS,
+  SCENARIO_EXPORT_PORT,
   serveDirectory,
   WELCOME_PHRASE,
 } from './fixtures/dev-sandbox';
@@ -67,7 +67,7 @@ import { execute, registeredTools, structured, waitForTool } from './fixtures/we
  *    context's cookie jar, which signs the admin page out too, hence the
  *    second `loginAdmin` before steps 6 and 7.
  *  * **The exported bundle (step 6)** is a NEW context on a DIFFERENT ORIGIN
- *    (`127.0.0.1:8099`). Here the isolation is not a workaround but the
+ *    (`SCENARIO_EXPORT_PORT`). Here the isolation is not a workaround but the
  *    subject: its own OPFS, its own service-worker registration and an empty
  *    database is exactly what someone who received the zip has, and the seed
  *    inside the archive is the only thing that can put the shop there.
@@ -216,14 +216,14 @@ test('the spec scenario: welcome → login → block → site → shop → shopp
   browser,
   page,
 }) => {
-  // The bill, measured at ~4 minutes on a 24-core box: a cold sandbox boot
-  // (wasm compile, OPFS create, migrations, seed import), 75 MiB of toolchain
-  // into the page, a release build of the block, a runtime rebuild for it,
-  // three products through four calls each, a second cold boot for the
-  // exported bundle on its own origin, two rollbacks and a service-worker
-  // restart. Fifteen minutes is the ceiling CI is given: a runner is slower
-  // than this box and none of the caches this test depends on are its to
-  // control.
+  // The bill, measured at ~70 s on a 24-core box (`total_ms=68322` and
+  // `68562` on two runs): a cold sandbox boot (wasm compile, OPFS create,
+  // migrations, seed import), 75 MiB of toolchain into the page, a release
+  // build of the block, a runtime rebuild for it, three products through four
+  // calls each, a second cold boot for the exported bundle on its own origin,
+  // two rollbacks and a service-worker restart. Fifteen minutes is the
+  // ceiling CI is given — 13× the measured figure: a runner is slower than
+  // this box and none of the caches this test depends on are its to control.
   test.setTimeout(15 * 60 * 1000);
   const scenarioStart = Date.now();
 
@@ -524,9 +524,9 @@ test('the spec scenario: welcome → login → block → site → shop → shopp
     // (`examples/dev-sandbox/build.sh`), and reading the sandbox's own writer
     // back with an INDEPENDENT implementation is the point.
     execFileSync('python3', ['-m', 'zipfile', '-e', zipPath, path.join(scratch, 'out')]);
-    const server = await serveDirectory(path.join(scratch, 'out'), EXPORT_PORT);
+    const server = await serveDirectory(path.join(scratch, 'out'), SCENARIO_EXPORT_PORT);
     const bundleStart = Date.now();
-    const fresh = await browser.newContext({ baseURL: `http://127.0.0.1:${EXPORT_PORT}` });
+    const fresh = await browser.newContext({ baseURL: `http://127.0.0.1:${SCENARIO_EXPORT_PORT}` });
     // Armed before the first navigation, or it would miss the boot it exists
     // to explain.
     const swConsole = captureServiceWorkerConsole(fresh);
@@ -555,7 +555,7 @@ test('the spec scenario: welcome → login → block → site → shop → shopp
           : '(the exported service worker logged nothing at all)';
         throw new Error(
           `the exported bundle did not render the shop.\n` +
-            `--- service worker console (${EXPORT_PORT}) ---\n${said}\n` +
+            `--- service worker console (${SCENARIO_EXPORT_PORT}) ---\n${said}\n` +
             `--- assertion ---\n${failure instanceof Error ? failure.message : String(failure)}`,
         );
       }

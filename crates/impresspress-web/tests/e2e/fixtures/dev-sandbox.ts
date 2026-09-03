@@ -1,6 +1,7 @@
 import { expect, type Page } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createConnection } from 'node:net';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 
 /**
  * Getting a page onto the browser development sandbox.
@@ -193,15 +194,25 @@ export const PAGE_TOOLS = [...DEV_TOOLS, ...SHOP_TOOLS].sort();
 export const MANIFEST_TOOLS = PAGE_TOOLS.filter((name) => !PAGE_LOCAL_TOOLS.includes(name));
 
 /**
- * Serve `dir` on `port` with Python's `http.server` and wait until it answers.
+ * Serve an unpacked export bundle from `dir` on `port` with Python's
+ * `http.server`, and wait until the port is answering *for this bundle*.
  *
  * The exported bundle has to be SERVED to be proved: a service worker cannot
  * be registered from a `file://` URL, which is the first thing the export's
  * own README says. `python3` is already a hard dependency of this repo's
  * tooling (`examples/dev-sandbox/build.sh` uses it), so this needs nothing
  * installed that CI does not already have.
+ *
+ * The readiness check is a GET of `/seed/manifest.json` compared against the
+ * copy the archive was unpacked to, not a TCP connect. A connect proves only
+ * that *something* is listening — and something else listening on that port
+ * (a leftover server from an interrupted run, another spec) would be served
+ * to the browser in place of the bundle under test, which fails as a wrong
+ * site rather than as a port collision. Comparing the one file that describes
+ * the whole bundle turns that class into an immediate, named error.
  */
 export async function serveDirectory(dir: string, port: number): Promise<ChildProcess> {
+  const expected = readFileSync(path.join(dir, 'seed', 'manifest.json'), 'utf8');
   const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], {
     cwd: dir,
     stdio: 'ignore',
@@ -211,18 +222,33 @@ export async function serveDirectory(dir: string, port: number): Promise<ChildPr
     if (server.exitCode !== null) {
       throw new Error(`static server for ${dir} exited with ${server.exitCode}`);
     }
-    const up = await new Promise<boolean>((resolve) => {
-      const socket = createConnection({ host: '127.0.0.1', port }, () => {
-        socket.end();
-        resolve(true);
-      });
-      socket.on('error', () => resolve(false));
-    });
-    if (up) return server;
+    const served = await fetch(`http://127.0.0.1:${port}/seed/manifest.json`)
+      .then((response) => (response.ok ? response.text() : null))
+      .catch(() => null);
+    if (served !== null) {
+      if (served !== expected) {
+        server.kill('SIGKILL');
+        throw new Error(
+          `127.0.0.1:${port} is serving a different bundle than ${dir} — something else is ` +
+            `already listening on that port`,
+        );
+      }
+      return server;
+    }
     if (Date.now() > deadline) throw new Error(`static server for ${dir} never came up`);
     await new Promise((r) => setTimeout(r, 100));
   }
 }
 
-/** The port the exported bundle is served on, beside the sandbox's own. */
-export const EXPORT_PORT = 8099;
+/**
+ * The ports the exported bundles are served on, beside the sandbox's own.
+ *
+ * One per spec, not one shared constant. `workers: 1` and
+ * `fullyParallel: false` make an overlap unlikely rather than impossible —
+ * the `finally` that kills each server is not reached if the process dies —
+ * and a port two specs share is a port on which one run's leftovers can be
+ * served to the next. Distinct ports plus `serveDirectory`'s bundle check
+ * mean neither half of that can go unnoticed.
+ */
+export const WORKSPACE_EXPORT_PORT = 8098;
+export const SCENARIO_EXPORT_PORT = 8099;

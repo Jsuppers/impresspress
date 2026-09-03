@@ -1458,13 +1458,16 @@ Only one compile runs at a time.',
 // bottom of this file — after every line of it, including this one.
 var exportButton = document.getElementById('dev-export');
 
-// Whether an export is running right now.
+// The running export's promise, or `null` when none is running.
 //
 // An export reads the whole runtime shell twice and builds a multi-megabyte
 // archive in memory; a second one started on top of the first would do all of
 // that again for a download the browser is about to replace anyway. The
-// button is therefore taken away for the duration.
-var exportInFlight = false;
+// button is taken away for the duration — and, because the button is not the
+// only caller, `exportSite` returns THIS promise rather than starting a
+// second export (a `dev_export` tool call racing a click is two callers, and
+// only one of them is a button).
+var exportInFlight = null;
 
 // Whether Export can be pressed, and why not when it cannot.
 //
@@ -1506,6 +1509,35 @@ function updateExportButton() {
 // leaked for the life of the page.
 var OBJECT_URL_TTL_MS = 60000;
 
+// Export once, no matter how many callers ask.
+//
+// A second call while one is running returns the RUNNING export's promise —
+// the same object, resolving to the same manifest, having made no second
+// request and started no second download. Not `null`, and not a throw: the
+// tool's `execute` reads `manifest.generation_id` off whatever this returns,
+// and the honest answer to "export the site" while an export of that same
+// site is in flight is that export.
+//
+// A plain function rather than an `async` one so the promise a second caller
+// gets is IDENTICAL to the first's; an `async` wrapper would adopt it into a
+// new one and the no-op would be observable only by counting requests.
+function exportSite() {
+  if (exportInFlight) {
+    return exportInFlight;
+  }
+  // Assigned before anything awaits — `runExport()` returns its promise
+  // synchronously — so two calls in the same turn cannot both get past the
+  // check above. Released on EVERY exit, including the failures: a refused
+  // export that left the button disabled would take the feature away for the
+  // life of the page, which is a worse outcome than the refusal itself.
+  exportInFlight = runExport().finally(function () {
+    exportInFlight = null;
+    updateExportButton();
+  });
+  updateExportButton();
+  return exportInFlight;
+}
+
 // Fetch the manifest, fetch the zip, hand it to the browser as a download.
 //
 // The manifest first, and not only for the filename: it is what the tool
@@ -1513,48 +1545,36 @@ var OBJECT_URL_TTL_MS = 60000;
 // what it just downloaded — how many files, how big, how many product rows —
 // without a second call. It is a summary of the very entry list the archive
 // is built from (`blocks/dev/export.rs`), so the two cannot disagree.
-async function exportSite() {
-  // Guarded on EVERY exit, including the failures — a refused export that
-  // left the button disabled would take the feature away for the life of the
-  // page, which is a worse outcome than the refusal itself. The flag is set
-  // before the first await so two calls that start in the same turn cannot
-  // both get past it.
-  exportInFlight = true;
-  updateExportButton();
-  try {
-    var manifest = await json(await api.get('/b/dev/api/export/manifest'));
-    var response = await api.get('/b/dev/api/export');
-    if (!response.ok) {
-      throw new Error('export failed: HTTP ' + response.status + ': ' + (await response.text()));
-    }
-    var blob = await response.blob();
-    var url = URL.createObjectURL(blob);
-    var link = document.createElement('a');
-    link.href = url;
-    link.download = 'impresspress-site-' + manifest.generation_id.slice(0, 8) + '.zip';
-    // Appended to the document before the click and removed after: a detached
-    // anchor's `click()` is honoured by Chromium but not by every engine, and
-    // this is the one line that makes the download work everywhere.
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(function () {
-      URL.revokeObjectURL(url);
-    }, OBJECT_URL_TTL_MS);
-    log(
-      'exported generation ' +
-        manifest.generation_id.slice(0, 8) +
-        ' — ' +
-        manifest.files.length +
-        ' files, ' +
-        (manifest.total_bytes / 1048576).toFixed(1) +
-        ' MiB'
-    );
-    return manifest;
-  } finally {
-    exportInFlight = false;
-    updateExportButton();
+async function runExport() {
+  var manifest = await json(await api.get('/b/dev/api/export/manifest'));
+  var response = await api.get('/b/dev/api/export');
+  if (!response.ok) {
+    throw new Error('export failed: HTTP ' + response.status + ': ' + (await response.text()));
   }
+  var blob = await response.blob();
+  var url = URL.createObjectURL(blob);
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = 'impresspress-site-' + manifest.generation_id.slice(0, 8) + '.zip';
+  // Appended to the document before the click and removed after: a detached
+  // anchor's `click()` is honoured by Chromium but not by every engine, and
+  // this is the one line that makes the download work everywhere.
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(function () {
+    URL.revokeObjectURL(url);
+  }, OBJECT_URL_TTL_MS);
+  log(
+    'exported generation ' +
+      manifest.generation_id.slice(0, 8) +
+      ' — ' +
+      manifest.files.length +
+      ' files, ' +
+      (manifest.total_bytes / 1048576).toFixed(1) +
+      ' MiB'
+  );
+  return manifest;
 }
 
 function registerExportTool() {

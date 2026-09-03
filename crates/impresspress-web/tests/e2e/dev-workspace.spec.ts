@@ -7,13 +7,13 @@ import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
   bootServiceWorker,
-  EXPORT_PORT,
   loginToWorkspace,
   MANIFEST_TOOLS,
   PAGE_TOOLS,
   serveDirectory,
   WELCOME_HEADING,
   WELCOME_PHRASE,
+  WORKSPACE_EXPORT_PORT,
 } from './fixtures/dev-sandbox';
 import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
 import { SHOP_HEADING, SHOP_OFFER, SHOP_PRODUCT, shopPage } from './fixtures/shop-fixture';
@@ -379,9 +379,9 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({
       zipPath,
       unpacked,
     ]);
-    const server = await serveDirectory(unpacked, EXPORT_PORT);
+    const server = await serveDirectory(unpacked, WORKSPACE_EXPORT_PORT);
     const exportedContext = await browser.newContext({
-      baseURL: `http://127.0.0.1:${EXPORT_PORT}`,
+      baseURL: `http://127.0.0.1:${WORKSPACE_EXPORT_PORT}`,
     });
     try {
       const site = await exportedContext.newPage();

@@ -151,7 +151,7 @@ test('a failed export reaches the agent as isError, never as a silent success', 
   assert.match(result.content[0].text, /^dev_export: /);
 });
 
-test('a second export cannot start while one is in flight', async () => {
+test('a second export joins the one in flight rather than starting another', async () => {
   // The archive request parks on this until the test releases it, which is
   // the only way to observe the page mid-export — nothing else in the harness
   // yields for long enough.
@@ -180,9 +180,17 @@ test('a second export cannot start while one is in flight', async () => {
   // An export reads the whole shell twice and builds a multi-megabyte archive
   // in memory; a second one on top of it would do all that again for a
   // download the browser is about to replace anyway.
-  assert.equal(handle.exportInFlight, true);
+  assert.ok(handle.exportInFlight, 'an export is in flight');
   assert.equal(button.disabled, true);
   assert.match(button.title, /in progress/i);
+
+  // The BUTTON is disabled, but the button is not the only caller: a
+  // `dev_export` tool call racing a click reaches `exportSite` directly. It
+  // gets the running export's own promise back — the same object — and starts
+  // nothing.
+  const second = handle.exportSite();
+  assert.equal(second, first, 'the second call is the first call');
+  await settle();
 
   // A status poll landing mid-export must NOT re-enable the button — one
   // owner decides, and it knows about both facts.
@@ -190,13 +198,13 @@ test('a second export cannot start while one is in flight', async () => {
   assert.equal(button.disabled, true);
 
   release();
-  await first;
+  assert.deepEqual(await second, await first, 'and resolves to the same manifest');
 
-  assert.equal(handle.exportInFlight, false);
+  assert.equal(handle.exportInFlight, null);
   assert.equal(button.disabled, false);
   assert.equal(button.title, '');
+  // One download and one pair of requests for the two calls, not two of each.
   assert.equal(downloads.length, 1);
-  // One manifest request and one archive request, not two of each.
   const exportCalls = fetchCalls
     .map(([url]) => String(url))
     .filter((url) => url.startsWith('/b/dev/api/export'));
@@ -220,7 +228,7 @@ test('a failed export gives the button back', async () => {
 
   await assert.rejects(() => handle.exportSite());
 
-  assert.equal(handle.exportInFlight, false);
+  assert.equal(handle.exportInFlight, null);
   const button = elements.get('dev-export');
   assert.equal(button.disabled, false);
   assert.equal(button.title, '');
