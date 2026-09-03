@@ -31,7 +31,7 @@
 //! returned futures `Send` on native, and what keeps a single-threaded browser
 //! runtime from deadlocking on its own queue.
 
-use std::sync::Mutex;
+use std::{collections::BTreeSet, sync::Mutex};
 
 use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
@@ -899,7 +899,7 @@ pub async fn converge_on_boot(
         .await
         .map_err(|e| e.message)?;
     let (previous, state) = active_or_clear(ctx, &state).await?;
-    retire_abandoned(ctx, &state).await;
+    retire_abandoned(ctx, &state, previous.as_ref()).await;
     if let Some(desired) = state.desired_generation_id.clone() {
         match generation::load(ctx, &desired).await {
             Ok((row, manifest)) => {
@@ -962,9 +962,15 @@ const ABANDONED_AT_BOOT: &str =
 ///
 /// A generation is `staged`/`validating`/`activating` because an activation is
 /// *running*, and a build is `staged` because a compile is. Nothing is running
-/// on a process that has just started, so every such row is wreckage — except
-/// the one the journal names, which is the activation this boot is about to
-/// converge on and the only one that can still finish.
+/// on a process that has just started, so every such row has to be settled —
+/// except the generation the journal names, which is the activation this boot
+/// is about to converge on and the only one that can still finish.
+///
+/// "Settled" is not the same as "abandoned". A build row whose artifact is
+/// named by the generation that is serving, or by the one being converged on,
+/// belongs to a compile that *arrived*: it is accepted rather than closed (see
+/// [`repo::builds::retire_in_flight`]), because that row is where the block's
+/// `BlockInfo` lives and the duplicate-agent-tool check reads it back.
 ///
 /// Left alone they are not merely untidy. Retention keeps an in-flight
 /// generation whatever its age, and the collector keeps a staged build's
@@ -975,7 +981,11 @@ const ABANDONED_AT_BOOT: &str =
 ///
 /// Best effort, like every other step of boot recovery: an instance that
 /// cannot tidy its ledger must still come up and serve.
-async fn retire_abandoned(ctx: &dyn Context, state: &RuntimeState) {
+async fn retire_abandoned(
+    ctx: &dyn Context,
+    state: &RuntimeState,
+    previous: Option<&(GenerationRow, GenerationManifest)>,
+) {
     let in_flight = match repo::generations::list_in_flight(ctx).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -1009,18 +1019,46 @@ async fn retire_abandoned(ctx: &dyn Context, state: &RuntimeState) {
         }
     }
 
-    // The same for builds, which have no journal: a staged build row is a
-    // compile that was running, and none is.
+    // Builds are settled the same way, against the manifests the journal
+    // vouches for rather than against the journal itself — a build row names
+    // an artifact, not a generation, so "is this compile still wanted?" is a
+    // question only the manifests can answer.
+    //
+    // Both halves are needed. The active manifest covers a compile whose
+    // activation committed before the process died (the row is one
+    // `set_status` short of `valid`); the desired manifest covers one whose
+    // activation is the very thing this boot is about to converge on. Closing
+    // either would leave a block live with no accepted build row recording its
+    // `BlockInfo`, and every later stage of *another* block refused for a
+    // collision check that cannot be run.
+    let mut vouched = BTreeSet::new();
+    if let Some((_row, manifest)) = previous {
+        vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
+    }
+    if let Some(desired) = state.desired_generation_id.as_deref() {
+        // A desired that cannot be loaded vouches for nothing; the
+        // dangling-desired arm in `converge_on_boot` deals with the row
+        // itself.
+        if let Ok((_row, manifest)) = generation::load(ctx, desired).await {
+            vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
+        }
+    }
+
     let diagnostics = serde_json::to_string(&[super::validation::Diagnostic::error(
         super::validation::BUILD_ABANDONED,
         ABANDONED_AT_BOOT,
     )])
     .unwrap_or_else(|_| "[]".to_string());
-    if let Err(e) = repo::builds::retire_in_flight(ctx, &diagnostics).await {
-        tracing::error!(
+    match repo::builds::retire_in_flight(ctx, &vouched, &diagnostics).await {
+        Ok(settled) => tracing::debug!(
+            promoted = settled.promoted,
+            retired = settled.retired,
+            "dev sandbox: settled the builds left in flight",
+        ),
+        Err(e) => tracing::error!(
             error = %e.message,
-            "dev sandbox: could not retire the abandoned builds at boot",
-        );
+            "dev sandbox: could not settle the builds left in flight at boot",
+        ),
     }
 }
 

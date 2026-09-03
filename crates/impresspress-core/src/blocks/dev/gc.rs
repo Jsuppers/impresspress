@@ -16,11 +16,17 @@
 //! source tree the moment it was written.
 //!
 //! An **artifact** is reachable from a retained generation's block manifest,
-//! or from a build row young enough that its compile may still be on its way
-//! to one. Staging stores the row before the bytes and only asks for an
-//! activation once the guest has been accepted; a site write's collection can
-//! run in that window, and without the build rows it would delete the artifact
-//! the compile is about to activate.
+//! or from a build row that is still [`repo::builds::BuildStatus::Staged`] —
+//! a compile that has stored its bytes and not yet reached a generation.
+//! Staging writes the row before the bytes and leaves it staged until its
+//! activation has minted a manifest; a site write's collection can run in that
+//! window, and without the build rows it would delete the artifact the compile
+//! is about to activate.
+//!
+//! A status, never an age. A browser compile takes tens of seconds and an
+//! agent's site writes arrive in bursts, so any rule that expired the
+//! protection by time would collect the artifact of a compile that was merely
+//! slow.
 //!
 //! Everything else in the two folders goes. Unreachable is not "probably
 //! unused": a blob no retained generation and no workspace path names cannot

@@ -5,7 +5,7 @@
 //! the reported `BlockInfo` and the compiler diagnostics, so a refusal can be
 //! explained after the fact without re-running the toolchain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
@@ -318,30 +318,61 @@ pub async fn is_in_flight_for_artifact(
     Ok(!list.records.is_empty())
 }
 
-/// Retire every in-flight build, recording `diagnostics_json` on each, and
-/// return how many were retired.
+/// What one boot's pass over the in-flight builds did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetiredBuilds {
+    /// Rows accepted, because a manifest the journal vouches for names the
+    /// artifact they staged.
+    pub promoted: usize,
+    /// Rows closed, because nothing does.
+    pub retired: usize,
+}
+
+/// Settle every in-flight build against the manifests the journal vouches for.
 ///
-/// For boot. A staged row means "a compile is running"; nothing is running on
-/// a process that has just started, so every one of them is the wreckage of a
-/// stage the last process did not finish. Left alone they would pin their
-/// artifacts against the workspace quota for the life of the instance, since
-/// the collector treats a staged row as a promise that a generation is coming.
+/// For boot. A staged row means "a compile is running", and nothing is running
+/// on a process that has just started — so each one is the wreckage of a stage
+/// the last process did not finish, and each one has to be settled one way or
+/// the other. Left staged they would pin their artifacts against the workspace
+/// quota for the life of the instance, because the collector reads a staged row
+/// as a promise that a generation is coming.
+///
+/// Which way depends on `vouched_artifacts`: the artifact hashes named by the
+/// generation that is serving and by the one the journal is converging on. A
+/// staged row whose artifact is in that set is a compile that **got there** —
+/// the process died between its activation committing and the row being
+/// accepted, which is one `set_status` apart — so it is promoted to
+/// [`BuildStatus::Valid`], keeping the `BlockInfo` the stage recorded before
+/// the activation. That is not cosmetic: the row is where
+/// [`latest_valid_for_artifact`] finds the endpoints of a block in the active
+/// set, and without it every later stage of *another* block is refused for a
+/// collision check it cannot run.
+///
+/// Everything else is closed as [`BuildStatus::Invalid`] with
+/// `diagnostics_json`, which is also what unpins its artifact.
 pub async fn retire_in_flight(
     ctx: &dyn Context,
+    vouched_artifacts: &BTreeSet<String>,
     diagnostics_json: &str,
-) -> Result<usize, WaferError> {
-    let rows = list_in_flight(ctx).await?;
-    for row in &rows {
-        set_status(
-            ctx,
-            &row.id,
-            BuildStatus::Invalid,
-            Some(diagnostics_json),
-            None,
-        )
-        .await?;
+) -> Result<RetiredBuilds, WaferError> {
+    let mut settled = RetiredBuilds::default();
+    for row in list_in_flight(ctx).await? {
+        if vouched_artifacts.contains(&row.artifact_sha256) {
+            set_status(ctx, &row.id, BuildStatus::Valid, None, None).await?;
+            settled.promoted += 1;
+        } else {
+            set_status(
+                ctx,
+                &row.id,
+                BuildStatus::Invalid,
+                Some(diagnostics_json),
+                None,
+            )
+            .await?;
+            settled.retired += 1;
+        }
     }
-    Ok(rows.len())
+    Ok(settled)
 }
 
 /// Every artifact this table indexes, as `sha256 -> stored bytes`.
@@ -635,28 +666,63 @@ mod tests {
     }
 
     /// A staged row on a process that has just started is the wreckage of an
-    /// unfinished compile, and left alone it pins its artifact forever.
+    /// unfinished compile, and left alone it pins its artifact forever — but
+    /// only the rows no live manifest vouches for. One whose artifact IS named
+    /// by a manifest got where it was going; the process merely died one
+    /// `set_status` short of saying so.
     #[tokio::test]
-    async fn retire_in_flight_closes_the_rows_a_crash_left_staged() {
+    async fn retire_in_flight_settles_each_staged_row_against_the_vouched_set() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let staged = insert(&ctx, &new_build("site/a")).await.expect("insert");
-        let accepted = insert(&ctx, &new_build("site/b")).await.expect("insert");
+        let orphan = insert(&ctx, &new_build("site/a")).await.expect("insert");
+        let mut landed = new_build("site/b");
+        landed.artifact_sha256 = "vouched".to_string();
+        let landed = insert(&ctx, &landed).await.expect("insert");
+        let accepted = insert(&ctx, &new_build("site/c")).await.expect("insert");
         set_status(&ctx, &accepted.id, BuildStatus::Valid, None, None)
             .await
             .expect("accept");
 
         let reason = r#"[{"level":"error","message":"abandoned at boot"}]"#;
-        assert_eq!(retire_in_flight(&ctx, reason).await.expect("retire"), 1);
+        let vouched = BTreeSet::from(["vouched".to_string()]);
+        assert_eq!(
+            retire_in_flight(&ctx, &vouched, reason)
+                .await
+                .expect("retire"),
+            RetiredBuilds {
+                promoted: 1,
+                retired: 1
+            },
+        );
 
-        let retired = get(&ctx, &staged.id).await.expect("get");
+        let retired = get(&ctx, &orphan.id).await.expect("get");
         assert_eq!(retired.status, BuildStatus::Invalid);
         assert_eq!(retired.diagnostics_json, reason);
-        // An accepted build is untouched, diagnostics included.
+
+        // Promoted, with the `BlockInfo` the stage recorded before its
+        // activation — which is the whole reason to promote rather than close.
+        let promoted = get(&ctx, &landed.id).await.expect("get");
+        assert_eq!(promoted.status, BuildStatus::Valid);
+        assert_eq!(promoted.block_info_json, BLOCK_INFO);
+        assert_eq!(promoted.diagnostics_json, DIAGNOSTICS);
+        assert_eq!(
+            latest_valid_for_artifact(&ctx, "vouched")
+                .await
+                .expect("lookup")
+                .map(|row| row.id),
+            Some(promoted.id),
+        );
+
+        // An already-accepted build is untouched, diagnostics included.
         let untouched = get(&ctx, &accepted.id).await.expect("get");
         assert_eq!(untouched.status, BuildStatus::Valid);
         assert_eq!(untouched.diagnostics_json, DIAGNOSTICS);
         // Idempotent: nothing is left in flight.
-        assert_eq!(retire_in_flight(&ctx, reason).await.expect("retire"), 0);
+        assert_eq!(
+            retire_in_flight(&ctx, &vouched, reason)
+                .await
+                .expect("retire"),
+            RetiredBuilds::default(),
+        );
     }
 
     /// `dev_status` reports the artifact store from this index, so it has to

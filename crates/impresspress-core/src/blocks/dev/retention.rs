@@ -266,15 +266,27 @@ mod tests {
     /// The serving generation is fetched on its own, so no listing page can
     /// come between it and the retained set.
     ///
-    /// 260 newer rows against a 200-row page cap: a `status IN (…)` listing
-    /// would have been truncated long before it reached this row, and the
-    /// collector would then have deleted the blobs the site is served from.
+    /// The rows piled on top of it are **in flight**, and that is the whole
+    /// design of the fixture. A page cap can only hide a row from a listing it
+    /// would otherwise have been in, and the only rows sharing a listing with
+    /// the serving generation are the ones a single
+    /// `status IN (active, staged, validating, activating)` query returns —
+    /// superseded and failed rows were never in it, so piling those on proves
+    /// nothing. So: 210 staged rows newer than the active one, against a
+    /// 200-row page. Read that way the serving generation is the 211th and
+    /// falls off the end, and the collector then deletes the blobs the site is
+    /// being served from. Read as it is now — one targeted lookup for the row
+    /// that is serving, a capped listing for the rest — it cannot.
     #[tokio::test]
-    async fn the_serving_generation_survives_more_newer_rows_than_a_page_holds() {
+    async fn the_serving_generation_survives_more_in_flight_rows_than_a_page_holds() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
         let active = row(&ctx, GenerationStatus::Active).await;
-        for _ in 0..260 {
+        // Ordinary history between them, so the pass below has work to do.
+        for _ in 0..20 {
             row(&ctx, GenerationStatus::Superseded).await;
+        }
+        for _ in 0..210 {
+            row(&ctx, GenerationStatus::Staged).await;
         }
 
         let retained_ids: Vec<String> = retained(&ctx)
@@ -287,11 +299,17 @@ mod tests {
             retained_ids.contains(&active.id),
             "the serving generation is retained past any page boundary",
         );
-        assert_eq!(retained_ids.len(), RETAINED_GENERATIONS + 1);
+        // The window's 20 (all staged), plus the 200 the in-flight page holds
+        // — 20 of which the window already had — plus the serving row.
+        assert_eq!(retained_ids.len(), RETAINED_GENERATIONS + 180 + 1);
 
-        // And the pass leaves it alone while deleting the 240 rows past the
-        // window — two pages' worth.
-        assert_eq!(prune(&ctx).await.expect("prune").len(), 240);
+        // And the pass leaves it alone: only the superseded rows past the
+        // window are retention's to delete.
+        let pruned = prune(&ctx).await.expect("prune");
+        assert_eq!(pruned.len(), 20);
+        assert!(pruned
+            .iter()
+            .all(|row| row.status == GenerationStatus::Superseded));
         assert_eq!(
             generations::get(&ctx, &active.id)
                 .await

@@ -24,6 +24,7 @@ use impresspress_core::{
             self,
             builds::{BuildStatus, NewBuild},
             generations::{self, GenerationCause, GenerationStatus, NewGeneration},
+            runtime_state::{self, ActivationPhase, RuntimeState},
         },
         retention,
         test_support::FakeControl,
@@ -144,8 +145,17 @@ async fn stage_build(ctx: &TestContext, artifact_sha256: &str, artifact_bytes: u
 /// A generation carrying `site`, staged and never activated — what a crash
 /// between the ledger insert and the runtime swap leaves behind.
 async fn stage_generation(ctx: &TestContext, site: SiteManifest) -> String {
+    stage_generation_of(ctx, site, Vec::new()).await
+}
+
+/// [`stage_generation`] with a block set.
+async fn stage_generation_of(
+    ctx: &TestContext,
+    site: SiteManifest,
+    blocks: Vec<DynamicBlockSpec>,
+) -> String {
     let id = repo::new_id();
-    let mut manifest = GenerationManifest::staged(site, Vec::new());
+    let mut manifest = GenerationManifest::staged(site, blocks);
     manifest.identify(id.clone(), None);
     generations::insert(
         ctx,
@@ -161,6 +171,26 @@ async fn stage_generation(ctx: &TestContext, site: SiteManifest) -> String {
     .await
     .expect("stage");
     id
+}
+
+/// A block spec whose artifact is stored but which has no build row at all —
+/// the shape a caller wants when it is about to write the row itself.
+async fn spec_only(ctx: &TestContext, name: &str) -> (DynamicBlockSpec, Vec<u8>) {
+    let bytes = format!("\0asm\x01{name}").into_bytes();
+    let artifact_sha256 = artifacts::put(ctx, &bytes).await.expect("store");
+    (
+        DynamicBlockSpec {
+            name: format!("site/{name}"),
+            artifact_sha256,
+            routes: vec![DynamicRoute {
+                prefix: format!("/b/{name}/"),
+                access: RouteAccessKind::Public,
+            }],
+            capabilities: wafer_block::BlockCapabilities::default(),
+            wafer_guest_version: WAFER_GUEST_VERSION,
+        },
+        bytes,
+    )
 }
 
 /// A site manifest naming one file whose blob is stored but which no
@@ -746,20 +776,141 @@ async fn an_orphaned_staged_generation_is_retired_at_boot_and_its_blobs_collecte
     );
 }
 
-/// The same for builds, which have no journal to be named by: a staged row is
-/// a compile that was running, and none is.
+/// A crash in the middle of a block compile is the case the journal exists
+/// for, and boot must not turn it into a permanently broken sandbox.
+///
+/// Convergence makes the block live again, so its build row is where
+/// `latest_valid_for_artifact` finds the `BlockInfo` the duplicate-agent-tool
+/// check reads — retiring that row would leave a live block with no accepted
+/// build, and every later `stage` of *another* block refused for a collision
+/// check it cannot run. So a staged row whose artifact a vouched-for manifest
+/// names is accepted, and only the rest are closed.
 #[tokio::test]
-async fn an_orphaned_staged_build_is_retired_at_boot_and_its_artifact_collected() {
+async fn a_staged_build_the_journal_vouches_for_is_accepted_at_boot() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let shared = ctx.dev_shared();
+
+    // The state a crash mid-compile leaves: the artifact stored, the build row
+    // still staged, the generation staged, and the journal pointing at it.
+    let (spec, bytes) = spec_only(&ctx, "hello").await;
+    let converging = spec.artifact_sha256.clone();
+    let build = stage_build(&ctx, &converging, bytes.len() as u64).await;
+    let desired = stage_generation_of(&ctx, SiteManifest::default(), vec![spec]).await;
+    runtime_state::write(
+        &ctx,
+        &RuntimeState {
+            active_generation_id: None,
+            desired_generation_id: Some(desired.clone()),
+            activation_phase: ActivationPhase::BuildingRuntime,
+            generation: 0,
+        },
+    )
+    .await
+    .expect("journal the interrupted activation");
+
+    // A second compile that got nowhere: nothing vouches for it.
+    let (_orphan_spec, orphan_bytes) = spec_only(&ctx, "orphan").await;
+    let orphan_artifact = blobs::sha256_hex(&orphan_bytes);
+    let orphan_build = stage_build(&ctx, &orphan_artifact, orphan_bytes.len() as u64).await;
+
+    let blocks = activation::converge_on_boot(&ctx, &shared)
+        .await
+        .expect("boot");
+    assert_eq!(
+        blocks.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+        vec!["site/hello"],
+        "the journalled activation is the one that converges",
+    );
+
+    // The row for the block that is now live was accepted, not closed — and
+    // it is reachable through the lookup the collision check uses.
+    assert_eq!(
+        repo::builds::get(&ctx, &build).await.expect("get").status,
+        BuildStatus::Valid,
+    );
+    assert!(
+        repo::builds::latest_valid_for_artifact(&ctx, &converging)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "a live block must have an accepted build recording its BlockInfo",
+    );
+
+    // The one nothing vouches for was closed instead, which unpinned its
+    // artifact — and the collection the converged activation ran has already
+    // taken both the object and the row. (The retirement's own message is
+    // asserted by the boot test below, which converges nothing and so leaves
+    // the row to look at.)
+    assert!(
+        repo::builds::list_in_flight(&ctx)
+            .await
+            .expect("list")
+            .is_empty(),
+        "boot settles every staged row, one way or the other",
+    );
+    assert!(
+        !artifacts::exists(&ctx, &orphan_artifact)
+            .await
+            .expect("exists"),
+        "no compile is coming for it",
+    );
+    assert_eq!(
+        repo::builds::get(&ctx, &orphan_build)
+            .await
+            .expect_err("collected with its artifact")
+            .code,
+        wafer_run::ErrorCode::NotFound,
+    );
+    assert!(
+        artifacts::exists(&ctx, &converging).await.expect("exists"),
+        "the generation that converged names it",
+    );
+}
+
+/// Builds have no journal to be named by, so boot settles each staged row
+/// against the manifests instead — and the *serving* manifest vouches for one
+/// just as the journalled one does. A crash between an activation committing
+/// and its build row being accepted is one `set_status` wide, and closing that
+/// row would leave a live block with no `BlockInfo` on record.
+#[tokio::test]
+async fn boot_accepts_the_staged_build_of_a_live_block_and_closes_the_rest() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let shared = ctx.dev_shared();
 
+    // A block that IS serving, whose build row never got as far as `valid`.
+    let (spec, live_bytes) = spec_only(&ctx, "live").await;
+    let live_artifact = spec.artifact_sha256.clone();
+    activation::request(
+        &ctx,
+        &shared,
+        GenerationCause::BlockCompile,
+        ActivationIntent::BlockSet {
+            site: None,
+            blocks: vec![spec],
+        },
+    )
+    .await
+    .expect("the block activates");
+    let live_build = stage_build(&ctx, &live_artifact, live_bytes.len() as u64).await;
+
+    // And a compile that got nowhere at all.
     let bytes = b"\0asm\x01abandoned";
     let artifact = artifacts::put(&ctx, bytes).await.expect("store");
     let row = stage_build(&ctx, &artifact, bytes.len() as u64).await;
 
+    // The journal owes nothing, so the active generation is the only thing
+    // that can vouch for either of them.
     activation::converge_on_boot(&ctx, &shared)
         .await
         .expect("boot");
+
+    let promoted = repo::builds::get(&ctx, &live_build).await.expect("get");
+    assert_eq!(
+        promoted.status,
+        BuildStatus::Valid,
+        "the generation that is serving names its artifact",
+    );
     let retired = repo::builds::get(&ctx, &row).await.expect("get");
     assert_eq!(retired.status, BuildStatus::Invalid);
     assert!(
@@ -772,5 +923,11 @@ async fn an_orphaned_staged_build_is_retired_at_boot_and_its_artifact_collected(
     assert!(
         !artifacts::exists(&ctx, &artifact).await.expect("exists"),
         "no compile is coming for it",
+    );
+    assert!(
+        artifacts::exists(&ctx, &live_artifact)
+            .await
+            .expect("exists"),
+        "and the serving block keeps its own",
     );
 }
