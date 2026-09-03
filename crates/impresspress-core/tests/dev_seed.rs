@@ -738,3 +738,49 @@ async fn a_seeded_build_row_records_the_block_info_the_guest_reported() {
     // control was asked once per seeded block.
     assert_eq!(control.inspections(), 1);
 }
+
+/// The staging path refuses a module built against a different
+/// `wafer_guest.rs` before it executes it (`blocks_api::handle_stage`), and a
+/// seed is the other way a module reaches this runtime. The failure the gate
+/// prevents is a trap inside wasmi during the boot activation — the one boot
+/// that can least explain itself — and §10.1 makes exports deliberately
+/// re-importable by someone who did not write them, so the two paths have to
+/// apply the same rule.
+#[tokio::test]
+async fn a_block_built_against_a_different_guest_version_is_refused() {
+    let (ctx, control) = fixture().await;
+    let mut manifest = manifest();
+    manifest.blocks[0].spec.wafer_guest_version = 99;
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle())
+        .await
+        .expect_err("a stale guest module must refuse the import");
+    // The staging path's own diagnostic, code and remedy included.
+    assert!(error.contains("wafer-guest-version"), "{error}");
+    assert!(error.contains("version 99"), "{error}");
+    assert!(error.contains("site/hello"), "{error}");
+    // Refused before anything was fetched, let alone stored: the version is
+    // knowable from the manifest.
+    assert_eq!(control.inspections(), 0);
+    assert!(workspace::load(&ctx)
+        .await
+        .expect("workspace")
+        .files
+        .is_empty());
+}
+
+/// Zero is "no version reported" on both paths — a compiler that could not
+/// read the file records `0`, and so does a bundle exported before the field
+/// existed. Neither is a mismatch, and refusing them would make every such
+/// bundle unimportable.
+#[tokio::test]
+async fn a_block_that_reports_no_guest_version_still_imports() {
+    let (ctx, control) = fixture().await;
+    let mut manifest = manifest();
+    manifest.blocks[0].spec.wafer_guest_version = 0;
+
+    seed::import(&ctx, control.as_ref(), &manifest, &bundle())
+        .await
+        .expect("a bundle that reports no version must still import")
+        .expect("fresh");
+}

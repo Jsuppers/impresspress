@@ -43,6 +43,7 @@ use wafer_run::Block;
 const PRODUCTS_TABLE: &str = "impresspress__products__products";
 const OFFERS_TABLE: &str = "impresspress__products__offers";
 const OFFER_COMPONENTS_TABLE: &str = "impresspress__products__offer_components";
+const PRODUCT_VERSIONS_TABLE: &str = "impresspress__products__product_versions";
 const PURCHASES_TABLE: &str = "impresspress__products__purchases";
 const ADMIN_USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
@@ -316,6 +317,90 @@ async fn export_carries_products_but_never_secrets_or_orders() {
     assert_eq!(offer["sync_error"], json!(""));
     let component = &snap.tables[OFFER_COMPONENTS_TABLE][0];
     assert_eq!(component["stripe_price_id"], json!(""));
+}
+
+/// Products are read live-only, and everything that hangs off a product has
+/// to be read the same way or the export carries rows pointing at nothing.
+///
+/// A soft-deleted product with an offer is the shape that breaks it: the
+/// product is filtered out by `list_live_products`, while `offers`,
+/// `offer_components` and `product_versions` were read whole. The imported
+/// shop then holds an offer whose `product_id` names no row — inert (the
+/// catalog reads active products) but data the export never decided to carry.
+#[tokio::test]
+async fn a_soft_deleted_products_offers_and_versions_do_not_travel() {
+    let ctx = TestContext::with_products().await.with_auth_added().await;
+    seed_product_and_order(&ctx).await;
+
+    // A second product, its own offer, that offer's component and a version
+    // row — then the product is soft-deleted, exactly as
+    // `DELETE /b/products/api/admin/products/{id}` leaves it.
+    seed_row(
+        &ctx,
+        PRODUCTS_TABLE,
+        "prod_retired",
+        json!({ "name": "Retired", "status": "active" }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        OFFERS_TABLE,
+        "offer_retired",
+        json!({ "product_id": "prod_retired", "name": "Retired" }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        OFFER_COMPONENTS_TABLE,
+        "component_retired",
+        json!({
+            "offer_id": "offer_retired",
+            "component_key": "base",
+            "label": "Base",
+        }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        PRODUCT_VERSIONS_TABLE,
+        "version_retired",
+        json!({ "product_id": "prod_retired", "version": 1 }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        PRODUCT_VERSIONS_TABLE,
+        "version_live",
+        json!({ "product_id": "prod_widget", "version": 1 }),
+    )
+    .await;
+    db::update(
+        &ctx,
+        PRODUCTS_TABLE,
+        "prod_retired",
+        json_map(json!({ "deleted_at": "2026-09-01T00:00:00Z" })),
+    )
+    .await
+    .expect("soft-delete the second product");
+
+    let snap = data_snapshot::export(&ctx).await.unwrap();
+
+    let ids = |table: &str| -> Vec<String> {
+        snap.tables[table]
+            .iter()
+            .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(ids(PRODUCTS_TABLE), vec!["prod_widget"]);
+    // The live product's rows all travel…
+    assert_eq!(ids(OFFERS_TABLE), vec!["offer_standard"]);
+    assert_eq!(ids(OFFER_COMPONENTS_TABLE), vec!["component_base"]);
+    assert_eq!(ids(PRODUCT_VERSIONS_TABLE), vec!["version_live"]);
+    // …and the retired one's — including the component, which is two links
+    // from the product it is orphaned by — travel with it or not at all.
+    assert!(!ids(OFFERS_TABLE).contains(&"offer_retired".to_string()));
+    assert!(!ids(OFFER_COMPONENTS_TABLE).contains(&"component_retired".to_string()));
+    assert!(!ids(PRODUCT_VERSIONS_TABLE).contains(&"version_retired".to_string()));
 }
 
 // ---------------------------------------------------------------------------

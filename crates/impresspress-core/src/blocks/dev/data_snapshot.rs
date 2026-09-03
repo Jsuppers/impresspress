@@ -39,7 +39,7 @@
 //! re-host their own shop and log back into it — design §10.1 calls this out
 //! explicitly, and the exported bundle's README discloses it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -356,6 +356,12 @@ mod variable_is_exportable_tests {
 /// Read every [`TABLE_ALLOWLIST`] table's rows into a [`DataSnapshot`].
 pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
     let mut tables = BTreeMap::new();
+    // The ids the products table actually exported, and the offers that
+    // survived them. Products are read live-only ([`list_live_products`]);
+    // three tables below hold rows that belong to a product and mean nothing
+    // without it, so they are filtered against these sets rather than read
+    // whole — see [`OWNED_TABLES`].
+    let mut exported: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for &(table, _mode) in TABLE_ALLOWLIST {
         // Products alone: read through the repo module's own live-only
         // lister, never the raw table name — see the comment on
@@ -376,13 +382,97 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
             // `variable_is_exportable`'s docs for why the check lives there
             // and not as a second `Mode`.
             .filter(|row| table != admin_schema::VARIABLES_TABLE || variable_is_exportable(row))
+            .filter(|row| owner_was_exported(table, row, &exported))
             .collect();
+        if OWNED_TABLES.iter().any(|(_, _, owner)| *owner == table) {
+            exported.insert(table, ids_of(&rows));
+        }
         tables.insert(table.to_string(), rows);
     }
     Ok(DataSnapshot {
         schema_version: SCHEMA_VERSION,
         tables,
     })
+}
+
+/// The three tables whose rows hang off another exported table's row, as
+/// `(table, the column naming its owner, the owner's table)`.
+///
+/// Products are exported live-only, so without this an offer whose product was
+/// soft-deleted would travel while its product did not, and land in the
+/// imported shop pointing at nothing. Inert (the catalog reads active
+/// products) but it is data the export would be carrying without having
+/// decided to.
+///
+/// `variables` is deliberately NOT here even though it has an `offer_id`: the
+/// column is `NOT NULL DEFAULT ''` (products migration 005), so an unowned
+/// variable is a legitimate state and "no owner" is not evidence of an orphan
+/// the way it is for these three.
+const OWNED_TABLES: &[(&str, &str, &str)] = &[
+    (PRODUCT_VERSIONS_TABLE, "product_id", PRODUCTS_COLLECTION),
+    (OFFERS_TABLE, "product_id", PRODUCTS_COLLECTION),
+    (OFFER_COMPONENTS_TABLE, "offer_id", OFFERS_TABLE),
+];
+
+/// Whether one row's owner is in the export, for the [`OWNED_TABLES`]; every
+/// other table's rows pass unconditionally.
+///
+/// A row whose owner column is missing or is not a string is dropped: the
+/// schema declares all three `TEXT NOT NULL`, so a row this cannot read is one
+/// this build does not understand, and carrying it would be exporting a
+/// dangling reference on the strength of not having looked.
+fn owner_was_exported(
+    table: &str,
+    row: &serde_json::Map<String, Value>,
+    exported: &BTreeMap<&str, BTreeSet<String>>,
+) -> bool {
+    let Some((_, column, owner)) = OWNED_TABLES.iter().find(|(name, _, _)| *name == table) else {
+        return true;
+    };
+    // Unreachable while `TABLE_ALLOWLIST` lists each owner before the tables
+    // that hang off it — which `every_owned_table_is_listed_after_its_owner`
+    // pins. Reading "no owner exported" from a set that has not been filled
+    // yet would silently empty the table, so the miss is treated as "keep the
+    // row" and the test is what makes it impossible.
+    let Some(ids) = exported.get(owner) else {
+        return true;
+    };
+    row.get(*column)
+        .and_then(Value::as_str)
+        .is_some_and(|id| ids.contains(id))
+}
+
+/// The `id` of every row in `rows`.
+fn ids_of(rows: &[serde_json::Map<String, Value>]) -> BTreeSet<String> {
+    rows.iter()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod owned_table_tests {
+    use super::*;
+
+    /// [`export`] fills each owner's id set as it reaches that table and
+    /// filters the dependent tables against it, so the allowlist's order is
+    /// load-bearing: an owner listed after its dependents would leave the set
+    /// empty at the moment it is read.
+    #[test]
+    fn every_owned_table_is_listed_after_its_owner() {
+        let position = |table: &str| {
+            TABLE_ALLOWLIST
+                .iter()
+                .position(|(name, _)| *name == table)
+                .unwrap_or_else(|| panic!("{table:?} is not on TABLE_ALLOWLIST"))
+        };
+        for (table, _column, owner) in OWNED_TABLES {
+            assert!(
+                position(owner) < position(table),
+                "{owner:?} must be exported before {table:?}, which is filtered against it"
+            );
+        }
+    }
 }
 
 /// A database [`db::Record`] as the JSON object [`DataSnapshot`] stores.
@@ -609,10 +699,11 @@ async fn import_row(
             let conflict: Vec<String> = conflict.iter().map(|c| (*c).to_string()).collect();
             // Products alone: written through the repo module's own
             // wholesale-upsert door, never the raw table name — see the
-            // comment on `TABLE_ALLOWLIST`'s products entry. That door is
-            // `BY_ID`, which is what the allowlist declares for it.
+            // comment on `TABLE_ALLOWLIST`'s products entry. The door takes
+            // the conflict target the allowlist declared, exactly as
+            // `db::upsert` does below, so there is one statement of it.
             if table == PRODUCTS_COLLECTION {
-                upsert_product_from_snapshot(ctx, data, update_columns).await?;
+                upsert_product_from_snapshot(ctx, data, conflict, update_columns).await?;
             } else {
                 db::upsert(
                     ctx,

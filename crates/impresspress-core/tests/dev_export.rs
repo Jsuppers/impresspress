@@ -881,6 +881,47 @@ async fn exporting_a_fresh_instance_is_refused() {
     );
 }
 
+/// A blob the manifest names that the store no longer has is the export
+/// LOSING A RACE, not an internal fault.
+///
+/// `assemble` reads the site manifest and then each blob with nothing held —
+/// deliberately, because a 10 MB read under the workspace mutex would block
+/// editing for the length of an export. What that admits is a `blocks/`-source
+/// delete landing in between and collecting the blob underneath the read. The
+/// answer has to say so and say what to do about it: a generic 500 reads like
+/// a bug in the exporter, and the remedy — try again — is not one anybody
+/// would guess from it.
+#[tokio::test]
+async fn a_blob_freed_mid_export_is_a_named_refusal_rather_than_a_500() {
+    let control = FakeControl::new();
+    let ctx = shop_instance(&control).await;
+    // Exactly what the race produces: the manifest still names the blob, the
+    // store no longer has it.
+    blobs::delete(&ctx, &blobs::sha256_hex(SHOP_HTML))
+        .await
+        .expect("free the blob the site manifest names");
+
+    let out = ctx
+        .dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        .await;
+    assert_eq!(output_http_status(out).await, 409);
+
+    // The same answer on the manifest endpoint, and on the non-HTTP callers:
+    // one wording, so an agent that retries on one retries on the other.
+    let out = ctx
+        .dispatch(admin_msg("retrieve", "/b/dev/api/export/manifest"))
+        .await;
+    assert_eq!(output_http_status(out).await, 409);
+    let error = impresspress_core::blocks::dev::export::build(&ctx, ctx.dev_shared().as_ref())
+        .await
+        .expect_err("a freed blob must refuse the export");
+    assert!(
+        error.message.contains("the workspace changed") && error.message.contains("try again"),
+        "{}",
+        error.message
+    );
+}
+
 /// Both routes are `/b/dev`'s, so both are admin-only at the router.
 #[tokio::test]
 async fn the_export_routes_are_admin_only() {

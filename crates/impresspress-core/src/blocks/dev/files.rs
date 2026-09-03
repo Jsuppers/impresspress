@@ -46,7 +46,7 @@ use super::{
         FileListResponse, FileReadRequest, FileReadResponse, FileWriteRequest, FileWriteResponse,
         GenerationSummary,
     },
-    gc, no_store, no_store_error, no_store_error_status,
+    no_store, no_store_error, no_store_error_status,
     paths::{self, WorkspaceArea},
     repo::generations::GenerationCause,
     workspace::{self, FileEntry, Workspace},
@@ -309,37 +309,33 @@ async fn publish_if_site(
 /// Reclaim the blob a delete may have orphaned, when the delete published
 /// nothing.
 ///
-/// A `site/` delete activates, and the activation collects. A `blocks/` delete
-/// does not activate at all (design §7.2: block source only reaches the runtime
-/// through a compile), and a block source is named by the workspace and by
-/// nothing else — no generation carries a crate, only the artifact compiled
-/// from it. So dropping the entry makes its blob garbage immediately, and
-/// without this it would stay charged against the workspace's quota until some
-/// unrelated site write happened to publish.
+/// A `site/` delete activates, and the activation prunes and collects. A
+/// `blocks/` delete does not activate at all (design §7.2: block source only
+/// reaches the runtime through a compile), and a block source is named by the
+/// workspace and by nothing else — no generation carries a crate, only the
+/// artifact compiled from it. So dropping the entry makes its blob garbage
+/// immediately, and without this it would stay charged against the workspace's
+/// quota until some unrelated site write happened to publish.
+///
+/// [`activation::maintain`] itself, not a bare `gc::collect`: the rule that
+/// pruning comes first and collection second is a property of the two steps,
+/// not of the caller that runs them, and this path was safe only for as long
+/// as every successful activation happened to leave the ledger inside the
+/// window — an invariant nothing stated and that a prune failure (which
+/// `maintain` logs and carries on from) breaks.
 ///
 /// After the manifest is saved and outside the lock that saved it: the
 /// collector takes that lock itself, and it reads the workspace it is about to
 /// collect against rather than the one this handler was holding.
 ///
-/// Failures are logged, not returned: the file *is* deleted, and reporting the
-/// delete as failed because the reclaim did would be untrue. The next
-/// activation collects instead.
+/// Failures are logged, not returned — `maintain`'s own contract: the file
+/// *is* deleted, and reporting the delete as failed because the reclaim did
+/// would be untrue. The next activation collects instead.
 async fn collect_if_unpublished(ctx: &dyn Context, shared: &DevShared, area: &WorkspaceArea) {
     if matches!(area, WorkspaceArea::Site) {
         return;
     }
-    match gc::collect(ctx, shared).await {
-        Ok(report) => tracing::debug!(
-            blobs_deleted = report.blobs_deleted,
-            bytes_freed = report.bytes_freed,
-            "dev sandbox: collected after a block-source delete",
-        ),
-        Err(e) => tracing::error!(
-            error = %e.message,
-            "dev sandbox: collecting after a block-source delete failed; it will be collected \
-             on the next activation",
-        ),
-    }
+    activation::maintain(ctx, shared).await;
 }
 
 // ---------------------------------------------------------------------------

@@ -77,9 +77,6 @@ const SW_PATH: &str = "sw.js";
 /// because [`seed`] owns the layout and this writes what it reads.
 const DATA_PATH: &str = "data.json";
 
-/// The content type the importer checks `seed/data.json` against.
-const DATA_CONTENT_TYPE: &str = "application/json";
-
 /// URL prefix the in-browser Rust toolchain's static assets are served under.
 ///
 /// Two things in the exported bundle refer to it and both have to go: the
@@ -261,9 +258,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     let mut seed_entries: Vec<Entry> = Vec::new();
     let mut site: Vec<seed::SeedFile> = Vec::new();
     for entry in &manifest.site.files {
-        let bytes = blobs::get(ctx, &entry.sha256)
-            .await
-            .map_err(Refusal::Internal)?;
+        let bytes = blobs::get(ctx, &entry.sha256).await.map_err(content_gone)?;
         seed_entries.push(Entry {
             path: format!("seed/site/{}", entry.path),
             bytes,
@@ -277,7 +272,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
         let name = seed::short_name(&spec.name);
         let artifact = artifacts::get(ctx, &spec.artifact_sha256)
             .await
-            .map_err(Refusal::Internal)?;
+            .map_err(content_gone)?;
         seed_entries.push(Entry {
             path: format!("seed/blocks/{name}.wasm"),
             bytes: artifact,
@@ -291,7 +286,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
         for source in &sources {
             let bytes = blobs::get(ctx, &source.sha256)
                 .await
-                .map_err(Refusal::Internal)?;
+                .map_err(content_gone)?;
             seed_entries.push(Entry {
                 path: format!("seed/blocks/{name}/{}", source.path),
                 bytes,
@@ -327,7 +322,7 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
             path: DATA_PATH.to_string(),
             sha256: blobs::sha256_hex(&data_bytes),
             size: data_bytes.len() as u64,
-            content_type: DATA_CONTENT_TYPE.to_string(),
+            content_type: seed::DATA_CONTENT_TYPE.to_string(),
         }),
     };
     let manifest_bytes = serde_json::to_vec_pretty(&seed_manifest)
@@ -634,6 +629,14 @@ fn encoding_error(what: &str, error: serde_json::Error) -> WaferError {
 // Refusals
 // ---------------------------------------------------------------------------
 
+/// What [`Refusal::WorkspaceChanged`] says, on both surfaces.
+///
+/// One string: the HTTP refusal and the `WaferError` the non-HTTP callers
+/// ([`build`], [`manifest_preview`]) get are the same answer to the same
+/// question, and an agent that retries on one wording should retry on the
+/// other.
+const WORKSPACE_CHANGED: &str = "the workspace changed while the export was being built; try again";
+
 /// Why an export could not be produced.
 ///
 /// Three shapes, because they reach the caller three different ways: a
@@ -643,10 +646,38 @@ fn encoding_error(what: &str, error: serde_json::Error) -> WaferError {
 enum Refusal {
     /// Nothing has been published, so there is no site to export.
     NothingPublished,
+    /// A blob or artifact the manifest names is no longer in the store: the
+    /// workspace was edited (and collected) while this export was being
+    /// assembled. See [`content_gone`].
+    WorkspaceChanged,
     /// The static shell could not be listed or read.
     Shell(String),
     /// A storage, ledger or encoding failure.
     Internal(WaferError),
+}
+
+/// A content read that came back [`ErrorCode::NotFound`] is the export losing
+/// a race, not an internal fault.
+///
+/// [`assemble`] reads the manifest first and then each blob, holding no lock
+/// across the two — deliberately, because a 10 MB read under the workspace
+/// mutex would block editing for the length of an export. What that admits is
+/// a `blocks/`-source delete landing between them: `files::handle_delete`
+/// collects after a `blocks/` delete (nothing was published, so no activation
+/// will), and the blob this loop is about to read can be freed underneath it.
+///
+/// The site half cannot lose this race — the active generation is always
+/// retained and a compile finishing mid-export leaves the old generation
+/// `Superseded` but inside the retention window — so the archive is still a
+/// consistent snapshot of one generation whenever it is produced at all. This
+/// only names the case where it cannot be produced, so the caller is told to
+/// try again rather than handed a 500 that reads like a bug in the exporter.
+fn content_gone(error: WaferError) -> Refusal {
+    if error.code == ErrorCode::NotFound {
+        Refusal::WorkspaceChanged
+    } else {
+        Refusal::Internal(error)
+    }
 }
 
 impl Refusal {
@@ -663,6 +694,13 @@ impl Refusal {
                 "there is nothing to export yet: no generation is active. Write a site file or \
                  compile a block first.",
             ),
+            // 409, and `Aborted` — "often due to a concurrency conflict" — is
+            // exactly what this is. Retrying is the whole remedy: the export
+            // is a function of what is live, and what is live is consistent
+            // again the moment the delete that raced it has finished.
+            Self::WorkspaceChanged => {
+                no_store_error_status(ErrorCode::Aborted, 409, WORKSPACE_CHANGED)
+            }
             Self::Shell(message) => err_internal("dev export shell", message),
             Self::Internal(error) => err_internal("dev export", error.message),
         }
@@ -676,6 +714,7 @@ impl Refusal {
                 ErrorCode::FailedPrecondition,
                 "there is nothing to export yet: no generation is active",
             ),
+            Self::WorkspaceChanged => WaferError::new(ErrorCode::Aborted, WORKSPACE_CHANGED),
             Self::Shell(message) => WaferError::new(
                 ErrorCode::Internal,
                 format!("the static shell could not be read: {message}"),

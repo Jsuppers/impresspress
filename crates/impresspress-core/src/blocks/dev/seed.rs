@@ -202,6 +202,15 @@ pub fn data_url(path: &str) -> String {
     format!("{ROOT}{path}")
 }
 
+/// The content type `seed/data.json` is served as, and so the one the
+/// manifest must declare for it.
+///
+/// Here rather than beside the exporter's [`SeedManifest.data`] writer for
+/// the reason [`ROOT`] and the URL builders above are here: this module owns
+/// the bundle's layout, [`super::export`] writes what it reads, and a string
+/// spelled at both ends is a string that can be spelled two ways.
+pub const DATA_CONTENT_TYPE: &str = "application/json";
+
 /// The short workspace name of a registered block (`site/hello` → `hello`).
 ///
 /// The workspace directory, the artifact URL and the route prefix are all
@@ -295,6 +304,30 @@ pub async fn import(
             .collect();
         if let Err(found) = validation::validate_spec(spec, &builtin_routes, &others) {
             return Err(refusal(&spec.name, &found));
+        }
+        // The same gate `blocks_api::handle_stage` applies to a compile, for
+        // the same reason and at the same point: before the module is fetched,
+        // stored or executed. A block built against a different
+        // `wafer_guest.rs` speaks a contract this runtime no longer
+        // guarantees, and loading it turns a one-line "rescaffold and
+        // recompile" into a trap inside wasmi — on the one boot that can least
+        // explain it. `validate_static` cannot produce this verdict
+        // (`BlockInfo` carries no such field, spec amendment 8), so the
+        // manifest is its only source; that is a reason to compare the number
+        // the manifest carries, not a reason to take it on trust.
+        //
+        // Zero is "no version reported", exactly as it is on the staging path:
+        // a compiler that could not read the file records `0` and nothing is
+        // checked. A bundle exported before this field existed carries the
+        // same `0` and must still import.
+        if spec.wafer_guest_version != 0 && spec.wafer_guest_version != super::WAFER_GUEST_VERSION {
+            return Err(refusal(
+                &spec.name,
+                &[validation::Diagnostic::stale_guest_module(
+                    spec.wafer_guest_version,
+                    super::WAFER_GUEST_VERSION,
+                )],
+            ));
         }
     }
 
@@ -436,7 +469,7 @@ pub async fn import(
     // a bare `Option<String>` path could only ever be.
     if let Some(declared) = &manifest.data {
         let url = data_url(&declared.path);
-        let bytes = fetch_and_verify(fetch, &url, declared, "application/json").await?;
+        let bytes = fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE).await?;
         let snapshot: data_snapshot::DataSnapshot = serde_json::from_slice(&bytes)
             .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?;
         data_snapshot::import(ctx, &snapshot)

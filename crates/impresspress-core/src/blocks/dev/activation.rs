@@ -698,7 +698,16 @@ async fn activate_staged(
 /// collector's reachability is read off the rows retention keeps, so a
 /// collection that ran before the prune would still be protecting the
 /// generations the prune is about to delete and would reclaim nothing.
-async fn maintain(ctx: &dyn Context, shared: &super::DevShared) {
+///
+/// Also the whole of what a `blocks/` delete does afterwards
+/// ([`super::files`]'s `collect_if_unpublished`), which publishes nothing and
+/// so never reaches this function through an activation. It is the same pair
+/// of steps in the same order for the same reason — a collection there that
+/// skipped the prune would be reading reachability off a window a *failed*
+/// prune had left too wide, which is the one case this ordering exists for —
+/// so it is one function, called from both, rather than a second collection
+/// site that has to remember the rule.
+pub(super) async fn maintain(ctx: &dyn Context, shared: &super::DevShared) {
     let pruned = match retention::prune(ctx).await {
         Ok(pruned) => pruned,
         Err(e) => {
