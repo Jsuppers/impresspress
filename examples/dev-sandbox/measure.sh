@@ -32,8 +32,12 @@
 # re-running this script never re-optimizes, it only re-measures.
 #
 # Thresholds (all overridable, all in the units named):
-#   MEASURE_MAX_DEV_DELTA_KIB        default 700   — dev gzip minus default
+#   MEASURE_MAX_DEV_DELTA_KIB        default 1536  — dev gzip minus default
 #                                                     gzip, in KiB
+#     (the dev-only bundle carries the workspace page, the compiler adapter,
+#     the vendored wafer_guest.rs + templates + reference; the guard is
+#     against runaway growth, not this delta — Plan 2 measured +661 KiB
+#     before Plan 3's additions)
 #   MEASURE_MAX_COMPILER_TOTAL_MIB   default 80    — compiler/dist total, MiB
 #   MEASURE_MAX_COMPILER_FILE_BYTES  default 25165824 (24 MiB) — any one
 #                                                     compiler/dist asset
@@ -83,7 +87,7 @@ fail() { printf 'measure.sh: FAIL: %s\n' "$*" >&2; FAILED=1; }
 
 FAILED=0
 
-MEASURE_MAX_DEV_DELTA_KIB="${MEASURE_MAX_DEV_DELTA_KIB:-700}"
+MEASURE_MAX_DEV_DELTA_KIB="${MEASURE_MAX_DEV_DELTA_KIB:-1536}"
 MEASURE_MAX_COMPILER_TOTAL_MIB="${MEASURE_MAX_COMPILER_TOTAL_MIB:-80}"
 MEASURE_MAX_COMPILER_FILE_BYTES="${MEASURE_MAX_COMPILER_FILE_BYTES:-25165824}"
 
