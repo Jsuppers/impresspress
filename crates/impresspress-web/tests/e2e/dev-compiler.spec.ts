@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { createHash } from 'node:crypto';
-import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -27,6 +27,11 @@ import { loginToWorkspace } from './fixtures/dev-sandbox';
  * exactly, including the two refusals that make the adapter's queue mean
  * something (a second `compile` while one is in flight, and anything after a
  * `cancel`). Plan 3 Task 6 drives the real compiler end to end.
+ *
+ * The one thing a fake cannot answer is whether the REAL worker is allowed to
+ * start at all — which is a property of headers, not of the protocol — so the
+ * last test here starts the packaged worker and waits for its `ready`. See
+ * that test for what it is really proving.
  *
  * # How the fake gets served
  *
@@ -57,6 +62,10 @@ const TEST_MANIFEST_URL = '/__impresspress_dev/compiler/test/manifest.json';
 const TEST_WORKER_URL = '/__impresspress_dev/compiler/test/worker.js';
 
 const FAKE_WORKER = fileURLToPath(new URL('./fixtures/fake-compiler-worker.js', import.meta.url));
+
+/** The manifest `build.sh` overlaid — the real toolchain's, not the fixture's. */
+const REAL_MANIFEST_URL = '/__impresspress_dev/compiler/manifest.json';
+const REAL_MANIFEST_FILE = path.join(DEV_DIST, '__impresspress_dev', 'compiler', 'manifest.json');
 
 /** The sixteen bytes `fake-compiler-worker.js` hands back, and their digest. */
 const ARTIFACT = Buffer.from(Array.from({ length: 16 }, (_, i) => i));
@@ -314,4 +323,105 @@ test('the compiler adapter queues compiles, cancels one, and recovers from a bro
     expect(violations[crateName].rejected, crateName).toBe(true);
     expect(violations[crateName].recovered, crateName).toBe(true);
   }
+});
+
+/**
+ * The packaged worker starts — which is a statement about HEADERS, not about
+ * the protocol.
+ *
+ * A document with a `Cross-Origin-Embedder-Policy` inherits that policy to
+ * every dedicated worker it starts, and the browser refuses one whose script
+ * response does not carry a compatible COEP. `/b/dev` is `credentialless`
+ * (`blocks/dev/page.rs`), and the toolchain lives under
+ * `/__impresspress_dev/compiler/` — a prefix on the service worker's bypass
+ * list, so the wasm runtime never sees those responses and cannot put a header
+ * on them. The static host is what answers them, and the host here is
+ * `python3 -m http.server`, which sends no such header: before
+ * `sw.js.tmpl`'s passthrough existed this failed with
+ * `net::ERR_BLOCKED_BY_RESPONSE` and a `Worker` `error` event carrying an empty
+ * message — all the page can ever be told.
+ *
+ * So the header on the response below can only have come from the service
+ * worker, and the worker reaching `ready` can only have happened because it
+ * did. That is the whole point of the test, and it is why it uses a bare
+ * `Worker` rather than `BrowserRustCompiler`: the adapter is covered above,
+ * and a failure here must be unambiguous about which layer broke.
+ *
+ * It is also the only test in this file that pays for the real toolchain —
+ * ~75 MiB over loopback and a wasm instantiation, measured at 7–11 s cold
+ * (`compiler/README.md`). It does not compile anything; Plan 3 Task 6 does.
+ */
+test('the packaged compiler worker starts under the isolation headers the service worker adds', async ({
+  page,
+}) => {
+  test.setTimeout(600_000);
+
+  // What `build.sh` overlaid into the bundle being served. Read from disk so
+  // the assertions below are against the tree under test, not against
+  // whatever the page happened to fetch.
+  const onDisk = JSON.parse(readFileSync(REAL_MANIFEST_FILE, 'utf8'));
+
+  await loginToWorkspace(page);
+
+  // `/b/dev` itself: the capability, not just the header. `SharedArrayBuffer`
+  // is what the toolchain's threads need and what isolation buys.
+  expect(await page.evaluate(() => crossOriginIsolated)).toBe(true);
+
+  const headers = await page.evaluate(async (url: string) => {
+    const response = await fetch(url, { cache: 'no-store' });
+    return {
+      status: response.status,
+      coep: response.headers.get('cross-origin-embedder-policy'),
+      coop: response.headers.get('cross-origin-opener-policy'),
+      manifest: await response.json(),
+    };
+  }, REAL_MANIFEST_URL);
+  expect(headers.status).toBe(200);
+  // Nothing on the static host sends these. The service worker did.
+  expect(headers.coep).toBe('credentialless');
+  expect(headers.coop).toBe('same-origin');
+  expect(headers.manifest.entry).toBe(onDisk.entry);
+
+  const started = await page.evaluate(async (entry: string) => {
+    const worker = new Worker(entry, { type: 'module' });
+    try {
+      return await new Promise<{ rustcVersion: string }>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('the compiler worker never answered `ready`')),
+          420_000,
+        );
+        worker.addEventListener('error', (event) => {
+          event.preventDefault();
+          clearTimeout(timer);
+          // An empty message is the signature of a COEP refusal: the browser
+          // will not say more about a worker it declined to start.
+          reject(
+            new Error(
+              'the compiler worker failed to start: ' +
+                (event.message || '(no message — this is what a COEP refusal looks like)'),
+            ),
+          );
+        });
+        worker.addEventListener('message', (event) => {
+          const message = event.data;
+          if (message.type === 'ready' && message.id === 'coep-probe') {
+            clearTimeout(timer);
+            resolve({ rustcVersion: message.rustcVersion });
+          } else if (message.type === 'error' && message.id === 'coep-probe') {
+            clearTimeout(timer);
+            reject(new Error('the compiler worker refused init: ' + message.message));
+          }
+        });
+        // `protocol.ts`'s `InitMessage`. `ready` is its one success answer.
+        worker.postMessage({ type: 'init', id: 'coep-probe' });
+      });
+    } finally {
+      // 75 MiB of toolchain has no business outliving this test.
+      worker.terminate();
+    }
+  }, onDisk.entry);
+
+  // The toolchain really came up: this string is `rustc --version` as run
+  // inside the worker's VFS, not something the page could have synthesized.
+  expect(started.rustcVersion).toContain('rustc');
 });

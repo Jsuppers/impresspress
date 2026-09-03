@@ -214,6 +214,84 @@ fn a_non_dev_bundle_does_not_bypass_the_seed_prefix() {
     assert!(!sw.contains("/seed/"), "sw.js = {sw}");
 }
 
+/// A dev bundle's service worker is the deployment's header layer.
+///
+/// The in-browser Rust toolchain runs in a dedicated worker started from a
+/// document that is COEP `credentialless`, and a browser refuses such a worker
+/// unless the worker SCRIPT's own response carries a compatible COEP. That
+/// script is a bypassed static file, so no runtime response can carry it and
+/// no static host is guaranteed to send it — which is why `sw.js` answers
+/// every bypassed same-origin request itself in a dev bundle and adds the
+/// pair. Without this the compiler cannot start on any host, and the only
+/// symptom the page gets is an empty `Worker` error event.
+#[test]
+fn a_dev_bundle_adds_the_isolation_headers_to_bypassed_responses() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    // Rendered from the build-time flag, not decided at runtime.
+    assert!(
+        sw.contains("if (true && url.pathname !== '/sw.js') {"),
+        "the dev rendering must take the passthrough branch; sw.js = {sw}"
+    );
+    assert!(
+        sw.contains("event.respondWith(passthrough(event.request));"),
+        "sw.js = {sw}"
+    );
+    // Both headers, with the values `blocks/dev/page.rs` and the
+    // security-headers block use for the rest of the origin.
+    assert!(
+        sw.contains("headers.set('Cross-Origin-Embedder-Policy', 'credentialless');"),
+        "sw.js = {sw}"
+    );
+    assert!(
+        sw.contains("headers.set('Cross-Origin-Opener-Policy', 'same-origin');"),
+        "sw.js = {sw}"
+    );
+    // Streamed, not buffered: these are multi-megabyte wasm parts.
+    assert!(
+        sw.contains("return new Response(response.body, {"),
+        "the passthrough must pipe the body, not read it; sw.js = {sw}"
+    );
+    // An opaque or error response has no readable headers and no exposed
+    // body, so rebuilding it would silently replace it with an empty 200.
+    assert!(
+        sw.contains("response.type === 'opaque'") && sw.contains("response.type === 'error'"),
+        "sw.js = {sw}"
+    );
+}
+
+/// And the other rendering, explicitly: a bundle with no sandbox has no
+/// compiler worker to start and no site-wide isolation to be consistent with,
+/// so its bypassed requests go to the network untouched — the behaviour every
+/// bundle had before the sandbox existed, and one less service-worker round
+/// trip per static asset.
+#[test]
+fn a_non_dev_bundle_leaves_bypassed_responses_to_the_network() {
+    let tmp = production_pkg_copy();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(
+        sw.contains("if (false && url.pathname !== '/sw.js') {"),
+        "the non-dev rendering must not take the passthrough branch; sw.js = {sw}"
+    );
+    // The early return is still the last statement of the bypass branch.
+    assert!(
+        sw.contains(
+            "        }\n        return;\n    }\n    event.respondWith(handleFetch(event.request));"
+        ),
+        "the bypass branch must still end in the plain early return; sw.js = {sw}"
+    );
+}
+
 /// The seed prefix joins whatever the app already asked for rather than
 /// replacing it — `examples/dev-sandbox` also bypasses the compiler worker.
 #[test]

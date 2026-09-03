@@ -150,10 +150,109 @@ self.addEventListener('fetch', (event) => {
         url.pathname.startsWith('/snippets/') ||
         url.pathname.startsWith('/vendor/') ||
         url.pathname.startsWith('/sql-')__EXTRA_BYPASS____EXTRA_BYPASS_EXACT__) {
+        // ------------------------------------------------------------------
+        // Bypassed — the network answers this, not the wasm runtime.
+        //
+        // In a NON-dev bundle that is the whole story: return, and the
+        // browser performs the fetch it would have performed with no service
+        // worker at all.
+        //
+        // In a DEV bundle it is not, and the reason is a rule that is easy to
+        // miss. A document with a `Cross-Origin-Embedder-Policy` inherits
+        // that policy to every dedicated worker it starts, and the browser
+        // REFUSES to start one whose own script response does not carry a
+        // compatible COEP. The sandbox's `/b/dev` is COEP `credentialless`
+        // (it needs `SharedArrayBuffer` for the in-browser Rust toolchain),
+        // and the toolchain's worker script is one of the files bypassed
+        // above — a quarter of a gigabyte of static assets that must not go
+        // through wasm. So the runtime never sees that response and cannot
+        // put a header on it; the static host does, and a static host that
+        // says nothing gets `net::ERR_BLOCKED_BY_RESPONSE` plus a `Worker`
+        // `error` event with an empty message, which is all the page can ever
+        // be told.
+        //
+        // Which static host? `python3 -m http.server` in CI, Cloudflare's
+        // asset server in production, whatever a contributor runs locally.
+        // "Every host that ever serves this bundle must be configured to send
+        // a header" is a rule with no enforcement point. The service worker
+        // is the one thing that ships INSIDE the bundle and sits in front of
+        // every same-origin request, so it is the deployment's header layer —
+        // the coi-serviceworker pattern, applied to the requests this worker
+        // otherwise waves through.
+        //
+        // Hence: a dev bundle answers the bypassed request itself, with the
+        // network's own response plus the cross-origin-isolation pair. The
+        // pair matches what the runtime already sends on everything it serves
+        // in a dev deployment (the security-headers block's
+        // `cross_origin_isolation`), so this makes the static files CONSISTENT
+        // with the rest of the origin rather than special.
+        //
+        // `credentialless` rather than `require-corp`: a site an agent built
+        // in this sandbox can still show a cross-origin image that carries no
+        // `Cross-Origin-Resource-Policy`, which under `require-corp` it could
+        // not.
+        //
+        // Every bypassed path, not just the toolchain's: the bypass list is
+        // the APP's (`--extra-bypass-prefix`), so this worker cannot know
+        // which of those prefixes an app loads a worker script from — and the
+        // headers are inert on every response that is neither a document nor
+        // a worker script, so widening the rule costs nothing and narrowing it
+        // would be a guess.
+        //
+        // `/sw.js` is kept out. The browser fetches a worker's own script
+        // outside any worker's `fetch` handler, so this branch should never
+        // see it; if some future browser routes it here anyway, answering it
+        // from inside the worker being replaced is how an update check gets a
+        // stale script.
+        //
+        // The condition below is rendered from `[dev] enabled` at BUILD time
+        // (`impresspress-bundle`'s `DEV_ENABLED` var, the same one
+        // `initialize()` reads above), so a shipped `sw.js` reads either
+        // `if (true && …)` or `if (false && …)` — the difference is visible in
+        // the file rather than decided at runtime, and a non-dev bundle keeps
+        // the plain early return it always had.
+        // ------------------------------------------------------------------
+        if (__DEV_ENABLED__ && url.pathname !== '/sw.js') {
+            event.respondWith(passthrough(event.request));
+        }
         return;
     }
     event.respondWith(handleFetch(event.request));
 });
+
+/**
+ * The network's answer to a bypassed request, plus the cross-origin-isolation
+ * headers. See the long comment in the `fetch` listener for why this exists.
+ *
+ * The body is PIPED, never buffered: the assets this runs on include
+ * multi-megabyte wasm parts, and reading one into an ArrayBuffer to hand it
+ * back would double the peak memory of every load for no gain. `response.body`
+ * is the original stream; the new `Response` wraps it.
+ *
+ * An opaque, opaque-redirect or error response is returned untouched. Its
+ * headers are not readable and its body is not exposed, so constructing a new
+ * `Response` from one does not copy it — it silently replaces it with an empty
+ * 200, which is far worse than the missing header this function exists to add.
+ * (Same-origin requests should never produce one here, since the cross-origin
+ * check above already returned; this is the guard for the case where they do.)
+ */
+async function passthrough(request) {
+    const response = await fetch(request);
+    if (response.type === 'opaque' || response.type === 'opaqueredirect' || response.type === 'error') {
+        return response;
+    }
+    const headers = new Headers(response.headers);
+    headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
+    headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+    // `response.body` is null exactly for the statuses that may not have one
+    // (204, 205, 304), which is also the set `new Response` rejects a body
+    // for — so this one expression is correct for both cases.
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    });
+}
 
 async function handleFetch(request) {
     if (poisoned) {
