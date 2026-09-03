@@ -57,6 +57,7 @@ use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream,
 use super::{
     activation::{self, ActivationIntent},
     artifacts,
+    blobs::sha256_hex,
     contracts::{ActivationResponse, StageBuildRequest, StageBuildResponse},
     control::DynamicBlockSpec,
     generation, no_store, no_store_error, paths,
@@ -158,9 +159,13 @@ async fn stage(
     let name = request.block_name.as_str();
     let registered = format!("site/{name}");
 
-    // Content-addressed, so re-staging identical bytes is a no-op write and
-    // two blocks that compiled to the same module share one object.
-    let artifact_sha256 = artifacts::put(ctx, artifact).await?;
+    // The row goes in BEFORE the bytes, and that order is what keeps the
+    // garbage collector's hands off them: an artifact no generation names yet
+    // is protected by its build row alone (see `super::gc`), so bytes stored
+    // ahead of the row would be unreachable for as long as the insert took.
+    // The hash is the artifact's own content hash either way — `artifacts::put`
+    // files it under exactly this key.
+    let artifact_sha256 = sha256_hex(artifact);
     let build = repo::builds::insert(
         ctx,
         &NewBuild {
@@ -176,6 +181,14 @@ async fn stage(
         },
     )
     .await?;
+
+    // Content-addressed, so re-staging identical bytes is a no-op write and
+    // two blocks that compiled to the same module share one object.
+    let stored = artifacts::put(ctx, artifact).await?;
+    debug_assert_eq!(
+        stored, artifact_sha256,
+        "artifact key must be its content hash"
+    );
 
     // From here to the activation, the active block set must not change
     // under us — see the module docs.

@@ -195,16 +195,7 @@ pub async fn latest_valid_for_artifact(
             // make "the latest" an arbitrary choice between them, and the
             // duplicate-agent-tool rule reads the `BlockInfo` off whichever
             // row it lands on.
-            sort: vec![
-                SortField {
-                    field: "created_at".into(),
-                    desc: true,
-                },
-                SortField {
-                    field: "id".into(),
-                    desc: true,
-                },
-            ],
+            sort: newest_first(),
             limit: 1,
             skip_count: true,
             ..Default::default()
@@ -225,16 +216,7 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<BuildRow>,
         ctx,
         TABLE,
         &ListOptions {
-            sort: vec![
-                SortField {
-                    field: "created_at".into(),
-                    desc: true,
-                },
-                SortField {
-                    field: "id".into(),
-                    desc: true,
-                },
-            ],
+            sort: newest_first(),
             limit: limit.clamp(1, MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()
@@ -242,6 +224,82 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<BuildRow>,
     )
     .await?;
     list.records.iter().map(decode).collect()
+}
+
+/// Every build stamped at or after `created_at`, newest first.
+///
+/// The garbage collector's window on a compile that has not reached a
+/// generation yet: staging stores the row before the bytes and only asks for
+/// an activation once the guest has been accepted, so between those two there
+/// is an artifact no manifest names. `None` means "the whole table" — an
+/// instance with no generations has no boundary to be younger than, and
+/// protecting every artifact is the safe reading of that.
+///
+/// Capped at [`MAX_LIST_LIMIT`] like every other listing here, and newest
+/// first so the page that survives the cap is the one holding the compiles
+/// that could still be in flight.
+pub async fn list_since(
+    ctx: &dyn Context,
+    created_at: Option<&str>,
+) -> Result<Vec<BuildRow>, WaferError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            filters: created_at
+                .map(|created_at| {
+                    vec![Filter {
+                        field: "created_at".into(),
+                        operator: FilterOp::GreaterEqual,
+                        value: serde_json::json!(created_at),
+                    }]
+                })
+                .unwrap_or_default(),
+            sort: newest_first(),
+            limit: MAX_LIST_LIMIT,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    list.records.iter().map(decode).collect()
+}
+
+/// Delete every build row naming `artifact_sha256`.
+///
+/// For the garbage collector, and only after the artifact itself is gone: a
+/// row that says an artifact was accepted, for bytes the store no longer
+/// holds, is a claim [`latest_valid_for_artifact`] would hand back to the
+/// duplicate-tool check as if the block were still loadable.
+pub async fn delete_for_artifact(
+    ctx: &dyn Context,
+    artifact_sha256: &str,
+) -> Result<(), WaferError> {
+    db::delete_by_filters(
+        ctx,
+        TABLE,
+        vec![Filter {
+            field: "artifact_sha256".into(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(artifact_sha256),
+        }],
+    )
+    .await
+}
+
+/// Newest first, with `id` breaking a `created_at` tie — the ordering every
+/// listing here uses, for the reason [`list_recent`] states.
+fn newest_first() -> Vec<SortField> {
+    vec![
+        SortField {
+            field: "created_at".into(),
+            desc: true,
+        },
+        SortField {
+            field: "id".into(),
+            desc: true,
+        },
+    ]
 }
 
 /// Decode a stored row. An unrecognized `status` is an error, never a default.
@@ -382,6 +440,60 @@ mod tests {
                 .expect("lookup"),
             None,
         );
+    }
+
+    /// The collector reads this to decide which artifacts a compile may still
+    /// be on its way to a generation with, so the boundary has to be
+    /// inclusive and `None` has to mean "everything".
+    #[tokio::test]
+    async fn list_since_is_bounded_below_by_the_timestamp_it_is_given() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let mut rows = Vec::new();
+        for name in ["site/a", "site/b", "site/c"] {
+            rows.push(insert(&ctx, &new_build(name)).await.expect("insert"));
+        }
+
+        let all = list_since(&ctx, None).await.expect("list");
+        assert_eq!(all.len(), 3, "no boundary is the whole table");
+
+        let from_second = list_since(&ctx, Some(&rows[1].created_at))
+            .await
+            .expect("list");
+        assert_eq!(
+            from_second
+                .iter()
+                .map(|r| r.block_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["site/c", "site/b"],
+            "at or after the boundary, newest first",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_for_artifact_removes_every_row_naming_it() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        // Two rows for one artifact — a re-stage of identical bytes — plus one
+        // for different bytes, which must survive.
+        let first = insert(&ctx, &new_build("site/a")).await.expect("insert");
+        let second = insert(&ctx, &new_build("site/b")).await.expect("insert");
+        let mut other = new_build("site/c");
+        other.artifact_sha256 = "kept".to_string();
+        let other = insert(&ctx, &other).await.expect("insert");
+
+        delete_for_artifact(&ctx, "art").await.expect("delete");
+        for gone in [&first, &second] {
+            assert_eq!(
+                get(&ctx, &gone.id).await.expect_err("gone").code,
+                ErrorCode::NotFound
+            );
+        }
+        assert_eq!(get(&ctx, &other.id).await.expect("kept").id, other.id);
+
+        // Idempotent: collecting an artifact whose rows are already gone is
+        // not an error.
+        delete_for_artifact(&ctx, "art")
+            .await
+            .expect("delete again");
     }
 
     #[test]

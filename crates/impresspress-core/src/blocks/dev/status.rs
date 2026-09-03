@@ -9,7 +9,7 @@ use wafer_run::{context::Context, OutputStream, WaferError};
 
 use super::{
     contracts::{ActivationView, ActiveBlockView, StatusResponse},
-    generation, no_store, repo, DevShared, WAFER_GUEST_VERSION,
+    gc, generation, no_store, repo, DevShared, WAFER_GUEST_VERSION,
 };
 use crate::http::err_internal;
 
@@ -53,6 +53,10 @@ async fn build(ctx: &dyn Context, shared: &DevShared) -> Result<StatusResponse, 
             })
             .unwrap_or_default(),
         activation,
+        // Walked from the stores on every poll. The page polls this while a
+        // tool call is outstanding, so the figures move as the collector
+        // works rather than only after the panel is reopened.
+        storage: gc::storage_usage(ctx).await?,
         wafer_guest_version: WAFER_GUEST_VERSION,
     })
 }

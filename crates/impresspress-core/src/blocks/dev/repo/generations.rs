@@ -4,7 +4,7 @@
 //! Rolling back publishes a *new* generation that copies an old one's
 //! manifests (design §7.2), so the history stays a straight line.
 
-use wafer_block::db::{ListOptions, SortField};
+use wafer_block::db::{Filter, FilterOp, FilterTree, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -28,12 +28,53 @@ pub enum GenerationStatus {
     Active,
     /// Abandoned; `failure_message` says why.
     Failed,
-    /// No longer serving — superseded by a later generation; retention keeps
-    /// the 20 most recent rows.
+    /// No longer serving — replaced by a later generation.
+    ///
+    /// Written by the activation that replaced it, and by nothing else. It is
+    /// not an ageing marker: a generation that falls out of the retention
+    /// window is deleted rather than relabelled, so a `failed` generation
+    /// still reads as `failed` for as long as the ledger keeps it.
+    //
+    // Worded for the agent, not for this file: these doc comments are
+    // published in `/openapi.json`. The rule itself lives in
+    // `super::super::retention`.
     Superseded,
 }
 
 impl GenerationStatus {
+    /// Every status a row can rest in.
+    ///
+    /// Retention derives the statuses it may delete from this list and
+    /// [`Self::survives_retention`] rather than restating them, so a status
+    /// added to the enum cannot be silently left out of either set.
+    pub const ALL: [Self; 6] = [
+        Self::Staged,
+        Self::Validating,
+        Self::Activating,
+        Self::Active,
+        Self::Failed,
+        Self::Superseded,
+    ];
+
+    /// Whether a row in this status is kept however far down the ledger it
+    /// has fallen.
+    ///
+    /// Two kinds qualify, and both for the same reason — deleting one would
+    /// destroy something the sandbox still needs rather than merely something
+    /// old. [`Self::Active`] is what the site *is*: twenty failed activations
+    /// after a good one do not make the good one collectable. The in-flight
+    /// three are what boot convergence re-runs (design §7.3) — the journal
+    /// may name one, and a recovery that cannot find its row is an
+    /// interrupted activation nothing can finish.
+    ///
+    /// Exhaustive on purpose: a new status has to state which side it is on.
+    pub fn survives_retention(self) -> bool {
+        match self {
+            Self::Staged | Self::Validating | Self::Activating | Self::Active => true,
+            Self::Failed | Self::Superseded => false,
+        }
+    }
+
     /// Canonical string form (matches the serde representation and the
     /// column's `CHECK` constraint).
     pub fn as_str(self) -> &'static str {
@@ -243,24 +284,17 @@ pub async fn set_status(
 /// one millisecond is an ordinary event rather than a race. Without a second
 /// key their order is whatever the backend happens to return, which decides
 /// what the ledger view shows first, which of them a rollback offers, and —
-/// through [`mark_superseded_before`] — which one falls outside the retention
-/// window. `id` is a v4 uuid, so the order it imposes is arbitrary; being
-/// arbitrary and *stable* is the whole requirement.
+/// through the boundary [`list_prunable`] compares against — which one falls
+/// outside the retention window and is deleted. `id` is a v4 uuid, so the
+/// order it imposes is arbitrary; being arbitrary and *stable* is the whole
+/// requirement, and [`list_prunable`] orders rows the same way for exactly
+/// that reason.
 pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<GenerationRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
-            sort: vec![
-                SortField {
-                    field: "created_at".into(),
-                    desc: true,
-                },
-                SortField {
-                    field: "id".into(),
-                    desc: true,
-                },
-            ],
+            sort: newest_first(),
             limit: limit.clamp(1, MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()
@@ -270,27 +304,128 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<Generation
     list.records.iter().map(decode).collect()
 }
 
-/// Upper bound on one `list_recent` page. The retention window is 20
-/// generations (§7.3); a page an order of magnitude larger is already a
-/// generous ceiling for the ledger view.
+/// Upper bound on one page of any listing here.
+///
+/// It bounds a *page*, not the retention pass: [`super::super::retention`]
+/// deletes what a page holds and asks for the next one, so a ledger far past
+/// the window is collected in full rather than down to this many rows.
 const MAX_LIST_LIMIT: i64 = 200;
 
-/// Mark every generation outside the newest `keep` as
-/// [`GenerationStatus::Superseded`], returning how many rows changed.
+/// Every row whose status keeps it regardless of age, newest first.
 ///
-/// Retention only *labels* rows here — blob collection reads the labels and is
-/// a separate step, so a crash between the two loses no data.
-pub async fn mark_superseded_before(ctx: &dyn Context, keep: usize) -> Result<usize, WaferError> {
-    let retained = list_recent(ctx, MAX_LIST_LIMIT).await?;
-    let mut marked = 0usize;
-    for row in retained.into_iter().skip(keep) {
-        if row.status == GenerationStatus::Superseded {
-            continue;
-        }
-        set_status(ctx, &row.id, GenerationStatus::Superseded, None, None).await?;
-        marked += 1;
+/// The other half of the retained set: [`list_recent`] answers "the newest
+/// `limit`", this answers "and whatever is serving or still in flight,
+/// wherever in the ledger it has fallen to". Filtered in the query rather
+/// than by paging the whole table, because the answer must not depend on how
+/// many generations have happened since.
+pub async fn list_retained_by_status(ctx: &dyn Context) -> Result<Vec<GenerationRow>, WaferError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            filters: vec![status_in(GenerationStatus::survives_retention)],
+            sort: newest_first(),
+            limit: MAX_LIST_LIMIT,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    list.records.iter().map(decode).collect()
+}
+
+/// One page of the rows retention may delete: everything strictly older than
+/// `boundary` whose status does not survive retention, newest first.
+///
+/// "Older than" is the order [`list_recent`] imposes, tiebreaker included —
+/// `created_at` first, `id` when two rows share a millisecond — so the row a
+/// caller passes as the boundary is exactly the last row it decided to keep,
+/// and nothing between the two definitions can fall through.
+///
+/// A query rather than a listing walked in memory: the rows to delete are the
+/// ones a `list_recent` page would *not* return, and asking the database for
+/// them directly is what stops the pass being bounded by [`MAX_LIST_LIMIT`].
+pub async fn list_prunable(
+    ctx: &dyn Context,
+    boundary: &GenerationRow,
+) -> Result<Vec<GenerationRow>, WaferError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            filters: vec![status_in(|status| !status.survives_retention())],
+            // AND-ed onto the status filter by the client: an OR group is the
+            // one shape a flat filter list cannot express, and the tiebreaker
+            // needs it.
+            filter_tree: Some(vec![FilterTree::Any(vec![
+                FilterTree::Leaf(Filter {
+                    field: "created_at".into(),
+                    operator: FilterOp::LessThan,
+                    value: serde_json::json!(boundary.created_at),
+                }),
+                FilterTree::All(vec![
+                    FilterTree::Leaf(Filter {
+                        field: "created_at".into(),
+                        operator: FilterOp::Equal,
+                        value: serde_json::json!(boundary.created_at),
+                    }),
+                    FilterTree::Leaf(Filter {
+                        field: "id".into(),
+                        operator: FilterOp::LessThan,
+                        value: serde_json::json!(boundary.id),
+                    }),
+                ]),
+            ])]),
+            sort: newest_first(),
+            limit: MAX_LIST_LIMIT,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    list.records.iter().map(decode).collect()
+}
+
+/// Delete one row.
+///
+/// Retention is the only caller: the ledger is append-only for as long as a
+/// generation is retained, and the one thing that removes a row is falling
+/// out of the window.
+pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
+    db::delete(ctx, TABLE, id).await
+}
+
+/// A `status IN (…)` filter over the statuses `keep` accepts.
+///
+/// Derived from [`GenerationStatus::ALL`] rather than written out, so the two
+/// halves of the split — retained and prunable — cannot both forget a status
+/// that was added to the enum.
+fn status_in(keep: impl Fn(GenerationStatus) -> bool) -> Filter {
+    let statuses: Vec<&str> = GenerationStatus::ALL
+        .iter()
+        .filter(|status| keep(**status))
+        .map(|status| status.as_str())
+        .collect();
+    Filter {
+        field: "status".into(),
+        operator: FilterOp::In,
+        value: serde_json::json!(statuses),
     }
-    Ok(marked)
+}
+
+/// Newest first, with `id` breaking a `created_at` tie — the one ordering
+/// every listing here uses, and the one the retention boundary is defined in.
+fn newest_first() -> Vec<SortField> {
+    vec![
+        SortField {
+            field: "created_at".into(),
+            desc: true,
+        },
+        SortField {
+            field: "id".into(),
+            desc: true,
+        },
+    ]
 }
 
 /// Decode a stored row. An unrecognized `status` or `cause` is an error, never
@@ -529,8 +664,41 @@ mod tests {
         assert_eq!(capped[0].id, ids[2].id);
     }
 
+    /// The two halves of the status split must partition the enum: a status
+    /// missing from both would make retention keep a row forever *and* never
+    /// list it as retained, and one in both would make it prunable and
+    /// unprunable at once.
+    #[test]
+    fn every_status_is_either_retained_or_prunable() {
+        let retained: Vec<GenerationStatus> = GenerationStatus::ALL
+            .into_iter()
+            .filter(|s| s.survives_retention())
+            .collect();
+        let prunable: Vec<GenerationStatus> = GenerationStatus::ALL
+            .into_iter()
+            .filter(|s| !s.survives_retention())
+            .collect();
+        assert_eq!(retained.len() + prunable.len(), GenerationStatus::ALL.len());
+        assert_eq!(
+            retained,
+            vec![
+                GenerationStatus::Staged,
+                GenerationStatus::Validating,
+                GenerationStatus::Activating,
+                GenerationStatus::Active,
+            ],
+        );
+        assert_eq!(
+            prunable,
+            vec![GenerationStatus::Failed, GenerationStatus::Superseded],
+        );
+    }
+
+    /// The boundary row itself is kept, everything strictly older than it is
+    /// offered up, and a status that survives retention is never offered
+    /// however old it is.
     #[tokio::test]
-    async fn mark_superseded_before_keeps_the_newest_and_is_idempotent() {
+    async fn list_prunable_offers_the_rows_older_than_the_boundary() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
         let mut rows = Vec::new();
         for _ in 0..4 {
@@ -540,24 +708,114 @@ mod tests {
                     .expect("insert"),
             );
         }
+        // Oldest first as inserted: [0] [1] [2] [3]. Everything is `Staged`,
+        // which survives retention — so nothing is prunable yet.
+        assert!(list_prunable(&ctx, &rows[2])
+            .await
+            .expect("list")
+            .is_empty());
 
-        assert_eq!(mark_superseded_before(&ctx, 2).await.expect("retain"), 2);
-
-        let listed = list_recent(&ctx, 10).await.expect("list");
-        let statuses: Vec<GenerationStatus> = listed.iter().map(|r| r.status).collect();
+        for row in &rows[..3] {
+            set_status(&ctx, &row.id, GenerationStatus::Superseded, None, None)
+                .await
+                .expect("supersede");
+        }
+        // The boundary is row 2, so rows 0 and 1 go and row 2 stays.
+        let prunable = list_prunable(&ctx, &rows[2]).await.expect("list");
         assert_eq!(
-            statuses,
-            vec![
-                GenerationStatus::Staged,
-                GenerationStatus::Staged,
-                GenerationStatus::Superseded,
-                GenerationStatus::Superseded,
-            ],
+            prunable.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![rows[1].id.as_str(), rows[0].id.as_str()],
+            "newest first, and the boundary itself is not in it",
         );
 
-        // Retention runs after every activation; re-running it must not
-        // re-write rows it already labelled.
-        assert_eq!(mark_superseded_before(&ctx, 2).await.expect("retain"), 0);
+        // A `Failed` row is prunable too — retention deletes by age, not by
+        // how the generation ended.
+        set_status(&ctx, &rows[0].id, GenerationStatus::Failed, None, None)
+            .await
+            .expect("fail");
+        assert_eq!(list_prunable(&ctx, &rows[2]).await.expect("list").len(), 2);
+    }
+
+    /// A `created_at` tie is broken by id in `list_prunable` exactly as it is
+    /// in `list_recent`. Written through `db::create` because `insert` stamps
+    /// the timestamp itself and a tie cannot be produced through it.
+    #[tokio::test]
+    async fn a_created_at_tie_is_split_by_id_on_both_sides_of_the_boundary() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let minted_at = "2026-09-03T00:00:00.000Z";
+        for id in ["a", "b", "c"] {
+            db::create(
+                &ctx,
+                TABLE,
+                crate::util::json_map(serde_json::json!({
+                    "id": id,
+                    "parent_id": serde_json::Value::Null,
+                    "status": GenerationStatus::Superseded.as_str(),
+                    "cause": GenerationCause::SiteWrite.as_str(),
+                    "site_manifest_json": SITE_MANIFEST,
+                    "block_manifest_json": BLOCK_MANIFEST,
+                    "manifest_sha256": "cc",
+                    "created_at": minted_at,
+                    "activated_at": serde_json::Value::Null,
+                    "failure_message": serde_json::Value::Null,
+                })),
+            )
+            .await
+            .expect("create");
+        }
+
+        let boundary = get(&ctx, "b").await.expect("get");
+        let prunable = list_prunable(&ctx, &boundary).await.expect("list");
+        assert_eq!(
+            prunable.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "only the row the same-millisecond ordering puts BELOW the boundary",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_retained_by_status_finds_the_rows_age_alone_would_drop() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let staged = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+            .await
+            .expect("insert");
+        let active = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+            .await
+            .expect("insert");
+        let gone = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+            .await
+            .expect("insert");
+        set_status(&ctx, &active.id, GenerationStatus::Active, None, None)
+            .await
+            .expect("activate");
+        set_status(&ctx, &gone.id, GenerationStatus::Superseded, None, None)
+            .await
+            .expect("supersede");
+
+        let mut ids: Vec<String> = list_retained_by_status(&ctx)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort();
+        let mut expected = vec![staged.id, active.id];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_row_from_the_ledger() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let row = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+            .await
+            .expect("insert");
+        delete(&ctx, &row.id).await.expect("delete");
+        assert_eq!(
+            get(&ctx, &row.id).await.expect_err("gone").code,
+            ErrorCode::NotFound
+        );
+        assert!(list_recent(&ctx, 10).await.expect("list").is_empty());
     }
 
     #[test]

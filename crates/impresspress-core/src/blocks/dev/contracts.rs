@@ -33,8 +33,35 @@ pub struct StatusResponse {
     pub blocks: Vec<ActiveBlockView>,
     /// The activation in progress, if any.
     pub activation: Option<ActivationView>,
+    /// What the sandbox's content stores hold right now.
+    pub storage: StorageUsage,
     /// `wafer_guest.rs` version the block scaffolder currently writes.
     pub wafer_guest_version: u32,
+}
+
+/// What the sandbox's two content stores, its workspace and its ledger hold.
+///
+/// Read from the stores themselves on every request rather than from a
+/// running counter: these are the figures that say whether the garbage
+/// collector is keeping up, and a counter that had drifted would look exactly
+/// like a collector that was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageUsage {
+    /// How many content-addressed blobs are stored. Includes blobs no file
+    /// names any more but a retained generation still does.
+    pub blobs: u32,
+    /// Total size of those blobs, in bytes.
+    pub blobs_bytes: u64,
+    /// How many compiled block artifacts are stored.
+    pub artifacts: u32,
+    /// Total size of those artifacts, in bytes.
+    pub artifacts_bytes: u64,
+    /// How many files the workspace currently holds.
+    pub workspace_files: u32,
+    /// How many generations the ledger is keeping: the retention window, plus
+    /// anything older that is still serving or still in flight.
+    pub retained_generations: u32,
 }
 
 /// One entry in the publication ledger, as the status and generation views

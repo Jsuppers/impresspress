@@ -232,7 +232,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -661,7 +661,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -989,7 +989,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -1286,7 +1286,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -1475,7 +1475,7 @@
                             },
                             {
                               "const": "superseded",
-                              "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                              "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                               "type": "string"
                             }
                           ]
@@ -1845,7 +1845,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -2009,7 +2009,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -2322,7 +2322,7 @@
                           },
                           {
                             "const": "superseded",
-                            "description": "No longer serving — superseded by a later generation; retention keeps\nthe 20 most recent rows.",
+                            "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
                             "type": "string"
                           }
                         ]
@@ -2411,6 +2411,57 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "storage": {
+                    "additionalProperties": false,
+                    "description": "What the sandbox's content stores hold right now.",
+                    "properties": {
+                      "artifacts": {
+                        "description": "How many compiled block artifacts are stored.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "artifacts_bytes": {
+                        "description": "Total size of those artifacts, in bytes.",
+                        "format": "uint64",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "blobs": {
+                        "description": "How many content-addressed blobs are stored. Includes blobs no file\nnames any more but a retained generation still does.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "blobs_bytes": {
+                        "description": "Total size of those blobs, in bytes.",
+                        "format": "uint64",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "retained_generations": {
+                        "description": "How many generations the ledger is keeping: the retention window, plus\nanything older that is still serving or still in flight.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "workspace_files": {
+                        "description": "How many files the workspace currently holds.",
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "blobs",
+                      "blobs_bytes",
+                      "artifacts",
+                      "artifacts_bytes",
+                      "workspace_files",
+                      "retained_generations"
+                    ],
+                    "type": "object"
+                  },
                   "wafer_guest_version": {
                     "description": "`wafer_guest.rs` version the block scaffolder currently writes.",
                     "format": "uint32",
@@ -2423,6 +2474,7 @@
                   "runtime_generation",
                   "blocks",
                   "activation",
+                  "storage",
                   "wafer_guest_version"
                 ],
                 "title": "StatusResponse",

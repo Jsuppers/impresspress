@@ -25,13 +25,13 @@ use super::{
     },
     generation, no_store, no_store_error,
     repo::{self, generations::GenerationCause},
-    DevShared,
+    retention, DevShared,
 };
 use crate::http::err_internal;
 
 /// Default page size: the retention window, so the default listing is exactly
 /// the set of generations that can still be rolled back to.
-const DEFAULT_LIMIT: u32 = activation::RETAINED_GENERATIONS as u32;
+const DEFAULT_LIMIT: u32 = retention::RETAINED_GENERATIONS as u32;
 
 /// `GET /b/dev/api/generations` — the ledger, newest first.
 pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {

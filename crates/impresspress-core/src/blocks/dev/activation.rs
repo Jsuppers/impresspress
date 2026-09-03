@@ -41,6 +41,7 @@ use super::{
     artifacts, blobs,
     contracts::{GenerationSummary, SiteManifest},
     control::DynamicBlockSpec,
+    gc,
     generation::{self, GenerationManifest},
     no_store_error_status,
     publisher::publish_site,
@@ -49,13 +50,9 @@ use super::{
         generations::{GenerationCause, GenerationRow, GenerationStatus, NewGeneration},
         runtime_state::{ActivationPhase, RuntimeState},
     },
-    workspace,
+    retention, workspace,
 };
 use crate::util::now_millis;
-
-/// How many generations the ledger keeps before older rows are labelled
-/// [`GenerationStatus::Superseded`] (design §7.3).
-pub const RETAINED_GENERATIONS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Outcomes
@@ -673,9 +670,7 @@ async fn activate_staged(
     )
     .await
     .map_err(storage_error)?;
-    repo::generations::mark_superseded_before(ctx, RETAINED_GENERATIONS)
-        .await
-        .map_err(storage_error)?;
+    maintain(ctx, shared).await;
     progress.record(ActivationPhase::Active, format!("generation {}", row.id));
 
     // Re-read rather than patch the local row: the summary the caller is
@@ -688,6 +683,49 @@ async fn activate_staged(
         generation: generation::summarize(&activated, manifest),
         progress: progress.steps,
     })
+}
+
+/// Retire the generations that have fallen out of the retention window, and
+/// reclaim what that made unreachable.
+///
+/// Runs after the commit, and reports nothing back. That is the point: by this
+/// line the generation is live and journalled, and returning a failure here
+/// would tell the caller its write did not land when it did. What a failure
+/// costs is storage the *next* activation collects instead — so it is logged
+/// at `error!` rather than swallowed, and nothing depends on it having run.
+///
+/// Pruning first, collection second, and never the other way round: the
+/// collector's reachability is read off the rows retention keeps, so a
+/// collection that ran before the prune would still be protecting the
+/// generations the prune is about to delete and would reclaim nothing.
+async fn maintain(ctx: &dyn Context, shared: &super::DevShared) {
+    let pruned = match retention::prune(ctx).await {
+        Ok(pruned) => pruned,
+        Err(e) => {
+            tracing::error!(
+                error = %e.message,
+                "dev sandbox: pruning the generation ledger failed; the window will be \
+                 re-applied on the next activation",
+            );
+            return;
+        }
+    };
+
+    match gc::collect(ctx, shared).await {
+        Ok(report) => tracing::debug!(
+            pruned = pruned.len(),
+            blobs_deleted = report.blobs_deleted,
+            artifacts_deleted = report.artifacts_deleted,
+            bytes_freed = report.bytes_freed,
+            "dev sandbox: retention and collection ran",
+        ),
+        Err(e) => tracing::error!(
+            error = %e.message,
+            pruned = pruned.len(),
+            "dev sandbox: collecting unreachable content failed; it will be collected on the \
+             next activation",
+        ),
+    }
 }
 
 /// Put the site back the way it was after a failed publish, and describe what
