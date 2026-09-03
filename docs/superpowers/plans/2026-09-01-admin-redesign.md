@@ -1927,7 +1927,7 @@ git commit -m "feat(cdn): versioned immutable asset worker for cdn.impresspress.
 ### Task 14: Regenerate visual baselines
 
 **Files:**
-- Modify: `.playwright-mcp/visual-baseline.spec.ts-snapshots/*.png` (~40 files, written by CI)
+- Modify: `crates/impresspress-web/tests/e2e/visual-baseline.spec.ts-snapshots/*.png` (~40 files, written by CI)
 
 - [ ] **Step 1: Push the branch and open the PR**
 
