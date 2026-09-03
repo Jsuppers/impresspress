@@ -940,7 +940,7 @@ and read together with this list.
     `SUGGESTED_PROMPT` (`blocks/dev/page.rs`) tell the agent to, and the
     seed's `site/index.html` does.
 
-18. **§6.2 / §7.4 / §8 / §13 / §15 / Plan 3 — the guest surface as built, and
+16. **§6.2 / §7.4 / §8 / §13 / §15 / Plan 3 — the guest surface as built, and
     the rulings the plan settled.** Plan 3 landed `wafer_guest.rs`, the Rubrc
     packaging and the compile path; seven things it decided differ from, or
     are not written in, the sections above.
