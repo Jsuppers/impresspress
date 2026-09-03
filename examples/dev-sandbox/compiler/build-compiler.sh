@@ -214,7 +214,12 @@ BUILD_KIND="$WANT_KIND"
 
 case "$(compose_decision "$BINDINGS" "$WANT_KIND")" in
   reuse)
-    BUILD_KIND="$(cat "$BINDINGS/.build-kind" 2>/dev/null || echo fast)"
+    BUILD_KIND="$(recorded_build_kind "$BINDINGS")"
+    # A component with no usable record is only ever REUSED on the `--fast`
+    # path (`compose_decision` refuses it on the other), and it goes into the
+    # manifest as `fast`: nothing here can say wasm-opt ran over it, and the
+    # verifier must keep refusing it without the allow flag.
+    [ "$BUILD_KIND" != unrecorded ] || BUILD_KIND=fast
     log "compose vfs.core.wasm already built, $BUILD_KIND ($(du -h "$BINDINGS/vfs.core.wasm" | cut -f1))"
     ;;
   refuse)

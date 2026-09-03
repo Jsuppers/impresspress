@@ -616,3 +616,78 @@ test('the finished ladder belongs to one compile: the next one clears it before 
     ['pending', 'pending', 'pending', 'pending']
   );
 });
+
+test('the ladder goes blank the moment a compile starts, not when its staging lands', async () => {
+  // The previous test asserts what the ladder reads once a compile is OVER.
+  // This one is about the eighty seconds in between: `drawLadder` runs only
+  // from `observe`, and the status is not polled while the worker works, so a
+  // reset that waited for the next poll would leave the last compile's four
+  // green steps standing over this one for its whole duration.
+  let live = null;
+  let release;
+  let held = null;
+  const { tools, elements } = instantiate({
+    hasModelContext: true,
+    compilerManifest: MANIFEST,
+    workspace: HELLO,
+    compiler: fakeCompiler(async () => {
+      if (held) await held;
+      return BUILT;
+    }),
+    status: () => ({
+      active_generation: live,
+      runtime_generation: live ? 1 : 0,
+      blocks: [],
+      activation: null,
+      wafer_guest_version: 1
+    }),
+    stage() {
+      live = { id: 'gen_2', cause: 'block_compile', status: 'active' };
+      return {
+        build_id: 'bld_1',
+        success: true,
+        diagnostics: [],
+        generation: live,
+        progress: [
+          { phase: 'validating', ms: 4, detail: '' },
+          { phase: 'building_runtime', ms: 91, detail: '' },
+          { phase: 'publishing', ms: 2, detail: '' },
+          { phase: 'active', ms: 0, detail: '' }
+        ]
+      };
+    }
+  });
+  await settle();
+
+  // One compile that lands, so there is a green ladder to be wrong about.
+  await tools.get('dev_compile_block').execute({ name: 'hello' });
+  const steps = elements.get('dev-progress-steps');
+  assert.equal(steps.getAttribute('data-phase'), 'active');
+  assert.deepEqual(
+    steps.children.map((step) => step.getAttribute('data-state')),
+    ['done', 'done', 'done', 'done']
+  );
+
+  // A second compile, stopped inside the worker.
+  held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const running = tools.get('dev_compile_block').execute({ name: 'hello' });
+  await settle();
+
+  assert.equal(steps.getAttribute('data-phase'), 'idle');
+  assert.deepEqual(
+    steps.children.map((step) => step.getAttribute('data-state')),
+    ['pending', 'pending', 'pending', 'pending']
+  );
+
+  // …and it fills in again from the staging response, which is the only
+  // account of those phases that survives the catch-up poll.
+  release();
+  await running;
+  assert.equal(steps.getAttribute('data-phase'), 'active');
+  assert.deepEqual(
+    steps.children.map((step) => step.getAttribute('data-state')),
+    ['done', 'done', 'done', 'done']
+  );
+});

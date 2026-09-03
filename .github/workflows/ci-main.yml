@@ -465,11 +465,22 @@ jobs:
     # The same wasm this repo's other browser jobs run against — the sandbox
     # bundle is built from `pkg/` the way `e2e-dev-sandbox` builds it.
     #
-    # `e2e-dev-sandbox` as well, and not for its result: the two jobs share one
-    # compiler cache key, so on a cold cache they would otherwise compose the
-    # toolchain twice in parallel and one of the two uploads would lose the
-    # race with a warning. Serialised, the first job seeds the entry and this
-    # one restores it.
+    # `e2e-dev-sandbox` as well, and this dependency IS on its result — which
+    # is what `needs` means, and what it has to mean here. The two jobs share
+    # one compiler cache key, so on a cold cache they would otherwise compose
+    # the toolchain twice in parallel and one of the two uploads would lose
+    # the race with a warning; serialised, the first seeds the entry and this
+    # one restores it. Letting this job run after a FAILED `e2e-dev-sandbox`
+    # would not preserve that: `actions/cache` saves in a post step declared
+    # `post-if: success()`, so a job that fails at its e2e step writes no
+    # entry at all, and this one would compose from scratch — in series,
+    # behind a job that has already reported the sandbox is broken.
+    #
+    # The cost is a skipped compile check when the sandbox e2e is red. It is
+    # only paid on a cold cache: once the release asset for the pin is
+    # published, neither job composes and this is pure ordering. If the lost
+    # signal ever matters more than the double compose, the answer is a
+    # separate cache key per job, not dropping the `needs`.
     needs: [build-wasm, e2e-dev-sandbox]
     runs-on: ubuntu-latest
     # The e2e itself is ~2-4 minutes. The ceiling is for the cache miss below:

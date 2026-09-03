@@ -36,7 +36,8 @@ if (buildKind !== "full" && buildKind !== "fast") {
   console.error(
     `write-manifest.mjs: COMPILER_BUILD_KIND must be "full" or "fast", got ` +
       `${JSON.stringify(buildKind)} — build-compiler.sh reads it from the composed ` +
-      `component's own .build-kind`,
+      `component's own .build-kind, where an empty file counts as no record at ` +
+      `all (scripts/compose-decision.sh)`,
   );
   process.exit(1);
 }

@@ -1217,7 +1217,17 @@ async function runCompile(name) {
   // when it does not. Nothing else needs this: a site write or a rollback
   // publishes a generation with a NEW id, which `renderStatus` already sees
   // is not the one `completed` describes.
+  //
+  // And the ladder on screen is redrawn here, not left to the next poll:
+  // `drawLadder` runs only from `observe`, and the status is no longer polled
+  // while the worker compiles (the panel opens at the staging call below), so
+  // forgetting `completed` without repainting would leave the PREVIOUS
+  // compile's four green steps standing over this one for its whole eighty
+  // seconds — the exact lie this line exists to end. `idle` is the phase
+  // `renderStatus` itself draws for a sandbox with nothing in flight, and it
+  // is not in `PHASES`, so every step comes out `pending`.
   completed = null;
+  drawLadder('idle', false);
   var snapshot = await snapshotBlock(name);
   if (snapshot.diagnostics.length) {
     log(

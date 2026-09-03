@@ -35,12 +35,25 @@
 # unrecorded component only happens on the `--fast` path, and that path's
 # manifest says `fast`.
 
+# The kind recorded beside the component, or `unrecorded`.
+#
+# An EMPTY `.build-kind` is the same as an absent one — a truncated write, or
+# a `>` that ran before the composition died, is not a claim that wasm-opt ran
+# — and it has to answer that way in both readers, or `build-compiler.sh`
+# would hand `write-manifest.mjs` an empty `COMPILER_BUILD_KIND` for a
+# component `compose_decision` had already called unrecorded.
+recorded_build_kind() {
+  local recorded
+  recorded="$(cat "$1/.build-kind" 2>/dev/null || true)"
+  [ -n "$recorded" ] || recorded=unrecorded
+  printf '%s\n' "$recorded"
+}
+
 compose_decision() {
   local bindings="$1" want="$2" have=""
 
   if [ -f "$bindings/vfs.core.wasm" ]; then
-    have="$(cat "$bindings/.build-kind" 2>/dev/null || true)"
-    [ -n "$have" ] || have=unrecorded
+    have="$(recorded_build_kind "$bindings")"
   fi
 
   case "$have" in

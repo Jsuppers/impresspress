@@ -24,15 +24,26 @@ trap 'rm -rf "$TMP"' EXIT
 
 failures=0
 
+# A fresh bindings directory: `none` writes no record at all, `empty` writes a
+# zero-byte one, anything else is the recorded kind.
+fake_bindings() {
+  local dir="$1" component="$2" recorded="$3"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  [ "$component" = no ] || : > "$dir/vfs.core.wasm"
+  case "$recorded" in
+    none) ;;
+    empty) : > "$dir/.build-kind" ;;
+    *) printf '%s\n' "$recorded" > "$dir/.build-kind" ;;
+  esac
+}
+
 # One case: a bindings directory built from `component`/`recorded`, the kind
 # asked for, and the decision that must come out.
 check() {
   local what="$1" component="$2" recorded="$3" want="$4" expected="$5"
   local dir="$TMP/case"
-  rm -rf "$dir"
-  mkdir -p "$dir"
-  [ "$component" = no ] || : > "$dir/vfs.core.wasm"
-  [ "$recorded" = none ] || printf '%s\n' "$recorded" > "$dir/.build-kind"
+  fake_bindings "$dir" "$component" "$recorded"
 
   local got
   got="$(compose_decision "$dir" "$want")"
@@ -59,6 +70,35 @@ check "an unrecorded component, --fast asked"  yes        none       fast  reuse
 # `rm` of the wasm, and answering `reuse` there would skip the composition
 # and then fail in the vite build with no explanation.
 check "a record with no component"             no         full       full  compose
+# An empty file is not a claim — a truncated write, or a `>` that ran before
+# the composition died. It has to read exactly as an absent one, in the
+# decision AND in `recorded_build_kind`, which is what the manifest's `build`
+# field is taken from.
+check "an empty record, full asked for"        yes        empty      full  refuse
+check "an empty record, --fast asked for"      yes        empty      fast  reuse
+
+# `recorded_build_kind` on its own: `build-compiler.sh` reads the manifest's
+# `build` field through it, so an empty file answering anything but
+# `unrecorded` would put an EMPTY `COMPILER_BUILD_KIND` on the manifest run.
+check_recorded() {
+  local what="$1" recorded="$2" expected="$3"
+  local dir="$TMP/recorded"
+  fake_bindings "$dir" yes "$recorded"
+
+  local got
+  got="$(recorded_build_kind "$dir")"
+  if [ "$got" = "$expected" ]; then
+    printf 'ok   %s\n' "$what"
+  else
+    printf 'FAIL %s: expected %s, got %s\n' "$what" "$expected" "$got" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+check_recorded "recorded_build_kind: no file"  none  unrecorded
+check_recorded "recorded_build_kind: empty"    empty unrecorded
+check_recorded "recorded_build_kind: full"     full  full
+check_recorded "recorded_build_kind: fast"     fast  fast
 
 if [ "$failures" -ne 0 ]; then
   printf '\ntest-build-kind.sh: %s failure(s)\n' "$failures" >&2
