@@ -46,6 +46,7 @@ pub mod status;
 pub mod tools;
 pub mod validation;
 pub mod workspace;
+pub mod zip;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
