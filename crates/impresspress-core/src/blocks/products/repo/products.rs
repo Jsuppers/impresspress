@@ -19,6 +19,10 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use wafer_block::db::{Filter, FilterOp, SortField};
+// `upsert_from_snapshot`'s only import, and it is `block-dev`-gated with it:
+// nothing else in this module upserts.
+#[cfg(feature = "block-dev")]
+use wafer_block::wire::database::OnConflict;
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -369,6 +373,41 @@ pub(crate) async fn restore(ctx: &dyn Context, id: &str) -> Result<Record, Wafer
     // for the second — the same two responses this function has always given.
     db::update_by_filters_count(ctx, TABLE, vec![id_filter(id), deleted_filter()], data).await?;
     db::get(ctx, TABLE, id).await
+}
+
+/// Insert-or-overwrite one row exactly as `blocks::dev::data_snapshot`'s
+/// import found it — `deleted_at` included, whatever the exported row said.
+///
+/// Reserved for that one caller. Every other write above acts on a single
+/// product by id and respects (or, named and justified, deliberately
+/// bypasses per this module's door tests) the row's *current* soft-delete
+/// state; this one restores a row wholesale from a trusted export, which is
+/// a different operation from all of them and is not exposed more generally
+/// — `data`/`conflict`/`update_columns` come from the snapshot row and the
+/// allowlist entry verbatim, so this function does not itself decide what
+/// "wholesale" means — and it is `block-dev`-gated because that caller is the
+/// sandbox's, absent from every default build.
+///
+/// `conflict` is passed in rather than hardcoded here. The allowlist already
+/// declares this table's conflict target (`Mode::Upsert(BY_ID)`) and
+/// `data_snapshot::import_row` already computes the update set from it; a
+/// second `vec!["id"]` written here would be the same fact stated twice, in
+/// two files, with nothing keeping them equal.
+#[cfg(feature = "block-dev")]
+pub(crate) async fn upsert_from_snapshot(
+    ctx: &dyn Context,
+    data: Vec<(String, Value)>,
+    conflict: Vec<String>,
+    update_columns: Vec<String>,
+) -> Result<i64, WaferError> {
+    db::upsert(
+        ctx,
+        TABLE,
+        data,
+        conflict,
+        OnConflict::SetColumns(update_columns),
+    )
+    .await
 }
 
 // The single definition of "deleted" for one already-loaded row, and the

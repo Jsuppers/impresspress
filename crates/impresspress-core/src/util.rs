@@ -431,12 +431,10 @@ pub(crate) fn validate_url_value(value: &str) -> Result<(), String> {
         // A hostname is not resolved here (see the doc's DNS-rebinding note),
         // but a *literal* well-known cloud-metadata hostname is still a
         // config-write mistake worth rejecting up front.
-        Some(url::Host::Domain(h)) => {
-            if crate::ssrf::is_cloud_metadata_host(h) {
-                return Err("URL must not point to a cloud metadata endpoint".to_string());
-            }
+        Some(url::Host::Domain(h)) if crate::ssrf::is_cloud_metadata_host(h) => {
+            return Err("URL must not point to a cloud metadata endpoint".to_string());
         }
-        None => {}
+        Some(url::Host::Domain(_)) | None => {}
     }
     Ok(())
 }

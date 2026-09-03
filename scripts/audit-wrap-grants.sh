@@ -47,6 +47,18 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 BLOCKS_DIR="crates/impresspress-core/src/blocks"
+# The dev block's guest TEMPLATES are not host code: they are the sources of
+# sandbox blocks (`site/<name>`) that Rubrc compiles for wasm32-wasip1 in the
+# browser. Their `db::*` calls run inside the guest, as the guest block, and
+# reach the database through WRAP under that block's own capabilities (the
+# `site__<name>__*` namespace rule in `blocks/dev/validation.rs`) — there is
+# no grant for `impresspress/dev` to declare, because `impresspress/dev` is
+# not the caller. Attributing them to the dev block by path would flag every
+# template as a missing grant, so the walk skips that directory.
+GUEST_TEMPLATES_DIR="$BLOCKS_DIR/dev/templates"
+# `grep -r` and `find` spell the exclusion differently; both forms below
+# name the same directory.
+GREP_EXCLUDE=(--exclude-dir=templates)
 
 if [ ! -d "$BLOCKS_DIR" ]; then
   echo "::error::$BLOCKS_DIR not found — run from a impresspress repo root."
@@ -117,7 +129,7 @@ while IFS= read -r line; do
 # inside a fn body (typically migration helpers). Module-level consts always
 # start at column 0 in this codebase. Visibility modifier may be `pub`,
 # `pub(crate)`, `pub(super)`, etc.
-done < <(grep -rEn "^(pub(\([^)]+\))?[[:space:]]+)?const [A-Z_]+: &str = \"[^\"]+\"" "$BLOCKS_DIR" 2>/dev/null || true)
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "^(pub(\([^)]+\))?[[:space:]]+)?const [A-Z_]+: &str = \"[^\"]+\"" "$BLOCKS_DIR" 2>/dev/null || true)
 
 # Parse `use ... as` aliases. Both crate-rooted and super-relative paths
 # matter — many files import `use crate::blocks::auth::USERS_COLLECTION as USERS`.
@@ -169,7 +181,7 @@ while IFS= read -r line; do
       fi
     done
   fi
-done < <(grep -rEn "^use[[:space:]]" "$BLOCKS_DIR" 2>/dev/null || true)
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "^use[[:space:]]" "$BLOCKS_DIR" 2>/dev/null || true)
 
 # Catch nested-brace `use crate::{ blocks::{ auth::{ FOO_COLLECTION as FOO } } };`
 # patterns that span multiple lines. The grep above matches only the `use ` line
@@ -212,7 +224,7 @@ while IFS= read -r file; do
       fi
     fi
   done < <(grep -oE "[A-Z_]{4,}[[:space:]]+as[[:space:]]+[A-Z_]{2,}" "$file" 2>/dev/null || true)
-done < <(find "$BLOCKS_DIR" -name '*.rs' 2>/dev/null)
+done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
 
 # ---------- Phase 1.6: re-exports + multi-line brace imports ----------
 # After Cleanup A (May 2026) every `auth/repo/*.rs` declares `pub const TABLE`.
@@ -450,7 +462,7 @@ while IFS= read -r file; do
       fi
     done < <(explode_use_body "$body")
   done < <(read_use_statements "$file")
-done < <(find "$BLOCKS_DIR" -name '*.rs' 2>/dev/null)
+done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
 
 # Second pass through `pub use` statements: chain re-exports. If A's mod.rs
 # re-exports a name from B's mod.rs (which is itself a re-export from B's
@@ -485,7 +497,7 @@ for _ in 1 2 3; do
         fi
       done < <(explode_use_body "$body")
     done < <(read_use_statements "$file")
-  done < <(find "$BLOCKS_DIR" -name '*.rs' 2>/dev/null)
+  done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
   [ "$changed" -eq 0 ] && break
 done
 
@@ -742,7 +754,7 @@ while IFS= read -r line; do
     owner="$(file_to_block_id "$file")"
     GRANTS+=("${owner}|${grantee}|${resource}|${type}|${kind}")
   fi
-done < <(grep -rEn "ResourceGrant::(read|read_write)\(" "$BLOCKS_DIR" 2>/dev/null || true)
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "ResourceGrant::(read|read_write)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
 # ---------- Phase 3: walk db::* callsites and check coverage ----------
 
@@ -908,7 +920,7 @@ while IFS= read -r line; do
         ;;
     esac
   fi
-done < <(grep -rEn "db::(list|create|update|delete|count|get|find_one)\(" "$BLOCKS_DIR" 2>/dev/null || true)
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "db::(list|create|update|delete|count|get|find_one)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
 # ---------- Phase 3.5: walk storage callsites and check coverage ----------
 # Mirrors Phase 3 but for typed Storage grants.
@@ -960,7 +972,7 @@ while IFS= read -r line; do
         ;;
     esac
   fi
-done < <(grep -rEn "clients::storage::(get|put|delete|list|create_folder|delete_folder|list_folders|get_stream)\(" "$BLOCKS_DIR" 2>/dev/null || true)
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "clients::storage::(get|put|delete|list|create_folder|delete_folder|list_folders|get_stream)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
 # ---------- Phase 4: report ----------
 

@@ -2,6 +2,14 @@ pub mod admin;
 pub mod auth;
 pub mod auth_ui;
 pub mod crud;
+// The browser development sandbox control plane. Deliberately absent from
+// `default` features and from `feature_block_manifest!` below: its
+// constructor takes a `RuntimeControl` handle, and the sandbox's security
+// model turns on the block not existing outside `examples/dev-sandbox`
+// rather than on an admin toggle. Registration comes from the consumer via
+// `ImpresspressBuilder::extra_block` + `add_route`.
+#[cfg(feature = "block-dev")]
+pub mod dev;
 pub mod email;
 pub mod errors;
 #[macro_use]

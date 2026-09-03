@@ -1,0 +1,23 @@
+{
+  "name": "@impresspress/dev-sandbox-compiler",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Packages the Rubrc rust toolchain (rustc/cargo/llvm compiled to wasm) as versioned static assets for the dev sandbox.",
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "build": "./build-compiler.sh",
+    "verify": "node scripts/verify-compiler-assets.mjs",
+    "probe": "node scripts/serve-probe.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "bun": "1.4.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3"
+  },
+  "dependencies": {
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "@oligami/browser_wasi_shim-threads": "0.4.1"
+  }
+}

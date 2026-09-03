@@ -10,6 +10,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-main.yml'
+      # The dev-sandbox e2e stages this proof guest into a live browser
+      # runtime, so a change to it must run CI.
+      - 'experiments/browser-service-worker-blocks/guest/**'
 
 concurrency:
   group: ci-main
@@ -100,6 +103,15 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
 
+      # `block-dev` is deliberately absent from `default` (the dev sandbox's
+      # control plane must not exist in a normal bundle), so the workspace
+      # clippy above compiles none of it — not the block, and not the ~4 200
+      # lines of `#![cfg(feature = "block-dev")]` integration tests that pin
+      # its rules. `--all-targets` is what reaches those, and `test-support`
+      # is what lets them link `FakeControl`.
+      - name: Clippy (block-dev)
+        run: cargo clippy --locked -p impresspress-core --features block-dev,test-support --all-targets -- -D warnings
+
   test:
     name: Tests
     needs: build-wasm
@@ -128,6 +140,36 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
+
+      # `tests/wafer_guest_golden.rs` builds both block templates with plain
+      # `cargo build --target wasm32-wasip1 --offline` and runs the resulting
+      # modules under wasmi. Without the target installed it would skip, so
+      # install it here and set IMPRESSPRESS_GUEST_GOLDEN below, which turns
+      # that skip into a failure.
+      - name: Install the wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      # The other half of the `block-dev` gap: `--workspace` above skips every
+      # `dev_*.rs` integration test, because all five are `#![cfg]`-gated on a
+      # feature nothing turns on. `wasm` is load-bearing rather than
+      # incidental — `tests/lockfile_e2e.rs` needs wafer-run built with wasmi,
+      # `tests/wafer_guest_golden.rs` runs the compiled templates through it,
+      # and `-p impresspress-core --features block-dev` alone leaves it red.
+      - name: Run the block-dev suite
+        env:
+          IMPRESSPRESS_GUEST_GOLDEN: "1"
+        run: cargo test --locked -p impresspress-core --features block-dev,wasm
+
+      # `dev.js` is a TAIL composed into an IIFE with nothing on `window`
+      # (see the file's own header comment), so its internal logic has no
+      # exported function the Rust suite above can call directly —
+      # `test/harness.mjs` reads the same source `dev_js()` composes and
+      # wraps it itself to reach the internal state. Pins the I1 fix (an
+      # abort mid-flight must not drive the poll count negative or leave
+      # `setInterval` running forever) and the M3 fix (a 409 with no
+      # `current_sha256` is a quota refusal, not a hash conflict).
+      - name: Run dev.js unit tests (node --test)
+        run: node --test crates/impresspress-core/src/blocks/dev/assets/test/*.test.mjs
 
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
@@ -225,6 +267,483 @@ jobs:
       # trait-surface drift this guards — would skip it.
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
+
+      # Pure path-helper unit tests for the hierarchical OPFS storage keys
+      # (`storage.rs`'s `storagePut`/`storageGet`/`storageDelete`/`storageList`
+      # bridge functions). Unconditional here for the same reason as the
+      # conformance-wiring check above: the path-filtered `browser-wasm-test`
+      # job (ci.yml) would skip this on a wafer-run pin bump that doesn't
+      # touch crates/impresspress-browser/.
+      - name: Run storage_paths.mjs unit tests (node --test)
+        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
+
+  # The only job that compiles, boots and exercises the browser development
+  # sandbox. `impresspress-web/src/dev_runtime.rs` — wasmi `inspect`/`probe`,
+  # the runtime rebuild, `replace_wafer`, boot convergence, seed-on-boot —
+  # exists only inside a service worker, so no host test can run a line of it;
+  # this job is where it runs. It is also the only place the `browser-devtools`
+  # feature set is compiled at all — `block-dev` itself is covered by the
+  # `Clippy (block-dev)` and `Run the block-dev suite` steps above, which lint
+  # and run `impresspress-core`'s half on the host.
+  e2e-dev-sandbox:
+    name: E2E dev sandbox (browser WASM + wasmi guest)
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    # The e2e itself is a few minutes. The ceiling is for the case where
+    # neither the release asset nor the cache is there and this job composes
+    # the toolchain: the same reasoning as `e2e-dev-compile`, which carried a
+    # budget while this one — running the identical step — did not.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # wasm32-unknown-unknown builds the `browser-devtools` bundle;
+          # wasm32-wasip1 builds the proof guest the e2e stages over HTTP.
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: e2e-dev
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pinned for the same reason as `build-wasm` — see the note there.
+          version: 'v0.15.0'
+
+      # build.rs prereq: the impresspress crate `include_bytes!`s pkg/. What the
+      # tests actually serve is built from `pkg-dev/` (the feature-on wasm),
+      # substituted through IMPRESSPRESS_WEB_WASM / IMPRESSPRESS_WEB_JS by the
+      # sealed web flow — but the CLI does not compile without pkg/ present.
+      - name: Download impresspress-web pkg/
+        uses: actions/download-artifact@v4
+        with:
+          name: impresspress-web-pkg
+          path: crates/impresspress-web/pkg
+
+      # The only `--features browser-devtools` gate in CI. `--no-deps` scopes it
+      # to this crate: the un-scoped command is red on six pre-existing
+      # impresspress-core warnings in other features' code.
+      - name: Clippy (browser-devtools, wasm32)
+        run: cargo clippy -p impresspress-web --target wasm32-unknown-unknown --features browser-devtools --no-deps -- -D warnings
+
+      # Debug build, as `e2e-build` does: the CLI only assembles static files
+      # here, so its runtime speed is irrelevant and a debug compile is cheaper.
+      - name: Install impresspress CLI (debug)
+        run: cargo install --path crates/impresspress --locked --debug --root "$GITHUB_WORKSPACE/out"
+
+      - name: Put impresspress on PATH
+        run: echo "$GITHUB_WORKSPACE/out/bin" >> "$GITHUB_PATH"
+
+      - name: Build the proof guest (wasm32-wasip1)
+        run: cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
+
+      # Ahead of `build.sh`, and 22 rather than the 20 this job installed after
+      # it: `build-compiler.sh` refuses anything older, and `build.sh --check`
+      # runs `verify-compiler-assets.mjs` through node as well.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # This job needs the packaged compiler even though nothing in it compiles
+      # Rust in the browser: `impresspress.toml` overlays `compiler/dist/` into
+      # every dev-sandbox bundle, so `build.sh` builds it when it is missing —
+      # which is the ~55 minute, 12.6 GB composition that would OOM this runner.
+      # `dev-compiler.spec.ts` and `dev-compile-tool.spec.ts` both read the
+      # manifest it produces, too. Same key as `e2e-dev-compile`, which `needs`
+      # this job so the two never compose in parallel and race to upload one
+      # entry; see that job for why there are no `restore-keys` and what
+      # `--fast` costs. Skipped entirely when the release asset was fetched:
+      # that tree is the same for every job and needs no cache.
+      # The optimized tree the developer published for this pin, and the only
+      # source of one: composing it costs ~35 minutes and 12.6 GB of RSS, which
+      # this runner does not have. `continue-on-error` because a branch that
+      # has moved `PIN.json` has no asset yet, and this job only needs to know
+      # whether the compiler still WORKS — the cache and the `--fast`
+      # composition below are what make such a branch testable. The DEPLOY
+      # workflow runs the same script without a fallback.
+      - name: Fetch the published compiler dist
+        id: compiler-fetch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: examples/dev-sandbox/compiler/fetch-dist.sh
+
+      - name: Cache the packaged compiler
+        id: compiler-dist
+        if: steps.compiler-fetch.outcome != 'success'
+        uses: actions/cache@v4
+        with:
+          path: examples/dev-sandbox/compiler/dist
+          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package.json', 'examples/dev-sandbox/compiler/package-lock.json', 'examples/dev-sandbox/compiler/tsconfig.json', 'examples/dev-sandbox/compiler/vite.config.ts', 'examples/dev-sandbox/compiler/build-compiler.sh') }}
+
+      - name: Allow a --fast compiler tree in this job only
+        run: echo "IMPRESSPRESS_COMPILER_ALLOW_FAST=1" >> "$GITHUB_ENV"
+
+      - name: Build the packaged compiler (no asset and no cache, unoptimized)
+        if: steps.compiler-fetch.outcome != 'success' && steps.compiler-dist.outputs.cache-hit != 'true'
+        run: examples/dev-sandbox/compiler/build-compiler.sh --fast
+
+      # `--check` fails fast on a seed/manifest.json that has drifted from
+      # seed/site/** — the same check `build.sh`'s normal path runs before it
+      # builds anything, surfaced as its own step so a stale manifest is
+      # reported without paying for a wasm-pack build first.
+      - name: Check the dev-sandbox seed manifest
+        run: examples/dev-sandbox/build.sh --check
+
+      # One script, shared with local runs: wasm-pack with `browser-devtools`,
+      # then the sealed web flow with `[dev] enabled = true` and the welcome
+      # seed overlaid onto `dist/seed/`. Its last stdout line is the dist path.
+      - name: Build the dev-sandbox bundle
+        run: |
+          DIST="$(examples/dev-sandbox/build.sh | tail -1)"
+          echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/impresspress-web/package-lock.json') }}
+
+      - name: Install Playwright
+        working-directory: crates/impresspress-web
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+
+      - name: Serve the dev bundle in background (port 8082)
+        run: |
+          python3 -m http.server 8082 -d "$DEV_DIST" &
+          echo $! > /tmp/dev-http-pid
+          # Wait for the server to accept connections, then prove both halves
+          # of the bundle are actually there: the worker, and the seed the
+          # first boot imports.
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8082/sw.js > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:8082/seed/manifest.json > /dev/null
+
+      # Teed to a file (not just printed) so the timing-baseline step below can
+      # grep the `console.log(...elapsed...)` lines dev-foundations.spec.ts
+      # and dev-workspace.spec.ts print. `set -o pipefail` is not optional:
+      # GitHub runs `run:` steps as `bash -e {0}` unless the step names a
+      # `shell:`, so without it the step exits with `tee`'s status and a
+      # failing spec passes the job.
+      - name: Run dev sandbox e2e (browser WASM, port 8082)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8082
+          PROOF_GUEST_WASM: ${{ github.workspace }}/experiments/browser-service-worker-blocks/guest/target/wasm32-wasip1/release/browser_compiled_wafer_block.wasm
+        # `dev-compiler.spec.ts` is here rather than in `e2e-dev-compile`
+        # because it needs the packaged worker only to prove it STARTS under
+        # the isolation headers — it compiles nothing, so it costs ~35 s and
+        # belongs with the other fake-worker specs.
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts 2>&1 \
+            | tee /tmp/dev-sandbox-e2e.log
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/dev-http-pid ]; then
+            kill "$(cat /tmp/dev-http-pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-dev-sandbox
+          path: crates/impresspress-web/playwright-report/
+          retention-days: 7
+
+      # `pkg/` (downloaded above) and `pkg-dev/` (built by build.sh, above)
+      # both already exist at this point, so this only measures — it never
+      # rebuilds. Fails the job on a size-threshold breach; see measure.sh's
+      # header for what's gated and why.
+      - name: Measure dev-sandbox bundle sizes
+        run: examples/dev-sandbox/measure.sh >> "$GITHUB_STEP_SUMMARY"
+
+      # Baseline only — no thresholds (see measure.sh's header for the sizes
+      # that DO gate). `always()` so this still records whatever timing lines
+      # made it into the log even if the e2e run or the size gate above
+      # failed.
+      - name: Record dev-sandbox timing baseline
+        if: always()
+        run: |
+          {
+            echo
+            echo '## Dev-sandbox timing baseline (no thresholds)'
+            echo
+            echo '```'
+            grep -E ': [0-9]+ ms$' /tmp/dev-sandbox-e2e.log || echo 'no timing lines captured'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e-dev-compile:
+    name: E2E dev sandbox (Rubrc compiles a block in the browser)
+    # The same wasm this repo's other browser jobs run against — the sandbox
+    # bundle is built from `pkg/` the way `e2e-dev-sandbox` builds it.
+    #
+    # `e2e-dev-sandbox` as well, and this dependency IS on its result — which
+    # is what `needs` means, and what it has to mean here. The two jobs share
+    # one compiler cache key, so on a cold cache they would otherwise compose
+    # the toolchain twice in parallel and one of the two uploads would lose
+    # the race with a warning; serialised, the first seeds the entry and this
+    # one restores it. Letting this job run after a FAILED `e2e-dev-sandbox`
+    # would not preserve that: `actions/cache` saves in a post step declared
+    # `post-if: success()`, so a job that fails at its e2e step writes no
+    # entry at all, and this one would compose from scratch — in series,
+    # behind a job that has already reported the sandbox is broken.
+    #
+    # The cost is a skipped compile check when the sandbox e2e is red. It is
+    # only paid on a cold cache: once the release asset for the pin is
+    # published, neither job composes and this is pure ordering. If the lost
+    # signal ever matters more than the double compose, the answer is a
+    # separate cache key per job, not dropping the `needs`.
+    needs: [build-wasm, e2e-dev-sandbox]
+    runs-on: ubuntu-latest
+    # The two e2es are ~5-10 minutes between them (three real compiles and
+    # four cold boots). The ceiling is for the cache miss below: composing the
+    # toolchain is the slow phase, and a job that gets killed at the default 6
+    # hours after spending an hour composing has cached nothing.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # wasm32-unknown-unknown builds the `browser-devtools` bundle;
+          # wasm32-wasip1 is what `build-compiler.sh` composes against.
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: e2e-dev
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pinned for the same reason as `build-wasm` — see the note there.
+          version: 'v0.15.0'
+
+      # build.rs prereq: the impresspress crate `include_bytes!`s pkg/. What the
+      # tests actually serve is built from `pkg-dev/` (the feature-on wasm),
+      # substituted through IMPRESSPRESS_WEB_WASM / IMPRESSPRESS_WEB_JS by the
+      # sealed web flow — but the CLI does not compile without pkg/ present.
+      - name: Download impresspress-web pkg/
+        uses: actions/download-artifact@v4
+        with:
+          name: impresspress-web-pkg
+          path: crates/impresspress-web/pkg
+
+      # Debug build, as `e2e-dev-sandbox` does: the CLI only assembles static
+      # files here, so its runtime speed is irrelevant.
+      - name: Install impresspress CLI (debug)
+        run: cargo install --path crates/impresspress --locked --debug --root "$GITHUB_WORKSPACE/out"
+
+      - name: Put impresspress on PATH
+        run: echo "$GITHUB_WORKSPACE/out/bin" >> "$GITHUB_PATH"
+
+      # 22, not the 20 the other browser jobs use: `build-compiler.sh` refuses
+      # anything older, and it fetches `bun` through its own `npm ci` rather
+      # than through a setup action.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `compiler/dist/` is ~72 MB of packaged toolchain and is fully
+      # determined by the inputs in this key: the pin (rubrc's commit, the
+      # composer, Binaryen, the sysroot), the worker sources bundled against
+      # it, the packaging scripts, `build-compiler.sh` itself, and everything
+      # that decides what vite emits and what it is called — `vite.config.ts`,
+      # `tsconfig.json`, `package.json` and the lockfile that pins vite and
+      # bun. A key missing any of those restores a stale tree that both e2e
+      # jobs then test while reporting green. No `restore-keys`: a near-miss
+      # restore would be a tree built from a different pin, and the only
+      # honest thing to do with it is rebuild.
+      # The optimized tree the developer published for this pin, and the only
+      # source of one: composing it costs ~35 minutes and 12.6 GB of RSS, which
+      # this runner does not have. `continue-on-error` because a branch that
+      # has moved `PIN.json` has no asset yet, and this job only needs to know
+      # whether the compiler still WORKS — the cache and the `--fast`
+      # composition below are what make such a branch testable. The DEPLOY
+      # workflow runs the same script without a fallback.
+      - name: Fetch the published compiler dist
+        id: compiler-fetch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: examples/dev-sandbox/compiler/fetch-dist.sh
+
+      - name: Cache the packaged compiler
+        id: compiler-dist
+        if: steps.compiler-fetch.outcome != 'success'
+        uses: actions/cache@v4
+        with:
+          path: examples/dev-sandbox/compiler/dist
+          key: compiler-dist-${{ hashFiles('examples/dev-sandbox/compiler/PIN.json', 'examples/dev-sandbox/compiler/src/**', 'examples/dev-sandbox/compiler/scripts/**', 'examples/dev-sandbox/compiler/package.json', 'examples/dev-sandbox/compiler/package-lock.json', 'examples/dev-sandbox/compiler/tsconfig.json', 'examples/dev-sandbox/compiler/vite.config.ts', 'examples/dev-sandbox/compiler/build-compiler.sh') }}
+
+      # This job — and ONLY this job — may run against a component composed
+      # without `wasm-opt`. `verify-compiler-assets.mjs` refuses a `--fast`
+      # tree unless this is set, which is what keeps such a tree out of a
+      # deploy: the deploy workflow never sets it and builds (or restores) the
+      # optimized tree a developer produced. Exported for the whole job because
+      # both `build.sh --check` and `build.sh` run the verifier.
+      - name: Allow a --fast compiler tree in this job only
+        run: echo "IMPRESSPRESS_COMPILER_ALLOW_FAST=1" >> "$GITHUB_ENV"
+
+      # Only on a cache miss, and with `--fast`, which swaps rubrc's
+      # `vfs:build:prod` for `vfs:build:prod:no-opt`: minutes instead of the
+      # ~35 that `wasm-opt -Oz` costs, at the price of a much larger component
+      # to download in the browser. That matters here only as minutes of test
+      # time. **The memory this path needs has not been measured** — the 12.6
+      # GB peak in `compiler/README.md` is the OPTIMIZED composition's, which
+      # would OOM a 7 GB runner; skipping `wasm-opt` is what is expected to
+      # avoid it, not something observed. If this step is ever OOM-killed, the
+      # answer is a larger runner, not a smaller component.
+      #
+      # `build-compiler.sh` installs what it needs itself (bun through
+      # `npm ci`, the sha256-checked `wasi_virt_layer-cli` and Binaryen
+      # releases, `wasm32-wasip1-threads` on both toolchains and a nightly with
+      # `rust-src`), so there is nothing to add here beyond node and rustup.
+      - name: Build the packaged compiler (no asset and no cache, unoptimized)
+        if: steps.compiler-fetch.outcome != 'success' && steps.compiler-dist.outputs.cache-hit != 'true'
+        run: examples/dev-sandbox/compiler/build-compiler.sh --fast
+
+      # Both halves of `--check`: the seed manifest, and the compiler tree —
+      # every file against `compiler/dist/manifest.json`'s hashes, and nothing
+      # over Cloudflare's asset limit. On a cache hit this is what proves the
+      # restored tree is intact rather than assuming it.
+      - name: Check the seed manifest and the compiler tree
+        run: examples/dev-sandbox/build.sh --check
+
+      # `compiler_is_current` matches PIN.json against the tree above, so this
+      # does not rebuild the compiler; it builds the wasm and assembles the
+      # bundle, with `compiler/dist/` overlaid at `/__impresspress_dev/compiler/`.
+      - name: Build the dev-sandbox bundle
+        run: |
+          DIST="$(examples/dev-sandbox/build.sh | tail -1)"
+          echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/impresspress-web/package-lock.json') }}
+
+      - name: Install Playwright
+        working-directory: crates/impresspress-web
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+
+      # A plain static host is enough: the service worker adds the COOP/COEP
+      # the compiler worker needs, and the compiler assets are ordinary files
+      # on the bypass list.
+      - name: Serve the dev bundle in background (port 8083)
+        run: |
+          python3 -m http.server 8083 -d "$DEV_DIST" &
+          echo $! > /tmp/dev-compile-http-pid
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8083/sw.js > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:8083/seed/manifest.json > /dev/null
+          curl -sf http://localhost:8083/__impresspress_dev/compiler/manifest.json > /dev/null
+
+      - name: Run the in-browser compile e2e (port 8083)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8083
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-compile.spec.ts 2>&1 \
+            | tee /tmp/dev-compile.log
+
+      # The spec prints its measurements as `dev-compile:` lines precisely so
+      # they can be lifted out of the log: toolchain start-up, the build, and
+      # the size of the module the browser produced. `always()` because a
+      # failure that still reached the compile is exactly when the numbers are
+      # worth reading.
+      - name: Report the compile timings
+        if: always()
+        run: |
+          {
+            echo '### Rubrc, in the browser'
+            echo
+            echo '```'
+            grep 'dev-compile:' /tmp/dev-compile.log \
+              || echo '(no dev-compile: lines — the run did not reach the compile)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The definition of done (design §21), as one test: the seven-step
+      # scenario of §16, on the bundle already being served. It belongs in THIS
+      # job rather than `e2e-dev-sandbox` for the same reason the spec above
+      # does — its second step compiles a Rust block with the real toolchain —
+      # and it runs AFTER that spec on purpose: the two share this server and
+      # this browser install, and a compiler already known to be broken would
+      # make the scenario's failure say nothing the step above has not said
+      # already. Each spec boots its own fresh origin, so neither can leave
+      # state for the other.
+      - name: Run the full scenario e2e (port 8083)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8083
+        run: |
+          set -o pipefail
+          npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-scenario.spec.ts 2>&1 \
+            | tee /tmp/dev-scenario.log
+
+      # One `dev-scenario:` line per step, printed as that step finishes — so
+      # the last line in the summary is also how far the scenario got.
+      - name: Report the scenario timings
+        if: always()
+        run: |
+          {
+            echo '### The seven-step scenario'
+            echo
+            echo '```'
+            grep 'dev-scenario:' /tmp/dev-scenario.log \
+              || echo '(no dev-scenario: lines — the run did not reach the scenario)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/dev-compile-http-pid ]; then
+            kill "$(cat /tmp/dev-compile-http-pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-dev-compile
+          path: crates/impresspress-web/playwright-report/
+          retention-days: 7
 
   products-browser:
     name: Products browser lifecycles

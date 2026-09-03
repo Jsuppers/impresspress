@@ -31,6 +31,9 @@ fn maybe_eq(field: &str, value: Option<&str>) -> Option<Filter> {
 // Context operations
 // ---------------------------------------------------------------------------
 
+// The context row's columns, one argument each — the same shape
+// `send_message` below already carries an allow for.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_context(
     ctx: &dyn Context,
     owner_id: &str,

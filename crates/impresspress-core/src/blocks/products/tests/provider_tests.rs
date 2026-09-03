@@ -1164,7 +1164,10 @@ async fn ambiguous_stripe_refund_failure_stays_retryable_with_the_same_key() {
         assert_eq!(result["claimed"], 1);
         assert_eq!(result["succeeded"], 1);
 
-        let requests = requests.lock().unwrap();
+        // Cloned out of the guard rather than asserted through it: a
+        // `MutexGuard` alive at the end of an async test body is held across
+        // the await points the harness adds around it.
+        let requests = requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].url, "https://api.stripe.com/v1/refunds");

@@ -65,7 +65,9 @@ pub use logger::make_console_logger;
 #[cfg(target_arch = "wasm32")]
 pub use network::make_network_service;
 #[cfg(target_arch = "wasm32")]
-pub use runtime::{dispatch_request, is_initialized, store_wafer};
+pub use runtime::{
+    current_wafer, dispatch_request, is_initialized, replace_wafer, restore_wafer, store_wafer,
+};
 #[cfg(target_arch = "wasm32")]
 pub use storage::make_storage_service;
 

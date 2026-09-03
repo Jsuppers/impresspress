@@ -39,6 +39,7 @@ pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
         extra_bypass_prefix: cfg.assets.extra_bypass_prefix.clone(),
         extra_bypass_exact: cfg.assets.extra_bypass_exact.clone(),
         opfs_wipe_on_recovery: cfg.assets.opfs_wipe_on_recovery,
+        dev_enabled: cfg.dev.enabled,
     };
     impresspress_bundle::assets::write_to(&dist_dir)?;
     impresspress_bundle::bundle::run(&dist_dir, repo_root, app)?;

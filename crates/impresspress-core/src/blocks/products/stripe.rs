@@ -34,7 +34,11 @@ use crate::{
 /// webhooks lack event idempotency"; I1 follow-up 2026-07-17: "recording
 /// event before side effects drops the event on transient failure"). See
 /// `003_stripe_events.sqlite.sql` for the schema and full rationale.
-const STRIPE_EVENTS_TABLE: &str = "impresspress__products__stripe_events";
+///
+/// Sourced from `repo::stripe_events::TABLE` (the repo-convention owner of
+/// the name) rather than restated here — this file keeps its own short
+/// alias since every call site below already spells `STRIPE_EVENTS_TABLE`.
+const STRIPE_EVENTS_TABLE: &str = repo::stripe_events::TABLE;
 
 /// `status` column values on [`STRIPE_EVENTS_TABLE`].
 const EVENT_STATUS_PENDING: &str = "pending";

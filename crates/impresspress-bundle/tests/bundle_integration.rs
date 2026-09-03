@@ -6,25 +6,30 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/bundle_fixtures/pkg-in")
 }
 
-fn default_app() -> AppConfig {
-    AppConfig {
-        app_name: None,
-        app_title: None,
-        boot_redirect: None,
-        extra_bypass_prefix: Vec::new(),
-        extra_bypass_exact: Vec::new(),
-        opfs_wipe_on_recovery: false,
-    }
+/// Copy the fixture pkg into a fresh temp dir.
+fn pkg_copy() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    copy_dir(&fixture_path(), tmp.path());
+    tmp
+}
+
+/// [`pkg_copy`] with the fixture's three-line `sw.js.tmpl` stub swapped for the
+/// **shipped** template. Tests that assert on real template content have to
+/// render the thing that actually reaches a browser.
+fn production_pkg_copy() -> tempfile::TempDir {
+    let tmp = pkg_copy();
+    let prod_tmpl = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sw.js.tmpl"));
+    fs::write(tmp.path().join("sw.js.tmpl"), prod_tmpl).unwrap();
+    tmp
 }
 
 #[test]
 fn exact_bypass_renders_into_sw() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
+    let tmp = pkg_copy();
 
     let app = AppConfig {
         extra_bypass_exact: vec!["/".to_string(), "/index.html".to_string()],
-        ..default_app()
+        ..AppConfig::default()
     };
     run(tmp.path(), tmp.path(), app).expect("bundler ok");
 
@@ -45,9 +50,8 @@ fn exact_bypass_renders_into_sw() {
 
 #[test]
 fn exact_bypass_empty_leaves_sw_unchanged() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
-    run(tmp.path(), tmp.path(), default_app()).expect("bundler ok");
+    let tmp = pkg_copy();
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
     assert!(!sw.contains("__EXTRA_BYPASS_EXACT__"));
     assert!(!sw.contains("=== '/'"));
@@ -55,10 +59,9 @@ fn exact_bypass_empty_leaves_sw_unchanged() {
 
 #[test]
 fn end_to_end_renames_rewrites_and_templates() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
+    let tmp = pkg_copy();
 
-    run(tmp.path(), tmp.path(), default_app()).expect("bundler ok");
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
 
     let manifest_body = fs::read_to_string(tmp.path().join("asset-manifest.json")).unwrap();
     assert!(manifest_body.contains("\"buildId\""));
@@ -95,14 +98,73 @@ fn end_to_end_renames_rewrites_and_templates() {
     assert!(!glue.contains("'app_bg.wasm'"));
 }
 
+/// `files` is the whole shell, and it is what the development sandbox's
+/// export copies into the bundle it hands the user. Three properties have to
+/// hold, and each has a way of failing silently:
+///
+///  * the RENDERED templates are listed, not the `*.tmpl` inputs — a listing
+///    taken before rendering would name three files that no longer exist and
+///    omit the three a browser actually loads;
+///  * the hashed wasm-pack pair is listed under the names it was RENAMED to,
+///    since the un-hashed originals are gone by then;
+///  * nested directories are walked, `/`-separated and sorted — the
+///    wasm-bindgen `snippets/` tree lives one level down and a shell missing
+///    it cannot load its own module.
+#[test]
+fn the_manifest_lists_every_file_of_the_rendered_shell() {
+    let tmp = pkg_copy();
+    std::fs::create_dir_all(tmp.path().join("snippets/inner")).unwrap();
+    std::fs::write(tmp.path().join("snippets/inner/glue.js"), "export {};").unwrap();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let body = fs::read_to_string(tmp.path().join("asset-manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let files: Vec<String> = manifest["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    assert!(files.contains(&"sw.js".to_string()), "{files:?}");
+    assert!(files.contains(&"index.html".to_string()), "{files:?}");
+    assert!(
+        files.contains(&"snippets/inner/glue.js".to_string()),
+        "the walk must recurse; {files:?}"
+    );
+    assert!(
+        files.contains(&"asset-manifest.json".to_string()),
+        "the manifest names itself, so copying every listed file copies the \
+         whole shell; {files:?}"
+    );
+    // The inputs, not the outputs: `render_if_exists` deletes each template
+    // it renders, and anything still ending in `.tmpl` is bundler input.
+    assert!(!files.iter().any(|f| f.ends_with(".tmpl")), "{files:?}");
+    // The hashed pair, under the names the rename produced.
+    assert!(
+        files
+            .iter()
+            .any(|f| f.starts_with("app-") && f.ends_with(".js")),
+        "{files:?}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.starts_with("app_bg-") && f.ends_with(".wasm")),
+        "{files:?}"
+    );
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(files, sorted, "the listing must be sorted");
+}
+
 #[test]
 fn deterministic_across_runs() {
-    let tmp1 = tempfile::tempdir().unwrap();
-    let tmp2 = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp1.path());
-    copy_dir(&fixture_path(), tmp2.path());
-    impresspress_bundle::bundle::run(tmp1.path(), tmp1.path(), default_app()).unwrap();
-    impresspress_bundle::bundle::run(tmp2.path(), tmp2.path(), default_app()).unwrap();
+    let tmp1 = pkg_copy();
+    let tmp2 = pkg_copy();
+    impresspress_bundle::bundle::run(tmp1.path(), tmp1.path(), AppConfig::default()).unwrap();
+    impresspress_bundle::bundle::run(tmp2.path(), tmp2.path(), AppConfig::default()).unwrap();
 
     let m1 = fs::read_to_string(tmp1.path().join("asset-manifest.json")).unwrap();
     let m2 = fs::read_to_string(tmp2.path().join("asset-manifest.json")).unwrap();
@@ -113,15 +175,10 @@ fn deterministic_across_runs() {
 
 #[test]
 fn empty_exact_leaves_production_sw_bypass_unchanged() {
-    let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&fixture_path(), tmp.path());
+    let tmp = production_pkg_copy();
 
-    // Overwrite the fixture stub with the real production template.
-    let prod_tmpl = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sw.js.tmpl"));
-    fs::write(tmp.path().join("sw.js.tmpl"), prod_tmpl).unwrap();
-
-    // default_app has both extra_bypass_prefix and extra_bypass_exact empty.
-    run(tmp.path(), tmp.path(), default_app()).expect("bundler ok");
+    // AppConfig::default() has both extra_bypass_prefix and extra_bypass_exact empty.
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
 
     let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
 
@@ -146,6 +203,187 @@ fn empty_exact_leaves_production_sw_bypass_unchanged() {
         sw.contains("startsWith('/sql-')) {"),
         "production bypass closing token changed; sw.js = {sw}"
     );
+}
+
+#[test]
+fn sw_passes_the_dev_flag_to_initialize() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    // ONE rendered constant, read by `initialize()` and by the passthrough
+    // branch alike — see `sw.js.tmpl`'s header for why the flag is stated
+    // once rather than substituted at each use.
+    assert!(
+        sw.contains("const DEV_ENABLED = true;"),
+        "sw.js did not receive the dev flag; sw.js = {sw}"
+    );
+    assert!(
+        sw.contains("initialize({ dev: DEV_ENABLED })"),
+        "initialize() must read the one constant; sw.js = {sw}"
+    );
+}
+
+#[test]
+fn sw_defaults_the_dev_flag_to_false() {
+    let tmp = production_pkg_copy();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    // The sandbox is off unless a bundle asks for it: an app that never sets
+    // `[dev] enabled` must ship a service worker that boots the runtime with
+    // the flag explicitly false, not merely absent.
+    assert!(sw.contains("const DEV_ENABLED = false;"), "sw.js = {sw}");
+    assert!(
+        sw.contains("initialize({ dev: DEV_ENABLED })"),
+        "initialize() must read the one constant; sw.js = {sw}"
+    );
+    assert!(
+        !sw.contains("__DEV_ENABLED__"),
+        "placeholder not substituted in sw.js"
+    );
+}
+
+/// The sandbox's seed bundle is fetched from the static host on a cold boot,
+/// so the service worker has to let `/seed/` through. It is the runtime's own
+/// flag that decides, not a second thing an app has to remember to configure.
+#[test]
+fn a_dev_bundle_bypasses_the_seed_prefix() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(
+        sw.contains("url.pathname.startsWith('/seed/')"),
+        "sw.js does not bypass the seed bundle; sw.js = {sw}"
+    );
+    assert!(
+        !sw.contains("__EXTRA_BYPASS__"),
+        "placeholder not substituted"
+    );
+}
+
+/// And only then: a bundle with no sandbox serves no seed, so intercepting
+/// `/seed/` is the correct (and unchanged) behaviour.
+#[test]
+fn a_non_dev_bundle_does_not_bypass_the_seed_prefix() {
+    let tmp = production_pkg_copy();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(!sw.contains("/seed/"), "sw.js = {sw}");
+}
+
+/// A dev bundle's service worker is the deployment's header layer.
+///
+/// The in-browser Rust toolchain runs in a dedicated worker started from a
+/// document that is COEP `credentialless`, and a browser refuses such a worker
+/// unless the worker SCRIPT's own response carries a compatible COEP. That
+/// script is a bypassed static file, so no runtime response can carry it and
+/// no static host is guaranteed to send it — which is why `sw.js` answers
+/// every bypassed same-origin request itself in a dev bundle and adds the
+/// pair. Without this the compiler cannot start on any host, and the only
+/// symptom the page gets is an empty `Worker` error event.
+#[test]
+fn a_dev_bundle_adds_the_isolation_headers_to_bypassed_responses() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    // Gated on the one build-time constant, not decided at runtime — the
+    // same constant `initialize()` is passed, so a bundle cannot be dev in
+    // one half of this file and not in the other.
+    assert!(
+        sw.contains("const DEV_ENABLED = true;")
+            && sw.contains("if (DEV_ENABLED && url.pathname !== '/sw.js') {"),
+        "the dev rendering must take the passthrough branch; sw.js = {sw}"
+    );
+    assert!(
+        sw.contains("event.respondWith(passthrough(event.request));"),
+        "sw.js = {sw}"
+    );
+    // Both headers, with the values `blocks/dev/page.rs` and the
+    // security-headers block use for the rest of the origin.
+    assert!(
+        sw.contains("headers.set('Cross-Origin-Embedder-Policy', 'credentialless');"),
+        "sw.js = {sw}"
+    );
+    assert!(
+        sw.contains("headers.set('Cross-Origin-Opener-Policy', 'same-origin');"),
+        "sw.js = {sw}"
+    );
+    // Streamed, not buffered: these are multi-megabyte wasm parts.
+    assert!(
+        sw.contains("return new Response(response.body, {"),
+        "the passthrough must pipe the body, not read it; sw.js = {sw}"
+    );
+    // An opaque or error response has no readable headers and no exposed
+    // body, so rebuilding it would silently replace it with an empty 200.
+    assert!(
+        sw.contains("response.type === 'opaque'") && sw.contains("response.type === 'error'"),
+        "sw.js = {sw}"
+    );
+}
+
+/// And the other rendering, explicitly: a bundle with no sandbox has no
+/// compiler worker to start and no site-wide isolation to be consistent with,
+/// so its bypassed requests go to the network untouched — the behaviour every
+/// bundle had before the sandbox existed, and one less service-worker round
+/// trip per static asset.
+#[test]
+fn a_non_dev_bundle_leaves_bypassed_responses_to_the_network() {
+    let tmp = production_pkg_copy();
+
+    run(tmp.path(), tmp.path(), AppConfig::default()).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(
+        sw.contains("const DEV_ENABLED = false;")
+            && sw.contains("if (DEV_ENABLED && url.pathname !== '/sw.js') {"),
+        "the non-dev rendering must not take the passthrough branch; sw.js = {sw}"
+    );
+    // The early return is still the last statement of the bypass branch.
+    assert!(
+        sw.contains(
+            "        }\n        return;\n    }\n    event.respondWith(handleFetch(event.request));"
+        ),
+        "the bypass branch must still end in the plain early return; sw.js = {sw}"
+    );
+}
+
+/// The seed prefix joins whatever the app already asked for rather than
+/// replacing it — `examples/dev-sandbox` also bypasses the compiler worker.
+#[test]
+fn the_seed_prefix_joins_an_apps_own_bypass_list() {
+    let tmp = production_pkg_copy();
+
+    let app = AppConfig {
+        dev_enabled: true,
+        extra_bypass_prefix: vec!["/__impresspress_dev/compiler/".to_string()],
+        ..AppConfig::default()
+    };
+    run(tmp.path(), tmp.path(), app).expect("bundler ok");
+
+    let sw = fs::read_to_string(tmp.path().join("sw.js")).unwrap();
+    assert!(sw.contains("url.pathname.startsWith('/__impresspress_dev/compiler/')"));
+    assert!(sw.contains("url.pathname.startsWith('/seed/')"));
 }
 
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {

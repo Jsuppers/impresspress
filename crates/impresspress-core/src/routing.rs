@@ -170,11 +170,103 @@ impl RouteAccess {
 /// Built-in [`ROUTES`] always win. An extra route with the same prefix as a
 /// built-in is ignored. To disable a built-in route, disable its feature
 /// flag — do not try to override it.
+///
+/// # Access
+///
+/// A *declared* path — one `BlockEndpoint` matches — is always
+/// `access.max(declared)`, exactly as a built-in [`Route`]'s is: neither the
+/// prefix tier nor the block's own declaration can weaken the other.
+///
+/// What the two constructors decide is the tier for an **undeclared** path,
+/// and it is a property of the *route*, not of how many endpoints its block
+/// happens to declare:
+///
+/// * [`ExtraRoute::new`] — `access` is the complete answer. This is what
+///   `ImpresspressBuilder::add_route` registers, because a downstream
+///   project's catch-all block serves paths it never declared and a
+///   fail-closed default would lock every one of them.
+/// * [`ExtraRoute::refined`] — an undeclared path falls back to
+///   [`RouteAccess::Authenticated`], the same fail-closed default
+///   [`declared_access`] applies to built-in routes. This is what the dev
+///   sandbox registers its dynamically-added guest blocks with.
+///
+/// # Why not "does the block declare any endpoint?"
+///
+/// That was the original switch, and it is wrong in both directions.
+///
+/// Fail-open: a guest block that declares NO endpoint is indistinguishable
+/// from a catch-all, so every path under its `Public` prefix was served to
+/// anonymous callers — the exact hole the per-endpoint refinement exists to
+/// close. (`validate_static` now also refuses such a guest, but the routing
+/// layer must not depend on that: the seed importer admits specs without a
+/// `BlockInfo` in hand.)
+///
+/// Fail-closed-by-surprise: adding a FIRST `BlockEndpoint` to an existing
+/// catch-all block flipped every *other* path that block serves from `access`
+/// to `Authenticated`, silently, as a side effect of declaring one endpoint.
+///
+/// Making it an explicit per-route choice is what lets both of those be right
+/// at once.
 #[derive(Debug, Clone)]
 pub struct ExtraRoute {
     pub prefix: String,
     pub access: RouteAccess,
     pub block_name: String,
+    /// Whether an undeclared path under `prefix` falls back to
+    /// [`RouteAccess::Authenticated`] rather than standing at `access`.
+    ///
+    /// Private so the choice is made through [`Self::new`] or
+    /// [`Self::refined`], whose names say which semantics the registrar
+    /// wanted — the same reason [`Route::router_final`] is private.
+    refine_undeclared: bool,
+}
+
+impl ExtraRoute {
+    /// A route whose `access` is the complete answer for any path its block
+    /// has not declared an endpoint for.
+    ///
+    /// The catch-all case, and what `ImpresspressBuilder::add_route` uses.
+    pub fn new(
+        prefix: impl Into<String>,
+        block_name: impl Into<String>,
+        access: RouteAccess,
+    ) -> ExtraRoute {
+        ExtraRoute {
+            prefix: prefix.into(),
+            access,
+            block_name: block_name.into(),
+            refine_undeclared: false,
+        }
+    }
+
+    /// A route whose `access` is a FLOOR: an undeclared path under it
+    /// requires a logged-in caller.
+    ///
+    /// For a block whose endpoint declarations are the authorization model —
+    /// the dev sandbox's guest blocks, which are compiled from source the
+    /// host did not write and are admitted on a `Public` prefix precisely
+    /// because every genuinely public path has to be declared as one.
+    pub fn refined(
+        prefix: impl Into<String>,
+        block_name: impl Into<String>,
+        access: RouteAccess,
+    ) -> ExtraRoute {
+        ExtraRoute {
+            prefix: prefix.into(),
+            access,
+            block_name: block_name.into(),
+            refine_undeclared: true,
+        }
+    }
+
+    /// Whether an undeclared path under this route falls back to
+    /// [`RouteAccess::Authenticated`].
+    ///
+    /// Exposed within the crate so deployment-plan export can round-trip the
+    /// exact route policy, as it already does for [`Route::is_router_final`].
+    pub(crate) const fn refines_undeclared(&self) -> bool {
+        self.refine_undeclared
+    }
 }
 
 /// The shared routing table. Order matters — more specific prefixes before general ones.
@@ -355,19 +447,55 @@ pub fn routes_config(block_infos: &[BlockInfo]) -> serde_json::Value {
 /// it can't (yet) declare that endpoint itself. `Authenticated`, not a hard
 /// deny, so a forgotten declaration degrades to "please log in" rather than
 /// 404ing a route that already works for logged-in callers.
-fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -> RouteAccess {
-    let Some(info) = block_infos.iter().find(|i| i.name == block_name) else {
-        return RouteAccess::Authenticated;
-    };
+/// The access tier an [`ExtraRoute`] actually enforces for `msg`.
+///
+/// Extra routes used to enforce `route.access` alone, which made
+/// `BlockEndpoint::auth` documentation-only for every downstream-registered
+/// block: a block reached through a `Public` extra route served its
+/// `Admin`-declared endpoints to anonymous callers. The dev sandbox is
+/// registered exactly that way, and its dynamically-added guest blocks
+/// declare their own per-endpoint auth, so the gap was load-bearing.
+///
+/// A DECLARED path is `access.max(declared)` for every extra route, without
+/// exception. Only the UNDECLARED case differs, and it is decided by which
+/// [`ExtraRoute`] constructor the registrar used rather than by whether the
+/// block happens to declare any endpoint at all — see [`ExtraRoute`]'s doc
+/// comment for why that distinction is load-bearing in both directions.
+fn extra_route_access(block_infos: &[BlockInfo], route: &ExtraRoute, msg: &Message) -> RouteAccess {
+    match declared_endpoint_access(block_infos, &route.block_name, msg) {
+        Some(declared) => route.access.max(declared),
+        None if route.refines_undeclared() => route.access.max(RouteAccess::Authenticated),
+        None => route.access,
+    }
+}
+
+/// The tier `block_name` DECLARED for `(msg.action, msg.path)`, or `None`
+/// when no endpoint matches (including when the block has no [`BlockInfo`]).
+///
+/// The undecorated answer: what the caller does with a `None` is the
+/// caller's policy, and the two callers differ. [`declared_access`] folds it
+/// into the fail-closed `Authenticated` default that governs built-in routes;
+/// [`extra_route_access`] consults the route's own choice.
+fn declared_endpoint_access(
+    block_infos: &[BlockInfo],
+    block_name: &str,
+    msg: &Message,
+) -> Option<RouteAccess> {
+    let info = block_infos.iter().find(|i| i.name == block_name)?;
     endpoint_match::endpoint_auth(&info.endpoints, msg.action(), msg.path())
         .map(RouteAccess::from_auth_level)
-        .unwrap_or(RouteAccess::Authenticated)
+}
+
+fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -> RouteAccess {
+    declared_endpoint_access(block_infos, block_name, msg).unwrap_or(RouteAccess::Authenticated)
 }
 
 /// Resolve the [`AuthLevel`] a caller must actually have to invoke `ep`,
-/// mirroring exactly what [`route_to_block`] enforces for it (routing.rs
-/// :435-440): `route.access.max(declared_access(...))`, with the
-/// `router_final` escape hatch making the route's own declaration final.
+/// mirroring exactly what [`route_to_block`] enforces for it:
+/// `route.access.max(declared_access(...))`, with the `router_final` escape
+/// hatch making a built-in route's own declaration final, and an extra route
+/// refined only when its target block declares endpoints (see
+/// [`extra_route_access`]).
 ///
 /// Lives here (not in `pipeline.rs`, where the WebMCP manifest calls it)
 /// because `Route::router_final` is a private field — deliberately not
@@ -442,12 +570,16 @@ pub fn effective_access(
         // No built-in route claims this path — fall through to the
         // downstream-registered ones, exactly as `route_to_block` does.
         None => match extra_routes.iter().find(|r| prefix_matches(&r.prefix)) {
-            // `route_to_block` enforces an extra route's `access` alone —
-            // it never refines it with `declared_access` — so neither does
-            // this. Taking a max with `ep.auth` here would HIDE a tool the
-            // router genuinely admits, the same mistake in the other
-            // direction.
-            Some(r) if r.block_name == block.name => r.access,
+            // Mirrors `extra_route_access`'s DECLARED branch, which is the
+            // only one reachable from here: `ep` is one of this block's own
+            // endpoints, so a request for `ep.path` necessarily matches a
+            // declaration and `refines_undeclared` never comes into it.
+            // Dropping the refinement would advertise a tool the router now
+            // rejects; adding one the router does not apply would hide a tool
+            // it admits.
+            Some(r) if r.block_name == block.name => {
+                r.access.max(RouteAccess::from_auth_level(ep.auth))
+            }
             _ => RouteAccess::Admin,
         },
     };
@@ -589,7 +721,9 @@ pub async fn route_to_block(
             return crate::http::err_not_found("endpoint not found");
         }
 
-        if let Some(denied) = check_access(route.access, &msg) {
+        // Access gate, refined by the target block's own declarations exactly
+        // as the built-in loop above does — see `extra_route_access`.
+        if let Some(denied) = check_access(extra_route_access(block_infos, route, &msg), &msg) {
             return denied;
         }
 
@@ -821,11 +955,11 @@ mod tests {
         async fn dispatched(features: &dyn FeatureConfig) -> bool {
             let mut ctx = TestContext::new().await;
             ctx.register_block("test/extra", std::sync::Arc::new(EchoBlock));
-            let extra = vec![ExtraRoute {
-                prefix: "/x/extra".to_string(),
-                access: RouteAccess::Public,
-                block_name: "test/extra".to_string(),
-            }];
+            let extra = vec![ExtraRoute::new(
+                "/x/extra",
+                "test/extra",
+                RouteAccess::Public,
+            )];
             let out = route_to_block(
                 &ctx,
                 anon_msg("retrieve", "/x/extra/thing"),
@@ -1258,11 +1392,11 @@ mod tests {
         let info = BlockInfo::new("test/reports", "0.0.1", "http-handler@v1", "t")
             .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
         let ep = info.endpoints[0].clone();
-        let extra = vec![ExtraRoute {
-            prefix: "/x/reports".to_string(),
-            access: RouteAccess::Admin,
-            block_name: "test/reports".to_string(),
-        }];
+        let extra = vec![ExtraRoute::new(
+            "/x/reports",
+            "test/reports",
+            RouteAccess::Admin,
+        )];
 
         assert_eq!(
             effective_access(&info, &ep, &extra),
@@ -1288,26 +1422,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effective_access_mirrors_a_looser_extra_route_rather_than_hiding_the_tool() {
-        // The other direction, and the reason this does NOT max with
-        // `ep.auth`: `route_to_block`'s extra-route loop enforces
-        // `route.access` alone — it never consults `declared_access`. A
-        // resolver that took the max here would hide a tool the router
-        // genuinely admits anonymously.
-        let ep_path = "/x/public-thing";
+    async fn an_extra_route_is_refined_by_the_target_blocks_own_declarations() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        // The other direction, and the one that used to be a hole:
+        // `route_to_block`'s extra-route loop enforced `route.access` alone,
+        // so a block reached through a `Public` extra route served its
+        // `Admin`-declared endpoints to anonymous callers. The dev sandbox is
+        // registered exactly this way and its guest blocks declare their own
+        // per-endpoint auth, so the gap was load-bearing.
+        let ep_path = "/x/admin-thing";
         let info = BlockInfo::new("test/pub", "0.0.1", "http-handler@v1", "t")
             .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Admin)]);
         let ep = info.endpoints[0].clone();
-        let extra = vec![ExtraRoute {
-            prefix: "/x/public-thing".to_string(),
-            access: RouteAccess::Public,
-            block_name: "test/pub".to_string(),
-        }];
+        let extra = vec![ExtraRoute::new("/x/", "test/pub", RouteAccess::Public)];
 
         assert_eq!(
             effective_access(&info, &ep, &extra),
-            AuthLevel::Public,
-            "extra routes are enforced on `route.access` alone, so the resolver must say Public"
+            AuthLevel::Admin,
+            "the resolver must report what the router now enforces"
+        );
+
+        // And the router agrees — the whole point of the resolver existing.
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("test/pub", std::sync::Arc::new(DispatchProbeBlock));
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", ep_path),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &extra,
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "an anonymous caller must not reach an Admin-declared endpoint through a Public \
+             extra route"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extra_route_to_a_block_that_declares_nothing_keeps_its_own_tier() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        // Every existing `ImpresspressBuilder::add_route` consumer registers a
+        // catch-all block that declares no endpoints. `declared_access`'s
+        // fail-closed `Authenticated` default would lock all of them, so the
+        // refinement applies only to a block that has opted in by declaring
+        // something.
+        let info = BlockInfo::new("test/catchall", "0.0.1", "http-handler@v1", "t");
+        let extra = vec![ExtraRoute::new("/x/", "test/catchall", RouteAccess::Public)];
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("test/catchall", std::sync::Arc::new(DispatchProbeBlock));
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", "/x/anything"),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&info),
+            &extra,
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_html(out).await,
+            "DISPATCHED",
+            "a block that declares no endpoints keeps its route's Public tier"
         );
     }
 

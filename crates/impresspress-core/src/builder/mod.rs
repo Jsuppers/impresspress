@@ -321,11 +321,29 @@ impl ImpresspressBuilder {
         block_name: impl Into<String>,
         access: RouteAccess,
     ) -> Self {
-        self.extra_routes.push(ExtraRoute {
-            prefix: prefix.into(),
-            block_name: block_name.into(),
-            access,
-        });
+        self.extra_routes
+            .push(ExtraRoute::new(prefix, block_name, access));
+        self
+    }
+
+    /// Register a route whose block's endpoint declarations ARE its
+    /// authorization model: `access` is a floor, and any path under `prefix`
+    /// that the block has not declared a `BlockEndpoint` for requires a
+    /// logged-in caller.
+    ///
+    /// [`Self::add_route`] is the right call for a catch-all block that
+    /// serves paths it never declares. This one is for a block whose code the
+    /// host did not write — the dev sandbox's compiled guests — where an
+    /// undeclared path must not inherit a permissive prefix tier. See
+    /// [`ExtraRoute`]'s doc comment.
+    pub fn add_refined_route(
+        mut self,
+        prefix: impl Into<String>,
+        block_name: impl Into<String>,
+        access: RouteAccess,
+    ) -> Self {
+        self.extra_routes
+            .push(ExtraRoute::refined(prefix, block_name, access));
         self
     }
 

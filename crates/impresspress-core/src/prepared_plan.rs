@@ -321,6 +321,15 @@ pub struct PreparedRoute {
     pub block: String,
     pub dispatch_to: String,
     pub router_final: bool,
+    /// Consumer routes only: whether a path the block has not declared an
+    /// endpoint for falls back to `Authenticated` rather than standing at
+    /// `access` (`routing::ExtraRoute::refined` vs `::new`).
+    ///
+    /// `default` so a plan exported before this field existed still imports —
+    /// and imports as `false`, which is `ExtraRoute::new`, which is what every
+    /// route in such a plan was.
+    #[serde(default)]
+    pub refine_undeclared: bool,
 }
 
 /// Immutable, serializable ImpressPress structure.
@@ -874,6 +883,7 @@ mod tests {
                 block: "impresspress/system".into(),
                 dispatch_to: "impresspress/system".into(),
                 router_final: false,
+                refine_undeclared: false,
             }],
             built_in_route_count: 1,
             block_settings: BTreeMap::new(),
