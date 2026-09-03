@@ -348,12 +348,7 @@ async fn claimed_tool_names(
     ctx: &dyn Context,
     others: &[DynamicBlockSpec],
 ) -> Result<ClaimedToolNames, WaferError> {
-    let mut claimed: BTreeSet<String> = ctx
-        .registered_blocks()
-        .iter()
-        .flat_map(|info| info.endpoints.iter())
-        .filter_map(|endpoint| endpoint.agent_tool.as_ref().map(|tool| tool.name.clone()))
-        .collect();
+    let mut claimed: BTreeSet<String> = validation::agent_tool_names(ctx.registered_blocks());
     for block in others {
         // A block is in the active set because a build row accepted it, so a
         // row that is gone or unreadable is a broken invariant — not a licence
@@ -387,11 +382,7 @@ async fn claimed_tool_names(
                 )));
             }
         };
-        claimed.extend(
-            info.endpoints
-                .iter()
-                .filter_map(|endpoint| endpoint.agent_tool.as_ref().map(|tool| tool.name.clone())),
-        );
+        claimed.extend(validation::agent_tool_names(std::slice::from_ref(&info)));
     }
     Ok(ClaimedToolNames::Complete(claimed))
 }

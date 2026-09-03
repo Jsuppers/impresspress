@@ -501,11 +501,14 @@ fn data_file(path: &str, bytes: &[u8]) -> seed::SeedFile {
 
 #[tokio::test]
 async fn seed_import_applies_data_json_when_present() {
+    // The importer takes the runtime seam explicitly, so a test binds the
+    // control it built the context over rather than passing a second one.
+    let control = FakeControl::new();
     let ctx = TestContext::with_products()
         .await
         .with_auth_added()
         .await
-        .with_dev_added(FakeControl::new())
+        .with_dev_added(control.clone())
         .await;
     let data_bytes = serde_json::to_vec(&mixed_snapshot()).unwrap();
     let manifest = SeedManifest {
@@ -519,7 +522,9 @@ async fn seed_import_applies_data_json_when_present() {
         .with(&seed::site_url("index.html"), b"<h1>shop</h1>")
         .with(&seed::data_url("data.json"), &data_bytes);
 
-    seed::import(&ctx, &manifest, &fetch).await.unwrap();
+    seed::import(&ctx, control.as_ref(), &manifest, &fetch)
+        .await
+        .unwrap();
 
     let products = db::list_all(&ctx, PRODUCTS_TABLE, Vec::new())
         .await
@@ -544,9 +549,10 @@ async fn seed_import_applies_data_json_when_present() {
 /// data-snapshot step.
 #[tokio::test]
 async fn seed_import_fails_when_data_json_does_not_verify() {
+    let control = FakeControl::new();
     let ctx = TestContext::with_products()
         .await
-        .with_dev_added(FakeControl::new())
+        .with_dev_added(control.clone())
         .await;
     let data_bytes = serde_json::to_vec(&mixed_snapshot()).unwrap();
     let mut declared = data_file("data.json", &data_bytes);
@@ -562,7 +568,7 @@ async fn seed_import_fails_when_data_json_does_not_verify() {
         .with(&seed::site_url("index.html"), b"<h1>shop</h1>")
         .with(&seed::data_url("data.json"), &data_bytes);
 
-    let err = seed::import(&ctx, &manifest, &fetch)
+    let err = seed::import(&ctx, control.as_ref(), &manifest, &fetch)
         .await
         .expect_err("a hash mismatch on data.json must fail the whole seed import");
     assert!(

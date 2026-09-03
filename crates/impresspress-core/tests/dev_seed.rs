@@ -10,7 +10,7 @@
 //! `tests/dev_data_snapshot.rs`.
 #![cfg(feature = "block-dev")]
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use impresspress_core::{
     blocks::dev::{
@@ -25,6 +25,7 @@ use impresspress_core::{
     test_support::TestContext,
 };
 use wafer_block::{Allowlist, BlockCapabilities};
+use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -46,6 +47,43 @@ fn hello_spec() -> DynamicBlockSpec {
         capabilities: wafer_block::BlockCapabilities::none(),
         wafer_guest_version: 0,
     }
+}
+
+/// The `BlockInfo` the seeded `hello` artifact reports through
+/// [`FakeControl::inspect`].
+///
+/// A seed import now runs the four rules that read the guest's own report
+/// (name, endpoints inside the route prefix, agent tool names, capabilities
+/// against `requires`), so a fixture whose control reported nothing useful
+/// would refuse every bundle below for a reason none of them is about. The
+/// declared spec has to be exactly what those rules produce from this, which
+/// is why the endpoint is under `/b/hello/` and the name is `site/hello`.
+fn hello_info() -> BlockInfo {
+    BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "hello").endpoints(vec![
+        BlockEndpoint::get("/b/hello/")
+            .auth(AuthLevel::Public)
+            .summary("hello"),
+    ])
+}
+
+/// A control whose `inspect` reports [`hello_info`] — the guest the bundle
+/// fixture below describes.
+fn hello_control() -> Arc<FakeControl> {
+    let control = FakeControl::new();
+    control.set_validated_info(hello_info());
+    control
+}
+
+/// The standard fixture: a dev context and the control it was built over.
+///
+/// Both halves are needed because `seed::import` takes the control
+/// explicitly — it is the runtime seam, and the context has no way to hand
+/// one back. Binding them here keeps a test from importing through a control
+/// that is not the one the block would rebuild through.
+async fn fixture() -> (TestContext, Arc<FakeControl>) {
+    let control = hello_control();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    (ctx, control)
 }
 
 /// A two-file site plus one block with one source file.
@@ -76,9 +114,9 @@ fn bundle() -> MapFetch {
 
 #[tokio::test]
 async fn a_seed_bundle_becomes_the_workspace_and_generation_zero() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
 
-    let generation = seed::import(&ctx, &manifest(), &bundle())
+    let generation = seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
         .await
         .expect("import")
         .expect("a fresh instance imports");
@@ -155,11 +193,10 @@ async fn a_seed_bundle_becomes_the_workspace_and_generation_zero() {
 /// the ordinary queue as generation 0, publishing the site.
 #[tokio::test]
 async fn the_imported_generation_activates_as_generation_zero() {
-    let control = FakeControl::new();
-    let ctx = TestContext::with_dev(control.clone()).await;
+    let (ctx, control) = fixture().await;
     let shared = ctx.dev_shared();
 
-    let generation = seed::import(&ctx, &manifest(), &bundle())
+    let generation = seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
         .await
         .expect("import")
         .expect("fresh");
@@ -194,7 +231,7 @@ async fn the_imported_generation_activates_as_generation_zero() {
 
     // And the instance is no longer fresh, so a re-import is a no-op.
     assert!(!seed::is_fresh(&ctx).await.expect("is_fresh"));
-    assert!(seed::import(&ctx, &manifest(), &bundle())
+    assert!(seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
         .await
         .expect("second import")
         .is_none());
@@ -209,8 +246,8 @@ async fn the_imported_generation_activates_as_generation_zero() {
 /// an error, because this runs on every boot.
 #[tokio::test]
 async fn a_second_import_on_a_non_fresh_instance_is_a_no_op() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
-    seed::import(&ctx, &manifest(), &bundle())
+    let (ctx, control) = fixture().await;
+    seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
         .await
         .expect("first import")
         .expect("fresh");
@@ -225,7 +262,7 @@ async fn a_second_import_on_a_non_fresh_instance_is_a_no_op() {
     .await
     .expect("publish");
 
-    assert!(seed::import(&ctx, &manifest(), &bundle())
+    assert!(seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
         .await
         .expect("second import")
         .is_none());
@@ -236,7 +273,7 @@ async fn a_second_import_on_a_non_fresh_instance_is_a_no_op() {
 /// first publish failed would delete whatever the user wrote next.
 #[tokio::test]
 async fn a_failed_generation_still_makes_an_instance_non_fresh() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     repo::generations::insert(
         &ctx,
         &repo::generations::NewGeneration {
@@ -260,7 +297,7 @@ async fn a_failed_generation_still_makes_an_instance_non_fresh() {
         "nothing is active — freshness must not rest on that alone"
     );
     assert!(!seed::is_fresh(&ctx).await.expect("is_fresh"));
-    assert!(seed::import(&ctx, &manifest(), &bundle())
+    assert!(seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
         .await
         .expect("import")
         .is_none());
@@ -272,10 +309,10 @@ async fn a_failed_generation_still_makes_an_instance_non_fresh() {
 
 #[tokio::test]
 async fn content_that_does_not_match_its_declared_hash_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let tampered = bundle().with(&seed::site_url("assets/app.js"), b"alert('gotcha')");
 
-    let error = seed::import(&ctx, &manifest(), &tampered)
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &tampered)
         .await
         .expect_err("a hash mismatch must refuse the import");
     assert!(
@@ -294,10 +331,10 @@ async fn content_that_does_not_match_its_declared_hash_is_refused() {
 
 #[tokio::test]
 async fn an_artifact_that_does_not_match_its_declared_hash_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let tampered = bundle().with(&seed::artifact_url("hello"), b"\0asm\x01\0\0\0different");
 
-    let error = seed::import(&ctx, &manifest(), &tampered)
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &tampered)
         .await
         .expect_err("a hash mismatch must refuse the import");
     assert!(
@@ -311,13 +348,13 @@ async fn an_artifact_that_does_not_match_its_declared_hash_is_refused() {
 /// than one that arrived over `POST /b/dev/api/builds/stage`.
 #[tokio::test]
 async fn an_oversized_artifact_is_refused_and_never_stored() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let huge = vec![0u8; validation::MAX_ARTIFACT_BYTES + 1];
     let mut manifest = manifest();
     manifest.blocks[0].spec.artifact_sha256 = blobs::sha256_hex(&huge);
     let bundle = bundle().with(&seed::artifact_url("hello"), &huge);
 
-    let error = seed::import(&ctx, &manifest, &bundle)
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle)
         .await
         .expect_err("an oversized artifact must refuse the import");
     assert!(
@@ -338,11 +375,11 @@ async fn an_oversized_artifact_is_refused_and_never_stored() {
 
 #[tokio::test]
 async fn a_size_that_does_not_match_the_content_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.site[0].size += 1;
 
-    let error = seed::import(&ctx, &manifest, &bundle())
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle())
         .await
         .expect_err("a size mismatch must refuse the import");
     assert!(
@@ -356,11 +393,11 @@ async fn a_size_that_does_not_match_the_content_is_refused() {
 /// how the file is served.
 #[tokio::test]
 async fn a_content_type_that_is_not_what_the_path_is_served_as_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.site[0].content_type = "text/plain".to_string();
 
-    let error = seed::import(&ctx, &manifest, &bundle())
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle())
         .await
         .expect_err("a content-type mismatch must refuse the import");
     assert!(error.contains("content type"), "{error}");
@@ -371,12 +408,12 @@ async fn a_content_type_that_is_not_what_the_path_is_served_as_is_refused() {
 /// here carries the file, so the only thing that can refuse it is the rule.
 #[tokio::test]
 async fn a_path_that_escapes_the_workspace_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.site[0].path = "../../elsewhere.html".to_string();
     let bundle = bundle().with(&seed::site_url("../../elsewhere.html"), INDEX);
 
-    let error = seed::import(&ctx, &manifest, &bundle)
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle)
         .await
         .expect_err("a traversing path must refuse the import");
     assert!(
@@ -387,22 +424,53 @@ async fn a_path_that_escapes_the_workspace_is_refused() {
 
 #[tokio::test]
 async fn a_file_the_bundle_does_not_carry_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
-    let incomplete = MapFetch::default().with(&seed::site_url("index.html"), INDEX);
+    let (ctx, control) = fixture().await;
+    // Everything the manifest names except one site file. Built up rather
+    // than derived from `bundle()` because the point is precisely which entry
+    // is missing: the artifacts are fetched and inspected before any site
+    // file is stored, so a bundle missing the artifact would be refused for
+    // the artifact and this test would no longer be about a site file at all.
+    let incomplete = MapFetch::default()
+        .with(&seed::site_url("index.html"), INDEX)
+        .with(&seed::artifact_url("hello"), ARTIFACT)
+        .with(&seed::source_url("hello", "src/lib.rs"), LIB_RS);
 
-    let error = seed::import(&ctx, &manifest(), &incomplete)
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &incomplete)
         .await
         .expect_err("a missing file must refuse the import");
     assert!(error.contains("assets/app.js"), "{error}");
 }
 
+/// The other half of the same rule, now that the artifact is fetched first: a
+/// bundle whose manifest names a block but does not carry its module is
+/// refused for the module, by name.
+#[tokio::test]
+async fn a_block_artifact_the_bundle_does_not_carry_is_refused() {
+    let (ctx, control) = fixture().await;
+    let incomplete = MapFetch::default()
+        .with(&seed::site_url("index.html"), INDEX)
+        .with(&seed::site_url("assets/app.js"), APP_JS);
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &incomplete)
+        .await
+        .expect_err("a missing artifact must refuse the import");
+    assert!(error.contains("/seed/blocks/hello.wasm"), "{error}");
+    // And nothing was stored: the artifacts are fetched before the first
+    // site file lands in the workspace.
+    assert!(workspace::load(&ctx)
+        .await
+        .expect("workspace")
+        .files
+        .is_empty());
+}
+
 #[tokio::test]
 async fn a_bundle_from_another_schema_version_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.schema_version = seed::SCHEMA_VERSION + 1;
 
-    let error = seed::import(&ctx, &manifest, &bundle())
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle())
         .await
         .expect_err("an unknown schema version must refuse the import");
     assert!(error.contains("schema_version"), "{error}");
@@ -414,14 +482,14 @@ async fn a_bundle_from_another_schema_version_is_refused() {
 /// is the name rule.
 #[tokio::test]
 async fn a_block_name_that_cannot_be_registered_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.blocks[0].spec.name = "site/my_shop".to_string();
     let bundle = bundle()
         .with(&seed::artifact_url("my_shop"), ARTIFACT)
         .with(&seed::source_url("my_shop", "src/lib.rs"), LIB_RS);
 
-    let error = seed::import(&ctx, &manifest, &bundle)
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle)
         .await
         .expect_err("an unregisterable block name must refuse the import");
     assert!(
@@ -473,11 +541,11 @@ async fn a_seeded_block_reaching_outside_its_namespace_is_refused() {
             "cap-network",
         ),
     ] {
-        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let (ctx, control) = fixture().await;
         let mut manifest = manifest();
         manifest.blocks[0].spec.capabilities = capabilities;
 
-        let Err(error) = seed::import(&ctx, &manifest, &bundle()).await else {
+        let Err(error) = seed::import(&ctx, control.as_ref(), &manifest, &bundle()).await else {
             panic!("{label} must refuse the import");
         };
         assert!(error.contains("site/hello"), "{label}: {error}");
@@ -500,14 +568,14 @@ async fn a_seeded_block_reaching_outside_its_namespace_is_refused() {
 /// name does not produce, and two seeded blocks may not claim one prefix.
 #[tokio::test]
 async fn a_seeded_block_claiming_someone_elses_route_is_refused() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.blocks[0].spec.routes = vec![DynamicRoute {
         prefix: "/admin/".to_string(),
         access: RouteAccessKind::Public,
     }];
 
-    let error = seed::import(&ctx, &manifest, &bundle())
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle())
         .await
         .expect_err("a route claim outside the block's own prefix must refuse the import");
     assert!(error.contains("route-prefix"), "{error}");
@@ -517,12 +585,12 @@ async fn a_seeded_block_claiming_someone_elses_route_is_refused() {
 /// same rule the files API follows, and the one the workspace quota rests on.
 #[tokio::test]
 async fn identical_content_at_two_paths_is_stored_once() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let (ctx, control) = fixture().await;
     let mut manifest = manifest();
     manifest.site.push(file("copy.html", INDEX));
     let bundle = bundle().with(&seed::site_url("copy.html"), INDEX);
 
-    seed::import(&ctx, &manifest, &bundle)
+    seed::import(&ctx, control.as_ref(), &manifest, &bundle)
         .await
         .expect("import")
         .expect("fresh");
@@ -550,4 +618,123 @@ fn the_bundle_layout_is_stated_once() {
     );
     assert_eq!(seed::short_name("site/hello"), "hello");
     assert_eq!(seed::short_name("hello"), "hello");
+}
+
+// ---------------------------------------------------------------------------
+// The rules that need the guest's own report
+// ---------------------------------------------------------------------------
+
+/// A seeded artifact is INSPECTED, and the four rules that read the guest's
+/// own `BlockInfo` are applied to what it reports.
+///
+/// The bundle here is otherwise perfect — the manifest declares `site/hello`,
+/// the artifact hashes as declared, every file is carried — and the only
+/// thing wrong is that the module calls itself something else. Nothing in
+/// `validate_spec` can see that: the declared spec is self-consistent, and
+/// the mismatch exists only between the manifest and the module. Before the
+/// importer had a `RuntimeControl` this bundle imported cleanly and the
+/// runtime then registered a guest under a name it does not answer to.
+#[tokio::test]
+async fn a_seeded_block_whose_module_reports_another_name_is_refused() {
+    let control = FakeControl::new();
+    control.set_validated_info(BlockInfo::new(
+        "site/imposter",
+        "0.1.0",
+        "http-handler@v1",
+        "not hello",
+    ));
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
+        .await
+        .expect_err("a guest that reports another name must refuse the import");
+    assert!(error.contains("name-mismatch"), "{error}");
+    assert!(error.contains("site/imposter"), "{error}");
+    // Refused before anything was stored: the artifacts are fetched and
+    // inspected ahead of the first workspace write.
+    assert!(workspace::load(&ctx)
+        .await
+        .expect("workspace")
+        .files
+        .is_empty());
+    assert!(!artifacts::exists(&ctx, &blobs::sha256_hex(ARTIFACT))
+        .await
+        .expect("exists"));
+}
+
+/// The endpoint rule, from the same report: a guest may only declare
+/// endpoints under the one prefix its name produces.
+#[tokio::test]
+async fn a_seeded_block_declaring_an_endpoint_outside_its_prefix_is_refused() {
+    let control = FakeControl::new();
+    control.set_validated_info(
+        BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "hello").endpoints(vec![
+            BlockEndpoint::get("/b/admin/api/users")
+                .auth(AuthLevel::Public)
+                .summary("not mine"),
+        ]),
+    );
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
+        .await
+        .expect_err("an endpoint outside the block's prefix must refuse the import");
+    assert!(error.contains("endpoint-outside-routes"), "{error}");
+}
+
+/// The manifest is a description of its own artifact, not a second, separate
+/// grant. A bundle whose spec asks for capabilities the module does not
+/// declare is refused even though BOTH halves would pass their own rules in
+/// isolation — `collections: Only(["site__hello__notes"])` is inside the
+/// block's own namespace, so `validate_spec` accepts it; the module simply
+/// never asked for it.
+#[tokio::test]
+async fn a_seeded_spec_that_grants_more_than_the_module_asks_for_is_refused() {
+    let (ctx, control) = fixture().await;
+    let mut manifest = manifest();
+    manifest.blocks[0].spec.capabilities = BlockCapabilities {
+        collections: Allowlist::Only(BTreeSet::from(["site__hello__notes".to_string()])),
+        ..BlockCapabilities::none()
+    };
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle())
+        .await
+        .expect_err("a spec the module does not report must refuse the import");
+    assert!(
+        error.contains("does not report") && error.contains("site/hello"),
+        "{error}"
+    );
+    assert!(error.contains("site__hello__notes"), "{error}");
+}
+
+/// The seeded build row records the guest's own `BlockInfo`, exactly as
+/// `blocks_api::stage` does.
+///
+/// Not bookkeeping: `blocks_api::claimed_tool_names` reads the stored
+/// `BlockInfo` of every block in the active generation and refuses the whole
+/// stage when one cannot be read. A `"null"` here — which is what a seed
+/// wrote before the importer had a control — meant a seeded instance could
+/// never compile a block of its own. `tests/dev_blocks.rs` drives that end to
+/// end; this pins the row the rule reads.
+#[tokio::test]
+async fn a_seeded_build_row_records_the_block_info_the_guest_reported() {
+    let (ctx, control) = fixture().await;
+
+    seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
+        .await
+        .expect("import")
+        .expect("fresh");
+
+    let build = repo::builds::latest_valid_for_artifact(&ctx, &blobs::sha256_hex(ARTIFACT))
+        .await
+        .expect("lookup")
+        .expect("row");
+    let stored: BlockInfo =
+        serde_json::from_str(&build.block_info_json).expect("the row carries a readable BlockInfo");
+    assert_eq!(stored.name, "site/hello");
+    assert_eq!(stored.endpoints.len(), 1);
+    assert_eq!(stored.endpoints[0].path, "/b/hello/");
+    // And it was read out of the module rather than invented: the fixture's
+    // control was asked once per seeded block.
+    assert_eq!(control.inspections(), 1);
 }

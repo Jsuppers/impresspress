@@ -28,27 +28,46 @@
 //! produce: a manifest naming `site/../../elsewhere`, or claiming a hash it
 //! does not have, is refused with a message that names the path.
 //!
-//! Every seeded block's **spec** is re-checked against the rules that do not
-//! need a runtime — [`validation::validate_spec`]: its name, its route prefix
-//! against the built-ins and against the rest of the bundle, and every §6.5
-//! capability rule. A seed is loaded with exactly the capabilities its
-//! manifest declares, so without this a bundle asking for `raw_sql` or a
-//! collection outside its own namespace would be granted it verbatim, and
-//! §10.1 makes exports deliberately re-importable by someone who did not
-//! write them.
+//! Every seeded block is checked TWICE, by the same two entry points the
+//! staging path uses, and in the same order:
 //!
-//! # What is *not* verified
+//! 1. [`validation::validate_spec`] over the manifest's declared spec, before
+//!    a single byte is fetched — its name, its route prefix against the
+//!    built-ins and against the rest of the bundle, and every §6.5 capability
+//!    rule. A seed is loaded with exactly the capabilities its manifest
+//!    declares, so without this a bundle asking for `raw_sql` or a collection
+//!    outside its own namespace would be granted it verbatim, and §10.1 makes
+//!    exports deliberately re-importable by someone who did not write them.
+//! 2. [`super::control::RuntimeControl::inspect`] over the fetched artifact,
+//!    then [`validation::validate_static`] over the `BlockInfo` the guest
+//!    itself reports — the four rules that need that report and that step 1
+//!    structurally cannot apply: that the guest calls itself `site/<name>`,
+//!    that its endpoints fall inside its own route prefix, that its agent
+//!    tool names collide with nothing else in the bundle or in the runtime,
+//!    and that `callable_blocks` matches `requires`. The accepted spec that
+//!    produces must then EQUAL the one the manifest declared: a bundle whose
+//!    manifest grants a block authority the guest does not ask for is a
+//!    bundle whose manifest is not a description of its own artifact.
 //!
-//! The guests are not re-inspected or re-probed. A seeded block was validated
-//! when it was staged in the instance that exported it, and the importer has
-//! no [`super::control::RuntimeControl`] handle of its own; the activation the
-//! caller then requests still refuses a manifest whose artifact is not stored.
-//! So the rules that read the guest's own `BlockInfo` — that it calls itself
-//! `site/<name>`, that its endpoints fall inside its routes, that its agent
-//! tool names are unclaimed, and that `callable_blocks` equals `requires` —
-//! are not applied: nothing here can ask the guest what it reports. Running
-//! them means executing the artifact, which is [`super::control`]'s job and
-//! Plan 4's question.
+//! `inspect` runs the module under `BlockCapabilities::none()` and reads
+//! `__wafer_info` — no lifecycle event, no request — which is why running it
+//! on content the static host served is safe. That report is also what is
+//! recorded on the seeded build row, so the duplicate-tool-name rule can be
+//! applied to whatever is staged NEXT: without it a seeded block left the
+//! staging path with no readable `BlockInfo` for an active block, which
+//! `blocks_api::claimed_tool_names` refuses outright — a seeded instance
+//! could never compile a block of its own.
+//!
+//! # What is still *not* verified
+//!
+//! [`super::control::RuntimeControl::probe`] is not run: no `Init`, no
+//! `Start`, no request. Those execute guest code under the accepted
+//! capabilities, and a seed import happens during boot, before anything is
+//! serving — the activation the caller requests next rebuilds the runtime
+//! with the block in it, which is where the guest first runs. A seeded guest
+//! that traps in `Init` therefore fails the activation rather than the
+//! import, and the sandbox falls back exactly as it does for any failed
+//! activation.
 
 use serde::{Deserialize, Serialize};
 use wafer_run::context::Context;
@@ -56,7 +75,7 @@ use wafer_run::context::Context;
 use super::{
     artifacts, blobs,
     contracts::SiteManifest,
-    control::DynamicBlockSpec,
+    control::{DynamicBlockSpec, RuntimeControl},
     data_snapshot,
     generation::GenerationManifest,
     paths,
@@ -219,17 +238,26 @@ pub async fn is_fresh(ctx: &dyn Context) -> Result<bool, String> {
 /// was already imported. That is the ordinary case on every boot after the
 /// first, not an error.
 ///
-/// The order is: fetch and verify everything, write the blobs and artifacts,
-/// then save the workspace. A workspace saved before its blobs would name
-/// content that is not stored, and every later read of those paths would be a
-/// 500; in this order a failure part-way leaves stored bytes that no manifest
-/// names, which costs storage and nothing else.
+/// `control` is the runtime seam ([`RuntimeControl::inspect`]) — the boot
+/// caller has one (`impresspress-web`'s `install` builds the control before
+/// the first runtime), and the module docs above say why an importer that
+/// did not use it left four validation rules unapplied and every later
+/// staging attempt refused.
+///
+/// The order is: check every declared spec, fetch and inspect every artifact,
+/// check every guest report, then write the blobs and artifacts, then save
+/// the workspace. A workspace saved before its blobs would name content that
+/// is not stored, and every later read of those paths would be a 500; in this
+/// order a failure part-way leaves stored bytes that no manifest names, which
+/// costs storage and nothing else — and a bundle refused for what its guests
+/// report has stored nothing at all.
 ///
 /// The returned manifest is *staged* — it has no id and no parent. Minting
 /// those is [`super::activation::request`]'s job, exactly as for every other
 /// generation.
 pub async fn import(
     ctx: &dyn Context,
+    control: &dyn RuntimeControl,
     manifest: &SeedManifest,
     fetch: &dyn SeedFetch,
 ) -> Result<Option<GenerationManifest>, String> {
@@ -266,35 +294,22 @@ pub async fn import(
             .map(|(_, spec)| spec.clone())
             .collect();
         if let Err(found) = validation::validate_spec(spec, &builtin_routes, &others) {
-            return Err(format!(
-                "the seed bundle's block {:?} cannot be registered: {}",
-                spec.name,
-                found
-                    .iter()
-                    // A diagnostic with no code is a compiler's, and the
-                    // seed bundle's blocks are checked by the VALIDATOR,
-                    // whose diagnostics all carry one — so the bare-message
-                    // arm should never run here. It is written out rather
-                    // than unwrapped because a boot refusal that panicked
-                    // instead of naming the block would be the worst
-                    // possible failure of this function.
-                    .map(|d| match &d.code {
-                        Some(code) => format!("{} [{}]", d.message, code),
-                        None => d.message.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ));
+            return Err(refusal(&spec.name, &found));
         }
     }
 
-    let mut ws = Workspace::default();
-    for entry in &manifest.site {
-        let workspace_path = format!("{}{}", workspace::SITE_PREFIX, entry.path);
-        let bytes = fetch_verified(fetch, &site_url(&entry.path), entry, &workspace_path).await?;
-        store(ctx, &mut ws, &workspace_path, &bytes).await?;
-    }
-
+    // Every artifact, fetched and INSPECTED before anything is stored.
+    //
+    // Held in memory as a set rather than processed one block at a time,
+    // because the duplicate-agent-tool rule below is a statement about the
+    // whole bundle: block two's tool names have to be checked against block
+    // one's report, and block one's against block two's. The worst case is
+    // `MAX_BLOCKS` × `MAX_ARTIFACT_BYTES`, and a real bundle carries one or
+    // two blocks of a few hundred KiB — the alternative, fetching each
+    // artifact twice, would pay the network cost of the whole bundle again on
+    // the one boot that can least afford it.
+    let mut inspected: Vec<(&SeedBlock, Vec<u8>, wafer_block::BlockInfo)> =
+        Vec::with_capacity(manifest.blocks.len());
     for block in &manifest.blocks {
         let name = short_name(&block.spec.name);
         // The artifact is content-addressed by the spec itself, so the spec's
@@ -322,8 +337,80 @@ pub async fn import(
                 block.spec.name, block.spec.artifact_sha256
             ));
         }
-        artifacts::put(ctx, &bytes).await.map_err(|e| e.message)?;
-        record_seeded_build(ctx, &block.spec, bytes.len() as u64).await?;
+        // Under `BlockCapabilities::none()`, with no lifecycle event — the
+        // guest's own capability declaration is INSIDE the value this
+        // returns, so the deny-all set is what makes reading it safe. See
+        // `control::RuntimeControl::inspect`.
+        let info = control
+            .inspect(&bytes)
+            .await
+            .map_err(|failure| format!("{url}: {failure}"))?;
+        inspected.push((block, bytes, info));
+    }
+
+    // The four rules that need the guest's own report. `claimed` is every
+    // agent tool name already taken: by a built-in block of this runtime, and
+    // by every OTHER block the same bundle carries — the seeded set is
+    // admitted as one generation, so two of its blocks claiming one name is
+    // the same collision as a staged block colliding with an active one.
+    for (index, (block, _bytes, info)) in inspected.iter().enumerate() {
+        let name = short_name(&block.spec.name);
+        let others: Vec<DynamicBlockSpec> = specs
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, spec)| spec.clone())
+            .collect();
+        let mut claimed = validation::agent_tool_names(ctx.registered_blocks());
+        for (other, (_, _, other_info)) in inspected.iter().enumerate() {
+            if other != index {
+                claimed.extend(validation::agent_tool_names(std::slice::from_ref(
+                    other_info,
+                )));
+            }
+        }
+        let accepted = validation::validate_static(
+            name,
+            info,
+            &block.spec.artifact_sha256,
+            &builtin_routes,
+            &others,
+            &claimed,
+        )
+        .map_err(|found| refusal(&block.spec.name, &found))?;
+        // The accepted spec is what the RULES produced from the guest's own
+        // report; the manifest's is what the bundle asked for. They have to
+        // be the same value, or the manifest is granting authority its
+        // artifact never asked for — the one thing a re-importable export
+        // format makes trivially forgeable. `wafer_guest_version` is the sole
+        // exception: `BlockInfo` carries no such field (spec amendment 8), so
+        // `validate_static` leaves it `0` and the manifest is its only source.
+        let accepted = DynamicBlockSpec {
+            wafer_guest_version: block.spec.wafer_guest_version,
+            ..accepted
+        };
+        if accepted != block.spec {
+            return Err(format!(
+                "the seed bundle's block {:?} declares a spec the guest does not report: the \
+                 manifest says {}, the module says {}",
+                block.spec.name,
+                describe(&block.spec),
+                describe(&accepted),
+            ));
+        }
+    }
+
+    let mut ws = Workspace::default();
+    for entry in &manifest.site {
+        let workspace_path = format!("{}{}", workspace::SITE_PREFIX, entry.path);
+        let bytes = fetch_verified(fetch, &site_url(&entry.path), entry, &workspace_path).await?;
+        store(ctx, &mut ws, &workspace_path, &bytes).await?;
+    }
+
+    for (block, bytes, info) in &inspected {
+        let name = short_name(&block.spec.name);
+        artifacts::put(ctx, bytes).await.map_err(|e| e.message)?;
+        record_seeded_build(ctx, &block.spec, bytes.len() as u64, info).await?;
 
         for entry in &block.sources {
             let workspace_path = format!("{}{name}/{}", workspace::BLOCKS_PREFIX, entry.path);
@@ -430,6 +517,47 @@ async fn fetch_verified(
     fetch_and_verify(fetch, url, declared, served).await
 }
 
+/// One block's refusal, with every diagnostic's message and code.
+///
+/// Shared by both validation passes so a boot refusal reads the same whether
+/// it came from the declared spec or from the guest's own report.
+fn refusal(name: &str, found: &[validation::Diagnostic]) -> String {
+    format!(
+        "the seed bundle's block {name:?} cannot be registered: {}",
+        found
+            .iter()
+            // A diagnostic with no code is a compiler's, and the seed
+            // bundle's blocks are checked by the VALIDATOR, whose
+            // diagnostics all carry one — so the bare-message arm should
+            // never run here. It is written out rather than unwrapped
+            // because a boot refusal that panicked instead of naming the
+            // block would be the worst possible failure of this function.
+            .map(|d| match &d.code {
+                Some(code) => format!("{} [{}]", d.message, code),
+                None => d.message.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// One spec as a line a human can compare against another.
+///
+/// Only the fields the accepted-equals-declared check can disagree on —
+/// `name` and `artifact_sha256` are already pinned by the checks above, so
+/// printing them again would bury the difference. `BlockCapabilities` derives
+/// `Debug` and nothing that renders more usefully.
+fn describe(spec: &DynamicBlockSpec) -> String {
+    format!(
+        "routes {:?}, capabilities {:?}",
+        spec.routes
+            .iter()
+            .map(|route| format!("{} ({})", route.prefix, route.access.as_str()))
+            .collect::<Vec<_>>(),
+        spec.capabilities,
+    )
+}
+
 /// Record a seeded artifact in the builds table.
 ///
 /// A seed drops compiled artifacts straight into the store, which would
@@ -444,21 +572,33 @@ async fn fetch_verified(
 /// never the thing keeping it reachable and must not be left `Staged`, which
 /// is the collector's "a compile is still coming" marker.
 ///
-/// `block_info_json` stays `"null"`: a bundle carries the registered spec, not
-/// the `BlockInfo` the guest reports, and inventing one would put endpoints
-/// into the duplicate-agent-tool check that no guest declared.
+/// `block_info_json` is the report [`RuntimeControl::inspect`] just read out
+/// of the artifact — the same value `blocks_api::stage` records, obtained the
+/// same way. It is not decoration: `blocks_api::claimed_tool_names` reads the
+/// stored `BlockInfo` of every block in the active generation to apply the
+/// duplicate-agent-tool rule, and refuses the whole stage when one cannot be
+/// read. A `"null"` here (which is what this wrote before the importer had a
+/// control) therefore meant a seeded instance could never compile a block of
+/// its own — the first `dev_compile_block` came back `build-row-missing`.
 async fn record_seeded_build(
     ctx: &dyn Context,
     spec: &DynamicBlockSpec,
     artifact_bytes: u64,
+    info: &wafer_block::BlockInfo,
 ) -> Result<(), String> {
+    let block_info_json = serde_json::to_string(info).map_err(|e| {
+        format!(
+            "the seeded block {:?}'s BlockInfo did not encode: {e}",
+            spec.name
+        )
+    })?;
     let row = repo::builds::insert(
         ctx,
         &repo::builds::NewBuild {
             block_name: spec.name.clone(),
             source_manifest_sha256: String::new(),
             artifact_sha256: spec.artifact_sha256.clone(),
-            block_info_json: "null".to_string(),
+            block_info_json,
             diagnostics_json: "[]".to_string(),
             compiler_version: SEEDED_COMPILER_VERSION.to_string(),
             artifact_bytes,

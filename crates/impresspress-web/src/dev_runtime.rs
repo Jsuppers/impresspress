@@ -839,7 +839,12 @@ async fn seed_on_boot(ctx: &dyn Context, shared: &Arc<DevShared>) -> Result<(), 
             return Ok(());
         }
     };
-    let Some(generation) = seed::import(ctx, &manifest, &fetch).await? else {
+    // `shared.control` is the same `BrowserRuntimeControl` every later
+    // activation rebuilds through: the importer uses it to `inspect` each
+    // seeded artifact under deny-all capabilities and run the four validation
+    // rules that need the guest's own `BlockInfo` (see `seed`'s module docs).
+    let Some(generation) = seed::import(ctx, shared.control.as_ref(), &manifest, &fetch).await?
+    else {
         return Ok(());
     };
     let outcome = activation::request(

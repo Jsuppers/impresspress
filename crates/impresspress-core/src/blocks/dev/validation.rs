@@ -305,6 +305,23 @@ pub fn builtin_route_prefixes() -> Vec<&'static str> {
         .collect()
 }
 
+/// Every agent tool name the given blocks' endpoints declare.
+///
+/// The one place a `BlockInfo` is turned into the set
+/// [`validate_static`]'s duplicate rule reads. Both callers of that rule
+/// build the set from a mixture of sources — the staging path from the
+/// runtime's registered blocks plus each active dynamic block's *stored*
+/// `BlockInfo`, the seed importer from the registered blocks plus the other
+/// blocks the same bundle carries — and a name that only one of them knew
+/// how to extract would leave the rule half-applied on the other path.
+pub fn agent_tool_names(infos: &[BlockInfo]) -> BTreeSet<String> {
+    infos
+        .iter()
+        .flat_map(|info| info.endpoints.iter())
+        .filter_map(|endpoint| endpoint.agent_tool.as_ref().map(|tool| tool.name.clone()))
+        .collect()
+}
+
 /// Whether `prefix` is a normalized route prefix: absolute, `/`-terminated,
 /// and free of segments that would make prefix matching a statement about
 /// something other than whole path segments.
