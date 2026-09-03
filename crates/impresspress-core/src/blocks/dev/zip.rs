@@ -46,15 +46,26 @@ const EOCD_SIG: u32 = 0x0605_4b50;
 /// Fixed size of a local file header, before the file name.
 const LOCAL_HEADER_FIXED_LEN: usize = 30;
 
+/// Fixed size of a central directory record, before the file name.
+const CENTRAL_HEADER_FIXED_LEN: usize = 46;
+
+/// Size of the end-of-central-directory record (no archive comment).
+const EOCD_LEN: usize = 22;
+
 /// Ceiling every offset/size field in the classic (non-ZIP64) format can
 /// hold.
 const MAX_ARCHIVE_BYTES: usize = u32::MAX as usize;
 
+/// Ceiling on entry count: both the central directory's own header and the
+/// end-of-central-directory record count entries in a `u16` field.
+const MAX_ENTRIES: usize = u16::MAX as usize;
+
 /// Failure adding one entry to a [`ZipWriter`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ZipError {
-    /// `path` is absolute, uses `\`, or is otherwise not the archive-relative,
-    /// forward-slash form every entry must use.
+    /// `path` is absolute, uses `\`, has an empty/`.`/`..` segment, or is
+    /// otherwise not the archive-relative, forward-slash form every entry
+    /// must use.
     #[error(
         "{0:?} is not a valid zip entry path — it must be relative and forward-slash-separated"
     )]
@@ -67,9 +78,16 @@ pub enum ZipError {
     #[error("{0:?} is longer than the 65535-byte zip entry name limit")]
     PathTooLong(String),
     /// Adding this entry would carry the archive past the 4 GiB ceiling the
-    /// classic (non-ZIP64) format's `u32` offset/size fields impose.
+    /// classic (non-ZIP64) format's `u32` offset/size fields impose — either
+    /// the entry data itself, or the central directory record `finish` will
+    /// eventually have to write for it.
     #[error("archive would exceed the 4 GiB limit this stored-entry writer supports (no ZIP64)")]
     TooLarge,
+    /// This archive already holds [`MAX_ENTRIES`] entries — one more would
+    /// overflow the central directory's 16-bit entry-count fields, wrapping
+    /// silently into a corrupt (undercounted) archive instead of refusing.
+    #[error("archive already holds the maximum {MAX_ENTRIES} entries this format's 16-bit count fields support")]
+    TooManyEntries,
 }
 
 /// What [`ZipWriter::finish`] needs to remember about one entry to write its
@@ -93,6 +111,13 @@ pub struct ZipWriter {
     /// check is O(1) rather than an O(n) scan of `entries` per call — an
     /// export bundle can carry thousands of source files.
     names: HashSet<String>,
+    /// Running total of every added entry's own central directory record
+    /// size (`CENTRAL_HEADER_FIXED_LEN + name.len()`). Kept incrementally so
+    /// `add` can refuse an entry that would carry `finish`'s eventual output
+    /// — data already written, plus the central directory, plus the EOCD —
+    /// past the 4 GiB ceiling, without `finish` itself needing to be
+    /// fallible.
+    central_dir_bytes: usize,
 }
 
 impl Default for ZipWriter {
@@ -108,19 +133,22 @@ impl ZipWriter {
             buf: Vec::new(),
             entries: Vec::new(),
             names: HashSet::new(),
+            central_dir_bytes: 0,
         }
     }
 
-    /// Add one stored entry. `path` must be relative (no leading `/`),
-    /// forward-slash-separated (no `\`), unique within this archive, and at
-    /// most 65535 UTF-8 bytes long.
+    /// Add one stored entry. `path` must be relative (no leading `/`, no `.`
+    /// or `..` segment, no empty segment — i.e.
+    /// [`wafer_block::wrap::is_traversal_safe_path`]), forward-slash-separated
+    /// (no `\`), unique within this archive, and at most 65535 UTF-8 bytes
+    /// long.
     ///
     /// Every check runs, and every fallible size cast happens, before
     /// anything is written or recorded — a rejected `add` leaves the writer
     /// exactly as it was, so a caller that wraps this in its own retry logic
     /// never has to reason about a half-applied entry.
     pub fn add(&mut self, path: &str, bytes: &[u8]) -> Result<(), ZipError> {
-        if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        if path.contains('\\') || !wafer_block::wrap::is_traversal_safe_path(path) {
             return Err(ZipError::BadPath(path.to_string()));
         }
         if path.len() > u16::MAX as usize {
@@ -129,10 +157,31 @@ impl ZipWriter {
         if self.names.contains(path) {
             return Err(ZipError::Duplicate(path.to_string()));
         }
+        // Checked before the size math below: a 65536th entry would wrap
+        // silently when `finish` casts `entries.len()` to `u16`, producing a
+        // corrupt archive that *looks* like it has fewer entries than it
+        // does rather than failing loudly.
+        if self.entries.len() >= MAX_ENTRIES {
+            return Err(ZipError::TooManyEntries);
+        }
+
         let offset = u32::try_from(self.buf.len()).map_err(|_| ZipError::TooLarge)?;
         let size = u32::try_from(bytes.len()).map_err(|_| ZipError::TooLarge)?;
         let grows_by = LOCAL_HEADER_FIXED_LEN + path.len() + bytes.len();
-        if self.buf.len().saturating_add(grows_by) > MAX_ARCHIVE_BYTES {
+        let central_entry_len = CENTRAL_HEADER_FIXED_LEN + path.len();
+        // The full projected size of `finish`'s eventual output: this
+        // entry's local header + data, every central directory record
+        // (already-written ones plus this one), and the EOCD — not just the
+        // data written so far. `finish` itself cannot fail, so every byte it
+        // will ever write has to be accounted for here.
+        let projected_total = self
+            .buf
+            .len()
+            .saturating_add(grows_by)
+            .saturating_add(self.central_dir_bytes)
+            .saturating_add(central_entry_len)
+            .saturating_add(EOCD_LEN);
+        if projected_total > MAX_ARCHIVE_BYTES {
             return Err(ZipError::TooLarge);
         }
 
@@ -141,6 +190,7 @@ impl ZipWriter {
         self.buf.extend_from_slice(bytes);
 
         self.names.insert(path.to_string());
+        self.central_dir_bytes += central_entry_len;
         self.entries.push(CentralEntry {
             name: path.to_string(),
             crc32,
@@ -248,5 +298,32 @@ mod tests {
         assert!(matches!(w.add("a", b"2"), Err(ZipError::Duplicate(_))));
         assert!(matches!(w.add("/a", b"2"), Err(ZipError::BadPath(_))));
         assert!(matches!(w.add("a\\b", b"2"), Err(ZipError::BadPath(_))));
+    }
+
+    #[test]
+    fn traversal_and_empty_segments_are_rejected() {
+        let mut w = ZipWriter::new();
+        assert!(matches!(w.add("", b"1"), Err(ZipError::BadPath(_))));
+        assert!(matches!(w.add("a/../b", b"1"), Err(ZipError::BadPath(_))));
+        assert!(matches!(w.add("./a", b"1"), Err(ZipError::BadPath(_))));
+        assert!(matches!(w.add("a//b", b"1"), Err(ZipError::BadPath(_))));
+        assert!(matches!(w.add("a/", b"1"), Err(ZipError::BadPath(_))));
+    }
+
+    /// 65535 tiny entries is fine; a 65536th is refused rather than wrapping
+    /// the central directory's `u16` entry-count field into a silently
+    /// undercounted (corrupt) archive. Real entries, not a shrunk limit —
+    /// 65535 one-byte-named, zero-byte entries is well under a second.
+    #[test]
+    fn refuses_more_than_max_entries() {
+        let mut w = ZipWriter::new();
+        for i in 0..MAX_ENTRIES {
+            w.add(&format!("f{i}"), b"")
+                .unwrap_or_else(|e| panic!("entry {i}: {e}"));
+        }
+        assert!(matches!(
+            w.add("one-too-many", b""),
+            Err(ZipError::TooManyEntries)
+        ));
     }
 }

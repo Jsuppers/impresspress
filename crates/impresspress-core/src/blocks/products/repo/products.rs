@@ -27,13 +27,6 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 
 pub(crate) const TABLE: &str = "impresspress__products__products";
 
-/// [`TABLE`], under a name this module's own door tests
-/// (`tests/repo_door_test.rs`) do not treat as the old, broadly-visible
-/// constant they exist to keep gone — see [`upsert_from_snapshot`] for why a
-/// caller ever needs the name at all without also getting a query built on
-/// it.
-pub(crate) const COLLECTION_NAME: &str = TABLE;
-
 // Column invariant — `deleted_at` holds exactly two kinds of value:
 //
 //   * SQL NULL         — the product is live;

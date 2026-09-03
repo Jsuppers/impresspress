@@ -122,14 +122,15 @@ pub struct SeedManifest {
     pub site: Vec<SeedFile>,
     /// Blocks the seeded generation runs.
     pub blocks: Vec<SeedBlock>,
-    /// The data snapshot's path within the bundle (design §10.1, amendment
-    /// 9: `seed/data.json`), or `None` when the bundle carries no rows.
+    /// The data snapshot file (design §10.1, amendment 9: `seed/data.json`),
+    /// or `None` when the bundle carries no rows.
     ///
-    /// A bundle-relative path, not a full [`SeedFetch`] URL — [`import`]
-    /// fetches it the same way every other bundle path becomes a URL,
-    /// prefixed with `/` (matching [`ROOT`], which already carries the
-    /// leading slash and the `seed/` this path itself starts with).
-    pub data: Option<String>,
+    /// A [`SeedFile`] like every other referenced file — `path` relative to
+    /// [`ROOT`] (`"data.json"`, giving the URL [`data_url`] builds) — not a
+    /// bare path string, so [`import`] verifies its hash, size and content
+    /// type exactly as it does for every `site`/block-source entry (design
+    /// §10.2) instead of trusting this one file unchecked.
+    pub data: Option<SeedFile>,
 }
 
 /// A future produced by [`SeedFetch::get`].
@@ -175,6 +176,11 @@ pub fn artifact_url(name: &str) -> String {
 /// URL of one file of a block's crate sources.
 pub fn source_url(name: &str, path: &str) -> String {
     format!("{ROOT}blocks/{name}/{path}")
+}
+
+/// URL of the data snapshot file.
+pub fn data_url(path: &str) -> String {
+    format!("{ROOT}{path}")
 }
 
 /// The short workspace name of a registered block (`site/hello` → `hello`).
@@ -336,10 +342,13 @@ pub async fn import(
     // The data snapshot, if the bundle carries one — after every file and
     // block artifact is stored (so a snapshot referencing this generation's
     // own content lands on a workspace that already has it), before the
-    // staged manifest is handed back for activation.
-    if let Some(data_path) = &manifest.data {
-        let url = format!("/{data_path}");
-        let bytes = fetch.get(&url).await?;
+    // staged manifest is handed back for activation. Verified the same way
+    // as every other referenced file (design §10.2) — hash, size and
+    // content type — via `fetch_and_verify`, not trusted unchecked the way
+    // a bare `Option<String>` path could only ever be.
+    if let Some(declared) = &manifest.data {
+        let url = data_url(&declared.path);
+        let bytes = fetch_and_verify(fetch, &url, declared, "application/json").await?;
         let snapshot: data_snapshot::DataSnapshot = serde_json::from_slice(&bytes)
             .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?;
         data_snapshot::import(ctx, &snapshot)
@@ -355,25 +364,23 @@ pub async fn import(
     )))
 }
 
-/// Fetch one declared file and check it is what the manifest said it was.
+/// Fetch one declared file and check it is what the manifest said it was —
+/// against `served_as`, the content type this instance considers correct for
+/// it.
 ///
 /// All three declared properties are load-bearing, so all three are checked:
 /// `sha256` is what design §10.2 requires ("verify every referenced file's
 /// hash"); `size` costs nothing over bytes already in hand and catches a
-/// manifest built from a different tree; `content_type` is what the site will
-/// actually be served as, and this instance derives it from the path, so a
-/// bundle claiming a different one was produced by an exporter that does not
-/// agree with this build about how files are served.
-async fn fetch_verified(
+/// manifest built from a different tree; `content_type` is what the file will
+/// actually be served as, so a bundle claiming a different one was produced
+/// by an exporter that does not agree with this build about how files are
+/// served.
+async fn fetch_and_verify(
     fetch: &dyn SeedFetch,
     url: &str,
     declared: &SeedFile,
-    workspace_path: &str,
+    served_as: &str,
 ) -> Result<Vec<u8>, String> {
-    // Refuse the *path* before anything is fetched: a manifest entry naming
-    // `../../elsewhere` must not cause a request for it either.
-    paths::validate_path(workspace_path)
-        .map_err(|e| format!("the seed bundle names {workspace_path:?}: {e}"))?;
     if declared.size > paths::MAX_FILE_BYTES as u64 {
         return Err(format!(
             "{url}: declares {} bytes; the per-file limit is {}",
@@ -397,15 +404,29 @@ async fn fetch_verified(
             declared.size
         ));
     }
-    let served = paths::content_type_for(workspace_path);
-    if declared.content_type != served {
+    if declared.content_type != served_as {
         return Err(format!(
-            "{url}: the manifest declares content type {:?}, but {workspace_path:?} is served as \
-             {served:?}",
+            "{url}: the manifest declares content type {:?}, but this build serves it as {served_as:?}",
             declared.content_type
         ));
     }
     Ok(bytes)
+}
+
+/// [`fetch_and_verify`] for a file that lands in the workspace (`site/…`,
+/// `blocks/<name>/…`): `workspace_path` both gates the fetch (a manifest
+/// entry naming `../../elsewhere` must not cause a request for it either)
+/// and derives the content type every such file is checked against.
+async fn fetch_verified(
+    fetch: &dyn SeedFetch,
+    url: &str,
+    declared: &SeedFile,
+    workspace_path: &str,
+) -> Result<Vec<u8>, String> {
+    paths::validate_path(workspace_path)
+        .map_err(|e| format!("the seed bundle names {workspace_path:?}: {e}"))?;
+    let served = paths::content_type_for(workspace_path);
+    fetch_and_verify(fetch, url, declared, served).await
 }
 
 /// Store one verified file's bytes and record it in the workspace under

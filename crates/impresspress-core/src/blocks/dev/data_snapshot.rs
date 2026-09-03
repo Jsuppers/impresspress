@@ -47,6 +47,12 @@ use wafer_block::wire::database::OnConflict;
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
+// A standalone, unbraced import so the text `products::TABLE` — the pattern
+// `blocks/products/tests/repo_door_test.rs`'s `only_the_allowlist_names_the_products_table_via_the_const`
+// scans for — appears here plainly rather than hidden inside the larger
+// grouped import below; this file is listed in that test's
+// `TABLE_IDENT_ALLOWED` with the same justification given there.
+use crate::blocks::products::TABLE as PRODUCTS_COLLECTION;
 use crate::{
     admin_schema,
     blocks::{
@@ -62,8 +68,8 @@ use crate::{
             list_live_products, upsert_product_from_snapshot, CHECKOUT_PRESETS_TABLE,
             DISPUTES_TABLE, ENTITLEMENTS_TABLE, GROUPS_TABLE, GROUP_TEMPLATES_TABLE,
             LINE_ITEMS_TABLE, OFFERS_TABLE, OFFER_COMPONENTS_TABLE, PAYMENT_LINKS_TABLE,
-            PRODUCTS_COLLECTION, PRODUCT_TEMPLATES_TABLE, PRODUCT_VERSIONS_TABLE,
-            PROVIDER_OPERATIONS_TABLE, PURCHASES_TABLE, REFUNDS_TABLE, SELLER_ACCOUNTS_TABLE,
+            PRODUCT_TEMPLATES_TABLE, PRODUCT_VERSIONS_TABLE, PROVIDER_OPERATIONS_TABLE,
+            PURCHASES_TABLE, REFUNDS_TABLE, SELLER_ACCOUNTS_TABLE, STRIPE_EVENTS_TABLE,
             SUBSCRIPTIONS_TABLE, SUBSCRIPTION_ITEMS_TABLE, TYPES_TABLE,
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
@@ -163,6 +169,7 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     PROVIDER_OPERATIONS_TABLE,
     REFUNDS_TABLE,
     DISPUTES_TABLE,
+    STRIPE_EVENTS_TABLE, // webhook idempotency ledger — this instance's own delivery history
     // --- admin: operational logs, and infrastructure state the runtime
     // re-derives at every boot rather than something anyone authored. ---
     admin_schema::BLOCK_SETTINGS_TABLE, // per-block enable flag + migration-hash tracking
@@ -189,22 +196,131 @@ pub const TABLE_EXCLUDED: &[&str] = &[
 /// Whether one row of `impresspress__admin__variables` may leave in an
 /// export.
 ///
+/// **Fails closed.** A row is exportable only when *every* check below
+/// affirmatively clears it — an odd shape (a `sensitive` value that isn't
+/// cleanly `0`/`false`, a `key` that isn't a plain string, a missing field
+/// entirely) is not "assume the safe default and export it", it is "cannot
+/// prove this is safe, so don't". The row's own schema guarantees `sensitive
+/// INTEGER NOT NULL DEFAULT 0` and `key TEXT NOT NULL`, so a row this
+/// function refuses to clear is either corrupt or from a build with a wider
+/// schema than this one reads — either way, the conservative answer is the
+/// only correct one.
+///
 /// Reuses [`crate::util::is_sensitive_key`] — the same SEC-060 rule the
 /// admin Variables page masks display values with (explicit `sensitive` flag
 /// **or** a `_SECRET`/`_KEY` suffix) — rather than checking the flag alone: a
 /// second, weaker sensitivity check here would be exactly the kind of
-/// disagreement that rule exists to prevent. The `IMPRESSPRESS_` prefix check
-/// is this module's own, additional rule: `CLAUDE.md` reserves that prefix
-/// for infrastructure config that must never reach the database at all, so a
-/// row like that appearing here would already be a bug upstream — this is
-/// the export's own backstop against it leaving anyway.
+/// disagreement that rule exists to prevent. Called with the flag already
+/// pinned to "clean false" (checked below), so it only evaluates the suffix
+/// half. The `IMPRESSPRESS_` prefix check is this module's own, additional
+/// rule: `CLAUDE.md` reserves that prefix for infrastructure config that
+/// must never reach the database at all, so a row like that appearing here
+/// would already be a bug upstream — this is the export's own backstop
+/// against it leaving anyway.
 pub fn variable_is_exportable(row: &serde_json::Map<String, Value>) -> bool {
-    let key = row.get("key").and_then(Value::as_str).unwrap_or("");
-    let sensitive_flag = row
-        .get("sensitive")
-        .and_then(crate::util::json_as_i64)
-        .unwrap_or(0);
-    !crate::util::is_sensitive_key(key, sensitive_flag) && !key.starts_with("IMPRESSPRESS_")
+    let Some(key) = row.get("key").and_then(Value::as_str) else {
+        return false;
+    };
+    let sensitive_is_clean_false = match row.get("sensitive") {
+        Some(Value::Bool(b)) => !*b,
+        Some(Value::Number(n)) => n.as_i64() == Some(0),
+        // Missing, `null`, a numeric string, a float, an object/array — none
+        // of these is the clean `0`/`false` the schema promises, so this
+        // does not clear the row.
+        _ => false,
+    };
+    if !sensitive_is_clean_false {
+        return false;
+    }
+    if crate::util::is_sensitive_key(key, 0) {
+        return false;
+    }
+    !key.starts_with("IMPRESSPRESS_")
+}
+
+#[cfg(test)]
+mod variable_is_exportable_tests {
+    use super::*;
+
+    fn row(fields: serde_json::Value) -> serde_json::Map<String, Value> {
+        match fields {
+            Value::Object(map) => map,
+            _ => panic!("row fixture must be a JSON object"),
+        }
+    }
+
+    #[test]
+    fn a_clean_non_sensitive_row_exports() {
+        assert!(variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": false,
+        }))));
+        assert!(variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": 0,
+        }))));
+    }
+
+    #[test]
+    fn an_explicitly_sensitive_row_never_exports() {
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": true,
+        }))));
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": 1,
+        }))));
+    }
+
+    #[test]
+    fn a_suffix_flagged_key_never_exports_even_when_the_flag_is_clear() {
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "STRIPE_SECRET",
+            "sensitive": false,
+        }))));
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "JWT_KEY",
+            "sensitive": 0,
+        }))));
+    }
+
+    #[test]
+    fn an_impresspress_prefixed_key_never_exports_even_when_the_flag_is_clear() {
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "IMPRESSPRESS_INTERNAL_FLAG",
+            "sensitive": false,
+        }))));
+    }
+
+    #[test]
+    fn odd_shapes_fail_closed_rather_than_defaulting_to_exportable() {
+        // Missing `sensitive` entirely.
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+        }))));
+        // `sensitive` present but not a clean 0/false shape.
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": "0",
+        }))));
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": 0.5,
+        }))));
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "sensitive": null,
+        }))));
+        // Missing `key` entirely, or `key` not a plain string.
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "sensitive": false,
+        }))));
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": 12345,
+            "sensitive": false,
+        }))));
+    }
 }
 
 /// Read every [`TABLE_ALLOWLIST`] table's rows into a [`DataSnapshot`].
@@ -222,6 +338,10 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
         let rows: Vec<serde_json::Map<String, Value>> = records
             .into_iter()
             .map(record_to_row)
+            .map(|mut row| {
+                reset_provider_linkage(table, &mut row);
+                row
+            })
             // The one table with a per-row export decision — see
             // `variable_is_exportable`'s docs for why the check lives there
             // and not as a second `Mode`.
@@ -247,6 +367,33 @@ fn record_to_row(record: db::Record) -> serde_json::Map<String, Value> {
     row
 }
 
+/// Reset one row's provider-linkage columns to their "not yet synced with
+/// this destination's own Stripe account" defaults, for the two tables that
+/// carry any (`products`, `offers`).
+///
+/// The importing instance has no Stripe account the exported ids belong to
+/// — carrying them over would point a re-hosted shop's checkout at another
+/// deployment's Stripe objects instead of re-creating its own the next time
+/// someone syncs. The defaults match exactly what `repo::products::create`
+/// and `repo::offers::create` write for a brand-new row (`stripe.rs`'s own
+/// "is this synced yet" check is `str_field("stripe_product_id").is_empty()`
+/// — the same sentinel this restores).
+fn reset_provider_linkage(table: &str, row: &mut serde_json::Map<String, Value>) {
+    const EMPTY: &str = "";
+    let set = |row: &mut serde_json::Map<String, Value>, key: &str, value: &str| {
+        row.insert(key.to_string(), Value::String(value.to_string()));
+    };
+    if table == PRODUCTS_COLLECTION {
+        set(row, "stripe_product_id", EMPTY);
+        set(row, "seller_account_id", EMPTY);
+    } else if table == OFFERS_TABLE {
+        set(row, "stripe_product_id", EMPTY);
+        set(row, "stripe_price_id", EMPTY);
+        set(row, "sync_status", "not_synced");
+        set(row, "sync_error", EMPTY);
+    }
+}
+
 /// Rows written per table, keyed by table name — only tables `snapshot`
 /// actually carried rows for appear here, so a table the export decided to
 /// include but that happened to be empty is present with `0`, and a table
@@ -256,11 +403,34 @@ pub struct ImportReport {
     pub tables: BTreeMap<String, usize>,
 }
 
+/// [`Mode::Replace`] tables, in the explicit dependency order [`import`]
+/// applies them in: `local_credentials.user_id` and `user_roles.user_id` are
+/// meaningful only once the row they name in `users` exists.
+///
+/// A fixed list rather than the snapshot's own (incidental, alphabetical)
+/// `BTreeMap` order — `"impresspress__admin__user_roles"` sorts before
+/// `"wafer_run__auth__users"`, which is exactly backwards.
+const REPLACE_ORDER: &[&str] = &[users::TABLE, local_credentials::TABLE, USER_ROLES_TABLE];
+
 /// Apply `snapshot`'s rows through typed database writes.
 ///
 /// Every table `snapshot.tables` names must be on [`TABLE_ALLOWLIST`] — see
 /// the module docs for why a name outside it is refused (`InvalidArgument`)
 /// rather than silently skipped or written anyway.
+///
+/// **Not atomic.** Each table is deleted-then-recreated (`Replace`) or
+/// upserted (`Upsert`) independently — the typed database client this
+/// module is required to use (CLAUDE.md: no raw SQL in block code) exposes
+/// no cross-call transaction, so a crash or error partway through leaves
+/// whatever tables were already written in their new state and the rest in
+/// their old one. This is worth a `wafer-run` ticket (a transaction/batch op
+/// on `wafer_core::clients::database`) rather than working around it here.
+/// What keeps this safe in the meantime: every write is keyed on the
+/// snapshot's own row ids, so importing the same snapshot again (after a
+/// partial failure, or on purpose) converges to the same end state —
+/// `tests/dev_data_snapshot.rs`'s
+/// `import_replaces_users_and_upserts_products_so_ownership_survives` test
+/// re-imports and asserts no duplication.
 pub async fn import(
     ctx: &dyn Context,
     snapshot: &DataSnapshot,
@@ -274,33 +444,42 @@ pub async fn import(
             ),
         ));
     }
+    for table in snapshot.tables.keys() {
+        if !TABLE_ALLOWLIST.iter().any(|(name, _)| name == table) {
+            return Err(WaferError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "the data snapshot names {table:?}, which is not on this build's export \
+                     allowlist"
+                ),
+            ));
+        }
+    }
 
     let mut report = ImportReport::default();
-    for (table, rows) in &snapshot.tables {
-        let mode = TABLE_ALLOWLIST
-            .iter()
-            .find(|(name, _)| name == table)
-            .map(|(_, mode)| *mode)
-            .ok_or_else(|| {
-                WaferError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "the data snapshot names {table:?}, which is not on this build's export \
-                         allowlist"
-                    ),
-                )
-            })?;
-
-        // `Replace` clears the whole table exactly once, ahead of every row
-        // — not per row — so a snapshot with zero rows for a `Replace` table
-        // still empties the destination (an owner who deleted their only
-        // product before exporting gets an empty products table, not a
-        // no-op).
-        if mode == Mode::Replace {
-            db::delete_by_filters(ctx, table, Vec::new()).await?;
-        }
+    // `Replace` tables first, in `REPLACE_ORDER` — not the snapshot's own
+    // alphabetical order. `Upsert` tables carry no such dependency (every
+    // foreign id they reference — `product_id`, `offer_id` — is validated by
+    // the owning handler at write time, never enforced by this import), so
+    // the remaining loop below keeps the snapshot's own order.
+    for &table in REPLACE_ORDER {
+        let Some(rows) = snapshot.tables.get(table) else {
+            continue;
+        };
+        db::delete_by_filters(ctx, table, Vec::new()).await?;
         for row in rows {
-            import_row(ctx, table, mode, row).await?;
+            import_row(ctx, table, Mode::Replace, row).await?;
+        }
+        report.tables.insert(table.to_string(), rows.len());
+    }
+    for (table, rows) in &snapshot.tables {
+        if REPLACE_ORDER.contains(&table.as_str()) {
+            continue; // already applied above, in dependency order
+        }
+        // `Upsert` is the only mode left once `REPLACE_ORDER` is excluded —
+        // every `Mode::Replace` entry in `TABLE_ALLOWLIST` is named there.
+        for row in rows {
+            import_row(ctx, table, Mode::Upsert, row).await?;
         }
         report.tables.insert(table.clone(), rows.len());
     }

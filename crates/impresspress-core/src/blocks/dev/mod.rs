@@ -279,11 +279,9 @@ pub fn wrap_grants() -> Vec<wafer_run::ResourceGrant> {
         wafer_run::ResourceGrant::read_write(BLOCK_NAME, "wafer-run/web/site/*")
             .typed(wafer_run::ResourceType::Storage),
     ];
-    grants.extend(
-        data_snapshot::TABLE_ALLOWLIST
-            .iter()
-            .map(|(table, _mode)| wafer_run::ResourceGrant::read_write(BLOCK_NAME, table)),
-    );
+    grants.extend(data_snapshot::TABLE_ALLOWLIST.iter().map(|(table, _mode)| {
+        wafer_run::ResourceGrant::read_write(BLOCK_NAME, table).typed(wafer_run::ResourceType::Db)
+    }));
     grants
 }
 
@@ -717,16 +715,17 @@ mod tests {
             Some(wafer_run::ResourceType::Storage)
         );
 
-        // Every other grant is one exact, untyped (Db), read-write entry per
+        // Every other grant is one exact, `Db`-typed, read-write entry per
         // `TABLE_ALLOWLIST` table — never a `{org}__{block}__*` prefix, which
         // would also admit a table `TABLE_EXCLUDED` deliberately keeps this
-        // block off.
+        // block off, and never untyped, which would also admit a Config key
+        // or Vector collection that happened to share the name.
         let db_grants = &grants[1..];
         assert_eq!(db_grants.len(), data_snapshot::TABLE_ALLOWLIST.len());
         for grant in db_grants {
             assert_eq!(grant.grantee, BLOCK_NAME);
             assert!(grant.write);
-            assert_eq!(grant.resource_type, None);
+            assert_eq!(grant.resource_type, Some(wafer_run::ResourceType::Db));
             assert!(
                 !grant.resource.ends_with('*'),
                 "{:?} is a prefix grant, not an exact table name",

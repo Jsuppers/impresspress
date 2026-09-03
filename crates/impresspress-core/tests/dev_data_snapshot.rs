@@ -21,10 +21,7 @@ use impresspress_core::{
     admin_schema,
     blocks::{
         admin::AdminBlock,
-        auth::repo::{
-            api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, oauth_pkce, orgs, pats,
-            provider_links, rate_limits, sessions, tokens, users,
-        },
+        auth::repo::users,
         dev::{
             data_snapshot::{self, DataSnapshot},
             seed::{self, SeedManifest},
@@ -48,42 +45,81 @@ const OFFERS_TABLE: &str = "impresspress__products__offers";
 const PURCHASES_TABLE: &str = "impresspress__products__purchases";
 const ADMIN_USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
-/// Every table `wafer-run/auth` (the framework block, `AuthBlock` in
-/// `wafer_core::service_blocks::auth`) owns.
-///
-/// Unlike `ProductsBlock`/`AdminBlock`, the framework auth block declares no
-/// `BlockInfo.collections` at all (its `info()` only adds the grants its
-/// `AuthService` reports) — its tables are named directly by each
-/// `auth::repo::*` module instead, per that module's own "one module per
-/// table" convention (`blocks/auth/repo/mod.rs`). So this list, not a
-/// `BlockInfo` reflection, is this file's source of "every table the auth
-/// block declares" for the coverage test below.
-const AUTH_TABLES: &[&str] = &[
-    api_keys::TABLE,
-    bootstrap_tokens::TABLE,
-    jwt_blocklist::TABLE,
-    local_credentials::TABLE,
-    oauth_pkce::TABLE,
-    orgs::TABLE,
-    pats::TABLE,
-    provider_links::TABLE,
-    rate_limits::TABLE,
-    sessions::TABLE,
-    tokens::TABLE,
-    users::TABLE,
-];
-
 // ---------------------------------------------------------------------------
 // Coverage: every declared table has a decision.
 // ---------------------------------------------------------------------------
 
+/// Every table name created by a `CREATE TABLE [IF NOT EXISTS] <name>`
+/// statement anywhere under the three blocks' own migration directories —
+/// the ground truth of what tables actually exist, read straight off the
+/// `.sql` files rather than off any Rust-side declaration of them.
+///
+/// This is why the coverage test below does not need (and, for auth, has no
+/// other way to get) a `BlockInfo.collections`-style list: `BlockInfo`'s own
+/// list is advisory (see the comment on `products/mod.rs`'s `.collections`
+/// call) and, as this test caught once already, can fall behind a table a
+/// migration created — `impresspress__products__stripe_events` (migration
+/// `003_stripe_events`) was never added to `ProductsBlock::info().collections`
+/// at all. Scanning the migrations directly cannot have that gap: a table
+/// with no `CREATE TABLE` here does not exist, and one that exists has no
+/// way to hide from this scan the way it could from a hand-kept list.
+fn tables_created_in_migrations() -> BTreeSet<String> {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut tables = BTreeSet::new();
+    for block in ["products", "admin", "auth"] {
+        let dir = manifest_dir
+            .join("src/blocks")
+            .join(block)
+            .join("migrations");
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let sql = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for line in sql.lines() {
+                let Some(rest) = line.trim_start().strip_prefix("CREATE TABLE") else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let rest = rest
+                    .strip_prefix("IF NOT EXISTS")
+                    .map_or(rest, str::trim_start);
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && *c != '(')
+                    .collect();
+                assert!(
+                    !name.is_empty(),
+                    "{}: a `CREATE TABLE` line with no table name: {line:?}",
+                    path.display()
+                );
+                tables.insert(name);
+            }
+        }
+    }
+    tables
+}
+
 #[test]
 fn every_declared_table_of_the_three_blocks_has_an_export_decision() {
-    let mut declared: Vec<String> = Vec::new();
+    let mut declared: BTreeSet<String> = tables_created_in_migrations();
+    // Cross-checked, not replaced, against the two feature blocks' own
+    // advisory `BlockInfo.collections` — a table one of them lists that no
+    // migration actually creates would be exactly the "declared but not
+    // real" mirror image of the `stripe_events` gap the migration scan
+    // exists to catch, and belongs in this failure too.
     for info in [ProductsBlock::new().info(), AdminBlock::new().info()] {
         declared.extend(info.collections.iter().map(|c| c.name.clone()));
     }
-    declared.extend(AUTH_TABLES.iter().map(|s| s.to_string()));
+    assert!(
+        declared.len() > 40,
+        "the migration scan found {} tables — it lost its way",
+        declared.len()
+    );
 
     let decided: BTreeSet<&str> = data_snapshot::TABLE_ALLOWLIST
         .iter()
@@ -143,6 +179,11 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
             "name": "Widget",
             "status": "active",
             "created_by": user_id,
+            // Provider-linkage columns, deliberately non-default here:
+            // `export_carries_products_but_never_secrets_or_orders` asserts
+            // these come back reset (see `data_snapshot::reset_provider_linkage`).
+            "stripe_product_id": "prod_stripe_source_owns_this",
+            "seller_account_id": "seller_source_owns_this",
         }),
     )
     .await;
@@ -154,6 +195,9 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
         json!({
             "product_id": "prod_widget",
             "name": "Standard",
+            "stripe_product_id": "prod_stripe_source_owns_this",
+            "stripe_price_id": "price_source_owns_this",
+            "sync_status": "synced",
         }),
     )
     .await;
@@ -198,6 +242,19 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
         }),
     )
     .await;
+    // Never exported: `IMPRESSPRESS_`-prefixed, even with a clear flag —
+    // CLAUDE.md reserves that prefix for infrastructure config.
+    seed_row(
+        ctx,
+        admin_schema::VARIABLES_TABLE,
+        "var_infra",
+        json!({
+            "key": "IMPRESSPRESS_INTERNAL_FLAG",
+            "value": "true",
+            "sensitive": false,
+        }),
+    )
+    .await;
 
     user_id
 }
@@ -220,13 +277,29 @@ async fn export_carries_products_but_never_secrets_or_orders() {
     assert_eq!(
         vars.len(),
         1,
-        "the sensitive variable is filtered out at export"
+        "the sensitive and IMPRESSPRESS_-prefixed variables are filtered out at export"
     );
     assert!(vars.iter().all(|v| v["sensitive"] != json!(true)
         && !v["key"].as_str().unwrap().starts_with("IMPRESSPRESS_")));
     assert!(!vars
         .iter()
         .any(|v| v["key"] == "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD"));
+    // The vacuous half of the check above, made real: the row really was
+    // seeded, and really is absent, not merely never present to begin with.
+    assert!(!vars
+        .iter()
+        .any(|v| v["key"] == "IMPRESSPRESS_INTERNAL_FLAG"));
+
+    // Provider-linkage columns come back reset — this destination has no
+    // Stripe account the source's ids belong to.
+    let product = &snap.tables[PRODUCTS_TABLE][0];
+    assert_eq!(product["stripe_product_id"], json!(""));
+    assert_eq!(product["seller_account_id"], json!(""));
+    let offer = &snap.tables[OFFERS_TABLE][0];
+    assert_eq!(offer["stripe_product_id"], json!(""));
+    assert_eq!(offer["stripe_price_id"], json!(""));
+    assert_eq!(offer["sync_status"], json!("not_synced"));
+    assert_eq!(offer["sync_error"], json!(""));
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +416,13 @@ fn index_file() -> seed::SeedFile {
     seed_file("index.html", b"<h1>shop</h1>")
 }
 
-fn one_product_snapshot() -> DataSnapshot {
+/// One product (`Mode::Upsert`), one admin variable (`Mode::Upsert`) and one
+/// user (`Mode::Replace`) — at least one table from each of the three
+/// blocks, so a test importing this under a WRAP-enforced dev context (see
+/// `seed_import_applies_data_json_when_present`) exercises the typed Db
+/// grant `dev::wrap_grants` adds per `TABLE_ALLOWLIST` table on more than
+/// just the specially-routed products path.
+fn mixed_snapshot() -> DataSnapshot {
     let mut tables = std::collections::BTreeMap::new();
     tables.insert(
         PRODUCTS_TABLE.to_string(),
@@ -362,9 +441,45 @@ fn one_product_snapshot() -> DataSnapshot {
         .into_iter()
         .collect()],
     );
+    tables.insert(
+        admin_schema::VARIABLES_TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "var_seeded",
+            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "value": "Seeded Shop",
+            "sensitive": false,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }))
+        .into_iter()
+        .collect()],
+    );
+    tables.insert(
+        users::TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "user_seeded",
+            "email": "seeded@example.com",
+            "display_name": "Seeded Owner",
+        }))
+        .into_iter()
+        .collect()],
+    );
     DataSnapshot {
         schema_version: data_snapshot::SCHEMA_VERSION,
         tables,
+    }
+}
+
+/// A [`seed::SeedFile`] declaring `bytes` at `path`, the way an exporter
+/// would — the same derivation [`seed_file`] uses for workspace files,
+/// reimplemented here because `manifest.data` is a bare file, not one that
+/// lands in the workspace tree `seed_file` targets.
+fn data_file(path: &str, bytes: &[u8]) -> seed::SeedFile {
+    seed::SeedFile {
+        path: path.to_string(),
+        sha256: impresspress_core::blocks::dev::blobs::sha256_hex(bytes),
+        size: bytes.len() as u64,
+        content_type: "application/json".to_string(),
     }
 }
 
@@ -372,21 +487,21 @@ fn one_product_snapshot() -> DataSnapshot {
 async fn seed_import_applies_data_json_when_present() {
     let ctx = TestContext::with_products()
         .await
+        .with_auth_added()
+        .await
         .with_dev_added(FakeControl::new())
         .await;
+    let data_bytes = serde_json::to_vec(&mixed_snapshot()).unwrap();
     let manifest = SeedManifest {
         schema_version: seed::SCHEMA_VERSION,
         source_generation: None,
         site: vec![index_file()],
         blocks: vec![],
-        data: Some("seed/data.json".to_string()),
+        data: Some(data_file("data.json", &data_bytes)),
     };
     let fetch = MapFetch::default()
         .with(&seed::site_url("index.html"), b"<h1>shop</h1>")
-        .with(
-            "/seed/data.json",
-            &serde_json::to_vec(&one_product_snapshot()).unwrap(),
-        );
+        .with(&seed::data_url("data.json"), &data_bytes);
 
     seed::import(&ctx, &manifest, &fetch).await.unwrap();
 
@@ -395,4 +510,56 @@ async fn seed_import_applies_data_json_when_present() {
         .unwrap();
     assert_eq!(products.len(), 1);
     assert_eq!(products[0].id, "prod_seeded");
+
+    let vars = db::list_all(&ctx, admin_schema::VARIABLES_TABLE, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].id, "var_seeded");
+
+    let users_rows = db::list_all(&ctx, users::TABLE, Vec::new()).await.unwrap();
+    assert_eq!(users_rows.len(), 1);
+    assert_eq!(users_rows[0].id, "user_seeded");
+}
+
+/// A `data.json` whose declared hash doesn't match its bytes fails the same
+/// way a corrupted `site`/block-source file would (design §10.2) — and the
+/// failure propagates out of `seed::import` as a whole, not just out of the
+/// data-snapshot step.
+#[tokio::test]
+async fn seed_import_fails_when_data_json_does_not_verify() {
+    let ctx = TestContext::with_products()
+        .await
+        .with_dev_added(FakeControl::new())
+        .await;
+    let data_bytes = serde_json::to_vec(&mixed_snapshot()).unwrap();
+    let mut declared = data_file("data.json", &data_bytes);
+    declared.sha256 = "0".repeat(64); // does not match `data_bytes`
+    let manifest = SeedManifest {
+        schema_version: seed::SCHEMA_VERSION,
+        source_generation: None,
+        site: vec![index_file()],
+        blocks: vec![],
+        data: Some(declared),
+    };
+    let fetch = MapFetch::default()
+        .with(&seed::site_url("index.html"), b"<h1>shop</h1>")
+        .with(&seed::data_url("data.json"), &data_bytes);
+
+    let err = seed::import(&ctx, &manifest, &fetch)
+        .await
+        .expect_err("a hash mismatch on data.json must fail the whole seed import");
+    assert!(
+        err.contains("hashes to"),
+        "expected a hash-mismatch message, got: {err}"
+    );
+
+    // Nothing from the (unverified) snapshot was applied.
+    assert_eq!(
+        db::list_all(&ctx, PRODUCTS_TABLE, Vec::new())
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }

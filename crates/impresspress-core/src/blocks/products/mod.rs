@@ -17,17 +17,16 @@ pub(crate) use handlers::{
     GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
 };
 // The products table's own door tests (`tests/repo_door_test.rs`) refuse a
-// call site outside `repo::products` that names the table directly — even a
-// re-exported alias under the old, broadly-visible name they exist to keep
-// gone. The data snapshot's export allowlist still needs the name (for its
-// `TABLE_ALLOWLIST`/`TABLE_EXCLUDED` bookkeeping and as the `DataSnapshot`
-// JSON key) and needs to read and write the live set — so it gets those
-// through this dedicated, differently-named trio instead: `COLLECTION_NAME`
-// carries the name without a query attached, and the two functions carry a
-// query without ever exposing the name they query on.
+// call site outside `repo::products` that names the table directly — the
+// data snapshot's export allowlist is one, deliberately (it needs the name
+// for its `TABLE_ALLOWLIST`/`TABLE_EXCLUDED` bookkeeping and as the
+// `DataSnapshot` JSON key), and is listed in `TABLE_IDENT_ALLOWED` there
+// with its own justification rather than routed around the scanner through
+// an extra same-value constant under a different name. The two functions
+// alongside it are how it reads and writes the live set without a query
+// built directly on the name.
 pub(crate) use repo::products::{
-    list_all as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot,
-    COLLECTION_NAME as PRODUCTS_COLLECTION,
+    list_all as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot, TABLE,
 };
 // `repo` is private to this module (unlike `auth`'s `pub mod repo`, whose
 // table constants are meant to be named from anywhere in the crate) — these
@@ -43,7 +42,7 @@ pub(crate) use repo::{
     offers::TABLE as OFFERS_TABLE, payment_links::TABLE as PAYMENT_LINKS_TABLE,
     product_versions::TABLE as PRODUCT_VERSIONS_TABLE,
     provider_operations::TABLE as PROVIDER_OPERATIONS_TABLE, refunds::TABLE as REFUNDS_TABLE,
-    seller_accounts::TABLE as SELLER_ACCOUNTS_TABLE,
+    seller_accounts::TABLE as SELLER_ACCOUNTS_TABLE, stripe_events::TABLE as STRIPE_EVENTS_TABLE,
     subscription_items::TABLE as SUBSCRIPTION_ITEMS_TABLE, subscriptions::SUBSCRIPTIONS_TABLE,
 };
 pub(crate) use repo::{
