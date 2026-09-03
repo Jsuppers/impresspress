@@ -18,8 +18,16 @@ served by the host.
 ## Build
 
 ```sh
-examples/dev-sandbox/build.sh
+cargo install --path crates/impresspress --locked --root ./out   # a current CLI
+IMPRESSPRESS=./out/bin/impresspress examples/dev-sandbox/build.sh
 ```
+
+`build.sh` assembles the bundle with whatever `impresspress` is on `PATH`
+unless `IMPRESSPRESS` names one. Install first: a stale binary from an older
+checkout (a `~/.cargo/bin/impresspress` left over from months ago, say) builds
+without the recursive-directory overlay `[[assets.overlay]]` needs, so
+`dist/seed/` never appears — the script's own sanity check catches that and
+says so, but the fix is a fresh CLI, not a change to this directory.
 
 This is the one recipe CI's `e2e-dev-sandbox` job and local e2e runs both use
 (`crates/impresspress-web/tests/e2e/dev-foundations.spec.ts`). It:
@@ -45,7 +53,7 @@ the build fast rather than shipping a bundle that cannot seed itself.
 ## Serve locally
 
 ```sh
-examples/dev-sandbox/build.sh
+IMPRESSPRESS=./out/bin/impresspress examples/dev-sandbox/build.sh
 python3 -m http.server 8080 -d examples/dev-sandbox/dist
 ```
 

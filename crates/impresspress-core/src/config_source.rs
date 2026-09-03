@@ -24,11 +24,11 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-15-lazy-block-init-design.md §2
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use wafer_block::ConfigVar;
-use wafer_run::{ConfigError, ConfigSource, EnvBlockConfig};
+use wafer_run::{ConfigError, ConfigSource, EnvBlockConfig, StaticConfigSource};
 
 /// Reads block-declared config keys from `std::env`, falling back to each
 /// [`ConfigVar`]'s `default` when the env var is unset.
@@ -114,13 +114,21 @@ impl ConfigSource for EnvConfigSource {
 /// every browser bundle, answering `412 FailedPrecondition` on every
 /// products route.
 ///
-/// Resolution order is [`wafer_run::StaticConfigSource`]'s, exactly: a
-/// published value wins, then a non-empty declared default, then the key is
-/// either a `MissingRequired` error (required) or silently absent
-/// (optional).
+/// Resolution order is [`StaticConfigSource`]'s because it *is*
+/// [`StaticConfigSource`]: this type is a published-later wrapper around one,
+/// not a second implementation of the ladder. The ladder (published value,
+/// then non-empty declared default, then `MissingRequired` for a required key
+/// / silently absent for an optional one) lives in wafer-run, on the other
+/// side of a repo boundary, and a hand-copied duplicate here would drift the
+/// moment wafer-run changed it — silently, because the copy would go on
+/// passing its own tests.
 #[derive(Debug, Default)]
 pub struct SharedConfigSource {
-    vars: std::sync::RwLock<HashMap<String, String>>,
+    /// Behind an `Arc` so [`Self::load_for_block`] can take a cheap handle out
+    /// from under the lock instead of cloning the whole variable map on every
+    /// block's first init. `publish` swaps the whole `Arc`, so a load already
+    /// in flight keeps reading a consistent snapshot.
+    inner: std::sync::RwLock<Arc<StaticConfigSource>>,
 }
 
 impl SharedConfigSource {
@@ -135,22 +143,9 @@ impl SharedConfigSource {
     /// not (an operator deleting a variable row, say).
     pub fn publish(&self, vars: HashMap<String, String>) {
         *self
-            .vars
+            .inner
             .write()
-            .expect("SharedConfigSource RwLock poisoned") = vars;
-    }
-
-    /// How many variables are currently published. For diagnostics and tests.
-    pub fn len(&self) -> usize {
-        self.vars
-            .read()
-            .expect("SharedConfigSource RwLock poisoned")
-            .len()
-    }
-
-    /// Whether nothing has been published yet.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+            .expect("SharedConfigSource RwLock poisoned") = Arc::new(StaticConfigSource::new(vars));
     }
 }
 
@@ -162,26 +157,16 @@ impl ConfigSource for SharedConfigSource {
         block: &str,
         declared_keys: &[ConfigVar],
     ) -> Result<EnvBlockConfig, ConfigError> {
-        let vars = self
-            .vars
-            .read()
-            .expect("SharedConfigSource RwLock poisoned");
-        let mut out = HashMap::with_capacity(declared_keys.len());
-        for var in declared_keys {
-            if let Some(value) = vars.get(&var.key) {
-                out.insert(var.key.clone(), value.clone());
-            } else if !var.default.is_empty() {
-                out.insert(var.key.clone(), var.default.clone());
-            } else if !var.optional {
-                return Err(ConfigError::MissingRequired {
-                    block: block.to_string(),
-                    key: var.key.clone(),
-                });
-            }
-            // optional + no value + no default: skip; `EnvBlockConfig::get()`
-            // returns None.
-        }
-        Ok(EnvBlockConfig::new(out))
+        // Take the handle and drop the guard in one statement, before the
+        // `await`: an `RwLockReadGuard` is not `Send`, and this trait method
+        // is `Send` on every target but wasm32.
+        let source = Arc::clone(
+            &self
+                .inner
+                .read()
+                .expect("SharedConfigSource RwLock poisoned"),
+        );
+        source.load_for_block(block, declared_keys).await
     }
 }
 
@@ -217,12 +202,10 @@ mod shared_config_source_tests {
     #[tokio::test]
     async fn a_published_value_satisfies_a_required_key() {
         let source = SharedConfigSource::new();
-        assert!(source.is_empty());
         source.publish(HashMap::from([(
             "A__B__SECRET".to_string(),
             "deadbeef".to_string(),
         )]));
-        assert_eq!(source.len(), 1);
         let cfg = source
             .load_for_block("impresspress/products", &[required("A__B__SECRET", "")])
             .await
@@ -230,9 +213,11 @@ mod shared_config_source_tests {
         assert_eq!(cfg.get("A__B__SECRET"), Some("deadbeef"));
     }
 
-    /// Resolution order matches `StaticConfigSource`: published value first,
-    /// declared default second, and an optional key with neither is simply
-    /// absent rather than an error.
+    /// The resolution ladder, pinned end to end: published value first,
+    /// declared default second, and an optional key with neither simply
+    /// absent rather than an error. The rungs are wafer-run's — this type
+    /// delegates to `StaticConfigSource` rather than restating them — so this
+    /// is the test that notices if a pin bump changes what a block sees.
     #[tokio::test]
     async fn published_beats_default_and_optional_keys_may_be_absent() {
         let source = SharedConfigSource::new();
@@ -260,7 +245,6 @@ mod shared_config_source_tests {
         let source = SharedConfigSource::new();
         source.publish(HashMap::from([("A__B__X".to_string(), "one".to_string())]));
         source.publish(HashMap::from([("A__B__Y".to_string(), "two".to_string())]));
-        assert_eq!(source.len(), 1);
         let err = source
             .load_for_block("b", &[required("A__B__X", "")])
             .await

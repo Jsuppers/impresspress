@@ -345,9 +345,19 @@ pub async fn handle_request(
     // manifest: the script bytes don't vary by caller, only the manifest it
     // fetches does, so there's no identity to resolve here.
     if path == ui::assets::WEBMCP_JS_STABLE_PATH {
+        // RFC 9110 §8.8.3: an entity-tag is an opaque *quoted-string*, so the
+        // quotes are part of the value, not formatting. A bare hash is not a
+        // well-formed `ETag`, and a client that echoes it back verbatim in
+        // `If-None-Match` — which is the whole point of sending one — offers
+        // something the comparison rules cannot match, so no `304` ever fires
+        // and the `no-cache` revalidation above re-downloads the script every
+        // navigation. `webmcp_js_hash()` itself stays bare: it is the hash,
+        // and `webmcp_js_url()` embeds it in a filename where quotes would be
+        // nonsense.
+        let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
         return ResponseBuilder::new()
             .set_header("Cache-Control", "no-cache")
-            .set_header("ETag", ui::assets::webmcp_js_hash())
+            .set_header("ETag", &etag)
             .body(
                 ui::assets::webmcp_js().as_bytes().to_vec(),
                 "application/javascript; charset=utf-8",
@@ -1708,10 +1718,11 @@ mod discovery_tests {
             Some("no-cache"),
             "stable path must be revalidated every load, not cached like the immutable hashed URL"
         );
+        let expected_etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
         assert_eq!(
             header("resp.header.ETag"),
-            Some(ui::assets::webmcp_js_hash()),
-            "ETag must be the same hash embedded in webmcp_js_url()"
+            Some(expected_etag.as_str()),
+            "ETag must be the hash webmcp_js_url() embeds, as an RFC 9110 quoted-string"
         );
         assert!(
             ui::assets::webmcp_js_url()

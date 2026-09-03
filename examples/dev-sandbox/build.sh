@@ -20,6 +20,15 @@
 #   examples/dev-sandbox/build.sh            # build dist/
 #   examples/dev-sandbox/build.sh --check     # verify seed/manifest.json only
 #
+# `IMPRESSPRESS=/path/to/impresspress` overrides which CLI binary assembles
+# the bundle. Default is whatever is on `PATH`, which is the trap this
+# override exists for: a stale `~/.cargo/bin/impresspress` from an older
+# checkout silently builds a bundle without the recursive-directory overlay
+# (`cli/helpers/overlays.rs`), so `dist/seed/` never appears and the sanity
+# check below fails with no hint that the CLI is the problem. Build a current
+# one with `cargo install --path crates/impresspress --locked` (add
+# `--root ./out` to keep it out of `~/.cargo/bin`) and point this at it.
+#
 # `--check` verifies every `seed/site/**` file against the hash and size
 # `seed/manifest.json` declares for it and exits non-zero on drift, WITHOUT
 # building anything — this is what CI runs to catch a seed file edited
@@ -41,6 +50,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
 log() { printf '==> %s\n' "$*" >&2; }
+
+# Resolved at this point, while the caller's cwd is still current: the build
+# below runs
+# from `$HERE`, so a relative override (`IMPRESSPRESS=./out/bin/impresspress`,
+# typed from the repo root) would otherwise be looked up against
+# `examples/dev-sandbox/` and not be found. `|| true` because `set -e` is on
+# and "not found" is reported by the check further down, with instructions.
+IMPRESSPRESS_BIN="$(command -v "${IMPRESSPRESS:-impresspress}" 2>/dev/null || true)"
+case "$IMPRESSPRESS_BIN" in
+  /* | '') ;;
+  *) IMPRESSPRESS_BIN="$(cd "$(dirname "$IMPRESSPRESS_BIN")" && pwd)/$(basename "$IMPRESSPRESS_BIN")" ;;
+esac
 
 # The seed fixture's manifest declares a hash and a size for every site file,
 # and `seed::import` refuses the whole bundle if either disagrees with the
@@ -87,8 +108,15 @@ log "wasm-pack build --features browser-devtools -> $REPO/crates/impresspress-we
 #    sealed path — which honours `IMPRESSPRESS_WEB_PKG_DIR` rather than
 #    rebuilding impresspress-web itself.
 cd "$HERE"
+[ -n "$IMPRESSPRESS_BIN" ] || {
+  echo "build.sh: no impresspress CLI on PATH (or at \$IMPRESSPRESS='${IMPRESSPRESS:-}')." >&2
+  echo "  cargo install --path '$REPO/crates/impresspress' --locked --root '$REPO/out'" >&2
+  echo "  IMPRESSPRESS='$REPO/out/bin/impresspress' examples/dev-sandbox/build.sh" >&2
+  exit 1
+}
+log "assembling the bundle with $IMPRESSPRESS_BIN"
 IMPRESSPRESS_WEB_PKG_DIR="$REPO/crates/impresspress-web/pkg-dev" \
-  impresspress build --target web --release
+  "$IMPRESSPRESS_BIN" build --target web --release
 
 DIST="$HERE/dist"
 [ -f "$DIST/sw.js" ] || { echo "build.sh: $DIST/sw.js was not produced" >&2; exit 1; }
@@ -101,7 +129,9 @@ grep -q 'dev: true' "$DIST/sw.js" || {
   exit 1
 }
 [ -f "$DIST/seed/manifest.json" ] || {
-  echo "build.sh: $DIST/seed/manifest.json was not overlaid — check impresspress.toml's [[assets.overlay]]" >&2
+  echo "build.sh: $DIST/seed/manifest.json was not overlaid — check impresspress.toml's [[assets.overlay]]," >&2
+  echo "  or an impresspress CLI older than the recursive-directory overlay (cli/helpers/overlays.rs):" >&2
+  echo "  $IMPRESSPRESS_BIN" >&2
   exit 1
 }
 

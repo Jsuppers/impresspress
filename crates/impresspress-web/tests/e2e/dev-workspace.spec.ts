@@ -260,10 +260,12 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({ p
   //
   // Two registrars share `document.modelContext` here: `dev.js` adds the
   // page-scoped allowlist, `webmcp.js` adds the deployment-wide manifest for
-  // the caller's tier. Waiting for the page-scoped count and then reading
-  // everything is what keeps this from pinning the *other* file's contract
-  // (the admin manifest's size is `webmcp.spec.ts`'s subject).
-  await registeredTools(page, PAGE_TOOLS.length);
+  // the caller's tier, and they finish in whichever order their two fetches
+  // complete. So both are waited for before anything is read: `waitForTool`
+  // for one name `webmcp.js` publishes, and `registeredTools`' own count wait
+  // for `dev.js`. Waiting on a name rather than a total is what keeps this
+  // from pinning the *other* file's contract — the admin manifest's size is
+  // `webmcp.spec.ts`'s subject, not this one's.
   await waitForTool(page, 'list_products');
   const tools = (await registeredTools(page, PAGE_TOOLS.length)).map((t) => t.name);
 

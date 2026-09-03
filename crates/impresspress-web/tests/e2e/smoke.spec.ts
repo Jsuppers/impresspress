@@ -119,6 +119,50 @@ test('the default bundle has no dev block', async ({ page }) => {
   // test passed for the wrong reason.
 });
 
+test('the default bundle serves the products catalog', async ({ page }) => {
+  // Regression guard for the browser target's config source (`bc1e8070`).
+  //
+  // `run_init_pipeline` resolves a block's DECLARED `ConfigVar`s through the
+  // runtime's `ConfigSource` BEFORE it calls that block's `lifecycle(Init)`,
+  // and a required key it cannot resolve is `InitError::Permanent` — the
+  // block is then dead for the life of the runtime, however well its handlers
+  // would have coped with the value being absent. The browser built every
+  // runtime with a permanently EMPTY `StaticConfigSource`, so
+  // `impresspress/products` — which declares
+  // `IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET` (auto-generated, empty default,
+  // not optional) — answered
+  // `412 FailedPrecondition: block \`impresspress/products\` init failed
+  // permanently` on EVERY products route, in every browser bundle, while
+  // `/b/webmcp/manifest.json` went on advertising `list_products`,
+  // `get_product`, `preview_price` and `start_checkout` to any agent that
+  // asked. `impresspress-web` now hands its runtimes a `SharedConfigSource`
+  // that the post-admin-init boot hook fills with the seeded variables.
+  //
+  // This lives in the SMOKE spec, not the sandbox one, precisely because the
+  // defect was never sandbox-specific: `dev-workspace.spec.ts` covers the
+  // `browser-devtools` bundle, and this covers the ordinary `pkg/` one that
+  // every other browser deployment ships. Nothing else asserted the default
+  // bundle can answer a products route at all.
+  //
+  // The catalog is the right route to ask for: `Public` (so no login), a pure
+  // read, and empty on a fresh instance — so this asserts the block INITED,
+  // not that anything seeded it.
+  await page.goto('/', { waitUntil: 'commit' });
+  await page.waitForURL(/\/b\/auth\/login/, { timeout: 30_000 });
+
+  const catalog = await page.evaluate(async () => {
+    const response = await fetch('/b/products/catalog');
+    return { status: response.status, body: await response.text() };
+  });
+  expect(catalog.status, catalog.body).toBe(200);
+  // `records` is the list field `CatalogProductListResponse` publishes
+  // (`products/contracts.rs`) — parsed rather than string-matched so a body
+  // that is not JSON at all fails here rather than passing on a substring.
+  const page1 = JSON.parse(catalog.body) as { records: unknown[]; total_count: number };
+  expect(Array.isArray(page1.records), catalog.body).toBe(true);
+  expect(page1.total_count).toBe(0);
+});
+
 test('a cold visitor gets WebMCP tools without a reload', async ({ page }) => {
   // The race this guards: `webmcp.js`'s deferred script runs while
   // `navigator.serviceWorker.controller` is still null (the SW hasn't taken
