@@ -7,7 +7,12 @@
  * its size and sha256 so `verify-compiler-assets.mjs` can prove the tree that
  * ships is the tree that was built.
  *
- * Usage: node scripts/write-manifest.mjs
+ * `COMPILER_BUILD_KIND` is required and must be `full` or `fast`:
+ * `build-compiler.sh` reads it off the composed component's own
+ * `.build-kind`, and a default here would be the very thing that file exists
+ * to prevent — an unlabelled component reported as optimized.
+ *
+ * Usage: COMPILER_BUILD_KIND=full node scripts/write-manifest.mjs
  */
 
 import { createHash } from "node:crypto";
@@ -23,6 +28,16 @@ const out = path.join(dist, version);
 
 if (!fs.existsSync(out)) {
   console.error(`write-manifest.mjs: ${out} does not exist — run build-compiler.sh`);
+  process.exit(1);
+}
+
+const buildKind = process.env.COMPILER_BUILD_KIND;
+if (buildKind !== "full" && buildKind !== "fast") {
+  console.error(
+    `write-manifest.mjs: COMPILER_BUILD_KIND must be "full" or "fast", got ` +
+      `${JSON.stringify(buildKind)} — build-compiler.sh reads it from the composed ` +
+      `component's own .build-kind`,
+  );
   process.exit(1);
 }
 
@@ -45,8 +60,9 @@ const manifest = {
   version,
   // `fast` means the component was composed without wasm-opt
   // (`build-compiler.sh --fast`): fine for local iteration, and refused by
-  // `verify-compiler-assets.mjs` so it can never be deployed.
-  build: process.env.COMPILER_BUILD_KIND === "fast" ? "fast" : "full",
+  // `verify-compiler-assets.mjs` so it can never be deployed. It is what the
+  // component's own `.build-kind` says, not what this run asked for.
+  build: buildKind,
   entry: `/__impresspress_dev/compiler/${version}/worker.js`,
   total_bytes: assets.reduce((n, asset) => n + asset.bytes, 0),
   assets,

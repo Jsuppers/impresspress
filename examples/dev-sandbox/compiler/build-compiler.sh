@@ -35,10 +35,10 @@
 #                rubrc's `worker_process/` + `vfs_bindings/`. None of rubrc's
 #                UI (Monaco, xterm, the SharedObject layer) is imported.
 #   5. asset     brotli-compress `vfs.core-<hash>.wasm` and split it into
-#                <= 24 MiB parts, because Cloudflare refuses a static asset
-#                larger than that (~10 minutes at quality 11); vendor the
-#                sysroot tarball. Both are skipped when the previous build's
-#                parts still match the component.
+#                <= 24 MiB parts (25 165 824 bytes), deliberately under
+#                Cloudflare's 25 MiB static-asset limit (~10 minutes at
+#                quality 11); vendor the sysroot tarball. Both are skipped
+#                when the previous build's parts still match the component.
 #   6. manifest  `dist/manifest.json` (sizes + sha256 of every file), then
 #                `scripts/verify-compiler-assets.mjs`.
 #
@@ -60,6 +60,13 @@
 # It is for iterating on the packaging locally. The manifest records the build
 # as `fast`, and `verify-compiler-assets.mjs` REFUSES it — so a `--fast` tree
 # can never be what `build.sh --check` passes or what gets deployed.
+#
+# Which kind a component IS is recorded beside it, in
+# `.rubrc/…/vfs_bindings/.build-kind`, and read back from there — not derived
+# from this invocation's flag, which would let a `--fast` component be
+# relabelled `full` by a later run that skipped phase 3. See
+# `scripts/compose-decision.sh`, and `scripts/test-build-kind.sh` for the
+# proof.
 
 set -euo pipefail
 
@@ -77,6 +84,9 @@ esac
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'build-compiler.sh: %s\n' "$*" >&2; exit 1; }
+
+# shellcheck source-path=SCRIPTDIR source=scripts/compose-decision.sh
+. "$HERE/scripts/compose-decision.sh"
 
 command -v node >/dev/null || die "node is required (>= 22)"
 command -v git >/dev/null || die "git is required"
@@ -195,28 +205,60 @@ fi
 
 BINDINGS="$RUBRC/page/src/worker_process/vfs_bindings"
 
-if [ ! -f "$BINDINGS/vfs.core.wasm" ]; then
-  log "bun install in .rubrc"
-  (cd "$RUBRC" && PATH="$HERE/node_modules/.bin:$PATH" "$BUN" install --frozen-lockfile)
+WANT_KIND=full
+[ "$FAST" = 0 ] || WANT_KIND=fast
 
-  # `bun run vfs:build:prod` is rubrc's own recipe: compose, copy the bindings
-  # next to the page sources, then install the bindings' own dependencies.
-  # `wasm-opt` has to be OURS and not the one wasi_virt_layer vendors — it
-  # passes `--enable-shared-everything`, which Binaryen <= 116 rejects.
-  if [ "$FAST" = 1 ]; then
-    log "composing vfs.core.wasm WITHOUT wasm-opt (--fast: not deployable)"
-    RECIPE=vfs:build:prod:no-opt
-  else
-    log "composing vfs.core.wasm (~35 minutes of wasm-opt, up to 12.6 GB RSS)"
-    RECIPE=vfs:build:prod
-  fi
-  (cd "$RUBRC" && PATH="$WASM_OPT_DIR:$WVL_DIR:$HERE/node_modules/.bin:$PATH" \
-    "$BUN" run "$RECIPE")
+# The kind the manifest will report. Set from the component that ends up on
+# disk, never from `$FAST` — see `scripts/compose-decision.sh`.
+BUILD_KIND="$WANT_KIND"
 
-  [ -f "$BINDINGS/vfs.core.wasm" ] || die "the composition did not produce $BINDINGS/vfs.core.wasm"
-else
-  log "compose vfs.core.wasm already built ($(du -h "$BINDINGS/vfs.core.wasm" | cut -f1))"
-fi
+case "$(compose_decision "$BINDINGS" "$WANT_KIND")" in
+  reuse)
+    BUILD_KIND="$(cat "$BINDINGS/.build-kind" 2>/dev/null || echo fast)"
+    log "compose vfs.core.wasm already built, $BUILD_KIND ($(du -h "$BINDINGS/vfs.core.wasm" | cut -f1))"
+    ;;
+  refuse)
+    die "$BINDINGS/vfs.core.wasm was composed before the build kind was recorded,
+  so there is no way to tell whether wasm-opt ran over it, and a full build
+  must not claim one that did not. Either
+
+    rm -f '$BINDINGS/vfs.core.wasm'
+
+  and pay ~35 minutes to recompose, or, if you know this component came from
+  a run WITHOUT --fast, record that:
+
+    echo full > '$BINDINGS/.build-kind'"
+    ;;
+  compose | recompose)
+    # A `recompose` is a `--fast` component and a full build: drop the record
+    # first, so a composition that dies half way leaves an unlabelled
+    # component (which the `refuse` arm above stops) rather than a `fast`
+    # label over bytes nobody can account for.
+    rm -f "$BINDINGS/.build-kind"
+
+    log "bun install in .rubrc"
+    (cd "$RUBRC" && PATH="$HERE/node_modules/.bin:$PATH" "$BUN" install --frozen-lockfile)
+
+    # `bun run vfs:build:prod` is rubrc's own recipe: compose, copy the
+    # bindings next to the page sources, then install the bindings' own
+    # dependencies. `wasm-opt` has to be OURS and not the one wasi_virt_layer
+    # vendors — it passes `--enable-shared-everything`, which Binaryen <= 116
+    # rejects.
+    if [ "$FAST" = 1 ]; then
+      log "composing vfs.core.wasm WITHOUT wasm-opt (--fast: not deployable)"
+      RECIPE=vfs:build:prod:no-opt
+    else
+      log "composing vfs.core.wasm (~35 minutes of wasm-opt, up to 12.6 GB RSS)"
+      RECIPE=vfs:build:prod
+    fi
+    (cd "$RUBRC" && PATH="$WASM_OPT_DIR:$WVL_DIR:$HERE/node_modules/.bin:$PATH" \
+      "$BUN" run "$RECIPE")
+
+    [ -f "$BINDINGS/vfs.core.wasm" ] || die "the composition did not produce $BINDINGS/vfs.core.wasm"
+    printf '%s\n' "$WANT_KIND" > "$BINDINGS/.build-kind"
+    BUILD_KIND="$WANT_KIND"
+    ;;
+esac
 
 # ------------------------------------------------------------------ 4. bundle
 
@@ -279,8 +321,7 @@ cp "$CACHE/$SYSROOT_TRIPLE.tar.br" "$OUT/sysroot/$SYSROOT_TRIPLE.tar.br"
 
 # ---------------------------------------------------------------- 6. manifest
 
-COMPILER_BUILD_KIND="$([ "$FAST" = 1 ] && echo fast || echo full)" \
-  node "$HERE/scripts/write-manifest.mjs"
+COMPILER_BUILD_KIND="$BUILD_KIND" node "$HERE/scripts/write-manifest.mjs"
 node "$HERE/scripts/verify-compiler-assets.mjs"
 
 log "dist/$VERSION ready: $(du -sh "$OUT" | cut -f1)"
