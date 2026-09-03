@@ -368,8 +368,8 @@ fn record_to_row(record: db::Record) -> serde_json::Map<String, Value> {
 }
 
 /// Reset one row's provider-linkage columns to their "not yet synced with
-/// this destination's own Stripe account" defaults, for the two tables that
-/// carry any (`products`, `offers`).
+/// this destination's own Stripe account" defaults, for the three tables
+/// that carry any (`products`, `offers`, `offer_components`).
 ///
 /// The importing instance has no Stripe account the exported ids belong to
 /// — carrying them over would point a re-hosted shop's checkout at another
@@ -377,7 +377,10 @@ fn record_to_row(record: db::Record) -> serde_json::Map<String, Value> {
 /// someone syncs. The defaults match exactly what `repo::products::create`
 /// and `repo::offers::create` write for a brand-new row (`stripe.rs`'s own
 /// "is this synced yet" check is `str_field("stripe_product_id").is_empty()`
-/// — the same sentinel this restores).
+/// — the same sentinel this restores); `offer_components.stripe_price_id`
+/// carries the identical `TEXT NOT NULL DEFAULT ''` shape (migration
+/// `005_commerce_v2`) for the same reason `offers.stripe_price_id` does — a
+/// per-component Stripe Price, not a per-offer one.
 fn reset_provider_linkage(table: &str, row: &mut serde_json::Map<String, Value>) {
     const EMPTY: &str = "";
     let set = |row: &mut serde_json::Map<String, Value>, key: &str, value: &str| {
@@ -391,6 +394,8 @@ fn reset_provider_linkage(table: &str, row: &mut serde_json::Map<String, Value>)
         set(row, "stripe_price_id", EMPTY);
         set(row, "sync_status", "not_synced");
         set(row, "sync_error", EMPTY);
+    } else if table == OFFER_COMPONENTS_TABLE {
+        set(row, "stripe_price_id", EMPTY);
     }
 }
 
@@ -411,6 +416,53 @@ pub struct ImportReport {
 /// `BTreeMap` order — `"impresspress__admin__user_roles"` sorts before
 /// `"wafer_run__auth__users"`, which is exactly backwards.
 const REPLACE_ORDER: &[&str] = &[users::TABLE, local_credentials::TABLE, USER_ROLES_TABLE];
+
+#[cfg(test)]
+mod replace_order_tests {
+    use super::*;
+
+    /// The two lists this const and `TABLE_ALLOWLIST`'s `Mode::Replace`
+    /// entries form have to agree, in both directions: a table in
+    /// `REPLACE_ORDER` that `TABLE_ALLOWLIST` doesn't mark `Replace` is
+    /// meaningless (nothing would ever route it through the `Replace` loop
+    /// in `import` in the first place), and a `Replace` table missing from
+    /// `REPLACE_ORDER` is worse — `import`'s loop below only ever applies
+    /// `Mode::Upsert` to a table outside `REPLACE_ORDER`, so a forgotten
+    /// entry would silently *upsert* a table meant to be replaced instead of
+    /// erroring anywhere.
+    #[test]
+    fn replace_order_is_exactly_the_allowlists_replace_entries() {
+        let allowlist_replace: std::collections::BTreeSet<&str> = TABLE_ALLOWLIST
+            .iter()
+            .filter(|(_, mode)| *mode == Mode::Replace)
+            .map(|(table, _)| *table)
+            .collect();
+        let replace_order: std::collections::BTreeSet<&str> =
+            REPLACE_ORDER.iter().copied().collect();
+
+        for table in &replace_order {
+            assert!(
+                allowlist_replace.contains(table),
+                "{table:?} is in REPLACE_ORDER but is not a Mode::Replace entry on \
+                 TABLE_ALLOWLIST"
+            );
+        }
+        for table in &allowlist_replace {
+            assert!(
+                replace_order.contains(table),
+                "{table:?} is a Mode::Replace entry on TABLE_ALLOWLIST but is missing from \
+                 REPLACE_ORDER"
+            );
+        }
+        // A duplicate entry in `REPLACE_ORDER` would otherwise pass the two
+        // set-membership checks above silently.
+        assert_eq!(
+            REPLACE_ORDER.len(),
+            replace_order.len(),
+            "REPLACE_ORDER has a duplicate entry"
+        );
+    }
+}
 
 /// Apply `snapshot`'s rows through typed database writes.
 ///

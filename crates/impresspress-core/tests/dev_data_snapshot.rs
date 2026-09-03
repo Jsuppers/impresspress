@@ -42,6 +42,7 @@ use wafer_run::Block;
 
 const PRODUCTS_TABLE: &str = "impresspress__products__products";
 const OFFERS_TABLE: &str = "impresspress__products__offers";
+const OFFER_COMPONENTS_TABLE: &str = "impresspress__products__offer_components";
 const PURCHASES_TABLE: &str = "impresspress__products__purchases";
 const ADMIN_USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
@@ -204,6 +205,19 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
 
     seed_row(
         ctx,
+        OFFER_COMPONENTS_TABLE,
+        "component_base",
+        json!({
+            "offer_id": "offer_standard",
+            "component_key": "base",
+            "label": "Base",
+            "stripe_price_id": "price_component_source_owns_this",
+        }),
+    )
+    .await;
+
+    seed_row(
+        ctx,
         PURCHASES_TABLE,
         "purchase_1",
         json!({ "user_id": user_id }),
@@ -300,6 +314,8 @@ async fn export_carries_products_but_never_secrets_or_orders() {
     assert_eq!(offer["stripe_price_id"], json!(""));
     assert_eq!(offer["sync_status"], json!("not_synced"));
     assert_eq!(offer["sync_error"], json!(""));
+    let component = &snap.tables[OFFER_COMPONENTS_TABLE][0];
+    assert_eq!(component["stripe_price_id"], json!(""));
 }
 
 // ---------------------------------------------------------------------------
