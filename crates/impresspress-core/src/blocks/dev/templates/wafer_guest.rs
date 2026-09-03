@@ -422,7 +422,16 @@ pub mod json {
             // `serde_json` decodes `3` as an integer and `3.0` as a float,
             // and a wire field typed `i64` refuses the latter.
             Json::Num(number) => {
-                if number.fract() == 0.0 && number.abs() < 1e15 {
+                if !number.is_finite() {
+                    // JSON has no `Infinity` and no `NaN`. The parser refuses
+                    // to produce one, but block code can still build one by
+                    // arithmetic (`1.0 / 0.0`), and `f64::to_string` would
+                    // then write the bare token `inf` — which makes the WHOLE
+                    // document unparseable to the host, losing the response
+                    // rather than one field. `null` is the value every JSON
+                    // decoder accepts for "no number here".
+                    out.push_str("null");
+                } else if number.fract() == 0.0 && number.abs() < 1e15 {
                     out.push_str(&(*number as i64).to_string());
                 } else {
                     out.push_str(&number.to_string());
@@ -518,6 +527,12 @@ pub mod json {
             std::str::from_utf8(&self.s[start..self.i])
                 .ok()
                 .and_then(|text| text.parse::<f64>().ok())
+                // `f64::from_str` answers `inf` for a literal too large to
+                // represent (`1e999`). Accepting it would put a value in the
+                // tree that JSON cannot express, and the renderer would turn
+                // it back into `null` — a silent change of the host's data.
+                // A number this codec cannot hold is a parse error instead.
+                .filter(|number| number.is_finite())
                 .map(Json::Num)
                 .ok_or_else(|| format!("bad number at byte {start}"))
         }
@@ -559,9 +574,15 @@ pub mod json {
                                     }
                                     self.i += 2;
                                     let low = self.hex4()?;
-                                    code = 0x10000
-                                        + ((code - 0xD800) << 10)
-                                        + (low.wrapping_sub(0xDC00) & 0x3FF);
+                                    // Range-checked, not masked: `\\uD83D\\u0041`
+                                    // is two legal escapes that are not a pair,
+                                    // and folding the second one's bits into the
+                                    // first would invent a code point the
+                                    // document never contained.
+                                    if !(0xDC00..=0xDFFF).contains(&low) {
+                                        return self.err("expected a low surrogate");
+                                    }
+                                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                                 }
                                 out.push(
                                     char::from_u32(code).ok_or_else(|| {
@@ -2172,5 +2193,72 @@ pub mod log {
                 message.len() as i32,
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Edge cases of the JSON codec that no template exercises.
+///
+/// They live here, beside the code, rather than in the sandbox's own test
+/// suite: the sandbox reaches them anyway (its parity test includes this file
+/// with `#[path]`, and an integration-test crate is compiled with `cfg(test)`),
+/// and a block author running `cargo test` in their own crate gets them too.
+/// Nothing here is compiled into a block's `.wasm` — `cargo build` does not
+/// set `cfg(test)`.
+#[cfg(test)]
+mod tests {
+    use super::json::Json;
+
+    /// A `\u` pair whose second half is not a low surrogate is a parse error,
+    /// not a code point folded together out of two unrelated escapes.
+    #[test]
+    fn a_surrogate_pair_needs_a_real_low_surrogate() {
+        // The escapes below are written with `\\u` in ordinary string
+        // literals, so the JSON text really contains a backslash — a raw
+        // literal holding the character itself would exercise the UTF-8
+        // copy path instead, which is a different branch.
+        assert_eq!(
+            Json::parse("\"\\uD83D\\uDE80\"")
+                .expect("a real pair")
+                .as_str(),
+            Some("\u{1F680}"),
+        );
+        // Two legal escapes that are not a pair. `\u0041` is `A`; masking the
+        // low half instead of range-checking it folds the two together into
+        // U+1F441, a code point the document never contained.
+        assert!(Json::parse("\"\\uD83D\\u0041\"").is_err());
+        // A high surrogate with nothing after it.
+        assert!(Json::parse("\"\\uD83D\"").is_err());
+        // A low surrogate with nothing before it is not a code point at all.
+        assert!(Json::parse("\"\\uDE80\"").is_err());
+    }
+
+    /// A literal too large for an `f64` is a parse error, not an infinity the
+    /// renderer would silently turn back into `null`.
+    #[test]
+    fn a_number_that_overflows_is_a_parse_error() {
+        assert!(Json::parse("1e999").is_err());
+        assert!(Json::parse("-1e999").is_err());
+        assert_eq!(
+            Json::parse("1e308").expect("in range").as_f64(),
+            Some(1e308)
+        );
+    }
+
+    /// A non-finite number block code built by arithmetic renders as `null`.
+    /// JSON has no `Infinity`, and writing the bare token would cost the
+    /// whole document rather than one field.
+    #[test]
+    fn a_non_finite_number_renders_as_null() {
+        assert_eq!(Json::Num(f64::INFINITY).render(), "null");
+        assert_eq!(Json::Num(f64::NEG_INFINITY).render(), "null");
+        assert_eq!(Json::Num(f64::NAN).render(), "null");
+        let rendered = Json::obj().set("n", Json::Num(f64::NAN)).render();
+        assert_eq!(rendered, r#"{"n":null}"#);
+        // The point of the substitution: what comes out still parses.
+        assert!(Json::parse(&rendered).is_ok());
     }
 }

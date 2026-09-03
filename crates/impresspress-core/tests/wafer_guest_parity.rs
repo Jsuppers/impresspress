@@ -187,9 +187,11 @@ fn json_codec_round_trips_wire_shapes() {
         Json::parse(r#""a\"b\\c\né""#).expect("escapes").as_str(),
         Some("a\"b\\c\né")
     );
-    // Astral code points arrive as a surrogate pair.
+    // A 4-byte UTF-8 sequence survives the copy path verbatim. (The
+    // `\uD83D\uDE80` *escape* form is pinned by the codec's own tests, in
+    // `wafer_guest.rs`.)
     assert_eq!(
-        Json::parse(r#""🚀""#).expect("surrogate pair").as_str(),
+        Json::parse(r#""🚀""#).expect("astral character").as_str(),
         Some("🚀")
     );
     // What the guest renders is what `serde_json` reads.

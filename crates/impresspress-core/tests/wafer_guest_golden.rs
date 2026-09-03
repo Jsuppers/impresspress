@@ -10,17 +10,31 @@
 //!    symlink) and build it with **plain `cargo`** for `wasm32-wasip1`,
 //!    `--offline`, which is what proves the crate has no dependencies — the
 //!    browser toolchain the sandbox actually uses has no registry at all;
-//! 2. load the module into a real `Wafer` under wasmi, beside the real
-//!    `wafer-run/database` block over in-memory SQLite;
-//! 3. start the runtime, which runs the guest's `Init` — and therefore its
-//!    `db::ensure_table` — under the capabilities its own `BlockInfo`
-//!    declared;
+//! 2. load it the way the sandbox loads a staged block — read its
+//!    `BlockInfo` under deny-all, run the static rules over that, then
+//!    `WasmiBlock::load_with_capabilities_and_limits` with the capabilities
+//!    those rules ACCEPTED (see [`load_as_the_sandbox_does`]);
+//! 3. register it in a real `Wafer` beside the real `wafer-run/database`
+//!    block over in-memory SQLite and start the runtime, which runs the
+//!    guest's `Init` — and therefore its `db::ensure_table`;
 //! 4. drive HTTP requests through it and assert on the bytes that come back.
 //!
 //! Everything between the template's source and the response body is the
-//! production path: the ABI exports, the JSON host codec, WRAP's
-//! own-namespace rule, the `schema` capability, and the real database
+//! production path: the same three-step load `impresspress-web`'s
+//! `dev_runtime::load_guest` performs, the ABI exports, the JSON host codec,
+//! WRAP's own-namespace rule, the `schema` capability, and the real database
 //! handler.
+//!
+//! Two things this cannot claim. `WasmiBlock`'s linker defines every host
+//! import regardless of the capability set — enforcement is per call, off the
+//! store's host state — so there is no load-time import filtering here to
+//! exercise. And `Wafer::start()` recomputes each block's effective
+//! capabilities as `declared ∩ config` and pushes them back into the block
+//! (`runtime/seal.rs::compute_effective_capabilities`), so the set passed at
+//! load is replaced before the first request. Loading through the production
+//! constructor with the accepted spec still matters: it is the call
+//! production makes, it is what a probe (which never reaches `start`) runs
+//! under, and it keeps this test honest if either of those two facts changes.
 //!
 //! # When it does not run
 //!
@@ -33,9 +47,10 @@
 
 use std::{path::Path, process::Command, sync::Arc};
 
-use wafer_block::{http_codec, streams::input::InputStream, Message};
+use impresspress_core::blocks::dev::{control::DynamicBlockSpec, validation};
+use wafer_block::{http_codec, streams::input::InputStream, BlockCapabilities, Message};
 use wafer_block_sqlite::service::SQLiteDatabaseService;
-use wafer_run::{wasm::WasmiBlock, Wafer};
+use wafer_run::{wasm::WasmiBlock, ResourceLimits, Wafer};
 
 // ---------------------------------------------------------------------------
 // Building a template
@@ -203,6 +218,50 @@ fn golden_wafer() -> Wafer {
     wafer
 }
 
+/// Load `wasm` exactly as the sandbox loads a staged block, and report the
+/// spec it was admitted under.
+///
+/// Three steps, in production's order (`blocks/dev/blocks_api.rs::stage` and
+/// `impresspress-web/src/dev_runtime.rs::load_guest`):
+///
+/// 1. **inspect** — instantiate under [`BlockCapabilities::none`] and read the
+///    guest's own `BlockInfo`. No lifecycle event runs, because nothing has
+///    approved the capability set that is *inside* the value being read.
+/// 2. **the rules** — [`validation::validate_static`] turns that declaration
+///    into an accepted [`DynamicBlockSpec`], refusing anything outside the
+///    block's namespace.
+/// 3. **load** — [`WasmiBlock::load_with_capabilities_and_limits`] with
+///    `spec.capabilities` (the accepted set, never the raw declaration) and
+///    [`ResourceLimits::default`], which is the fuel/memory pair
+///    `dev_runtime::guest_limits` also builds.
+///
+/// A `load_from_bytes` here would be `BlockCapabilities::unrestricted()` — a
+/// set no staged block is ever handed, and one that would make step 2's
+/// refusals irrelevant to what actually ran.
+fn load_as_the_sandbox_does(name: &str, wasm: &[u8]) -> (WasmiBlock, DynamicBlockSpec) {
+    let inspected = WasmiBlock::load_with_capabilities(wasm, BlockCapabilities::none())
+        .unwrap_or_else(|e| panic!("inspect-load {name}: {e}"));
+    let info = wafer_run::Block::info(&inspected);
+
+    let spec = validation::validate_static(
+        name,
+        &info,
+        "sha",
+        &validation::builtin_route_prefixes(),
+        &[],
+        &std::collections::BTreeSet::new(),
+    )
+    .unwrap_or_else(|found| panic!("the compiled {name} template was refused: {found:?}"));
+
+    let block = WasmiBlock::load_with_capabilities_and_limits(
+        wasm,
+        spec.capabilities.clone(),
+        ResourceLimits::default(),
+    )
+    .unwrap_or_else(|e| panic!("load {name} under its accepted capabilities: {e}"));
+    (block, spec)
+}
+
 /// The `Message` the HTTP boundary builds for a request, plus the auth meta
 /// the auth layer would have added.
 fn http_msg(method: &str, path: &str, auth: &[(&str, &str)]) -> Message {
@@ -232,7 +291,13 @@ async fn table_template_creates_its_table_and_serves_its_endpoints() {
     }
     let wasm = build_template("table");
     let mut wafer = golden_wafer();
-    let block = WasmiBlock::load_from_bytes(&wasm).expect("load the newsletter module");
+    // Loaded under the capabilities the sandbox's rules accepted — including
+    // `schema: true`, which is what lets the `Init` below create the table.
+    let (block, spec) = load_as_the_sandbox_does("newsletter", &wasm);
+    assert!(
+        spec.capabilities.schema,
+        "the accepted spec grants schema ops"
+    );
     wafer
         .register_block("site/newsletter", Arc::new(block))
         .expect("register site/newsletter");
@@ -362,7 +427,11 @@ async fn hello_template_answers() {
     }
     let wasm = build_template("hello");
     let mut wafer = golden_wafer();
-    let block = WasmiBlock::load_from_bytes(&wasm).expect("load the hello module");
+    // A block that claims nothing runs under a capability set that permits
+    // nothing — the production constructor, with `none()` as the accepted set.
+    let (block, spec) = load_as_the_sandbox_does("hello", &wasm);
+    assert!(!spec.capabilities.collections.is_enabled());
+    assert!(!spec.capabilities.schema);
     wafer
         .register_block("site/hello", Arc::new(block))
         .expect("register site/hello");
@@ -396,18 +465,9 @@ async fn a_compiled_template_reports_the_block_info_the_sandbox_accepts() {
         return;
     }
     let wasm = build_template("table");
-    let block = WasmiBlock::load_from_bytes(&wasm).expect("load the newsletter module");
-    let info = wafer_run::Block::info(&block);
-
-    let spec = impresspress_core::blocks::dev::validation::validate_static(
-        "newsletter",
-        &info,
-        "sha",
-        &impresspress_core::blocks::dev::validation::builtin_route_prefixes(),
-        &[],
-        &std::collections::BTreeSet::new(),
-    )
-    .unwrap_or_else(|found| panic!("the compiled template was refused: {found:?}"));
+    // `load_as_the_sandbox_does` IS the inspect → rules → load sequence, so
+    // reaching its second return value means the rules accepted the module.
+    let (_block, spec) = load_as_the_sandbox_does("newsletter", &wasm);
     assert_eq!(spec.name, "site/newsletter");
     assert_eq!(spec.routes[0].prefix, "/b/newsletter/");
     assert!(spec.capabilities.schema);
