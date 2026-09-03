@@ -5,8 +5,9 @@
  * rejected at deploy time — or, worse, half-served — fails in CI instead. The
  * four things that can go wrong here have all actually gone wrong once:
  *
- *   * a file over Cloudflare's 25 165 824 byte static-asset limit (which is
- *     why the component is split at all),
+ *   * a file over the 24 MiB (25 165 824 byte) cap this package holds itself
+ *     to — deliberately under Cloudflare's 25 MiB static-asset limit, and why
+ *     the component is split at all,
  *   * a `manifest.json` that disagrees with the bytes next to it, because a
  *     file was regenerated without rewriting the manifest,
  *   * the composed `vfs.core-*.wasm` left beside its `.br.part-NNN` files,

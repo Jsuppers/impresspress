@@ -2,8 +2,9 @@
  * Brotli-compress `vfs.core-<hash>.wasm` and split it into parts small enough
  * to serve as static assets, then delete the original.
  *
- * Cloudflare refuses a static asset over 25 165 824 bytes and the composed
- * component is an order of magnitude past that, so the browser reassembles it:
+ * Parts are capped at 24 MiB (25 165 824 bytes), under Cloudflare's 25 MiB
+ * static-asset limit, and the composed component is an order of magnitude
+ * past that, so the browser reassembles it:
  * `vfs-runner.ts` reads `<name>.wasm.br.json`, fetches the parts in order and
  * pipes them through a brotli decoder into `WebAssembly.compileStreaming`.
  * The manifest shape is rubrc's (`page/src/worker_process/util_cmd.ts` reads

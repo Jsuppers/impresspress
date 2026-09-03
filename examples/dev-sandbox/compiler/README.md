@@ -25,6 +25,8 @@ compiler/
   PIN.json                       every input: rubrc's commit, the composer, Binaryen, the sysroot
   src/ansi.ts                    ANSI stripping for the shell transcript
   build-compiler.sh              PIN.json -> dist/<version>/            (~55 min cold, 6-50 s incremental)
+  pack-dist.sh                   a built dist/ -> the release asset       ("Publishing the compiler")
+  fetch-dist.sh                  the release asset -> dist/              (what a deploy runs)
   src/protocol.ts                the page <-> worker contract
   src/worker-entry.ts            the worker the page creates
   src/vfs-runner.ts              the worker that runs the toolchain component
@@ -32,6 +34,8 @@ compiler/
   scripts/prepare-vfs-asset.mjs  brotli + split the composed wasm
   scripts/write-manifest.mjs     dist/manifest.json
   scripts/verify-compiler-assets.mjs   what `build.sh --check` runs
+  scripts/compose-decision.sh    whether phase 3 may reuse the component on disk
+  scripts/test-build-kind.sh     that decision, over a fake tree            (`bash` test)
   scripts/serve-probe.mjs        the probe's server, with the sandbox's COOP/COEP
   scripts/run-probe.mjs          runs the probe headlessly and prints the numbers
   dist/                          gitignored build output, overlaid at /__impresspress_dev/compiler/
@@ -39,7 +43,10 @@ compiler/
 ```
 
 `dist/` is not committed: it is 72 MB (365 MiB before compression), and it is
-fully determined by `PIN.json`, so CI caches it on that file's hash (Task 8).
+fully determined by `PIN.json`. A deploy gets it from a **release asset** the
+developer publishes for that pin (see "Publishing the compiler"); the CI jobs
+that only test whether the compiler still works try the same asset and fall
+back to a cache keyed on the pin, and then to a `--fast` composition.
 
 **`dist/` holds exactly one version.** The whole directory is overlaid onto the
 bundle, so a version directory left behind by a pin bump would be deployed
@@ -88,6 +95,17 @@ the packaging itself. `dist/manifest.json` records `"build": "fast"` and
 `--fast` tree cannot reach a deploy by accident. (Implemented, not exercised —
 see "Not confirmed".)
 
+Which kind a component IS is recorded beside it, in `.build-kind`, at the
+moment it is composed, and the manifest reports that rather than what the
+current run asked for. Phase 3 is skipped when `vfs.core.wasm` is already
+there, so `--fast` followed by a plain run would otherwise stamp
+`"build": "full"` on a component nobody optimized — and the verifier, which is
+the only thing keeping `--fast` out of a deploy, would accept it. A plain run
+over a `fast` component recomposes; over a component composed before
+`.build-kind` existed it stops and says which one line to write, rather than
+spending 35 minutes to find out. `scripts/test-build-kind.sh` is that whole
+decision table, run against a fake tree in under a second.
+
 The one exception is deliberate and explicit:
 
 ```bash
@@ -125,10 +143,11 @@ cross-origin request at all.
 
 ### Why the component is split
 
-Cloudflare will not serve a static asset over 25 165 824 bytes and the
-composed component is 365 MiB (the four toolchain modules going in are
-~230 MB; single-memory lowering grows them). `prepare-vfs-asset.mjs` brotli-compresses it
-and splits it into `vfs.core-<hash>.wasm.br.part-NNN` beside a
+Parts are capped at 24 MiB (25 165 824 bytes) — deliberately under
+Cloudflare's 25 MiB (26 214 400 byte) static-asset limit, which nothing here
+has ever observed from a real upload — and the composed component is 365 MiB
+(the four toolchain modules going in are ~230 MB; single-memory lowering grows
+them). `prepare-vfs-asset.mjs` brotli-compresses it and splits it into `vfs.core-<hash>.wasm.br.part-NNN` beside a
 `vfs.core-<hash>.wasm.br.json` describing them; `vfs-runner.ts` fetches the
 parts in order, pipes them through a brotli decoder into
 `WebAssembly.compileStreaming`, and caches the compiled module in IndexedDB so
@@ -153,6 +172,41 @@ component we could pin instead of composing. It does not: `v1-dist`
 v1") is a snapshot of the old *page* — Monaco, xterm, their chunks — with no
 `vfs.core-*` file in it at all. So we compose, from the pinned sources, with
 pinned tools.
+
+## Publishing the compiler
+
+**The deploy does not build the compiler. It downloads the one you built.**
+
+`build-compiler.sh` without `--fast` is ~55 minutes and peaks at 12.6 GB of
+RSS. No GitHub-hosted runner has that, so `deploy-dev-sandbox.yml` runs
+`fetch-dist.sh` instead, which pulls a release asset and fails — loudly, and
+with these instructions — when there is none for the pinned version. Publish
+one whenever `PIN.json` moves, and before the pin bump reaches `main`:
+
+```bash
+compiler/build-compiler.sh    # once, on a machine with the memory
+compiler/pack-dist.sh         # verifies, tars, and prints the command below
+gh release create compiler-<version> .cache/compiler-dist-<version>.tar \
+  --title 'Compiler dist <version>' --notes '…'
+```
+
+`<version>` is `PIN.json`'s `version` — rubrc's commit at eight characters —
+so the tag, the asset and the tree inside it all move together and a checkout
+can only ever be handed the toolchain its own pin asks for. An existing
+release takes `gh release upload <tag> <asset> --clobber` instead.
+
+Both halves refuse a `--fast` tree, and refuse it directly rather than
+through `IMPRESSPRESS_COMPILER_ALLOW_FAST`: the correctness-CI jobs export
+that variable for their whole job and they run `fetch-dist.sh` too, so a check
+that honoured it would be no check at all there. `pack-dist.sh` will not pack
+a `"build": "fast"` manifest and `fetch-dist.sh` will not accept one.
+
+`fetch-dist.sh` uses `gh` when it is installed and `curl` otherwise, unpacks
+into an emptied `dist/`, and runs `verify-compiler-assets.mjs` over what
+landed — every file against the manifest's sha256, nothing over the 24 MiB
+per-part cap, and the manifest's pin against `PIN.json`'s. It is a no-op when
+`dist/` already holds a verified tree for the pin, so calling it twice costs
+one hash pass.
 
 ## The protocol
 
@@ -254,7 +308,7 @@ Every line below is from a run on 2026-09-03 against `dist/807ace9e`
 | artifact | **88 892 bytes**, instantiates, exports the whole wafer ABI |
 | `compile` of the same crate with a syntax error | 5 585 ms |
 | total download to first `ready` | **75.1 MB** (13 files: 55.4 MB of component parts, 18.9 MB sysroot, 0.8 MB JS) |
-| largest single file | **25 165 824 bytes** — `vfs.core-*.wasm.br.part-001`, exactly the cap |
+| largest single file | **25 165 824 bytes** — `vfs.core-*.wasm.br.part-001`, exactly our 24 MiB cap |
 
 1. **The worker starts from a same-origin module URL, and its subordinate
    workers resolve theirs after bundling.** `new Worker('./807ace9e/worker.js',
@@ -280,7 +334,7 @@ Every line below is from a run on 2026-09-03 against `dist/807ace9e`
    module that links but is missing one is not a block and the sandbox would
    only discover that at activation. Under the 200 KB the design assumed and
    well under the sandbox's 4 MiB limit. Confirmed.
-5. **Sizes.** Largest file 25 165 824 bytes (a part, at the cap); total
+5. **Sizes.** Largest file 25 165 824 bytes (a part, at our 24 MiB cap); total
    75.1 MB, of which 55.4 MB is the component's three brotli parts (365.3 MiB
    of wasm compressed to 52.8 MiB), 18.9 MB the vendored sysroot and 0.8 MB
    the JS. Confirmed.
@@ -338,7 +392,8 @@ Everything above was measured. These were not, and should not be assumed:
 * **The Cloudflare edge is untested.** Everything ran against
   `scripts/serve-probe.mjs`, which sets the same two headers the deployment
   does but is not a CDN: no range requests, no compression negotiation, no
-  cache. The 25 165 824 byte limit is enforced by our verifier, not observed
+  cache. The 24 MiB (25 165 824 byte) per-part cap is our own, enforced by
+  our verifier; Cloudflare's 25 MiB limit it sits under was never observed
   from a real upload.
 * **`rustc 1.83.0-dev` is whatever rubrc's pinned commit embeds**, not a
   version we chose or can bump independently. The templates and

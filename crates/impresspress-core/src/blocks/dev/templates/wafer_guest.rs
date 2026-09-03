@@ -1202,7 +1202,11 @@ impl Block {
     }
 
     /// Declare the platform services this block calls: any of
-    /// [`DATABASE`], [`STORAGE`], [`CONFIG`] and `wafer-run/logger`.
+    /// [`DATABASE`], [`STORAGE`] and [`CONFIG`].
+    ///
+    /// Logging is not one of them, which is why there is no constant for it:
+    /// [`log`] reaches the host directly (`__wafer_host_log`) rather than
+    /// through a block call, so it is available without being declared.
     ///
     /// It is also the block's `callable_blocks` capability — the two are two
     /// spellings of one fact, so this module renders both from this one list
@@ -1229,7 +1233,9 @@ impl Block {
     }
 
     /// Claim a config key. Must start with `SITE__{NAME}__`, the block's own
-    /// name uppercased with hyphens turned into underscores.
+    /// name uppercased — hyphens in the block name stay hyphens here, as they
+    /// do in [`collection`](Block::collection), so `my-shop` claims
+    /// `SITE__MY-SHOP__*`.
     pub fn config_key(mut self, key: &str) -> Block {
         self.config_keys.push(key.to_string());
         self

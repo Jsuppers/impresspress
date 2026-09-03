@@ -24,6 +24,13 @@ half of a block id all at once, so the alphabet is the intersection of what
 all three accept. There is no underscore: the runtime refuses one in a block
 id.
 
+**`src/` is flat.** Put every module beside `lib.rs` — `src/handlers.rs`, not
+`src/handlers/mod.rs`. The sandbox refuses a nested path with a
+`nested-source` diagnostic: the browser toolchain writes each file into its
+VFS by path, and whether that creates the intermediate directories has not
+been verified, so a crate laid out that way would fail somewhere inside
+rustc rather than here.
+
 A block named `<name>` is registered as `site/<name>` and everything else
 follows from that:
 
@@ -53,6 +60,14 @@ clients. No `serde`, no `serde_json`, no `uuid`, no `chrono`.
 There are no procedural macros either, so there is nothing to derive. A
 struct that has to cross the wire is built as a `json::Json` value by hand.
 
+`[package] name` must stay equal to the block's directory name, and if you
+add a `[lib] name` it must too. Between them they decide what cargo calls the
+built `.wasm`, and the sandbox reads that one file back out of the VFS by the
+block's name — rename either and the build succeeds with nothing to collect.
+The sandbox refuses the mismatch before it compiles, with a `package-name`
+diagnostic. (Hyphens become underscores in the file name, as cargo does it:
+`my-shop` builds `my_shop.wasm`.)
+
 ## The `block()` and `init()` functions
 
 `src/lib.rs` must define exactly two public functions. The vendored module's
@@ -70,12 +85,18 @@ gets. A collection you do not claim is a `PermissionDenied` at run time.
 
 ```rust
 Block::new("site/newsletter", "Newsletter signups")
+    .version("0.2.0")                            // defaults to "0.1.0"
     .requires(&[DATABASE])                       // DATABASE / STORAGE / CONFIG
     .collection("site__newsletter__subscribers") // also turns on `schema`
     .storage_folder("site/newsletter")
     .config_key("SITE__NEWSLETTER__FROM_ADDRESS")
     .endpoint(/* … */)
 ```
+
+`.version(..)` is the version the block reports about itself, and it is only
+that: the sandbox versions a deployment by generation, so nothing routes,
+caches or refuses on it. Set it if it means something to you, leave it alone
+if it does not.
 
 `init()` runs once, when the block is activated, and is where a block creates
 its tables. It is run again on every activation, so it must be idempotent —
@@ -138,6 +159,12 @@ let out = Json::obj()
 `as_str`, `as_i64`, `as_f64`, `as_bool` and `as_array` all return `None` when
 the value is of another type — `as_i64` on `1.5` is `None`, never a truncated
 `1`.
+
+`Json::parse(text) -> Result<Json, String>` reads one complete document —
+trailing data is an error, not something ignored — and `value.render()`
+writes it back as compact JSON. `Response::json` renders for you, so these
+two are for the text you handle yourself: a JSON column read out of a record,
+a body you want to log.
 
 ## Routes and path params
 
@@ -308,6 +335,9 @@ for the operator. Never put a host error's message in a response body on a
 public route: it can name internals. Log it, and answer with something
 generic.
 
+Logging needs no declaration: it is a direct host call, not a cross-block
+one, so `wafer-run/logger` does not belong in `.requires(..)`.
+
 ## Errors from the host
 
 Every `db::*`, `storage::*` and `config::*` call returns
@@ -341,7 +371,7 @@ it just tried to reach. Fix the declaration in `block()`, not the call.
 | Workspace total | ≤ 64 MiB of stored blobs |
 | Blocks per workspace | 16 |
 | Network | none — a block cannot make outbound requests |
-| Cross-block calls | only `wafer-run/database`, `wafer-run/storage`, `wafer-run/config`, `wafer-run/logger` |
+| Cross-block calls | only `wafer-run/database`, `wafer-run/storage`, `wafer-run/config` |
 | Raw SQL / raw DDL | never granted |
 | Crypto, vector indexes | never granted |
 | Sensitive headers | never granted — a block never sees the session cookie |
@@ -390,6 +420,9 @@ The codes you are most likely to see:
 | `cap-callable` / `cap-requires-mismatch` | `requires` must name exactly the platform services you use |
 | `tool-name-duplicate` | Another block already publishes that agent tool name |
 | `route-collision` | Another block, or a built-in route, already serves that prefix |
+| `binary-source` | A file under `blocks/<name>/` the toolchain cannot read as text |
+| `package-name` | `Cargo.toml`'s `[package] name` must be the block's directory name |
+| `nested-source` | A file in a subdirectory of `src/` — the layout is flat |
 | `artifact-too-large` | Restore the `[profile.release]` size settings |
 | `wafer-guest-version` | Rescaffold: the block was built against an older `wafer_guest.rs` |
 | `guest-load` / `guest-info` / `guest-init` / `guest-probe` | The module was loaded and something failed at that stage — the message is the host's |

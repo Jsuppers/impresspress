@@ -940,6 +940,74 @@ and read together with this list.
     `SUGGESTED_PROMPT` (`blocks/dev/page.rs`) tell the agent to, and the
     seed's `site/index.html` does.
 
+18. **§6.2 / §7.4 / §8 / §13 / §15 / Plan 3 — the guest surface as built, and
+    the rulings the plan settled.** Plan 3 landed `wafer_guest.rs`, the Rubrc
+    packaging and the compile path; seven things it decided differ from, or
+    are not written in, the sections above.
+
+    *§6.2 overstates the module.* `db::` is
+    `{ensure_table, create, get, list, update, delete, count}` — there is no
+    `upsert`, no `create_table`, no `create_index` and no `add_column`.
+    `ensure_table` takes a `TableDef` that carries its own indexes, which is
+    the shape `DatabaseService` already had (amendment 2), so `create_index`
+    would have been a second spelling of one wire op. `storage::{get, put,
+    delete, list}`, `config::get` and `log::{error, warn, info, debug}` are as
+    written. `Ctx` is a **unit type**: it carries no cancellation state and no
+    handle, because nothing in the guest ABI can observe a cancelled request —
+    it is the token that says a call is being made from inside a request or an
+    `init`, and it is passed by reference so it can gain a body later without
+    touching a signature. `log::*` is a direct host import
+    (`__wafer_host_log`), not a cross-block call, so `wafer-run/logger` is not
+    in `requires` and the module has no constant for it.
+
+    *The service worker is the deployment's header layer.* Amendment 14 made
+    cross-origin isolation deployment-wide but left "where" open. It is
+    `sw.js`: the one thing that ships inside the bundle and sits in front of
+    every same-origin request, where "every static host must be configured"
+    has no enforcement point at all. Two consequences worth stating: every
+    bypassed asset in a dev bundle now round-trips through the service
+    worker's JS (streamed, not buffered), and this partly supersedes amendment
+    14's account of where the isolation comes from — the browser runtime still
+    sets the headers on what it renders, but the bypass list is covered by the
+    worker.
+
+    *`Diagnostic.code` is `Option<String>`.* rustc does not number every
+    diagnostic, and a page that invented a code for the unnumbered ones would
+    be a mapping layer over a wire that already says "absent". Every producer
+    in the crate still sets one; the two page-produced diagnostics carry their
+    own.
+
+    *The guest `Method` has no `Put`.* Not a simplification — the runtime's
+    endpoint type has no such method, so a block declaring one would fail to
+    load. `Patch` for a partial update, `Post` for a replacement.
+
+    *`--fast` composition, and who may use it.* `build-compiler.sh --fast`
+    skips `wasm-opt` for local iteration and for the CI jobs that only need to
+    know the compiler still works; `dist/manifest.json` records
+    `"build": "fast"` and `verify-compiler-assets.mjs` refuses it unless
+    `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` says this is that job. The deploy
+    path never sets it. The kind is recorded beside the composed component
+    (`.build-kind`) rather than derived from the current invocation's flag,
+    because phase 3 is skipped when the component already exists.
+
+    *The adapter owns both compile budgets.* Start-up is guarded by a 360 s
+    **silence** watchdog re-armed on every `progress`, not a ceiling — it must
+    not pre-empt the worker's own 300 s per-step guards, and what it detects is
+    a toolchain that has stopped talking. A compile gets 120 s, enforced
+    page-side by sending `cancel` and terminating; the worker's own 10-minute
+    limit is a backstop for a wedged shell.
+
+    *§15 — the optimized `dist/` is a release asset.* Composing it is ~35
+    minutes of `wasm-opt -Oz` peaking at 12.6 GB of RSS, which no
+    GitHub-hosted runner has, and it is fully determined by `PIN.json`. So a
+    developer builds it once per pin, publishes it as
+    `compiler-dist-<version>.tar` on tag `compiler-<version>`
+    (`compiler/pack-dist.sh`), and `deploy-dev-sandbox.yml` runs
+    `compiler/fetch-dist.sh` — which verifies every file against the manifest
+    inside, requires `"build": "full"`, and fails the deploy with instructions
+    when there is no asset for the pin. The correctness-CI jobs try the same
+    asset first and fall back to a cache and then to a `--fast` composition.
+
 ## 21. Definition of done
 
 - `browser-devtools` is off by default and absent from a normal bundle; the

@@ -17,6 +17,9 @@
 //! is what lets `db::ensure_table` create the table. Raw SQL and raw DDL are
 //! never granted.
 
+// The `cfg` gate lets the sandbox's own parity test compile this file for the
+// host; a host `cargo check` fails on the unconditional `use` below. A block
+// is built for wasm32-wasip1, where the module is there.
 #[cfg(target_arch = "wasm32")]
 mod wafer_guest;
 

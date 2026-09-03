@@ -11,6 +11,10 @@
 // `wafer_guest.rs` sits beside this file. It is vendored, not a dependency —
 // the browser toolchain has no registry access, so `Cargo.toml`'s
 // `[dependencies]` table is empty and the whole SDK is that one module.
+//
+// The `cfg` gate lets the sandbox's own parity test compile this file for the
+// host; a host `cargo check` fails on the unconditional `use` below. A block
+// is built for wasm32-wasip1, where the module is there.
 #[cfg(target_arch = "wasm32")]
 mod wafer_guest;
 
