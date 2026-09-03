@@ -434,6 +434,10 @@ jobs:
           done
           curl -sf http://localhost:8082/seed/manifest.json > /dev/null
 
+      # Teed to a file (not just printed) so the timing-baseline step below can
+      # grep the `console.log(...elapsed...)` lines dev-foundations.spec.ts
+      # and dev-workspace.spec.ts print — pipefail is on by default for `run:`
+      # steps on Linux runners, so `tee` does not swallow a test failure here.
       - name: Run dev sandbox e2e (browser WASM, port 8082)
         working-directory: crates/impresspress-web
         env:
@@ -443,7 +447,7 @@ jobs:
         # because it needs the packaged worker only to prove it STARTS under
         # the isolation headers — it compiles nothing, so it costs ~35 s and
         # belongs with the other fake-worker specs.
-        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts
+        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts tests/e2e/dev-compiler.spec.ts tests/e2e/dev-compile-tool.spec.ts | tee /tmp/dev-sandbox-e2e.log
 
       - name: Stop server
         if: always()
@@ -459,6 +463,29 @@ jobs:
           name: playwright-report-dev-sandbox
           path: crates/impresspress-web/playwright-report/
           retention-days: 7
+
+      # `pkg/` (downloaded above) and `pkg-dev/` (built by build.sh, above)
+      # both already exist at this point, so this only measures — it never
+      # rebuilds. Fails the job on a size-threshold breach; see measure.sh's
+      # header for what's gated and why.
+      - name: Measure dev-sandbox bundle sizes
+        run: examples/dev-sandbox/measure.sh >> "$GITHUB_STEP_SUMMARY"
+
+      # Baseline only — no thresholds (see measure.sh's header for the sizes
+      # that DO gate). `always()` so this still records whatever timing lines
+      # made it into the log even if the e2e run or the size gate above
+      # failed.
+      - name: Record dev-sandbox timing baseline
+        if: always()
+        run: |
+          {
+            echo
+            echo '## Dev-sandbox timing baseline (no thresholds)'
+            echo
+            echo '```'
+            grep -E ': [0-9]+ ms$' /tmp/dev-sandbox-e2e.log || echo 'no timing lines captured'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   e2e-dev-compile:
     name: E2E dev sandbox (Rubrc compiles a block in the browser)
