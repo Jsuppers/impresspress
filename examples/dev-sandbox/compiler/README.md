@@ -11,8 +11,12 @@ the commit `PIN.json` names, builds its component with rubrc's own recipe, and
 bundles **our** worker against two of its source trees. The pieces we wrote are
 `src/worker-entry.ts` (the protocol, the WASI farm, the artifact capture),
 `src/vfs-runner.ts` (rubrc's `util_cmd.ts` with the UI taken out) and the
-scripts. Everything else is rubrc's, at its own licence: MIT OR Apache-2.0,
-which is also the licence of the rustc/cargo/LLVM wasm it embeds.
+scripts. Everything else is rubrc's, at its own licence: MIT OR Apache-2.0.
+The toolchain wasm it embeds inherits rustc's, cargo's and rust-analyzer's
+MIT OR Apache-2.0 — except `llvm_opt.wasm`, which is a build of LLVM and is
+therefore **Apache-2.0 WITH LLVM-exception**. `PIN.json`'s `licenses` records
+each of them; `dist/manifest.json`'s single `license` field reports the
+package as a whole.
 
 ## Layout
 
@@ -34,20 +38,54 @@ compiler/
   .rubrc/ .cache/ node_modules/  gitignored build inputs
 ```
 
-`dist/` is not committed: it is a quarter of a gigabyte, and it is fully
-determined by `PIN.json`, so CI caches it on that file's hash (Task 8).
+`dist/` is not committed: it is 72 MB (365 MiB before compression), and it is
+fully determined by `PIN.json`, so CI caches it on that file's hash (Task 8).
+
+**`dist/` holds exactly one version.** The whole directory is overlaid onto the
+bundle, so a version directory left behind by a pin bump would be deployed
+alongside the current one without anything having checked it.
+`build-compiler.sh` removes the others and `verify-compiler-assets.mjs` fails
+on anything under `dist/` that is not `manifest.json` or the version the
+manifest names.
 
 ## Building
 
 ```bash
 compiler/build-compiler.sh          # or: examples/dev-sandbox/build.sh, which calls it when stale
+compiler/build-compiler.sh --fast   # local iteration only; see below
 ```
 
 Needs node >= 22, rustup, curl and tar. It downloads what it needs (rubrc,
 `wasi_virt_layer-cli`, Binaryen, the sysroot tarball), checks every download
-against the sha256 in `PIN.json`, and caches each phase, so a re-run after
-editing `src/**` takes seconds. From cold it takes about twenty minutes,
-almost all of it `wasm-opt -Oz` over ~230 MB of toolchain wasm.
+against the sha256 in `PIN.json`, and caches each phase.
+
+Measured on a 24-core box, and these are the real numbers, not estimates:
+
+| | |
+| --- | --- |
+| everything, from an empty tree | **~55 minutes** |
+| of which `wasm-opt -Oz` (phase 3) | ~35 minutes, peaking at **12.6 GB RSS** |
+| of which brotli + split (phase 5) | ~10 minutes |
+| `src/**` changed, component unchanged | **~50 seconds** |
+
+**A 7 GB CI runner will be OOM-killed in phase 3.** The final `wasm-opt` pass
+runs over a 410 MB merged module and wants 12.6 GB. `dist/` is fully
+determined by `PIN.json`, so CI should cache it on that file's hash and never
+build it; a machine that must build it needs a large runner.
+
+The ~50 second re-run is what it costs to change `src/worker-entry.ts`: the
+checkout, the composition and the split are all skipped, and what is left is
+vite hashing and copying the 365 MiB component into `dist/` and
+`prepare-vfs-asset.mjs` hashing it again to prove the parts on disk are a
+split of exactly those bytes, before deleting it.
+
+`--fast` composes with rubrc's `vfs:build:prod:no-opt`, which skips `wasm-opt`
+altogether: minutes instead of ~35, at the price of a much larger component —
+more parts, more download, more memory in the browser. It is for iterating on
+the packaging itself. `dist/manifest.json` records `"build": "fast"` and
+`verify-compiler-assets.mjs` REFUSES that, so `build.sh --check` fails and a
+`--fast` tree can never be deployed. (Implemented, not exercised — see "Not
+confirmed".)
 
 Two things the script insists on that are easy to get wrong by hand:
 
@@ -114,7 +152,20 @@ page → { type: 'cancel', id }
 ```
 
 * **One compile at a time.** A `compile` that arrives while another is in
-  flight is answered with a failed `result`, not queued.
+  flight is answered with a failed `result`, not queued. That request is
+  refused; the worker is fine.
+* **`broken` is terminal.** A failed `init` and any `cancel` put the worker
+  there and nothing takes it out. `compile` on a `broken` (or not yet `ready`)
+  worker is answered `{ type: 'error' }` — the adapter's signal to
+  `terminate()` and start a fresh one, rather than to retry.
+* **A `cancel` with nothing in flight is refused, not obeyed.** It answers
+  `{ type: 'error', id, message: 'nothing in flight' }` and changes no state:
+  a double click, or a cancel that raced the result it meant to cancel, must
+  not be able to brick a healthy worker.
+* **The 120 s compile budget is the adapter's, not the worker's.** The
+  worker's own 10-minute ceiling is a backstop for a shell that has wedged.
+  The sandbox's promise is enforced page-side, by sending `cancel` and then
+  terminating.
 * **The artifact is transferred**, not copied: after `result`, the buffer
   belongs to the page.
 * **`cancel` spends the worker.** Rubrc's shell runs a command on a session
@@ -124,9 +175,15 @@ page → { type: 'cancel', id }
   costs a re-instantiation, not a re-download — the compiled module is in
   IndexedDB.
 * **`diagnostics`** are `{ file, line, column, severity, message, code? }`.
-* **`stdout`** is the shell transcript with ANSI stripped (cargo writes its
-  diagnostics there); **`stderr`** is what the guest wrote to fd 2 outside the
-  shell's own stream, which is usually empty.
+* **`stdout` and `stderr` are split by content, not by file descriptor**,
+  because the guest's streams arrive already merged into one terminal
+  transcript. `stderr` is the build as a human would have seen it: rustc's own
+  `rendered` text for each diagnostic, then cargo's status output, then
+  anything written to fd 2 outside the shell's stream. `stdout` is the rest of
+  the session — `cargo clean` and the `download` that reads the artifact out
+  of the VFS. Cargo's `--message-format=json` protocol lines appear in
+  neither: they are what `diagnostics` is made of, so `stdout` is not a wall
+  of JSON.
 
 ### How a compile actually happens
 
@@ -166,11 +223,11 @@ Every line below is from a run on 2026-09-03 against `dist/807ace9e`
 
 | | |
 | --- | --- |
-| `ready` (cold: nothing cached) | **7 085 ms** (7.1-7.5 s over three runs) |
-| `ready` (warm: component in IndexedDB) | **6 834 ms** |
-| `compile` of the `hello` template, release, `wasm32-wasip1` | **37 863 ms** (cargo's own figure: 37.57 s) |
-| artifact | **88 892 bytes**, instantiates |
-| `compile` of the same crate with a syntax error | 5 663 ms |
+| `ready` (cold: nothing cached) | **11 329 ms** (7.1-11.9 s over five runs — it varies with what else the machine is doing) |
+| `ready` (warm: component in IndexedDB) | **7 019 ms** (6.8-8.0 s) |
+| `compile` of the `hello` template, release, `wasm32-wasip1` | **37 805 ms** (cargo's own figure: 37.57 s) |
+| artifact | **88 892 bytes**, instantiates, exports the whole wafer ABI |
+| `compile` of the same crate with a syntax error | 5 585 ms |
 | total download to first `ready` | **75.1 MB** (13 files: 55.4 MB of component parts, 18.9 MB sysroot, 0.8 MB JS) |
 | largest single file | **25 165 824 bytes** — `vfs.core-*.wasm.br.part-001`, exactly the cap |
 
@@ -192,20 +249,33 @@ Every line below is from a run on 2026-09-03 against `dist/807ace9e`
    dies before cargo emits JSON (a malformed `Cargo.toml`), but it was not
    needed here. Confirmed.
 4. **The release build of the std-only guest is 88 892 bytes and
-   instantiates**, exporting exactly the wafer ABI: `memory`,
-   `__wafer_alloc`, `__wafer_host_codec`, `__wafer_info`, `__wafer_handle`,
-   `__wafer_lifecycle`. Under the 200 KB the design assumed and well under
-   the sandbox's 4 MiB limit. Confirmed.
+   instantiates**, exporting the whole wafer ABI — the probe asserts all five
+   of `__wafer_alloc`, `__wafer_info`, `__wafer_handle`, `__wafer_lifecycle`
+   and `__wafer_host_codec` rather than printing what it found, because a
+   module that links but is missing one is not a block and the sandbox would
+   only discover that at activation. Under the 200 KB the design assumed and
+   well under the sandbox's 4 MiB limit. Confirmed.
 5. **Sizes.** Largest file 25 165 824 bytes (a part, at the cap); total
    75.1 MB, of which 55.4 MB is the component's three brotli parts (365.3 MiB
    of wasm compressed to 52.8 MiB), 18.9 MB the vendored sysroot and 0.8 MB
    the JS. Confirmed.
-6. **Times.** Cold 7.1 s, warm 6.8 s — within noise of each other. The warm start is not faster: on
-   localhost the download is not the cost — instantiating a 365 MiB module
-   and streaming the sysroot tarball into the VFS is, and the IndexedDB path
-   only skips the fetch and `compileStreaming`. Over a real network the gap
-   will open up; on a fast local one it does not. Confirmed, and worth
-   knowing before promising users a fast second visit.
+6. **A stray `cancel` does not brick the worker.** `cancel` with nothing in
+   flight is answered `{ type: 'error', message: 'nothing in flight' }`, and
+   the compile the probe runs immediately afterwards still succeeds — which is
+   the actual proof, since a broken worker would answer `error` there instead
+   of compiling. Confirmed.
+7. **`stdout` and `stderr` carry what they claim.** On the failing build,
+   `stderr` begins with rustc's own rendering (``error: expected `;`, found
+   `value` `` with the source excerpt and the `help:` line) and continues with
+   cargo's status output; `stdout` holds the `cargo clean` and `download`
+   lines. Neither contains a byte of cargo's JSON. Confirmed.
+8. **Times.** Cold 11.3 s, warm 7.0 s — but cold ranged 7.1-11.9 s across
+   five runs while warm stayed 6.8-8.0 s, so the honest reading is that on
+   localhost the two are close and the cache buys little. The download is not
+   what costs: instantiating a 365 MiB module and streaming the sysroot
+   tarball into the VFS is, and the IndexedDB path only skips the fetch and
+   `compileStreaming`. Over a real network the gap should open up; do not
+   promise users a fast second visit on the strength of these numbers.
 
 Two things this run also settled, neither of them predicted:
 
@@ -221,6 +291,37 @@ Two things this run also settled, neither of them predicted:
   through a variable to keep that resolution at runtime; do not "simplify"
   it back.
 
+
+## Not confirmed
+
+Everything above was measured. These were not, and should not be assumed:
+
+* **One target only.** `wasm32-wasip1` is the only sysroot vendored;
+  `load_sysroot` for any other triple resolves to a file that is not there and
+  fails. That is deliberate — the alternative is fetching from a third party —
+  but the sandbox is single-target until another tarball is pinned.
+* **`cancel` → `terminate()` → fresh worker was not run end to end.** The
+  refusal path is (a stray `cancel` is answered `error` and the worker keeps
+  working — the probe checks it); cancelling a *running* compile, terminating
+  and re-initialising is not. The adapter (Task 3) is where that gets
+  exercised.
+* **No page reload was measured.** The "warm" figure is a second worker in the
+  same page, which is the same IndexedDB but not the same code path a returning
+  visitor takes.
+* **Two compiles per worker, not more.** Nothing here says what a worker does
+  after twenty, or how the VFS's memory behaves over a long session.
+* **The Cloudflare edge is untested.** Everything ran against
+  `scripts/serve-probe.mjs`, which sets the same two headers the deployment
+  does but is not a CDN: no range requests, no compression negotiation, no
+  cache. The 25 165 824 byte limit is enforced by our verifier, not observed
+  from a real upload.
+* **`rustc 1.83.0-dev` is whatever rubrc's pinned commit embeds**, not a
+  version we chose or can bump independently. The templates and
+  `wafer_guest.rs` have to keep compiling on it, and a pin bump can move it.
+* **`--fast` has not been run.** It selects rubrc's own `no-opt` recipe and
+  marks the manifest so the verifier refuses it, but the composition has not
+  been exercised that way here.
+* **Nothing was checked against a browser other than chromium 146.**
 
 ## Updating the pin
 

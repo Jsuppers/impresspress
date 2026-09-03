@@ -107,12 +107,15 @@ print("seed/manifest.json matches seed/site/**", file=sys.stderr)
 PY
 }
 
-# The browser toolchain (`compiler/`) is a quarter of a gigabyte of composed
-# wasm and takes ~20 minutes to build, so it is built only when it is missing
-# or when `compiler/PIN.json` has moved since the tree in `compiler/dist/` was
-# produced. Everything about that tree — the rubrc commit, the sysroot, the
-# tools — comes from that one file, so comparing it against the built
-# manifest is the whole staleness test.
+# The browser toolchain (`compiler/`) is 365 MiB of composed wasm and takes
+# ~55 minutes to build from cold — and its `wasm-opt` pass peaked at 12.6 GB
+# RSS when it was measured, so it CANNOT run on a 7 GB CI runner: cache
+# `compiler/dist/` on `compiler/PIN.json` (which fully determines it) or use a
+# large runner. It is therefore built only when it is missing or when
+# `PIN.json` has moved since the tree in `compiler/dist/` was produced.
+# Everything about that tree — the rubrc commit, the sysroot, the tools —
+# comes from that one file, so comparing it against the built manifest is the
+# whole staleness test.
 compiler_is_current() {
   python3 - "$HERE" <<'COMPILERPIN'
 import json, pathlib, sys

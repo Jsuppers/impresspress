@@ -10,8 +10,14 @@
  *   * a `manifest.json` that disagrees with the bytes next to it, because a
  *     file was regenerated without rewriting the manifest,
  *   * the composed `vfs.core-*.wasm` left beside its `.br.part-NNN` files,
- *     which would ship a quarter of a gigabyte nobody fetches, and
- *   * a `dist/` built from a different pin than the one in the tree.
+ *     which would ship a quarter of a gigabyte nobody fetches,
+ *   * a `dist/` built from a different pin than the one in the tree,
+ *   * ANYTHING under `dist/` outside the one version directory the manifest
+ *     names — a leftover version from before a pin bump is overlaid and
+ *     served exactly like the current one, and nothing else here would look
+ *     at it, and
+ *   * a component composed by `--fast`, which skips `wasm-opt` and is for
+ *     local iteration only.
  *
  * Usage: node scripts/verify-compiler-assets.mjs
  */
@@ -43,6 +49,24 @@ if (manifest.rubrc?.sha !== pin.rubrc.sha) {
 }
 if (manifest.entry !== `/__impresspress_dev/compiler/${pin.version}/worker.js`) {
   problems.push(`manifest.json's entry is ${manifest.entry}, which is not this version's worker`);
+}
+if (manifest.build === "fast") {
+  problems.push(
+    "this component was composed by `build-compiler.sh --fast`, which skips wasm-opt — " +
+      "rebuild without --fast before deploying",
+  );
+}
+
+// dist/ holds exactly one version plus the manifest that names it. Everything
+// in this directory is overlaid onto the bundle, so a second version left
+// behind by a pin bump would be deployed without ever being checked.
+for (const entry of fs.readdirSync(dist, { withFileTypes: true })) {
+  if (entry.name === "manifest.json" && entry.isFile()) continue;
+  if (entry.name === manifest.version && entry.isDirectory()) continue;
+  problems.push(
+    `dist/${entry.name}: dist holds one version (${manifest.version}) plus manifest.json, ` +
+      "and everything here is deployed — remove it or rebuild",
+  );
 }
 
 const walk = (dir) =>

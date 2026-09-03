@@ -3,6 +3,14 @@
   "version": "807ace9e",
   "target": "wasm32-wasip1",
   "license": "MIT OR Apache-2.0",
+  "licenses": {
+    "rubrc": "MIT OR Apache-2.0 (root, lib and page package.json; the repo carries no LICENSE file)",
+    "rustc_cargo_rust_analyzer_wasm": "MIT OR Apache-2.0, inherited by the prebuilt rustc_opt.wasm / cargo_opt.wasm / lsp_opt.wasm",
+    "llvm_wasm": "Apache-2.0 WITH LLVM-exception \u2014 llvm_opt.wasm is a build of LLVM",
+    "wasi_virt_layer_cli": "MIT OR Apache-2.0 (LICENSE in the release tarball)",
+    "sysroot": "MIT OR Apache-2.0 \u2014 a build of the rust standard library",
+    "note": "`license` above is what dist/manifest.json reports for the package as a whole; the LLVM exception applies to the LLVM inside the composed component."
+  },
   "part_bytes": 25165824,
   "rubrc": {
     "repo": "https://github.com/oligamiq/rubrc",

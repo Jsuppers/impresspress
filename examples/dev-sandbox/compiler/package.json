@@ -8,7 +8,8 @@
   "scripts": {
     "build": "./build-compiler.sh",
     "verify": "node scripts/verify-compiler-assets.mjs",
-    "probe": "node scripts/serve-probe.mjs"
+    "probe": "node scripts/serve-probe.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
     "bun": "1.4.0",

@@ -43,6 +43,10 @@ const assets = walk(out)
 const manifest = {
   schema_version: 1,
   version,
+  // `fast` means the component was composed without wasm-opt
+  // (`build-compiler.sh --fast`): fine for local iteration, and refused by
+  // `verify-compiler-assets.mjs` so it can never be deployed.
+  build: process.env.COMPILER_BUILD_KIND === "fast" ? "fast" : "full",
   entry: `/__impresspress_dev/compiler/${version}/worker.js`,
   total_bytes: assets.reduce((n, asset) => n + asset.bytes, 0),
   assets,

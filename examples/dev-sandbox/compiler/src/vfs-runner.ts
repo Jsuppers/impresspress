@@ -204,7 +204,10 @@ const start = async (wasiRef: unknown) => {
   post({ type: "progress", stage: "initializing", detail: "instantiating" });
 
   const animal = new WASIFarmAnimal(
-    [wasiRef],
+    // A farm ref is an opaque structured-clone payload: `worker-entry.ts`
+    // produced it with `farm.get_ref()` and it arrived here by postMessage,
+    // so there is nothing this side can usefully assert about its shape.
+    [wasiRef] as ConstructorParameters<typeof WASIFarmAnimal>[0],
     [],
     [`VFS_THREADS=${VFS_THREADS}`],
     {

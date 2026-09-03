@@ -7,10 +7,29 @@
  * page loads the worker from already carries it.
  *
  * One compile at a time. The worker answers `compile` with exactly one
- * `result` carrying that request's `id`, and a `compile` that arrives while
- * another is in flight is answered with a failed `result` rather than queued:
- * the sandbox has one editor and one build button, and a queue would only
- * hide a bug in the page.
+ * terminal message carrying that request's `id`, and a `compile` that arrives
+ * while another is in flight is answered with a failed `result` rather than
+ * queued: the sandbox has one editor and one build button, and a queue would
+ * only hide a bug in the page.
+ *
+ * # States, and which of them the adapter must give up on
+ *
+ * The worker is `new`, then `initializing`, then `ready`, and `compiling`
+ * while a build runs. `broken` is terminal — nothing leaves it. Two things
+ * put it there: a failed `init`, and any `cancel`.
+ *
+ * * `compile` on a worker that is `broken` (or not yet `ready`) is answered
+ *   with `{ type: 'error' }`. That is the adapter's signal to `terminate()`
+ *   and start a fresh worker; sending another request is pointless.
+ * * `compile` on a worker that is merely busy is answered with a failed
+ *   `result`. THAT request is refused; the worker is fine.
+ *
+ * # Who owns the compile budget
+ *
+ * The worker does not. Its internal ceiling (10 minutes) is a backstop for a
+ * shell that has wedged; the 120 s budget the sandbox promises is the
+ * ADAPTER's policy, enforced by sending `cancel` and then terminating. A
+ * worker that answers slowly is not misbehaving — it is compiling.
  */
 
 /** `init` starts the toolchain: download, instantiate, load the sysroot. */
@@ -28,13 +47,21 @@ export type CompileMessage = {
 };
 
 /**
- * `cancel` abandons the in-flight compile.
+ * `cancel` abandons the in-flight compile. `id` is the compile's id.
  *
  * Rubrc's shell has no way to interrupt a running command from outside the
  * session thread that is blocked in it, so the worker cannot unwind a compile
  * in progress. It answers with `{ success: false, cancelled: true }` and is
  * then UNUSABLE: the adapter must `terminate()` it and `init` a fresh one.
  * The `cancelled` result is the signal to do that, not a resumption point.
+ * The abandoned build keeps running underneath until the worker is
+ * terminated; its `result` and any further `progress` for that id are
+ * dropped, so a cancelled compile still gets exactly one terminal message.
+ *
+ * A `cancel` that names nothing in flight — a double click, or one that raced
+ * the `result` it meant to cancel — is answered `{ type: 'error', id,
+ * message: 'nothing in flight' }` and changes nothing. It must not be able to
+ * brick a healthy worker.
  */
 export type CancelMessage = { type: "cancel"; id: string };
 
@@ -78,16 +105,36 @@ export type ResultMessage = {
   success: boolean;
   /** Transferred, not copied — the adapter owns the buffer after this. */
   artifact?: ArrayBuffer;
-  /** The shell transcript: cargo's own output, ANSI stripped. */
+  /**
+   * The session's other output, ANSI stripped: `cargo clean` and the
+   * `download` that reads the artifact out of the VFS.
+   *
+   * The guest's streams reach the worker already merged into one terminal
+   * transcript, so these two fields are split by content rather than by file
+   * descriptor — see `stderr`.
+   */
   stdout: string;
-  /** What the guest wrote to fd 2 outside the shell's own stream. */
+  /**
+   * The build as a human would have seen it, ANSI stripped: rustc's own
+   * rendering of each diagnostic, then cargo's status output, then anything
+   * the guest wrote to fd 2 outside the shell's stream.
+   *
+   * Cargo runs under `--message-format=json`, and those protocol lines are in
+   * neither field: they are what `diagnostics` is made of.
+   */
   stderr: string;
   diagnostics: Diagnostic[];
   elapsedMs: number;
   cancelled?: boolean;
 };
 
-/** Sent when the worker fails outside a request, e.g. the image is corrupt. */
+/**
+ * Sent when the worker cannot serve a request at all.
+ *
+ * `init` that fails, `compile` on a `broken` or not-yet-`ready` worker, and a
+ * `cancel` with nothing in flight. The first two mean "terminate me"; the
+ * third means "you cancelled nothing" and leaves the worker usable.
+ */
 export type ErrorMessage = { type: "error"; id: string; message: string };
 
 export type WorkerMessage =

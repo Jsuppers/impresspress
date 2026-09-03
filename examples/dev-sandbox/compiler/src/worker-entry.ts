@@ -61,15 +61,20 @@ const PROMPT = "$ ";
 /** `input_string` with this session id is the VFS's write-file event. */
 const WRITE_FILE_SESSION = 0xeeeeeeee;
 const SESSION = 0;
-/** Long enough for a cold `cargo build` of a std-only crate; see README. */
+/**
+ * The worker's hard backstop, NOT the sandbox's compile budget.
+ *
+ * The page owns the policy — Plan 0 budgets a compile at 120 s and the adapter
+ * enforces it by sending `cancel` and terminating the worker. This ceiling
+ * exists only so that a compile which has genuinely wedged (a shell that never
+ * returns its prompt) fails with a message instead of holding the worker for
+ * ever, and it is deliberately far above any budget a caller would set.
+ */
 const COMPILE_TIMEOUT_MS = 10 * 60 * 1000;
+/** Same idea for init: the sysroot is 18.9 MB of tar streamed into the VFS. */
 const SYSROOT_TIMEOUT_MS = 5 * 60 * 1000;
 /** The only target the sandbox builds for, and the sysroot we vendor. */
 const SYSROOT_TRIPLE = "wasm32-wasip1";
-
-const post = (message: WorkerMessage, transfer: Transferable[] = []) => {
-  (globalThis as unknown as Worker).postMessage(message, transfer);
-};
 
 // ---------------------------------------------------------------- terminal
 
@@ -130,18 +135,16 @@ const runnerReady = new Promise<void>((resolve, reject) => {
 });
 
 const startRunner = (wasiRef: unknown) => {
-  runner = new VfsRunner();
-  runner.addEventListener("message", (event: MessageEvent) => {
+  const started: Worker = new VfsRunner();
+  runner = started;
+  started.addEventListener("message", (event: MessageEvent) => {
     const data = event.data;
     switch (data?.type) {
       case "terminal":
         transcript.append(new TextDecoder().decode(toBytes(data.data)));
         break;
       case "progress":
-        post({
-          type: "progress",
-          id: currentId,
-          stage: data.stage as ProgressStage,
+        postProgress(currentId, data.stage as ProgressStage, {
           loaded: data.loaded,
           total: data.total,
           detail: data.detail,
@@ -155,7 +158,7 @@ const startRunner = (wasiRef: unknown) => {
         break;
     }
   });
-  runner.postMessage({ type: "start", wasi_ref: wasiRef });
+  started.postMessage({ type: "start", wasi_ref: wasiRef });
 };
 
 const send = (line: string) => {
@@ -308,7 +311,11 @@ farm = new WASIFarm(
   {
     allocator_size: 100 * 1024 * 1024,
     base_call_allocator_size: 64 * 1024 * 1024,
-    unknown_fn: async (unknown: { name: string; args: Record<string, unknown> }) => {
+    // The shim types this argument as `unknown`, which is honest: it is
+    // whatever the guest asked the host to do. Every branch below is keyed on
+    // the name, so it is narrowed once, here.
+    unknown_fn: async (message: unknown) => {
+      const unknown = message as { name: string; args: Record<string, unknown> };
       if (isHttpBridgeMessage(unknown)) return await httpBridge(unknown);
       if (isChildProcessMessage(unknown)) return await childBridge(unknown);
 
@@ -361,30 +368,46 @@ farm = new WASIFarm(
 // -------------------------------------------------------------- diagnostics
 
 /**
- * `--message-format=json` first, the text fallback second.
+ * Split a build's transcript into diagnostics, what rustc rendered, and the
+ * lines that were not cargo's JSON protocol.
  *
- * Cargo's JSON lines share the session stream with its human output, so the
- * parse is per line and tolerant: a line that is not a JSON object is left to
- * the regex, which is the only thing available when a build fails before
- * cargo starts (a malformed `Cargo.toml`, say).
+ * `--message-format=json` is tried first and is what actually runs (see the
+ * README's confirmed list). The regex is the fallback for a build that dies
+ * before cargo emits any JSON at all — a malformed `Cargo.toml`, say.
  */
 const TEXT_DIAGNOSTIC =
   /^(error|warning)(?:\[(E\d+)\])?: (.*)\n\s+--> ([^:\n]+):(\d+):(\d+)/gm;
 
-const parseDiagnostics = (
-  text: string,
-): { diagnostics: Diagnostic[]; fromJson: boolean; buildFinished?: boolean } => {
+type ParsedBuild = {
+  diagnostics: Diagnostic[];
+  /** rustc's own rendering of each diagnostic, exactly as it would print it. */
+  rendered: string[];
+  /** Transcript lines that were not cargo's JSON protocol: its status output. */
+  plain: string[];
+  fromJson: boolean;
+  /** `build-finished`'s verdict, when cargo got far enough to give one. */
+  buildFinished?: boolean;
+};
+
+const parseBuild = (text: string): ParsedBuild => {
   const diagnostics: Diagnostic[] = [];
+  const rendered: string[] = [];
+  const plain: string[] = [];
   let fromJson = false;
   let buildFinished: boolean | undefined;
 
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) continue;
+    if (!trimmed.startsWith("{")) {
+      plain.push(line);
+      continue;
+    }
     let value: Record<string, unknown>;
     try {
       value = JSON.parse(trimmed);
     } catch {
+      // A line that opens with `{` but is not JSON is human output.
+      plain.push(line);
       continue;
     }
     if (value.reason === "build-finished") {
@@ -397,11 +420,18 @@ const parseDiagnostics = (
     const message = value.message as {
       level?: string;
       message?: string;
+      rendered?: string;
       code?: { code?: string } | null;
-      spans?: { file_name?: string; line_start?: number; column_start?: number; is_primary?: boolean }[];
+      spans?: {
+        file_name?: string;
+        line_start?: number;
+        column_start?: number;
+        is_primary?: boolean;
+      }[];
     };
     const level = message?.level;
     if (level !== "error" && level !== "warning") continue;
+    if (message.rendered) rendered.push(message.rendered.replace(/\n$/, ""));
     const span = message.spans?.find((s) => s.is_primary) ?? message.spans?.[0];
     diagnostics.push({
       file: span?.file_name ?? "",
@@ -413,7 +443,7 @@ const parseDiagnostics = (
     });
   }
 
-  if (fromJson) return { diagnostics, fromJson, buildFinished };
+  if (fromJson) return { diagnostics, rendered, plain, fromJson, buildFinished };
 
   TEXT_DIAGNOSTIC.lastIndex = 0;
   for (const match of text.matchAll(TEXT_DIAGNOSTIC)) {
@@ -426,40 +456,58 @@ const parseDiagnostics = (
       ...(match[2] ? { code: match[2] } : {}),
     });
   }
-  return { diagnostics, fromJson };
+  return { diagnostics, rendered, plain, fromJson };
 };
 
 // ------------------------------------------------------------ the protocol
 
+/**
+ * `new` -> `initializing` -> `ready` <-> `compiling`, and `broken` from any of
+ * them. **`broken` is terminal**: the worker never leaves it, because the only
+ * two ways in are a failed `init` and a `cancel`, and after a `cancel` a
+ * session thread is still sitting inside cargo where nothing outside it can
+ * reach. The adapter's answer to `broken` is `terminate()` plus a fresh
+ * worker, not another request.
+ */
 type State = "new" | "initializing" | "ready" | "compiling" | "broken";
 let state: State = "new";
+/** The id of the compile that is running, if one is. */
+let inFlight: string | undefined;
+/**
+ * Compiles already answered with `cancelled: true`.
+ *
+ * The build they belong to keeps running (nothing can stop it), so when it
+ * finally settles its `result` and any late `progress` are dropped: one
+ * request gets exactly one terminal message.
+ */
+const cancelledIds = new Set<string>();
 let currentId = "";
 let rustcVersion = "";
 
-const fail = (id: string, message: string, extra: Partial<ResultMessage> = {}) => {
-  post({
-    type: "result",
-    id,
-    success: false,
-    stdout: "",
-    stderr: message,
-    diagnostics: [],
-    elapsedMs: 0,
-    ...extra,
-  });
+const post = (message: WorkerMessage, transfer: Transferable[] = []) => {
+  (globalThis as unknown as Worker).postMessage(message, transfer);
+};
+
+const postProgress = (
+  id: string,
+  stage: ProgressStage,
+  extra: { loaded?: number; total?: number; detail?: string } = {},
+) => {
+  if (cancelledIds.has(id)) return;
+  post({ type: "progress", id, stage, ...extra });
 };
 
 const init = async (id: string) => {
   state = "initializing";
   currentId = id;
-  post({ type: "progress", id, stage: "download", loaded: 0, total: 0 });
+  postProgress(id, "download", { loaded: 0, total: 0 });
   startRunner(farm.get_ref());
   await runnerReady;
 
-  post({ type: "progress", id, stage: "initializing", detail: "waiting for the shell" });
+  postProgress(id, "initializing", { detail: "waiting for the shell" });
   await transcript.wait(idle, SYSROOT_TIMEOUT_MS, "the shell's first prompt");
 
-  post({ type: "progress", id, stage: "initializing", detail: "loading the sysroot" });
+  postProgress(id, "initializing", { detail: "loading the sysroot" });
   await runCommand(`load_sysroot ${SYSROOT_TRIPLE}`, SYSROOT_TIMEOUT_MS, "load_sysroot");
 
   rustcVersion = (await runCommand("rustc --version", SYSROOT_TIMEOUT_MS, "rustc --version")).trim();
@@ -470,10 +518,13 @@ const init = async (id: string) => {
 const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
   const started = Date.now();
   state = "compiling";
+  inFlight = message.id;
   currentId = message.id;
   stderrText = "";
   downloadChunks = [];
   downloadName = "";
+  /** Shell output that is not the build's own: `cargo clean`, `download`. */
+  let shellLog = "";
 
   for (const [path, content] of Object.entries(message.files)) {
     writeFile(path.startsWith("/") ? path : `/${path}`, content);
@@ -488,7 +539,7 @@ const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
   // toolchain has no registry), so there is no dependency graph to keep warm
   // — the only thing being rebuilt is the block itself, which has to be
   // rebuilt anyway.
-  await runCommand("cargo clean", COMPILE_TIMEOUT_MS, "cargo clean");
+  shellLog += await runCommand("cargo clean", COMPILE_TIMEOUT_MS, "cargo clean");
 
   const profile = message.release ? " --release" : "";
   const output = await runCommand(
@@ -496,7 +547,7 @@ const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
     COMPILE_TIMEOUT_MS,
     "cargo build",
   );
-  const { diagnostics, buildFinished } = parseDiagnostics(output);
+  const { diagnostics, rendered, plain, buildFinished } = parseBuild(output);
   const errored = diagnostics.some((d) => d.severity === "error");
   const built = buildFinished ?? !errored;
 
@@ -505,8 +556,8 @@ const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
     const crateFile = `${message.crateName.replace(/-/g, "_")}.wasm`;
     const artifactPath =
       `/target/${message.target}/${message.release ? "release" : "debug"}/${crateFile}`;
-    post({ type: "progress", id: message.id, stage: "compiling", detail: `reading ${artifactPath}` });
-    await runCommand(`download ${artifactPath}`, COMPILE_TIMEOUT_MS, "download");
+    postProgress(message.id, "compiling", { detail: `reading ${artifactPath}` });
+    shellLog += await runCommand(`download ${artifactPath}`, COMPILE_TIMEOUT_MS, "download");
     // `download` prints "File not found" and streams nothing when the path is
     // wrong, so the name the bridge reported is checked rather than assumed:
     // chunks left over from an earlier request must never be served as this
@@ -522,25 +573,60 @@ const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
       artifact = bytes.buffer;
     }
   }
+  downloadChunks = [];
+  downloadName = "";
 
-  const success = built && artifact !== undefined;
-  state = "ready";
-  post(
+  // How the two text fields are filled, and why they are not fd 1 and fd 2:
+  // the guest's streams reach us already merged into one terminal transcript,
+  // so the split is by content. `stderr` is what a human would have seen from
+  // the build — rustc's own rendering of each diagnostic, then cargo's status
+  // output, then anything the guest wrote to fd 2 outside the shell's stream.
+  // `stdout` is the rest of the session: `cargo clean` and `download`. Cargo's
+  // `--message-format=json` protocol lines appear in neither; they are what
+  // `diagnostics` is made of.
+  const humanBuildOutput = [...rendered, plain.join("\n").trim()]
+    .filter((part) => part.length > 0)
+    .join("\n");
+
+  deliver(
+    message.id,
     {
       type: "result",
       id: message.id,
-      success,
+      success: built && artifact !== undefined,
       ...(artifact ? { artifact } : {}),
-      stdout: output,
-      stderr: stderrText,
+      stdout: shellLog.trim(),
+      stderr: [humanBuildOutput, stderrText.trim()].filter((p) => p.length > 0).join("\n"),
       diagnostics,
       elapsedMs: Date.now() - started,
     },
     artifact ? [artifact] : [],
   );
-  downloadChunks = [];
-  downloadName = "";
 };
+
+/**
+ * Answer a compile, unless a `cancel` already answered it.
+ *
+ * This is also the only place that leaves the `compiling` state, and it will
+ * not leave `broken` — a cancelled worker stays cancelled even though the
+ * build it abandoned eventually finishes underneath it.
+ */
+const deliver = (id: string, result: ResultMessage, transfer: Transferable[] = []) => {
+  inFlight = undefined;
+  if (cancelledIds.has(id)) return;
+  if (state === "compiling") state = "ready";
+  post(result, transfer);
+};
+
+const failed = (id: string, message: string): ResultMessage => ({
+  type: "result",
+  id,
+  success: false,
+  stdout: "",
+  stderr: message,
+  diagnostics: [],
+  elapsedMs: 0,
+});
 
 globalThis.addEventListener("message", (event: MessageEvent) => {
   const message = event.data as PageMessage;
@@ -559,27 +645,47 @@ globalThis.addEventListener("message", (event: MessageEvent) => {
       return;
 
     case "compile":
-      if (state === "compiling") {
-        fail(message.id, "a compile is already in flight");
+      // A worker that cannot serve this request AT ALL answers `error`, and
+      // the adapter is expected to terminate it. A worker that is merely busy
+      // answers a failed `result`: that request is refused, the worker is not.
+      if (state === "broken" || state === "new" || state === "initializing") {
+        post({ type: "error", id: message.id, message: `compile in state ${state}` });
         return;
       }
-      if (state !== "ready") {
-        fail(message.id, `compile in state ${state}`);
+      if (state === "compiling") {
+        post(failed(message.id, `a compile is already in flight (${inFlight})`));
         return;
       }
       compile(message).catch((error) => {
-        state = "broken";
-        fail(message.id, String(error), { elapsedMs: 0 });
+        if (state === "compiling") state = "broken";
+        deliver(message.id, failed(message.id, String(error)));
       });
       return;
 
-    case "cancel":
+    case "cancel": {
+      // Nothing in flight: a stray cancel — a double click, or one that raced
+      // the result it meant to cancel — must not brick a healthy worker, so it
+      // is answered with `error` and changes no state.
+      if (inFlight === undefined) {
+        post({ type: "error", id: message.id, message: "nothing in flight" });
+        return;
+      }
+      if (inFlight !== message.id) {
+        post({
+          type: "error",
+          id: message.id,
+          message: `nothing in flight for ${message.id}; ${inFlight} is running`,
+        });
+        return;
+      }
       // The session thread is inside cargo and nothing outside it can unwind
-      // that, so this reports the compile as cancelled and marks the worker
-      // spent. The adapter terminates it and starts a fresh one — see
-      // `CancelMessage` in protocol.ts.
+      // that: the compile is answered as cancelled and the worker is spent.
+      // The adapter terminates it and starts a fresh one — see `CancelMessage`
+      // in protocol.ts.
+      cancelledIds.add(message.id);
       state = "broken";
-      fail(message.id, "cancelled", { cancelled: true });
+      post({ ...failed(message.id, "cancelled"), cancelled: true });
       return;
+    }
   }
 });

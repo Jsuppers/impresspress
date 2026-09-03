@@ -59,6 +59,17 @@
     return Object.keys(instance.exports);
   };
 
+  // What the host actually calls on a block. A module that compiled and linked
+  // but is missing one of these is not a block, and the sandbox would only
+  // find out when it tried to activate it.
+  const REQUIRED_EXPORTS = [
+    "__wafer_alloc",
+    "__wafer_info",
+    "__wafer_handle",
+    "__wafer_lifecycle",
+    "__wafer_host_codec",
+  ];
+
   /** `crossOriginIsolated` as seen from inside a worker, not just the page. */
   const workerIsolation = async () => {
     const source = "postMessage({ coi: crossOriginIsolated, sab: typeof SharedArrayBuffer !== 'undefined' });";
@@ -164,13 +175,30 @@
     if (good.artifact) {
       try {
         const exports = await instantiates(good.artifact);
-        results.measurements.instantiate = { ok: true, exports };
-        step(true, `artifact instantiates, exports: ${exports.join(", ")}`);
+        const missing = REQUIRED_EXPORTS.filter((name) => !exports.includes(name));
+        results.measurements.instantiate = { ok: missing.length === 0, exports, missing };
+        step(
+          missing.length === 0,
+          missing.length === 0
+            ? `artifact instantiates and exports the wafer ABI (${REQUIRED_EXPORTS.length}/${REQUIRED_EXPORTS.length})`
+            : `artifact is missing wafer ABI exports: ${missing.join(", ")}`,
+        );
       } catch (error) {
         results.measurements.instantiate = { ok: false, error: String(error) };
         step(false, `artifact does not instantiate: ${error}`);
       }
     }
+    show();
+
+    // A cancel with nothing in flight must be refused, not obeyed: it used to
+    // brick the worker. The error build that follows is the proof that it did
+    // not — a broken worker answers `error` there instead of compiling.
+    const strayCancel = await channel.send({ type: "cancel", id: "cancel-nothing" });
+    results.measurements.stray_cancel = strayCancel;
+    step(
+      strayCancel.type === "error" && /nothing in flight/.test(strayCancel.message ?? ""),
+      `cancel with nothing in flight: ${strayCancel.type} ${strayCancel.message ?? ""}`,
+    );
     show();
 
     // The same crate with a statement that is missing its semicolon.
@@ -197,6 +225,9 @@ fn probe_deliberate_error() -> i32 {
       success: bad.success,
       diagnostics: bad.diagnostics,
       stdout_tail: (bad.stdout ?? "").slice(-2000),
+      // rustc's own rendering of the failure: this is what `stderr` is for,
+      // and a build that fails is the case where it matters.
+      stderr_tail: (bad.stderr ?? "").slice(-2000),
     };
     const diagnostic = (bad.diagnostics ?? []).find((d) => d.severity === "error");
     step(

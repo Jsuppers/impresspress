@@ -145,15 +145,63 @@ const baseName = path.basename(wasmFile);
 const originalSize = fs.statSync(wasmFile).size;
 const manifestPath = path.join(outDir, `${baseName}.br.json`);
 
-// The wasm's name carries a hash of its contents, so a manifest sitting next
-// to it under the same name describes exactly these bytes: the split is done
-// and compressing 365 MiB again would produce the same parts. (Compressing is
-// most of this script's runtime, so this is what makes re-running the build
-// after an edit to `src/**` cheap.)
+// A split belonging to some other component — left by an earlier pin, or by a
+// `--fast` build — must not survive next to this one: `write-manifest.mjs`
+// lists whatever is on disk, so it would be published.
+for (const file of fs.readdirSync(outDir)) {
+  if (!/^vfs\.core-.*\.wasm\.br\.(json|part-\d+)$/.test(file)) continue;
+  if (file.startsWith(`${baseName}.br.`)) continue;
+  fs.unlinkSync(path.join(outDir, file));
+  console.log(`removed ${file}: it belongs to another component`);
+}
+
+// Compressing 365 MiB at quality 11 is ~10 minutes and most of this script's
+// runtime, so an existing split is reused — but only after proving it is a
+// split of THESE bytes. The name already carries vite's content hash; this
+// also checks the sha256 the manifest recorded of the original wasm and that
+// every part is present at the size it claims. Anything short of that
+// recompresses, because a stale or truncated part is a compiler image that
+// fails to instantiate half a minute into someone's first visit.
 if (fs.existsSync(manifestPath)) {
-  fs.unlinkSync(wasmFile);
-  console.log(`${baseName}: already split, kept the existing parts`);
-  process.exit(0);
+  const existing = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const hash = createHash("sha256");
+  for await (const chunk of fs.createReadStream(wasmFile)) hash.update(chunk);
+  const actual = hash.digest("hex");
+
+  const parts = Array.isArray(existing.parts) ? existing.parts : [];
+  const complaint =
+    existing.originalFile !== baseName
+      ? `it is a split of ${existing.originalFile}`
+      : existing.sha256 !== actual
+        ? `it was taken from ${String(existing.sha256).slice(0, 12)}…, not ${actual.slice(0, 12)}…`
+        : existing.originalSize !== originalSize
+          ? `it records ${existing.originalSize} bytes, not ${originalSize}`
+          : parts.length === 0
+            ? "it lists no parts"
+            : parts
+                .map((part) => {
+                  const file = path.join(outDir, part.file);
+                  if (!fs.existsSync(file)) return `${part.file} is missing`;
+                  const size = fs.statSync(file).size;
+                  return size === part.size ? "" : `${part.file} is ${size} bytes, not ${part.size}`;
+                })
+                .find((problem) => problem !== "") ?? "";
+
+  if (complaint === "") {
+    fs.unlinkSync(wasmFile);
+    console.log(`${baseName}: already split, kept ${parts.length} parts`);
+    process.exit(0);
+  }
+
+  console.log(`${baseName}: recompressing — the existing split does not match (${complaint})`);
+  for (const part of parts) {
+    try {
+      fs.unlinkSync(path.join(outDir, part.file));
+    } catch {
+      // it was already missing; that is one of the reasons we are here
+    }
+  }
+  fs.unlinkSync(manifestPath);
 }
 
 const splitter = new Splitter(baseName, outDir);

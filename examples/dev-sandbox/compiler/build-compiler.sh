@@ -12,6 +12,7 @@
 #
 # Usage:
 #   compiler/build-compiler.sh          # build dist/<version>/ (slow: see below)
+#   compiler/build-compiler.sh --fast   # local iteration only, see below
 #
 # The phases, in order, each skipped when its output already exists so a
 # re-run after editing `src/worker-entry.ts` costs seconds rather than half an
@@ -25,24 +26,53 @@
 #                Binaryen's `wasm-opt` — and the rustup targets.
 #   3. compose   `wasi_virt_layer build` — links the four toolchain modules
 #                plus rubrc's vfs/vfs-shell into a single `vfs.core.wasm`.
-#                THIS IS THE SLOW ONE: `wasm-opt -Oz` over ~230 MB of input
-#                takes 15-30 minutes single-core.
+#                THIS IS THE EXPENSIVE ONE. Measured on a 24-core box:
+#                ~35 minutes of `wasm-opt -Oz`, and its final pass over the
+#                410 MB merged module peaked at 12.6 GB RSS. A 7 GB CI runner
+#                WILL be OOM-killed here — cache `dist/` on `PIN.json` (it is
+#                fully determined by that file) or use a large runner.
 #   4. bundle    our vite build: `src/worker-entry.ts` plus, via aliases,
 #                rubrc's `worker_process/` + `vfs_bindings/`. None of rubrc's
 #                UI (Monaco, xterm, the SharedObject layer) is imported.
 #   5. asset     brotli-compress `vfs.core-<hash>.wasm` and split it into
 #                <= 24 MiB parts, because Cloudflare refuses a static asset
-#                larger than that; vendor the sysroot tarball.
+#                larger than that (~10 minutes at quality 11); vendor the
+#                sysroot tarball. Both are skipped when the previous build's
+#                parts still match the component.
 #   6. manifest  `dist/manifest.json` (sizes + sha256 of every file), then
 #                `scripts/verify-compiler-assets.mjs`.
 #
 # Phase 3 needs a nightly toolchain: `wasi_virt_layer` builds the VFS crate
 # with `-Zbuild-std=std,panic_unwind` (`--vfs-unwind`), and both toolchains
 # need the `wasm32-wasip1-threads` target.
+#
+# Measured wall times on a 24-core box, for the figures the README quotes:
+#   * everything, from an empty tree: ~55 minutes.
+#   * `src/**` changed, component unchanged: ~50 seconds. Phases 1-3 and the
+#     ~10 minute split are skipped; what is left is vite hashing and copying
+#     the 365 MiB component into `dist/` and this script hashing it again to
+#     prove the parts still match it, before deleting it.
+#
+# `--fast` swaps rubrc's `vfs:build:prod` for `vfs:build:prod:no-opt`, which
+# skips `wasm-opt` entirely: minutes instead of ~35, at the price of a much
+# larger component (more parts, more download, more memory in the browser).
+# It is for iterating on the packaging locally. The manifest records the build
+# as `fast`, and `verify-compiler-assets.mjs` REFUSES it — so a `--fast` tree
+# can never be what `build.sh --check` passes or what gets deployed.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+FAST=0
+case "${1:-}" in
+  "") ;;
+  --fast) FAST=1 ;;
+  *)
+    printf 'build-compiler.sh: unknown argument %s (only --fast)\n' "$1" >&2
+    exit 2
+    ;;
+esac
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'build-compiler.sh: %s\n' "$*" >&2; exit 1; }
@@ -172,9 +202,15 @@ if [ ! -f "$BINDINGS/vfs.core.wasm" ]; then
   # next to the page sources, then install the bindings' own dependencies.
   # `wasm-opt` has to be OURS and not the one wasi_virt_layer vendors — it
   # passes `--enable-shared-everything`, which Binaryen <= 116 rejects.
-  log "composing vfs.core.wasm (15-30 minutes: wasm-opt over ~230 MB)"
+  if [ "$FAST" = 1 ]; then
+    log "composing vfs.core.wasm WITHOUT wasm-opt (--fast: not deployable)"
+    RECIPE=vfs:build:prod:no-opt
+  else
+    log "composing vfs.core.wasm (~35 minutes of wasm-opt, up to 12.6 GB RSS)"
+    RECIPE=vfs:build:prod
+  fi
   (cd "$RUBRC" && PATH="$WASM_OPT_DIR:$WVL_DIR:$HERE/node_modules/.bin:$PATH" \
-    "$BUN" run vfs:build:prod)
+    "$BUN" run "$RECIPE")
 
   [ -f "$BINDINGS/vfs.core.wasm" ] || die "the composition did not produce $BINDINGS/vfs.core.wasm"
 else
@@ -183,11 +219,52 @@ fi
 
 # ------------------------------------------------------------------ 4. bundle
 
+# One version per dist. `manifest.json` names exactly one, the whole directory
+# is overlaid onto the bundle, and `verify-compiler-assets.mjs` only checks the
+# version it names — so a pin bump that left the old tree behind would deploy
+# a second, unverified copy of the compiler. Remove it here rather than trust
+# whoever bumped the pin to remember.
+for stale in "$DIST"/*; do
+  [ -e "$stale" ] || continue
+  case "$(basename "$stale")" in
+    "$VERSION" | manifest.json) ;;
+    *)
+      log "removing dist/$(basename "$stale") — dist holds one version"
+      rm -rf "$stale"
+      ;;
+  esac
+done
+
+# The split of the composed component costs ~10 minutes of brotli and does not
+# change when only `src/**` does, so it is set aside across the vite build
+# (which empties its output directory) and handed back to
+# `prepare-vfs-asset.mjs`. That script keeps it only when it matches the
+# component byte for byte, and recompresses when it does not — so a rebuild
+# after an edit to the worker is seconds, and a rebuild after a pin bump is
+# not silently wrong.
+KEEP="$CACHE/split-$VERSION"
+rm -rf "$KEEP"
+mkdir -p "$KEEP"
+if compgen -G "$OUT/vfs.core-*.wasm.br.json" >/dev/null; then
+  mv "$OUT"/vfs.core-*.wasm.br.json "$OUT"/vfs.core-*.wasm.br.part-* "$KEEP/"
+fi
+if [ -d "$OUT/sysroot" ]; then
+  mv "$OUT/sysroot" "$KEEP/sysroot"
+fi
+
 log "vite build -> dist/$VERSION"
 rm -rf "$OUT"
 (cd "$HERE" && COMPILER_VERSION="$VERSION" npx --no-install vite build)
 
 [ -f "$OUT/worker.js" ] || die "the vite build did not produce dist/$VERSION/worker.js"
+
+if compgen -G "$KEEP/vfs.core-*.wasm.br.json" >/dev/null; then
+  mv "$KEEP"/vfs.core-*.wasm.br.json "$KEEP"/vfs.core-*.wasm.br.part-* "$OUT/"
+fi
+if [ -d "$KEEP/sysroot" ]; then
+  mv "$KEEP/sysroot" "$OUT/sysroot"
+fi
+rm -rf "$KEEP"
 
 # ------------------------------------------------------------------- 5. asset
 
@@ -201,7 +278,8 @@ cp "$CACHE/$SYSROOT_TRIPLE.tar.br" "$OUT/sysroot/$SYSROOT_TRIPLE.tar.br"
 
 # ---------------------------------------------------------------- 6. manifest
 
-node "$HERE/scripts/write-manifest.mjs"
+COMPILER_BUILD_KIND="$([ "$FAST" = 1 ] && echo fast || echo full)" \
+  node "$HERE/scripts/write-manifest.mjs"
 node "$HERE/scripts/verify-compiler-assets.mjs"
 
 log "dist/$VERSION ready: $(du -sh "$OUT" | cut -f1)"
