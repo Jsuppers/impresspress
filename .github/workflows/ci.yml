@@ -11,10 +11,6 @@ on:
       - 'Cargo.lock'
       - 'scripts/**'
       - '.github/workflows/ci.yml'
-      # Visual-baseline PNGs live outside crates/. Without this, baseline-only
-      # commits (e.g. from regen-visual-baselines.yml) skip CI and the PR
-      # shows "no checks" — blocking merge.
-      - '.playwright-mcp/**'
       # The dev-sandbox e2e stages this proof guest into a live browser
       # runtime, so a change to it must run CI.
       - 'experiments/browser-service-worker-blocks/guest/**'

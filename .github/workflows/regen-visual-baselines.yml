@@ -119,7 +119,7 @@ jobs:
           fi
 
       # The products browser-lifecycle specs snapshot into the same
-      # .playwright-mcp/ tree but run fully mocked — no native server needed.
+      # e2e snapshot tree but run fully mocked — no native server needed.
       - name: Regen products browser-lifecycle snapshots
         working-directory: crates/impresspress-web
         run: npx playwright test --config=tests/playwright.config.ts tests/e2e/products-*.spec.ts --update-snapshots
@@ -142,15 +142,32 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Playwright writes each spec's baselines to `<spec>-snapshots/` beside
+          # the spec; the examples suite keeps its own under `examples/tests/`.
+          # `:(glob)` leaves the matching to git instead of the shell, so `**`
+          # crosses directory boundaries and covers specs nested under `e2e/`
+          # as well as ones added directly beside today's.
+          BASELINES=(
+            ':(glob)crates/impresspress-web/tests/e2e/**/*-snapshots/**'
+            'examples/tests/'
+          )
           # Use `git status --porcelain` instead of `git diff` so this also
           # picks up untracked baselines — i.e. ones that were deleted in
           # the PR's prior commit and recreated by --update-snapshots.
-          if [ -z "$(git status --porcelain '.playwright-mcp/' 'examples/tests/')" ]; then
+          # `git status` tolerates a pathspec that matches nothing but `git add`
+          # exits 128 on one, so narrow the list to the paths that drifted.
+          CHANGED=()
+          for spec in "${BASELINES[@]}"; do
+            if [ -n "$(git status --porcelain -- "$spec")" ]; then
+              CHANGED+=("$spec")
+            fi
+          done
+          if [ ${#CHANGED[@]} -eq 0 ]; then
             echo "::notice::No baseline drift — nothing to commit."
             exit 0
           fi
           echo "Baseline diff detected:"
-          git status --porcelain '.playwright-mcp/' 'examples/tests/'
-          git add .playwright-mcp/ examples/tests/
+          git status --porcelain -- "${CHANGED[@]}"
+          git add -- "${CHANGED[@]}"
           git commit -m "test(ui): regen visual baselines from CI render (auto-committed by regen-visual-baselines.yml against ${TARGET_BRANCH})"
           git push origin "HEAD:${TARGET_BRANCH}"

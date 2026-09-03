@@ -7,7 +7,11 @@ const PORT = process.env.TEST_PORT ? parseInt(process.env.TEST_PORT) : 8080;
 // extends this with `globalSetup` — see `playwright.visual-baseline.config.ts`.
 export default defineConfig({
   testDir: './e2e',
-  snapshotDir: '../../../.playwright-mcp',
+  // Snapshot baselines live in Playwright's default location next to the
+  // specs (`e2e/<spec>-snapshots/`). They must NOT be pointed at
+  // `.playwright-mcp/` — that is the Playwright MCP server's scratch dir
+  // (page snapshots, console logs) and is gitignored, which silently made
+  // the committed baselines unstageable.
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: 0,
