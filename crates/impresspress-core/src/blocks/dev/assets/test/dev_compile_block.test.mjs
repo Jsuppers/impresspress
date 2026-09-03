@@ -116,6 +116,99 @@ test('snapshotBlock refuses a binary file under blocks/ with a binary-source dia
   assert.ok(!('src/logo.png' in snapshot.files));
 });
 
+test('snapshotBlock refuses a nested source directory with a nested-source diagnostic', async () => {
+  const { handle, fetchCalls } = instantiate({
+    workspace: [...HELLO, file('blocks/hello/src/routes/mod.rs', 'pub fn r() {}\n')]
+  });
+  const snapshot = await handle.snapshotBlock('hello');
+
+  // Whether rubrc's write-file event creates intermediate directories has
+  // never been verified, so a nested path is refused with the path in hand
+  // rather than sent and left to fail inside rustc.
+  assert.equal(snapshot.diagnostics.length, 1);
+  assert.equal(snapshot.diagnostics[0].severity, 'error');
+  assert.equal(snapshot.diagnostics[0].code, 'nested-source');
+  assert.equal(snapshot.diagnostics[0].file, 'src/routes/mod.rs');
+  assert.ok(!('src/routes/mod.rs' in snapshot.files));
+  // Refused on the path alone: the contents cannot change the answer, so the
+  // file is never read.
+  assert.ok(
+    !fetchCalls.some(
+      (call) =>
+        String(call[0]) === '/b/dev/api/files/read' &&
+        JSON.parse(call[1].body).path === 'blocks/hello/src/routes/mod.rs'
+    )
+  );
+});
+
+test('snapshotBlock refuses a Cargo.toml whose package is not the block', async () => {
+  const { handle } = instantiate({
+    workspace: [
+      file('blocks/hello/Cargo.toml', '[package]\nname = "renamed"\n'),
+      HELLO[1],
+      HELLO[2]
+    ]
+  });
+  const snapshot = await handle.snapshotBlock('hello');
+
+  // cargo names the artifact after the package and the worker reads it back
+  // by the BLOCK's name, so a rename is a green build with nothing to
+  // collect. Both names are in the message, because the fix is one of them.
+  assert.equal(snapshot.diagnostics.length, 1);
+  assert.equal(snapshot.diagnostics[0].code, 'package-name');
+  assert.equal(snapshot.diagnostics[0].file, 'Cargo.toml');
+  assert.match(snapshot.diagnostics[0].message, /renamed\.wasm/);
+  assert.match(snapshot.diagnostics[0].message, /"hello"/);
+});
+
+test('a `[lib] name` that renames the artifact is refused too', async () => {
+  const { handle } = instantiate({
+    workspace: [
+      file(
+        'blocks/hello/Cargo.toml',
+        '[package]\nname = "hello"\n\n[lib]\ncrate-type = ["cdylib"]\nname = "other"\n'
+      ),
+      HELLO[1],
+      HELLO[2]
+    ]
+  });
+  // `[lib] name` is what cargo names a cdylib after, so it breaks the artifact
+  // path exactly as a renamed package does — the check is on the file cargo
+  // will write, not on one key.
+  const snapshot = await handle.snapshotBlock('hello');
+  assert.equal(snapshot.diagnostics.length, 1);
+  assert.equal(snapshot.diagnostics[0].code, 'package-name');
+  assert.match(snapshot.diagnostics[0].message, /other\.wasm/);
+});
+
+test('a name in a table that is neither [package] nor [lib] is not read as one', async () => {
+  const { handle } = instantiate({
+    workspace: [
+      file(
+        'blocks/hello/Cargo.toml',
+        '[package]\nname = "hello"\n\n[lib]\ncrate-type = ["cdylib"]\n\n' +
+          '[[bench]]\nname = "not-the-crate"\n'
+      ),
+      HELLO[1],
+      HELLO[2]
+    ]
+  });
+  assert.deepEqual((await handle.snapshotBlock('hello')).diagnostics, []);
+});
+
+test('a hyphenated block matches the underscored artifact cargo writes', async () => {
+  const { handle } = instantiate({
+    workspace: [
+      file('blocks/my-shop/Cargo.toml', '[package]\nname = "my-shop"\n'),
+      file('blocks/my-shop/src/lib.rs', LIB_RS),
+      file('blocks/my-shop/src/wafer_guest.rs', WAFER_GUEST)
+    ]
+  });
+  // cargo writes `my_shop.wasm` for a package called `my-shop`, and the worker
+  // asks for exactly that — so this must not be a refusal.
+  assert.deepEqual((await handle.snapshotBlock('my-shop')).diagnostics, []);
+});
+
 test('the source manifest digest is over sorted `path\\0sha256\\n` lines, crate-relative', async () => {
   const { handle } = instantiate({ workspace: HELLO });
   const snapshot = await handle.snapshotBlock('hello');
@@ -376,6 +469,80 @@ test('a successful compile stages the artifact and merges what staging answered'
     elements.get('dev-progress-steps').children.map((step) => step.getAttribute('data-state')),
     ['done', 'done', 'done', 'done']
   );
+});
+
+test('the status is not polled while the worker compiles, only while the sandbox activates', async () => {
+  // A compiler that stops in the middle of `compile`, which is where the real
+  // one spends ~40 seconds. Everything asserted below is asserted THERE.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  let statusReads = 0;
+  const { handle, tools, elements } = instantiate({
+    hasModelContext: true,
+    compilerManifest: MANIFEST,
+    workspace: HELLO,
+    compiler: fakeCompiler(async () => {
+      await held;
+      return BUILT;
+    }),
+    status: () => {
+      statusReads += 1;
+      return { active_generation: null, runtime_generation: 0, blocks: [], activation: null };
+    },
+    stage: () => ({
+      build_id: 'bld_1',
+      success: true,
+      diagnostics: [],
+      generation: { id: 'gen_2', cause: 'block_compile', status: 'active' },
+      progress: [{ phase: 'active', ms: 0, detail: '' }]
+    })
+  });
+  await settle();
+  const readsBeforeCompile = statusReads;
+
+  const running = tools.get('dev_compile_block').execute({ name: 'hello' });
+  await settle();
+
+  // The whole point: nothing is polling. `/b/dev/api/status` cannot say
+  // anything new while the work is in the worker, and on a D1-backed
+  // deployment every one of those reads is real.
+  assert.equal(handle.outstanding, 0);
+  assert.equal(handle.isPolling, false);
+  assert.equal(statusReads, readsBeforeCompile);
+  // …and the button is out of reach for the duration, so a second click
+  // cannot queue a second identical build behind this one.
+  assert.equal(elements.get('dev-compile').disabled, true);
+  assert.match(elements.get('dev-compile').title, /already running/);
+
+  release();
+  await running;
+
+  // Back, because staging is over and there is a toolchain and a block again.
+  assert.equal(elements.get('dev-compile').disabled, false);
+  assert.equal(elements.get('dev-compile').title, '');
+  // Staging DID open the window — the ladder the panel shows comes from the
+  // catch-up that closing it runs.
+  assert.ok(statusReads > readsBeforeCompile);
+});
+
+test('a failed compile still releases the Compile button', async () => {
+  const { tools, elements } = instantiate({
+    hasModelContext: true,
+    compilerManifest: MANIFEST,
+    workspace: HELLO,
+    // A throw, not a failed build: the machinery failed, and the `finally`
+    // that re-enables the button is the only thing that can run.
+    compiler: fakeCompiler(() => {
+      throw new Error('the worker broke its protocol');
+    })
+  });
+  await settle();
+
+  const result = await tools.get('dev_compile_block').execute({ name: 'hello' });
+  assert.equal(result.isError, true);
+  assert.equal(elements.get('dev-compile').disabled, false);
 });
 
 test('the finished ladder belongs to one compile: the next one clears it before it starts', async () => {

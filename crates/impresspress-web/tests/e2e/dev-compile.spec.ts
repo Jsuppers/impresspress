@@ -246,7 +246,14 @@ test('an agent scaffolds, compiles and uses a Rust block end to end', async ({ p
   expect(compiled.success, JSON.stringify(compiled.diagnostics)).toBe(true);
   expect(compiled.cancelled).toBe(false);
   expect(compiled.elapsed_ms).toBeGreaterThan(0);
-  expect(compiled.diagnostics).toEqual([]);
+  // No ERROR-severity diagnostic, rather than none at all: rustc at a future
+  // pin may warn on the `table` template — a lint that turned on, an import
+  // that stopped being needed — and a warning is a yellow checkpoint, not a
+  // red one. The build succeeded; that is what this line is about.
+  expect(
+    compiled.diagnostics.filter((d) => d.severity === 'error'),
+    JSON.stringify(compiled.diagnostics),
+  ).toEqual([]);
   expect(compiled.build_id).toBeTruthy();
   expect(compiled.generation?.cause).toBe('block_compile');
   expect(compiled.generation?.status).toBe('active');

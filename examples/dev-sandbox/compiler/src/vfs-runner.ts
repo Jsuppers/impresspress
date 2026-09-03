@@ -136,6 +136,26 @@ const loadVfsCore = async (): Promise<WebAssembly.Module> => {
     const writer = writable.getWriter();
     try {
       let loaded = 0;
+      // One message per stream chunk is thousands of them over a ~55 MiB
+      // download, all describing the same bar, and every one of them is a
+      // structured clone plus a listener hop plus a line the page has to
+      // dedupe. Report on whole mebibytes or a quarter second, whichever
+      // comes first — and unconditionally at the end, so the bar always
+      // finishes where the manifest says it should rather than wherever the
+      // last throttled chunk left it.
+      const PROGRESS_BYTES = 1024 * 1024;
+      const PROGRESS_MS = 250;
+      let reportedBytes = 0;
+      let reportedAt = Date.now();
+      const report = (force: boolean) => {
+        const now = Date.now();
+        if (!force && loaded - reportedBytes < PROGRESS_BYTES && now - reportedAt < PROGRESS_MS) {
+          return;
+        }
+        reportedBytes = loaded;
+        reportedAt = now;
+        post({ type: "progress", stage: "download", loaded, total: manifest.compressedSize });
+      };
       for (const part of manifest.parts) {
         const partResponse = await fetch(new URL(part.file, manifestUrl.href).href);
         if (!partResponse.ok || !partResponse.body) {
@@ -148,13 +168,14 @@ const loadVfsCore = async (): Promise<WebAssembly.Module> => {
           if (done) break;
           partLoaded += value.byteLength;
           loaded += value.byteLength;
-          post({ type: "progress", stage: "download", loaded, total: manifest.compressedSize });
+          report(false);
           await writer.write(value);
         }
         if (partLoaded !== part.size) {
           throw new Error(`${part.file}: got ${partLoaded} bytes, manifest says ${part.size}`);
         }
       }
+      report(true);
       await writer.close();
     } catch (error) {
       await writer.abort(error);

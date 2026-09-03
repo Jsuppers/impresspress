@@ -557,7 +557,12 @@ const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
     const artifactPath =
       `/target/${message.target}/${message.release ? "release" : "debug"}/${crateFile}`;
     postProgress(message.id, "compiling", { detail: `reading ${artifactPath}` });
-    shellLog += await runCommand(`download ${artifactPath}`, COMPILE_TIMEOUT_MS, "download");
+    const downloadOutput = await runCommand(
+      `download ${artifactPath}`,
+      COMPILE_TIMEOUT_MS,
+      "download",
+    );
+    shellLog += downloadOutput;
     // `download` prints "File not found" and streams nothing when the path is
     // wrong, so the name the bridge reported is checked rather than assumed:
     // chunks left over from an earlier request must never be served as this
@@ -571,6 +576,27 @@ const compile = async (message: Extract<PageMessage, { type: "compile" }>) => {
         at += chunk.byteLength;
       }
       artifact = bytes.buffer;
+    } else {
+      // cargo said it finished and there is nothing at the path we derived
+      // from `crateName` — most plausibly a `Cargo.toml` whose `[package]
+      // name` was changed, since that is what cargo names the file after.
+      // Without this the request goes back as `success: false` with an EMPTY
+      // diagnostics list: the one answer that tells an agent nothing at all,
+      // and the exact shape `compile-timeout` exists to avoid. It is a
+      // diagnostic rather than a throw because it IS an answer about the
+      // crate, and the worker is fine.
+      diagnostics.push({
+        file: "",
+        line: 0,
+        column: 0,
+        severity: "error",
+        code: "artifact-missing",
+        message:
+          `the build finished but ${artifactPath} could not be read out of the VFS ` +
+          `(\`download\` said: ${downloadOutput.trim() || "nothing"}). ` +
+          "`[package] name` in Cargo.toml must be the block's name — cargo names " +
+          "the artifact after the package.",
+      });
     }
   }
   downloadChunks = [];
@@ -683,6 +709,12 @@ globalThis.addEventListener("message", (event: MessageEvent) => {
       // The adapter terminates it and starts a fresh one — see `CancelMessage`
       // in protocol.ts.
       cancelledIds.add(message.id);
+      // Cleared for the same reason `deliver` clears it: this request has had
+      // its one terminal message. A second `cancel` with the same id would
+      // otherwise pass both guards above and post a second one. The adapter
+      // does not send that, but the invariant is the file's, not the
+      // adapter's.
+      inFlight = undefined;
       state = "broken";
       post({ ...failed(message.id, "cancelled"), cancelled: true });
       return;

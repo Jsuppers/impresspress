@@ -339,20 +339,24 @@ function reloadPreview() {
 // writes would otherwise flicker the iframe and re-fetch the file tree for
 // nothing.
 //
-// The six `dev_` names are the mutating half of the control plane — its
+// The five `dev_` names are the mutating half of the control plane — its
 // reads (`dev_status`, `dev_list_files`, `dev_read_file`,
 // `dev_list_generations`, `dev_get_generation`, `dev_read_reference`) change
 // nothing. `shop_` covers the products family except its three listers
 // (`shop_list_products`, `shop_list_groups`, `shop_list_offers`), which the
 // negative lookahead excludes.
 //
-// `dev_compile_block` is in the list even though it is registered by
-// `registerPageLocal` rather than from the manifest, because this regex is
-// the page's ONE answer to "does this tool want the progress panel live" and
-// `registerPageTool` is where it is applied — see there. A compile publishes
-// a generation and rebuilds the runtime, so it is the most mutating call on
-// the page; `dev_export` writes nothing and is not here.
-var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_compile_block|dev_rollback|dev_remove_block|shop_(?!list_))/;
+// `dev_compile_block` is deliberately NOT here, and it is the one absence
+// that is a decision rather than an oversight. Almost all of a compile
+// happens inside the worker — forty seconds in which `/b/dev/api/status`
+// cannot report anything it has not already reported — so wrapping the tool
+// would spend ~130 status reads and as many ladder redraws per compile, every
+// one of them answering `idle`; on a D1-backed deployment those are real
+// reads. `compileBlock` opens the panel around the STAGING call instead,
+// which is the half the host does and the only half the journal describes,
+// and the compiler's own progress reaches the log through `onProgress`.
+// `dev_export` writes nothing and is not here either.
+var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_rollback|dev_remove_block|shop_(?!list_))/;
 
 // Every name this page registered. `registerTool`'s options bag takes an
 // `AbortSignal`, but a browser (or a polyfill) that ignores it would leave
@@ -824,6 +828,15 @@ var compileSelect = document.getElementById('dev-compile-block');
 // The blocks in the workspace, as `renderBlockChoices` last saw them.
 var blockNames = [];
 
+// Whether a compile is running, whoever started it.
+//
+// Both entries into `compileBlock` — the button and `dev_compile_block` —
+// set it, because a second build is the same waste however it was asked for:
+// the worker refuses a concurrent `compile` outright, so the page would spend
+// another snapshot and another eighty seconds to be told what it already
+// knew. `updateCompileButton` is the only reader; see there.
+var compileInFlight = false;
+
 // Whether Compile can be pressed, and why not when it cannot.
 //
 // It takes TWO things this page learns separately and in no fixed order: a
@@ -839,6 +852,15 @@ var blockNames = [];
 // nothing to compile, and offering the click anyway is a promise it cannot
 // keep.
 function updateCompileButton() {
+  // First, because while a compile runs it is the whole answer: there IS a
+  // toolchain and there IS a block, and the button must still not be
+  // pressable. Set from `compileBlock`, so an agent's `dev_compile_block`
+  // greys it out exactly as the button's own click does.
+  if (compileInFlight) {
+    compileButton.disabled = true;
+    compileButton.title = 'A compile is already running';
+    return;
+  }
   if (!compilerManifest) {
     compileButton.disabled = true;
     compileButton.title = 'No compiler in this build';
@@ -1000,17 +1022,49 @@ function stageDiagnostic(diagnostic) {
   };
 }
 
+// What cargo will call the built `.wasm`, from a `Cargo.toml` — or `null`
+// when the file names nothing.
+//
+// Deliberately not a TOML parser: these are the two keys that decide the
+// artifact's file name and nothing else is read. The scan is per table, so a
+// `name` under `[profile.release]` cannot be mistaken for one of them.
+// `[lib] name` wins where it is set, because that is what cargo names a
+// cdylib after; hyphens become underscores, which is the form the worker
+// asks the VFS for.
+function cargoArtifactStem(text) {
+  var table = '';
+  var names = {};
+  text.split('\n').forEach(function (raw) {
+    var line = raw.trim();
+    if (line.charAt(0) === '[') {
+      table = line;
+      return;
+    }
+    var found = /^name\s*=\s*"([^"]*)"/.exec(line);
+    if (found && (table === '[package]' || table === '[lib]')) {
+      names[table] = found[1];
+    }
+  });
+  var name = names['[lib]'] !== undefined ? names['[lib]'] : names['[package]'];
+  return name === undefined ? null : name.replace(/-/g, '_');
+}
+
 // Read `blocks/<name>/` out of the workspace, as the compiler wants it.
 //
 // The worker's VFS is keyed on paths RELATIVE to the crate root — it writes
 // `Cargo.toml` and `src/lib.rs`, not `blocks/hello/Cargo.toml` — so the
 // workspace prefix is stripped here and nowhere else.
 //
-// A file the sandbox could not hand back as text is a hard stop rather than
-// a skip: the crate would compile without it, quietly producing a block
-// whose sources are not the sources on disk. `include_bytes!` of an image is
-// the shape that gets a human here, and the diagnostic names the file so
-// they can move it out of `blocks/`.
+// Three things are refused here rather than handed to the compiler, each
+// with its own code, because each of them reaches rustc as a failure it can
+// only describe badly:
+//
+//   * `binary-source` — a file the sandbox could not hand back as text. A
+//     skip would let the crate compile without it, quietly producing a block
+//     whose sources are not the sources on disk; `include_bytes!` of an image
+//     is the shape that gets a human here.
+//   * `nested-source` — a path under a subdirectory of `src/`.
+//   * `package-name` — a `Cargo.toml` whose package is not this block.
 async function snapshotBlock(name) {
   var prefix = BLOCKS_PREFIX + name + '/';
   var listed = await json(await api.get('/b/dev/api/files?prefix=' + encodeURIComponent(prefix)));
@@ -1036,6 +1090,27 @@ async function snapshotBlock(name) {
   for (var i = 0; i < listed.files.length; i += 1) {
     var entry = listed.files[i];
     var rel = entry.path.slice(prefix.length);
+    // A flat `src/` is the limit, and this is where it is enforced. The
+    // worker writes every file into the VFS by path, and whether rubrc's
+    // write-file event creates the intermediate directories has never been
+    // verified — so a crate laid out with `src/routes/mod.rs` would fail
+    // somewhere inside rustc, with a message about a module it could not
+    // find, instead of failing here with the path in it. Refused before the
+    // read, because nothing about the contents changes the answer.
+    if (rel.indexOf('src/') === 0 && rel.indexOf('/', 4) >= 0) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'nested-source',
+        message:
+          entry.path +
+          ' is in a subdirectory of src/, and the browser toolchain compiles a flat src/. ' +
+          'Move it beside lib.rs.',
+        file: rel,
+        line: null,
+        column: null
+      });
+      continue;
+    }
     var file = await json(await api.post('/b/dev/api/files/read', { path: entry.path }));
     if (file.encoding !== 'utf8') {
       diagnostics.push({
@@ -1056,6 +1131,33 @@ async function snapshotBlock(name) {
     }
     files[rel] = file.content;
     manifest.push(rel + '\0' + file.sha256 + '\n');
+    // cargo names the artifact after the crate, and the worker reads that one
+    // file back out of the VFS by the BLOCK's name. A renamed crate therefore
+    // builds cleanly and leaves nothing to collect — a green build with no
+    // module, which the worker can only report as "the artifact is missing".
+    // Refusing it here says which line to change.
+    if (rel === 'Cargo.toml') {
+      var stem = cargoArtifactStem(file.content);
+      var wanted = name.replace(/-/g, '_');
+      if (stem !== null && stem !== wanted) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'package-name',
+          message:
+            'Cargo.toml builds ' +
+            stem +
+            '.wasm, but this block is "' +
+            name +
+            '" and the sandbox reads back ' +
+            wanted +
+            '.wasm. `[package] name` — and `[lib] name`, if you set one — must be the ' +
+            "block's name.",
+          file: rel,
+          line: null,
+          column: null
+        });
+      }
+    }
     // The vendored module IS the ABI, so the version the block was compiled
     // against is read out of the copy that was compiled — not out of the
     // sandbox's own constant, which would report agreement it cannot see. A
@@ -1080,6 +1182,23 @@ async function snapshotBlock(name) {
 // Snapshot, compile, stage — the whole of what `dev_compile_block` and the
 // Compile button do, with the result they both report.
 //
+// The wrapper is the in-flight bookkeeping and nothing else: `#dev-compile`
+// is greyed out for the duration, whichever of the two started the build,
+// and it comes back however the build ended — including a throw, which is
+// why this is a `finally` and not a line at each exit.
+async function compileBlock(name) {
+  compileInFlight = true;
+  updateCompileButton();
+  try {
+    return await runCompile(name);
+  } finally {
+    compileInFlight = false;
+    updateCompileButton();
+  }
+}
+
+// The three steps themselves, and the result they produce.
+//
 // Every failure that is an ANSWER about the block comes back as
 // `success: false` with diagnostics: sources the compiler cannot read, a
 // crate that does not compile, a module the validator refuses. Only a
@@ -1087,7 +1206,7 @@ async function snapshotBlock(name) {
 // its protocol, a request the sandbox refused — throws, and the callers turn
 // that into the tool's `isError`. That split is design §7.4: an agent needs
 // to know whether to fix its Rust or to stop trying.
-async function compileBlock(name) {
+async function runCompile(name) {
   // The ladder this page is about to draw is not the last one's. `completed`
   // survives only while it describes the live generation, and everything
   // below can end without producing a new one — a crate that does not build,
@@ -1101,7 +1220,16 @@ async function compileBlock(name) {
   completed = null;
   var snapshot = await snapshotBlock(name);
   if (snapshot.diagnostics.length) {
-    log('compile refused: ' + name + ' has source the compiler cannot read');
+    log(
+      'compile refused: ' +
+        name +
+        ' — ' +
+        snapshot.diagnostics
+          .map(function (diagnostic) {
+            return diagnostic.code;
+          })
+          .join(', ')
+    );
     return {
       success: false,
       cancelled: false,
@@ -1177,16 +1305,24 @@ async function compileBlock(name) {
   // revision every compiler URL already carries — is the honest fallback for
   // a worker that reached `ready` without reporting one.
   var compilerVersion = built.compilerVersion || compilerManifest.version;
-  var staged = await json(
-    await api.post('/b/dev/api/builds/stage', {
-      block_name: name,
-      artifact_base64: toBase64(built.artifact),
-      source_manifest_sha256: snapshot.sourceSha,
-      compiler_version: compilerVersion,
-      diagnostics: diagnostics,
-      wafer_guest_version: snapshot.guestVersion
-    })
-  );
+  // The progress panel opens HERE and not around the whole compile. Staging
+  // is the only part of this the HOST does — publish, rebuild the runtime,
+  // activate — so it is the only part `/b/dev/api/status` can describe, and
+  // the ladder is drawn from exactly those phases. Everything above ran in
+  // the worker and reported through `appendProgress`; polling the status
+  // through it would be a hundred-odd reads of a row that says `idle`.
+  var staged = await withProgress(async function () {
+    return json(
+      await api.post('/b/dev/api/builds/stage', {
+        block_name: name,
+        artifact_base64: toBase64(built.artifact),
+        source_manifest_sha256: snapshot.sourceSha,
+        compiler_version: compilerVersion,
+        diagnostics: diagnostics,
+        wafer_guest_version: snapshot.guestVersion
+      })
+    );
+  })();
   if (staged.success) {
     log('compiled ' + name + ' — generation ' + staged.generation.id);
     renderProgress(staged.generation.id, staged.progress);
@@ -1280,7 +1416,7 @@ Only one compile runs at a time.',
 
 // The button runs the same function on the same block, and reports the same
 // way: the panel is the human's copy of what the agent would have been told.
-var compileSelected = withProgress(async function () {
+async function compileSelected() {
   // `updateCompileButton` keeps the button disabled unless there is both a
   // toolchain and a block, so this is unreachable through the UI — it is here
   // because `compileBlock` would otherwise be handed an empty name and spend
@@ -1291,7 +1427,7 @@ var compileSelected = withProgress(async function () {
     return;
   }
   await compileBlock(name);
-});
+}
 
 compileButton.addEventListener('click', function () {
   compileSelected().catch(logError);

@@ -397,13 +397,18 @@ mod tests {
             "a workspace with no blocks must leave the button disabled too"
         );
         // One owner for the button's state. The two facts arrive from
-        // separate fetches in no fixed order, so a second place setting
-        // `disabled` would race and whichever landed later would win
+        // separate fetches in no fixed order — and a third, whether a compile
+        // is running, arrives from the compile itself — so a second place
+        // setting `disabled` would race and whichever landed later would win
         // regardless of what it knew.
+        assert!(
+            js.contains("if (compileInFlight) {"),
+            "a compile in flight must leave the button disabled too"
+        );
         assert_eq!(
             js.matches("compileButton.disabled =").count(),
-            3,
-            "`disabled` must be set only by updateCompileButton's three arms"
+            4,
+            "`disabled` must be set only by updateCompileButton's four arms"
         );
     }
 
