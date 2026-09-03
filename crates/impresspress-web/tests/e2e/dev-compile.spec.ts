@@ -2,7 +2,7 @@ import { test, expect, type BrowserContext, type Page } from '@playwright/test';
 
 import { bootServiceWorker, loginAdmin, loginToWorkspace } from './fixtures/dev-sandbox';
 import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
-import { execute, registeredTools, waitForTool, type ToolResult } from './fixtures/webmcp-helpers';
+import { execute, registeredTools, structured, waitForTool } from './fixtures/webmcp-helpers';
 
 /**
  * The checkpoint: a Rust block written, compiled, served and rolled back
@@ -117,13 +117,6 @@ const STAGE_PROBE = `
     };
   })();
 `;
-
-/** The structured half of a tool result, with "and it was not an error" folded in. */
-function structured<T>(result: ToolResult): T {
-  expect(result.isError, result.content[0]?.text).toBeFalsy();
-  expect(result.structuredContent, JSON.stringify(result)).toBeTruthy();
-  return result.structuredContent as unknown as T;
-}
 
 type FileEntry = { path: string; sha256: string; size: number };
 type FileRead = FileEntry & { encoding: string; content: string };

@@ -1,25 +1,23 @@
 import { test, expect, type Page } from '@playwright/test';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
   bootServiceWorker,
+  EXPORT_PORT,
   loginToWorkspace,
+  MANIFEST_TOOLS,
+  PAGE_TOOLS,
+  serveDirectory,
   WELCOME_HEADING,
   WELCOME_PHRASE,
 } from './fixtures/dev-sandbox';
 import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
-import { SHOP_OFFER, SHOP_PRODUCT } from './fixtures/shop-fixture';
-import {
-  execute,
-  registeredTools,
-  waitForTool,
-  type ToolResult,
-} from './fixtures/webmcp-helpers';
+import { SHOP_HEADING, SHOP_OFFER, SHOP_PRODUCT, shopPage } from './fixtures/shop-fixture';
+import { execute, registeredTools, structured, waitForTool } from './fixtures/webmcp-helpers';
 
 /**
  * Plan 2 checkpoint for the browser development sandbox: **an agent builds
@@ -63,145 +61,6 @@ import {
  * import. So each pays a cold boot, and each is independent of the others.
  */
 
-/**
- * The twelve `dev_*` tools `/b/dev/api/tools.json` projects, plus the two
- * `dev.js` registers itself.
- *
- * `dev_read_reference` and `dev_create_block` are Plan 3's — the guest-API
- * reference an agent reads before writing Rust, and the scaffolder that lays
- * a block down from a template. Both are ordinary HTTP tools
- * (`blocks/dev/tools.rs`'s `SELECTIONS`), so both are in `tools.json`.
- *
- * `dev_compile_block` and `dev_export` are not, for opposite reasons:
- * compiling happens in a page worker and never reaches the server as one
- * request, while exporting DOES have an endpoint whose answer is a multi-
- * megabyte zip — a file for the browser to download, not a tool result. Both
- * are page-local, which is why they belong in this list rather than in
- * `tools.json`. `dev_export_manifest` — what an export WOULD contain, as
- * small JSON — is an ordinary HTTP tool and is in the manifest.
- */
-const DEV_TOOLS = [
-  'dev_status',
-  'dev_list_files',
-  'dev_read_file',
-  'dev_read_reference',
-  'dev_write_file',
-  'dev_delete_file',
-  'dev_list_generations',
-  'dev_get_generation',
-  'dev_rollback',
-  'dev_create_block',
-  'dev_remove_block',
-  'dev_export_manifest',
-  'dev_compile_block',
-  'dev_export',
-];
-
-/** The products admin API, projected as the shop-building half of the page. */
-const SHOP_TOOLS = [
-  'shop_list_products',
-  'shop_create_product',
-  'shop_update_product',
-  'shop_delete_product',
-  'shop_restore_product',
-  'shop_list_groups',
-  'shop_create_group',
-  'shop_list_offers',
-  'shop_create_offer',
-  'shop_update_offer',
-  'shop_publish_offer',
-  'shop_archive_offer',
-];
-
-/** The two `dev.js` registers locally rather than from the manifest. */
-const PAGE_LOCAL_TOOLS = ['dev_compile_block', 'dev_export'];
-
-/** Everything the `/b/dev` page itself registers, in either half. */
-const PAGE_TOOLS = [...DEV_TOOLS, ...SHOP_TOOLS].sort();
-
-/**
- * What `/b/dev/api/tools.json` publishes — `PAGE_TOOLS` minus the two stubs.
- * `dev.js` logs this count after it registers the manifest, which is how the
- * page reports the size of the surface it was given.
- */
-const MANIFEST_TOOLS = PAGE_TOOLS.filter((name) => !PAGE_LOCAL_TOOLS.includes(name));
-
-/** The heading the agent's page carries; the proof a write reached the site. */
-const SHOP_HEADING = 'The print shop';
-
-/**
- * The page the agent writes over the welcome starter site.
- *
- * Deliberately what design §4.1's suggested prompt asks an agent for, not a
- * placeholder: it reads the *public* catalog (`/b/products/catalog`, the
- * anonymous surface — the `shop_*` tools are admin-only and a shopper has
- * none of them) and mounts the shipped storefront widget for each product.
- * `page.records` is the list field `CatalogProductListResponse` publishes
- * (`products/contracts.rs`); a page that guessed `items` would render an
- * empty shop and this whole test would still "pass" up to the last
- * assertion.
- *
- * Built through the DOM rather than `innerHTML` so the product name is text,
- * not markup — the shop is the boundary a prompt injection would cross, and a
- * fixture that pasted names into HTML would be modelling the wrong thing.
- *
- * `.shop-product-name` rather than a bare `h2`: the storefront widget renders
- * its own `h2` inside a shadow root, and Playwright's CSS engine pierces open
- * shadow roots, so `locator('h2')` would match two elements and fail strict
- * mode. Distinct class names keep the page's own markup addressable.
- *
- * # Why the page has to ask for `webmcp.js` itself
- *
- * `/b/webmcp/webmcp.js` is the deployment's WebMCP registration script at its
- * stable path, and design §16 scenario 5 requires the shopper's own agent to
- * have `list_products` on this page. Nothing puts that script here for it:
- * `ui::layout` injects the content-hashed `/b/static/webmcp-{hash}.js` into
- * every SSR-rendered ImpressPress page, but `/` on a sandbox is a file the
- * agent wrote, served verbatim by `wafer-run/web`, which injects nothing into
- * anybody's HTML. So a site that wants its visitors' agents to have tools has
- * to include the script itself, exactly as it has to include `storefront.js`
- * to get the purchase widget — and it does so at the stable path
- * (`GET /b/webmcp/webmcp.js`, `pipeline.rs`, `ui::assets::
- * WEBMCP_JS_STABLE_PATH`) rather than the content-hashed one, since a page
- * the agent writes has no SSR document to read the current hash off. The
- * guide and `SUGGESTED_PROMPT` on `/b/dev` tell the agent to write exactly
- * this tag (`blocks/dev/page.rs`).
- */
-function shopPage(): string {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>${SHOP_HEADING}</title>
-  <script src="/b/products/storefront.js" defer></script>
-  <script src="/b/webmcp/webmcp.js" defer></script>
-</head>
-<body>
-  <h1>${SHOP_HEADING}</h1>
-  <ul id="products"></ul>
-  <script>
-    fetch('/b/products/catalog')
-      .then(function (response) { return response.json(); })
-      .then(function (page) {
-        var list = document.getElementById('products');
-        page.records.forEach(function (product) {
-          var item = document.createElement('li');
-          var heading = document.createElement('h2');
-          heading.className = 'shop-product-name';
-          heading.textContent = product.name;
-          var widget = document.createElement('impresspress-product');
-          widget.setAttribute('product-id', product.id);
-          item.appendChild(heading);
-          item.appendChild(widget);
-          list.appendChild(item);
-        });
-      });
-  </script>
-</body>
-</html>
-`;
-}
-
 /** A 1×1 transparent PNG — the smallest honestly-binary file. 67 bytes. */
 const PIXEL_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==';
@@ -236,24 +95,6 @@ async function openWorkspace(page: Page) {
   await page.waitForURL((url) => url.pathname === '/b/dev', { timeout: 60_000 });
 }
 
-/**
- * The structured half of a tool result, with "and it was not an error"
- * folded in.
- *
- * Every tool on this page declares an `outputSchema`
- * (`impresspress-core/tests/snapshots/dev.tools.json`), so `webmcp-core.js`
- * parses each success body into `structuredContent` — a tool that came back
- * with only a text block either failed or lost its schema, and both are
- * defects rather than shapes to branch on. `content[0].text` is the message
- * on the failure path (`Request failed (409): …`), which is what makes a
- * broken assertion here readable.
- */
-function structured<T>(result: ToolResult): T {
-  expect(result.isError, result.content[0]?.text).toBeFalsy();
-  expect(result.structuredContent, JSON.stringify(result)).toBeTruthy();
-  return result.structuredContent as unknown as T;
-}
-
 /** `contracts::ExportManifest`, trimmed to what this spec reads. */
 type ExportManifest = {
   generation_id: string;
@@ -268,41 +109,6 @@ type ExportManifest = {
 type FileRead = { path: string; sha256: string; size: number; encoding: string; content: string };
 type FileWrite = { path: string; sha256: string; size: number; generation: Generation | null };
 type Generation = { id: string; cause: string; status: string };
-
-/**
- * Serve `dir` on `port` with Python's `http.server` and wait until it answers.
- *
- * The exported bundle has to be SERVED to be proved: a service worker cannot
- * be registered from a `file://` URL, which is the first thing the export's
- * own README says. `python3` is already a hard dependency of this repo's
- * tooling (`examples/dev-sandbox/build.sh` uses it), so this needs nothing
- * installed that CI does not already have.
- */
-async function serveDirectory(dir: string, port: number): Promise<ChildProcess> {
-  const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], {
-    cwd: dir,
-    stdio: 'ignore',
-  });
-  const deadline = Date.now() + 30_000;
-  for (;;) {
-    if (server.exitCode !== null) {
-      throw new Error(`static server for ${dir} exited with ${server.exitCode}`);
-    }
-    const up = await new Promise<boolean>((resolve) => {
-      const socket = createConnection({ host: '127.0.0.1', port }, () => {
-        socket.end();
-        resolve(true);
-      });
-      socket.on('error', () => resolve(false));
-    });
-    if (up) return server;
-    if (Date.now() > deadline) throw new Error(`static server for ${dir} never came up`);
-    await new Promise((r) => setTimeout(r, 100));
-  }
-}
-
-/** The port the exported bundle is served on, beside the sandbox's own. */
-const EXPORT_PORT = 8099;
 
 test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({
   page,

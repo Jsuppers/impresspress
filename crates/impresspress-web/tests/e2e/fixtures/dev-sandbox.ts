@@ -1,14 +1,17 @@
 import { expect, type Page } from '@playwright/test';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { createConnection } from 'node:net';
 
 /**
  * Getting a page onto the browser development sandbox.
  *
  * Every sandbox spec (`dev-foundations.spec.ts`, `dev-workspace.spec.ts`,
- * `dev-compiler.spec.ts`) starts the same way — boot the service worker, sign
- * in as the seeded admin, and for most of them land on `/b/dev` — and none of
- * it is what any of them is testing. The boot wait alone is subtle enough
- * (three separate conditions, each for its own reason) that a second copy of
- * it would be a second thing to get wrong.
+ * `dev-compiler.spec.ts`, `dev-compile.spec.ts`, `dev-scenario.spec.ts`)
+ * starts the same way — boot the service worker, sign in as the seeded admin,
+ * and for most of them land on `/b/dev` — and none of it is what any of them
+ * is testing. The boot wait alone is subtle enough (three separate
+ * conditions, each for its own reason) that a second copy of it would be a
+ * second thing to get wrong.
  *
  * These helpers are for the SANDBOX bundle (`examples/dev-sandbox/build.sh`,
  * served on `TEST_PORT` by a plain static host), not for the native server the
@@ -114,3 +117,112 @@ export async function loginToWorkspace(page: Page) {
   await page.goto('/b/dev', { waitUntil: 'commit' });
   await expect(page.locator('#dev-progress-steps li').first()).toBeAttached({ timeout: 60_000 });
 }
+
+// ---------------------------------------------------------------------------
+// What the workspace publishes, and how the exported bundle is served.
+//
+// Both halves below are read by more than one spec — `dev-workspace.spec.ts`
+// pins them as its own subject, and `dev-scenario.spec.ts` walks the whole of
+// design §16 through them — so they live here rather than in whichever file
+// happened to need them first. A second copy of a twenty-six name allowlist,
+// or of "spawn a static host and wait for the port", is a second thing to keep
+// in step with the contract it describes.
+// ---------------------------------------------------------------------------
+
+/**
+ * The twelve `dev_*` tools `/b/dev/api/tools.json` projects, plus the two
+ * `dev.js` registers itself.
+ *
+ * `dev_read_reference` and `dev_create_block` are Plan 3's — the guest-API
+ * reference an agent reads before writing Rust, and the scaffolder that lays
+ * a block down from a template. Both are ordinary HTTP tools
+ * (`blocks/dev/tools.rs`'s `SELECTIONS`), so both are in `tools.json`.
+ *
+ * `dev_compile_block` and `dev_export` are not, for opposite reasons:
+ * compiling happens in a page worker and never reaches the server as one
+ * request, while exporting DOES have an endpoint whose answer is a multi-
+ * megabyte zip — a file for the browser to download, not a tool result. Both
+ * are page-local, which is why they belong in this list rather than in
+ * `tools.json`. `dev_export_manifest` — what an export WOULD contain, as
+ * small JSON — is an ordinary HTTP tool and is in the manifest.
+ */
+export const DEV_TOOLS = [
+  'dev_status',
+  'dev_list_files',
+  'dev_read_file',
+  'dev_read_reference',
+  'dev_write_file',
+  'dev_delete_file',
+  'dev_list_generations',
+  'dev_get_generation',
+  'dev_rollback',
+  'dev_create_block',
+  'dev_remove_block',
+  'dev_export_manifest',
+  'dev_compile_block',
+  'dev_export',
+];
+
+/** The products admin API, projected as the shop-building half of the page. */
+export const SHOP_TOOLS = [
+  'shop_list_products',
+  'shop_create_product',
+  'shop_update_product',
+  'shop_delete_product',
+  'shop_restore_product',
+  'shop_list_groups',
+  'shop_create_group',
+  'shop_list_offers',
+  'shop_create_offer',
+  'shop_update_offer',
+  'shop_publish_offer',
+  'shop_archive_offer',
+];
+
+/** The two `dev.js` registers locally rather than from the manifest. */
+export const PAGE_LOCAL_TOOLS = ['dev_compile_block', 'dev_export'];
+
+/** Everything the `/b/dev` page itself registers, in either half. */
+export const PAGE_TOOLS = [...DEV_TOOLS, ...SHOP_TOOLS].sort();
+
+/**
+ * What `/b/dev/api/tools.json` publishes — `PAGE_TOOLS` minus the two stubs.
+ * `dev.js` logs this count after it registers the manifest, which is how the
+ * page reports the size of the surface it was given.
+ */
+export const MANIFEST_TOOLS = PAGE_TOOLS.filter((name) => !PAGE_LOCAL_TOOLS.includes(name));
+
+/**
+ * Serve `dir` on `port` with Python's `http.server` and wait until it answers.
+ *
+ * The exported bundle has to be SERVED to be proved: a service worker cannot
+ * be registered from a `file://` URL, which is the first thing the export's
+ * own README says. `python3` is already a hard dependency of this repo's
+ * tooling (`examples/dev-sandbox/build.sh` uses it), so this needs nothing
+ * installed that CI does not already have.
+ */
+export async function serveDirectory(dir: string, port: number): Promise<ChildProcess> {
+  const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], {
+    cwd: dir,
+    stdio: 'ignore',
+  });
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    if (server.exitCode !== null) {
+      throw new Error(`static server for ${dir} exited with ${server.exitCode}`);
+    }
+    const up = await new Promise<boolean>((resolve) => {
+      const socket = createConnection({ host: '127.0.0.1', port }, () => {
+        socket.end();
+        resolve(true);
+      });
+      socket.on('error', () => resolve(false));
+    });
+    if (up) return server;
+    if (Date.now() > deadline) throw new Error(`static server for ${dir} never came up`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/** The port the exported bundle is served on, beside the sandbox's own. */
+export const EXPORT_PORT = 8099;

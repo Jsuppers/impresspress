@@ -1,10 +1,11 @@
-import type { Page } from '@playwright/test';
+import { expect, type Page } from '@playwright/test';
 
 /**
  * Reading and driving `document.modelContext` from a test.
  *
- * These two helpers were born inside `webmcp.spec.ts`; they live here because
- * `dev-workspace.spec.ts` needs exactly the same two operations against a
+ * These helpers were born inside `webmcp.spec.ts`; they live here because the
+ * sandbox specs (`dev-workspace.spec.ts`, `dev-compile.spec.ts`,
+ * `dev-scenario.spec.ts`) need exactly the same operations against a
  * completely different server (the browser-WASM sandbox bundle rather than
  * the native binary). Two copies of "wait until N tools exist, then read
  * them" would be two things to keep in step with the polyfill's test hooks —
@@ -90,4 +91,27 @@ export async function execute(
       ).modelContext.__execute(toolName as string, toolArgs),
     [name, args] as const,
   );
+}
+
+/**
+ * The structured half of a tool result, with "and it was not an error" folded
+ * in.
+ *
+ * Every tool the sandbox specs call declares an `outputSchema`
+ * (`impresspress-core/tests/snapshots/dev.tools.json`), so `webmcp-core.js`
+ * parses each success body into `structuredContent` — a tool that came back
+ * with only a text block either failed or lost its schema, and both are
+ * defects rather than shapes to branch on. `content[0].text` is the message on
+ * the failure path (`Request failed (409): …`), which is what makes a broken
+ * assertion readable.
+ *
+ * Shared rather than copied: `dev-compile.spec.ts`, `dev-workspace.spec.ts`
+ * and `dev-scenario.spec.ts` all unwrap tool results the same way, and three
+ * copies of "assert not-an-error, then cast" would be three places for the
+ * failure message to drift.
+ */
+export function structured<T>(result: ToolResult): T {
+  expect(result.isError, result.content[0]?.text).toBeFalsy();
+  expect(result.structuredContent, JSON.stringify(result)).toBeTruthy();
+  return result.structuredContent as unknown as T;
 }
