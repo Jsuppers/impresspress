@@ -41,10 +41,25 @@
 //   protocol-error         report an out-of-band `error` instead of a result
 //   slow                   take five seconds, so a `cancel` has something to hit
 //
-// Anything else compiles: `success: true` with a sixteen-byte artifact, unless
-// one of the files contains the marker `FAIL`, which produces one error
-// diagnostic and no artifact — a crate that does not compile, which is an
-// ordinary answer and not a failure of the protocol.
+// Anything else compiles: `success: true` with an artifact, unless one of the
+// files contains the marker `FAIL`, which produces one error diagnostic and no
+// artifact — a crate that does not compile, which is an ordinary answer and
+// not a failure of the protocol.
+//
+// # Where the artifact comes from
+//
+// Sixteen bytes, by default. That is enough for a spec whose subject is the
+// PROTOCOL: the adapter hands the buffer back and digests it, and neither
+// operation cares what is in it.
+//
+// It is not enough for a spec whose subject is the TOOL. `POST /b/dev/api/
+// builds/stage` instantiates the module, reads its `BlockInfo` and runs its
+// lifecycle before it will activate anything, so sixteen bytes are refused
+// with a `guest-*` diagnostic and nothing downstream of staging is ever
+// reached. So `dev-compile-tool.spec.ts` compiles the scaffolded block on the
+// HOST with real cargo and drops the resulting `<crateName>.wasm` beside this
+// file; the switch below is simply whether such a file is there. A 404 — the
+// ordinary case — means no spec put one there.
 
 /** `worker-entry.ts`'s own states, and for the same reasons. */
 let state = 'new';
@@ -91,8 +106,20 @@ const deliver = (id, result, transfer = []) => {
   post(result, transfer);
 };
 
-/** The bytes a successful build hands back, as a transferable buffer. */
-const artifact = () => Uint8Array.from({ length: ARTIFACT_BYTES }, (_, i) => i).buffer;
+/**
+ * The bytes a successful build hands back, as a transferable buffer.
+ *
+ * A real `<crateName>.wasm` beside this worker wins; otherwise the canned
+ * sixteen. Same-origin, so the fetch needs nothing the worker's inherited
+ * `credentialless` COEP would refuse.
+ */
+const artifact = async (crateName) => {
+  const response = await fetch(new URL(`./${crateName}.wasm`, import.meta.url));
+  if (response.ok) {
+    return await response.arrayBuffer();
+  }
+  return Uint8Array.from({ length: ARTIFACT_BYTES }, (_, i) => i).buffer;
+};
 
 /**
  * The first file carrying the `FAIL` marker, as one rustc-shaped diagnostic.
@@ -137,7 +164,7 @@ const compile = (message) => {
 
   const slow = message.crateName === 'slow';
   setTimeout(
-    () => {
+    async () => {
       const stdout = `fake build #${build}: ${message.crateName}`;
       const elapsedMs = Date.now() - started;
 
@@ -213,7 +240,7 @@ const compile = (message) => {
         });
         return;
       }
-      const bytes = artifact();
+      const bytes = await artifact(message.crateName);
       deliver(
         message.id,
         {

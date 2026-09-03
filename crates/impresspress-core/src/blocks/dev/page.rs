@@ -164,6 +164,19 @@ fn body() -> Markup {
                 // without the overlay. Export stays disabled until the
                 // exporter exists; the agent sees both names as tools that
                 // refuse honestly.
+
+                // Which block Compile acts on. It ships EMPTY, and stays
+                // empty on a workspace with no blocks: the options are the
+                // `blocks/<name>/` prefixes in the file listing (`dev.js`'s
+                // `renderBlockChoices`, refreshed with the file pane), and
+                // a block only exists as files under such a prefix — there
+                // is no block record until one compiles, so there is
+                // nothing this markup could have known to pre-render. The
+                // label is on the control rather than beside it because the
+                // pane is a row of buttons with no space for one, and a
+                // select whose only clue is its first option is
+                // unreachable by anything that is not looking at it.
+                select #dev-compile-block aria-label="Block to compile" {}
                 button #dev-compile .btn .btn-secondary type="button" disabled { "Compile block" }
                 button #dev-export .btn .btn-secondary type="button" disabled { "Export" }
                 button #dev-refresh-tools .btn .btn-secondary type="button" { "Refresh tools" }
@@ -270,6 +283,7 @@ mod tests {
             "dev-new-file",
             "dev-refresh-tools",
             "dev-compile",
+            "dev-compile-block",
             "dev-compiler-version",
         ] {
             assert!(
@@ -373,6 +387,67 @@ mod tests {
         assert!(
             js.contains("compileButton.title = 'No compiler in this build';"),
             "a build with no compiler must say so on the button"
+        );
+    }
+
+    /// Every `/b/dev/api/…` URL the page calls is a route this block serves.
+    ///
+    /// `dev.js` reaches four endpoints that no Rust caller does — the file
+    /// list, the file read, the staging endpoint and the status poll — and
+    /// nothing but a running browser would notice a typo in one of them: a
+    /// misspelled path is a 404 the page logs and swallows, so the Compile
+    /// button would simply stop working with a line in a panel to say why.
+    /// The URLs are scraped out of the script rather than listed here, so a
+    /// new endpoint the page starts calling is checked without this test
+    /// being edited.
+    #[test]
+    fn the_page_only_calls_endpoints_this_block_routes() {
+        let js = assets::dev_js();
+        let mut found = 0;
+        for (index, _) in js.match_indices("'/b/dev/api") {
+            let rest = &js[index + 1..];
+            let end = rest.find('\'').expect("an unterminated string literal");
+            // The query string is not part of a route template: the files
+            // list is `/b/dev/api/files?prefix=…` at the call site and
+            // `/b/dev/api/files` in the table.
+            let url = &rest[..end];
+            let path = url.split('?').next().unwrap();
+            assert!(
+                super::super::ROUTES
+                    .iter()
+                    .any(|route| route.template == path),
+                "dev.js calls {url}, which this block does not route"
+            );
+            found += 1;
+        }
+        // A scrape that matched nothing would pass the loop above silently.
+        assert!(found >= 4, "only {found} api URLs found in dev.js");
+    }
+
+    /// The page reads the guest ABI version out of the module the scaffolder
+    /// writes, in the spelling that module actually uses.
+    ///
+    /// `dev.js` parses `WAFER_GUEST_VERSION` out of the block's own copy of
+    /// `src/wafer_guest.rs` and reports it with the staged build, and
+    /// `blocks_api.rs` refuses anything that is not the sandbox's own. A
+    /// vendored module whose constant were reformatted — a type annotation
+    /// dropped, the spacing changed — would stop matching, the page would
+    /// report `null`, and every compiled block would be recorded as guest
+    /// version `0` ("unknown") with the check silently disabled. This is the
+    /// only place the regex and the file it is aimed at are both in scope.
+    #[test]
+    fn the_page_can_read_the_version_out_of_the_vendored_guest_module() {
+        assert!(
+            assets::dev_js().contains(r"/WAFER_GUEST_VERSION: u32 = (\d+)/"),
+            "dev.js must read the block's own guest version, not assume one"
+        );
+        let expected = format!(
+            "WAFER_GUEST_VERSION: u32 = {}",
+            super::super::WAFER_GUEST_VERSION
+        );
+        assert!(
+            super::super::scaffold::Template::WAFER_GUEST.contains(&expected),
+            "the vendored module must state `{expected}` for dev.js's regex to find it"
         );
     }
 

@@ -112,9 +112,16 @@ var lastPhase = null;
 var lastDetail = null;
 var lastActiveGeneration = null;
 
-function renderStatus(status) {
-  var activation = status.activation;
-  var phase = activation ? activation.phase : 'idle';
+// Draw the ladder for one phase.
+//
+// `finished` is the difference between "the activation is HERE" and "the
+// activation ENDED here": a live poll wants the phase it read marked
+// `current`, while an activation that is over wants its last phase marked
+// `done` like every step before it. A phase that is not a step at all
+// (`idle`, `failed`) leaves every step `pending` — what happened to the
+// activation as a whole is stated on the list's own `data-phase`, which is
+// what the stylesheet's `[data-phase='failed']` rule reads.
+function drawLadder(phase, finished) {
   var reached = -1;
   PHASES.forEach(function (entry, index) {
     if (entry[0] === phase) {
@@ -125,15 +132,64 @@ function renderStatus(status) {
   steps.setAttribute('data-phase', phase);
   steps.innerHTML = '';
   PHASES.forEach(function (entry, index) {
+    var state = 'pending';
+    if (reached >= 0 && index < reached) {
+      state = 'done';
+    } else if (reached >= 0 && index === reached) {
+      state = finished ? 'done' : 'current';
+    }
     var li = document.createElement('li');
     li.className = 'dev-step';
-    li.setAttribute(
-      'data-state',
-      reached < 0 ? 'pending' : index < reached ? 'done' : index === reached ? 'current' : 'pending'
-    );
+    li.setAttribute('data-state', state);
     li.textContent = entry[1];
     steps.appendChild(li);
   });
+}
+
+// The ladder of an activation that has already FINISHED, and the generation
+// it produced — or `null` when this page has not watched one finish.
+//
+// The journal only describes an activation while it is in flight: the moment
+// the swap is recorded the row rests at `idle` (`repo/runtime_state.rs`), so
+// `/b/dev/api/status` stops mentioning the phases it passed through. A
+// compile that took forty seconds would therefore leave a BLANK ladder a
+// third of a second later, because `withProgress` runs a catch-up poll the
+// instant the call returns. The one account of those phases that survives is
+// the `progress` the staging response carries, so `renderProgress` records it
+// here against the generation it published, and `renderStatus` keeps showing
+// it for as long as that generation is the live one.
+var completed = null;
+
+// Draw the ladder from an activation's own after-the-fact account of itself,
+// and log where the time went. `progress` is `ProgressStep[]`
+// (`blocks/dev/activation.rs`) — one entry per phase, ending at `active`.
+function renderProgress(generationId, progress) {
+  if (!progress.length) {
+    return;
+  }
+  completed = { generation: generationId, phase: progress[progress.length - 1].phase };
+  drawLadder(completed.phase, true);
+  progress.forEach(function (step) {
+    log('activation: ' + step.phase + ' — ' + step.ms + ' ms' + (step.detail ? ' (' + step.detail + ')' : ''));
+  });
+}
+
+function renderStatus(status) {
+  var activation = status.activation;
+  var phase = activation ? activation.phase : 'idle';
+  var activeId = status.active_generation ? status.active_generation.id : null;
+  // Nothing in flight, and the generation the last activation published is
+  // still the live one: keep that activation's ladder up. Blanking it would
+  // be the panel forgetting the very thing it was watching a moment ago,
+  // and `data-phase="active"` is not a guess — `ActivationPhase::Active`
+  // means "the generation is live", which is exactly what the status just
+  // confirmed. Anything else — a phase in flight, or a newer generation this
+  // page did not watch land — is drawn from the status, as before.
+  if (phase === 'idle' && completed !== null && completed.generation === activeId) {
+    drawLadder(completed.phase, true);
+  } else {
+    drawLadder(phase, false);
+  }
 
   if (phase !== lastPhase) {
     log('activation: ' + phase + (activation ? ' (' + activation.generation_id + ')' : ''));
@@ -146,7 +202,6 @@ function renderStatus(status) {
     log(activation.detail);
     lastDetail = activation.detail;
   }
-  var activeId = status.active_generation ? status.active_generation.id : null;
   if (activeId !== lastActiveGeneration) {
     log('live generation: ' + (activeId || 'none'));
     lastActiveGeneration = activeId;
@@ -284,14 +339,20 @@ function reloadPreview() {
 // writes would otherwise flicker the iframe and re-fetch the file tree for
 // nothing.
 //
-// The five `dev_` names are the mutating half of the control plane — its
+// The six `dev_` names are the mutating half of the control plane — its
 // reads (`dev_status`, `dev_list_files`, `dev_read_file`,
 // `dev_list_generations`, `dev_get_generation`, `dev_read_reference`) change
 // nothing. `shop_` covers the products family except its three listers
 // (`shop_list_products`, `shop_list_groups`, `shop_list_offers`), which the
-// negative lookahead excludes. `dev_compile_block` joins the list when it
-// lands; it mutates too.
-var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_rollback|dev_remove_block|shop_(?!list_))/;
+// negative lookahead excludes.
+//
+// `dev_compile_block` is in the list even though it is registered by
+// `registerPageLocal` rather than from the manifest, because this regex is
+// the page's ONE answer to "does this tool want the progress panel live" and
+// `registerPageTool` is where it is applied — see there. A compile publishes
+// a generation and rebuilds the runtime, so it is the most mutating call on
+// the page; `dev_export` writes nothing and is not here.
+var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_compile_block|dev_rollback|dev_remove_block|shop_(?!list_))/;
 
 // Every name this page registered. `registerTool`'s options bag takes an
 // `AbortSignal`, but a browser (or a polyfill) that ignores it would leave
@@ -300,7 +361,20 @@ var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_rollback|d
 // list is the fallback: on abort, unregister exactly these by name.
 var registered = [];
 
+// Register one tool, whichever registrar it came from.
+//
+// The `withProgress` wrap lives HERE rather than in `registerFromManifest`
+// so that both registrars obey the same rule: a page-local tool that mutates
+// the site wants the panel live and the panes refreshed for exactly the
+// reasons a manifest tool does, and a second copy of the decision would be a
+// second place for `MUTATING` to be forgotten. Applied outermost, so the
+// panel is live for the whole call — `registerFromManifest` has already
+// wrapped the manifest tools' `execute` in `withSessionCheck`, which has to
+// see the raw result.
 function registerPageTool(options) {
+  if (MUTATING.test(options.name)) {
+    options.execute = withProgress(options.execute);
+  }
   document.modelContext.registerTool(options, { signal: abort.signal });
   registered.push(options.name);
 }
@@ -360,12 +434,9 @@ function registerFromManifest(manifest) {
       // registration options, `execute` included — the request it builds is
       // the same same-origin call `webmcp.js` makes for a site tool.
       var options = toolOptions(tool);
-      // Session check innermost, so it sees the raw result; progress
-      // outermost, so the panel is live for the whole call.
+      // Session check innermost, so it sees the raw result. The progress
+      // wrap goes on outside it, in `registerPageTool`.
       options.execute = withSessionCheck(options.execute);
-      if (MUTATING.test(tool.name)) {
-        options.execute = withProgress(options.execute);
-      }
       registerPageTool(options);
     } catch (error) {
       // One tool the browser rejected is not a reason to lose the rest —
@@ -376,11 +447,12 @@ function registerFromManifest(manifest) {
   log('registered ' + registered.length + ' workspace tools');
 }
 
-// `dev_compile_block` and `dev_export` have no HTTP endpoint behind them:
-// compiling happens in a worker on this page, and exporting writes a bundle
-// from it — neither exists in this build yet. They are registered anyway, as
-// honest refusals: an agent that discovers them gets `isError` and a reason,
-// which is what stops it inventing its own way to compile or export.
+// `dev_compile_block` and `dev_export` are the two tools with no HTTP
+// endpoint behind them: compiling happens in a worker on this page, and
+// exporting writes a bundle from it. `dev_compile_block` is real below;
+// `dev_export` is still a stub, and is registered anyway as an honest
+// refusal — an agent that discovers it gets `isError` and a reason, which is
+// what stops it inventing its own way to export.
 function notAvailable(name) {
   return {
     isError: true,
@@ -389,18 +461,7 @@ function notAvailable(name) {
 }
 
 function registerPageLocal() {
-  registerPageTool({
-    name: 'dev_compile_block',
-    description: 'Compile a Rust block in the browser. Not available in this build yet.',
-    inputSchema: {
-      type: 'object',
-      properties: { name: { type: 'string' } },
-      required: ['name']
-    },
-    execute: async function () {
-      return notAvailable('dev_compile_block');
-    }
-  });
+  registerCompileTool();
   registerPageTool({
     name: 'dev_export',
     description: 'Export the site as a runnable static bundle. Not available in this build yet.',
@@ -484,6 +545,11 @@ function setEditorEnabled(enabled) {
 
 async function loadFiles() {
   var files = (await json(await api.get('/b/dev/api/files'))).files;
+  // The Compile button's block list is a projection of the SAME listing, not
+  // a second request: the workspace's blocks are exactly the `blocks/<name>/`
+  // prefixes in it, and asking twice would let the two panes disagree about
+  // a block an agent had just created or removed.
+  renderBlockChoices(files);
   list.innerHTML = '';
   files.forEach(function (file) {
     var li = document.createElement('li');
@@ -740,6 +806,404 @@ async function discoverCompiler() {
   compileButton.disabled = false;
   log('compiler ' + compilerManifest.version + ' available');
 }
+
+// ---- compiling a block ----------------------------------------------------
+
+// Where a block's sources live, and the string every path under one starts
+// with. `workspace::BLOCKS_PREFIX` on the other side.
+var BLOCKS_PREFIX = 'blocks/';
+
+// Which block the Compile button acts on.
+//
+// Assigned here rather than beside the file pane's own elements because it
+// belongs to the compiler, and the ordering works out either way: nothing
+// calls `loadFiles` until the first-paint block at the bottom of this file,
+// which is below this line.
+var compileSelect = document.getElementById('dev-compile-block');
+
+// The workspace's blocks, as the Compile button's options.
+//
+// Derived from the file listing rather than kept as its own state: a block
+// IS a `blocks/<name>/` prefix with files under it (there is no block
+// record until one compiles), so the listing is the only honest source. The
+// listing arrives in path order, so the names come out sorted without
+// sorting.
+function renderBlockChoices(files) {
+  var names = [];
+  files.forEach(function (file) {
+    if (file.path.indexOf(BLOCKS_PREFIX) !== 0) {
+      return;
+    }
+    var name = file.path.slice(BLOCKS_PREFIX.length).split('/')[0];
+    if (name && names.indexOf(name) < 0) {
+      names.push(name);
+    }
+  });
+  // Every mutating call refreshes the panes, so this runs while a human may
+  // have a block picked and be reaching for Compile. Their choice is read
+  // back and restored; a block that has since been removed is simply gone,
+  // and the select falls back to its first option.
+  var chosen = compileSelect.value;
+  compileSelect.innerHTML = '';
+  names.forEach(function (name) {
+    var option = document.createElement('option');
+    option.value = name;
+    option.textContent = name;
+    compileSelect.appendChild(option);
+  });
+  if (names.indexOf(chosen) >= 0) {
+    compileSelect.value = chosen;
+  }
+}
+
+/** Lowercase hex SHA-256 of a string, the form the build row records. */
+async function sha256Hex(text) {
+  var digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.prototype.map
+    .call(new Uint8Array(digest), function (byte) {
+      return byte.toString(16).padStart(2, '0');
+    })
+    .join('');
+}
+
+// The artifact as `artifact_base64`.
+//
+// `btoa` takes a string, so the bytes go through `String.fromCharCode` — and
+// that has to be chunked, because `apply` spreads its array into ARGUMENTS
+// and a 4 MiB module would be four million of them, which overflows the call
+// stack in every engine. 0x8000 is the conventional slice: comfortably under
+// every engine's argument limit, and 128 iterations at the sandbox's 4 MiB
+// ceiling.
+function toBase64(bytes) {
+  var CHUNK = 0x8000;
+  var parts = [];
+  for (var i = 0; i < bytes.length; i += CHUNK) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(parts.join(''));
+}
+
+// The compiler's own stages, as log lines.
+//
+// They are NOT activation phases and are deliberately kept off the ladder:
+// `download`/`initializing`/`compiling` happen in a worker on this page,
+// before the server has been told anything at all, while every step of the
+// ladder is a phase of an activation the SERVER is running. A panel that
+// mixed them would be claiming the site was being republished while a
+// toolchain downloaded.
+//
+// De-duplicated on the rendered line, because the toolchain reports its
+// ~72 MiB download by chunks and the log holds 200 lines — without this one
+// cold start would flush everything else out of the panel.
+var lastProgressLine = null;
+
+function appendProgress(progress) {
+  var line = 'compiler: ' + progress.stage;
+  if (progress.total > 0) {
+    line += ' ' + Math.floor((progress.loaded / progress.total) * 100) + '%';
+  }
+  if (progress.detail) {
+    line += ' — ' + progress.detail;
+  }
+  if (line === lastProgressLine) {
+    return;
+  }
+  lastProgressLine = line;
+  log(line);
+}
+
+// The one compiler session this page ever has.
+//
+// Kept across compiles because `BrowserRustCompiler` replaces its own worker
+// after a cancel, a timeout or a protocol violation and stays usable
+// (compiler-adapter.js): the instance outlives the workers it owns, so
+// throwing it away here would only discard a toolchain that is already
+// downloaded and instantiated.
+var compiler = null;
+
+async function ensureCompiler(onProgress) {
+  // Not something the agent did, and not something a retry fixes: this
+  // bundle was built without the compiler overlay. `discoverCompiler` has
+  // already said so on the button; this is the same fact reaching a tool
+  // call, and it is the one compile failure that is an `isError` rather than
+  // a result — there is no build to report on.
+  if (!compilerManifest) {
+    throw new Error('No compiler in this build.');
+  }
+  if (!compiler) {
+    compiler = new BrowserRustCompiler(compilerManifest);
+  }
+  // Idempotent, and the only place the toolchain's start-up is paid for: a
+  // later compile joins whatever worker this one leaves behind.
+  await compiler.initialize(onProgress);
+  return compiler;
+}
+
+// One compiler diagnostic, as the sandbox's own wire type.
+//
+// Two different contracts meet here and this is the only place they can. In
+// `compiler/src/protocol.ts` `code` is OPTIONAL — rustc numbers some
+// diagnostics and not others — while `validation::Diagnostic`'s is a
+// required string the whole design tells callers to match on instead of the
+// message. Passing the worker's value straight through would make a single
+// unnumbered WARNING on an otherwise good build a 400 from
+// `POST /b/dev/api/builds/stage`, and the block would fail to activate for a
+// reason nothing on the page could explain. `rustc` is the code such a
+// diagnostic actually has: the compiler said it, and gave it no number.
+function stageDiagnostic(diagnostic) {
+  return {
+    severity: diagnostic.severity,
+    code: diagnostic.code || 'rustc',
+    message: diagnostic.message,
+    file: typeof diagnostic.file === 'string' ? diagnostic.file : null,
+    line: typeof diagnostic.line === 'number' ? diagnostic.line : null,
+    column: typeof diagnostic.column === 'number' ? diagnostic.column : null
+  };
+}
+
+// Read `blocks/<name>/` out of the workspace, as the compiler wants it.
+//
+// The worker's VFS is keyed on paths RELATIVE to the crate root — it writes
+// `Cargo.toml` and `src/lib.rs`, not `blocks/hello/Cargo.toml` — so the
+// workspace prefix is stripped here and nowhere else.
+//
+// A file the sandbox could not hand back as text is a hard stop rather than
+// a skip: the crate would compile without it, quietly producing a block
+// whose sources are not the sources on disk. `include_bytes!` of an image is
+// the shape that gets a human here, and the diagnostic names the file so
+// they can move it out of `blocks/`.
+async function snapshotBlock(name) {
+  var prefix = BLOCKS_PREFIX + name + '/';
+  var listed = await json(await api.get('/b/dev/api/files?prefix=' + encodeURIComponent(prefix)));
+  // A name with nothing under it is a request the caller got wrong, not a
+  // verdict on a block — the same thing the files API answers with a 404,
+  // and it reaches the agent the same way (`isError`). Handing an empty
+  // `files` map to the compiler would instead spend a minute of rustc to
+  // report that a crate with no `Cargo.toml` does not build.
+  if (!listed.files.length) {
+    throw new Error('there is no block at ' + prefix + ' — create one with dev_create_block');
+  }
+  var files = {};
+  var diagnostics = [];
+  var guestVersion = null;
+  // The source manifest, one `<crate-relative path>\0<sha256>\n` line per
+  // file, sorted. NUL rather than a space because a path may contain
+  // anything but that, so no two different snapshots can produce one string;
+  // crate-relative because that is what the compiler was given, and a digest
+  // over paths it never saw would describe a different build than the one
+  // that ran. The server stores it without recomputing it — it is provenance
+  // for a stored build, so its only contract is with itself.
+  var manifest = [];
+  for (var i = 0; i < listed.files.length; i += 1) {
+    var entry = listed.files[i];
+    var rel = entry.path.slice(prefix.length);
+    var file = await json(await api.post('/b/dev/api/files/read', { path: entry.path }));
+    if (file.encoding !== 'utf8') {
+      diagnostics.push({
+        severity: 'error',
+        code: 'binary-source',
+        message:
+          entry.path +
+          ' is ' +
+          file.encoding +
+          '-encoded, and the browser toolchain compiles text. Move it out of ' +
+          prefix +
+          ' or delete it.',
+        file: rel,
+        line: null,
+        column: null
+      });
+      continue;
+    }
+    files[rel] = file.content;
+    manifest.push(rel + '\0' + file.sha256 + '\n');
+    // The vendored module IS the ABI, so the version the block was compiled
+    // against is read out of the copy that was compiled — not out of the
+    // sandbox's own constant, which would report agreement it cannot see. A
+    // block whose module has been edited past recognition simply reports
+    // nothing, and staging records `0` — "unknown" — rather than a guess.
+    if (rel === 'src/wafer_guest.rs') {
+      var found = /WAFER_GUEST_VERSION: u32 = (\d+)/.exec(file.content);
+      if (found) {
+        guestVersion = Number(found[1]);
+      }
+    }
+  }
+  manifest.sort();
+  return {
+    files: files,
+    diagnostics: diagnostics,
+    guestVersion: guestVersion,
+    sourceSha: await sha256Hex(manifest.join(''))
+  };
+}
+
+// Snapshot, compile, stage — the whole of what `dev_compile_block` and the
+// Compile button do, with the result they both report.
+//
+// Every failure that is an ANSWER about the block comes back as
+// `success: false` with diagnostics: sources the compiler cannot read, a
+// crate that does not compile, a module the validator refuses. Only a
+// failure of the machinery — no compiler in this build, a worker that broke
+// its protocol, a request the sandbox refused — throws, and the callers turn
+// that into the tool's `isError`. That split is design §7.4: an agent needs
+// to know whether to fix its Rust or to stop trying.
+async function compileBlock(name) {
+  var snapshot = await snapshotBlock(name);
+  if (snapshot.diagnostics.length) {
+    log('compile refused: ' + name + ' has source the compiler cannot read');
+    return {
+      success: false,
+      build_id: null,
+      generation: null,
+      diagnostics: snapshot.diagnostics,
+      stdout: '',
+      stderr: '',
+      elapsed_ms: 0,
+      compiler_version: null,
+      progress: []
+    };
+  }
+
+  var session = await ensureCompiler(appendProgress);
+  var built = await session.compile({
+    crateName: name,
+    files: snapshot.files,
+    onProgress: appendProgress
+  });
+  var diagnostics = built.diagnostics.map(stageDiagnostic);
+  if (!built.success) {
+    log('compile failed: ' + name + ' (' + built.elapsedMs + ' ms)');
+    return {
+      success: false,
+      build_id: null,
+      generation: null,
+      diagnostics: diagnostics,
+      stdout: built.stdout,
+      stderr: built.stderr,
+      elapsed_ms: built.elapsedMs,
+      compiler_version: built.compilerVersion,
+      progress: []
+    };
+  }
+
+  // `compiler_version` is required and identifies the toolchain that
+  // produced the stored artifact. `rustc --version` from inside the worker's
+  // VFS is the better answer; the manifest's version — the pinned rubrc
+  // revision every compiler URL already carries — is the honest fallback for
+  // a worker that reached `ready` without reporting one.
+  var compilerVersion = built.compilerVersion || compilerManifest.version;
+  var staged = await json(
+    await api.post('/b/dev/api/builds/stage', {
+      block_name: name,
+      artifact_base64: toBase64(built.artifact),
+      source_manifest_sha256: snapshot.sourceSha,
+      compiler_version: compilerVersion,
+      diagnostics: diagnostics,
+      wafer_guest_version: snapshot.guestVersion
+    })
+  );
+  if (staged.success) {
+    log('compiled ' + name + ' — generation ' + staged.generation.id);
+    renderProgress(staged.generation.id, staged.progress);
+  } else {
+    log('staging refused ' + name + ': ' + staged.diagnostics.length + ' diagnostics');
+  }
+  return {
+    success: staged.success,
+    build_id: staged.build_id,
+    generation: staged.generation,
+    // The staging response already carries back the diagnostics it was sent,
+    // with the validator's appended — so it is the whole account of the
+    // build and the local copy is not concatenated onto it again.
+    diagnostics: staged.diagnostics,
+    stdout: built.stdout,
+    stderr: built.stderr,
+    elapsed_ms: built.elapsedMs,
+    compiler_version: compilerVersion,
+    progress: staged.progress
+  };
+}
+
+function registerCompileTool() {
+  registerPageTool({
+    name: 'dev_compile_block',
+    description:
+      'Compile blocks/<name>/ with the in-browser Rust toolchain (wasm32-wasip1, no \
+dependencies — the whole SDK is the vendored src/wafer_guest.rs). On success the block is \
+validated and activated immediately and its routes are live at /b/<name>/; on failure the result \
+carries structured compiler or validator diagnostics and the previous generation keeps serving. \
+Only one compile runs at a time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Block name, as used in blocks/<name>/' }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean' },
+        build_id: { type: ['string', 'null'] },
+        generation: { type: ['object', 'null'] },
+        diagnostics: { type: 'array' },
+        stdout: { type: 'string' },
+        stderr: { type: 'string' },
+        elapsed_ms: { type: 'integer' },
+        compiler_version: { type: ['string', 'null'] },
+        progress: { type: 'array' }
+      },
+      required: ['success', 'diagnostics']
+    },
+    execute: async function (args) {
+      try {
+        var result = await compileBlock(String(args && args.name));
+        // Both halves, because an agent may read either: the text block is
+        // what a client without `outputSchema` support shows, and
+        // `structuredContent` is what one with it reads.
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+          structuredContent: result
+        };
+      } catch (error) {
+        // Everything that is not an answer about the block. The adapter has
+        // already destroyed and replaced the worker by the time a protocol
+        // violation or a timeout reaches here, so the NEXT call works — say
+        // so, rather than leaving the agent to guess whether compiling is
+        // over for this session.
+        logError(error);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text:
+                'dev_compile_block: ' +
+                (error && error.message ? error.message : String(error))
+            }
+          ]
+        };
+      }
+    }
+  });
+}
+
+// The button runs the same function on the same block, and reports the same
+// way: the panel is the human's copy of what the agent would have been told.
+var compileSelected = withProgress(async function () {
+  var name = compileSelect.value;
+  if (!name) {
+    window.alert('There is no block to compile yet. Create one first (dev_create_block).');
+    return;
+  }
+  await compileBlock(name);
+});
+
+compileButton.addEventListener('click', function () {
+  compileSelected().catch(logError);
+});
 
 // ---- first paint ----------------------------------------------------------
 
