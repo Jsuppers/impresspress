@@ -34,5 +34,13 @@ opfs_wipe_on_recovery = false
 from = "seed"
 to = "seed"
 
+# The browser toolchain, built by `compiler/build-compiler.sh` and versioned
+# by the rubrc commit `compiler/PIN.json` pins. `dist/` holds one directory
+# per version plus a `manifest.json` naming the current one, so a deploy that
+# changes the pin serves a new set of URLs rather than re-using cached ones.
+[[assets.overlay]]
+from = "compiler/dist"
+to = "__impresspress_dev/compiler"
+
 [dev]
 enabled = true

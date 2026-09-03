@@ -18,7 +18,7 @@
 #
 # Usage:
 #   examples/dev-sandbox/build.sh            # build dist/
-#   examples/dev-sandbox/build.sh --check     # verify seed/manifest.json only
+#   examples/dev-sandbox/build.sh --check     # verify what is already built
 #
 # `IMPRESSPRESS=/path/to/impresspress` overrides which CLI binary assembles
 # the bundle. Default is whatever is on `PATH`, which is the trap this
@@ -30,7 +30,9 @@
 # `--root ./out` to keep it out of `~/.cargo/bin`) and point this at it.
 #
 # `--check` verifies every `seed/site/**` file against the hash and size
-# `seed/manifest.json` declares for it and exits non-zero on drift, WITHOUT
+# `seed/manifest.json` declares for it — and, when `compiler/dist/` has been
+# built, that its files match `compiler/dist/manifest.json` and none of them
+# is over Cloudflare's asset limit — exiting non-zero on drift, WITHOUT
 # building anything — this is what CI runs to catch a seed file edited
 # without regenerating the manifest. A plain build runs the same check first,
 # so a stale manifest fails fast rather than shipping a bundle
@@ -105,12 +107,57 @@ print("seed/manifest.json matches seed/site/**", file=sys.stderr)
 PY
 }
 
+# The browser toolchain (`compiler/`) is a quarter of a gigabyte of composed
+# wasm and takes ~20 minutes to build, so it is built only when it is missing
+# or when `compiler/PIN.json` has moved since the tree in `compiler/dist/` was
+# produced. Everything about that tree — the rubrc commit, the sysroot, the
+# tools — comes from that one file, so comparing it against the built
+# manifest is the whole staleness test.
+compiler_is_current() {
+  python3 - "$HERE" <<'COMPILERPIN'
+import json, pathlib, sys
+
+compiler = pathlib.Path(sys.argv[1], "compiler")
+manifest = compiler / "dist" / "manifest.json"
+if not manifest.is_file():
+    raise SystemExit(1)
+pin = json.loads((compiler / "PIN.json").read_text())
+built = json.loads(manifest.read_text())
+if built.get("version") != pin["version"]:
+    raise SystemExit(1)
+if built.get("rubrc", {}).get("sha") != pin["rubrc"]["sha"]:
+    raise SystemExit(1)
+COMPILERPIN
+}
+
+# The compiler is only checked when it has been built: a tree that has never
+# run `build-compiler.sh` is a normal state for anyone working on the seed or
+# the wasm, and `--check` is meant to be cheap.
+check_compiler() {
+  if [ ! -d "$HERE/compiler/dist" ]; then
+    log "compiler/dist is not built — nothing to check"
+    return 0
+  fi
+  log "verifying compiler/dist against its manifest and the 24 MiB asset limit"
+  node "$HERE/compiler/scripts/verify-compiler-assets.mjs"
+}
+
 if [ "${1:-}" = "--check" ]; then
   check_seed
+  check_compiler
   exit 0
 fi
 
 check_seed
+
+# 0. The browser toolchain, overlaid onto the bundle at
+#    `/__impresspress_dev/compiler/` (see `impresspress.toml`).
+if compiler_is_current; then
+  log "compiler/dist is current for compiler/PIN.json"
+else
+  log "compiler/build-compiler.sh (dist is missing or built from another pin)"
+  "$HERE/compiler/build-compiler.sh"
+fi
 
 # 1. The feature-on wasm. `--out-dir pkg-dev` keeps it away from `pkg/`, which
 #    is the ordinary (feature-off) bundle every other consumer serves — a
@@ -148,6 +195,10 @@ grep -q 'dev: true' "$DIST/sw.js" || {
   echo "build.sh: $DIST/seed/manifest.json was not overlaid — check impresspress.toml's [[assets.overlay]]," >&2
   echo "  or an impresspress CLI older than the recursive-directory overlay (cli/helpers/overlays.rs):" >&2
   echo "  $IMPRESSPRESS_BIN" >&2
+  exit 1
+}
+[ -f "$DIST/__impresspress_dev/compiler/manifest.json" ] || {
+  echo "build.sh: $DIST/__impresspress_dev/compiler/manifest.json was not overlaid — check impresspress.toml's [[assets.overlay]]" >&2
   exit 1
 }
 
