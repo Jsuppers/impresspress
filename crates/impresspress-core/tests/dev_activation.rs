@@ -733,13 +733,21 @@ async fn site_writes_that_arrive_during_an_activation_coalesce_and_both_publish(
     let compile = compile_of(&ctx, &["hello"]).await;
 
     // The driver parks inside `rebuild` — the one place an activation can be
-    // held open — so the two writes are admitted while it is in flight.
+    // held open — so the two writes are admitted while it is in flight. The
+    // gate opens only once BOTH writes are folded into the pending slot:
+    // `join!` polls in order, but a write path that yields on any of its
+    // awaits hands control back before it has enqueued, and a gate released
+    // on the first poll round then lets the driver finish ahead of the writes
+    // — which is exactly the interleaving this test is not about.
     let release = control.gate_next_rebuild();
     let (driver, first, second, ()) = tokio::join!(
         activation::request(&ctx, &shared, GenerationCause::BlockCompile, compile),
         write_file(&ctx, "site/a.css", "a{}", None),
         write_file(&ctx, "site/b.css", "b{}", None),
         async {
+            while shared.activation.pending_waiters() < 2 {
+                tokio::task::yield_now().await;
+            }
             let _ = release.send(());
         },
     );

@@ -365,6 +365,23 @@ impl ActivationQueue {
         Self::default()
     }
 
+    /// How many callers are folded into the pending slot right now.
+    ///
+    /// Test-only observation point: a test that wants to hold an activation
+    /// open and prove that requests admitted *meanwhile* coalesce has to know
+    /// when they have actually been admitted. Polling futures in a fixed order
+    /// is not that — any `.await` on the write path that yields lets the
+    /// driver run ahead — so the test waits on this count instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_waiters(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("activation queue mutex")
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.waiters.len())
+    }
+
     /// Admit one request: drive it, or fold it into the pending state.
     ///
     /// Folding keeps every waiter — a caller whose intent was superseded still
