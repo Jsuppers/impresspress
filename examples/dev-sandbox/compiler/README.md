@@ -24,7 +24,7 @@ package as a whole.
 compiler/
   PIN.json                       every input: rubrc's commit, the composer, Binaryen, the sysroot
   src/ansi.ts                    ANSI stripping for the shell transcript
-  build-compiler.sh              PIN.json -> dist/<version>/            (~20 min from cold)
+  build-compiler.sh              PIN.json -> dist/<version>/            (~55 min cold, 6-50 s incremental)
   src/protocol.ts                the page <-> worker contract
   src/worker-entry.ts            the worker the page creates
   src/vfs-runner.ts              the worker that runs the toolchain component
@@ -65,27 +65,43 @@ Measured on a 24-core box, and these are the real numbers, not estimates:
 | --- | --- |
 | everything, from an empty tree | **~55 minutes** |
 | of which `wasm-opt -Oz` (phase 3) | ~35 minutes, peaking at **12.6 GB RSS** |
-| of which brotli + split (phase 5) | ~10 minutes |
-| `src/**` changed, component unchanged | **~50 seconds** |
+| of which brotli + split (phase 5) | 9 min 26 s |
+| `src/**` changed, component unchanged | **6 s** warm, **~50 s** cold (page cache) |
 
 **A 7 GB CI runner will be OOM-killed in phase 3.** The final `wasm-opt` pass
 runs over a 410 MB merged module and wants 12.6 GB. `dist/` is fully
 determined by `PIN.json`, so CI should cache it on that file's hash and never
 build it; a machine that must build it needs a large runner.
 
-The ~50 second re-run is what it costs to change `src/worker-entry.ts`: the
-checkout, the composition and the split are all skipped, and what is left is
-vite hashing and copying the 365 MiB component into `dist/` and
-`prepare-vfs-asset.mjs` hashing it again to prove the parts on disk are a
-split of exactly those bytes, before deleting it.
+That re-run is what it costs to change `src/worker-entry.ts`: the checkout, the
+composition and the split are all skipped, and what is left is vite hashing and
+copying the 365 MiB component into `dist/` and `prepare-vfs-asset.mjs` hashing
+it and every part to prove the split on disk is a split of exactly those bytes.
+Both figures were measured: 6.3 s with the component still in the page cache
+from a previous run, 52.4 s reading it from disk.
 
 `--fast` composes with rubrc's `vfs:build:prod:no-opt`, which skips `wasm-opt`
 altogether: minutes instead of ~35, at the price of a much larger component —
 more parts, more download, more memory in the browser. It is for iterating on
 the packaging itself. `dist/manifest.json` records `"build": "fast"` and
-`verify-compiler-assets.mjs` REFUSES that, so `build.sh --check` fails and a
-`--fast` tree can never be deployed. (Implemented, not exercised — see "Not
-confirmed".)
+`verify-compiler-assets.mjs` refuses that, so `build.sh --check` fails and a
+`--fast` tree cannot reach a deploy by accident. (Implemented, not exercised —
+see "Not confirmed".)
+
+The one exception is deliberate and explicit:
+
+```bash
+IMPRESSPRESS_COMPILER_ALLOW_FAST=1 examples/dev-sandbox/build.sh --check
+```
+
+**Only the CI job that tests whether the compiler still works may set that**,
+so it can build with `--fast` instead of paying 55 minutes for an answer it
+does not need optimised. The verifier prints a warning saying the tree must
+not be deployed, and everything else about the check still applies. **The
+deploy workflow never sets it** — a `--fast` component is a compiler nobody
+optimised, and the whole point of `dist/` is that what was verified is what
+ships. `build.sh` passes the environment through untouched, which is the only
+reason this works; there is no flag to plumb.
 
 Two things the script insists on that are easy to get wrong by hand:
 
@@ -118,6 +134,15 @@ parts in order, pipes them through a brotli decoder into
 `WebAssembly.compileStreaming`, and caches the compiled module in IndexedDB so
 the second visit skips the download. The manifest shape is rubrc's own, so
 their loader and ours read the same files.
+
+That manifest also carries a `sha256` of the component and of **each part**.
+Those exist for the build, not the browser: a rebuild reuses an existing split
+only after hashing every part and finding what it expects, because a part
+corrupted in place keeps its size, survives being set aside across the vite
+build, and would then be hashed into `dist/manifest.json` as though it were
+correct — the manifest would agree with the disk, and the disk would be wrong.
+At runtime the reassembled stream is checked by brotli itself and against
+`originalSize`.
 
 ### `v1-dist`
 

@@ -48,10 +48,11 @@
 #
 # Measured wall times on a 24-core box, for the figures the README quotes:
 #   * everything, from an empty tree: ~55 minutes.
-#   * `src/**` changed, component unchanged: ~50 seconds. Phases 1-3 and the
-#     ~10 minute split are skipped; what is left is vite hashing and copying
-#     the 365 MiB component into `dist/` and this script hashing it again to
-#     prove the parts still match it, before deleting it.
+#   * `src/**` changed, component unchanged: 6 seconds with the 365 MiB
+#     component still in the page cache, ~50 seconds without it. Phases 1-3
+#     and the ~9.5 minute split are skipped; what is left is vite hashing and
+#     copying the component into `dist/`, and this script hashing it and every
+#     part to prove the split on disk is a split of exactly these bytes.
 #
 # `--fast` swaps rubrc's `vfs:build:prod` for `vfs:build:prod:no-opt`, which
 # skips `wasm-opt` entirely: minutes instead of ~35, at the price of a much

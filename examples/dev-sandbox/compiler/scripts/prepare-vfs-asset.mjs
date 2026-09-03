@@ -7,7 +7,11 @@
  * `vfs-runner.ts` reads `<name>.wasm.br.json`, fetches the parts in order and
  * pipes them through a brotli decoder into `WebAssembly.compileStreaming`.
  * The manifest shape is rubrc's (`page/src/worker_process/util_cmd.ts` reads
- * the same one), so a part written here is readable by their loader and ours.
+ * the same one) plus a `sha256` on each part and on the original wasm. Those
+ * are for the BUILD: they are what lets a later run prove the split on disk is
+ * a split of exactly this component before reusing it instead of spending ten
+ * minutes recompressing. At runtime the reassembled stream is checked by
+ * brotli itself and against `originalSize`.
  *
  * This is rubrc's `scripts/prepare-vfs-asset.mjs` reduced to the part we
  * need: no `_headers` file (the sandbox's host sets COOP/COEP), no `v1`
@@ -66,12 +70,16 @@ class Splitter extends Writable {
           const file = `${this.baseName}.br.part-${String(this.parts.length).padStart(3, "0")}`;
           const tmp = path.join(this.outDir, `${file}.tmp`);
           this.stream = fs.createWriteStream(tmp);
-          this.parts.push({ file, tmp, size: 0 });
+          // Hashed as it is written: the manifest's per-part sha256 is what a
+          // later build checks before reusing this split, and hashing here
+          // costs nothing extra to read.
+          this.parts.push({ file, tmp, size: 0, hash: createHash("sha256") });
         }
         const room = PART_BYTES - this.partBytes;
         const take = Math.min(chunk.length - offset, room);
         const slice = chunk.subarray(offset, offset + take);
         const drained = this.stream.write(slice);
+        this.parts[this.parts.length - 1].hash.update(slice);
         this.partBytes += take;
         this.compressedSize += take;
         this.parts[this.parts.length - 1].size += take;
@@ -169,27 +177,40 @@ if (fs.existsSync(manifestPath)) {
   const actual = hash.digest("hex");
 
   const parts = Array.isArray(existing.parts) ? existing.parts : [];
-  const complaint =
-    existing.originalFile !== baseName
-      ? `it is a split of ${existing.originalFile}`
-      : existing.sha256 !== actual
-        ? `it was taken from ${String(existing.sha256).slice(0, 12)}…, not ${actual.slice(0, 12)}…`
-        : existing.originalSize !== originalSize
-          ? `it records ${existing.originalSize} bytes, not ${originalSize}`
-          : parts.length === 0
-            ? "it lists no parts"
-            : parts
-                .map((part) => {
-                  const file = path.join(outDir, part.file);
-                  if (!fs.existsSync(file)) return `${part.file} is missing`;
-                  const size = fs.statSync(file).size;
-                  return size === part.size ? "" : `${part.file} is ${size} bytes, not ${part.size}`;
-                })
-                .find((problem) => problem !== "") ?? "";
+  const complaint = (() => {
+    if (existing.originalFile !== baseName) return `it is a split of ${existing.originalFile}`;
+    if (existing.sha256 !== actual) {
+      return `it was taken from ${String(existing.sha256).slice(0, 12)}…, not ${actual.slice(0, 12)}…`;
+    }
+    if (existing.originalSize !== originalSize) {
+      return `it records ${existing.originalSize} bytes, not ${originalSize}`;
+    }
+    if (parts.length === 0) return "it lists no parts";
+    for (const part of parts) {
+      const file = path.join(outDir, part.file);
+      if (!fs.existsSync(file)) return `${part.file} is missing`;
+      const size = fs.statSync(file).size;
+      if (size !== part.size) return `${part.file} is ${size} bytes, not ${part.size}`;
+      // The bytes themselves, not just their length. A part corrupted in place
+      // keeps its size, survives the aside-and-restore this script's caller
+      // does around the vite build, and would then be re-hashed into
+      // `dist/manifest.json` as if it were correct — the manifest would agree
+      // with the disk and the disk would be wrong. A split written before this
+      // check existed has no per-part hash, and is not trusted either.
+      if (typeof part.sha256 !== "string") return `${part.file} predates per-part hashes`;
+      const hash = createHash("sha256");
+      hash.update(fs.readFileSync(file));
+      const digest = hash.digest("hex");
+      if (digest !== part.sha256) {
+        return `${part.file} is ${digest.slice(0, 12)}…, not ${String(part.sha256).slice(0, 12)}…`;
+      }
+    }
+    return "";
+  })();
 
   if (complaint === "") {
     fs.unlinkSync(wasmFile);
-    console.log(`${baseName}: already split, kept ${parts.length} parts`);
+    console.log(`${baseName}: already split, kept ${parts.length} parts (hashes verified)`);
     process.exit(0);
   }
 
@@ -258,7 +279,11 @@ try {
         originalSize,
         compressedSize: splitter.compressedSize,
         sha256: originalHash.digest("hex"),
-        parts: splitter.parts.map((part) => ({ file: part.file, size: part.size })),
+        parts: splitter.parts.map((part) => ({
+          file: part.file,
+          size: part.size,
+          sha256: part.hash.digest("hex"),
+        })),
       },
       null,
       2,

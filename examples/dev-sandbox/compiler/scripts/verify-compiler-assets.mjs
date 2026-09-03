@@ -17,7 +17,9 @@
  *     served exactly like the current one, and nothing else here would look
  *     at it, and
  *   * a component composed by `--fast`, which skips `wasm-opt` and is for
- *     local iteration only.
+ *     local iteration only — unless `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` is
+ *     set, which is how a CI job that only wants to know whether the compiler
+ *     still WORKS can use a cheap build. The deploy path never sets it.
  *
  * Usage: node scripts/verify-compiler-assets.mjs
  */
@@ -50,10 +52,18 @@ if (manifest.rubrc?.sha !== pin.rubrc.sha) {
 if (manifest.entry !== `/__impresspress_dev/compiler/${pin.version}/worker.js`) {
   problems.push(`manifest.json's entry is ${manifest.entry}, which is not this version's worker`);
 }
-if (manifest.build === "fast") {
+const allowFast = process.env.IMPRESSPRESS_COMPILER_ALLOW_FAST === "1";
+if (manifest.build === "fast" && !allowFast) {
   problems.push(
     "this component was composed by `build-compiler.sh --fast`, which skips wasm-opt — " +
-      "rebuild without --fast before deploying",
+      "rebuild without --fast before deploying, or set IMPRESSPRESS_COMPILER_ALLOW_FAST=1 " +
+      "if this is the correctness-testing CI job",
+  );
+}
+if (manifest.build === "fast" && allowFast) {
+  console.warn(
+    "verify-compiler-assets.mjs: accepting a --fast component because " +
+      "IMPRESSPRESS_COMPILER_ALLOW_FAST=1 — this tree must not be deployed",
   );
 }
 

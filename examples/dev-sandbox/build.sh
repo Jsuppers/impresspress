@@ -136,6 +136,12 @@ COMPILERPIN
 # The compiler is only checked when it has been built: a tree that has never
 # run `build-compiler.sh` is a normal state for anyone working on the seed or
 # the wasm, and `--check` is meant to be cheap.
+#
+# The environment reaches the verifier untouched, which is how
+# `IMPRESSPRESS_COMPILER_ALLOW_FAST=1` gets through: a CI job that only wants
+# to know whether the compiler still works may build it with
+# `build-compiler.sh --fast` and set that variable. The deploy workflow must
+# never set it — a `--fast` component skips `wasm-opt` entirely.
 check_compiler() {
   if [ ! -d "$HERE/compiler/dist" ]; then
     log "compiler/dist is not built — nothing to check"
