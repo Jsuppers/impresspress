@@ -196,6 +196,32 @@ mod tests {
         }
     }
 
+    /// Saving a binary file's placeholder over the file itself is the one
+    /// data-loss path this pane has: the box shows
+    /// `(binary file, N bytes)`, the stored `expected_sha256` still matches,
+    /// so the write succeeds, destroys the file and publishes a generation
+    /// for it. Both halves of the guard are pinned here — the early return
+    /// and the button that moves with the box — because the behaviour itself
+    /// can only be driven by the Task 6 end-to-end test, and a source
+    /// assertion that fails loudly on a rewrite is worth more than nothing
+    /// until then.
+    #[test]
+    fn a_binary_file_cannot_be_saved_over() {
+        let js = assets::dev_js();
+        assert!(
+            js.contains("if (!current || text.disabled) {"),
+            "save() must refuse a disabled editor, not just a missing file"
+        );
+        assert!(
+            js.contains("saveButton.disabled = !enabled;"),
+            "the Save button must be disabled with the editor"
+        );
+        assert!(
+            js.contains("setEditorEnabled(file.encoding === 'utf8');"),
+            "opening a file is what decides whether the editor is usable"
+        );
+    }
+
     /// The prompt names tools, not endpoints the agent would have to guess
     /// at, and every tool it names is one `/b/dev/api/tools.json` publishes.
     #[test]

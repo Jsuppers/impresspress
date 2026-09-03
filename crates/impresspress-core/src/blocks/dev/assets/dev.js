@@ -144,6 +144,14 @@ function renderStatus(status) {
 var polling = null;
 var lastRuntimeGeneration = null;
 
+// How many mutating calls are outstanding. A COUNT, not a flag: two of them
+// can overlap — an agent firing `shop_create_product` three times without
+// awaiting each, or a human saving while a tool call runs — and a flag would
+// let the first one to finish stop the interval and run the catch-up while
+// the others are still in flight, blanking the panel mid-activation and
+// reading a workspace that is about to change again.
+var outstanding = 0;
+
 // ~300 ms while a mutating call is outstanding (design §7.5). There is no
 // push channel: the block answers `no-store` precisely so this poll always
 // sees the journal as it stands.
@@ -198,12 +206,19 @@ function refreshSiteTools() {
 // activate) leaves the page showing a workspace that no longer exists.
 function withProgress(execute) {
   return async function (args) {
+    outstanding += 1;
     startPolling();
     try {
       return await execute(args);
     } finally {
-      stopPolling();
-      await refreshAfterChange();
+      outstanding -= 1;
+      // The LAST call out of the room turns the lights off and does the
+      // catch-up once, rather than every call racing to redraw a workspace
+      // its siblings are still changing.
+      if (outstanding === 0) {
+        stopPolling();
+        await refreshAfterChange();
+      }
     }
   };
 }
@@ -236,11 +251,19 @@ function reloadPreview() {
 // ---- tools ----------------------------------------------------------------
 
 // Which tools change the site, and therefore want the progress panel live
-// and the panes refreshed. `shop_` covers the whole products family; the
-// four `dev_` names are the mutating half of the control plane (its reads —
-// `dev_status`, `dev_list_files`, `dev_read_file`, `dev_list_generations`,
-// `dev_get_generation` — change nothing and must not restart the poll).
-var MUTATING = /^(dev_write_file|dev_delete_file|dev_rollback|dev_remove_block|shop_)/;
+// and the panes refreshed afterwards. Everything else is a read, and a read
+// must NOT reload the preview: an agent listing the catalog between two
+// writes would otherwise flicker the iframe and re-fetch the file tree for
+// nothing.
+//
+// The four `dev_` names are the mutating half of the control plane — its
+// reads (`dev_status`, `dev_list_files`, `dev_read_file`,
+// `dev_list_generations`, `dev_get_generation`) change nothing. `shop_`
+// covers the products family except its three listers
+// (`shop_list_products`, `shop_list_groups`, `shop_list_offers`), which the
+// negative lookahead excludes. Plan 3 adds `dev_create_block` and
+// `dev_compile_block`; both mutate and belong in this list.
+var MUTATING = /^(dev_write_file|dev_delete_file|dev_rollback|dev_remove_block|shop_(?!list_))/;
 
 // Every name this page registered. `registerTool`'s options bag takes an
 // `AbortSignal`, but a browser (or a polyfill) that ignores it would leave
@@ -270,6 +293,28 @@ function unregisterPageTools() {
   registered = [];
 }
 
+// The session check for the manifest tools' own requests.
+//
+// Their `execute` comes from `toolOptions` (webmcp-core.js) and fetches
+// without going through this file's `api`, so `check` never sees the
+// response — and a refusal arrives as a RESULT (`isError` plus
+// `Request failed (403): …`), never as a rejection. Reading that text back
+// is what lets the same "the session is gone, take the tools away" rule
+// apply to a tool call as to a pane refresh; without it the page would keep
+// offering tools that 403 for the rest of the session.
+var SESSION_GONE = /^Request failed \((401|403)\)/;
+
+function withSessionCheck(execute) {
+  return async function (args) {
+    var result = await execute(args);
+    var first = result && result.isError && result.content && result.content[0];
+    if (first && typeof first.text === 'string' && SESSION_GONE.test(first.text)) {
+      abort.abort();
+    }
+    return result;
+  };
+}
+
 function registerFromManifest(manifest) {
   if (!manifest || !Array.isArray(manifest.tools)) {
     return;
@@ -280,6 +325,9 @@ function registerFromManifest(manifest) {
       // registration options, `execute` included — the request it builds is
       // the same same-origin call `webmcp.js` makes for a site tool.
       var options = toolOptions(tool);
+      // Session check innermost, so it sees the raw result; progress
+      // outermost, so the panel is live for the whole call.
+      options.execute = withSessionCheck(options.execute);
       if (MUTATING.test(tool.name)) {
         options.execute = withProgress(options.execute);
       }
@@ -348,6 +396,10 @@ window.addEventListener('pagehide', function () {
 });
 
 abort.signal.addEventListener('abort', function () {
+  // Whatever was in flight is not coming back — the session behind it is
+  // gone — so the count is reset rather than decremented to zero by calls
+  // that will never return from their `finally`.
+  outstanding = 0;
   stopPolling();
   unregisterPageTools();
 });
@@ -363,6 +415,18 @@ var current = null;
 var list = document.getElementById('dev-file-list');
 var text = document.getElementById('dev-editor-text');
 var title = document.getElementById('dev-editor-title');
+var saveButton = document.getElementById('dev-save');
+
+// The textarea and Save move together, and that pairing is load-bearing. A
+// binary file leaves the box holding a PLACEHOLDER, not the file; saving it
+// would write `(binary file, N bytes)` back as utf8 — with a matching
+// `expected_sha256`, so the conflict check waves it through — destroying the
+// file and publishing a generation for the loss. Locking the box without
+// locking the button leaves exactly that one click available.
+function setEditorEnabled(enabled) {
+  text.disabled = !enabled;
+  saveButton.disabled = !enabled;
+}
 
 async function loadFiles() {
   var files = (await json(await api.get('/b/dev/api/files'))).files;
@@ -394,12 +458,16 @@ async function openFile(path) {
   // literal text on the next save.
   text.value =
     file.encoding === 'utf8' ? file.content : '(binary file, ' + file.size + ' bytes)';
-  text.disabled = file.encoding !== 'utf8';
+  setEditorEnabled(file.encoding === 'utf8');
   await loadFiles();
 }
 
 var save = withProgress(async function () {
-  if (!current) {
+  // `text.disabled` is the second half of the guard, not a UI detail: a
+  // disabled box holds a placeholder rather than the file's content (see
+  // `setEditorEnabled`), and the button being disabled too is not something
+  // this function may assume — a caller could reach it another way.
+  if (!current || text.disabled) {
     return;
   }
   var response = await api.post('/b/dev/api/files/write', {
@@ -435,7 +503,7 @@ var remove = withProgress(async function () {
   current = null;
   title.textContent = 'Editor';
   text.value = '';
-  text.disabled = false;
+  setEditorEnabled(true);
   log('deleted ' + path);
 });
 
@@ -446,7 +514,20 @@ var create = withProgress(async function () {
   }
   // `expected_sha256: null` is "I expect nothing here" — writing over an
   // existing file by accident is a 409, not a silent overwrite.
-  await json(await api.post('/b/dev/api/files/write', { path: path, content: '', expected_sha256: null }));
+  var response = await api.post('/b/dev/api/files/write', {
+    path: path,
+    content: '',
+    expected_sha256: null
+  });
+  // Told, not logged. The human just typed this path; that it already names
+  // a file is an answer to what they asked for, and the same shape `save`
+  // uses for its own conflict — a line in the log they have to go looking
+  // for reads as "nothing happened".
+  if (response.status === 409) {
+    window.alert(path + ' already exists. Open it from the file list instead.');
+    return;
+  }
+  await json(response);
   await openFile(path);
   log('created ' + path);
 });
