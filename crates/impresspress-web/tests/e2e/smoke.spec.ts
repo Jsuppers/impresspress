@@ -183,24 +183,44 @@ test('a cold visitor gets WebMCP tools without a reload', async ({ page }) => {
   //
   // So: reach the real page normally, then shadow `navigator.serviceWorker`
   // on it ONLY (the loader shell at `/` is untouched, so registration still
-  // happens for real) to force exactly the state the fix handles —
-  // `controller` reads null and `.ready` is a promise this test holds open
-  // — and prove `webmcp.js` waits for it instead of registering nothing.
+  // happens for real) to force exactly the state the fix handles, and prove
+  // `webmcp.js` waits for it instead of registering nothing.
+  //
+  // The state being forced is UNCONTROLLED, not "no worker yet": `controller`
+  // reads null and no `controllerchange` has fired. That distinction is the
+  // fix. `navigator.serviceWorker.ready` — which this stub deliberately does
+  // not expose — resolves on `registration.active`, and `active` is populated
+  // at the *activating* state while `sw.js.tmpl` calls `clients.claim()`
+  // inside `activate`'s `waitUntil`. So `ready` can resolve in exactly the
+  // window this test holds open, and a manifest fetch issued there goes to
+  // the network: on a host with SPA fallback that answers `index.html` with
+  // 200, `r.json()` throws, webmcp.js's `.catch` swallows it, and the page
+  // ends up with no tools at all and no error. `controller` is the signal
+  // that actually means "my fetches reach the worker".
   await page.addInitScript(MODEL_CONTEXT_POLYFILL);
   await page.addInitScript(() => {
     if (location.pathname !== '/b/auth/login') return;
     const real = navigator.serviceWorker;
-    let release = () => {};
-    const heldReady = new Promise((resolve) => {
-      release = () => resolve(real.controller);
-    });
-    (window as unknown as { __releaseWebmcpReady: () => void }).__releaseWebmcpReady = release;
+    let controlled = false;
+    const listeners = new Set<() => void>();
+    (window as unknown as { __releaseWebmcpControl: () => void }).__releaseWebmcpControl = () => {
+      controlled = true;
+      listeners.forEach((l) => l());
+    };
     Object.defineProperty(navigator, 'serviceWorker', {
       configurable: true,
       get() {
         return {
-          get controller() { return null; },
-          get ready() { return heldReady; },
+          // Null until this document is claimed — the real worker is
+          // controlling underneath, which is what makes the fetch after
+          // release actually reach the wasm router.
+          get controller() { return controlled ? real.controller : null; },
+          addEventListener(type: string, listener: () => void) {
+            if (type === 'controllerchange') listeners.add(listener);
+          },
+          removeEventListener(type: string, listener: () => void) {
+            if (type === 'controllerchange') listeners.delete(listener);
+          },
           getRegistration: real.getRegistration.bind(real),
         };
       },
@@ -209,16 +229,18 @@ test('a cold visitor gets WebMCP tools without a reload', async ({ page }) => {
   await page.goto('/', { waitUntil: 'commit' });
   await page.waitForURL(/\/b\/auth\/login/, { timeout: 30_000 });
 
-  // While `.ready` is held open, webmcp.js must not have registered
+  // While the page is uncontrolled, webmcp.js must not have registered
   // anything — this is the assertion that fails (immediately, not a
-  // timeout) against the pre-fix script, which fetches the manifest
-  // unconditionally and ignores `navigator.serviceWorker` entirely.
+  // timeout) against a script that fetches the manifest unconditionally, and
+  // against one that settles for `.ready`: this stub has no `ready` at all,
+  // so reading it would throw straight into the `.then(load, load)` fallback
+  // and register the network's answer.
   await page.waitForTimeout(500);
   expect(await page.evaluate(() => document.modelContext.__tools().length)).toBe(0);
 
-  // Releasing `.ready` (the SW finishing activation) lets it proceed —
-  // without a reload, and without the test navigating again.
-  await page.evaluate(() => (window as unknown as { __releaseWebmcpReady: () => void }).__releaseWebmcpReady());
+  // The claim landing (`controllerchange`) lets it proceed — without a
+  // reload, and without the test navigating again.
+  await page.evaluate(() => (window as unknown as { __releaseWebmcpControl: () => void }).__releaseWebmcpControl());
   const names = await page.waitForFunction(() => {
     const t = document.modelContext.__tools();
     return t.length > 0 ? t.map((x) => x.name) : null;

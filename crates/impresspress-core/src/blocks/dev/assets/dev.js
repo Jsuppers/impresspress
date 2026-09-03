@@ -17,8 +17,9 @@
 // ---- the API client -------------------------------------------------------
 
 // The lifetime of everything this page registers. Aborting it is the single
-// teardown path: `pagehide` fires it, and so does the first sign that the
-// session behind the page is gone (below).
+// teardown path: a `pagehide` the document does not come back from fires it,
+// and so does the first sign that the session behind the page is gone
+// (below).
 var abort = new AbortController();
 
 // A 401/403 means this document is still on screen but its session is not.
@@ -414,7 +415,22 @@ if ('modelContext' in document && typeof document.modelContext.registerTool === 
 
 // `pagehide`, not `unload`: it is the event a bfcache-eligible navigation
 // actually fires, and it fires on the tab being closed as well.
-window.addEventListener('pagehide', function () {
+//
+// `event.persisted` is the half that matters. It is `true` when the document
+// is going INTO the back/forward cache rather than away for good — it can
+// come back, on Back, with its JS state intact and its session cookie still
+// valid. Aborting there would be permanent (an `AbortController` cannot be
+// reset), so the restored page would look alive while every tool it
+// registered had been unregistered, `withProgress` short-circuited on
+// `abort.signal.aborted`, and the log claiming the session expired. Nothing
+// but a manual reload would bring it back. A frozen document's tools are not
+// reachable by an agent on whatever page replaced it, so there is nothing to
+// tear down while it sits there; if it is evicted instead of restored, the
+// document is discarded and `document.modelContext` goes with it.
+window.addEventListener('pagehide', function (event) {
+  if (event.persisted) {
+    return;
+  }
   abort.abort();
 });
 
@@ -489,6 +505,32 @@ async function openFile(path) {
   await loadFiles();
 }
 
+// A refusal's parsed body, or `null` when it has no shape either reader
+// below can use.
+//
+// Every `/b/dev` refusal answers JSON: a `FileConflict` for a stale hash,
+// and `{error, message}` for everything else (`no_store_error` /
+// `no_store_error_status`, `blocks/dev/mod.rs`). What is NOT guaranteed is
+// that the response came from the block at all — an intermediary's HTML
+// error page, or a truncated body, parses to nothing or to a bare string,
+// and neither `'current_sha256' in body` nor `body.message` may be asked of
+// those (`in` throws a `TypeError` on a non-object, which would escape as a
+// raw JS error into the log in place of the server's own explanation).
+//
+// This covers the 401/403 too, which `check` has already turned into a
+// teardown by the time a caller gets here. The log line that teardown writes
+// says the tools are gone; it does not say the click that provoked it did
+// nothing. Both are worth saying, and the human asked for one of them.
+async function refusalBody(response) {
+  var text = await response.text();
+  try {
+    var body = JSON.parse(text);
+    return body && typeof body === 'object' ? body : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 // `/b/dev/api/files/write` answers 409 for two UNRELATED reasons that
 // happen to share a status: a real hash conflict (`FileConflict` —
 // `path`/`current_sha256`/`current_size`, and `current_sha256` is present
@@ -498,7 +540,15 @@ async function openFile(path) {
 // limit" is not a hash conflict). The status alone cannot tell them apart —
 // only the body's shape can.
 function isFileConflict(body) {
-  return 'current_sha256' in body;
+  return body !== null && 'current_sha256' in body;
+}
+
+// The server's own words for a refusal, or `fallback` when the body carries
+// none. The refusals the human sees most — a path outside the workspace, a
+// quota, a file that is not there — all say something specific and useful,
+// and none of it survives being replaced by a status code.
+function refusalMessage(body, fallback) {
+  return (body && typeof body.message === 'string' && body.message) || fallback;
 }
 
 var save = withProgress(async function () {
@@ -514,17 +564,22 @@ var save = withProgress(async function () {
     content: text.value,
     expected_sha256: current.sha256
   });
-  // A 409 is not a failure of the request — it is the answer to it. Read
-  // before `json()`, which would turn it into a thrown error and lose the
-  // body.
-  if (response.status === 409) {
-    var body = await response.json();
+  // A refusal is not a failure of the request — it is the answer to it.
+  // Read before `json()`, which would turn it into a thrown error and lose
+  // the body.
+  //
+  // EVERY refusal, not just the 409. The human clicked Save; whether the
+  // answer is a hash conflict (409), a path the workspace will not take
+  // (400) or a quota (413), it is a reply to what they just did, and a line
+  // in the log they have to go looking for reads as "nothing happened".
+  if (!response.ok) {
+    var body = await refusalBody(response);
     if (isFileConflict(body)) {
       window.alert('Changed elsewhere (now ' + body.current_sha256 + '). Reopen the file.');
     } else {
       // Not a hash conflict — show the server's own explanation rather
       // than a `current_sha256` this body never carries.
-      window.alert(body.message || 'Save refused (409).');
+      window.alert(refusalMessage(body, 'Save refused (' + response.status + ').'));
     }
     return;
   }
@@ -542,9 +597,26 @@ var remove = withProgress(async function () {
     return;
   }
   var path = current.path;
-  await json(
-    await api.post('/b/dev/api/files/delete', { path: path, expected_sha256: current.sha256 })
-  );
+  var response = await api.post('/b/dev/api/files/delete', {
+    path: path,
+    expected_sha256: current.sha256
+  });
+  // Same rule as `save` and `create`: the human clicked Delete and confirmed
+  // it. A stale hash (409 — someone else changed the file since it was
+  // opened, which is exactly the case `expected_sha256` exists to catch) or
+  // a file already gone (404) is the answer to that click, not a log line.
+  if (!response.ok) {
+    var body = await refusalBody(response);
+    if (isFileConflict(body)) {
+      window.alert('Changed elsewhere since it was opened. Reopen ' + path + ' before deleting.');
+    } else {
+      window.alert(
+        refusalMessage(body, 'Delete of ' + path + ' was refused (' + response.status + ').')
+      );
+    }
+    return;
+  }
+  await json(response);
   current = null;
   title.textContent = 'Editor';
   text.value = '';
@@ -564,16 +636,20 @@ var create = withProgress(async function () {
     content: '',
     expected_sha256: null
   });
-  // Told, not logged. The human just typed this path; that it already names
-  // a file (or that the workspace hit a quota) is an answer to what they
-  // asked for, and a line in the log they have to go looking for reads as
-  // "nothing happened".
-  if (response.status === 409) {
-    var body = await response.json();
+  // Told, not logged, on EVERY refusal. The human just typed this path; that
+  // it already names a file (409), is not a path the workspace accepts (400
+  // — by far the likeliest answer to something typed freehand into a
+  // `prompt()`), or that the workspace hit a quota (409/413) is all an answer
+  // to what they asked for, and a line in the log they have to go looking
+  // for reads as "nothing happened".
+  if (!response.ok) {
+    var body = await refusalBody(response);
     if (isFileConflict(body)) {
       window.alert(path + ' already exists. Open it from the file list instead.');
     } else {
-      window.alert(body.message || (path + ' was refused (409).'));
+      window.alert(
+        refusalMessage(body, path + ' was refused (' + response.status + ').')
+      );
     }
     return;
   }

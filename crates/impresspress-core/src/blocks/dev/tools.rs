@@ -15,8 +15,10 @@
 //! selected products endpoints carry none — the manifest below is the only
 //! place they become tools at all).
 
-use wafer_core::discovery::{generate_webmcp_selected, ToolSelection, WebMcpRefusal};
-use wafer_run::{context::Context, AuthLevel, HttpMethod, OutputStream};
+use wafer_core::discovery::{
+    generate_webmcp_selected, ToolSelection, WebMcpRefusal, WebMcpRefusalReport,
+};
+use wafer_run::{context::Context, AuthLevel, BlockInfo, HttpMethod, OutputStream};
 
 /// The curated tool list this manifest publishes: `(block, method, path,
 /// tool name, description)`.
@@ -205,9 +207,12 @@ pub const SELECTIONS: &[(&str, HttpMethod, &str, &str, &str)] = &[
     ),
 ];
 
-/// Serve the manifest: project [`SELECTIONS`] against the runtime's actually
-/// registered blocks, using each selected endpoint's own declared
-/// [`AuthLevel`] as the enforced one.
+/// [`SELECTIONS`] projected against `blocks`: the manifest to serve, and
+/// every row that could not be projected.
+///
+/// The one place the projection is expressed, so the document [`handle`]
+/// serves and the diagnostic [`log_selection_refusals`] reports are derived
+/// from the same call rather than two that could drift apart.
 ///
 /// `|_b, ep| ep.auth` (rather than a router-aware resolver like
 /// `routing::effective_access`) is correct here specifically because every
@@ -216,8 +221,7 @@ pub const SELECTIONS: &[(&str, HttpMethod, &str, &str, &str)] = &[
 /// — there is no tier this route's mount could raise the ceiling to that the
 /// declaration does not already claim. See `pipeline.rs`'s
 /// `/b/webmcp/manifest.json` handler for the case where that is not true.
-pub async fn handle(ctx: &dyn Context) -> OutputStream {
-    let blocks = ctx.registered_blocks();
+fn generate(blocks: &[BlockInfo]) -> (serde_json::Value, Vec<WebMcpRefusalReport>) {
     let selections: Vec<ToolSelection> = SELECTIONS
         .iter()
         .map(|(block, method, path, name, description)| ToolSelection {
@@ -228,8 +232,44 @@ pub async fn handle(ctx: &dyn Context) -> OutputStream {
             description: (*description).into(),
         })
         .collect();
-    let (doc, refused) =
-        generate_webmcp_selected(blocks, AuthLevel::Admin, |_b, ep| ep.auth, &selections);
+    generate_webmcp_selected(blocks, AuthLevel::Admin, |_b, ep| ep.auth, &selections)
+}
+
+/// Serve the manifest: [`SELECTIONS`] projected against the runtime's
+/// actually registered blocks.
+///
+/// Refusals are discarded on purpose. They are a property of the BUILD — a
+/// `SELECTIONS` row naming a block this build did not compile in, or a typo
+/// in a row — identical for every call, and `/b/dev/api/tools.json` is
+/// re-derived on every GET (it is `no-store`, and the page fetches it on
+/// load and again behind "Refresh tools"). Logging them here would emit the
+/// same N lines per request, at the mercy of whoever is clicking: the exact
+/// amplification `pipeline.rs`'s manifest handler documents and avoids. They
+/// are computed and logged once instead, at runtime construction, by
+/// [`log_selection_refusals`] — the diagnostic moved, it was not dropped.
+pub async fn handle(ctx: &dyn Context) -> OutputStream {
+    let (doc, _refused) = generate(ctx.registered_blocks());
+    super::no_store().json(&doc)
+}
+
+/// Log what [`SELECTIONS`] could not project, once, from the block set the
+/// runtime was built with.
+///
+/// Called from `builder::registration::build()`, alongside the deployment-
+/// wide WebMCP refusal pass it mirrors — the one place refusals are turned
+/// into operator-visible warnings. `build()` runs once per `Wafer`
+/// construction (on Cloudflare Workers, once per isolate), so this is
+/// bounded by deploys and sandbox activations rather than by requests.
+///
+/// A build that compiled the dev block in but did not REGISTER it never
+/// serves [`handle`], and every `SELECTIONS` row would refuse for the same
+/// uninteresting reason. Returning early keeps those 21 lines out of the
+/// logs of every runtime that simply is not a sandbox.
+pub(crate) fn log_selection_refusals(blocks: &[BlockInfo]) {
+    if !blocks.iter().any(|b| b.name == super::BLOCK_NAME) {
+        return;
+    }
+    let (_doc, refused) = generate(blocks);
     for r in &refused {
         match r.reason {
             // Expected whenever this build was compiled without
@@ -257,5 +297,126 @@ pub async fn handle(ctx: &dyn Context) -> OutputStream {
             ),
         }
     }
-    super::no_store().json(&doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::dev::test_support::FakeControl,
+        test_support::{MessageCapture, TestContext},
+    };
+
+    /// A substring of the `SelectionNotFound` warning, matched rather than
+    /// the whole line so these tests do not depend on the wording staying
+    /// byte-for-byte in sync with production.
+    const NOT_FOUND_WARNING: &str = "dev tools.json: selection not found";
+
+    /// A fixture where `SELECTIONS` really does refuse: the dev block is
+    /// registered, `impresspress/products` is not, so every `shop_*` row
+    /// names a block that is not there. Without that asymmetry the tests
+    /// below would pass vacuously against zero refusals.
+    async fn dev_without_products() -> TestContext {
+        TestContext::with_dev(FakeControl::new()).await
+    }
+
+    /// How many `SELECTIONS` rows name `impresspress/products` — the exact
+    /// number of refusals the fixture above must produce, derived from the
+    /// list rather than hard-coded so adding a `shop_*` row cannot silently
+    /// weaken the assertions.
+    fn products_rows() -> usize {
+        SELECTIONS
+            .iter()
+            .filter(|(block, ..)| *block == "impresspress/products")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn serving_the_manifest_logs_nothing_however_many_times_it_is_asked() {
+        let ctx = dev_without_products().await;
+
+        // Precondition: this fixture genuinely refuses.
+        let (_doc, refused) = generate(ctx.registered_blocks());
+        assert_eq!(
+            refused.len(),
+            products_rows(),
+            "precondition: every products row must refuse when that block is absent: {refused:?}"
+        );
+
+        let capture = MessageCapture::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        // More than once: the defect is per-REQUEST amplification, so a
+        // single silent call would be weak evidence. The page fetches this
+        // on load and again on every "Refresh tools" click.
+        let _first = handle(&ctx).await;
+        let _second = handle(&ctx).await;
+        let _third = handle(&ctx).await;
+        drop(guard);
+
+        assert_eq!(
+            capture.count_containing(NOT_FOUND_WARNING),
+            0,
+            "the per-request path must log no refusals — they are a property of the build, \
+             identical for every call, and logged once at runtime construction instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_build_time_pass_reports_each_refusal_once() {
+        let ctx = dev_without_products().await;
+
+        let capture = MessageCapture::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        log_selection_refusals(ctx.registered_blocks());
+        drop(guard);
+
+        assert_eq!(
+            capture.count_containing(NOT_FOUND_WARNING),
+            products_rows(),
+            "the diagnostic moved to runtime construction — it must not have been dropped: an \
+             operator wondering why the page is missing its shop_* tools still has to be able \
+             to find out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_the_dev_block_reports_nothing() {
+        // Compiling `block-dev` in is not the same as registering the block.
+        // Every deployment that is not a sandbox is in this state, never
+        // serves `/b/dev/api/tools.json`, and must not pay a warn line per
+        // `SELECTIONS` row for a manifest it does not publish.
+        let ctx = TestContext::with_admin().await;
+        assert!(
+            !ctx.registered_blocks()
+                .iter()
+                .any(|b| b.name == crate::blocks::dev::BLOCK_NAME),
+            "precondition: the dev block must be absent from this fixture"
+        );
+
+        let capture = MessageCapture::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        log_selection_refusals(ctx.registered_blocks());
+        drop(guard);
+
+        assert_eq!(capture.count_containing(NOT_FOUND_WARNING), 0);
+    }
+
+    /// Moving the logging must not have changed a byte of what the page
+    /// receives.
+    #[tokio::test]
+    async fn refusals_do_not_change_what_is_published() {
+        let ctx = dev_without_products().await;
+        let (doc, _refused) = generate(ctx.registered_blocks());
+        let names: Vec<&str> = doc["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name"))
+            .collect();
+        assert!(
+            names.iter().all(|n| n.starts_with("dev_")),
+            "a build without the products block publishes exactly its dev_* rows: {names:?}"
+        );
+        assert_eq!(names.len(), SELECTIONS.len() - products_rows());
+    }
 }

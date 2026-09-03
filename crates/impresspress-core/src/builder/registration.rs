@@ -397,6 +397,22 @@ impl ImpresspressBuilder {
             );
         }
 
+        // The dev sandbox's page-scoped manifest (`GET
+        // /b/dev/api/tools.json`) is projected from a curated selection
+        // list rather than from `agent_tool` annotations, so its refusals
+        // are invisible to the pass above — a `SELECTIONS` row naming a
+        // block this build did not compile in, or a typo in one, refuses
+        // there and nowhere else. Same reasoning as above applies to where
+        // it is logged: that route re-derives its document on every GET (it
+        // is `no-store`, and the page fetches it on load and again behind
+        // its "Refresh tools" button), so logging per request would emit the
+        // same static facts as many times as the page is asked. Computed and
+        // logged here instead, once, from the same `block_infos` snapshot —
+        // and skipped entirely when the dev block is not registered, since
+        // a runtime that never serves the route has nothing to report.
+        #[cfg(feature = "block-dev")]
+        crate::blocks::dev::tools::log_selection_refusals(&block_infos);
+
         let router = ImpresspressRouterBlock::with_extra_routes(
             self.jwt_secret.clone(),
             feature_config,

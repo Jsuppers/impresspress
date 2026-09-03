@@ -485,7 +485,8 @@ test('the editor refuses to save a binary file over itself', async ({ page }) =>
   test.setTimeout(300_000);
 
   // `dev.js` uses `alert`/`confirm`/`prompt`; the only one reachable here is
-  // `save()`'s 409 alert. Playwright auto-dismisses an unhandled dialog, so
+  // `save()`'s refusal alert, which fires for ANY status the server refuses
+  // with, not just a 409. Playwright auto-dismisses an unhandled dialog, so
   // without this the one thing a broken guard might surface would vanish
   // silently — the recorder turns it into an assertion instead.
   const dialogs: string[] = [];
@@ -572,7 +573,7 @@ test('the editor refuses to save a binary file over itself', async ({ page }) =>
     before.generations.map((g) => g.id),
   );
 
-  // A 409 would have alerted; so would anything else `save()` decided to
-  // report. It refused before it asked.
+  // Any refusal the server sent back would have alerted — `save()` reports
+  // every one of them, not just the 409. It refused before it asked.
   expect(dialogs).toEqual([]);
 });

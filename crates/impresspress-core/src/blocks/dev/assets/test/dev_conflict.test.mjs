@@ -34,3 +34,49 @@ test('the quota refusal body ({error, message}) is NOT a hash conflict', () => {
     false
   );
 });
+
+test('a body that is not an object at all is not a hash conflict — and does not throw', () => {
+  const { handle } = instantiate();
+  // `refusalBody` hands `null` to these readers whenever the response was
+  // not the block's own JSON (an intermediary's error page, a truncated
+  // body). `'current_sha256' in null` is a `TypeError`, which would escape
+  // `save`/`create`/`remove` into the log in place of the server's own
+  // explanation and leave the human staring at a closed dialog.
+  assert.equal(handle.isFileConflict(null), false);
+});
+
+test("refusalBody parses the block's JSON refusals and rejects every other shape", async () => {
+  const { handle } = instantiate();
+  const body = (text) => handle.refusalBody({ text: async () => text });
+
+  assert.deepEqual(await body('{"error":"InvalidArgument","message":"bad path"}'), {
+    error: 'InvalidArgument',
+    message: 'bad path'
+  });
+  // Not JSON at all — an intermediary's HTML error page.
+  assert.equal(await body('<!doctype html><title>502</title>'), null);
+  // Valid JSON, but not a shape either reader can be asked about.
+  assert.equal(await body('"just a string"'), null);
+  assert.equal(await body('null'), null);
+  assert.equal(await body(''), null);
+});
+
+test("refusalMessage prefers the server's own words and falls back otherwise", () => {
+  const { handle } = instantiate();
+  assert.equal(
+    handle.refusalMessage(
+      { error: 'ResourceExhausted', message: 'the limit is 1048576 bytes' },
+      'x'
+    ),
+    'the limit is 1048576 bytes'
+  );
+  // No body, no message, or a message that is not a non-empty string: the
+  // caller's fallback names what the human just tried and the status.
+  assert.equal(handle.refusalMessage(null, 'Save refused (400).'), 'Save refused (400).');
+  assert.equal(
+    handle.refusalMessage({ error: 'Internal' }, 'Save refused (500).'),
+    'Save refused (500).'
+  );
+  assert.equal(handle.refusalMessage({ message: '' }, 'Save refused (400).'), 'Save refused (400).');
+  assert.equal(handle.refusalMessage({ message: 42 }, 'Save refused (400).'), 'Save refused (400).');
+});

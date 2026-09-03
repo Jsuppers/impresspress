@@ -1860,6 +1860,70 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
     }
 }
 
+// ---------------------------------------------------------------------------
+// Log capture
+// ---------------------------------------------------------------------------
+
+/// Minimal [`tracing::Subscriber`] that records the rendered `message` field
+/// of every event it sees, so a test can assert on what was (or was not)
+/// logged without pulling in `tracing-subscriber`.
+///
+/// Shared, because more than one route has had to prove it does NOT log:
+/// refusal diagnostics that are static across calls belong at runtime
+/// construction, not on a path a caller can loop (`pipeline`'s
+/// `/b/webmcp/manifest.json`, `blocks::dev::tools`' `/b/dev/api/tools.json`).
+/// Install it with `tracing::subscriber::set_default`, which is scoped to the
+/// current thread — so a `#[tokio::test]` on the multi-thread runtime would
+/// miss events from work that migrated to another worker. Every use so far
+/// runs the awaited call on the test's own thread.
+#[derive(Clone, Default)]
+pub struct MessageCapture(Arc<Mutex<Vec<String>>>);
+
+struct MessageVisitor<'a> {
+    out: &'a mut String,
+}
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            *self.out = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for MessageCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = String::new();
+        event.record(&mut MessageVisitor { out: &mut message });
+        self.0
+            .lock()
+            .expect("MessageCapture mutex poisoned")
+            .push(message);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+impl MessageCapture {
+    /// How many captured messages contain `needle`.
+    pub fn count_containing(&self, needle: &str) -> usize {
+        self.0
+            .lock()
+            .expect("MessageCapture mutex poisoned")
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use wafer_block::db::ListOptions;

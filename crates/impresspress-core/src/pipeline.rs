@@ -2003,55 +2003,11 @@ mod discovery_tests {
     // for the "still reported somewhere" half of this fix).
     // -------------------------------------------------------------------
 
-    /// Minimal `tracing::Subscriber` that records the rendered `message`
-    /// field of every event it sees, so a test can assert on what was (or
-    /// was not) logged without pulling in `tracing-subscriber`.
-    #[derive(Clone, Default)]
-    struct MessageCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    struct MessageVisitor<'a> {
-        out: &'a mut String,
-    }
-
-    impl tracing::field::Visit for MessageVisitor<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                *self.out = format!("{value:?}");
-            }
-        }
-    }
-
-    impl tracing::Subscriber for MessageCapture {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut message = String::new();
-            event.record(&mut MessageVisitor { out: &mut message });
-            self.0
-                .lock()
-                .expect("MessageCapture mutex poisoned")
-                .push(message);
-        }
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    impl MessageCapture {
-        fn count_containing(&self, needle: &str) -> usize {
-            self.0
-                .lock()
-                .expect("MessageCapture mutex poisoned")
-                .iter()
-                .filter(|m| m.contains(needle))
-                .count()
-        }
-    }
+    /// The shared log-capture subscriber. Lives in `test_support` because
+    /// `blocks::dev::tools` proves the same "this route must log nothing"
+    /// property about `/b/dev/api/tools.json` and needs the identical
+    /// machinery.
+    use crate::test_support::MessageCapture;
 
     /// The exact text `generate_webmcp`'s wrapper (and now
     /// `builder::registration::build()`) attaches to the refusal warning —

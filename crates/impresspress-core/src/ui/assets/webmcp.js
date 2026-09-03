@@ -53,11 +53,20 @@ function load() {
           // One tool the browser rejected is not a reason to lose the rest.
         }
       });
-      generation += 1;
     })
     .catch(function () {
       // A failed manifest fetch means no tools. That is a degraded page,
       // not a broken one — never surface it to the visitor.
+    })
+    .then(function () {
+      // Bumped on EVERY settled load, degraded ones included, and after the
+      // `.catch` so nothing above can skip it. `generation` counts completed
+      // `load()` calls — a poller waiting for a refresh to land is waiting
+      // for the call to finish, not for it to find tools, and a load that
+      // ends with zero tools has finished. Bumping only on the success path
+      // would hang every such poller (`webmcp.spec.ts` is one) on exactly
+      // the degraded page this file otherwise takes care to tolerate.
+      generation += 1;
     });
 }
 
@@ -78,24 +87,51 @@ window.__impresspressWebmcp = {
 };
 
 var sw = navigator.serviceWorker;
+
+// Resolves once this document is CONTROLLED by a service worker — not
+// merely once one is active.
+//
+// The distinction is the whole point. `navigator.serviceWorker.ready`
+// resolves on `registration.active`, which is populated at the *activating*
+// state, while `sw.js.tmpl` calls `clients.claim()` inside its `activate`
+// handler's `waitUntil`. So `ready` can resolve before the claim has taken
+// effect, and a fetch issued in that window goes to the network rather than
+// to the wasm router. On a host with SPA fallback (`not_found_handling =
+// "single-page-application"`, which `examples/dev-sandbox/wrangler.toml`
+// sets) the network answers `index.html` with **200** — `r.ok` is true,
+// `r.json()` throws, the `.catch` swallows it, and the page silently ends up
+// with no tools at all. `controller` is the signal that actually means "my
+// fetches reach the worker"; `controllerchange` is when it arrives.
+function whenControlled() {
+  if (sw.controller) {
+    return Promise.resolve();
+  }
+  return new Promise(function (resolve) {
+    sw.addEventListener('controllerchange', function onChange() {
+      sw.removeEventListener('controllerchange', onChange);
+      resolve();
+    });
+  });
+}
+
 if (sw && sw.controller) {
-  // Already controlled — a repeat visit, or a native server where there is
-  // no worker to wait on in the first place. Nothing to wait for.
+  // Already controlled — a repeat visit. Nothing to wait for.
   load();
 } else if (sw) {
   // In a service-worker build the first paint beats the worker: the manifest
   // route (`/b/webmcp/manifest.json`) is served by the worker, so fetching
-  // it before the worker controls the page 404s through the network instead
-  // of hitting the wasm router. Wait for `sw.ready`, which resolves once a
-  // registration is active.
+  // it before the worker controls the page misses the wasm router (see
+  // `whenControlled`).
   //
   // A native server also exposes `navigator.serviceWorker` (it is a
   // standard browser API, not something the SW build adds), but there is no
-  // registration to become active — `sw.ready` on a page with none never
-  // resolves. `getRegistration()` tells the two apart: it resolves with
-  // `undefined` when nothing is registered, so the native path falls
-  // through to `load()` immediately instead of hanging.
-  sw.getRegistration().then(function (r) { return r ? sw.ready : null; }).then(load, load);
+  // registration and no worker that will ever claim this page — waiting for
+  // one would hang forever. `getRegistration()` tells the two apart: it
+  // resolves with `undefined` when nothing is registered, so the native path
+  // falls through to `load()` immediately.
+  sw.getRegistration()
+    .then(function (r) { return r ? whenControlled() : null; })
+    .then(load, load);
 } else {
   // No Service Worker support at all (or it was stripped by the embedder).
   load();

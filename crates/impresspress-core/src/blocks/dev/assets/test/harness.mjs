@@ -21,6 +21,10 @@ const tail = fs.readFileSync(path.join(here, '..', 'dev.js'), 'utf8');
 // (in particular `outstanding`/`polling`) into one another.
 export function instantiate({ hasModelContext = false } = {}) {
   const fetchCalls = [];
+  // Every `window.addEventListener` the tail makes, so a test can fire the
+  // real handler — `pagehide`'s `event.persisted` branch is a decision the
+  // handler owns, and there is no other way to reach it.
+  const windowListeners = [];
   const fakeElement = () => ({
     value: '',
     textContent: '',
@@ -50,7 +54,11 @@ export function instantiate({ hasModelContext = false } = {}) {
           }
         : {})
     },
-    window: { addEventListener() {} },
+    window: {
+      addEventListener(type, listener) {
+        windowListeners.push({ type, listener });
+      }
+    },
     fetch(...args) {
       fetchCalls.push(args);
       // `loadFiles()` (bottom of the tail) awaits this on load; an empty
@@ -85,9 +93,18 @@ return {
   abort,
   unregisterPageTools,
   get registered() { return registered.slice() },
-  isFileConflict
+  isFileConflict,
+  refusalBody,
+  refusalMessage
 };`
   );
   const handle = factory(...Object.values(sandbox));
-  return { handle, fetchCalls };
+  // Fires every `window` listener the tail registered for `type`, with
+  // `event` as the argument — the shape a browser would deliver.
+  const fireWindow = (type, event) => {
+    windowListeners
+      .filter((l) => l.type === type)
+      .forEach((l) => l.listener(event));
+  };
+  return { handle, fetchCalls, fireWindow };
 }

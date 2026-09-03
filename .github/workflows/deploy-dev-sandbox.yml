@@ -3,12 +3,25 @@ name: Deploy dev-sandbox
 on:
   push:
     branches: [main]
+    # Every input this job actually builds from. A path missing here is not a
+    # skipped run — it is dev.impresspress.org silently left on stale code
+    # until some unrelated change happens to trip the filter.
     paths:
       - 'examples/dev-sandbox/**'
       - 'crates/impresspress-web/**'
       - 'crates/impresspress-core/**'
       - 'crates/impresspress-browser/**'
       - 'crates/impresspress-bundle/**'
+      # `cargo install --path crates/impresspress` below builds the CLI that
+      # `build.sh` then runs; the bundle it produces depends on the CLI's
+      # asset overlay (`cli/helpers/overlays.rs`) closely enough that
+      # build.sh's own failure message names a stale CLI as the cause.
+      - 'crates/impresspress/**'
+      # The workspace manifest and the lockfile the `--locked` install
+      # resolves against: a wafer-run pin bump changes what every crate above
+      # compiles to without touching one of their paths.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/deploy-dev-sandbox.yml'
   workflow_dispatch:
 

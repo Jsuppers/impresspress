@@ -184,6 +184,18 @@ jobs:
       - name: Run dev.js unit tests (node --test)
         run: node --test crates/impresspress-core/src/blocks/dev/assets/test/*.test.mjs
 
+      # `webmcp.js` is the same shape (a tail composed by
+      # `ui/assets.rs::compose_webmcp_script`) and its own harness composes it
+      # the same way. What these pin is WHEN it fetches the manifest: before
+      # the service worker controls the page that fetch misses the wasm
+      # router, and behind SPA fallback the network answers `index.html` with
+      # 200 — a silent zero-tool page. `e2e-smoke` covers the same property
+      # end to end, but only in the one browser arrangement it can stage;
+      # these cover the arrangements it cannot (a native server with no
+      # registration at all, a claim that never comes).
+      - name: Run webmcp.js unit tests (node --test)
+        run: node --test crates/impresspress-core/src/ui/assets/test/*.test.mjs
+
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
   # its Rust list actually references — was dead code in CI: nothing anywhere
