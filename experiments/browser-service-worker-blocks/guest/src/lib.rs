@@ -4,11 +4,18 @@
 //! macros. Keeping this spike to `std` tests the smallest useful overlap
 //! between Rubrc's present compiler surface and WAFER's stable JSON ABI.
 
+// One declared endpoint: the sandbox refuses a guest that declares none
+// (`endpoints-empty`) — a block serves its prefix through the endpoints it
+// declares, and the declared `auth` is what the router enforces for the
+// route. The path is under the prefix the sandbox derives from the renamed
+// `site/hello`; under the guest's own name it is refused earlier, by
+// `name-mismatch`, which is what the e2e's step 4 pins.
 const INFO: &[u8] = br#"{
   "name":"browser/hello",
   "version":"0.1.0",
   "interface":"handler@v1",
-  "summary":"A no-dependency block compiled for wasm32-wasip1"
+  "summary":"A no-dependency block compiled for wasm32-wasip1",
+  "endpoints":[{"method":"GET","path":"/b/hello/","summary":"Greets the visitor","auth":"public"}]
 }"#;
 
 const RESPONSE: &[u8] = br#"{
