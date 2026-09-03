@@ -350,19 +350,23 @@ mod tests {
         );
     }
 
-    /// The Compile button ships disabled, and only the compiler manifest
-    /// turns it on.
+    /// The Compile button ships disabled, and two facts have to arrive
+    /// before it turns on.
     ///
     /// The markup is identical in every build; whether the browser toolchain
     /// is present is a property of the bundle's asset overlay, which nothing
     /// in this crate can see. So an enabled-by-default button would be a
     /// promise a build without the overlay cannot keep — and the 404 path has
-    /// to say so on the button rather than fail on click. Both halves are
-    /// pinned here because the behaviour itself needs a browser
-    /// (`dev-workspace.spec.ts`) and a source assertion that fails loudly on a
-    /// rewrite is worth more than nothing in between.
+    /// to say so on the button rather than fail on click. The second fact is
+    /// the workspace's: a block only exists as files under `blocks/<name>/`,
+    /// so a fresh instance has nothing to compile and the button says which
+    /// half is missing rather than offering a click it can only answer with
+    /// an alert. All of it is pinned here because the behaviour itself needs
+    /// a browser (`dev-workspace.spec.ts`, `dev-compile-tool.spec.ts`) and a
+    /// source assertion that fails loudly on a rewrite is worth more than
+    /// nothing in between.
     #[test]
-    fn the_compile_button_is_enabled_only_by_the_compiler_manifest() {
+    fn the_compile_button_is_enabled_only_by_a_toolchain_and_a_block() {
         let html = body().into_string();
         assert!(
             html.contains(
@@ -387,6 +391,19 @@ mod tests {
         assert!(
             js.contains("compileButton.title = 'No compiler in this build';"),
             "a build with no compiler must say so on the button"
+        );
+        assert!(
+            js.contains("if (!blockNames.length) {"),
+            "a workspace with no blocks must leave the button disabled too"
+        );
+        // One owner for the button's state. The two facts arrive from
+        // separate fetches in no fixed order, so a second place setting
+        // `disabled` would race and whichever landed later would win
+        // regardless of what it knew.
+        assert_eq!(
+            js.matches("compileButton.disabled =").count(),
+            3,
+            "`disabled` must be set only by updateCompileButton's three arms"
         );
     }
 

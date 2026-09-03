@@ -794,8 +794,8 @@ async function discoverCompiler() {
   // build — CI's foundations run is one — and the honest thing is a button
   // that says why it cannot be pressed rather than one that fails on click.
   if (response.status === 404) {
-    compileButton.title = 'No compiler in this build';
     log('no compiler in this build');
+    updateCompileButton();
     return;
   }
   if (!response.ok) {
@@ -803,7 +803,7 @@ async function discoverCompiler() {
   }
   compilerManifest = await response.json();
   compilerVersionEl.textContent = describeCompiler(compilerManifest);
-  compileButton.disabled = false;
+  updateCompileButton();
   log('compiler ' + compilerManifest.version + ' available');
 }
 
@@ -820,6 +820,38 @@ var BLOCKS_PREFIX = 'blocks/';
 // calls `loadFiles` until the first-paint block at the bottom of this file,
 // which is below this line.
 var compileSelect = document.getElementById('dev-compile-block');
+
+// The blocks in the workspace, as `renderBlockChoices` last saw them.
+var blockNames = [];
+
+// Whether Compile can be pressed, and why not when it cannot.
+//
+// It takes TWO things this page learns separately and in no fixed order: a
+// toolchain (the manifest, fetched once at load) and something to compile (a
+// `blocks/<name>/` prefix in the file listing, refreshed after every mutating
+// call). Either answer can arrive first, so both write their fact and call
+// this, and this is the only place the button's state is decided — two call
+// sites each setting `disabled` would race, and whichever landed second would
+// win regardless of what it knew.
+//
+// A disabled button with a reason on it, rather than an enabled one that
+// explains itself in an alert after the fact: the page already knows there is
+// nothing to compile, and offering the click anyway is a promise it cannot
+// keep.
+function updateCompileButton() {
+  if (!compilerManifest) {
+    compileButton.disabled = true;
+    compileButton.title = 'No compiler in this build';
+    return;
+  }
+  if (!blockNames.length) {
+    compileButton.disabled = true;
+    compileButton.title = 'No block to compile yet — create one with dev_create_block';
+    return;
+  }
+  compileButton.disabled = false;
+  compileButton.title = '';
+}
 
 // The workspace's blocks, as the Compile button's options.
 //
@@ -854,6 +886,8 @@ function renderBlockChoices(files) {
   if (names.indexOf(chosen) >= 0) {
     compileSelect.value = chosen;
   }
+  blockNames = names;
+  updateCompileButton();
 }
 
 /** Lowercase hex SHA-256 of a string, the form the build row records. */
@@ -941,23 +975,28 @@ async function ensureCompiler(onProgress) {
 
 // One compiler diagnostic, as the sandbox's own wire type.
 //
-// Two different contracts meet here and this is the only place they can. In
-// `compiler/src/protocol.ts` `code` is OPTIONAL — rustc numbers some
-// diagnostics and not others — while `validation::Diagnostic`'s is a
-// required string the whole design tells callers to match on instead of the
-// message. Passing the worker's value straight through would make a single
-// unnumbered WARNING on an otherwise good build a 400 from
-// `POST /b/dev/api/builds/stage`, and the block would fail to activate for a
-// reason nothing on the page could explain. `rustc` is the code such a
-// diagnostic actually has: the compiler said it, and gave it no number.
+// A copy, and deliberately nothing more. The two types carry the same six
+// fields with the same meanings, and `code` is optional on BOTH sides —
+// `compiler/src/protocol.ts` leaves it out when rustc gave the diagnostic no
+// number, and `validation::Diagnostic.code` is an `Option<String>` for
+// exactly that case — so a diagnostic the compiler did not number goes out as
+// `null` rather than being given a value the page made up. The only work here
+// is spelling "absent" the way the wire does (`undefined` → `null`), because
+// `JSON.stringify` drops an undefined field and serde would then see a
+// missing key rather than an explicit one.
+//
+// Nothing is re-checked: `compiler-adapter.js` validates every diagnostic's
+// shape before `compile` resolves (`malformedDiagnostic`) and treats a
+// malformed one as a protocol violation, so a guard here would be a second
+// opinion about a value that cannot reach this function.
 function stageDiagnostic(diagnostic) {
   return {
     severity: diagnostic.severity,
-    code: diagnostic.code || 'rustc',
+    code: diagnostic.code === undefined ? null : diagnostic.code,
     message: diagnostic.message,
-    file: typeof diagnostic.file === 'string' ? diagnostic.file : null,
-    line: typeof diagnostic.line === 'number' ? diagnostic.line : null,
-    column: typeof diagnostic.column === 'number' ? diagnostic.column : null
+    file: diagnostic.file,
+    line: diagnostic.line,
+    column: diagnostic.column
   };
 }
 
@@ -1049,11 +1088,23 @@ async function snapshotBlock(name) {
 // that into the tool's `isError`. That split is design §7.4: an agent needs
 // to know whether to fix its Rust or to stop trying.
 async function compileBlock(name) {
+  // The ladder this page is about to draw is not the last one's. `completed`
+  // survives only while it describes the live generation, and everything
+  // below can end without producing a new one — a crate that does not build,
+  // a staging refusal, an activation the host abandons — leaving a fully
+  // green ladder standing over a compile that never landed. Dropping it here
+  // costs nothing when the compile succeeds (`renderProgress` sets it again a
+  // few lines later) and is the difference between an empty panel and a lie
+  // when it does not. Nothing else needs this: a site write or a rollback
+  // publishes a generation with a NEW id, which `renderStatus` already sees
+  // is not the one `completed` describes.
+  completed = null;
   var snapshot = await snapshotBlock(name);
   if (snapshot.diagnostics.length) {
     log('compile refused: ' + name + ' has source the compiler cannot read');
     return {
       success: false,
+      cancelled: false,
       build_id: null,
       generation: null,
       diagnostics: snapshot.diagnostics,
@@ -1072,10 +1123,43 @@ async function compileBlock(name) {
     onProgress: appendProgress
   });
   var diagnostics = built.diagnostics.map(stageDiagnostic);
+  // A compile the adapter GAVE UP ON, which is not the same failure as a
+  // crate that does not build.
+  //
+  // `compile` RESOLVES this one rather than rejecting: `#abandonInFlight`
+  // answers the abandoned build with `{ success: false, cancelled: true,
+  // diagnostics: [] }` because the cancel was the page's own doing — the
+  // 120 s budget is the PAGE's policy, not the worker's (compiler-adapter.js).
+  // So without a word from here it would reach an agent as "your crate does
+  // not compile" with zero diagnostics: the one failure that says nothing at
+  // all about the block, and the one an agent would answer by rewriting Rust
+  // that was never the problem. Nothing else knows what happened, so the page
+  // says it — the same way it produces its own `binary-source` diagnostic.
+  if (built.cancelled) {
+    diagnostics = [
+      {
+        severity: 'error',
+        code: 'compile-timeout',
+        message:
+          'the compile exceeded 120 s and was cancelled; the worker was recreated' +
+          (built.stderr ? ' (' + built.stderr + ')' : ''),
+        file: null,
+        line: null,
+        column: null
+      }
+    ].concat(diagnostics);
+  }
   if (!built.success) {
-    log('compile failed: ' + name + ' (' + built.elapsedMs + ' ms)');
+    log(
+      (built.cancelled ? 'compile cancelled: ' : 'compile failed: ') +
+        name +
+        ' (' +
+        built.elapsedMs +
+        ' ms)'
+    );
     return {
       success: false,
+      cancelled: built.cancelled,
       build_id: null,
       generation: null,
       diagnostics: diagnostics,
@@ -1111,6 +1195,7 @@ async function compileBlock(name) {
   }
   return {
     success: staged.success,
+    cancelled: false,
     build_id: staged.build_id,
     generation: staged.generation,
     // The staging response already carries back the diagnostics it was sent,
@@ -1146,6 +1231,7 @@ Only one compile runs at a time.',
       type: 'object',
       properties: {
         success: { type: 'boolean' },
+        cancelled: { type: 'boolean' },
         build_id: { type: ['string', 'null'] },
         generation: { type: ['object', 'null'] },
         diagnostics: { type: 'array' },
@@ -1168,11 +1254,13 @@ Only one compile runs at a time.',
           structuredContent: result
         };
       } catch (error) {
-        // Everything that is not an answer about the block. The adapter has
-        // already destroyed and replaced the worker by the time a protocol
-        // violation or a timeout reaches here, so the NEXT call works — say
-        // so, rather than leaving the agent to guess whether compiling is
-        // over for this session.
+        // Everything that is not an answer about the block: no compiler in
+        // this build, a worker that broke its protocol or would not start, a
+        // request the sandbox refused. A TIMEOUT does not come through here
+        // — the adapter resolves that one, and `compileBlock` reports it as
+        // a `compile-timeout` diagnostic above. For the violations that do,
+        // the adapter has already destroyed and replaced the worker by the
+        // time this runs, so the next call works.
         logError(error);
         return {
           isError: true,
@@ -1193,9 +1281,13 @@ Only one compile runs at a time.',
 // The button runs the same function on the same block, and reports the same
 // way: the panel is the human's copy of what the agent would have been told.
 var compileSelected = withProgress(async function () {
+  // `updateCompileButton` keeps the button disabled unless there is both a
+  // toolchain and a block, so this is unreachable through the UI — it is here
+  // because `compileBlock` would otherwise be handed an empty name and spend
+  // a request finding out.
   var name = compileSelect.value;
   if (!name) {
-    window.alert('There is no block to compile yet. Create one first (dev_create_block).');
+    log('nothing to compile: the workspace has no blocks');
     return;
   }
   await compileBlock(name);

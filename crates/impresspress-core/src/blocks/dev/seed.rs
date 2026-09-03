@@ -263,7 +263,17 @@ pub async fn import(
                 spec.name,
                 found
                     .iter()
-                    .map(|d| format!("{} [{}]", d.message, d.code))
+                    // A diagnostic with no code is a compiler's, and the
+                    // seed bundle's blocks are checked by the VALIDATOR,
+                    // whose diagnostics all carry one — so the bare-message
+                    // arm should never run here. It is written out rather
+                    // than unwrapped because a boot refusal that panicked
+                    // instead of naming the block would be the worst
+                    // possible failure of this function.
+                    .map(|d| match &d.code {
+                        Some(code) => format!("{} [{}]", d.message, code),
+                        None => d.message.clone(),
+                    })
                     .collect::<Vec<_>>()
                     .join("; ")
             ));

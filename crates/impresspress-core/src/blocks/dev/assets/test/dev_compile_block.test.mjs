@@ -259,10 +259,48 @@ test('a crate that does not compile is a result, and the diagnostics keep rustc 
     line: 12,
     column: 4
   });
-  // An unnumbered diagnostic still has to satisfy `validation::Diagnostic`'s
-  // required `code`, or a single warning on an otherwise good build would
-  // make the staging call a 400.
-  assert.equal(result.structuredContent.diagnostics[1].code, 'rustc');
+  // rustc numbered the first and not the second, and that is exactly what is
+  // reported: `validation::Diagnostic.code` is an `Option<String>`, so the
+  // page has no reason to invent a value for a diagnostic nobody coded.
+  assert.equal(result.structuredContent.diagnostics[1].code, null);
+  assert.equal(result.structuredContent.cancelled, false);
+});
+
+test('a compile the adapter gave up on is a timeout, not a crate that does not build', async () => {
+  const { tools } = instantiate({
+    hasModelContext: true,
+    compilerManifest: MANIFEST,
+    workspace: HELLO,
+    // What `#abandonInFlight` resolves with when the 120 s budget expires: a
+    // RESULT, with `cancelled` set and nothing at all to say about the crate.
+    compiler: fakeCompiler(() => ({
+      ...BUILT,
+      success: false,
+      cancelled: true,
+      artifact: null,
+      stdout: '',
+      stderr: 'the compile did not finish within 120000 ms',
+      diagnostics: []
+    }))
+  });
+  await settle();
+
+  const result = await tools.get('dev_compile_block').execute({ name: 'hello' });
+  // Still a result — the page asked for the cancel, so there is nothing for
+  // `isError` to report.
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.success, false);
+  assert.equal(result.structuredContent.cancelled, true);
+  // …and it does NOT come back as a failed build with an empty diagnostics
+  // list, which is what an agent would answer by rewriting Rust that was
+  // never the problem.
+  assert.equal(result.structuredContent.diagnostics.length, 1);
+  assert.equal(result.structuredContent.diagnostics[0].code, 'compile-timeout');
+  assert.equal(result.structuredContent.diagnostics[0].severity, 'error');
+  assert.equal(result.structuredContent.diagnostics[0].file, null);
+  // The adapter's own account of it is carried into the message, so a budget
+  // that moves is still visible on the page.
+  assert.match(result.structuredContent.diagnostics[0].message, /did not finish within 120000 ms/);
 });
 
 test('a successful compile stages the artifact and merges what staging answered', async () => {
@@ -311,10 +349,18 @@ test('a successful compile stages the artifact and merges what staging answered'
   assert.equal(result.structuredContent.generation.cause, 'block_compile');
   assert.equal(result.structuredContent.progress.length, 4);
 
-  // The request the page built: base64 of the artifact's own bytes, the
-  // block's short name (not `site/hello`), and the version read out of the
-  // block's own guest module.
+  // The request the page built. The key SET is asserted, not just the fields
+  // below: `StageBuildRequest` is `deny_unknown_fields`, so one extra key is a
+  // 400 that no assertion about the fields it does carry would ever catch.
   assert.equal(staged.length, 1);
+  assert.deepEqual(Object.keys(staged[0]).sort(), [
+    'artifact_base64',
+    'block_name',
+    'compiler_version',
+    'diagnostics',
+    'source_manifest_sha256',
+    'wafer_guest_version'
+  ]);
   assert.equal(staged[0].block_name, 'hello');
   assert.equal(staged[0].artifact_base64, Buffer.from(BUILT.artifact).toString('base64'));
   assert.equal(staged[0].wafer_guest_version, 1);
@@ -329,5 +375,77 @@ test('a successful compile stages the artifact and merges what staging answered'
   assert.deepEqual(
     elements.get('dev-progress-steps').children.map((step) => step.getAttribute('data-state')),
     ['done', 'done', 'done', 'done']
+  );
+});
+
+test('the finished ladder belongs to one compile: the next one clears it before it starts', async () => {
+  // The sandbox after a compile that landed, and a staging endpoint that
+  // refuses the SECOND one — the shape that used to leave a fully green
+  // ladder standing over a build that never went live.
+  let live = null;
+  let refuse = false;
+  const { tools, elements } = instantiate({
+    hasModelContext: true,
+    compilerManifest: MANIFEST,
+    workspace: HELLO,
+    compiler: fakeCompiler(() => BUILT),
+    status: () => ({
+      active_generation: live,
+      runtime_generation: live ? 1 : 0,
+      blocks: [],
+      activation: null,
+      wafer_guest_version: 1
+    }),
+    stage() {
+      if (refuse) {
+        return {
+          build_id: 'bld_2',
+          success: false,
+          diagnostics: [
+            {
+              severity: 'error',
+              code: 'cap-collection',
+              message: 'the block claimed a collection outside its namespace',
+              file: null,
+              line: null,
+              column: null
+            }
+          ],
+          generation: null,
+          progress: []
+        };
+      }
+      live = { id: 'gen_2', cause: 'block_compile', status: 'active' };
+      return {
+        build_id: 'bld_1',
+        success: true,
+        diagnostics: [],
+        generation: live,
+        progress: [
+          { phase: 'validating', ms: 4, detail: '' },
+          { phase: 'building_runtime', ms: 91, detail: '' },
+          { phase: 'publishing', ms: 2, detail: '' },
+          { phase: 'active', ms: 0, detail: '' }
+        ]
+      };
+    }
+  });
+  await settle();
+
+  await tools.get('dev_compile_block').execute({ name: 'hello' });
+  assert.equal(elements.get('dev-progress-steps').getAttribute('data-phase'), 'active');
+
+  // The second compile is refused by the validator, so nothing is activated
+  // and `gen_2` is still live. Without the reset the ladder would still read
+  // "Active, all four done" — a green account of a build that was thrown out.
+  refuse = true;
+  const second = await tools.get('dev_compile_block').execute({ name: 'hello' });
+  assert.equal(second.isError, undefined);
+  assert.equal(second.structuredContent.success, false);
+  assert.equal(second.structuredContent.diagnostics[0].code, 'cap-collection');
+  assert.equal(elements.get('dev-progress-steps').getAttribute('data-phase'), 'idle');
+  assert.deepEqual(
+    elements.get('dev-progress-steps').children.map((step) => step.getAttribute('data-state')),
+    ['pending', 'pending', 'pending', 'pending']
   );
 });

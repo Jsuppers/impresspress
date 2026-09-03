@@ -18,6 +18,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { instantiate } from './harness.mjs';
 
+/**
+ * One block in the workspace.
+ *
+ * Compile needs BOTH a toolchain and something to compile
+ * (`updateCompileButton`), so a test about the manifest has to supply the
+ * other half or it would be asserting the wrong reason for a disabled button.
+ * The last case below is the other half on its own.
+ */
+const ONE_BLOCK = [
+  { path: 'blocks/hello/Cargo.toml', sha256: 'a'.repeat(64), content: '[package]\n' }
+];
+
 /** The real manifest's shape, trimmed to the fields the page reads. */
 const MANIFEST = {
   schema_version: 1,
@@ -36,7 +48,10 @@ const MANIFEST = {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 test('a manifest enables the Compile button and names the toolchain', async () => {
-  const { handle, elements, fetchCalls } = instantiate({ compilerManifest: MANIFEST });
+  const { handle, elements, fetchCalls } = instantiate({
+    compilerManifest: MANIFEST,
+    workspace: ONE_BLOCK
+  });
   await settle();
 
   // Fetched once, from the path the bundle overlays the compiler to, and
@@ -62,7 +77,7 @@ test('a manifest enables the Compile button and names the toolchain', async () =
 });
 
 test('a 404 leaves the button disabled with a reason on it', async () => {
-  const { handle, elements } = instantiate({ compilerManifest: null });
+  const { handle, elements } = instantiate({ compilerManifest: null, workspace: ONE_BLOCK });
   await settle();
 
   // Still disabled, exactly as `page.rs` shipped it.
@@ -80,4 +95,16 @@ test('the version line is the manifest, formatted — not a hardcoded string', (
     handle.describeCompiler({ version: 'deadbeef', total_bytes: 1048576 }),
     'Compiler vdeadbeef · 1.0 MiB'
   );
+});
+
+test('a toolchain with nothing to compile leaves the button disabled, and says which half is missing', async () => {
+  const { elements } = instantiate({ compilerManifest: MANIFEST, workspace: [] });
+  await settle();
+
+  // The manifest arrived, so the version line is filled in — but a workspace
+  // with no `blocks/<name>/` prefix has nothing for Compile to act on, and a
+  // button that offered the click anyway could only answer it with an alert.
+  assert.equal(elements.get('dev-compiler-version').textContent, 'Compiler v807ace9e \u00b7 71.6 MiB');
+  assert.equal(elements.get('dev-compile').disabled, true);
+  assert.match(elements.get('dev-compile').title, /No block to compile/);
 });

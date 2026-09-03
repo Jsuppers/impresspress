@@ -162,7 +162,17 @@ pub struct Diagnostic {
     /// Stable machine-readable identifier, e.g. `cap-collection` for a
     /// capability outside the block's namespace or `guest-init` for a trap
     /// in the guest's `Init`. Match on this rather than on `message`.
-    pub code: String,
+    ///
+    /// `null` when whoever produced the diagnostic had no code for it. Every
+    /// diagnostic this crate produces has one — they are the constants above
+    /// — but a *compiler* diagnostic forwarded by `/b/dev` need not: rustc
+    /// numbers some of what it says (`E0425`) and not the rest, and the page
+    /// forwards what the compiler gave it. This field is optional for the
+    /// same reason `file`/`line`/`column` are: "when the compiler reported
+    /// one". Inventing a placeholder on the way in would put a value in the
+    /// build's stored record that nothing ever said.
+    #[serde(default)]
+    pub code: Option<String>,
     /// What is wrong, and what to change.
     pub message: String,
     /// Workspace-relative source file the diagnostic is about, when the
@@ -184,7 +194,7 @@ impl Diagnostic {
     pub fn error(code: &str, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Error,
-            code: code.to_string(),
+            code: Some(code.to_string()),
             message: message.into(),
             file: None,
             line: None,
@@ -919,7 +929,16 @@ mod tests {
         result
             .as_ref()
             .err()
-            .map(|found| found.iter().map(|d| d.code.as_str()).collect())
+            .map(|found| {
+                found
+                    .iter()
+                    // Every diagnostic this crate produces carries a code, so
+                    // a `None` here is a producer that forgot one rather than
+                    // a compiler diagnostic — and it must fail the assertion
+                    // it lands in, not silently match nothing.
+                    .map(|d| d.code.as_deref().unwrap_or("<no code>"))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1213,7 +1232,7 @@ mod tests {
         let failure =
             ValidationFailure::new(super::super::control::ValidationStage::Init, "trap: oops");
         let diagnostic = Diagnostic::guest(&failure);
-        assert_eq!(diagnostic.code, "guest-init");
+        assert_eq!(diagnostic.code.as_deref(), Some("guest-init"));
         assert_eq!(diagnostic.message, "trap: oops");
         assert_eq!(diagnostic.severity, Severity::Error);
     }
@@ -1221,7 +1240,7 @@ mod tests {
     #[test]
     fn the_oversize_refusal_reports_the_limit_it_enforces() {
         let diagnostic = Diagnostic::artifact_too_large(MAX_ARTIFACT_BYTES + 1);
-        assert_eq!(diagnostic.code, ARTIFACT_TOO_LARGE);
+        assert_eq!(diagnostic.code.as_deref(), Some(ARTIFACT_TOO_LARGE));
         assert!(
             diagnostic.message.contains(&MAX_ARTIFACT_BYTES.to_string()),
             "{}",

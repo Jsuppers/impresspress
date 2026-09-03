@@ -361,8 +361,12 @@
                     "description": "One thing the compiler or the validator has to say about a build.",
                     "properties": {
                       "code": {
-                        "description": "Stable machine-readable identifier, e.g. `cap-collection` for a\ncapability outside the block's namespace or `guest-init` for a trap\nin the guest's `Init`. Match on this rather than on `message`.",
-                        "type": "string"
+                        "default": null,
+                        "description": "Stable machine-readable identifier, e.g. `cap-collection` for a\ncapability outside the block's namespace or `guest-init` for a trap\nin the guest's `Init`. Match on this rather than on `message`.\n\n`null` when whoever produced the diagnostic had no code for it. Every\ndiagnostic this crate produces has one — they are the constants above\n— but a *compiler* diagnostic forwarded by `/b/dev` need not: rustc\nnumbers some of what it says (`E0425`) and not the rest, and the page\nforwards what the compiler gave it. This field is optional for the\nsame reason `file`/`line`/`column` are: \"when the compiler reported\none\". Inventing a placeholder on the way in would put a value in the\nbuild's stored record that nothing ever said.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "column": {
                         "description": "1-based column in `file`, when the compiler reported one.",
@@ -421,7 +425,6 @@
                     },
                     "required": [
                       "severity",
-                      "code",
                       "message"
                     ],
                     "type": "object"
@@ -481,8 +484,12 @@
                       "description": "One thing the compiler or the validator has to say about a build.",
                       "properties": {
                         "code": {
-                          "description": "Stable machine-readable identifier, e.g. `cap-collection` for a\ncapability outside the block's namespace or `guest-init` for a trap\nin the guest's `Init`. Match on this rather than on `message`.",
-                          "type": "string"
+                          "default": null,
+                          "description": "Stable machine-readable identifier, e.g. `cap-collection` for a\ncapability outside the block's namespace or `guest-init` for a trap\nin the guest's `Init`. Match on this rather than on `message`.\n\n`null` when whoever produced the diagnostic had no code for it. Every\ndiagnostic this crate produces has one — they are the constants above\n— but a *compiler* diagnostic forwarded by `/b/dev` need not: rustc\nnumbers some of what it says (`E0425`) and not the rest, and the page\nforwards what the compiler gave it. This field is optional for the\nsame reason `file`/`line`/`column` are: \"when the compiler reported\none\". Inventing a placeholder on the way in would put a value in the\nbuild's stored record that nothing ever said.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "column": {
                           "description": "1-based column in `file`, when the compiler reported one.",

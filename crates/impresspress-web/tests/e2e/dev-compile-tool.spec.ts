@@ -194,15 +194,22 @@ test('dev_compile_block compiles a scaffolded block, stages it and puts it live;
   await waitForTool(page, 'dev_create_block');
   await waitForTool(page, 'dev_compile_block');
 
-  // The page found the (substituted) manifest and turned Compile on. Without
-  // this the tool below would refuse with "No compiler in this build." and
-  // every assertion after it would be about the wrong thing.
-  await expect(page.locator('#dev-compile')).toBeEnabled();
+  // The page found the (substituted) manifest: the version line is written,
+  // and the only thing still holding the button back is that the workspace has
+  // no blocks yet. Without this the tool below would refuse with "No compiler
+  // in this build." and every assertion after it would be about the wrong
+  // thing.
+  await expect(page.locator('#dev-compiler-version')).toHaveText(/^Compiler vtest /);
+  await expect(page.locator('#dev-compile')).toBeDisabled();
 
   // --- 1. Scaffold, and build the very same bytes on the host -------------
   const created = structured<CreateBlock>(
     await execute(page, 'dev_create_block', { name: BLOCK, template: 'hello' }),
   );
+  // …and now there is something to compile, so the button turns on. Both
+  // halves of `updateCompileButton`, in the order a first-time visitor meets
+  // them.
+  await expect(page.locator('#dev-compile')).toBeEnabled();
   expect(created.files.map((f) => f.path)).toEqual([
     `blocks/${BLOCK}/Cargo.toml`,
     `blocks/${BLOCK}/src/lib.rs`,
