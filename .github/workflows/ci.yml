@@ -173,6 +173,17 @@ jobs:
       - name: Run the block-dev suite
         run: cargo test --locked -p impresspress-core --features block-dev,wasm
 
+      # `dev.js` is a TAIL composed into an IIFE with nothing on `window`
+      # (see the file's own header comment), so its internal logic has no
+      # exported function the Rust suite above can call directly —
+      # `test/harness.mjs` reads the same source `dev_js()` composes and
+      # wraps it itself to reach the internal state. Pins the I1 fix (an
+      # abort mid-flight must not drive the poll count negative or leave
+      # `setInterval` running forever) and the M3 fix (a 409 with no
+      # `current_sha256` is a quota refusal, not a hash conflict).
+      - name: Run dev.js unit tests (node --test)
+        run: node --test crates/impresspress-core/src/blocks/dev/assets/test/*.test.mjs
+
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
   # its Rust list actually references — was dead code in CI: nothing anywhere

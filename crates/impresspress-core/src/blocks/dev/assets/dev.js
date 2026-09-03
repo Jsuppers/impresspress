@@ -206,16 +206,32 @@ function refreshSiteTools() {
 // activate) leaves the page showing a workspace that no longer exists.
 function withProgress(execute) {
   return async function (args) {
+    // Once the session is gone (`abort.signal.aborted`), the abort handler
+    // has already zeroed `outstanding` and stopped the interval — this is a
+    // straggler call reaching the wrapper after that (a browser that ignored
+    // `registerTool`'s `signal`, or a call already queued on the event
+    // loop). Joining the count back in would reopen the exact race this
+    // guard exists to close, so run it plain instead of tracking it.
+    if (abort.signal.aborted) {
+      return execute(args);
+    }
     outstanding += 1;
     startPolling();
     try {
       return await execute(args);
     } finally {
-      outstanding -= 1;
+      // Clamp rather than trust the increment/decrement to stay paired: the
+      // abort handler can reset `outstanding` to 0 out from under a call
+      // that is still in flight (it was never given `abort.signal`, so it
+      // always reaches this `finally`). Without the clamp that decrement
+      // drives the count negative, `outstanding === 0` becomes unreachable,
+      // and the next call would start a poll interval nothing could stop.
+      outstanding = Math.max(0, outstanding - 1);
       // The LAST call out of the room turns the lights off and does the
       // catch-up once, rather than every call racing to redraw a workspace
-      // its siblings are still changing.
-      if (outstanding === 0) {
+      // its siblings are still changing. Skip it once aborted — the handler
+      // already stopped polling, and the endpoints below would just 403.
+      if (outstanding === 0 && !abort.signal.aborted) {
         stopPolling();
         await refreshAfterChange();
       }
@@ -278,7 +294,14 @@ function registerPageTool(options) {
 }
 
 function unregisterPageTools() {
-  if (typeof document.modelContext.unregisterTool !== 'function') {
+  // `unregisterPageTools` runs on every `pagehide` and on every 401/403,
+  // regardless of whether registration ever happened — a browser with no
+  // WebMCP support at all has no `document.modelContext` (`registered` is
+  // already `[]` in that case, from the guard below), so `document
+  // .modelContext` must be checked for existence before its own methods
+  // are, or this throws on unload in exactly the browsers the top-level
+  // guard (`'modelContext' in document`) was written to tolerate.
+  if (!document.modelContext || typeof document.modelContext.unregisterTool !== 'function') {
     registered = [];
     return;
   }
@@ -396,12 +419,16 @@ window.addEventListener('pagehide', function () {
 });
 
 abort.signal.addEventListener('abort', function () {
-  // Whatever was in flight is not coming back — the session behind it is
-  // gone — so the count is reset rather than decremented to zero by calls
-  // that will never return from their `finally`.
+  // Nothing in flight is handed `abort.signal` — `api.get`/`api.post` only
+  // ever pass `credentials` — so every mutating call still in flight WILL
+  // reach its own `finally` and decrement `outstanding`. Resetting it here
+  // is therefore just the interval's teardown, not a substitute for those
+  // decrements; `withProgress` (above) is what keeps them from taking the
+  // count negative or restarting the interval afterwards.
   outstanding = 0;
   stopPolling();
   unregisterPageTools();
+  log('session expired — workspace tools removed; sign in again');
 });
 
 // ---- files and the editor -------------------------------------------------
@@ -462,6 +489,18 @@ async function openFile(path) {
   await loadFiles();
 }
 
+// `/b/dev/api/files/write` answers 409 for two UNRELATED reasons that
+// happen to share a status: a real hash conflict (`FileConflict` —
+// `path`/`current_sha256`/`current_size`, and `current_sha256` is present
+// even when its value is `null`) and the block-count quota refusal
+// (`QuotaError::TooManyBlocks`, `files.rs` — a bare `{error, message}`, no
+// `current_sha256` at all, because "the workspace's shape conflicts with a
+// limit" is not a hash conflict). The status alone cannot tell them apart —
+// only the body's shape can.
+function isFileConflict(body) {
+  return 'current_sha256' in body;
+}
+
 var save = withProgress(async function () {
   // `text.disabled` is the second half of the guard, not a UI detail: a
   // disabled box holds a placeholder rather than the file's content (see
@@ -475,12 +514,18 @@ var save = withProgress(async function () {
     content: text.value,
     expected_sha256: current.sha256
   });
-  // A 409 is not a failure of the request — it is the answer to it, and it
-  // carries the hash the file actually has. Read before `json()`, which
-  // would turn it into a thrown error and lose the conflict body.
+  // A 409 is not a failure of the request — it is the answer to it. Read
+  // before `json()`, which would turn it into a thrown error and lose the
+  // body.
   if (response.status === 409) {
-    var conflict = await response.json();
-    window.alert('Changed elsewhere (now ' + conflict.current_sha256 + '). Reopen the file.');
+    var body = await response.json();
+    if (isFileConflict(body)) {
+      window.alert('Changed elsewhere (now ' + body.current_sha256 + '). Reopen the file.');
+    } else {
+      // Not a hash conflict — show the server's own explanation rather
+      // than a `current_sha256` this body never carries.
+      window.alert(body.message || 'Save refused (409).');
+    }
     return;
   }
   var written = await json(response);
@@ -520,11 +565,16 @@ var create = withProgress(async function () {
     expected_sha256: null
   });
   // Told, not logged. The human just typed this path; that it already names
-  // a file is an answer to what they asked for, and the same shape `save`
-  // uses for its own conflict — a line in the log they have to go looking
-  // for reads as "nothing happened".
+  // a file (or that the workspace hit a quota) is an answer to what they
+  // asked for, and a line in the log they have to go looking for reads as
+  // "nothing happened".
   if (response.status === 409) {
-    window.alert(path + ' already exists. Open it from the file list instead.');
+    var body = await response.json();
+    if (isFileConflict(body)) {
+      window.alert(path + ' already exists. Open it from the file list instead.');
+    } else {
+      window.alert(body.message || (path + ' was refused (409).'));
+    }
     return;
   }
   await json(response);
