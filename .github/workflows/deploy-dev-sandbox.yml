@@ -53,7 +53,10 @@ jobs:
         run: examples/dev-sandbox/build.sh
 
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
+        # Pinned to v3's tagged commit, not the floating major tag — this
+        # job holds CLOUDFLARE_API_TOKEN, the same reasoning as the
+        # wasm-pack-action pin above ("live push-to-main infra").
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3
         with:
           workingDirectory: examples/dev-sandbox
           command: deploy

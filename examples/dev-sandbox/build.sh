@@ -74,6 +74,7 @@ import hashlib, json, sys, pathlib
 
 root = pathlib.Path(sys.argv[1], "seed")
 manifest = json.loads((root / "manifest.json").read_text())
+declared = {entry["path"] for entry in manifest["site"]}
 for entry in manifest["site"]:
     path = root / "site" / entry["path"]
     if not path.is_file():
@@ -85,6 +86,21 @@ for entry in manifest["site"]:
             f"{path}: is {len(data)} bytes / {actual}, but seed/manifest.json "
             f"declares {entry['size']} bytes / {entry['sha256']}"
         )
+
+# The reverse direction: seed::import only ever imports what the manifest
+# lists, so a file added under seed/site/ and never added to
+# seed/manifest.json passes the forward check above and then silently never
+# ships — the fresh origin that seeds from this bundle just never gets it.
+# Walk the actual files and fail on anything the manifest does not declare.
+site_dir = root / "site"
+actual_files = {p.relative_to(site_dir).as_posix() for p in site_dir.rglob("*") if p.is_file()}
+undeclared = actual_files - declared
+if undeclared:
+    raise SystemExit(
+        "seed/site/** has file(s) seed/manifest.json does not declare, so they would "
+        "never be imported: " + ", ".join(sorted(undeclared))
+    )
+
 print("seed/manifest.json matches seed/site/**", file=sys.stderr)
 PY
 }

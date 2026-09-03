@@ -108,9 +108,16 @@ Admin-only. Three panes: file tree + editor; the live site in a sandboxed
 iframe; a progress and log panel. A visible "How this workspace works" section
 gives the workflow, the file layout (`site/`, `blocks/<name>/`), the tool
 names, and a suggested prompt the human can copy. Because `/b/dev` is our own
-trusted document, instructing the agent from it is correct; the
-prompt-injection boundary is the iframe, which is `sandbox`ed and cannot reach
-the parent's tools.
+trusted document, instructing the agent from it is correct. The iframe's
+`sandbox` attribute is NOT the prompt-injection boundary: it carries
+`allow-scripts allow-same-origin` over same-origin content, so the framed
+page can reach `parent.document.modelContext` (including `registerTool`) and
+`parent.__impresspressWebmcp` directly — see amendment 7 for why and what the
+attribute buys instead. What the sandbox actually relies on is that the
+framed content is the admin's own site and every tool call is authorized
+server-side, not that the iframe walls anything off; a separate preview
+origin (or a credentialless frame, which would lose the service worker) is
+the real fix and is a tracked follow-up.
 
 On load the page starts prefetching the pinned Rubrc payload in the
 background with a progress bar so the first compile does not pay the
@@ -808,11 +815,31 @@ and read together with this list.
    `frame-src 'self'` for `/b/dev`; `'unsafe-eval'` in the current constant is
    already stripped by the block and `'wasm-unsafe-eval'` survives.
 
-7. **§4.2 / Plan 2 — the preview iframe is same-origin.** `sandbox="allow-scripts
+7. **§4.2 / Plan 2 — the preview iframe is same-origin, and `sandbox` grants
+   it no isolation from the parent.** `sandbox="allow-scripts
    allow-same-origin allow-forms allow-popups"`: without `allow-same-origin`
    the framed site's calls to `/b/products/*` would be cross-origin and
-   CORS-blocked. Isolation is "no tool is registered inside the frame and the
-   parent exposes nothing on `window`".
+   CORS-blocked, and the storefront widget dies — so `allow-same-origin` is
+   unavoidable without a distinct preview origin. But `allow-scripts` plus
+   `allow-same-origin` together on same-origin content means the framed page
+   can read and write `parent.document.modelContext` (including
+   `registerTool`, i.e. it can register its own tools ahead of the
+   workspace's) and `parent.__impresspressWebmcp` (`webmcp.js` sets it, and
+   `ui::layout` injects `webmcp.js` into `/b/dev` like every other SSR page —
+   the parent does NOT expose nothing on `window`), and per the HTML spec
+   such a frame can remove its own `sandbox` attribute and re-navigate
+   itself out of the sandbox entirely. It also needs none of that: any
+   script on `/` already runs same-origin with the admin's session cookie
+   and a same-origin `fetch` passes the pipeline's Fetch-Metadata CSRF
+   check, sandboxed iframe or not. What `sandbox` actually buys: no
+   top-level navigation of the parent, no modals, no downloads, no
+   pointer-lock/presentation — nothing about the parent's tools. The real
+   model: the preview is trusted-equal to its parent; the isolation
+   boundary is the browser-local instance itself (§2: `shop_*` tools exist
+   only on the trusted `/b/dev` page of a throwaway browser-local instance),
+   not the iframe.
+   A distinct preview origin (or a credentialless frame, which would lose
+   the service worker) is the actual fix and is a tracked follow-up.
 8. **§8 / Plan 3 — `wafer_guest_version` comes from the page.** `BlockInfo`
    has no such field; the page reads the `WAFER_GUEST_VERSION` line of the
    vendored file and sends it in `StageBuildRequest`.
@@ -876,6 +903,24 @@ and read together with this list.
     page can still show a cross-origin image whose host never set CORP.
     Safari does not implement `credentialless`, so it gets no isolation and
     no threaded compiler; the WebMCP browsers are Chromium-based.
+
+    Cost to agent-built sites, not just to Safari: the adherence check above
+    cuts both ways — a document with ANY non-`unsafe-none` COEP can only
+    embed a nested document that ALSO carries a compatible COEP, and every
+    document in the sandbox now carries one because it is deployment-wide.
+    So a page the agent writes under `site/` cannot embed a third-party
+    iframe at all — YouTube, a map, Stripe Embedded Checkout
+    (`products/assets/storefront.js`'s `presentation: "embedded"`) — because
+    none of those origins serve `Cross-Origin-Embedder-Policy`. Nothing
+    regresses today: `script-src 'self' 'unsafe-inline'` already blocks
+    `js.stripe.com`, and hosted checkout is a top-level redirect, which COOP
+    does not touch. But "build me a shop" is exactly the workflow that meets
+    this wall the moment embedded checkout or a video embed comes up, and an
+    agent has no way to discover it short of the iframe silently failing to
+    load — there is no error the sandbox can show, because the browser is
+    the one refusing the navigation. This is the tradeoff the deployment-wide
+    default accepts, not a defect in it; a page that genuinely needs a
+    cross-origin embed has no workaround inside the sandbox today.
 
 15. **§9 / §16 / Plan 2 Task 6 — a stable `/b/webmcp/webmcp.js` route.**
     `ui::layout` injects `webmcp.js` at the content-hashed

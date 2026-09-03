@@ -101,10 +101,15 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
     );
 }
 
-/// COOP/COEP belong to the workspace document alone. Cross-origin isolation
-/// is what `SharedArrayBuffer` (and therefore the in-browser compiler) needs;
-/// putting it on the whole block would isolate the JSON API for no reason and
-/// make the header look like a deployment-wide policy it is not.
+/// COOP/COEP are deployment-wide now (amendment 14: the browser runtime sets
+/// `cross_origin_isolation = credentialless` on the whole sandbox deployment,
+/// not just this page — the preview iframe needs the site itself to carry a
+/// compatible COEP too). This test does not contradict that: it pins that
+/// `/b/dev`'s own JSON API does not set the pair itself — `page::handle` sets
+/// it explicitly on the workspace document (see the module doc comment for
+/// why: cross-origin isolation is what `SharedArrayBuffer`, and so the
+/// in-browser compiler, needs), and nothing upstream of this route adds it a
+/// second time.
 #[tokio::test]
 async fn other_pages_are_not_cross_origin_isolated() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;

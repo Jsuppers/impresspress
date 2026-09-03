@@ -114,13 +114,33 @@ fn body() -> Markup {
             }
             section #dev-preview .dev-pane {
                 h2 { "Live site" }
-                // `sandbox` is the prompt-injection boundary (design §4.2):
-                // whatever the agent — or a shopper's content — puts on the
-                // published site renders here, and must not be able to reach
-                // this document's tools. `allow-same-origin` is what lets the
-                // parent reload the frame after a generation lands; the site
-                // it frames is same-origin anyway, so it grants nothing the
-                // frame could not otherwise obtain.
+                // `sandbox` is NOT a prompt-injection boundary, and cannot
+                // be one while this frame carries `allow-same-origin` on
+                // same-origin content: the framed page can read and write
+                // `parent.document.modelContext` (including `registerTool`)
+                // and `parent.__impresspressWebmcp` (set by `webmcp.js`,
+                // which every SSR page — this one included — loads), and
+                // per the HTML spec a same-origin frame with both
+                // `allow-scripts` and `allow-same-origin` can drop its own
+                // `sandbox` attribute and re-navigate itself out of the
+                // sandbox altogether. `allow-same-origin` is unavoidable
+                // without a distinct preview origin: without it the framed
+                // site's own `/b/products/*` calls are cross-origin and
+                // CORS-blocked, and the storefront widget dies. What this
+                // attribute actually buys is narrower — no top-level
+                // navigation of the parent, no modals, no downloads, no
+                // pointer-lock/presentation — and needs none of the above
+                // reasoning to justify: any script on `/` already runs
+                // same-origin with the admin's session cookie regardless of
+                // this iframe. What the sandbox actually relies on: the
+                // framed content IS the admin's own site (design §2 — the
+                // `shop_*`/`dev_*` tools exist only on this trusted,
+                // browser-local instance) and every tool call is authorized
+                // server-side, not the browser tab it happens to render in.
+                // A distinct preview origin (or a credentialless frame,
+                // which would lose the service worker `webmcp.js` needs) is
+                // the real fix and is a tracked follow-up — this attribute
+                // does not provide isolation from the parent today.
                 iframe #dev-preview-frame
                     src="/"
                     sandbox="allow-scripts allow-same-origin allow-forms allow-popups"

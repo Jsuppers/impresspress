@@ -30,19 +30,22 @@ without the recursive-directory overlay `[[assets.overlay]]` needs, so
 says so, but the fix is a fresh CLI, not a change to this directory.
 
 This is the one recipe CI's `e2e-dev-sandbox` job and local e2e runs both use
-(`crates/impresspress-web/tests/e2e/dev-foundations.spec.ts`). It:
+(`crates/impresspress-web/tests/e2e/dev-foundations.spec.ts` and
+`dev-workspace.spec.ts`). It:
 
-1. Builds `impresspress-web` to wasm with `--features browser-devtools` into
+1. Verifies `seed/manifest.json` against `seed/site/**` — see `--check`
+   below. Runs first so a stale manifest fails fast rather than paying for a
+   wasm build before finding out the bundle cannot seed itself.
+2. Builds `impresspress-web` to wasm with `--features browser-devtools` into
    `crates/impresspress-web/pkg-dev` (this is what puts the `/b/dev`
    control-plane code in the binary at all — `[dev] enabled` alone only wires
    the service-worker plumbing around it).
-2. Verifies `seed/manifest.json` against `seed/site/**` — see `--check` below.
 3. Runs `impresspress build --target web --release` from this directory
    (`IMPRESSPRESS_WEB_PKG_DIR` pointed at `pkg-dev`) to assemble `dist/`.
 
 Last line of stdout is the absolute path to `dist/`.
 
-`examples/dev-sandbox/build.sh --check` runs step 2 only — verifies every
+`examples/dev-sandbox/build.sh --check` runs step 1 only — verifies every
 `seed/site/**` file's sha256 and size against `seed/manifest.json` and exits
 non-zero on drift, without building anything. Run this after editing the seed
 site; a manifest that has drifted from the files it describes is exactly what
