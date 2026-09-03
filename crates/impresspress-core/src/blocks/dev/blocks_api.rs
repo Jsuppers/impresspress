@@ -343,12 +343,21 @@ enum ClaimedToolNames {
 ///
 /// The dynamic half comes from each block's stored `BlockInfo` rather than
 /// from the generation manifest, which carries routes and capabilities but
-/// not endpoints.
+/// not endpoints. `others` is the target generation with the block being
+/// staged taken out, so a block being RECOMPILED never claims against itself.
+///
+/// The built-in half is `validation::builtin_agent_tool_names` and not
+/// `ctx.registered_blocks()` for the same reason, one layer down: a rebuilt
+/// runtime has the live dynamic blocks registered in it too, so the
+/// unfiltered list carries the previous version of the very block being
+/// staged. See that function for why the filter is the `site/` namespace
+/// rather than the names in the generation.
 async fn claimed_tool_names(
     ctx: &dyn Context,
     others: &[DynamicBlockSpec],
 ) -> Result<ClaimedToolNames, WaferError> {
-    let mut claimed: BTreeSet<String> = validation::agent_tool_names(ctx.registered_blocks());
+    let mut claimed: BTreeSet<String> =
+        validation::builtin_agent_tool_names(ctx.registered_blocks());
     for block in others {
         // A block is in the active set because a build row accepted it, so a
         // row that is gone or unreadable is a broken invariant — not a licence

@@ -421,7 +421,12 @@ async fn import_bundle(
             .filter(|(other, _)| *other != index)
             .map(|(_, spec)| spec.clone())
             .collect();
-        let mut claimed = validation::agent_tool_names(ctx.registered_blocks());
+        // Built-ins only. `registered_blocks` is the runtime's whole sealed
+        // snapshot, dynamic blocks included, and a seed import that ran on an
+        // instance already serving one would otherwise count that block's
+        // tools as claimed by a built-in — see
+        // `validation::builtin_agent_tool_names`.
+        let mut claimed = validation::builtin_agent_tool_names(ctx.registered_blocks());
         for (other, (_, _, other_info)) in inspected.iter().enumerate() {
             if other != index {
                 claimed.extend(validation::agent_tool_names(std::slice::from_ref(

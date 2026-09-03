@@ -61,6 +61,18 @@ pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 /// more useful than the bare name mismatch that also fires.
 pub const RESERVED_NAME_PREFIXES: &[&str] = &["wafer-run/", "impresspress/"];
 
+/// The namespace every dynamically-registered block is named under.
+///
+/// A guest is admitted as `site/{name}` and under no other name:
+/// [`validate_static`] and [`validate_spec`] both refuse a `BlockInfo` whose
+/// name is not this prefix plus the name it was compiled as
+/// ([`NAME_MISMATCH`]), and [`RESERVED_NAME_PREFIXES`] refuses one that
+/// reaches for a built-in's namespace instead. Those two rules together make
+/// this prefix a *partition* of a running runtime's registered block list:
+/// everything under it is a sandbox block, everything else is a built-in.
+/// [`builtin_agent_tool_names`] is what reads it that way.
+pub const BLOCK_NAMESPACE: &str = "site/";
+
 /// The only blocks a guest may declare as callable (design §6.5).
 ///
 /// Cross-block calls into feature blocks are out of scope for v1: a guest's
@@ -310,16 +322,60 @@ pub fn builtin_route_prefixes() -> Vec<&'static str> {
 /// The one place a `BlockInfo` is turned into the set
 /// [`validate_static`]'s duplicate rule reads. Both callers of that rule
 /// build the set from a mixture of sources — the staging path from the
-/// runtime's registered blocks plus each active dynamic block's *stored*
-/// `BlockInfo`, the seed importer from the registered blocks plus the other
+/// built-ins ([`builtin_agent_tool_names`]) plus each active dynamic block's
+/// *stored* `BlockInfo`, the seed importer from the built-ins plus the other
 /// blocks the same bundle carries — and a name that only one of them knew
-/// how to extract would leave the rule half-applied on the other path.
-pub fn agent_tool_names(infos: &[BlockInfo]) -> BTreeSet<String> {
+/// how to extract would leave the rule half-applied on the other path. Which
+/// blocks go IN is each caller's decision and a load-bearing one; see
+/// [`builtin_agent_tool_names`] for the half that is easy to get wrong.
+pub fn agent_tool_names<'a>(infos: impl IntoIterator<Item = &'a BlockInfo>) -> BTreeSet<String> {
     infos
-        .iter()
+        .into_iter()
         .flat_map(|info| info.endpoints.iter())
         .filter_map(|endpoint| endpoint.agent_tool.as_ref().map(|tool| tool.name.clone()))
         .collect()
+}
+
+/// Every agent tool name claimed by a **built-in** block of this runtime,
+/// given the runtime's full registered block list.
+///
+/// The distinction is the whole point, and getting it wrong is a real bug the
+/// sandbox shipped: `Context::registered_blocks` is the runtime's sealed
+/// snapshot of *everything* registered, and a runtime that has been rebuilt
+/// for a generation has every ACTIVE dynamic block registered in it too (they
+/// arrive through `ImpresspressBuilder::extra_block`; see
+/// `impresspress-web/src/runtime_factory.rs`). Seeding the claimed set from
+/// that list unfiltered makes a block collide with ITSELF the moment it is
+/// recompiled: the live previous version holds the name, and the staged new
+/// version — the same block, the same tool — is refused
+/// [`TOOL_NAME_DUPLICATE`] for a name nothing else has ever claimed. The only
+/// way out was to remove the block and compile it again from nothing, which
+/// takes the block offline for a full compile.
+///
+/// # Why the namespace and not the generation's names
+///
+/// Excluding "the blocks in the target generation" would fix the case above
+/// and leave the shape of the bug behind: the registered list describes the
+/// runtime as it is RUNNING, which is not the generation being staged into. A
+/// block dropped from the generation but not yet rebuilt away, or a runtime
+/// still one generation behind, would leave a stale dynamic block sitting in
+/// the built-in half — a phantom claim on a name no live block holds. The
+/// namespace rule cannot drift that way because it is not bookkeeping: it is
+/// the same [`BLOCK_NAMESPACE`] rule `validate_static` enforces on every
+/// guest on the way in, so "registered and under `site/`" and "is a sandbox
+/// block" are the same statement.
+///
+/// The dynamic half of the claimed set is built separately and from the
+/// authoritative source — each active block's *stored* `BlockInfo`, which is
+/// what the generation it belongs to actually accepted — by
+/// `super::blocks_api::claimed_tool_names` on the staging path and by
+/// `super::seed::import` on the seed path.
+pub fn builtin_agent_tool_names(registered: &[BlockInfo]) -> BTreeSet<String> {
+    agent_tool_names(
+        registered
+            .iter()
+            .filter(|info| !info.name.starts_with(BLOCK_NAMESPACE)),
+    )
 }
 
 /// Whether `prefix` is a normalized route prefix: absolute, `/`-terminated,
@@ -385,7 +441,7 @@ pub fn validate_static(
     claimed_tool_names: &BTreeSet<String>,
 ) -> Result<DynamicBlockSpec, Vec<Diagnostic>> {
     let mut found = Vec::new();
-    let registered = format!("site/{name}");
+    let registered = format!("{BLOCK_NAMESPACE}{name}");
     let prefix = format!("/b/{name}/");
 
     // --- Identity ---------------------------------------------------------
@@ -586,7 +642,7 @@ pub fn validate_spec(
     // artifacts and a generation row. `seed::is_fresh` is false from that row
     // onwards, so the instance can never seed again and the operator is left
     // with an opaque rebuild failure instead of this diagnostic.
-    let Some(name) = spec.name.strip_prefix("site/") else {
+    let Some(name) = spec.name.strip_prefix(BLOCK_NAMESPACE) else {
         return Err(vec![Diagnostic::error(
             NAME_MISMATCH,
             format!(

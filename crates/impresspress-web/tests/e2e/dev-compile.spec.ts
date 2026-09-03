@@ -33,9 +33,12 @@ import { execute, registeredTools, structured, waitForTool } from './fixtures/we
  *    manifest, and a call to it writes a row. This is the point of the whole
  *    sandbox: a block an agent wrote minutes ago is a tool another agent can
  *    use, with no deploy step in between.
- * 4. A broken edit is an ANSWER — a diagnostic with a line number — and the
+ * 4. RECOMPILING it works — the case a browser agent hit and no test covered:
+ *    a block that declares an agent tool used to collide with its own tool
+ *    name on its second compile, and the only way out was to remove it.
+ * 5. A broken edit is an ANSWER — a diagnostic with a line number — and the
  *    previously compiled block keeps serving.
- * 5. Rolling back to the generation before the compile removes the block, its
+ * 6. Rolling back to the generation before the compile removes the block, its
  *    route and its tool.
  *
  * # Why the visitor shares this browser context
@@ -62,6 +65,18 @@ const SUBSCRIBERS = '/b/newsletter/subscribers';
 
 /** The one endpoint the template opts into `.agent_tool(..)`. */
 const TOOL = 'subscribe_newsletter';
+
+/**
+ * The refusal a duplicate subscribe gets, verbatim from the `table` template,
+ * and what the recompile in step 7 edits it to.
+ *
+ * A string literal is the smallest real source edit, and this one is the
+ * smallest OBSERVABLE one: reading it back through the route proves the
+ * artifact that just compiled is the one serving, and getting it at all proves
+ * the block's table and rows outlived the recompile.
+ */
+const DUPLICATE = 'that address is already subscribed';
+const DUPLICATE_EDITED = 'that address is already on the list';
 
 /** Who subscribes, and through which door. */
 const BY_ADMIN = 'admin@newsletter.test';
@@ -190,12 +205,13 @@ async function toolNames(page: Page): Promise<string[]> {
 
 test('an agent scaffolds, compiles and uses a Rust block end to end', async ({ page, context }) => {
   // The bill: a cold sandbox boot (wasm compile, OPFS create, migrations, seed
-  // import), 75 MiB of toolchain into the page, a release build of the block,
-  // two activations that each rebuild the wasmi runtime, and a second
-  // toolchain start-up for the failing build. Measured at 1.3 minutes on a
-  // 24-core box; ten is the ceiling CI is given, because a runner is slower
-  // and a cold `wasm-pack` cache is not this test's to control.
-  test.setTimeout(10 * 60 * 1000);
+  // import), 75 MiB of toolchain into the page, THREE release builds of the
+  // block (the compile, the recompile, and the one that fails), and the
+  // activations that each rebuild the wasmi runtime. Measured at 1.3 minutes
+  // for two builds on a 24-core box; twelve is the ceiling CI is given,
+  // because a runner is slower and a cold `wasm-pack` cache is not this
+  // test's to control.
+  test.setTimeout(12 * 60 * 1000);
 
   // Nothing here drives the buttons that alert, but an unhandled dialog blocks
   // the page rather than failing it — a hang with no message is the worst
@@ -327,7 +343,55 @@ test('an agent scaffolds, compiles and uses a Rust block end to end', async ({ p
   // table the guest created.
   expect(await subscriberEmails(page)).toEqual([BY_VISITOR, BY_ADMIN]);
 
-  // --- 7. A broken edit is a diagnostic, not an outage --------------------
+  // --- 7. Recompiling keeps the block live, with its data and its tool ----
+  //
+  // The scenario an agent hit driving the live sandbox. Everything above is
+  // this block's FIRST compile; this is its second. Staging seeded the "agent
+  // tool name already claimed" set from the runtime's registered blocks —
+  // which, after the rebuild in step 3, INCLUDE the live `site/newsletter` —
+  // so a block that declares a tool collided with ITSELF on recompile and was
+  // refused `tool-name-duplicate` naming `subscribe_newsletter`, a tool
+  // nothing else has ever declared. The agent's only way forward was
+  // `dev_remove_block`, which takes the block, its route and its tool offline
+  // for the length of a full compile.
+  const live = structured<FileRead>(
+    await execute(page, 'dev_read_file', { path: `blocks/${BLOCK}/src/lib.rs` }),
+  );
+  const edited = live.content.replace(DUPLICATE, DUPLICATE_EDITED);
+  // Same guard as the broken edit below: the template moving out from under
+  // this test is worth its own failure, or the recompile would pass on bytes
+  // it never changed.
+  expect(edited, `"${DUPLICATE}" is no longer in the table template`).not.toBe(live.content);
+  structured(
+    await execute(page, 'dev_write_file', {
+      path: `blocks/${BLOCK}/src/lib.rs`,
+      content: edited,
+      expected_sha256: live.sha256,
+    }),
+  );
+
+  const recompiled = structured<Compile>(await execute(page, 'dev_compile_block', { name: BLOCK }));
+  expect(recompiled.success, JSON.stringify(recompiled.diagnostics)).toBe(true);
+  expect(
+    recompiled.diagnostics.filter((d) => d.severity === 'error'),
+    JSON.stringify(recompiled.diagnostics),
+  ).toEqual([]);
+  // A NEW generation, active — a recompile REPLACES the block rather than
+  // joining the live set beside itself.
+  expect(recompiled.generation?.cause).toBe('block_compile');
+  expect(recompiled.generation?.status).toBe('active');
+  expect(recompiled.generation?.id).not.toBe(compiled.generation?.id);
+  expect(recompiled.generation?.blocks).toBe(1);
+
+  // The route answers out of the artifact that just compiled: the address
+  // step 4 subscribed is still a duplicate — so the table and its rows
+  // outlived the recompile — and the refusal is the edited one.
+  const duplicate = await subscribe(page, BY_ADMIN);
+  expect(duplicate.status, duplicate.body).toBe(409);
+  expect(duplicate.body).toContain(DUPLICATE_EDITED);
+  expect(await subscriberEmails(page)).toEqual([BY_VISITOR, BY_ADMIN]);
+
+  // --- 8. A broken edit is a diagnostic, not an outage --------------------
   const source = structured<FileRead>(
     await execute(page, 'dev_read_file', { path: `blocks/${BLOCK}/src/lib.rs` }),
   );
@@ -371,7 +435,7 @@ test('an agent scaffolds, compiles and uses a Rust block end to end', async ({ p
   // — routes, table and rows intact.
   expect(await subscriberEmails(page)).toEqual([BY_VISITOR, BY_ADMIN]);
 
-  // --- 8. Rollback removes the block, its route and its tool ---------------
+  // --- 9. Rollback removes the block, its route and its tool ---------------
   //
   // Newest first, so the first generation with no blocks is the sandbox as it
   // was immediately before the compile.
