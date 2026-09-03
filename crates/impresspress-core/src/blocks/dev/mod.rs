@@ -40,6 +40,7 @@ pub mod publisher;
 pub mod repo;
 pub mod seed;
 pub mod status;
+pub mod tools;
 pub mod validation;
 pub mod workspace;
 
@@ -98,6 +99,8 @@ pub enum Route {
     ApiBuildStage,
     /// `POST /b/dev/api/blocks/{name}/remove`
     ApiBlockRemove,
+    /// `GET /b/dev/api/tools.json`
+    ApiToolsJson,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
@@ -149,6 +152,11 @@ pub const ROUTES: &[EndpointRoute<Route>] = &[
         HttpMethod::Post,
         "/b/dev/api/blocks/{name}/remove",
         Route::ApiBlockRemove,
+    ),
+    EndpointRoute::new(
+        HttpMethod::Get,
+        "/b/dev/api/tools.json",
+        Route::ApiToolsJson,
     ),
 ];
 
@@ -389,6 +397,19 @@ impl Block for DevBlock {
                 .auth(AuthLevel::Admin)
                 .path_params::<contracts::BlockPathParams>()
                 .output::<contracts::ActivationResponse>(),
+            // Deliberately carries no `.agent_tool(..)`: this endpoint IS a
+            // tool manifest, and a tool that named itself in its own output
+            // is exactly the leak
+            // `dev_tools_manifest.rs`'s `no_dev_or_shop_tool_leaks_into_the_global_manifest`
+            // exists to catch. See `tools` for what it publishes instead.
+            BlockEndpoint::get("/b/dev/api/tools.json")
+                .summary("Page-scoped WebMCP tool manifest")
+                .description(
+                    "The curated `dev_*` and `shop_*` tools the /b/dev page registers for its \
+                     in-page agent — a page-scoped WebMCP manifest, not the deployment-wide one \
+                     at /b/webmcp/manifest.json.",
+                )
+                .auth(AuthLevel::Admin),
         ])
         .admin_url(ROUTE_PREFIX)
         // The sandbox is registered only where it is meant to exist; a
@@ -421,6 +442,7 @@ impl Block for DevBlock {
             }
             Route::ApiBuildStage => blocks_api::handle_stage(ctx, &self.shared, input).await,
             Route::ApiBlockRemove => blocks_api::handle_remove(ctx, &self.shared, &msg).await,
+            Route::ApiToolsJson => tools::handle(ctx).await,
         }
     }
 

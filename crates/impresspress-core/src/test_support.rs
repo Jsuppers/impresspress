@@ -337,25 +337,50 @@ impl TestContext {
     /// starts, exactly as they do at boot.
     #[cfg(feature = "block-dev")]
     pub async fn with_dev(control: Arc<dyn crate::blocks::dev::RuntimeControl>) -> Self {
+        Self::with_admin().await.with_dev_added(control).await
+    }
+
+    /// Add the `impresspress/dev` block to an EXISTING fixture — the dev
+    /// migrations, block registration, storage wiring, `/b/dev` extra route
+    /// and WRAP enforcement [`Self::with_dev`] applies to a fresh context,
+    /// applied instead on top of whatever `self` already carries.
+    ///
+    /// For a test that needs `impresspress/dev` alongside another block's
+    /// own fixture — e.g. `TestContext::with_products().await.with_dev_added(..)`
+    /// for `/b/dev/api/tools.json`, which projects both blocks' endpoints
+    /// into one manifest. [`Self::with_dev`] cannot do this: it always starts
+    /// from a bare `with_admin()` context, so a caller that needs a second
+    /// block already registered would have no way to add it before the dev
+    /// block's WRAP enforcement switches on.
+    ///
+    /// Migrations, not registration order, are what production guarantees
+    /// (admin's `block_settings` table before any block's `apply_if_blessed`
+    /// upsert) — adding dev's migrations after another block's have already
+    /// run is exactly what a deployment that enables the sandbox alongside an
+    /// existing block set does, so this is not a fixture-only shortcut.
+    #[cfg(feature = "block-dev")]
+    pub async fn with_dev_added(
+        mut self,
+        control: Arc<dyn crate::blocks::dev::RuntimeControl>,
+    ) -> Self {
         use crate::blocks::dev;
 
-        let mut ctx = Self::with_admin().await;
-        ctx.apply_block_migrations(
+        self.apply_block_migrations(
             dev::BLOCK_NAME,
             dev::migrations::SQLITE_MIGRATIONS,
             dev::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
         let shared = dev::DevShared::new(control);
-        ctx.dev_shared = Some(shared.clone());
-        ctx.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
+        self.dev_shared = Some(shared.clone());
+        self.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // namespacing wrapper — that wrapper is what turns the block's own
         // `blobs` / `""` folders into `impresspress/dev/…`, and what would
         // refuse a cross-block reach that the grant list did not cover.
         let store = Arc::new(InMemoryStorageService::new());
-        ctx.storage = Some(store.clone());
+        self.storage = Some(store.clone());
         let storage = crate::blocks::storage::create(store, Arc::from("impresspress/admin"));
         // The storage block runs its OWN cross-block check against a grant
         // list the runtime injects after startup. Leaving it empty (the
@@ -364,13 +389,13 @@ impl TestContext {
         // a missing grant from an unconfigured block — and the site publish
         // Task 7 builds on would fail here for the wrong reason.
         storage.update_wrap_grants(&dev::wrap_grants());
-        ctx.register_block("wafer-run/storage", storage);
-        ctx.add_extra_route(ExtraRoute::new(
+        self.register_block("wafer-run/storage", storage);
+        self.add_extra_route(ExtraRoute::new(
             dev::ROUTE_PREFIX.to_string(),
             dev::BLOCK_NAME.to_string(),
             crate::routing::RouteAccess::Admin,
         ));
-        ctx.with_wrap(dev::BLOCK_NAME, dev::wrap_grants(), "impresspress/admin")
+        self.with_wrap(dev::BLOCK_NAME, dev::wrap_grants(), "impresspress/admin")
     }
 
     /// Register a route the way `ImpresspressBuilder::add_route` does, so
