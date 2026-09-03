@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -268,7 +269,45 @@ type FileRead = { path: string; sha256: string; size: number; encoding: string; 
 type FileWrite = { path: string; sha256: string; size: number; generation: Generation | null };
 type Generation = { id: string; cause: string; status: string };
 
-test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({ page }) => {
+/**
+ * Serve `dir` on `port` with Python's `http.server` and wait until it answers.
+ *
+ * The exported bundle has to be SERVED to be proved: a service worker cannot
+ * be registered from a `file://` URL, which is the first thing the export's
+ * own README says. `python3` is already a hard dependency of this repo's
+ * tooling (`examples/dev-sandbox/build.sh` uses it), so this needs nothing
+ * installed that CI does not already have.
+ */
+async function serveDirectory(dir: string, port: number): Promise<ChildProcess> {
+  const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], {
+    cwd: dir,
+    stdio: 'ignore',
+  });
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    if (server.exitCode !== null) {
+      throw new Error(`static server for ${dir} exited with ${server.exitCode}`);
+    }
+    const up = await new Promise<boolean>((resolve) => {
+      const socket = createConnection({ host: '127.0.0.1', port }, () => {
+        socket.end();
+        resolve(true);
+      });
+      socket.on('error', () => resolve(false));
+    });
+    if (up) return server;
+    if (Date.now() > deadline) throw new Error(`static server for ${dir} never came up`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/** The port the exported bundle is served on, beside the sandbox's own. */
+const EXPORT_PORT = 8099;
+
+test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({
+  page,
+  browser,
+}) => {
   // A cold boot compiles the wasm, creates the OPFS database, runs every
   // block's migrations and imports the seed. The default 60 s is a boot
   // budget, not a test budget.
@@ -510,10 +549,63 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({ p
     expect(inspected.index).toContain(SHOP_HEADING);
     // And the shop's data came with it.
     expect(inspected.data.tables['impresspress__products__products']).toHaveLength(1);
+    console.log(`export → download → verified archive: ${Date.now() - exportStart} ms`);
+
+    // --- 5b. …and the exported folder RUNS ------------------------------
+    //
+    // The whole claim of design §1 step 4 and §10.1, and the one thing
+    // reading the archive cannot establish: unzip it, serve it, open it, and
+    // find the shop.
+    //
+    // A NEW CONTEXT on a DIFFERENT ORIGIN, unlike the shopper below. That is
+    // not a workaround, it is the subject: a different origin has its own
+    // OPFS, its own service-worker registration and an empty database, so
+    // this boots the exported bundle exactly as someone who received the zip
+    // would — and the seed import is the only thing that can put a site
+    // there. The bundle boots with `const DEV_ENABLED = false;`, so this also
+    // proves the fix that split `SandboxMode`: with the runtime half keyed on
+    // the flag, this page would be blank.
+    const runStart = Date.now();
+    const unpacked = path.join(scratch, 'site');
+    execFileSync('python3', [
+      '-c',
+      'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])',
+      zipPath,
+      unpacked,
+    ]);
+    const server = await serveDirectory(unpacked, EXPORT_PORT);
+    const exported = await browser.newContext({ baseURL: `http://127.0.0.1:${EXPORT_PORT}` });
+    try {
+      const site = await exported.newPage();
+      await bootServiceWorker(site);
+
+      // The site the agent wrote, served from a folder on a plain static
+      // host. Its seed was imported on this origin's first boot.
+      await expect(site.locator('h1')).toHaveText(SHOP_HEADING, { timeout: 120_000 });
+      // …and the product came with it, through the catalog route the page
+      // fetches — so the data snapshot imported too, and the products block
+      // is serving on the exported runtime.
+      await expect(site.locator('.shop-product-name')).toHaveText(SHOP_PRODUCT.name, {
+        timeout: 60_000,
+      });
+
+      // No workspace. The `/b/dev` route is not registered in an exported
+      // bundle, and the router is the gate — so this is a 404, not a 403.
+      expect(await site.evaluate(async () => (await fetch('/b/dev/api/status')).status)).toBe(404);
+
+      // And no cross-origin isolation: an exported site has no compiler
+      // needing `SharedArrayBuffer` and no preview frame to keep loadable, so
+      // it gets back the third-party iframes isolation would have cost it
+      // (spec amendment 14's stated tradeoff, amendment 19's other half).
+      expect(await site.evaluate(() => window.crossOriginIsolated)).toBe(false);
+      console.log(`exported bundle: served, booted, shop renders: ${Date.now() - runStart} ms`);
+    } finally {
+      await exported.close();
+      server.kill('SIGKILL');
+    }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
-  console.log(`export → download → verified archive: ${Date.now() - exportStart} ms`);
 
   // --- 6. The shopper ----------------------------------------------------
   //

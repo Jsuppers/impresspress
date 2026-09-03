@@ -19,7 +19,7 @@ pub mod config;
 pub mod dev_runtime;
 pub mod runtime_factory;
 
-pub use runtime_factory::{RuntimeFactory, RuntimeOptions};
+pub use runtime_factory::{RuntimeFactory, RuntimeOptions, SandboxMode};
 
 const IMPRESSPRESS_CSP: &str = concat!(
     "default-src 'self'; ",
@@ -40,10 +40,15 @@ const IMPRESSPRESS_CSP: &str = concat!(
 /// the bundle's `__DEV_ENABLED__` placeholder. A missing or non-boolean `dev`
 /// reads as `false` — the sandbox is never enabled by an unparseable value.
 ///
-/// The flag is a *request*. On a build without `browser-devtools` it resolves
-/// to inactive (see `runtime_factory::resolve_dev_active`), and `{ dev: true }`
-/// is then a no-op apart from the single console warning below: same seeded
-/// variables, same CSP, same routes as `{ dev: false }`.
+/// The flag is a *request*, and it selects the WORKSPACE half of the sandbox
+/// only (see [`SandboxMode`]). A build with `browser-devtools` compiled in
+/// always runs the sandbox's RUNTIME half — the seed import, the generation
+/// ledger, journal convergence, the dynamic-block rebuild — because that is
+/// what makes an ImpressPress folder serve the site it ships, and an EXPORTED
+/// bundle boots with `{ dev: false }` precisely so it has no `/b/dev`. On a
+/// build without the feature the flag resolves to [`SandboxMode::Absent`] and
+/// `{ dev: true }` is a no-op apart from the single console warning below:
+/// same seeded variables, same CSP, same routes as `{ dev: false }`.
 #[wasm_bindgen]
 pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     if impresspress_browser::is_initialized() {
@@ -78,12 +83,13 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     .map_err(|e| JsValue::from_str(&e))?;
 
     // The sandbox control plane is attached BEFORE the first build, so the
-    // cold-start runtime already carries `/b/dev`. Doing it afterwards would
-    // mean the page did not exist until a rebuild — and an instance with no
-    // guest blocks has no reason to rebuild, so on the common path it would
-    // never exist at all. `attach` answers `None` whenever the sandbox is not
-    // active, and the factory is then untouched. Without the feature there is
-    // no `attach` at all and `factory` is used as constructed.
+    // cold-start runtime already carries the dev block (and, in a workspace
+    // build, `/b/dev`). Doing it afterwards would mean the page did not exist
+    // until a rebuild — and an instance with no guest blocks has no reason to
+    // rebuild, so on the common path it would never exist at all. `attach`
+    // answers `None` only when the feature is not compiled in, and the factory
+    // is then untouched. Without the feature there is no `attach` at all and
+    // `factory` is used as constructed.
     #[cfg(feature = "browser-devtools")]
     let (factory, sandbox) = dev_runtime::attach(factory);
 
@@ -96,6 +102,11 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     // Seed on a fresh instance, converge on whatever the activation journal
     // was in the middle of, and rebuild with the active block set — all before
     // returning, because requests only start once `initialize()` resolves.
+    //
+    // This runs for an EXPORTED bundle too (`{ dev: false }` with the feature
+    // compiled in). It is the whole reason the export works: the archive ships
+    // a `seed/` beside the shell, and this is what reads it. See
+    // `SandboxMode`.
     #[cfg(feature = "browser-devtools")]
     if let Some(sandbox) = &sandbox {
         dev_runtime::install(sandbox).await;
@@ -129,15 +140,16 @@ struct BrowserBootHooks {
     block_settings_handle: Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>>,
     jwt_secret_handle: Arc<std::sync::RwLock<String>>,
     crypto: Arc<impresspress_browser::crypto::BrowserCryptoService>,
-    /// Whether this bundle was booted with the development sandbox requested.
-    /// Seeds the sandbox's own variables — see `config::seed_and_load_variables`.
-    dev_active: bool,
+    /// What the sandbox contributes to this runtime. Decides which of the
+    /// sandbox's own variables are seeded — see
+    /// `config::seed_and_load_variables`.
+    mode: SandboxMode,
 }
 
 #[wafer_block::wafer_async_trait]
 impl builder::BootHooks for BrowserBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
-        let vars = config::seed_and_load_variables(&self.db, self.dev_active).await?;
+        let vars = config::seed_and_load_variables(&self.db, self.mode).await?;
         web_sys::console::log_1(
             &format!(
                 "impresspress: {} variables loaded from database",

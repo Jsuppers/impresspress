@@ -1075,6 +1075,52 @@ and read together with this list.
     everything else is retired. Left alone, either would pin content against
     the workspace's 64 MiB quota (§6.6) for the life of the instance.
 
+19. **§10.1 / §10.2 / §21 / Plan 4 Task 3 review — the exported runtime: the
+    FEATURE decides the runtime, the FLAG decides the workspace.** §21 says
+    "the exported bundle has it off", and the export duly renders
+    `const DEV_ENABLED = false;` into `sw.js`. But `dev_active` was
+    `feature_compiled && requested`, and EVERYTHING keyed on it — including
+    `dev_runtime::install`, which is the only caller of `seed::import`. So an
+    exported bundle imported nothing: the `seed/` the archive ships beside the
+    shell was never read, `/` had no site, and the folder came up empty,
+    contradicting §10.2 ("on a cold boot with no active generation the service
+    worker fetches `/seed/manifest.json`" — a property of the deployment, not
+    of whether anyone can edit it), §10.1's whole point, and the README the
+    export writes.
+
+    The gate is therefore split in three
+    (`impresspress-web`'s `SandboxMode`): `Absent` (feature off — §13's
+    "the sandbox is absent, not merely disabled" is unchanged), `Exported`
+    (feature on, `dev: false`) and `Workspace` (feature on, `dev: true`).
+    With the feature compiled in, the sandbox's **runtime** half always runs:
+    the `impresspress/dev` block is registered (which is what runs its
+    migrations and creates the ledger), its WRAP grants are handed over (which
+    is what lets the boot path write the published site and the data-snapshot
+    tables), `wafer-run/web` keeps `cache_mode = "no-cache"` (§10.1 says the
+    exported bundle serves the site that way "too"), the generation's dynamic
+    blocks are registered with their routes, `WAFER_RUN_SHARED__HAS_LANDING_PAGE`
+    is force-set, and boot runs seed import → journal convergence → the
+    rebuild. Only the **workspace** half is keyed on the flag: the `/b/dev`
+    route, the widened CSP (`worker-src 'self' blob:; frame-src 'self'`),
+    `frame_ancestors: self` and `cross_origin_isolation: credentialless`.
+    (`IMPRESSPRESS_DEV_ENABLED` is no longer written to the database — the
+    Plan 1 review fix removed it; the flag lives in the bundle's `sw.js`
+    only. `HAS_LANDING_PAGE` is force-set in BOTH directions, `"false"` when
+    the runtime is absent, so a stale `"true"` from an earlier sandbox on the
+    same origin cannot outlive it.)
+
+    Two consequences worth stating. An exported site gets cross-origin
+    isolation *back* — it has no compiler needing `SharedArrayBuffer` and no
+    preview iframe to keep loadable — so a page an agent built there can embed
+    the third-party iframe amendment 14 says the sandbox cannot (a video, a
+    map, Stripe Embedded Checkout). And the dev block is *registered but
+    unrouted* in `Exported`: §13's gate is the router ("not any check inside
+    any handler"), and an unrouted block has no HTTP surface, so `/b/dev` is a
+    404 there. It remains visible on `/b/admin/blocks` and in `/openapi.json`
+    to that site's own admin, which is cosmetic and the accepted cost of
+    running the block's real lifecycle rather than reproducing its migrations
+    from the boot path under a grant on another block's table.
+
 ## 21. Definition of done
 
 - `browser-devtools` is off by default and absent from a normal bundle; the

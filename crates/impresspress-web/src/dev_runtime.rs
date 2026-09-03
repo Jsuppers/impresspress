@@ -770,7 +770,8 @@ impl ShellSource for BrowserShellSource {
             // written by a bundler that predates the `files` field, and the
             // export would silently produce a folder with no runtime in it.
             return Err(format!(
-                "{ASSET_MANIFEST_URL} lists no files; this bundle was built by an                  impresspress-bundle that does not write the shell's file list"
+                "{ASSET_MANIFEST_URL} lists no files; this bundle was built by an \
+                 impresspress-bundle that does not write the shell's file list"
             ));
         }
         Ok(manifest.files)
@@ -800,14 +801,22 @@ pub struct Sandbox {
 /// Attach the sandbox control plane to `factory`, before the first runtime is
 /// built.
 ///
-/// Returns the shared factory handle and — when the sandbox is actually active
-/// — the [`Sandbox`] [`install`] needs. `None` is the whole "feature off (or
-/// flag off) = nothing" rule from this crate's `resolve_dev_active`: no
-/// control, no `DevShared`, so `RuntimeFactory::with_dev` is never called and
-/// the runtime that gets built is byte-identical to one that never asked for a
-/// sandbox.
+/// Returns the shared factory handle and — whenever the sandbox's RUNTIME half
+/// is present — the [`Sandbox`] [`install`] needs.
+///
+/// Keyed on [`SandboxMode::runtime_present`](crate::SandboxMode::runtime_present), **not** on the `dev` flag. An
+/// exported bundle boots with `{ dev: false }` and still needs every one of
+/// these: the control that loads its seeded blocks, the `DevShared` that owns
+/// the activation queue, and the [`install`] below that imports the `seed/`
+/// the archive ships beside the shell. Keying this on the flag is what made an
+/// exported site come up empty. `None` is therefore the "feature off =
+/// nothing" rule alone (design §13): no control, no `DevShared`, so
+/// `RuntimeFactory::with_dev` is never called and the runtime that gets built
+/// is byte-identical to one that never asked for a sandbox. Which of the two
+/// compiled-in modes this is decides what the FACTORY registers, not whether
+/// there is a control at all — see [`SandboxMode`](crate::SandboxMode).
 pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Sandbox>) {
-    if !factory.dev_active {
+    if !factory.mode.runtime_present() {
         return (Rc::new(factory), None);
     }
     let control = BrowserRuntimeControl::new();
@@ -823,6 +832,12 @@ pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Sandbox>) 
 }
 
 /// Bring the sandbox up on the runtime that was just stored.
+///
+/// Runs in BOTH compiled-in modes ([`Exported`](crate::SandboxMode::Exported)
+/// as well as [`Workspace`](crate::SandboxMode::Workspace)). For an exported bundle this is the entire
+/// reason the folder works at all: step 1 below is what reads the `seed/` the
+/// archive ships beside the shell, and steps 2–3 are what put its blocks in
+/// the runtime.
 ///
 /// In order:
 ///
