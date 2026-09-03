@@ -564,10 +564,12 @@ impl SourcesMatch {
         match self {
             Self::Current => "sources match the compiled artifact",
             Self::Stale => {
-                "SOURCES DIFFER from the compiled artifact — the .wasm here was built from an                  earlier version of src/; recompile and re-export to make them agree"
+                "SOURCES DIFFER from the compiled artifact — the .wasm here was built from an \
+                 earlier version of src/; recompile and re-export to make them agree"
             }
             Self::Unknown => {
-                "no source digest recorded (a seeded block, or one whose build record is gone)                  — the sources are shipped as found and were not checked against the artifact"
+                "no source digest recorded (a seeded block, or one whose build record is gone) \
+                 — the sources are shipped as found and were not checked against the artifact"
             }
         }
     }

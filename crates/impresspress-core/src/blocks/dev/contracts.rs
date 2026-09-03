@@ -53,10 +53,12 @@ pub struct StatusResponse {
 
 /// What the sandbox's two content stores, its workspace and its ledger hold.
 ///
-/// Read from the stores themselves on every request rather than from a
-/// running counter: these are the figures that say whether the garbage
-/// collector is keeping up, and a counter that had drifted would look exactly
-/// like a collector that was.
+/// Read from the workspace's own counters and the builds table on every
+/// request, never by walking the stores — see [`super::gc::storage_usage`],
+/// which owns that decision and the reason for it (a storage `list` is
+/// `O(folder)` on the OPFS backend, and the page polls this three times a
+/// second while a tool call is outstanding). The one full listing belongs to
+/// the collector, which runs once per activation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageUsage {

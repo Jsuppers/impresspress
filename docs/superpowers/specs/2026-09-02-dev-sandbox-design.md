@@ -1109,11 +1109,12 @@ and read together with this list.
     the runtime is absent, so a stale `"true"` from an earlier sandbox on the
     same origin cannot outlive it.)
 
-    Two consequences worth stating. An exported site gets cross-origin
-    isolation *back* — it has no compiler needing `SharedArrayBuffer` and no
-    preview iframe to keep loadable — so a page an agent built there can embed
-    the third-party iframe amendment 14 says the sandbox cannot (a video, a
-    map, Stripe Embedded Checkout). And the dev block is *registered but
+    Two consequences worth stating. An exported site *loses* cross-origin
+    isolation — it has no compiler needing `SharedArrayBuffer` and no preview
+    iframe to keep loadable, so it needs none — and gets back what isolation
+    cost: a page an agent built there can embed the third-party iframe
+    amendment 14 says the sandbox cannot (a video, a map, Stripe Embedded
+    Checkout). And the dev block is *registered but
     unrouted* in `Exported`: §13's gate is the router ("not any check inside
     any handler"), and an unrouted block has no HTTP surface, so `/b/dev` is a
     404 there. It remains visible on `/b/admin/blocks` and in `/openapi.json`

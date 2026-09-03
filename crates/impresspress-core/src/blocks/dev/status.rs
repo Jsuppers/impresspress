@@ -53,9 +53,10 @@ async fn build(ctx: &dyn Context, shared: &DevShared) -> Result<StatusResponse, 
             })
             .unwrap_or_default(),
         activation,
-        // Walked from the stores on every poll. The page polls this while a
-        // tool call is outstanding, so the figures move as the collector
-        // works rather than only after the panel is reopened.
+        // From the workspace counters and the builds table on every poll, not
+        // from a walk of the stores (`gc::storage_usage` says why). The page
+        // polls this while a tool call is outstanding, so the figures move as
+        // the collector works rather than only after the panel is reopened.
         storage: gc::storage_usage(ctx).await?,
         wafer_guest_version: WAFER_GUEST_VERSION,
         // One indexed read of a `UNIQUE` column, on the same poll — cheap in
