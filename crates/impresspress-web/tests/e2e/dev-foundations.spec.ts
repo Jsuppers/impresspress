@@ -1,5 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Plan 1 checkpoint for the browser development sandbox.
@@ -8,10 +9,10 @@ import { readFileSync } from 'node:fs';
  * `inspect`/`probe`, the runtime rebuild, `replace_wafer`, the boot context,
  * seed-on-boot — only exists inside a service worker. Nothing in it can be
  * covered by a host test, so this file is the first and only place it runs.
- * The bundle it serves is built by
- * `tests/e2e/fixtures/build-dev-bundle.sh` (a `browser-devtools` wasm through
- * the sealed web flow with `[dev] enabled = true`, plus the seed fixture at
- * `dist/seed/`).
+ * The bundle it serves is built by `examples/dev-sandbox/build.sh` (a
+ * `browser-devtools` wasm through the sealed web flow with `[dev] enabled =
+ * true`, the welcome starter site at `examples/dev-sandbox/seed/` overlaid
+ * onto `dist/seed/`).
  *
  * The first test is the anonymous half: **seed-on-boot** (a fresh origin
  * serving `/seed/manifest.json` imports generation 0 and publishes its site),
@@ -94,18 +95,34 @@ const PATCHED_B64 = Buffer.from(
 
 /** What the proof guest answers on its route. */
 const GUEST_GREETING = 'Hello from a browser-compiled WAFER block!';
-/** The one line `tests/e2e/fixtures/dev-sandbox-seed/seed/site/index.html` holds. */
-const SEED_TEXT = 'dev sandbox welcome placeholder';
+
 /**
- * SHA-256 of that file, as `seed/manifest.json` declares it.
- *
- * Stated here rather than recomputed because it is what the *first* write has
- * to send as `expected_sha256`: the seed already published `site/index.html`,
- * so a write claiming to expect nothing there is a conflict, not a create.
- * `build-dev-bundle.sh` fails the build if the manifest and the file disagree,
- * which is what keeps this constant honest.
+ * A stable phrase from the real welcome page
+ * (`examples/dev-sandbox/seed/site/index.html`) — the "Open workspace" link
+ * text, present on every render regardless of copy edits elsewhere on the
+ * page.
  */
-const SEED_SHA256 = '58541b54e4a31ce058a26babb9ee10dcf1a888afd388427f172502e4d23ade50';
+const WELCOME_PHRASE = 'Open workspace';
+
+/**
+ * SHA-256 of `seed/site/index.html`, read from `examples/dev-sandbox/seed/
+ * manifest.json` at test time rather than pinned here — it is what the
+ * *first* write has to send as `expected_sha256`: the seed already published
+ * `site/index.html`, so a write claiming to expect nothing there is a
+ * conflict, not a create. `build.sh --check` fails the build if the manifest
+ * and the file disagree, which is what keeps this read honest.
+ */
+const seedManifestPath = fileURLToPath(
+  new URL('../../../../examples/dev-sandbox/seed/manifest.json', import.meta.url),
+);
+const seedManifest: { site: { path: string; sha256: string }[] } = JSON.parse(
+  readFileSync(seedManifestPath, 'utf8'),
+);
+const seedIndexHtml = seedManifest.site.find((f) => f.path === 'index.html');
+if (!seedIndexHtml) {
+  throw new Error(`${seedManifestPath} has no "index.html" entry in "site"`);
+}
+const SEED_SHA256 = seedIndexHtml.sha256;
 
 /**
  * Load `/` and wait until the service worker is serving it.
@@ -219,7 +236,7 @@ test('a fresh origin seeds itself, serves the seeded site, and keeps the sandbox
   console.log(`cold boot (seed import, no blocks): ${Date.now() - bootStart} ms`);
 
   await page.goto('/', { waitUntil: 'commit' });
-  await expect(page.locator('body')).toContainText(SEED_TEXT, { timeout: 60_000 });
+  await expect(page.locator('body')).toContainText(WELCOME_PHRASE, { timeout: 60_000 });
   // `no-cache` on the entrypoint — but note this one does NOT discriminate:
   // `wafer-block-web` answers `no-cache` for any `text/html` whatever its
   // `cache_mode`. The assertion that the sandbox's
@@ -416,11 +433,13 @@ test('the dev sandbox stages a guest, survives a restart and rolls back', async 
   // the seed.
   expect(causes).toEqual(['block_compile', 'site_write', 'site_write', 'seed']);
   // `find` takes the newest `site_write` — the stylesheet one, which is the
-  // generation immediately before the block and carries both site files.
+  // generation immediately before the block and carries every seed site file
+  // plus the `site/style.css` this test added (step 3's index write did not
+  // grow the count — it overwrote a file the seed already published).
   const beforeTheBlock = listed.generations.find(
     (g: { cause: string }) => g.cause === 'site_write',
   );
-  expect(beforeTheBlock.site_files).toBe(2);
+  expect(beforeTheBlock.site_files).toBe(seedManifest.site.length + 1);
   const rolledBack = await postJson(
     page,
     `/b/dev/api/generations/${beforeTheBlock.id}/rollback`,

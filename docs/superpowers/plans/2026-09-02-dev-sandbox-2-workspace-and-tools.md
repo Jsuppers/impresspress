@@ -511,7 +511,7 @@ git commit -m "feat(dev): the /b/dev workspace page with page-scoped tool regist
 - Create: `examples/dev-sandbox/impresspress.toml`, `examples/dev-sandbox/README.md`, `examples/dev-sandbox/build.sh`
 - Create: `examples/dev-sandbox/seed/manifest.json`, `examples/dev-sandbox/seed/site/index.html`, `examples/dev-sandbox/seed/site/styles.css`
 - Modify: `crates/impresspress/src/cli/helpers/overlays.rs` (directory overlays)
-- Modify: `crates/impresspress-web/tests/e2e/fixtures/dev-sandbox-seed/` → symlink or copy of `examples/dev-sandbox/seed` (single source: point Plan 1's e2e at the example)
+- Delete: the Plan 1 placeholder seed fixture directory under `crates/impresspress-web/tests/e2e/fixtures/` (single source: `dev-foundations.spec.ts` now reads `examples/dev-sandbox/seed/manifest.json` directly, per the task-4 controller ruling — no symlink/copy)
 
 **Interfaces:**
 - Produces: `examples/dev-sandbox/build.sh` that emits `examples/dev-sandbox/dist/` — the sealed web bundle with `dev_enabled: true`, `/seed/` + `/__impresspress_dev/compiler/` bypassed, the seed overlaid — from a feature-on `pkg-dev`. `impresspress.toml`:

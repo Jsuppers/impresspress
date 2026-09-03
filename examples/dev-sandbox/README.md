@@ -1,0 +1,82 @@
+# dev-sandbox
+
+The bundle behind `dev.impresspress.org`: a browser-local WebMCP development
+sandbox. `impresspress.toml` sets `[dev] enabled = true`, which turns on the
+`impresspress/dev` block (`/b/dev`) and the service worker's seed-on-boot
+import (`impresspress-core::blocks::dev::seed`). `seed/` is the welcome
+starter site every fresh origin boots with — `seed/manifest.json` plus
+`seed/site/{index.html,styles.css}` — overlaid onto `dist/seed/` wholesale by
+`[[assets.overlay]]`.
+
+Every visitor who opens the deployed URL gets their **own** instance: a
+service worker and an OPFS database created fresh in their browser on first
+load. Nothing a visitor does — publishing a page, compiling a block, editing
+the shop — reaches this repo, this build, or any other visitor. The only
+thing every visitor shares is the seed bundle itself, which is static files
+served by the host.
+
+## Build
+
+```sh
+examples/dev-sandbox/build.sh
+```
+
+This is the one recipe CI's `e2e-dev-sandbox` job and local e2e runs both use
+(`crates/impresspress-web/tests/e2e/dev-foundations.spec.ts`). It:
+
+1. Builds `impresspress-web` to wasm with `--features browser-devtools` into
+   `crates/impresspress-web/pkg-dev` (this is what puts the `/b/dev`
+   control-plane code in the binary at all — `[dev] enabled` alone only wires
+   the service-worker plumbing around it).
+2. Verifies `seed/manifest.json` against `seed/site/**` — see `--check` below.
+3. Runs `impresspress build --target web --release` from this directory
+   (`IMPRESSPRESS_WEB_PKG_DIR` pointed at `pkg-dev`) to assemble `dist/`.
+
+Last line of stdout is the absolute path to `dist/`.
+
+`examples/dev-sandbox/build.sh --check` runs step 2 only — verifies every
+`seed/site/**` file's sha256 and size against `seed/manifest.json` and exits
+non-zero on drift, without building anything. Run this after editing the seed
+site; a manifest that has drifted from the files it describes is exactly what
+`seed::import` refuses at runtime (a fresh origin would fail to boot).
+`build.sh`'s normal path runs the same check first, so a stale manifest fails
+the build fast rather than shipping a bundle that cannot seed itself.
+
+## Serve locally
+
+```sh
+examples/dev-sandbox/build.sh
+python3 -m http.server 8080 -d examples/dev-sandbox/dist
+```
+
+Open `http://localhost:8080/` — the welcome page (generation 0, seeded).
+Sign in at `http://localhost:8080/b/auth/login?redirect=/b/dev` to reach the
+workspace.
+
+## Credentials
+
+The seeded admin account (`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` /
+`_PASSWORD`, seeded by every browser build — see
+`crates/impresspress-web/src/config.rs`):
+
+- Email: `admin@example.com`
+- Password: `admin123`
+
+This is a throwaway per-browser instance with no data of any consequence
+behind it, which is why the credentials are public in the welcome page
+itself.
+
+## A later plan changes what `/seed/` carries — read this before adding rows
+
+`seed/manifest.json`'s `data` field is reserved (design §10.1, amendment 9)
+for a `seed/data.json` snapshot a later plan will add, so an exported
+sandbox can carry its own users, not just its site and blocks. **`seed/**` is
+served by the static host as plain files, with no auth in front of it** —
+that is what lets a fresh service worker fetch it before anything else has
+booted. The day `seed/data.json` exists, it will carry password hashes for
+whatever `admin123`-style default this bundle ships, in a file anyone can
+`curl`. Do not add that file to this directory, or point one at a real
+account, without re-reading design §10.1's amendment and deciding how the
+exported hash is meant to be safe to publish (a disposable/rotated one, most
+likely) — "static file next to the site" is not a place to put a real
+credential.

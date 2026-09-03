@@ -591,12 +591,19 @@ jobs:
       - name: Build the proof guest (wasm32-wasip1)
         run: cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
 
+      # `--check` fails fast on a seed/manifest.json that has drifted from
+      # seed/site/** — the same check `build.sh`'s normal path runs before it
+      # builds anything, surfaced as its own step so a stale manifest is
+      # reported without paying for a wasm-pack build first.
+      - name: Check the dev-sandbox seed manifest
+        run: examples/dev-sandbox/build.sh --check
+
       # One script, shared with local runs: wasm-pack with `browser-devtools`,
-      # then the sealed web flow over a throwaway `[dev] enabled` app, then the
-      # seed fixture into `dist/seed/`. Its last stdout line is the dist path.
+      # then the sealed web flow with `[dev] enabled = true` and the welcome
+      # seed overlaid onto `dist/seed/`. Its last stdout line is the dist path.
       - name: Build the dev-sandbox bundle
         run: |
-          DIST="$(crates/impresspress-web/tests/e2e/fixtures/build-dev-bundle.sh | tail -1)"
+          DIST="$(examples/dev-sandbox/build.sh | tail -1)"
           echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
 
       - name: Setup Node

@@ -1582,7 +1582,7 @@ git commit -m "feat(web): wasmi-backed RuntimeControl, boot convergence and seed
 
 **Files:**
 - Create: `crates/impresspress-web/tests/e2e/dev-foundations.spec.ts`
-- Create: `crates/impresspress-web/tests/e2e/fixtures/dev-sandbox-seed/seed/manifest.json`, `seed/site/index.html` (a one-line welcome placeholder; Plan 2 replaces it)
+- Create: a placeholder seed fixture under `crates/impresspress-web/tests/e2e/fixtures/` — `seed/manifest.json`, `seed/site/index.html`, a one-line welcome placeholder (Plan 2 Task 4 deletes this fixture directory and points the spec at `examples/dev-sandbox/seed/` instead)
 - Modify: `.github/workflows/ci.yml` (new job `e2e-dev-sandbox` modelled on `e2e-smoke` :445-506), `ci-main.yml` mirror
 - Modify: `crates/impresspress-web/package.json` (`"e2e:dev": …`)
 
@@ -1603,7 +1603,7 @@ TOML
 IMPRESSPRESS_WEB_WASM="$REPO/crates/impresspress-web/pkg-dev/impresspress_web_bg.wasm" \
 IMPRESSPRESS_WEB_JS="$REPO/crates/impresspress-web/pkg-dev/impresspress_web.js" \
 impresspress build --target web --release          # sealed mode: no Cargo.toml here → dist/
-cp -r "$REPO/crates/impresspress-web/tests/e2e/fixtures/dev-sandbox-seed/seed" dist/
+cp -r "$REPO/crates/impresspress-web/tests/e2e/fixtures/<placeholder seed fixture>/seed" dist/
 python3 -m http.server 8082 -d dist
 ```
   (Plan 2 turns this into `examples/dev-sandbox/`.)

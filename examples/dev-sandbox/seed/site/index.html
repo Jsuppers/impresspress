@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ImpressPress dev sandbox</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main>
+    <h1>ImpressPress dev sandbox</h1>
+
+    <p>
+      This is a browser-local <strong>WebMCP</strong> development sandbox.
+      Open this page in a browser whose agent supports WebMCP, and the agent
+      can drive it directly — no server, no deploy, no account setup beyond
+      what is already here.
+    </p>
+
+    <p>
+      Every visitor gets their own instance: a service worker and an OPFS
+      database created fresh in your browser on first load. Nothing you do
+      here leaves the browser.
+    </p>
+
+    <h2>Credentials</h2>
+    <dl>
+      <dt>Email</dt>
+      <dd><code>admin@example.com</code></dd>
+      <dt>Password</dt>
+      <dd><code>admin123</code></dd>
+    </dl>
+
+    <p class="workspace-link">
+      <a href="/b/auth/login?redirect=/b/dev">Open workspace</a>
+    </p>
+
+    <h2>What the agent can do here</h2>
+    <ul>
+      <li>Build and publish this site</li>
+      <li>Write and compile Rust blocks</li>
+      <li>Stock and configure a shop</li>
+      <li>Export the result as a bundle</li>
+    </ul>
+  </main>
+</body>
+</html>

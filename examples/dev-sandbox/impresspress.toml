@@ -1,0 +1,38 @@
+# dev.impresspress.org — the browser development sandbox.
+#
+# `[dev] enabled = true` puts `{ dev: true }` into `sw.js`, which is what lets
+# the service worker's `install` import `/seed/manifest.json` as generation 0
+# on a fresh origin (`impresspress-core::blocks::dev::seed`) and registers the
+# `/b/dev` control-plane page. The wasm this bundle embeds must ALSO be built
+# with `impresspress-web/browser-devtools` (see `build.sh`) — this flag alone
+# does not put the dev block's code in the binary, it only turns on the
+# service-worker plumbing around it.
+[app]
+name = "dev-sandbox"
+title = "ImpressPress dev sandbox"
+boot_redirect = "/"
+
+[assets]
+# `/seed/` is already bypassed whenever `[dev] enabled` (`impresspress-bundle`
+# adds `SEED_BYPASS_PREFIX` itself — see `bundle/mod.rs`), so it is not
+# repeated here. `/__impresspress_dev/compiler/` is the compiler-worker
+# assets `/b/dev` loads (the module worker + its blob-URL subordinates);
+# those are static files served by the host, not runtime routes, so they need
+# the same treatment.
+extra_bypass_prefix = ["/__impresspress_dev/compiler/"]
+# This deployment's only persistent state is what a visitor built in their own
+# browser. A wipe-on-recovery default would be a resilience feature for a
+# server deployment; here it would be silent data loss for whoever is mid
+# build when a transient init failure hits, so it stays off — same as every
+# other bundle's default.
+opfs_wipe_on_recovery = false
+
+# The welcome starter site, overlaid onto the bundle wholesale: `seed/` holds
+# `manifest.json` + `site/**`, and `apply_overlays` now copies a directory
+# entry recursively (`crates/impresspress/src/cli/helpers/overlays.rs`).
+[[assets.overlay]]
+from = "seed"
+to = "seed"
+
+[dev]
+enabled = true
