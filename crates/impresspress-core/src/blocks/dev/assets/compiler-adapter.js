@@ -87,6 +87,32 @@ const COMPILE_TIMEOUT_MS = 120000;
 const CANCEL_GRACE_MS = 2000;
 
 /**
+ * How long `initialize` tolerates a worker that has stopped speaking.
+ *
+ * NOT a ceiling on start-up. The timer is re-armed by every `progress`
+ * message, so a slow link finishes however long it takes — `vfs-runner.ts`
+ * posts `download` progress per chunk, and the farm posts one for each step
+ * after that. What it catches is the case nothing else can: a worker that
+ * neither answers nor errors — a fetch stalled with no failure, a subordinate
+ * worker that died silently — which would otherwise leave `#ready` pending for
+ * the life of the page, with every queued `compile` behind it and `dispose()`
+ * the only way out.
+ *
+ * Six minutes because it must never pre-empt the worker's OWN guards. The
+ * worker gives each start-up step a `SYSROOT_TIMEOUT_MS` of 300 s
+ * (`worker-entry.ts`) and reports a step that overruns as an `error` — with a
+ * message naming the step, which is strictly better than anything this side
+ * can say. A window under that would race those guards and could kill a
+ * healthy init on a slow machine, trading a hang for a wrong answer. This is
+ * the backstop for the worker's backstops, and nothing finer.
+ *
+ * `new BrowserRustCompiler(manifest, { initSilenceMs })` overrides it; the
+ * end-to-end test injects a short one so the behaviour can be driven in
+ * seconds rather than minutes.
+ */
+const INIT_SILENCE_TIMEOUT_MS = 360000;
+
+/**
  * A diagnostic, exactly as `protocol.ts` defines it.
  *
  * @typedef {{ file: string, line: number, column: number,
@@ -114,6 +140,76 @@ const CANCEL_GRACE_MS = 2000;
  *   compilerVersion: string | null
  * }} CompileResult
  */
+
+/**
+ * Why this `result` cannot be handed to the page, or `null` if it can.
+ *
+ * Every field `ResultMessage` declares, checked before any of it is passed
+ * on. The adapter is the only thing between the worker and code that will
+ * `.map()` over `diagnostics` and put `line` into a template, so a `result`
+ * that is the right SHAPE is part of the contract, not just the right type
+ * tag: a `diagnostics` entry with a string `line` would otherwise surface as
+ * a rendering bug three layers away from the worker that caused it.
+ *
+ * `severity` is restricted to the two values `protocol.ts` names. Safe
+ * against the real compiler: both of `worker-entry.ts`'s parsers drop every
+ * other rustc level before building a `Diagnostic` (the JSON path skips
+ * anything that is not `error`/`warning`, and the text fallback's regex only
+ * matches those two).
+ */
+function malformedResult(message) {
+  if (typeof message.success !== 'boolean') {
+    return '`success` is not a boolean';
+  }
+  if (typeof message.stdout !== 'string') {
+    return '`stdout` is not a string';
+  }
+  if (typeof message.stderr !== 'string') {
+    return '`stderr` is not a string';
+  }
+  if (typeof message.elapsedMs !== 'number' || !Number.isFinite(message.elapsedMs)) {
+    return '`elapsedMs` is not a finite number';
+  }
+  if (message.cancelled !== undefined && typeof message.cancelled !== 'boolean') {
+    return '`cancelled` is present but not a boolean';
+  }
+  if (!Array.isArray(message.diagnostics)) {
+    return '`diagnostics` is not an array';
+  }
+  for (let index = 0; index < message.diagnostics.length; index += 1) {
+    const wrong = malformedDiagnostic(message.diagnostics[index]);
+    if (wrong) {
+      return 'diagnostics[' + index + '] ' + wrong;
+    }
+  }
+  return null;
+}
+
+/** The same, for one entry of `diagnostics`. */
+function malformedDiagnostic(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== 'object') {
+    return 'is not an object';
+  }
+  if (typeof diagnostic.file !== 'string') {
+    return 'has no `file` string';
+  }
+  if (typeof diagnostic.line !== 'number' || !Number.isFinite(diagnostic.line)) {
+    return 'has no `line` number';
+  }
+  if (typeof diagnostic.column !== 'number' || !Number.isFinite(diagnostic.column)) {
+    return 'has no `column` number';
+  }
+  if (diagnostic.severity !== 'error' && diagnostic.severity !== 'warning') {
+    return 'has a `severity` that is neither error nor warning';
+  }
+  if (typeof diagnostic.message !== 'string') {
+    return 'has no `message` string';
+  }
+  if (diagnostic.code !== undefined && typeof diagnostic.code !== 'string') {
+    return 'has a `code` that is not a string';
+  }
+  return null;
+}
 
 /** Lowercase hex SHA-256 of a buffer, the form `builds/stage` records. */
 async function sha256Hex(buffer) {
@@ -146,7 +242,15 @@ export class BrowserRustCompiler {
    */
   #ready = null;
 
-  /** Request id → `{ resolve, reject, onProgress, timer, startedAt }`. */
+  /**
+   * Request id → the pending entry that will settle it.
+   *
+   * `{ resolve, reject, expects, onProgress, timer, silenceTimer, startedAt }`.
+   * `expects` is the message type that may settle it — `'ready'` for an
+   * `init`, `'result'` for a `compile` — so a worker answering the right id
+   * with the wrong KIND is caught rather than silently resolving the caller
+   * with a message of a shape they never asked for.
+   */
   #pending = new Map();
 
   /** Tail of the promise chain that serialises `compile` calls. */
@@ -163,11 +267,18 @@ export class BrowserRustCompiler {
 
   #disposed = false;
 
+  /** The start-up silence window, overridable for tests. */
+  #initSilenceMs;
+
   /**
    * @param {{ version: string, entry: string, target: string }} manifest
    *   `/__impresspress_dev/compiler/manifest.json`, parsed.
+   * @param {{ initSilenceMs?: number }} [options]
+   *   `initSilenceMs` overrides [`INIT_SILENCE_TIMEOUT_MS`]. It exists so the
+   *   end-to-end test can drive the start-up watchdog in seconds instead of
+   *   minutes; the page passes nothing and gets the documented default.
    */
-  constructor(manifest) {
+  constructor(manifest, options = {}) {
     if (!manifest || typeof manifest !== 'object') {
       throw new TypeError('BrowserRustCompiler: the compiler manifest is required');
     }
@@ -194,7 +305,14 @@ export class BrowserRustCompiler {
     if (typeof manifest.target !== 'string' || manifest.target === '') {
       throw new TypeError('BrowserRustCompiler: manifest.target must be a non-empty string');
     }
+    if (
+      options.initSilenceMs !== undefined &&
+      (typeof options.initSilenceMs !== 'number' || !(options.initSilenceMs > 0))
+    ) {
+      throw new TypeError('BrowserRustCompiler: initSilenceMs must be a positive number');
+    }
     this.#manifest = manifest;
+    this.#initSilenceMs = options.initSilenceMs ?? INIT_SILENCE_TIMEOUT_MS;
   }
 
   /** The pinned compiler bundle's version — the rubrc sha the URLs carry. */
@@ -318,11 +436,28 @@ export class BrowserRustCompiler {
     this.#worker = worker;
 
     const id = this.#nextId('init');
-    // No timeout. The variable part of `init` is a 75 MB download whose
-    // progress the worker reports as it goes (`stage: 'download'`), so a
-    // stall is visible in the panel; a ceiling here would refuse slow
-    // connections for a compiler that is still on its way.
-    const ready = await this.#request(id, { type: 'init', id }, { onProgress });
+    // No ceiling on how long start-up may take — the variable part is a 75 MB
+    // download, and refusing slow connections would be the wrong failure. What
+    // there is instead is a SILENCE watchdog: the timer below is re-armed by
+    // every `progress` message, so a worker that is still talking has as long
+    // as it needs, and one that has stopped talking altogether is eventually
+    // let go of. See `INIT_SILENCE_TIMEOUT_MS`.
+    const ready = await this.#request(
+      id,
+      { type: 'init', id },
+      {
+        expects: 'ready',
+        onProgress,
+        silenceMs: this.#initSilenceMs,
+        onSilence: () =>
+          this.#failWorker(
+            worker,
+            'the compiler worker stopped reporting progress for ' +
+              this.#initSilenceMs +
+              ' ms while starting up'
+          )
+      }
+    );
     this.#rustcVersion = typeof ready.rustcVersion === 'string' ? ready.rustcVersion : null;
     return this.#rustcVersion;
   }
@@ -363,6 +498,7 @@ export class BrowserRustCompiler {
           release: true
         },
         {
+          expects: 'result',
           onProgress,
           timeoutMs: COMPILE_TIMEOUT_MS,
           onTimeout: () =>
@@ -379,9 +515,16 @@ export class BrowserRustCompiler {
   /**
    * Send one request and wait for the message that settles it.
    *
+   * `timeoutMs` is a deadline for the whole request; `silenceMs` is a gap
+   * between messages, re-armed by every `progress`. A request may have either,
+   * and they mean different things: a compile that takes too long is over
+   * budget, a start-up that goes quiet has stopped happening.
+   *
    * @param {string} id
    * @param {object} message
-   * @param {{ onProgress?: Function, timeoutMs?: number, onTimeout?: Function }} options
+   * @param {{ expects: 'ready' | 'result', onProgress?: Function,
+   *           timeoutMs?: number, onTimeout?: Function,
+   *           silenceMs?: number, onSilence?: Function }} options
    */
   #request(id, message, options = {}) {
     const worker = this.#worker;
@@ -393,15 +536,20 @@ export class BrowserRustCompiler {
       entry = {
         resolve,
         reject,
+        expects: options.expects,
         onProgress: options.onProgress,
         startedAt: Date.now(),
         timer: options.timeoutMs
           ? setTimeout(() => {
               options.onTimeout();
             }, options.timeoutMs)
-          : null
+          : null,
+        silenceMs: options.silenceMs,
+        onSilence: options.onSilence,
+        silenceTimer: null
       };
       this.#pending.set(id, entry);
+      this.#armSilence(entry);
     });
     // A settlement signal `#abandonInFlight` can wait on without competing
     // for the answer itself — whoever asked for the compile still gets it.
@@ -413,15 +561,32 @@ export class BrowserRustCompiler {
     return answered;
   }
 
-  /** Pop a pending request, clearing its timer. */
+  /**
+   * (Re)start a request's silence watchdog.
+   *
+   * Called when the request is posted and again on every `progress` for it,
+   * which is what makes the window a gap between messages rather than a
+   * deadline for the whole request.
+   */
+  #armSilence(entry) {
+    if (!entry.silenceMs) {
+      return;
+    }
+    if (entry.silenceTimer !== null) {
+      clearTimeout(entry.silenceTimer);
+    }
+    entry.silenceTimer = setTimeout(() => {
+      entry.onSilence();
+    }, entry.silenceMs);
+  }
+
+  /** Pop a pending request, clearing both of its timers. */
   #take(id) {
     const entry = this.#pending.get(id);
     if (!entry) {
       return null;
     }
-    if (entry.timer !== null) {
-      clearTimeout(entry.timer);
-    }
+    clearEntryTimers(entry);
     this.#pending.delete(id);
     return entry;
   }
@@ -453,7 +618,15 @@ export class BrowserRustCompiler {
         // build the page abandoned (or for a request that has just been
         // answered) is a race, not a defect. Only messages that claim to
         // ANSWER something the page never asked are treated as violations.
-        if (entry && entry.onProgress) {
+        if (!entry) {
+          return;
+        }
+        // The worker is still working, so the silence watchdog starts over.
+        // Before the callback, not after: a page callback that throws must
+        // not leave a request that IS progressing armed against a stale
+        // deadline.
+        this.#armSilence(entry);
+        if (entry.onProgress) {
           // Called last in the branch on purpose: a callback the page
           // supplied is the page's to get right, and if it throws, the
           // exception belongs in the console — not swallowed here, and with
@@ -474,6 +647,9 @@ export class BrowserRustCompiler {
           this.#unexpectedId('ready', message.id);
           return;
         }
+        if (this.#wrongKind(entry, 'ready', message.id)) {
+          return;
+        }
         entry.resolve(message);
         return;
       }
@@ -484,11 +660,21 @@ export class BrowserRustCompiler {
           this.#unexpectedId('result', message.id);
           return;
         }
+        if (this.#wrongKind(entry, 'result', message.id)) {
+          return;
+        }
         // Validated here, synchronously, and not in the async settle below:
         // a violation has to destroy the worker and reject everything it
         // owed, and by the time an `await` had resumed, the queue could
         // already have posted the next compile into a worker that is about
         // to be killed.
+        const malformed = malformedResult(message);
+        if (malformed) {
+          const why = 'the compiler worker sent a result whose ' + malformed;
+          entry.reject(new Error(why));
+          this.#violation(why);
+          return;
+        }
         const artifact = message.artifact;
         if (artifact !== undefined) {
           if (!(artifact instanceof ArrayBuffer)) {
@@ -514,8 +700,22 @@ export class BrowserRustCompiler {
       }
 
       case 'error': {
-        // The worker sets `state = "broken"` before it posts this, so there
-        // is nothing left to talk to whether or not the id is one we know.
+        // `protocol.ts` gives `error` three causes, and only two of them mean
+        // "terminate me": an `init` that failed, and a `compile` on a worker
+        // that is `broken` or not yet `ready`. The third — a `cancel` naming
+        // nothing in flight — leaves the worker perfectly usable.
+        //
+        // Every one of them is terminal HERE, and not because the protocol
+        // says so. The recoverable case can only reach this adapter one way:
+        // `#abandonInFlight` posts a `cancel` while it still holds the build's
+        // pending entry, so the only worker that can answer "nothing in
+        // flight" is one whose `result` was already sitting in this page's
+        // message queue — i.e. a cancel that lost the race with the answer it
+        // meant to stop. In that window the adapter has already decided to
+        // replace the worker, the compile has already been settled with its
+        // real result, and destroying is what was going to happen anyway. So
+        // treating `error` as terminal costs at most a re-`init` nobody was
+        // going to skip, and never takes an answer away from a caller.
         const entry = this.#take(message.id);
         const error = new Error('the compiler worker failed: ' + message.message);
         if (entry) {
@@ -555,6 +755,34 @@ export class BrowserRustCompiler {
     });
   }
 
+  /**
+   * The worker answered a request of ours with a message of the wrong kind.
+   *
+   * An `init` is settled by `ready` and a `compile` by `result`; swapping them
+   * would resolve the caller with an object that has none of the fields they
+   * are about to read — a `CompileResult` with no `diagnostics`, or an
+   * `initialize` that resolved to `undefined` and left the page believing a
+   * toolchain came up. Cheap to detect, and silent for ever if it is not.
+   *
+   * @returns {boolean} true when the entry has been rejected and the worker
+   *   destroyed, so the caller must stop.
+   */
+  #wrongKind(entry, kind, id) {
+    if (entry.expects === kind) {
+      return false;
+    }
+    const why =
+      'the compiler worker answered ' +
+      kind +
+      ' for ' +
+      id +
+      ', which was a request for ' +
+      entry.expects;
+    entry.reject(new Error('compiler protocol violation: ' + why));
+    this.#violation(why);
+    return true;
+  }
+
   #unexpectedId(kind, id) {
     this.#violation(
       'the compiler worker answered ' + kind + ' for a request this page did not make: ' + id
@@ -577,13 +805,10 @@ export class BrowserRustCompiler {
       return;
     }
     this.#inFlight = null;
-    // Whatever happens from here this build is over, so the 120 s timer must
-    // not fire again on the way out — a timeout that cancelled a compile
-    // would otherwise be free to cancel it a second time.
-    if (build.timer !== null) {
-      clearTimeout(build.timer);
-      build.timer = null;
-    }
+    // Whatever happens from here this build is over, so its clocks must not
+    // fire again on the way out — a timeout that cancelled a compile would
+    // otherwise be free to cancel it a second time.
+    clearEntryTimers(build);
 
     const worker = this.#worker;
     if (worker) {
@@ -650,11 +875,21 @@ export class BrowserRustCompiler {
       worker.terminate();
     }
     for (const entry of owed) {
-      if (entry.timer !== null) {
-        clearTimeout(entry.timer);
-      }
+      clearEntryTimers(entry);
       entry.reject(error);
     }
+  }
+}
+
+/** Stop both of a pending entry's clocks. */
+function clearEntryTimers(entry) {
+  if (entry.timer !== null) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  if (entry.silenceTimer !== null) {
+    clearTimeout(entry.silenceTimer);
+    entry.silenceTimer = null;
   }
 }
 

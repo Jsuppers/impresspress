@@ -31,15 +31,33 @@
 //
 // # Making it misbehave
 //
-// The adapter treats four things as reasons to destroy the worker, and each
-// needs a worker willing to do it. `crateName` is the switch, because it
-// travels in the compile message the page already sends:
+// Every way the adapter can decide a worker is not worth talking to needs a
+// worker willing to be that. `crateName` is the switch for the ones that
+// happen during a compile, because it travels in the message the page already
+// sends:
 //
-//   protocol-wrong-id      answer with an id nobody asked for
-//   protocol-not-a-buffer  send the artifact as a Uint8Array, not transferred
-//   protocol-oversized     send an artifact one byte over the sandbox's limit
-//   protocol-error         report an out-of-band `error` instead of a result
-//   slow                   take five seconds, so a `cancel` has something to hit
+//   protocol-wrong-id       answer with an id nobody asked for
+//   protocol-not-a-buffer   send the artifact as a Uint8Array, not transferred
+//   protocol-oversized      send an artifact one byte over the sandbox's limit
+//   protocol-error          report an out-of-band `error` instead of a result
+//   protocol-ready-for-build  answer a compile with `ready` — the right id,
+//                           the wrong KIND of message
+//   protocol-malformed-result      a result whose `stdout` is a number
+//   protocol-malformed-diagnostic  a result whose diagnostic has a string `line`
+//   slow                    take five seconds, so a `cancel` has something to hit
+//
+// The two that happen during INIT cannot travel that way — an `init` message
+// carries nothing but its id — so they are query parameters on the worker's
+// own URL, which the manifest's `entry` supplies and `self.location` reads
+// back. They exist for the start-up silence watchdog:
+//
+//   ?silent-init=1     post one `progress` and then never speak again
+//   ?drip-init=<ms>    post a `progress` every <ms> for six ticks, then `ready`
+//
+// `silent-init` is the hang the watchdog exists for. `drip-init` is the other
+// half of the same statement: a start-up that takes LONGER than the window but
+// keeps reporting must still succeed, which is what makes the watchdog a gap
+// between messages rather than a ceiling on start-up.
 //
 // Anything else compiles: `success: true` with an artifact, unless one of the
 // files contains the marker `FAIL`, which produces one error diagnostic and no
@@ -60,6 +78,19 @@
 // HOST with real cargo and drops the resulting `<crateName>.wasm` beside this
 // file; the switch below is simply whether such a file is there. A 404 — the
 // ordinary case — means no spec put one there.
+
+/**
+ * The init behaviour this worker was started with — see the header.
+ *
+ * A worker's `self.location` is the URL it was created from, query string
+ * included, so the manifest's `entry` is all the page needs to choose.
+ */
+const PARAMS = new URLSearchParams(self.location.search);
+const SILENT_INIT = PARAMS.has('silent-init');
+const DRIP_INIT_MS = Number(PARAMS.get('drip-init') ?? 0);
+
+/** How many `progress` messages `drip-init` sends before it says `ready`. */
+const DRIP_TICKS = 6;
 
 /** `worker-entry.ts`'s own states, and for the same reasons. */
 let state = 'new';
@@ -144,15 +175,45 @@ const failure = (files) => {
     : null;
 };
 
+/** The last two messages of a successful start-up. */
+const finishInit = (id) => {
+  postProgress(id, 'initializing', { detail: 'waiting for the shell' });
+  state = 'ready';
+  post({ type: 'ready', id, rustcVersion: 'rustc 1.90.0-nightly (fake worker)' });
+};
+
 const init = (id) => {
   state = 'initializing';
   // Two progress messages then `ready`. The real worker sends one more
   // `initializing` (it loads the sysroot); the adapter passes through
   // whatever arrives, so the count is the fake's business, not the page's.
   postProgress(id, 'download', { loaded: 0, total: 75124002 });
-  postProgress(id, 'initializing', { detail: 'waiting for the shell' });
-  state = 'ready';
-  post({ type: 'ready', id, rustcVersion: 'rustc 1.90.0-nightly (fake worker)' });
+
+  // The hang the start-up watchdog exists for: the worker is alive, the
+  // `error` event never fires, and nothing else will ever arrive. Without a
+  // watchdog the adapter's `initialize` stays pending for the life of the
+  // page.
+  if (SILENT_INIT) {
+    return;
+  }
+
+  // Slower than the watchdog's window, but never silent for as long as it —
+  // a start-up that keeps reporting must be allowed to finish.
+  if (DRIP_INIT_MS > 0) {
+    let sent = 1;
+    const ticking = setInterval(() => {
+      sent += 1;
+      if (sent < DRIP_TICKS) {
+        postProgress(id, 'download', { loaded: sent, total: DRIP_TICKS });
+        return;
+      }
+      clearInterval(ticking);
+      finishInit(id);
+    }, DRIP_INIT_MS);
+    return;
+  }
+
+  finishInit(id);
 };
 
 const compile = (message) => {
@@ -216,6 +277,50 @@ const compile = (message) => {
           );
           return;
         }
+        case 'protocol-ready-for-build':
+          // The right id, answering the right request — with the message that
+          // settles an `init`. A `CompileResult` built from this would have
+          // none of the fields the caller is about to read.
+          deliver(message.id, {
+            type: 'ready',
+            id: message.id,
+            rustcVersion: 'rustc 1.90.0-nightly (fake worker)',
+          });
+          return;
+        case 'protocol-malformed-result':
+          // Well formed everywhere the type tag can be checked, wrong in a
+          // field the page will read as text.
+          deliver(message.id, {
+            type: 'result',
+            id: message.id,
+            success: true,
+            stdout: 42,
+            stderr: '',
+            diagnostics: [],
+            elapsedMs,
+          });
+          return;
+        case 'protocol-malformed-diagnostic':
+          // The shape that would otherwise surface three layers away, as a
+          // rendering bug in whatever put `line` into a template.
+          deliver(message.id, {
+            type: 'result',
+            id: message.id,
+            success: false,
+            stdout,
+            stderr: '',
+            diagnostics: [
+              {
+                file: 'src/lib.rs',
+                line: 'one',
+                column: 1,
+                severity: 'error',
+                message: 'expected `;`, found `value`',
+              },
+            ],
+            elapsedMs,
+          });
+          return;
         case 'protocol-error':
           // What a worker whose image is corrupt reports: not an answer about
           // the crate, an admission that it cannot serve the request at all.

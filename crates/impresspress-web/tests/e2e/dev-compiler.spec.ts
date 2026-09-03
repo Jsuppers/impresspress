@@ -56,10 +56,34 @@ const DEV_DIST =
   process.env.DEV_DIST ??
   fileURLToPath(new URL('../../../../examples/dev-sandbox/dist', import.meta.url));
 
-/** Where the test-only manifest and worker go, and the URLs they get. */
+/** Where the test-only manifests and worker go, and the URLs they get. */
 const TEST_COMPILER_DIR = path.join(DEV_DIST, '__impresspress_dev', 'compiler', 'test');
 const TEST_MANIFEST_URL = '/__impresspress_dev/compiler/test/manifest.json';
 const TEST_WORKER_URL = '/__impresspress_dev/compiler/test/worker.js';
+
+/**
+ * Three manifests, one worker.
+ *
+ * An `init` message carries nothing but its id, so a fake that has to behave
+ * differently DURING start-up can only be told which way through the URL it
+ * was started from — and the manifest's `entry` is where the page gets that
+ * URL. Hence a manifest per init behaviour rather than a worker per behaviour.
+ */
+const SILENT_MANIFEST_URL = '/__impresspress_dev/compiler/test/manifest-silent.json';
+const DRIP_MANIFEST_URL = '/__impresspress_dev/compiler/test/manifest-drip.json';
+
+/**
+ * The start-up silence window this file injects, and the drip interval that
+ * has to survive it.
+ *
+ * The shipped window is six minutes (`INIT_SILENCE_TIMEOUT_MS`), which is a
+ * backstop for the worker's own 300 s step guards and not something a test can
+ * wait for. `new BrowserRustCompiler(manifest, { initSilenceMs })` exists for
+ * exactly this. Six drip ticks of 400 ms is 2.4 s of start-up — comfortably
+ * longer than the 1.5 s window, with no gap in it longer than 400 ms.
+ */
+const TEST_SILENCE_MS = 1500;
+const DRIP_TICK_MS = 400;
 
 const FAKE_WORKER = fileURLToPath(new URL('./fixtures/fake-compiler-worker.js', import.meta.url));
 
@@ -77,19 +101,19 @@ const MAX_ARTIFACT_BYTES = 4194304;
 /** What `fake-compiler-worker.js` answers `rustc --version` with. */
 const FAKE_RUSTC_VERSION = 'rustc 1.90.0-nightly (fake worker)';
 
-test.beforeAll(() => {
-  mkdirSync(TEST_COMPILER_DIR, { recursive: true });
-  copyFileSync(FAKE_WORKER, path.join(TEST_COMPILER_DIR, 'worker.js'));
-  // The same shape `scripts/write-manifest.mjs` writes, minus the asset
-  // inventory nothing on the page reads: the adapter takes `entry`, `version`
-  // and `target`, and refuses a manifest missing any of them.
+/**
+ * The same shape `scripts/write-manifest.mjs` writes, minus the asset
+ * inventory nothing on the page reads: the adapter takes `entry`, `version`
+ * and `target`, and refuses a manifest missing any of them.
+ */
+function writeManifest(name: string, entry: string) {
   writeFileSync(
-    path.join(TEST_COMPILER_DIR, 'manifest.json'),
+    path.join(TEST_COMPILER_DIR, name),
     `${JSON.stringify(
       {
         schema_version: 1,
         version: 'test',
-        entry: TEST_WORKER_URL,
+        entry,
         total_bytes: 0,
         assets: [],
         license: 'MIT OR Apache-2.0',
@@ -99,6 +123,19 @@ test.beforeAll(() => {
       2,
     )}\n`,
   );
+}
+
+test.beforeAll(() => {
+  // Removed before it is created, not just after it is used: a run killed
+  // between the two hooks (a `Ctrl-C`, a timed-out CI job) leaves the fixture
+  // inside `dist/`, and the next run would build on top of whatever version of
+  // the worker was there — or ship it, if a deploy came first.
+  rmSync(TEST_COMPILER_DIR, { recursive: true, force: true });
+  mkdirSync(TEST_COMPILER_DIR, { recursive: true });
+  copyFileSync(FAKE_WORKER, path.join(TEST_COMPILER_DIR, 'worker.js'));
+  writeManifest('manifest.json', TEST_WORKER_URL);
+  writeManifest('manifest-silent.json', `${TEST_WORKER_URL}?silent-init=1`);
+  writeManifest('manifest-drip.json', `${TEST_WORKER_URL}?drip-init=${DRIP_TICK_MS}`);
 });
 
 test.afterAll(() => {
@@ -248,14 +285,32 @@ test('the compiler adapter queues compiles, cancels one, and recovers from a bro
       files: { 'src/lib.rs': '// ok' },
     });
 
-    // --- the four protocol violations -------------------------------------
+    // --- cancel with a compile already queued behind it -------------------
+    // The case the queue makes possible and nothing above covers: the cancel
+    // lands on the build in flight, and the one waiting its turn has to end up
+    // on a worker that does not exist yet. If `#destroy` left the instance in
+    // a state the queue could not start from, this is where it would hang.
+    const doomed = compiler.compile({ crateName: 'slow', files: { 'src/lib.rs': '// ok' } });
+    const queuedBehind = compiler.compile({
+      crateName: 'behind-cancel',
+      files: { 'src/lib.rs': '// ok' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await compiler.cancel();
+    const doomedResult = await doomed;
+    const behindResult = await queuedBehind;
+
+    // --- the protocol violations ------------------------------------------
     // Each must REJECT — the compiler said nothing about the crate, so there
     // is no result to resolve with — and leave the instance usable.
     const violations: Record<string, any> = {};
     for (const crateName of [
       'protocol-wrong-id',
+      'protocol-ready-for-build',
       'protocol-not-a-buffer',
       'protocol-oversized',
+      'protocol-malformed-result',
+      'protocol-malformed-diagnostic',
       'protocol-error',
     ]) {
       const broke = await settle(compiler.compile({ crateName, files: { 'src/lib.rs': '// ok' } }));
@@ -281,6 +336,8 @@ test('the compiler adapter queues compiles, cancels one, and recovers from a bro
         compilerVersion: cancelled.compilerVersion,
       },
       afterCancel: { success: afterCancel.success, stdout: afterCancel.stdout },
+      doomed: { cancelled: doomedResult.cancelled, stderr: doomedResult.stderr },
+      behind: { success: behindResult.success, stdout: behindResult.stdout },
       violations,
     };
   }, TEST_MANIFEST_URL);
@@ -306,6 +363,15 @@ test('the compiler adapter queues compiles, cancels one, and recovers from a bro
   expect(result.afterCancel.success).toBe(true);
   expect(result.afterCancel.stdout).toBe('fake build #1: after-cancel');
 
+  // The cancel took the build it named…
+  expect(result.doomed.cancelled).toBe(true);
+  expect(result.doomed.stderr).toBe('cancelled');
+  // …and the one queued behind it ran on a worker built for it afterwards.
+  // Build #1 again: the fake numbers builds per worker, so anything else here
+  // would mean the queued compile went to the worker that was torn down.
+  expect(result.behind.success).toBe(true);
+  expect(result.behind.stdout).toBe('fake build #1: behind-cancel');
+
   const violations = result.violations as Record<
     string,
     { rejected: boolean; message: string | null; recovered: boolean }
@@ -318,11 +384,127 @@ test('the compiler adapter queues compiles, cancels one, and recovers from a bro
     `over the sandbox limit of ${MAX_ARTIFACT_BYTES}`,
   );
   expect(violations['protocol-error'].message).toContain('the compiler image is corrupt');
+  // The right id, the wrong KIND of message: an `init`'s answer settling a
+  // compile would hand the caller an object with no `diagnostics` at all.
+  expect(violations['protocol-ready-for-build'].message).toContain(
+    'answered ready for build-',
+  );
+  expect(violations['protocol-ready-for-build'].message).toContain(
+    'which was a request for result',
+  );
+  // Fields checked before any of them is handed on.
+  expect(violations['protocol-malformed-result'].message).toContain(
+    '`stdout` is not a string',
+  );
+  expect(violations['protocol-malformed-diagnostic'].message).toContain(
+    'diagnostics[0] has no `line` number',
+  );
   // Every one of them rejected, and every one left a compiler that still works.
   for (const crateName of Object.keys(violations)) {
     expect(violations[crateName].rejected, crateName).toBe(true);
     expect(violations[crateName].recovered, crateName).toBe(true);
   }
+});
+
+/**
+ * The start-up watchdog: a worker that stops speaking is let go of, and one
+ * that is merely slow is not.
+ *
+ * `initialize` has no deadline, on purpose — the variable part of it is a
+ * 75 MiB download, and refusing slow connections would be the wrong failure.
+ * That left one hole: a worker that neither answers nor fires its `error`
+ * event (a fetch stalled with no failure, a subordinate worker that died
+ * quietly) parked `initialize` for the life of the page, with every queued
+ * `compile` behind it and `dispose()` the only way out. The watchdog closes it
+ * without reintroducing a ceiling, and BOTH halves of that are asserted here:
+ * the silent worker is abandoned, and the one whose start-up runs longer than
+ * the window while still reporting is not.
+ *
+ * The shipped window is six minutes — a backstop for the worker's own 300 s
+ * per-step guards, which report a wedged step far better than this side can —
+ * so the test injects a short one through the constructor option that exists
+ * for it. Nothing else about the behaviour is test-specific.
+ */
+test('a start-up that goes silent is abandoned; one that is merely slow is not', async ({
+  page,
+}) => {
+  test.setTimeout(300_000);
+  await loginToWorkspace(page);
+
+  const result = await page.evaluate(
+    async (input: { silentUrl: string; dripUrl: string; silenceMs: number }) => {
+      const modulePath = '/b/dev/static/compiler-adapter.js';
+      const { BrowserRustCompiler } = await import(modulePath);
+
+      /** Run something and report how long it took, settled either way. */
+      const timed = async (run: () => Promise<any>): Promise<any> => {
+        const started = Date.now();
+        try {
+          const value = await run();
+          return { ok: true, ms: Date.now() - started, value };
+        } catch (error: any) {
+          return { ok: false, ms: Date.now() - started, message: error.message };
+        }
+      };
+
+      // --- the worker that stops speaking ---------------------------------
+      const silentManifest = await (await fetch(input.silentUrl)).json();
+      const silent = new BrowserRustCompiler(silentManifest, {
+        initSilenceMs: input.silenceMs,
+      });
+      const first = await timed(() => silent.initialize());
+      // A second call has to build a NEW worker rather than hand back the
+      // rejection the first one left behind. Only the clock can tell those
+      // apart: a sticky `#ready` would reject at once.
+      const second = await timed(() => silent.initialize());
+      // And a compile has to fail rather than queue behind a start-up that is
+      // never going to finish.
+      const compileAfter = await timed(() =>
+        silent.compile({ crateName: 'hello', files: { 'src/lib.rs': '// ok' } }),
+      );
+      await silent.dispose();
+
+      // --- the worker that is merely slow ---------------------------------
+      const dripManifest = await (await fetch(input.dripUrl)).json();
+      const drip = new BrowserRustCompiler(dripManifest, { initSilenceMs: input.silenceMs });
+      const slowStart = await timed(() => drip.initialize());
+      const built = slowStart.ok
+        ? await timed(() =>
+            drip.compile({ crateName: 'after-slow-start', files: { 'src/lib.rs': '// ok' } }),
+          )
+        : null;
+      await drip.dispose();
+
+      return { first, second, compileAfter, slowStart, built };
+    },
+    { silentUrl: SILENT_MANIFEST_URL, dripUrl: DRIP_MANIFEST_URL, silenceMs: TEST_SILENCE_MS },
+  );
+
+  // Abandoned, and for the stated reason.
+  expect(result.first.ok).toBe(false);
+  expect(result.first.message).toContain(
+    `stopped reporting progress for ${TEST_SILENCE_MS} ms`,
+  );
+  // It waited the window — it did not give up early — and it did not wait the
+  // six-minute default, which is the whole point of the injected option.
+  expect(result.first.ms).toBeGreaterThanOrEqual(TEST_SILENCE_MS - 200);
+  expect(result.first.ms).toBeLessThan(30_000);
+
+  // The second attempt paid the window again, so it started a worker of its
+  // own: the failure was not cached.
+  expect(result.second.ok).toBe(false);
+  expect(result.second.ms).toBeGreaterThanOrEqual(TEST_SILENCE_MS - 200);
+
+  // …and so did the compile, instead of waiting for ever.
+  expect(result.compileAfter.ok).toBe(false);
+  expect(result.compileAfter.message).toContain('stopped reporting progress');
+
+  // The other half: a start-up LONGER than the window, never silent for as
+  // long as it, finishes. A ceiling would have killed this one.
+  expect(result.slowStart.ok, result.slowStart.message).toBe(true);
+  expect(result.slowStart.ms).toBeGreaterThan(TEST_SILENCE_MS);
+  expect(result.built.ok).toBe(true);
+  expect(result.built.value.success).toBe(true);
 });
 
 /**
