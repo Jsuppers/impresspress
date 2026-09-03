@@ -135,29 +135,29 @@ const SHOP_HEADING = 'The print shop';
  *
  * # Why the page has to ask for `webmcp.js` itself
  *
- * `webmcpJsUrl` is the deployment's WebMCP registration script, and design
- * §16 scenario 5 requires the shopper's own agent to have `list_products` on
- * this page. Nothing puts that script here for it: `ui::layout` injects it
- * into every SSR-rendered ImpressPress page, but `/` on a sandbox is a file
- * the agent wrote, served verbatim by `wafer-run/web`, which injects nothing
- * into anybody's HTML. So a site that wants its visitors' agents to have
- * tools has to include the script, exactly as it has to include
- * `storefront.js` to get the purchase widget.
- *
- * The URL is content-hashed (`ui::assets::webmcp_js_url`), so it cannot be
- * written down here. The test reads it off the `/b/dev` document — an
- * SSR-rendered page that carries it — which is also the only way an agent
- * standing on that page could learn it today. That is a rough edge worth
- * naming rather than hiding: see the task report.
+ * `/b/webmcp/webmcp.js` is the deployment's WebMCP registration script at its
+ * stable path, and design §16 scenario 5 requires the shopper's own agent to
+ * have `list_products` on this page. Nothing puts that script here for it:
+ * `ui::layout` injects the content-hashed `/b/static/webmcp-{hash}.js` into
+ * every SSR-rendered ImpressPress page, but `/` on a sandbox is a file the
+ * agent wrote, served verbatim by `wafer-run/web`, which injects nothing into
+ * anybody's HTML. So a site that wants its visitors' agents to have tools has
+ * to include the script itself, exactly as it has to include `storefront.js`
+ * to get the purchase widget — and it does so at the stable path
+ * (`GET /b/webmcp/webmcp.js`, `pipeline.rs`, `ui::assets::
+ * WEBMCP_JS_STABLE_PATH`) rather than the content-hashed one, since a page
+ * the agent writes has no SSR document to read the current hash off. The
+ * guide and `SUGGESTED_PROMPT` on `/b/dev` tell the agent to write exactly
+ * this tag (`blocks/dev/page.rs`).
  */
-function shopPage(webmcpJsUrl: string): string {
+function shopPage(): string {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <title>${SHOP_HEADING}</title>
   <script src="/b/products/storefront.js" defer></script>
-  <script src="${webmcpJsUrl}" defer></script>
+  <script src="/b/webmcp/webmcp.js" defer></script>
 </head>
 <body>
   <h1>${SHOP_HEADING}</h1>
@@ -307,22 +307,10 @@ test('an agent builds the shop on /b/dev and a shopper sees it at /', async ({ p
   expect(seeded.encoding).toBe('utf8');
   expect(seeded.content).toContain(WELCOME_PHRASE);
 
-  // The registration script this page carries, read off the `/b/dev`
-  // document `ui::layout` rendered — see `shopPage`. Asserted before it is
-  // used, so a layout change that dropped the script fails here rather than
-  // as an unexplained "the shopper has no tools" 15 s later.
-  const webmcpJsUrl = await page.evaluate(() => {
-    const tag = document.querySelector('script[src*="/b/static/webmcp-"]');
-    return tag ? tag.getAttribute('src') : null;
-  });
-  expect(webmcpJsUrl, 'ui::layout must still serve the hashed webmcp.js').toMatch(
-    /^\/b\/static\/webmcp-[0-9a-f]{8}\.js$/,
-  );
-
   const writeStart = Date.now();
   const wrote = structured<FileWrite>(await execute(page, 'dev_write_file', {
     path: 'site/index.html',
-    content: shopPage(webmcpJsUrl as string),
+    content: shopPage(),
     expected_sha256: seeded.sha256,
   }));
   // A `site/**` write publishes immediately — there is no separate deploy.

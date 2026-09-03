@@ -44,11 +44,17 @@ use crate::{http::ResponseBuilder, ui};
 /// `shop_publish_offer`, `shop_update_product`) and the endpoints the agent
 /// would otherwise have to discover, and end by asking for the result to be
 /// shown — which is what makes the live-site iframe the last thing that moves.
+/// It also carries the same `/b/webmcp/webmcp.js` instruction as the guide
+/// above, as a clause on the `site/index.html` sentence rather than a
+/// separate one, since a visitor's agent only gets the shop's tools if the
+/// page the agent writes actually includes the tag.
 const SUGGESTED_PROMPT: &str = "Build me a small online shop for handmade ceramics. Create a home \
 page at site/index.html that lists products from /b/products/catalog and lets a visitor open one, \
-using the storefront widget from /b/products/storefront.js. Then create three products with \
-shop_create_product, give each a published offer with shop_create_offer and shop_publish_offer, \
-and set their status to active with shop_update_product. Show me the live site when you are done.";
+using the storefront widget from /b/products/storefront.js, and include <script \
+src=\"/b/webmcp/webmcp.js\" defer></script> in its <head> so a visitor's agent can use the shop's \
+tools. Then create three products with shop_create_product, give each a published offer with \
+shop_create_offer and shop_publish_offer, and set their status to active with \
+shop_update_product. Show me the live site when you are done.";
 
 /// Serve the workspace document.
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -79,7 +85,10 @@ fn body() -> Markup {
                      backend blocks under " code { "blocks/<name>/" } ", stock the shop with the "
                     code { "shop_*" } " tools, and export the result. Every successful change is \
                      live at " a href="/" target="_blank" { "/" } " immediately; "
-                    code { "dev_rollback" } " undoes a generation."
+                    code { "dev_rollback" } " undoes a generation. Include "
+                    code { "<script src=\"/b/webmcp/webmcp.js\" defer></script>" } " in every page \
+                     you write under " code { "site/" } ", so a visitor's agent gets the site's \
+                     public tools too."
                 }
                 p {
                     "Start with " code { "dev_status" } ". Credentials for this browser-local \

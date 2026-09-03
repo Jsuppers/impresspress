@@ -17,6 +17,7 @@ use crate::{
     features::FeatureConfig,
     http::ResponseBuilder,
     routing::{self, ExtraRoute},
+    ui,
 };
 
 /// How the pipeline persists the per-request audit row.
@@ -332,6 +333,27 @@ pub async fn handle_request(
             .json(&body);
     }
 
+    // WebMCP registration script at a stable path — beside the manifest
+    // above for the same reason the discovery documents sit here: it needs
+    // no routing through `SystemBlock`/`route_to_block` at all. SSR pages get
+    // `webmcp.js` injected by `ui::layout` at the content-hashed URL
+    // `ui::assets::webmcp_js_url()` embeds (`/b/static/webmcp-{hash}.js`,
+    // served by `SystemBlock`'s `CORE_TABLE`), which changes every deploy. A
+    // page written under `site/` — served by `wafer-run/web`, not this
+    // pipeline — never gets that injection and has no way to discover the
+    // current hash, so it needs one path that never moves. Public like the
+    // manifest: the script bytes don't vary by caller, only the manifest it
+    // fetches does, so there's no identity to resolve here.
+    if path == ui::assets::WEBMCP_JS_STABLE_PATH {
+        return ResponseBuilder::new()
+            .set_header("Cache-Control", "no-cache")
+            .set_header("ETag", ui::assets::webmcp_js_hash())
+            .body(
+                ui::assets::webmcp_js().as_bytes().to_vec(),
+                "application/javascript; charset=utf-8",
+            );
+    }
+
     // 2a. CSRF: cookie-authenticated unsafe-method requests must pass the
     // Fetch-Metadata/Origin/Referer policy before any block sees them. Bearer
     // -authenticated callers (`cookie_authenticated == false`) are exempt — see
@@ -548,6 +570,7 @@ mod discovery_tests {
             anon_msg, bearer_for_roles, collect_or_panic, discovery_json, discovery_json_as,
             real_block_infos, TestContext, TEST_JWT_SECRET,
         },
+        ui,
     };
 
     #[tokio::test]
@@ -1638,6 +1661,63 @@ mod discovery_tests {
         assert!(
             cache_control.contains("no-store"),
             "the manifest is per-session and must not be cached, got: {cache_control:?}"
+        );
+    }
+
+    /// The stable `/b/webmcp/webmcp.js` route beside the manifest: a page
+    /// written under `site/` (no SSR `ui::layout` injection, so no way to
+    /// discover the content-hashed `/b/static/webmcp-{hash}.js`) can
+    /// hardcode this path and get the same script.
+    #[tokio::test]
+    async fn webmcp_js_is_served_at_the_stable_path_for_anonymous_callers() {
+        let ctx = TestContext::new().await;
+        let mut msg = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
+        msg.set_meta("http.header.host", "impresspress.example.com");
+        let out = handle_request(
+            &ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+
+        assert_eq!(
+            buf.body,
+            ui::assets::webmcp_js().as_bytes(),
+            "stable-path route must serve the same composed script as the hashed URL"
+        );
+
+        let header = |key: &str| {
+            buf.meta
+                .iter()
+                .find(|m| m.key == key)
+                .map(|m| m.value.as_str())
+        };
+        assert_eq!(
+            header(wafer_run::META_RESP_CONTENT_TYPE),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            header("resp.header.Cache-Control"),
+            Some("no-cache"),
+            "stable path must be revalidated every load, not cached like the immutable hashed URL"
+        );
+        assert_eq!(
+            header("resp.header.ETag"),
+            Some(ui::assets::webmcp_js_hash()),
+            "ETag must be the same hash embedded in webmcp_js_url()"
+        );
+        assert!(
+            ui::assets::webmcp_js_url()
+                .ends_with(&format!("webmcp-{}.js", ui::assets::webmcp_js_hash())),
+            "webmcp_js_hash() must be the same hash webmcp_js_url() embeds: {}",
+            ui::assets::webmcp_js_url()
         );
     }
 

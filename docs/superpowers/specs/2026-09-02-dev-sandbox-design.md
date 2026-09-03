@@ -681,9 +681,10 @@ feature-off: no routes, no migrations, no tools.
 
 **browser (wasm-bindgen / Playwright):** nested OPFS; `Rc<Wafer>` retained
 across an awaited request during a swap; service-worker restart reloads the
-active generation; `crossOriginIsolated === true` on `/b/dev` and false on
-`/`; compiler worker start, cancel, crash recovery; seed import on a fresh
-origin.
+active generation; `crossOriginIsolated === true` on both `/b/dev` and `/`
+(amendment 14 — deployment-wide `credentialless` when the sandbox is
+active, not `/b/dev` alone); compiler worker start, cancel, crash recovery;
+seed import on a fresh origin.
 
 **The scenario e2e** (Playwright with the WebMCP polyfill `webmcp.spec.ts`
 uses):
@@ -875,6 +876,24 @@ and read together with this list.
     page can still show a cross-origin image whose host never set CORP.
     Safari does not implement `credentialless`, so it gets no isolation and
     no threaded compiler; the WebMCP browsers are Chromium-based.
+
+15. **§9 / §16 / Plan 2 Task 6 — a stable `/b/webmcp/webmcp.js` route.**
+    `ui::layout` injects `webmcp.js` at the content-hashed
+    `/b/static/webmcp-{hash}.js` (`ui::assets::webmcp_js_url()`) into every
+    SSR page, but a page under `site/` is served verbatim by `wafer-run/web`
+    and gets no injection — a visitor's agent sees no tools on an
+    agent-built site, and the hashed URL is not discoverable outside an SSR
+    document. Plan 2 Task 6's e2e worked around this by reading the hash off
+    `/b/dev`. `pipeline.rs` now serves the same composed script at the
+    stable, un-hashed `GET /b/webmcp/webmcp.js` (`ui::assets::
+    WEBMCP_JS_STABLE_PATH`) — public, beside `/b/webmcp/manifest.json` — with
+    `Cache-Control: no-cache` and an `ETag` of the script's short hash
+    (`ui::assets::webmcp_js_hash()`, the same hash `webmcp_js_url()`
+    embeds). Site pages must include
+    `<script src="/b/webmcp/webmcp.js" defer></script>` to give visitors'
+    agents the site's public tools; the `/b/dev` guide and
+    `SUGGESTED_PROMPT` (`blocks/dev/page.rs`) tell the agent to, and the
+    seed's `site/index.html` does.
 
 ## 21. Definition of done
 

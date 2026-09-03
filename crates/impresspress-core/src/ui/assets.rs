@@ -208,16 +208,30 @@ pub fn htmx_js_url() -> &'static str {
     })
 }
 
+/// Short content hash of [`webmcp_js`] — the same hash embedded in
+/// [`webmcp_js_url`] and, at the stable path, exposed as the `ETag` of
+/// `GET /b/webmcp/webmcp.js` (`pipeline.rs`). One function so the two
+/// projections of "which version of the script is this" can never drift
+/// apart.
+pub fn webmcp_js_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| short_hash(webmcp_js().as_bytes()))
+}
+
 /// WebMCP script URL with content hash, e.g. `/b/static/webmcp-a1b2c3d4.js`
 pub fn webmcp_js_url() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}webmcp-{}.js",
-            short_hash(webmcp_js().as_bytes())
-        )
-    })
+    URL.get_or_init(|| format!("{STATIC_PREFIX}webmcp-{}.js", webmcp_js_hash()))
 }
+
+/// Stable (non-content-hashed) path for `webmcp.js`, served by
+/// `pipeline.rs` at `GET /b/webmcp/webmcp.js` — right beside
+/// `/b/webmcp/manifest.json`. Unlike [`webmcp_js_url`], this path never
+/// changes between deploys, so it's the one an agent-written page under
+/// `site/` (served by `wafer-run/web`, not `SystemBlock`'s content-hashed
+/// `/b/static/*` table) can hardcode in a `<script>` tag without first
+/// discovering the current hash.
+pub const WEBMCP_JS_STABLE_PATH: &str = "/b/webmcp/webmcp.js";
 
 /// marked.js (markdown parser), vendored from marked@14 — self-hosted instead of
 /// a jsdelivr CDN `<script>` so there's no external runtime fetch (CSP-friendly,
