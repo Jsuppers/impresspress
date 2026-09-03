@@ -36,6 +36,17 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("vector", &["/b/vector"]),
 ];
 
+/// Blocks whose snapshot exists only under a non-default feature.
+///
+/// `dev` cannot live in [`SNAPSHOTTED_BLOCKS`]: a default-feature run does not
+/// compile the block, `real_block_infos()` does not list it, and the empty-
+/// snapshot guard below would (correctly) fail. A separate cfg-gated list is
+/// how a per-element `#[cfg]` is expressed on a `const` slice.
+#[cfg(feature = "block-dev")]
+const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[("dev", &["/b/dev"])];
+#[cfg(not(feature = "block-dev"))]
+const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[];
+
 /// Blocks that legitimately have no schema-carrying endpoints yet, so an
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
@@ -79,7 +90,7 @@ async fn openapi_matches_committed_snapshots() {
 
     let mut failures = Vec::new();
 
-    for (block, prefixes) in SNAPSHOTTED_BLOCKS {
+    for (block, prefixes) in SNAPSHOTTED_BLOCKS.iter().chain(FEATURE_GATED_BLOCKS) {
         let actual = block_openapi(&doc, prefixes);
         let path = snapshot_dir().join(format!("{block}.openapi.json"));
 

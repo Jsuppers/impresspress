@@ -148,7 +148,7 @@ mod tests {
     fn inventory_rejects_digest_mismatch_unsorted_duplicates_and_bad_keys() {
         let (bytes, sha) = inventory_json(&["a/b.css"]);
         assert!(ReleaseInventory::from_json_bytes(&bytes, "sha256:0000").is_err());
-        let mut tampered = bytes.clone();
+        let mut tampered = bytes;
         tampered.push(b' ');
         assert!(ReleaseInventory::from_json_bytes(&tampered, &sha).is_err());
 

@@ -650,9 +650,11 @@ fn sanitize_reference(value: &str) -> String {
     let valid = value.len() == 20
         && value.starts_with("TKT-")
         && value[4..].bytes().all(|b| b.is_ascii_hexdigit());
-    valid
-        .then(|| value.to_ascii_uppercase())
-        .unwrap_or_default()
+    if valid {
+        value.to_ascii_uppercase()
+    } else {
+        String::new()
+    }
 }
 
 #[cfg(test)]

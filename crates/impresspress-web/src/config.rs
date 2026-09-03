@@ -21,8 +21,16 @@ use wafer_core::interfaces::database::service::DatabaseService;
 /// and return the full variable map. Browser-equivalent of the native
 /// `seed_and_load_variables()` — there are no process env vars in the browser,
 /// only the local defaults below plus auto-generated secrets.
+/// `dev_active` is the *resolved* verdict from
+/// [`crate::runtime_factory::resolve_dev_active`], never the raw
+/// `initialize({ dev })` request: on a build without `browser-devtools` the
+/// sandbox does not exist, so a feature-off boot must leave a database
+/// indistinguishable from one that never asked for a sandbox — which is why
+/// `WAFER_RUN_SHARED__HAS_LANDING_PAGE` below is written on BOTH verdicts
+/// rather than only on the affirmative one.
 pub async fn seed_and_load_variables(
     db: &Arc<dyn DatabaseService>,
+    dev_active: bool,
 ) -> Result<HashMap<String, String>, String> {
     // Browser-only defaults. These are not declared `ConfigVar`s (so the
     // auto-gen pass won't seed them) and there's no env to source them from —
@@ -54,6 +62,48 @@ pub async fn seed_and_load_variables(
         "/webllm-engine.js",
         "Embedded Scripts",
         "Module-type script URLs embedded in every page",
+        false,
+    )
+    .await?;
+
+    // The sandbox owns `/` — an editable site is the point of it — so the
+    // router must serve `wafer-run/web` there instead of bouncing anonymous
+    // visitors to the login page (design §7.3).
+    //
+    // FORCE-SET, not seeded, and force-set in BOTH directions.
+    //
+    // Not seeded, because this hook runs *after* the admin block's
+    // `lifecycle(Init)`, which has already written every declared
+    // `config_vars` default — and `WAFER_RUN_SHARED__HAS_LANDING_PAGE` is
+    // declared, defaulting to `"false"`. `seed_variable_if_absent` is
+    // therefore a guaranteed no-op on this key, which is precisely the bug
+    // Plan 1 Task 10's e2e caught: the sandbox published a site that `/` then
+    // refused to serve.
+    //
+    // Both directions, because the browser database is keyed by ORIGIN and
+    // outlives the bundle that wrote it. Serving a `dev: false` build (or one
+    // compiled without `browser-devtools`) to an origin the sandbox bundle
+    // previously ran on would otherwise leave a stale `"true"` in OPFS, and
+    // `/` would keep serving a site nothing can publish to any more instead of
+    // redirecting anonymous visitors to the login page. That directly
+    // contradicts what `runtime_factory::resolve_dev_active` promises — "a
+    // build without the feature must produce a runtime indistinguishable from
+    // one that was never asked for a sandbox" — and a value only ever written
+    // in one direction cannot deliver it.
+    //
+    // Writing `"false"` here overrides nothing an operator would have set: in
+    // the browser target the sandbox is the ONLY producer of a landing page
+    // (no web flow publishes a site — see `cli/flows/{sealed,embed}_web.rs`,
+    // unlike their native counterparts), so without it there is nothing at `/`
+    // to serve. `set_variable` writes nothing when the value already matches,
+    // so the common case is a read.
+    impresspress_core::boot::set_variable(
+        db,
+        "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+        if dev_active { "true" } else { "false" },
+        "Has Landing Page",
+        "Serve a static landing page (wafer-run/web) at `/` instead of \
+         redirecting anonymous visitors to the login page",
         false,
     )
     .await?;

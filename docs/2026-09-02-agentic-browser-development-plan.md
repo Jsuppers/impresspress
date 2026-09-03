@@ -11,6 +11,15 @@ test them, expose their typed operations to a browser agent through WebMCP, and
 activate or roll back a combined site/backend release without rebuilding the
 outer ImpressPress service-worker package.
 
+> **2026-09-02 note.** The dev.impresspress.org sandbox design
+> (`docs/superpowers/specs/2026-09-02-dev-sandbox-design.md`) adopts this
+> plan's architecture and supersedes it where the two differ: activation is
+> automatic with a generation ledger instead of a confirmation nonce, the live
+> site is the preview, guest capabilities are declared and granted exactly,
+> v1 guests speak JSON for host calls and get table-scoped DDL (wafer-run),
+> curated shop tools exist on `/b/dev`, and export is a runnable bundle. Its
+> §17 replaces the phases below.
+
 Check a task only when its implementation and stated verification both pass.
 When implementation evidence changes a design decision, add a dated note here
 instead of silently changing the architecture.

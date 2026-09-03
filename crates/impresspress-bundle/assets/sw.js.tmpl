@@ -53,7 +53,7 @@ async function ensureInitialized() {
         }
         console.log('[__APP_NAME__] Initializing runtime...');
         try {
-            await initialize();
+            await initialize({ dev: __DEV_ENABLED__ });
         } catch (e) {
             await selfDestruct(`runtime initialize() failed: ${e}`);
             throw e;

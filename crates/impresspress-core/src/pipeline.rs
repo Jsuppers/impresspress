@@ -2006,11 +2006,11 @@ mod csrf_wiring_tests {
     }
 
     fn extra_route() -> Vec<ExtraRoute> {
-        vec![ExtraRoute {
-            prefix: "/x/csrf-probe".to_string(),
-            access: RouteAccess::Public,
-            block_name: "test/csrf-probe".to_string(),
-        }]
+        vec![ExtraRoute::new(
+            "/x/csrf-probe",
+            "test/csrf-probe",
+            RouteAccess::Public,
+        )]
     }
 
     #[tokio::test]
@@ -2193,11 +2193,11 @@ mod streaming_audit_tests {
     }
 
     fn route(prefix: &str, block: &str) -> Vec<ExtraRoute> {
-        vec![ExtraRoute {
-            prefix: prefix.to_string(),
-            access: RouteAccess::Public,
-            block_name: block.to_string(),
-        }]
+        vec![ExtraRoute::new(
+            prefix.to_string(),
+            block.to_string(),
+            RouteAccess::Public,
+        )]
     }
 
     async fn drive(ctx: &TestContext, path: &str, routes: &[ExtraRoute]) {

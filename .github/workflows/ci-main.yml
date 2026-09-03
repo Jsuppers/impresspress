@@ -10,6 +10,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-main.yml'
+      # The dev-sandbox e2e stages this proof guest into a live browser
+      # runtime, so a change to it must run CI.
+      - 'experiments/browser-service-worker-blocks/guest/**'
 
 concurrency:
   group: ci-main
@@ -100,6 +103,15 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
 
+      # `block-dev` is deliberately absent from `default` (the dev sandbox's
+      # control plane must not exist in a normal bundle), so the workspace
+      # clippy above compiles none of it — not the block, and not the ~4 200
+      # lines of `#![cfg(feature = "block-dev")]` integration tests that pin
+      # its rules. `--all-targets` is what reaches those, and `test-support`
+      # is what lets them link `FakeControl`.
+      - name: Clippy (block-dev)
+        run: cargo clippy --locked -p impresspress-core --features block-dev,test-support --all-targets -- -D warnings
+
   test:
     name: Tests
     needs: build-wasm
@@ -128,6 +140,14 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
+
+      # The other half of the `block-dev` gap: `--workspace` above skips every
+      # `dev_*.rs` integration test, because all five are `#![cfg]`-gated on a
+      # feature nothing turns on. `wasm` is load-bearing rather than
+      # incidental — `tests/lockfile_e2e.rs` needs wafer-run built with wasmi,
+      # and `-p impresspress-core --features block-dev` alone leaves it red.
+      - name: Run the block-dev suite
+        run: cargo test --locked -p impresspress-core --features block-dev,wasm
 
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
@@ -225,6 +245,140 @@ jobs:
       # trait-surface drift this guards — would skip it.
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
+
+      # Pure path-helper unit tests for the hierarchical OPFS storage keys
+      # (`storage.rs`'s `storagePut`/`storageGet`/`storageDelete`/`storageList`
+      # bridge functions). Unconditional here for the same reason as the
+      # conformance-wiring check above: the path-filtered `browser-wasm-test`
+      # job (ci.yml) would skip this on a wafer-run pin bump that doesn't
+      # touch crates/impresspress-browser/.
+      - name: Run storage_paths.mjs unit tests (node --test)
+        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
+
+  # The only job that compiles, boots and exercises the browser development
+  # sandbox. `impresspress-web/src/dev_runtime.rs` — wasmi `inspect`/`probe`,
+  # the runtime rebuild, `replace_wafer`, boot convergence, seed-on-boot —
+  # exists only inside a service worker, so no host test can run a line of it;
+  # this job is where it runs. It is also the only place the `browser-devtools`
+  # feature set is compiled at all — `block-dev` itself is covered by the
+  # `Clippy (block-dev)` and `Run the block-dev suite` steps above, which lint
+  # and run `impresspress-core`'s half on the host.
+  e2e-dev-sandbox:
+    name: E2E dev sandbox (browser WASM + wasmi guest)
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # wasm32-unknown-unknown builds the `browser-devtools` bundle;
+          # wasm32-wasip1 builds the proof guest the e2e stages over HTTP.
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: e2e-dev
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pinned for the same reason as `build-wasm` — see the note there.
+          version: 'v0.15.0'
+
+      # build.rs prereq: the impresspress crate `include_bytes!`s pkg/. What the
+      # tests actually serve is built from `pkg-dev/` (the feature-on wasm),
+      # substituted through IMPRESSPRESS_WEB_WASM / IMPRESSPRESS_WEB_JS by the
+      # sealed web flow — but the CLI does not compile without pkg/ present.
+      - name: Download impresspress-web pkg/
+        uses: actions/download-artifact@v4
+        with:
+          name: impresspress-web-pkg
+          path: crates/impresspress-web/pkg
+
+      # The only `--features browser-devtools` gate in CI. `--no-deps` scopes it
+      # to this crate: the un-scoped command is red on six pre-existing
+      # impresspress-core warnings in other features' code.
+      - name: Clippy (browser-devtools, wasm32)
+        run: cargo clippy -p impresspress-web --target wasm32-unknown-unknown --features browser-devtools --no-deps -- -D warnings
+
+      # Debug build, as `e2e-build` does: the CLI only assembles static files
+      # here, so its runtime speed is irrelevant and a debug compile is cheaper.
+      - name: Install impresspress CLI (debug)
+        run: cargo install --path crates/impresspress --locked --debug --root "$GITHUB_WORKSPACE/out"
+
+      - name: Put impresspress on PATH
+        run: echo "$GITHUB_WORKSPACE/out/bin" >> "$GITHUB_PATH"
+
+      - name: Build the proof guest (wasm32-wasip1)
+        run: cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
+
+      # One script, shared with local runs: wasm-pack with `browser-devtools`,
+      # then the sealed web flow over a throwaway `[dev] enabled` app, then the
+      # seed fixture into `dist/seed/`. Its last stdout line is the dist path.
+      - name: Build the dev-sandbox bundle
+        run: |
+          DIST="$(crates/impresspress-web/tests/e2e/fixtures/build-dev-bundle.sh | tail -1)"
+          echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/impresspress-web/package-lock.json') }}
+
+      - name: Install Playwright
+        working-directory: crates/impresspress-web
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+
+      - name: Serve the dev bundle in background (port 8082)
+        run: |
+          python3 -m http.server 8082 -d "$DEV_DIST" &
+          echo $! > /tmp/dev-http-pid
+          # Wait for the server to accept connections, then prove both halves
+          # of the bundle are actually there: the worker, and the seed the
+          # first boot imports.
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8082/sw.js > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:8082/seed/manifest.json > /dev/null
+
+      - name: Run dev sandbox e2e (browser WASM, port 8082)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8082
+          PROOF_GUEST_WASM: ${{ github.workspace }}/experiments/browser-service-worker-blocks/guest/target/wasm32-wasip1/release/browser_compiled_wafer_block.wasm
+        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/dev-http-pid ]; then
+            kill "$(cat /tmp/dev-http-pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-dev-sandbox
+          path: crates/impresspress-web/playwright-report/
+          retention-days: 7
 
   products-browser:
     name: Products browser lifecycles

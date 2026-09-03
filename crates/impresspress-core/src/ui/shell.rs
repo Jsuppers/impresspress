@@ -97,6 +97,9 @@ fn render_topbar(t: &Topbar<'_>) -> Markup {
 ///
 /// `nav_groups` partitions the sidebar (Workspace / Data / System for admin,
 /// Account / Apps for portal). `user` is pinned at the sidebar bottom.
+// Every argument is an independent slot in the page chrome; a struct would
+// be the same list with a name on it.
+#[allow(clippy::too_many_arguments)]
 pub fn shell(
     nav_groups: &[NavGroup],
     user: Option<&UserInfo>,

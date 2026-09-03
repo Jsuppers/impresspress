@@ -9,6 +9,20 @@ pub struct Config {
     pub wasm: WasmConfig,
     #[serde(default)]
     pub impresspress: ImpresspressConfig,
+    #[serde(default)]
+    pub dev: DevConfig,
+}
+
+/// `[dev]` — the browser development sandbox (`impresspress/dev` block,
+/// `/b/dev`, dynamic guest blocks). Off by default; also requires the
+/// consumer crate to be built with `impresspress-web/browser-devtools`. A
+/// bundle built without the feature accepts `enabled = true` and ignores it —
+/// the block cannot exist in a binary that never compiled it.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DevConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Points at the impresspress workspace when the consumer repo isn't part of it.
@@ -236,6 +250,55 @@ boot_redirect = "/"
         let err = find_and_load(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("impresspress.toml"));
         assert!(err.contains("no"));
+    }
+
+    #[test]
+    fn dev_table_parses_and_defaults_off() {
+        let cfg = parse(
+            r#"
+[app]
+name = "x"
+title = "X"
+boot_redirect = "/"
+
+[dev]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert!(cfg.dev.enabled);
+
+        // The sandbox is opt-in: a config that never mentions `[dev]` must
+        // leave it off rather than inheriting whatever the last build used.
+        let cfg = parse(
+            r#"
+[app]
+name = "x"
+title = "X"
+boot_redirect = "/"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.dev.enabled);
+    }
+
+    #[test]
+    fn reject_unknown_field_in_dev() {
+        let err = parse(
+            r#"
+[app]
+name = "x"
+title = "X"
+boot_redirect = "/"
+
+[dev]
+enabled = true
+sandbox = "yes"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sandbox"), "expected 'sandbox', got: {err}");
     }
 
     #[test]

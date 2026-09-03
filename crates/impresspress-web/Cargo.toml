@@ -13,6 +13,22 @@ crate-type = ["cdylib", "rlib"]
 # can be loaded from bytes by the browser-hosted ImpressPress runtime. This is
 # intentionally opt-in until the browser editor/compiler pipeline exists.
 dynamic-wasm-blocks = ["wafer-run/wasmi"]
+# The browser development sandbox: the `impresspress/dev` control plane plus
+# wasmi for the guest blocks it activates. Off by default; a bundle built with
+# it still needs `[dev] enabled = true` in `impresspress.toml` to register
+# anything, and a bundle built without it ignores the flag entirely — the
+# sandbox's security model is that the block is absent from normal
+# deployments, not merely switched off in one.
+# `web-sys/ServiceWorkerGlobalScope` + `WorkerGlobalScope`: seed-on-boot
+# fetches `/seed/manifest.json` from the worker's own global (`web_sys::window()`
+# is `None` there). Pulled in by the feature rather than unconditionally, so a
+# feature-off build compiles exactly the web-sys surface it did before.
+browser-devtools = [
+    "dynamic-wasm-blocks",
+    "impresspress-core/block-dev",
+    "web-sys/ServiceWorkerGlobalScope",
+    "web-sys/WorkerGlobalScope",
+]
 
 [dependencies]
 # Browser framework (platform services + SW plumbing)

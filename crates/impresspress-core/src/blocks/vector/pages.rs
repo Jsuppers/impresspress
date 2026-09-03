@@ -718,7 +718,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     // the SELECT-by-document_id query above keeps working on re-ingest.
     let entries: Vec<VectorEntry> = chunks
         .into_iter()
-        .zip(vectors.into_iter())
+        .zip(vectors)
         .enumerate()
         .map(|(i, (chunk_text, vector))| VectorEntry {
             id: format!("{}:{}", body.document_id, i),

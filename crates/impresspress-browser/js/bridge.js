@@ -123,6 +123,82 @@ export async function dbFlush() {
 
 // ─── Storage (OPFS) ──────────────────────────────────────────────────────────
 
+// Key-path helpers (dir/leaf splitting, metadata sidecar naming). Pure —
+// no DOM/OPFS APIs — and `export`ed so `js/test/storage_paths.test.mjs`
+// covers them directly with `node --test`, importing this file as its
+// single source of truth (no separate `storage_paths.mjs` copy to drift
+// out of sync). bridge.js's other top-level import
+// (`/vendor/sql-wasm-esm.js`) doesn't resolve under plain Node, so the
+// test run stubs it via `js/test/node-hooks.mjs`
+// (`node --import ./js/test/node-hooks.mjs --test ...`); see that file's
+// header comment. These helpers ARE also reachable from real
+// request-handling code (storagePut/storageGet/storageDelete/storageList
+// below), so — unlike a cross-file import — nothing here can 404 at
+// runtime: wasm-bindgen only ever needs to find `bridge.js` itself
+// (`#[wasm_bindgen(module = "/js/bridge.js")]` in `bridge.rs`), and these
+// functions live inside it.
+// Mirrored on the Rust side as `impresspress_core::blocks::dev::paths::
+// META_SUFFIX`, which refuses it in a dev-sandbox workspace path so a file
+// named after a sidecar can never reach `splitKey` below. Both sides carry
+// the other's name: change one and change the other.
+const META_SUFFIX = '.__meta__';
+
+// Reject path separators and control characters (including DEL); spaces
+// and other printable/unicode characters are legitimate in a file name
+// (OPFS itself allows them) so they're accepted here. Matches the Rust-side
+// path rules used for native storage (see Plan 1 Task 6), which also allow
+// spaces.
+const INVALID_SEGMENT_CHARS = /[\\/\x00-\x1f\x7f]/;
+
+export function validateSegments(segments) {
+    if (!Array.isArray(segments) || segments.length === 0) {
+        throw new TypeError('storage path must have at least one segment');
+    }
+    for (const s of segments) {
+        if (typeof s !== 'string' || s === '' || s === '.' || s === '..') {
+            throw new TypeError(`invalid storage path segment: ${JSON.stringify(s)}`);
+        }
+        if (INVALID_SEGMENT_CHARS.test(s)) {
+            throw new TypeError(`storage path segment contains an invalid character: ${JSON.stringify(s)}`);
+        }
+        // EVERY segment, not just the leaf: a DIRECTORY named `page.html.__meta__`
+        // lands in the same OPFS directory as the sidecar of a sibling file
+        // named `page.html`, and the two then fight over one name. The Rust
+        // producer refuses the suffix on every segment for exactly this reason
+        // (`paths.rs::validate_path`); this is the same rule at the boundary
+        // that owns the sidecars.
+        if (s.endsWith(META_SUFFIX)) {
+            throw new TypeError(`storage path segment may not name a metadata sidecar: ${JSON.stringify(s)}`);
+        }
+    }
+    return segments;
+}
+
+/** @returns {{dirs: string[], leaf: string}} */
+export function splitKey(key) {
+    if (typeof key !== 'string' || key === '' || key.endsWith('/')) {
+        throw new TypeError(`invalid storage key: ${JSON.stringify(key)}`);
+    }
+    // `validateSegments` refuses META_SUFFIX on every segment, the leaf
+    // included, so there is no separate leaf check here.
+    const segments = validateSegments(key.split('/'));
+    return { dirs: segments.slice(0, -1), leaf: segments[segments.length - 1] };
+}
+
+export function joinKey(dirs, leaf) {
+    return [...dirs, leaf].join('/');
+}
+
+/** Sidecar name for `leaf`. The suffix is mirrored in Rust — see `META_SUFFIX`. */
+export function metaName(leaf) {
+    return `${leaf}${META_SUFFIX}`;
+}
+
+/** Whether `name` is a sidecar. The suffix is mirrored in Rust — see `META_SUFFIX`. */
+export function isMetaName(name) {
+    return name.endsWith(META_SUFFIX);
+}
+
 const STORAGE_DIR = 'storage';
 
 async function getStorageRoot() {
@@ -151,6 +227,23 @@ async function getFolderHandle(storageRoot, folder, create = false) {
 }
 
 /**
+ * Resolve the OPFS directory handle a key's leaf file lives in, walking the
+ * key's own `dirs` segments (from `splitKey`) below the folder handle.
+ * These are nested directories WITHIN a storage folder — distinct from
+ * `getFolderHandle`'s folder-name segments above. Only `storagePut` passes
+ * `create: true`; parents are created only by `put`, per the storage
+ * contract (`get`/`delete` pass `create: false` and let a missing directory
+ * surface as the same `NotFoundError` a missing file would).
+ */
+async function getKeyParent(folderHandle, dirs, create) {
+    let handle = folderHandle;
+    for (const segment of dirs) {
+        handle = await handle.getDirectoryHandle(segment, { create });
+    }
+    return handle;
+}
+
+/**
  * Write file + metadata to OPFS.
  * @param {string} folder
  * @param {string} key
@@ -160,16 +253,18 @@ async function getFolderHandle(storageRoot, folder, create = false) {
 export async function storagePut(folder, key, data, contentType) {
     const storageRoot = await getStorageRoot();
     const folderHandle = await getFolderHandle(storageRoot, folder, true);
+    const { dirs, leaf } = splitKey(key);
+    const parent = await getKeyParent(folderHandle, dirs, true);
 
     // Write file data
-    const fileHandle = await folderHandle.getFileHandle(key, { create: true });
+    const fileHandle = await parent.getFileHandle(leaf, { create: true });
     const writable = await fileHandle.createWritable();
     await writable.write(data);
     await writable.close();
 
     // Write metadata
     const meta = { content_type: contentType, size: data.length };
-    const metaHandle = await folderHandle.getFileHandle(`${key}.__meta__`, { create: true });
+    const metaHandle = await parent.getFileHandle(metaName(leaf), { create: true });
     const metaWritable = await metaHandle.createWritable();
     await metaWritable.write(JSON.stringify(meta));
     await metaWritable.close();
@@ -188,9 +283,11 @@ export async function storagePut(folder, key, data, contentType) {
 export async function storageGet(folder, key) {
     const storageRoot = await getStorageRoot();
     const folderHandle = await getFolderHandle(storageRoot, folder, false);
+    const { dirs, leaf } = splitKey(key);
+    const parent = await getKeyParent(folderHandle, dirs, false);
 
     // Read file data
-    const fileHandle = await folderHandle.getFileHandle(key);
+    const fileHandle = await parent.getFileHandle(leaf);
     const file = await fileHandle.getFile();
     const buffer = await file.arrayBuffer();
     const data = new Uint8Array(buffer);
@@ -198,7 +295,7 @@ export async function storageGet(folder, key) {
     // Read metadata
     let meta = { content_type: 'application/octet-stream', size: data.length };
     try {
-        const metaHandle = await folderHandle.getFileHandle(`${key}.__meta__`);
+        const metaHandle = await parent.getFileHandle(metaName(leaf));
         const metaFile = await metaHandle.getFile();
         const metaText = await metaFile.text();
         meta = JSON.parse(metaText);
@@ -217,16 +314,59 @@ export async function storageGet(folder, key) {
 export async function storageDelete(folder, key) {
     const storageRoot = await getStorageRoot();
     const folderHandle = await getFolderHandle(storageRoot, folder, false);
-    await folderHandle.removeEntry(key);
+    const { dirs, leaf } = splitKey(key);
+    const parent = await getKeyParent(folderHandle, dirs, false);
+    await parent.removeEntry(leaf);
     try {
-        await folderHandle.removeEntry(`${key}.__meta__`);
+        await parent.removeEntry(metaName(leaf));
     } catch (_e) {
         // Metadata may not exist
+    }
+    await pruneEmptyDirs(folderHandle, dirs);
+}
+
+/**
+ * Drop the directories `dirs` names, deepest first, for as long as they are
+ * empty. Stops at `folderHandle`, which is the storage folder itself and is
+ * never removed.
+ *
+ * A storage key namespace is flat to its callers — `blog/post.html` is a key,
+ * not a file in a directory — but OPFS makes `blog` a real directory, and a
+ * directory OUTLIVES the last key under it. That leftover is not merely
+ * untidy: a name is a directory or a file and never both, so an empty `blog`
+ * makes `storagePut(folder, 'blog', …)` throw `TypeMismatchError` at
+ * `getFileHandle(…, {create: true})` forever. The dev sandbox reaches that
+ * state by publishing a site where a path stops being a directory and becomes
+ * a page — see `publisher.rs`, which orders such a deletion before the write
+ * precisely so this prune can free the name in time.
+ *
+ * Best-effort by construction: `removeEntry` without `recursive` throws
+ * `InvalidModificationError` on a directory that is not empty, which is the
+ * normal case (a sibling key still lives there) and the signal to stop
+ * walking up.
+ */
+async function pruneEmptyDirs(folderHandle, dirs) {
+    for (let depth = dirs.length; depth > 0; depth -= 1) {
+        let parent = folderHandle;
+        try {
+            for (const segment of dirs.slice(0, depth - 1)) {
+                parent = await parent.getDirectoryHandle(segment, { create: false });
+            }
+            await parent.removeEntry(dirs[depth - 1]);
+        } catch (_e) {
+            // Not empty, or already gone. Either way nothing above it can be
+            // empty either, so stop.
+            return;
+        }
     }
 }
 
 /**
  * List files in a folder matching `prefix`, paginated by `limit`/`offset`.
+ * Walks nested directories recursively so a hierarchical key like
+ * `assets/app.js` (see `storagePut`/`storage_paths.mjs`) shows up as one
+ * joined key rather than being hidden inside a subdirectory; `prefix`
+ * matches against that full joined key.
  * @param {string} folder
  * @param {string} prefix
  * @param {number} limit
@@ -250,13 +390,17 @@ export async function storageList(folder, prefix, limit, offset) {
     const folderHandle = await getFolderHandle(storageRoot, folder, false);
 
     const keys = [];
-    for await (const [name] of folderHandle.entries()) {
-        // Skip metadata files
-        if (name.endsWith('.__meta__')) continue;
-        if (!prefix || name.startsWith(prefix)) {
-            keys.push(name);
+    async function walk(handle, dirs) {
+        for await (const [name, entry] of handle.entries()) {
+            if (entry.kind === 'directory') {
+                await walk(entry, [...dirs, name]);
+            } else if (!isMetaName(name)) {
+                const key = joinKey(dirs, name);
+                if (!prefix || key.startsWith(prefix)) keys.push(key);
+            }
         }
     }
+    await walk(folderHandle, []);
 
     keys.sort();
     const total = keys.length;

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source_generation": null,
+  "site": [
+    {
+      "path": "index.html",
+      "sha256": "58541b54e4a31ce058a26babb9ee10dcf1a888afd388427f172502e4d23ade50",
+      "size": 32,
+      "content_type": "text/html; charset=utf-8"
+    }
+  ],
+  "blocks": [],
+  "data": null
+}

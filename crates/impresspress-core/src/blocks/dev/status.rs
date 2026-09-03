@@ -1,0 +1,58 @@
+//! `GET /b/dev/api/status` — what is live, what is in flight.
+//!
+//! The `/b/dev` page polls this every ~300 ms while a mutating tool call is
+//! outstanding (design §7.5), which is why the whole block answers
+//! `Cache-Control: no-store`: a cached status is a progress panel that never
+//! moves.
+
+use wafer_run::{context::Context, OutputStream, WaferError};
+
+use super::{
+    contracts::{ActivationView, ActiveBlockView, StatusResponse},
+    generation, no_store, repo, DevShared, WAFER_GUEST_VERSION,
+};
+use crate::http::err_internal;
+
+/// Answer the status endpoint.
+pub async fn handle(ctx: &dyn Context, shared: &DevShared) -> OutputStream {
+    match build(ctx, shared).await {
+        Ok(response) => no_store().json(&response),
+        Err(e) => err_internal("dev sandbox status", e),
+    }
+}
+
+async fn build(ctx: &dyn Context, shared: &DevShared) -> Result<StatusResponse, WaferError> {
+    let state = repo::runtime_state::read(ctx).await?;
+
+    // The block manifest is stored as the same `DynamicBlockSpec` list the
+    // runtime is rebuilt from, so the active block set needs no separate
+    // record — it is a projection of the generation that is live.
+    let active = generation::active_from(ctx, &state).await?;
+
+    let activation = state
+        .desired_generation_id
+        .map(|generation_id| ActivationView {
+            generation_id,
+            phase: state.activation_phase,
+            detail: String::new(),
+        });
+
+    Ok(StatusResponse {
+        active_generation: active
+            .as_ref()
+            .map(|(row, manifest)| generation::summarize(row, manifest)),
+        runtime_generation: shared.control.runtime_generation(),
+        blocks: active
+            .as_ref()
+            .map(|(_row, manifest)| {
+                manifest
+                    .blocks
+                    .iter()
+                    .map(ActiveBlockView::from_spec)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        activation,
+        wafer_guest_version: WAFER_GUEST_VERSION,
+    })
+}

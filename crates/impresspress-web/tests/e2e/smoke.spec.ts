@@ -72,3 +72,48 @@ test('admin can log in and reach the dashboard', async ({ page }) => {
   await page.waitForURL(/\/b\/admin\//, { timeout: 30_000 });
   await expect(page).toHaveURL(/\/b\/admin\//);
 });
+
+test('the default bundle has no dev block', async ({ page }) => {
+  // The sandbox's security model (design §13) is that `impresspress/dev` is
+  // ABSENT from a normal deployment, not merely disabled in one. `pkg/` is
+  // built without `browser-devtools` and without `[dev] enabled`, so both
+  // halves of that must hold: no route, and no relaxed header for the
+  // compiler worker / preview iframe the sandbox would need.
+  //
+  // Wait for the SW-served boot redirect to land rather than for
+  // `navigator.serviceWorker.controller`: loader.js navigates to
+  // `boot_redirect` the moment the SW takes control, which destroys the
+  // execution context out from under an `evaluate()` that raced it. Landing
+  // on /b/auth/login means the wasm router has already answered a request,
+  // which is the precondition both fetches below need anyway.
+  await page.goto('/', { waitUntil: 'commit' });
+  await page.waitForURL(/\/b\/auth\/login/, { timeout: 30_000 });
+
+  const status = await page.evaluate(async () => (await fetch('/b/dev/api/status')).status);
+  expect(status).toBe(404);
+
+  const csp = await page.evaluate(
+    async () => (await fetch('/b/auth/login')).headers.get('content-security-policy'),
+  );
+  expect(csp).not.toBeNull();
+  // `worker-src` exists ONLY when the sandbox is active — nothing else in the
+  // bundle spawns a worker.
+  expect(csp).not.toContain('worker-src');
+  // The sandbox previews the live site in a same-origin iframe and relaxes
+  // this to `'self'` (`runtime_factory.rs`); a normal deployment refuses
+  // framing outright.
+  expect(csp).toContain("frame-ancestors 'none'");
+  // Deliberately NOT `expect(csp).not.toContain('frame-src')`, which is what
+  // this line used to say. The products block declares
+  // `frame-src https://js.stripe.com https://hooks.stripe.com
+  // https://checkout.stripe.com` for Stripe Checkout, so a feature-OFF bundle
+  // has a `frame-src` too — and this assertion failed the first time it was
+  // run against a real built `pkg/` (Plan 1 Task 10's fix round).
+  //
+  // Both lines above really do discriminate: `dev-foundations.spec.ts`
+  // asserts the opposite of each on a `browser-devtools` + `[dev] enabled`
+  // bundle. They did not until `flows::register_site_main` stopped replacing
+  // the factory's whole `wafer-run/security-headers` config with the shared
+  // CSP directives — until then both bundles served the same policy and this
+  // test passed for the wrong reason.
+});

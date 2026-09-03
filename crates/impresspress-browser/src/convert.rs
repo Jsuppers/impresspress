@@ -66,6 +66,8 @@ pub async fn request_to_message(
 
     // Collect headers into (name, value) pairs for the codec.
     let mut header_pairs: Vec<(String, String)> = Vec::new();
+    let mut saw_host = false;
+    let mut saw_fetch_site = false;
     let headers: Headers = request.headers();
     let iter =
         js_sys::try_iter(&headers)?.ok_or_else(|| JsValue::from_str("headers not iterable"))?;
@@ -75,7 +77,77 @@ pub async fn request_to_message(
         let arr: js_sys::Array = item.dyn_into()?;
         let key = arr.get(0).as_string().unwrap_or_default();
         let val = arr.get(1).as_string().unwrap_or_default();
+        let lower = key.to_ascii_lowercase();
+        saw_host |= lower == "host";
+        saw_fetch_site |= lower == "sec-fetch-site";
         header_pairs.push((key, val));
+    }
+
+    // Synthesize the request metadata a service worker cannot be sent.
+    //
+    // `Host` and `Sec-Fetch-Site` are both absent from `FetchEvent.request`:
+    // `Host` is a forbidden header name the `Headers` view never exposes, and
+    // the Fetch spec appends `Sec-Fetch-*` during HTTP-network-or-cache fetch
+    // — *after* service-worker interception. So does `Origin`, and `Referer`.
+    // The result is that `impresspress_core::csrf::enforce_origin_policy` —
+    // which reads `sec-fetch-site` first and falls back to `origin`/`referer`
+    // against `host` — finds nothing at all and takes its fail-closed tail,
+    // rejecting **every** cookie-authenticated mutation the browser bundle
+    // makes. Not a sandbox problem: it is every `fetch`-driven admin form.
+    //
+    // The worker can prove what the missing headers would have said, and the
+    // proof is the set of requests that can reach a service worker at all:
+    //
+    // * a subresource request (`fetch`, `XHR`, a form posted by script) is
+    //   dispatched to the worker only when the *client that issued it* is
+    //   controlled by this worker — which requires that client to be
+    //   same-origin with the worker's scope. A cross-site page's request to
+    //   this origin is never handed to this worker; it goes straight to the
+    //   network (or to that page's own worker). So a same-origin request URL
+    //   on a non-navigation really is a same-origin request.
+    // * a navigation into the scope is dispatched to the worker whoever
+    //   started it, which is exactly the CSRF case a cross-site `<form>`
+    //   POST uses. `Request::referrer` — an attribute, not a header, and so
+    //   readable here — is the only thing that can separate our own page
+    //   from somebody else's, and a referrer that is ABSENT separates
+    //   nothing: suppression is attacker-controllable, so it is refused
+    //   rather than reported as `Sec-Fetch-Site: none` (which the policy
+    //   accepts). See [`fetch_site_for`] for the full argument.
+    //
+    // Anything that does not positively match one of those is `cross-site`,
+    // so a value this cannot prove stays a refusal. A header that really is
+    // present is never overwritten — a real `Sec-Fetch-Site` from a client
+    // that sends one outranks anything inferred here.
+    //
+    // Outside a worker global (a unit test, or a main-thread caller) the
+    // worker's own origin is unknowable, and nothing is synthesized at all:
+    // the policy then fails closed exactly as it did before this ran.
+    if let Some(location) = worker_location() {
+        if !saw_host {
+            // Defence in depth, and **not the live path**. `host` only matters
+            // to `csrf::enforce_origin_policy`'s `origin`/`referer` fallback,
+            // and that fallback is unreachable whenever this block runs at
+            // all: the `sec-fetch-site` synthesized just below is
+            // unconditional inside this `if`, and the policy reads
+            // `sec-fetch-site` *first* and returns on it. So a future reader
+            // should not assume the fallback is exercised by any test here —
+            // it is what would carry the policy if the `Sec-Fetch-Site` arm
+            // were ever removed, or if a client sent a `host` header of its
+            // own that this branch then declines to overwrite.
+            header_pairs.push(("host".to_string(), location.host));
+        }
+        if !saw_fetch_site {
+            header_pairs.push((
+                "sec-fetch-site".to_string(),
+                fetch_site_for(
+                    request_mode(request),
+                    &request.referrer(),
+                    &url.origin(),
+                    &location.origin,
+                )
+                .to_string(),
+            ));
+        }
     }
 
     // Re-inject the `Cookie` header from the SW's CookieStore.
@@ -102,6 +174,134 @@ pub async fn request_to_message(
     );
 
     Ok((msg, InputStream::from_bytes(body)))
+}
+
+/// The worker's own `origin` and `host`, as its global `location` reports them.
+struct WorkerLocation {
+    /// `scheme://host[:port]` — what a request URL's origin is compared to.
+    origin: String,
+    /// `host[:port]` — the authority `csrf::enforce_origin_policy` compares an
+    /// `Origin`/`Referer` header against.
+    host: String,
+}
+
+/// Read the worker global's `location`, or `None` when there is no worker
+/// global (a `wasm-pack test --node` harness, or a main-thread caller).
+///
+/// `None` is deliberately not a fallback to the request's own origin: that
+/// would let the request under inspection supply the authority it is checked
+/// against, which is not a check at all.
+fn worker_location() -> Option<WorkerLocation> {
+    let scope = js_sys::global()
+        .dyn_into::<web_sys::WorkerGlobalScope>()
+        .ok()?;
+    let location = scope.location();
+    Some(WorkerLocation {
+        origin: location.origin(),
+        host: location.host(),
+    })
+}
+
+/// `Request::mode` as the Fetch spec spells it, or `""` for a value this
+/// build of `web-sys` does not name.
+fn request_mode(request: &web_sys::Request) -> &'static str {
+    match request.mode() {
+        web_sys::RequestMode::SameOrigin => "same-origin",
+        web_sys::RequestMode::Cors => "cors",
+        web_sys::RequestMode::NoCors => "no-cors",
+        web_sys::RequestMode::Navigate => "navigate",
+        _ => "",
+    }
+}
+
+/// What `Sec-Fetch-Site` a service worker can *prove* for a request it was
+/// handed. Pure, so every arm is testable without a browser.
+///
+/// * `mode` — `Request::mode`, as [`request_mode`] spells it.
+/// * `referrer` — `Request::referrer`; `""` when the request has none.
+/// * `request_origin` — the origin of the request's own URL.
+/// * `self_origin` — the worker's own origin ([`worker_location`]).
+///
+/// The security argument is at the call site. The rule, restated: a
+/// non-navigation reaching this worker came from a client this worker
+/// controls, so a same-origin URL makes it same-origin; a navigation is
+/// same-origin only when its referrer says so; everything else — **including
+/// a navigation with no referrer at all** — is `cross-site`, which is what an
+/// unprovable case must resolve to.
+///
+/// # Why a referrer-less navigation is not `none`
+///
+/// `Sec-Fetch-Site: none` means "no initiator" — a typed URL, a bookmark — and
+/// `csrf::enforce_origin_policy` accepts it. A service worker cannot tell that
+/// apart from a navigation whose referrer was **suppressed**, and suppression
+/// is attacker-controllable: `<form referrerpolicy="no-referrer">`, a
+/// `<meta name="referrer">` on the attacking page, or a redirect that drops
+/// it. A same-site sibling's top-level `<form>` POST is exactly the shape
+/// `SameSite=Lax` still attaches the `auth_token` cookie to, so answering
+/// `none` here would hand that request the CSRF check's approval.
+///
+/// Nothing legitimate is lost by refusing it. This value is only ever
+/// consulted for a cookie-authenticated **unsafe** method (the policy returns
+/// early otherwise), and a same-origin form POST carries a referrer under the
+/// `Referrer-Policy: strict-origin-when-cross-origin` the security-headers
+/// block sets — a bookmark or typed URL is a `GET`, which never reaches the
+/// check at all.
+fn fetch_site_for(
+    mode: &str,
+    referrer: &str,
+    request_origin: &str,
+    self_origin: &str,
+) -> &'static str {
+    // An empty `self_origin` would make `"" == ""` true for a request whose
+    // origin is also unreadable, turning two unknowns into a same-origin
+    // verdict. Refuse before any comparison can do that.
+    if self_origin.is_empty() {
+        return "cross-site";
+    }
+    match mode {
+        // The client asked for a same-origin-only fetch and got one; the
+        // browser would have failed it otherwise.
+        "same-origin" => "same-origin",
+        // The default for `fetch()` is `cors`, so this is the ordinary
+        // same-origin API call. `no-cors` covers `<img>`, `<script>` and
+        // `sendBeacon` from the same controlled client.
+        "cors" | "no-cors" => {
+            if request_origin == self_origin {
+                "same-origin"
+            } else {
+                "cross-site"
+            }
+        }
+        // A navigation is judged on its referrer, and ONLY a referrer that
+        // is provably ours passes. An absent one is refused rather than
+        // reported as `none` — see the note above; this function never
+        // returns `none`.
+        "navigate" => {
+            if !referrer.is_empty() && origin_of(referrer) == self_origin {
+                "same-origin"
+            } else {
+                "cross-site"
+            }
+        }
+        _ => "cross-site",
+    }
+}
+
+/// The `scheme://authority` prefix of an absolute URL, or `""` when the string
+/// is not one.
+///
+/// Deliberately not `web_sys::Url` (a JS global this crate's pure tests must
+/// not need) and deliberately not lenient: `about:client` — the referrer
+/// placeholder a `Request` can carry before the referrer is resolved — has no
+/// authority, returns `""`, and is therefore judged cross-site.
+fn origin_of(url: &str) -> &str {
+    let Some(after_scheme) = url.find("://").map(|i| i + 3) else {
+        return "";
+    };
+    match url[after_scheme..].find('/') {
+        Some(slash) => &url[..after_scheme + slash],
+        None => url,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,4 +606,172 @@ fn build_streaming_response(
     init.set_status(status);
     init.set_headers(&headers);
     web_sys::Response::new_with_opt_readable_stream_and_init(Some(&raw_js), &init)
+}
+
+// ---------------------------------------------------------------------------
+// The `Sec-Fetch-Site` mapping
+// ---------------------------------------------------------------------------
+
+/// `impresspress-browser` only compiles for `wasm32`, so these run under
+/// `wasm-pack test --node` — the same harness `storage.rs` and `bridge.rs`
+/// use. [`fetch_site_for`] and [`origin_of`] are pure, so nothing here needs a
+/// worker, a `Request` or a network.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod fetch_site_tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{fetch_site_for, origin_of};
+
+    const SELF_ORIGIN: &str = "https://dev.impresspress.org";
+
+    #[wasm_bindgen_test]
+    fn a_same_origin_mode_request_is_same_origin() {
+        assert_eq!(
+            fetch_site_for("same-origin", "", SELF_ORIGIN, SELF_ORIGIN),
+            "same-origin"
+        );
+    }
+
+    /// The ordinary case: `fetch('/b/dev/api/files/write', {method:'POST'})`
+    /// from a page this worker controls. `fetch`'s default mode is `cors`.
+    #[wasm_bindgen_test]
+    fn a_cors_request_for_our_own_origin_is_same_origin() {
+        assert_eq!(
+            fetch_site_for("cors", "", SELF_ORIGIN, SELF_ORIGIN),
+            "same-origin"
+        );
+        assert_eq!(
+            fetch_site_for("no-cors", "", SELF_ORIGIN, SELF_ORIGIN),
+            "same-origin"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_cors_request_for_another_origin_is_cross_site() {
+        assert_eq!(
+            fetch_site_for("cors", "", "https://evil.example", SELF_ORIGIN),
+            "cross-site"
+        );
+        assert_eq!(
+            fetch_site_for("no-cors", "", "https://evil.example", SELF_ORIGIN),
+            "cross-site"
+        );
+    }
+
+    /// Clicking a link on our own page.
+    #[wasm_bindgen_test]
+    fn a_navigation_referred_by_our_own_page_is_same_origin() {
+        assert_eq!(
+            fetch_site_for(
+                "navigate",
+                "https://dev.impresspress.org/b/admin/",
+                SELF_ORIGIN,
+                SELF_ORIGIN
+            ),
+            "same-origin"
+        );
+    }
+
+    /// A referrer-less navigation is REFUSED, not reported as `none`.
+    ///
+    /// `none` would mean "no initiator" (a typed URL, a bookmark) and
+    /// `csrf::enforce_origin_policy` accepts it — but a worker cannot tell
+    /// that from a navigation whose referrer an attacker suppressed with
+    /// `referrerpolicy="no-referrer"`, a `<meta name=referrer>`, or a
+    /// redirect. A same-site sibling's top-level `<form>` POST carries the
+    /// `SameSite=Lax` cookie, so `none` here would be a CSRF bypass. Nothing
+    /// legitimate is lost: this value is only consulted for a
+    /// cookie-authenticated unsafe method, and a real same-origin form POST
+    /// has a referrer.
+    #[wasm_bindgen_test]
+    fn a_navigation_with_no_referrer_is_cross_site() {
+        assert_eq!(
+            fetch_site_for("navigate", "", SELF_ORIGIN, SELF_ORIGIN),
+            "cross-site"
+        );
+    }
+
+    /// Stated on its own because it is the property the arm above exists for:
+    /// nothing this function can answer is ever `none`.
+    #[wasm_bindgen_test]
+    fn no_input_produces_none() {
+        for mode in [
+            "same-origin",
+            "cors",
+            "no-cors",
+            "navigate",
+            "websocket",
+            "",
+        ] {
+            for referrer in ["", "about:client", SELF_ORIGIN, "https://evil.example/a"] {
+                for request_origin in ["", SELF_ORIGIN, "https://evil.example"] {
+                    assert_ne!(
+                        fetch_site_for(mode, referrer, request_origin, SELF_ORIGIN),
+                        "none",
+                        "mode {mode}, referrer {referrer}, origin {request_origin}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The CSRF case this whole mapping exists to keep refused: a cross-site
+    /// page posting a `<form>` at us navigates into the worker's scope, so the
+    /// worker *does* see it.
+    #[wasm_bindgen_test]
+    fn a_navigation_referred_by_someone_else_is_cross_site() {
+        assert_eq!(
+            fetch_site_for(
+                "navigate",
+                "https://evil.example/attack.html",
+                SELF_ORIGIN,
+                SELF_ORIGIN
+            ),
+            "cross-site"
+        );
+    }
+
+    /// `about:client` has no authority, so it cannot be shown to be ours.
+    #[wasm_bindgen_test]
+    fn a_navigation_with_an_unparseable_referrer_is_cross_site() {
+        assert_eq!(
+            fetch_site_for("navigate", "about:client", SELF_ORIGIN, SELF_ORIGIN),
+            "cross-site"
+        );
+    }
+
+    /// A mode this build of `web-sys` does not name resolves to `""`, and an
+    /// unprovable case is a refusal.
+    #[wasm_bindgen_test]
+    fn an_unknown_mode_is_cross_site() {
+        assert_eq!(
+            fetch_site_for("", "", SELF_ORIGIN, SELF_ORIGIN),
+            "cross-site"
+        );
+        assert_eq!(
+            fetch_site_for("websocket", "", SELF_ORIGIN, SELF_ORIGIN),
+            "cross-site"
+        );
+    }
+
+    /// Two unknowns must not compare equal into a same-origin verdict.
+    #[wasm_bindgen_test]
+    fn an_unknown_self_origin_is_cross_site_whatever_the_request_says() {
+        for mode in ["same-origin", "cors", "no-cors", "navigate"] {
+            assert_eq!(
+                fetch_site_for(mode, "", "", ""),
+                "cross-site",
+                "mode {mode} with no worker origin",
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn origin_of_takes_the_scheme_and_authority_only() {
+        assert_eq!(origin_of("https://a.example/b/c?d=e"), "https://a.example");
+        assert_eq!(origin_of("http://127.0.0.1:8082/"), "http://127.0.0.1:8082");
+        assert_eq!(origin_of("http://127.0.0.1:8082"), "http://127.0.0.1:8082");
+        assert_eq!(origin_of("about:client"), "");
+        assert_eq!(origin_of(""), "");
+    }
 }
