@@ -323,6 +323,7 @@ pub async fn import(
             ));
         }
         artifacts::put(ctx, &bytes).await.map_err(|e| e.message)?;
+        record_seeded_build(ctx, &block.spec, bytes.len() as u64).await?;
 
         for entry in &block.sources {
             let workspace_path = format!("{}{name}/{}", workspace::BLOCKS_PREFIX, entry.path);
@@ -428,6 +429,51 @@ async fn fetch_verified(
     let served = paths::content_type_for(workspace_path);
     fetch_and_verify(fetch, url, declared, served).await
 }
+
+/// Record a seeded artifact in the builds table.
+///
+/// A seed drops compiled artifacts straight into the store, which would
+/// otherwise leave them the only artifacts no build row describes — and that
+/// table is what `dev_status` reports the artifact store from, and what
+/// `super::gc` deletes a row from when it collects the bytes. A seeded
+/// instance would report an empty artifact store while running four blocks.
+///
+/// Written straight to [`BuildStatus::Valid`]: the bundle's spec is the
+/// accepted spec the exporting instance's ledger held, and generation 0 —
+/// which the caller activates next — already names the artifact, so the row is
+/// never the thing keeping it reachable and must not be left `Staged`, which
+/// is the collector's "a compile is still coming" marker.
+///
+/// `block_info_json` stays `"null"`: a bundle carries the registered spec, not
+/// the `BlockInfo` the guest reports, and inventing one would put endpoints
+/// into the duplicate-agent-tool check that no guest declared.
+async fn record_seeded_build(
+    ctx: &dyn Context,
+    spec: &DynamicBlockSpec,
+    artifact_bytes: u64,
+) -> Result<(), String> {
+    let row = repo::builds::insert(
+        ctx,
+        &repo::builds::NewBuild {
+            block_name: spec.name.clone(),
+            source_manifest_sha256: String::new(),
+            artifact_sha256: spec.artifact_sha256.clone(),
+            block_info_json: "null".to_string(),
+            diagnostics_json: "[]".to_string(),
+            compiler_version: SEEDED_COMPILER_VERSION.to_string(),
+            artifact_bytes,
+        },
+    )
+    .await
+    .map_err(|e| e.message)?;
+    repo::builds::set_status(ctx, &row.id, repo::builds::BuildStatus::Valid, None, None)
+        .await
+        .map_err(|e| e.message)
+}
+
+/// What a seeded build records where a compile would record its toolchain: the
+/// bundle produced the bytes, and no toolchain ran here.
+const SEEDED_COMPILER_VERSION: &str = "seed-bundle";
 
 /// Store one verified file's bytes and record it in the workspace under
 /// construction.

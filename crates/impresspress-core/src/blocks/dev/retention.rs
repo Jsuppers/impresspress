@@ -23,6 +23,12 @@
 //! owns that half of the definition so it cannot be restated differently here
 //! and in the query that deletes.
 //!
+//! An in-flight row is kept because an activation might still finish it — not
+//! because it is immortal. `activation::converge_on_boot` retires the ones no
+//! journal names, which is what stops a crash loop from accumulating rows that
+//! pin blobs against the workspace quota (design amendment 13) and what keeps
+//! [`retained`]'s in-flight listing bounded.
+//!
 //! # Superseded is not an age
 //!
 //! `Superseded` is the status of a generation a later one replaced, written by
@@ -53,18 +59,37 @@ pub const RETAINED_GENERATIONS: usize = 20;
 
 /// The rows retention keeps.
 ///
-/// The newest [`RETAINED_GENERATIONS`], followed by any row kept for its
-/// status alone that the window did not already hold. Deduplicated by id, so
-/// a caller can treat the result as a set — which is what the collector needs
-/// it to be.
+/// The newest [`RETAINED_GENERATIONS`], then the generation that is serving,
+/// then whatever is still in flight — deduplicated by id, so a caller can
+/// treat the result as a set, which is what the collector needs it to be.
+///
+/// # Why three queries and not one
+///
+/// A single `status IN (…)` listing would be capped by a page, and the two
+/// kinds of row behind that cap are not equally safe to lose. The serving
+/// generation is what the site *is*: losing it would let the collector delete
+/// the blobs the site is being served from, so it is fetched on its own
+/// ([`generations::find_active`], one row, no cap between it and the answer).
+/// The in-flight rows are recovery targets and their listing IS capped — which
+/// is safe only because the set is *bounded*: `activation::converge_on_boot`
+/// retires every in-flight row the journal does not name, so what remains is
+/// the one being converged on plus the at-most-one an activation is running.
+/// Without that retirement, a crash loop would accumulate staged rows that
+/// pinned blobs against the workspace quota forever and, past the cap, would
+/// start pushing the serving generation out of this set.
 pub async fn retained(ctx: &dyn Context) -> Result<Vec<GenerationRow>, WaferError> {
     let mut rows = generations::list_recent(ctx, RETAINED_GENERATIONS as i64).await?;
     if rows.len() < RETAINED_GENERATIONS {
-        // The whole ledger is inside the window: a second query could only
-        // return rows this one already holds.
+        // The whole ledger is inside the window: the other two queries could
+        // only return rows this one already holds.
         return Ok(rows);
     }
-    for row in generations::list_retained_by_status(ctx).await? {
+
+    let older = generations::find_active(ctx)
+        .await?
+        .into_iter()
+        .chain(generations::list_in_flight(ctx).await?);
+    for row in older {
         if !rows.iter().any(|kept| kept.id == row.id) {
             rows.push(row);
         }
@@ -236,6 +261,44 @@ mod tests {
         assert!(retained_ids.contains(&active.id));
         assert!(retained_ids.contains(&staged.id));
         assert_eq!(retained_ids.len(), RETAINED_GENERATIONS + 2);
+    }
+
+    /// The serving generation is fetched on its own, so no listing page can
+    /// come between it and the retained set.
+    ///
+    /// 260 newer rows against a 200-row page cap: a `status IN (…)` listing
+    /// would have been truncated long before it reached this row, and the
+    /// collector would then have deleted the blobs the site is served from.
+    #[tokio::test]
+    async fn the_serving_generation_survives_more_newer_rows_than_a_page_holds() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let active = row(&ctx, GenerationStatus::Active).await;
+        for _ in 0..260 {
+            row(&ctx, GenerationStatus::Superseded).await;
+        }
+
+        let retained_ids: Vec<String> = retained(&ctx)
+            .await
+            .expect("retained")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(
+            retained_ids.contains(&active.id),
+            "the serving generation is retained past any page boundary",
+        );
+        assert_eq!(retained_ids.len(), RETAINED_GENERATIONS + 1);
+
+        // And the pass leaves it alone while deleting the 240 rows past the
+        // window — two pages' worth.
+        assert_eq!(prune(&ctx).await.expect("prune").len(), 240);
+        assert_eq!(
+            generations::get(&ctx, &active.id)
+                .await
+                .expect("get")
+                .status,
+            GenerationStatus::Active,
+        );
     }
 
     /// Retention deletes by age; it never rewrites how a generation ended.

@@ -899,6 +899,7 @@ pub async fn converge_on_boot(
         .await
         .map_err(|e| e.message)?;
     let (previous, state) = active_or_clear(ctx, &state).await?;
+    retire_abandoned(ctx, &state).await;
     if let Some(desired) = state.desired_generation_id.clone() {
         match generation::load(ctx, &desired).await {
             Ok((row, manifest)) => {
@@ -951,6 +952,76 @@ pub async fn converge_on_boot(
     Ok(active
         .map(|(_, manifest)| manifest.blocks)
         .unwrap_or_default())
+}
+
+/// The message an abandoned row is closed with.
+const ABANDONED_AT_BOOT: &str =
+    "abandoned at boot: the process ended before this activation finished";
+
+/// Close out the in-flight work the previous process did not finish.
+///
+/// A generation is `staged`/`validating`/`activating` because an activation is
+/// *running*, and a build is `staged` because a compile is. Nothing is running
+/// on a process that has just started, so every such row is wreckage — except
+/// the one the journal names, which is the activation this boot is about to
+/// converge on and the only one that can still finish.
+///
+/// Left alone they are not merely untidy. Retention keeps an in-flight
+/// generation whatever its age, and the collector keeps a staged build's
+/// artifact, so each abandoned row pins content against the workspace's 64 MiB
+/// quota (design §6.6) for the life of the instance — a crash loop would fill
+/// it with generations nothing can ever activate. An unbounded in-flight set
+/// also eventually outgrows the page `retention::retained` reads it through.
+///
+/// Best effort, like every other step of boot recovery: an instance that
+/// cannot tidy its ledger must still come up and serve.
+async fn retire_abandoned(ctx: &dyn Context, state: &RuntimeState) {
+    let in_flight = match repo::generations::list_in_flight(ctx).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                error = %e.message,
+                "dev sandbox: could not read the in-flight generations at boot",
+            );
+            Vec::new()
+        }
+    };
+    for row in in_flight {
+        // The journalled one is the activation being converged on, not
+        // wreckage: `converge_on_boot` re-runs it a few lines below.
+        if state.desired_generation_id.as_deref() == Some(row.id.as_str()) {
+            continue;
+        }
+        if let Err(e) = repo::generations::set_status(
+            ctx,
+            &row.id,
+            GenerationStatus::Failed,
+            Some(ABANDONED_AT_BOOT),
+            None,
+        )
+        .await
+        {
+            tracing::error!(
+                generation_id = %row.id,
+                error = %e.message,
+                "dev sandbox: could not retire an abandoned generation at boot",
+            );
+        }
+    }
+
+    // The same for builds, which have no journal: a staged build row is a
+    // compile that was running, and none is.
+    let diagnostics = serde_json::to_string(&[super::validation::Diagnostic::error(
+        super::validation::BUILD_ABANDONED,
+        ABANDONED_AT_BOOT,
+    )])
+    .unwrap_or_else(|_| "[]".to_string());
+    if let Err(e) = repo::builds::retire_in_flight(ctx, &diagnostics).await {
+        tracing::error!(
+            error = %e.message,
+            "dev sandbox: could not retire the abandoned builds at boot",
+        );
+    }
 }
 
 /// The generation the journal says is live, or `None` after clearing a pointer

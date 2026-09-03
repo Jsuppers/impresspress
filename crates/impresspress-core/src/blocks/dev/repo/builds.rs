@@ -5,6 +5,8 @@
 //! the reported `BlockInfo` and the compiler diagnostics, so a refusal can be
 //! explained after the fact without re-running the toolchain.
 
+use std::collections::BTreeMap;
+
 use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
@@ -31,6 +33,25 @@ pub enum BuildStatus {
 }
 
 impl BuildStatus {
+    /// Whether a row in this status says its compile has not reached a
+    /// generation yet — and so whether the artifact it names is protected by
+    /// the row alone.
+    ///
+    /// Only [`Self::Staged`] does. Staging inserts the row *before* it stores
+    /// the bytes and leaves it staged until the activation it asks for has
+    /// minted a generation, so the row covers exactly the interval in which
+    /// nothing else names the artifact ([`super::super::gc`]). `Valid` and
+    /// `Invalid` are both terminal: by then either a generation names the
+    /// artifact or the compile is over and it is garbage.
+    ///
+    /// Exhaustive on purpose: a new status has to state which side it is on.
+    pub fn is_in_flight(self) -> bool {
+        match self {
+            Self::Staged => true,
+            Self::Valid | Self::Invalid => false,
+        }
+    }
+
     /// Canonical string form (matches the serde representation and the
     /// column's `CHECK` constraint).
     pub fn as_str(self) -> &'static str {
@@ -70,6 +91,13 @@ pub struct BuildRow {
     pub diagnostics_json: String,
     /// Pinned toolchain revision that produced the artifact.
     pub compiler_version: String,
+    /// Stored size of the artifact, in bytes.
+    ///
+    /// Here rather than read back from the object store, because this table
+    /// is the index of what the store holds — the collector deletes a row
+    /// with the artifact it names — and `dev_status` reports the store's size
+    /// on every poll.
+    pub artifact_bytes: u64,
     /// Whether the artifact was accepted.
     pub status: BuildStatus,
     /// RFC 3339 creation time.
@@ -92,6 +120,8 @@ pub struct NewBuild {
     pub diagnostics_json: String,
     /// Pinned toolchain revision.
     pub compiler_version: String,
+    /// Stored size of the artifact, in bytes.
+    pub artifact_bytes: u64,
 }
 
 /// Append a build in [`BuildStatus::Staged`], returning the stored row.
@@ -104,6 +134,7 @@ pub async fn insert(ctx: &dyn Context, new: &NewBuild) -> Result<BuildRow, Wafer
         block_info_json: new.block_info_json.clone(),
         diagnostics_json: new.diagnostics_json.clone(),
         compiler_version: new.compiler_version.clone(),
+        artifact_bytes: new.artifact_bytes,
         status: BuildStatus::Staged,
         created_at: super::now(),
     };
@@ -119,6 +150,7 @@ pub async fn insert(ctx: &dyn Context, new: &NewBuild) -> Result<BuildRow, Wafer
             "block_info_json": row.block_info_json,
             "diagnostics_json": row.diagnostics_json,
             "compiler_version": row.compiler_version,
+            "artifact_bytes": row.artifact_bytes,
             "status": row.status.as_str(),
             "created_at": row.created_at,
         })),
@@ -184,11 +216,7 @@ pub async fn latest_valid_for_artifact(
                     operator: FilterOp::Equal,
                     value: serde_json::json!(artifact_sha256),
                 },
-                Filter {
-                    field: "status".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(BuildStatus::Valid.as_str()),
-                },
+                status_is(BuildStatus::Valid),
             ],
             // With `limit: 1` the tiebreaker is not cosmetic: two valid builds
             // of one artifact stamped in the same millisecond would otherwise
@@ -226,35 +254,28 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<BuildRow>,
     list.records.iter().map(decode).collect()
 }
 
-/// Every build stamped at or after `created_at`, newest first.
+/// Every build whose compile has not reached a generation yet, newest first.
 ///
-/// The garbage collector's window on a compile that has not reached a
-/// generation yet: staging stores the row before the bytes and only asks for
-/// an activation once the guest has been accepted, so between those two there
-/// is an artifact no manifest names. `None` means "the whole table" — an
-/// instance with no generations has no boundary to be younger than, and
-/// protecting every artifact is the safe reading of that.
+/// These are the garbage collector's artifact roots outside the ledger:
+/// staging inserts the row before it stores the bytes and leaves it
+/// [`BuildStatus::Staged`] until the activation it asks for has minted a
+/// generation, so a staged row means "these bytes are on their way to a
+/// manifest, do not collect them".
 ///
-/// Capped at [`MAX_LIST_LIMIT`] like every other listing here, and newest
-/// first so the page that survives the cap is the one holding the compiles
-/// that could still be in flight.
-pub async fn list_since(
-    ctx: &dyn Context,
-    created_at: Option<&str>,
-) -> Result<Vec<BuildRow>, WaferError> {
+/// A *status*, not an age window. A time-based rule ("younger than the oldest
+/// retained generation") looks equivalent and is not: a browser compile takes
+/// tens of seconds, and twenty site writes during one would push its build
+/// past the boundary and collect the artifact out from under it.
+///
+/// Capped at [`MAX_LIST_LIMIT`], which is safe because the set is bounded:
+/// staged rows are terminal only while a compile is running, and
+/// [`retire_in_flight`] retires the ones a crash left behind on the next boot.
+pub async fn list_in_flight(ctx: &dyn Context) -> Result<Vec<BuildRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
-            filters: created_at
-                .map(|created_at| {
-                    vec![Filter {
-                        field: "created_at".into(),
-                        operator: FilterOp::GreaterEqual,
-                        value: serde_json::json!(created_at),
-                    }]
-                })
-                .unwrap_or_default(),
+            filters: vec![status_is(BuildStatus::Staged)],
             sort: newest_first(),
             limit: MAX_LIST_LIMIT,
             skip_count: true,
@@ -263,6 +284,131 @@ pub async fn list_since(
     )
     .await?;
     list.records.iter().map(decode).collect()
+}
+
+/// Whether any in-flight build names `artifact_sha256`.
+///
+/// The collector's last look before it deletes. Its root set is read once, and
+/// a stage that inserted its row after that read would not be in it — this
+/// re-asks the question against the row that would have to exist, immediately
+/// before the object goes. One query per *deleted* artifact, which is a rare
+/// event.
+pub async fn is_in_flight_for_artifact(
+    ctx: &dyn Context,
+    artifact_sha256: &str,
+) -> Result<bool, WaferError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            filters: vec![
+                Filter {
+                    field: "artifact_sha256".into(),
+                    operator: FilterOp::Equal,
+                    value: serde_json::json!(artifact_sha256),
+                },
+                status_is(BuildStatus::Staged),
+            ],
+            limit: 1,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(!list.records.is_empty())
+}
+
+/// Retire every in-flight build, recording `diagnostics_json` on each, and
+/// return how many were retired.
+///
+/// For boot. A staged row means "a compile is running"; nothing is running on
+/// a process that has just started, so every one of them is the wreckage of a
+/// stage the last process did not finish. Left alone they would pin their
+/// artifacts against the workspace quota for the life of the instance, since
+/// the collector treats a staged row as a promise that a generation is coming.
+pub async fn retire_in_flight(
+    ctx: &dyn Context,
+    diagnostics_json: &str,
+) -> Result<usize, WaferError> {
+    let rows = list_in_flight(ctx).await?;
+    for row in &rows {
+        set_status(
+            ctx,
+            &row.id,
+            BuildStatus::Invalid,
+            Some(diagnostics_json),
+            None,
+        )
+        .await?;
+    }
+    Ok(rows.len())
+}
+
+/// Every artifact this table indexes, as `sha256 -> stored bytes`.
+///
+/// The size of the artifact store, answered from the ledger rather than by
+/// walking the folder: `dev_status` is polled every ~300 ms while a tool call
+/// is outstanding, and a storage `list` is `O(folder)` on the OPFS backend the
+/// sandbox actually runs on. The table tracks the store because both ends are
+/// maintained together — a row is written before its bytes are stored, and the
+/// collector deletes a row with the artifact it names.
+///
+/// Deduplicated by hash: two compiles that produced identical bytes are two
+/// rows and one stored object. Only the two columns it needs are selected, so
+/// the poll does not drag the `BlockInfo` and diagnostics JSON of every build
+/// across with it, and it pages until the table is exhausted rather than
+/// stopping at [`MAX_LIST_LIMIT`] — an under-reported total would look exactly
+/// like a collector that had run.
+pub async fn artifact_index(ctx: &dyn Context) -> Result<BTreeMap<String, u64>, WaferError> {
+    let mut index = BTreeMap::new();
+    let mut offset = 0i64;
+    loop {
+        let list = db::list(
+            ctx,
+            TABLE,
+            &ListOptions {
+                columns: Some(vec!["artifact_sha256".into(), "artifact_bytes".into()]),
+                sort: vec![SortField {
+                    field: "artifact_sha256".into(),
+                    desc: false,
+                }],
+                limit: MAX_LIST_LIMIT,
+                offset,
+                skip_count: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let count = list.records.len() as i64;
+        for record in &list.records {
+            index.insert(
+                record.str_field("artifact_sha256").to_string(),
+                record.u64_field("artifact_bytes"),
+            );
+        }
+        if count < MAX_LIST_LIMIT {
+            return Ok(index);
+        }
+        offset += count;
+    }
+}
+
+/// Delete one build row.
+///
+/// Two callers, and both are undoing something: staging drops the row it
+/// inserted when the artifact it describes could not be stored, and the
+/// collector drops the rows of an artifact it has just deleted.
+pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
+    db::delete(ctx, TABLE, id).await
+}
+
+/// A `status = …` filter.
+fn status_is(status: BuildStatus) -> Filter {
+    Filter {
+        field: "status".into(),
+        operator: FilterOp::Equal,
+        value: serde_json::json!(status.as_str()),
+    }
 }
 
 /// Delete every build row naming `artifact_sha256`.
@@ -313,6 +459,7 @@ fn decode(record: &db::Record) -> Result<BuildRow, WaferError> {
         block_info_json: super::json_text(record, "block_info_json"),
         diagnostics_json: super::json_text(record, "diagnostics_json"),
         compiler_version: record.str_field("compiler_version").to_string(),
+        artifact_bytes: record.u64_field("artifact_bytes"),
         status: BuildStatus::parse(status_text).ok_or_else(|| {
             WaferError::new(
                 ErrorCode::Internal,
@@ -343,6 +490,7 @@ mod tests {
             block_info_json: BLOCK_INFO.to_string(),
             diagnostics_json: DIAGNOSTICS.to_string(),
             compiler_version: "rubrc@pinned".to_string(),
+            artifact_bytes: 128,
         }
     }
 
@@ -359,6 +507,7 @@ mod tests {
         assert_eq!(read_back.block_info_json, BLOCK_INFO);
         assert_eq!(read_back.diagnostics_json, DIAGNOSTICS);
         assert_eq!(read_back.compiler_version, "rubrc@pinned");
+        assert_eq!(read_back.artifact_bytes, 128);
     }
 
     #[tokio::test]
@@ -442,30 +591,119 @@ mod tests {
         );
     }
 
-    /// The collector reads this to decide which artifacts a compile may still
-    /// be on its way to a generation with, so the boundary has to be
-    /// inclusive and `None` has to mean "everything".
+    #[test]
+    fn only_a_staged_build_is_in_flight() {
+        assert!(BuildStatus::Staged.is_in_flight());
+        assert!(!BuildStatus::Valid.is_in_flight());
+        assert!(!BuildStatus::Invalid.is_in_flight());
+    }
+
+    /// The collector's roots outside the ledger are exactly the staged rows —
+    /// a status, never an age. A build that has been accepted or refused is
+    /// over, and its artifact's fate belongs to the generations.
     #[tokio::test]
-    async fn list_since_is_bounded_below_by_the_timestamp_it_is_given() {
+    async fn list_in_flight_is_the_staged_rows_and_nothing_else() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
         let mut rows = Vec::new();
         for name in ["site/a", "site/b", "site/c"] {
             rows.push(insert(&ctx, &new_build(name)).await.expect("insert"));
         }
+        assert_eq!(list_in_flight(&ctx).await.expect("list").len(), 3);
 
-        let all = list_since(&ctx, None).await.expect("list");
-        assert_eq!(all.len(), 3, "no boundary is the whole table");
-
-        let from_second = list_since(&ctx, Some(&rows[1].created_at))
+        set_status(&ctx, &rows[0].id, BuildStatus::Valid, None, None)
             .await
-            .expect("list");
+            .expect("accept");
+        set_status(&ctx, &rows[1].id, BuildStatus::Invalid, None, None)
+            .await
+            .expect("refuse");
         assert_eq!(
-            from_second
+            list_in_flight(&ctx)
+                .await
+                .expect("list")
                 .iter()
                 .map(|r| r.block_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["site/c", "site/b"],
-            "at or after the boundary, newest first",
+            vec!["site/c"],
+        );
+
+        assert!(is_in_flight_for_artifact(&ctx, "art").await.expect("ask"));
+        assert!(!is_in_flight_for_artifact(&ctx, "other").await.expect("ask"));
+        set_status(&ctx, &rows[2].id, BuildStatus::Valid, None, None)
+            .await
+            .expect("accept");
+        assert!(!is_in_flight_for_artifact(&ctx, "art").await.expect("ask"));
+    }
+
+    /// A staged row on a process that has just started is the wreckage of an
+    /// unfinished compile, and left alone it pins its artifact forever.
+    #[tokio::test]
+    async fn retire_in_flight_closes_the_rows_a_crash_left_staged() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let staged = insert(&ctx, &new_build("site/a")).await.expect("insert");
+        let accepted = insert(&ctx, &new_build("site/b")).await.expect("insert");
+        set_status(&ctx, &accepted.id, BuildStatus::Valid, None, None)
+            .await
+            .expect("accept");
+
+        let reason = r#"[{"level":"error","message":"abandoned at boot"}]"#;
+        assert_eq!(retire_in_flight(&ctx, reason).await.expect("retire"), 1);
+
+        let retired = get(&ctx, &staged.id).await.expect("get");
+        assert_eq!(retired.status, BuildStatus::Invalid);
+        assert_eq!(retired.diagnostics_json, reason);
+        // An accepted build is untouched, diagnostics included.
+        let untouched = get(&ctx, &accepted.id).await.expect("get");
+        assert_eq!(untouched.status, BuildStatus::Valid);
+        assert_eq!(untouched.diagnostics_json, DIAGNOSTICS);
+        // Idempotent: nothing is left in flight.
+        assert_eq!(retire_in_flight(&ctx, reason).await.expect("retire"), 0);
+    }
+
+    /// `dev_status` reports the artifact store from this index, so it has to
+    /// count stored *objects* rather than rows, and it must not stop at a
+    /// page boundary.
+    #[tokio::test]
+    async fn the_artifact_index_deduplicates_by_hash_and_pages_to_the_end() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        // Two rows, one artifact: a re-stage of identical bytes.
+        insert(&ctx, &new_build("site/a")).await.expect("insert");
+        insert(&ctx, &new_build("site/a")).await.expect("insert");
+        let mut other = new_build("site/b");
+        other.artifact_sha256 = "other".to_string();
+        other.artifact_bytes = 7;
+        insert(&ctx, &other).await.expect("insert");
+
+        let index = artifact_index(&ctx).await.expect("index");
+        assert_eq!(index.len(), 2, "two stored objects, three rows");
+        assert_eq!(index.get("art"), Some(&128));
+        assert_eq!(index.get("other"), Some(&7));
+        assert_eq!(index.values().sum::<u64>(), 135);
+    }
+
+    /// The page cap is not the answer's ceiling: 250 rows against a 200-row
+    /// page still counts every artifact.
+    #[tokio::test]
+    async fn the_artifact_index_is_not_bounded_by_one_page() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        for i in 0..250 {
+            let mut build = new_build("site/a");
+            build.artifact_sha256 = format!("art-{i:04}");
+            build.artifact_bytes = 1;
+            insert(&ctx, &build).await.expect("insert");
+        }
+        let index = artifact_index(&ctx).await.expect("index");
+        assert_eq!(index.len(), 250);
+        assert_eq!(index.values().sum::<u64>(), 250);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_one_row() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        let row = insert(&ctx, &new_build("site/a")).await.expect("insert");
+        delete(&ctx, &row.id).await.expect("delete");
+        assert_eq!(
+            get(&ctx, &row.id).await.expect_err("gone").code,
+            ErrorCode::NotFound
         );
     }
 
@@ -509,6 +747,7 @@ mod tests {
         data.insert("block_info_json".to_string(), serde_json::json!("null"));
         data.insert("diagnostics_json".to_string(), serde_json::json!("[]"));
         data.insert("compiler_version".to_string(), serde_json::json!("v"));
+        data.insert("artifact_bytes".to_string(), serde_json::json!(0));
         data.insert("status".to_string(), serde_json::json!("probably_fine"));
         data.insert("created_at".to_string(), serde_json::json!("1970-01-01"));
         let record = db::Record {

@@ -178,13 +178,33 @@ async fn stage(
             diagnostics_json: serde_json::to_string(&request.diagnostics)
                 .map_err(encoding_error)?,
             compiler_version: request.compiler_version.clone(),
+            artifact_bytes: artifact.len() as u64,
         },
     )
     .await?;
 
     // Content-addressed, so re-staging identical bytes is a no-op write and
     // two blocks that compiled to the same module share one object.
-    let stored = artifacts::put(ctx, artifact).await?;
+    //
+    // A failed store takes the row back out. The row's whole job is to say
+    // "these bytes are stored and on their way to a generation"; left behind
+    // for bytes that never arrived it would tell the collector to protect an
+    // object that does not exist, and tell `dev_status` the artifact store
+    // holds it. Best effort — if the delete fails too, the next boot's
+    // `retire_in_flight` closes the row.
+    let stored = match artifacts::put(ctx, artifact).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            if let Err(cleanup) = repo::builds::delete(ctx, &build.id).await {
+                tracing::error!(
+                    build_id = %build.id,
+                    error = %cleanup.message,
+                    "dev sandbox: could not drop the build row of an artifact that failed to store",
+                );
+            }
+            return Err(e);
+        }
+    };
     debug_assert_eq!(
         stored, artifact_sha256,
         "artifact key must be its content hash"
@@ -255,11 +275,19 @@ async fn stage(
         return Ok(refusal_response(Some(build.id), diagnostics));
     }
 
+    // The reported `BlockInfo` is recorded now — the guest has just produced
+    // it, and a process that dies during the activation below must not lose
+    // it — but the row STAYS staged. `Staged` is what tells the collector this
+    // artifact is on its way to a generation and must not be touched
+    // (`super::gc`), and it is on its way until the activation has minted one.
+    // Accepting it here instead would leave the artifact rootless for the
+    // whole time the request sits in the activation queue — which is exactly
+    // when the activation ahead of it runs the collector.
     let block_info_json = serde_json::to_string(&info).map_err(encoding_error)?;
     repo::builds::set_status(
         ctx,
         &build.id,
-        BuildStatus::Valid,
+        BuildStatus::Staged,
         None,
         Some(&block_info_json),
     )
@@ -267,14 +295,22 @@ async fn stage(
 
     let mut blocks = others;
     blocks.push(spec);
-    let outcome = match activation::request(
+    let activated = activation::request(
         ctx,
         shared,
         GenerationCause::BlockCompile,
         ActivationIntent::BlockSet { site: None, blocks },
     )
-    .await
-    {
+    .await;
+
+    // Accepted either way: the guest passed every rule and the probe, which is
+    // what `Valid` states. Whether the *activation* landed is the generation
+    // ledger's business — and it is also what the artifact's reachability now
+    // rests on, since a refused activation still leaves a `failed` generation
+    // naming it until that row ages out.
+    repo::builds::set_status(ctx, &build.id, BuildStatus::Valid, None, None).await?;
+
+    let outcome = match activated {
         Ok(outcome) => outcome,
         Err(e) => return Ok(e.into_response()),
     };

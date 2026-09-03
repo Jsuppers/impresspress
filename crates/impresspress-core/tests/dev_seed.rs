@@ -132,6 +132,23 @@ async fn a_seed_bundle_becomes_the_workspace_and_generation_zero() {
     assert_eq!(site, vec!["assets/app.js", "index.html"]);
     assert_eq!(generation.blocks.len(), 1);
     assert_eq!(generation.blocks[0].name, "site/hello");
+
+    // A seeded artifact is recorded in the builds table like a compiled one.
+    // That table is the index `dev_status` reports the artifact store from and
+    // the one the collector deletes a row from when it reclaims the bytes, so
+    // an artifact missing from it is an artifact the sandbox cannot see.
+    let build = repo::builds::latest_valid_for_artifact(&ctx, &blobs::sha256_hex(ARTIFACT))
+        .await
+        .expect("lookup")
+        .expect("the seeded artifact has an accepted build row");
+    assert_eq!(build.block_name, "site/hello");
+    assert_eq!(build.artifact_bytes, ARTIFACT.len() as u64);
+    // Never left staged: `staged` is the collector's "a compile is still
+    // coming" marker, and none is.
+    assert!(repo::builds::list_in_flight(&ctx)
+        .await
+        .expect("list")
+        .is_empty());
 }
 
 /// The whole point of the import: the manifest it returns activates through

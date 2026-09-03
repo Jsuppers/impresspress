@@ -27,13 +27,35 @@
 //! be read back by any request the sandbox can serve, because every read
 //! addresses content through one of those two.
 //!
+//! # The ordering invariant
+//!
+//! **List first, then read the roots.** The candidate set is fixed by the
+//! folder listing, and every root is read after it, so anything stored *after*
+//! the listing is not a candidate at all and needs no root to protect it. The
+//! reverse order — roots, then listing — has a hole with no bottom: a compile
+//! that inserts its build row after the roots are read and stores its bytes
+//! before the listing produces an object that is a candidate and has no root,
+//! and the collector deletes the artifact the compile is about to activate.
+//!
+//! That is why staging inserts its build row *before* it stores the artifact
+//! (`super::blocks_api`). Together the two orderings close the interval: bytes
+//! in the listing were stored before it, their row was written before them, so
+//! the root read that follows the listing cannot miss it.
+//!
+//! The workspace is read under the same lock a file write takes, after the
+//! listing, for the same reason in the other store: a write stores its blob
+//! and saves the entry naming it inside one lock hold.
+//!
+//! Each artifact is asked about once more, immediately before it goes, in case
+//! a stage arrived in between ([`repo::builds::is_in_flight_for_artifact`]) —
+//! cheap, because only a deletion pays for it.
+//!
 //! # When it runs
 //!
 //! At the end of every successful activation, after retention has pruned
-//! (`super::activation`). That is the only moment a generation stops being
-//! reachable, and it is already the moment the workspace may have stopped
-//! naming a blob — so the two things that can create garbage are both
-//! immediately behind it.
+//! (`super::activation`), and after a `blocks/` file delete, which changes what
+//! the workspace names without publishing anything. Those are the two moments
+//! content stops being reachable.
 
 use std::collections::BTreeSet;
 
@@ -65,8 +87,52 @@ pub struct GcReport {
     pub bytes_freed: u64,
 }
 
+/// A seam the collector yields at, once, between its listing and its roots.
+///
+/// The module's whole soundness argument is an ordering one, and orderings are
+/// exactly what a serial test cannot observe: nothing in the fixture's storage
+/// or database yields, so no compile can interleave itself into the gap the
+/// argument is about. This is the one place a test can put something there.
+///
+/// Production passes [`Uninterrupted`]. There is no `cfg(test)` on the trait
+/// because a seam that only exists under `cfg(test)` is a seam whose shipped
+/// build is a different function from the tested one.
+#[wafer_block::wafer_async_trait]
+pub trait GcInterleave: wafer_run::MaybeSend + wafer_run::MaybeSync {
+    /// Called once, after both folders have been listed and before any root
+    /// has been read.
+    async fn after_listing(&self);
+}
+
+/// The [`GcInterleave`] production uses: nothing happens in the gap.
+pub struct Uninterrupted;
+
+#[wafer_block::wafer_async_trait]
+impl GcInterleave for Uninterrupted {
+    async fn after_listing(&self) {}
+}
+
 /// Delete every blob and artifact nothing retained can reach.
 pub async fn collect(ctx: &dyn Context, shared: &DevShared) -> Result<GcReport, WaferError> {
+    collect_interleaved(ctx, shared, &Uninterrupted).await
+}
+
+/// [`collect`], with the [`GcInterleave`] seam exposed.
+///
+/// Public for `tests/dev_gc.rs`; every production caller wants [`collect`].
+pub async fn collect_interleaved(
+    ctx: &dyn Context,
+    shared: &DevShared,
+    interleave: &dyn GcInterleave,
+) -> Result<GcReport, WaferError> {
+    // 1. The listings, first and before anything else is read. They fix the
+    //    candidate set: an object stored after this point is not in it.
+    let blob_objects = list_all(ctx, blobs::FOLDER).await?;
+    let artifact_objects = list_all(ctx, artifacts::FOLDER).await?;
+
+    interleave.after_listing().await;
+
+    // 2. The roots, all read after the listings.
     let retained = retention::retained(ctx).await?;
     let mut live_blobs = BTreeSet::new();
     let mut live_artifacts = BTreeSet::new();
@@ -84,37 +150,42 @@ pub async fn collect(ctx: &dyn Context, shared: &DevShared) -> Result<GcReport, 
                 .map(|spec| spec.artifact_sha256.clone()),
         );
     }
-
-    // A compile that has not reached a generation yet. The boundary is the
-    // oldest row retention kept: a build older than that belongs to an era
-    // whose generations have already gone, so nothing it staged can still be
-    // in flight.
-    let oldest_retained = retained.iter().map(|row| row.created_at.as_str()).min();
-    for build in repo::builds::list_since(ctx, oldest_retained).await? {
+    // Plus every compile that has stored an artifact and not yet reached a
+    // generation — a *status*, not an age: a browser compile takes tens of
+    // seconds, and a rule that expired the protection by time would collect
+    // the artifact of a compile that was merely slow.
+    for build in repo::builds::list_in_flight(ctx).await? {
         live_artifacts.insert(build.artifact_sha256);
     }
 
+    // 3. The deletes.
     let mut report = GcReport::default();
-    collect_blobs(ctx, shared, live_blobs, &mut report).await?;
-    collect_artifacts(ctx, &live_artifacts, &mut report).await?;
+    collect_blobs(ctx, shared, blob_objects, live_blobs, &mut report).await?;
+    collect_artifacts(ctx, artifact_objects, &live_artifacts, &mut report).await?;
     Ok(report)
 }
 
-/// What the two stores and the workspace currently hold.
+/// What the two stores, the workspace and the ledger hold.
 ///
-/// Computed from the listings on every call rather than kept as a counter:
-/// these are the figures a reader checks the collector *against*, and a
-/// counter that drifted would be indistinguishable from a collector that had
-/// stopped running.
+/// Read from the counters and the ledger, never by walking the stores. The
+/// `/b/dev` page polls status every ~300 ms while a tool call is outstanding,
+/// and a storage `list` is `O(folder)` on the OPFS backend the sandbox runs
+/// on — one full listing path is enough, and it belongs to [`collect`], which
+/// runs once per activation rather than three times a second.
+///
+/// The two sources are the same bytes counted at the two ends that maintain
+/// them: [`workspace::Workspace`]'s blob counters are written by the file
+/// writes that store blobs and credited by [`collect`] as it frees them, and
+/// the builds table has a row per stored artifact because staging writes the
+/// row before the bytes and [`collect`] deletes the row with them.
 pub async fn storage_usage(ctx: &dyn Context) -> Result<StorageUsage, WaferError> {
-    let blobs = list_all(ctx, blobs::FOLDER).await?;
-    let artifacts = list_all(ctx, artifacts::FOLDER).await?;
     let ws = workspace::load(ctx).await?;
+    let artifacts = repo::builds::artifact_index(ctx).await?;
     Ok(StorageUsage {
-        blobs: blobs.len() as u32,
-        blobs_bytes: total_bytes(&blobs),
+        blobs: ws.blob_count,
+        blobs_bytes: ws.blob_bytes,
         artifacts: artifacts.len() as u32,
-        artifacts_bytes: total_bytes(&artifacts),
+        artifacts_bytes: artifacts.values().sum(),
         workspace_files: ws.files.len() as u32,
         retained_generations: retention::retained(ctx).await?.len() as u32,
     })
@@ -124,6 +195,7 @@ pub async fn storage_usage(ctx: &dyn Context) -> Result<StorageUsage, WaferError
 async fn collect_blobs(
     ctx: &dyn Context,
     shared: &DevShared,
+    candidates: Vec<ObjectInfo>,
     mut live: BTreeSet<String>,
     report: &mut GcReport,
 ) -> Result<(), WaferError> {
@@ -131,8 +203,10 @@ async fn collect_blobs(
     // Crediting the freed bytes is a read-modify-write of the whole manifest,
     // so a write that loaded before it and saved after it would put them back.
     // And a write stores its blob *inside* that lock, before it saves the
-    // entry naming it — so holding the lock across the listing is what stops
-    // this deleting a blob whose entry is a few instructions away.
+    // entry naming it — so reading the workspace here, after the listing and
+    // under the lock, cannot miss an entry for a blob that is a candidate:
+    // either the write had not stored its blob when the listing ran (not a
+    // candidate) or it had already saved the entry (a root).
     //
     // Deadlock-free for the reason `activation::adopt_site` documents:
     // `files.rs` releases the lock before it asks for an activation, so
@@ -142,7 +216,7 @@ async fn collect_blobs(
     live.extend(ws.files.values().map(|entry| entry.sha256.clone()));
 
     let mut credited = false;
-    for object in list_all(ctx, blobs::FOLDER).await? {
+    for object in candidates {
         if live.contains(&object.key) {
             continue;
         }
@@ -165,10 +239,11 @@ async fn collect_blobs(
 /// Delete the unreachable artifacts and the build rows that named them.
 async fn collect_artifacts(
     ctx: &dyn Context,
+    candidates: Vec<ObjectInfo>,
     live: &BTreeSet<String>,
     report: &mut GcReport,
 ) -> Result<(), WaferError> {
-    for object in list_all(ctx, artifacts::FOLDER).await? {
+    for object in candidates {
         // A key this block did not write is left alone. Nothing else writes
         // the folder, so this arm is unreachable in practice — but deleting an
         // object whose hash cannot be read is deleting something the collector
@@ -177,6 +252,12 @@ async fn collect_artifacts(
             continue;
         };
         if live.contains(sha) {
+            continue;
+        }
+        // One last look, immediately before the object goes: the root set was
+        // read a few awaits ago, and a stage that inserted its row after that
+        // read would not be in it. Only a deletion pays for this query.
+        if repo::builds::is_in_flight_for_artifact(ctx, sha).await? {
             continue;
         }
         artifacts::delete(ctx, sha).await?;
@@ -192,6 +273,10 @@ async fn collect_artifacts(
 }
 
 /// Every object in `folder`, walked until the listing is exhausted.
+///
+/// The only full-listing path in the block, and it is reached only from
+/// [`collect_interleaved`] — `dev_status` reports the stores from the counters
+/// that track them, so nothing walks a folder on a poll.
 ///
 /// Two paging modes, because the backends this runs on differ. A store that
 /// answers a `next_cursor` is paged by that token, which is what keeps a deep
@@ -246,8 +331,4 @@ async fn list_all(ctx: &dyn Context, folder: &str) -> Result<Vec<ObjectInfo>, Wa
 /// that would credit the workspace with sixteen exabytes.
 fn size_of(object: &ObjectInfo) -> u64 {
     object.size.max(0) as u64
-}
-
-fn total_bytes(objects: &[ObjectInfo]) -> u64 {
-    objects.iter().map(size_of).sum()
 }

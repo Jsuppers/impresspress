@@ -126,6 +126,9 @@ pub const ARTIFACT_TOO_LARGE: &str = "artifact-too-large";
 /// The artifact was compiled against a `wafer_guest.rs` that is not the one
 /// the sandbox scaffolds.
 pub const WAFER_GUEST_VERSION_CODE: &str = "wafer-guest-version";
+/// A staged build the previous process did not finish, retired on the next
+/// boot (`super::activation::converge_on_boot`).
+pub const BUILD_ABANDONED: &str = "build-abandoned";
 
 // ---------------------------------------------------------------------------
 // Diagnostics

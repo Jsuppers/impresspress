@@ -11,23 +11,29 @@
 //! directly would prove the collector's arithmetic and nothing about the loop.
 #![cfg(feature = "block-dev")]
 
+use base64ct::{Base64, Encoding as _};
 use impresspress_core::{
     blocks::dev::{
         activation::{self, ActivationIntent},
         artifacts, blobs,
+        contracts::SiteManifest,
         control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind},
+        gc::{self, GcInterleave},
+        generation::{self, GenerationManifest},
         repo::{
             self,
             builds::{BuildStatus, NewBuild},
-            generations::{self, GenerationStatus},
+            generations::{self, GenerationCause, GenerationStatus, NewGeneration},
         },
         retention,
         test_support::FakeControl,
-        workspace, WAFER_GUEST_VERSION,
+        workspace::{self, FileEntry},
+        WAFER_GUEST_VERSION,
     },
-    test_support::{admin_msg, output_json, TestContext},
+    test_support::{admin_msg, output_http_status, output_json, TestContext},
 };
 use serde_json::json;
+use wafer_core::clients::storage;
 use wafer_run::OutputStream;
 
 // ---------------------------------------------------------------------------
@@ -72,21 +78,108 @@ async fn storage_of(ctx: &TestContext) -> serde_json::Value {
     status["storage"].clone()
 }
 
-/// One block named `name`, with its own artifact stored.
+/// One block named `name`, with its own artifact stored and the accepted
+/// build row a real compile would have left behind.
 async fn block_spec(ctx: &TestContext, name: &str) -> DynamicBlockSpec {
-    let artifact_sha256 = artifacts::put(ctx, format!("\0asm\x01{name}").as_bytes())
+    let bytes = format!("\0asm\x01{name}").into_bytes();
+    let artifact_sha256 = artifacts::put(ctx, &bytes)
         .await
         .expect("store the artifact a manifest names");
-    DynamicBlockSpec {
+    let spec = DynamicBlockSpec {
         name: format!("site/{name}"),
-        artifact_sha256,
+        artifact_sha256: artifact_sha256.clone(),
         routes: vec![DynamicRoute {
             prefix: format!("/b/{name}/"),
             access: RouteAccessKind::Public,
         }],
         capabilities: wafer_block::BlockCapabilities::default(),
         wafer_guest_version: WAFER_GUEST_VERSION,
-    }
+    };
+    accept_build(ctx, &spec, bytes.len() as u64).await;
+    spec
+}
+
+/// The `valid` build row staging leaves behind once its activation has landed.
+async fn accept_build(ctx: &TestContext, spec: &DynamicBlockSpec, artifact_bytes: u64) -> String {
+    let row = repo::builds::insert(
+        ctx,
+        &NewBuild {
+            block_name: spec.name.clone(),
+            source_manifest_sha256: "src".to_string(),
+            artifact_sha256: spec.artifact_sha256.clone(),
+            block_info_json: "null".to_string(),
+            diagnostics_json: "[]".to_string(),
+            compiler_version: "rubrc@pinned".to_string(),
+            artifact_bytes,
+        },
+    )
+    .await
+    .expect("insert build");
+    repo::builds::set_status(ctx, &row.id, BuildStatus::Valid, None, None)
+        .await
+        .expect("accept build");
+    row.id
+}
+
+/// The `staged` build row a compile holds from before its bytes are stored
+/// until its activation has minted a generation.
+async fn stage_build(ctx: &TestContext, artifact_sha256: &str, artifact_bytes: u64) -> String {
+    repo::builds::insert(
+        ctx,
+        &NewBuild {
+            block_name: "site/pending".to_string(),
+            source_manifest_sha256: "src".to_string(),
+            artifact_sha256: artifact_sha256.to_string(),
+            block_info_json: "null".to_string(),
+            diagnostics_json: "[]".to_string(),
+            compiler_version: "rubrc@pinned".to_string(),
+            artifact_bytes,
+        },
+    )
+    .await
+    .expect("insert build")
+    .id
+}
+
+/// A generation carrying `site`, staged and never activated — what a crash
+/// between the ledger insert and the runtime swap leaves behind.
+async fn stage_generation(ctx: &TestContext, site: SiteManifest) -> String {
+    let id = repo::new_id();
+    let mut manifest = GenerationManifest::staged(site, Vec::new());
+    manifest.identify(id.clone(), None);
+    generations::insert(
+        ctx,
+        &NewGeneration {
+            id: id.clone(),
+            parent_id: None,
+            cause: GenerationCause::SiteWrite,
+            site_manifest_json: generation::canonical_text(&manifest.site).expect("canonical"),
+            block_manifest_json: generation::canonical_text(&manifest.blocks).expect("canonical"),
+            manifest_sha256: generation::manifest_sha256(&manifest).expect("hash"),
+        },
+    )
+    .await
+    .expect("stage");
+    id
+}
+
+/// A site manifest naming one file whose blob is stored but which no
+/// workspace path holds.
+async fn site_only_blob(ctx: &TestContext, content: &str) -> (SiteManifest, String) {
+    let (sha256, _stored) = blobs::put(ctx, content.as_bytes())
+        .await
+        .expect("store the blob a manifest names");
+    (
+        SiteManifest {
+            files: vec![FileEntry {
+                path: "index.html".to_string(),
+                sha256: sha256.clone(),
+                size: content.len() as u64,
+                content_type: "text/html; charset=utf-8".to_string(),
+            }],
+        },
+        sha256,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +228,18 @@ async fn gc_deletes_blobs_no_retained_generation_or_workspace_references() {
     let ws = workspace::load(&ctx).await.expect("load workspace");
     assert_eq!(ws.blob_count, 20, "25 stored, 5 reclaimed");
     assert_eq!(ws.blob_bytes, 5 * 2 + 15 * 3);
+
+    // `dev_status` reports those counters rather than walking the store, so
+    // something has to check the two against each other: a counter that had
+    // drifted would look exactly like a collector that was keeping up.
+    let stored = storage::list(&ctx, blobs::FOLDER, &storage::ListOptions::default())
+        .await
+        .expect("list the blob store");
+    assert_eq!(stored.objects.len(), 20, "the counters describe the store");
+    assert_eq!(
+        stored.objects.iter().map(|o| o.size).sum::<i64>(),
+        (5 * 2 + 15 * 3) as i64,
+    );
 }
 
 /// A block's sources live in the workspace and in no generation at all — a
@@ -164,9 +269,11 @@ async fn gc_never_deletes_a_blob_the_workspace_still_names_even_if_no_generation
         "twenty retained site versions plus the block source: {storage}",
     );
 
-    // And it goes the moment nothing names it: the delete leaves the blob
-    // alone (an older generation might have named it), the next collection
-    // takes it.
+    // And it goes the moment nothing names it — on the delete itself, not on
+    // some later unrelated site write. A `blocks/` delete publishes nothing
+    // (design §7.2), so without the collector running here the blob would stay
+    // charged against the workspace's quota until the agent happened to edit
+    // the site.
     let deleted = dev_post(
         &ctx,
         "/b/dev/api/files/delete",
@@ -174,11 +281,21 @@ async fn gc_never_deletes_a_blob_the_workspace_still_names_even_if_no_generation
     )
     .await;
     output_json(deleted).await;
-    write_file(&ctx, "site/page.html", "v24", sha.as_deref()).await;
     assert!(
         !blobs::exists(&ctx, &src_sha).await.expect("exists"),
-        "nothing names it any more",
+        "the delete that orphaned it is what reclaims it",
     );
+    let ws = workspace::load(&ctx).await.expect("load workspace");
+    assert!(
+        !ws.files.contains_key("blocks/hello/src/lib.rs"),
+        "and the entry is gone with it",
+    );
+    assert_eq!(
+        storage_of(&ctx).await["blobs"],
+        20,
+        "the quota accounting was credited, not just the store",
+    );
+    let _ = sha;
 }
 
 /// The figures move as content is reclaimed — that is what makes them worth
@@ -233,23 +350,6 @@ async fn gc_deletes_the_artifact_and_the_build_row_of_a_block_no_generation_name
 
     let spec = block_spec(&ctx, "hello").await;
     let superseded = spec.artifact_sha256.clone();
-    // The build row a real compile would have left behind, accepted.
-    let build = repo::builds::insert(
-        &ctx,
-        &NewBuild {
-            block_name: spec.name.clone(),
-            source_manifest_sha256: "src".to_string(),
-            artifact_sha256: superseded.clone(),
-            block_info_json: "null".to_string(),
-            diagnostics_json: "[]".to_string(),
-            compiler_version: "rubrc@pinned".to_string(),
-        },
-    )
-    .await
-    .expect("insert build");
-    repo::builds::set_status(&ctx, &build.id, BuildStatus::Valid, None, None)
-        .await
-        .expect("accept build");
 
     activation::request(
         &ctx,
@@ -308,46 +408,121 @@ async fn gc_deletes_the_artifact_and_the_build_row_of_a_block_no_generation_name
     assert_eq!(storage_of(&ctx).await["artifacts"], 1);
 }
 
-/// A compile stores its artifact before any generation names it. Its build row
-/// is what protects the bytes in that window — without it, a site write's
-/// collection landing between the stage and the activation would delete the
-/// artifact the compile is about to activate.
+/// A compile stores its artifact before any generation names it, and its build
+/// row is what protects the bytes for as long as that lasts.
+///
+/// The window is a *status*, not a stretch of time. A browser compile takes
+/// tens of seconds and an agent's site writes arrive in bursts, so the 21
+/// writes here are exactly what an age-based rule ("younger than the oldest
+/// retained generation") would let past — each one activates, each activation
+/// collects, and by the last the staged build is older than every generation
+/// the window keeps.
 #[tokio::test]
-async fn a_staged_build_protects_its_artifact_before_any_generation_names_it() {
+async fn a_staged_build_protects_its_artifact_through_a_burst_of_site_writes() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
 
-    // A ledger already past the window, so the collector has work to do and
-    // is not merely retaining everything.
+    // The state `POST /b/dev/api/builds/stage` is in between its row and its
+    // activation: row staged, bytes stored, no generation.
+    let bytes = b"\0asm\x01staged";
+    let artifact = blobs::sha256_hex(bytes);
+    stage_build(&ctx, &artifact, bytes.len() as u64).await;
+    artifacts::put(&ctx, bytes).await.expect("store");
+
+    // The compile is still running while the agent edits the site.
     let mut sha = None;
     for i in 0..21 {
         sha = Some(write_file(&ctx, "site/index.html", &format!("v{i}"), sha.as_deref()).await);
     }
-
-    // The state `POST /b/dev/api/builds/stage` is in between its row and its
-    // activation: bytes stored, row staged, no generation.
-    let artifact = artifacts::put(&ctx, b"\0asm\x01staged")
-        .await
-        .expect("store the artifact");
-    repo::builds::insert(
-        &ctx,
-        &NewBuild {
-            block_name: "site/pending".to_string(),
-            source_manifest_sha256: "src".to_string(),
-            artifact_sha256: artifact.clone(),
-            block_info_json: "null".to_string(),
-            diagnostics_json: "[]".to_string(),
-            compiler_version: "rubrc@pinned".to_string(),
-        },
-    )
-    .await
-    .expect("insert build");
-
-    // Another activation, which collects.
-    write_file(&ctx, "site/index.html", "v21", sha.as_deref()).await;
-
     assert!(
         artifacts::exists(&ctx, &artifact).await.expect("exists"),
-        "the build row is what says this compile is still in flight",
+        "a slow compile is still a compile: its row says the bytes are on their way",
+    );
+
+    // And the protection ends with the status, not with a clock: a refused
+    // compile's artifact goes on the next collection.
+    let row = repo::builds::list_in_flight(&ctx)
+        .await
+        .expect("list")
+        .pop()
+        .expect("the staged row");
+    repo::builds::set_status(&ctx, &row.id, BuildStatus::Invalid, None, None)
+        .await
+        .expect("refuse");
+    write_file(&ctx, "site/index.html", "v21", sha.as_deref()).await;
+    assert!(
+        !artifacts::exists(&ctx, &artifact).await.expect("exists"),
+        "nothing is on its way to a generation any more",
+    );
+}
+
+/// The collector lists before it reads its roots, and that ordering is the
+/// whole of its soundness: an object stored after the listing is not a
+/// candidate, and a root written after the listing is still read.
+///
+/// Unobservable without a seam — nothing in the fixture yields, so no compile
+/// can interleave itself into the gap — so `GcInterleave` puts one there.
+/// Under the reverse order (roots, then listing) both halves below are
+/// deleted.
+#[tokio::test]
+async fn a_stage_that_lands_between_the_listing_and_the_roots_keeps_its_artifact() {
+    /// Stages a build the way `blocks_api` does: the row for bytes that are
+    /// already stored, then a second artifact stored from scratch.
+    struct StageMidCollect<'a> {
+        ctx: &'a TestContext,
+        listed: String,
+        unlisted: Vec<u8>,
+    }
+
+    #[wafer_block::wafer_async_trait]
+    impl GcInterleave for StageMidCollect<'_> {
+        async fn after_listing(&self) {
+            // (a) A root for an artifact the listing already saw. The roots
+            //     are read after this, so it must be seen.
+            stage_build(self.ctx, &self.listed, 16).await;
+            // (b) An artifact stored after the listing, with no root at all.
+            //     It is not a candidate, so it needs none.
+            artifacts::put(self.ctx, &self.unlisted)
+                .await
+                .expect("store");
+        }
+    }
+
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    // An artifact in the store that nothing names — a candidate, and without
+    // the interleaved row it would go.
+    let listed = artifacts::put(&ctx, b"\0asm\x01listed")
+        .await
+        .expect("store");
+    // A second one that no generation and no row will ever name, so the
+    // collection below is doing real work rather than nothing at all.
+    let doomed = artifacts::put(&ctx, b"\0asm\x01doomed")
+        .await
+        .expect("store");
+
+    let unlisted = b"\0asm\x01unlisted".to_vec();
+    let unlisted_sha = blobs::sha256_hex(&unlisted);
+    let interleave = StageMidCollect {
+        ctx: &ctx,
+        listed: listed.clone(),
+        unlisted,
+    };
+    let report = gc::collect_interleaved(&ctx, &shared, &interleave)
+        .await
+        .expect("collect");
+
+    assert_eq!(report.artifacts_deleted, 1, "the unreferenced one went");
+    assert!(!artifacts::exists(&ctx, &doomed).await.expect("exists"));
+    assert!(
+        artifacts::exists(&ctx, &listed).await.expect("exists"),
+        "its build row was written before the roots were read",
+    );
+    assert!(
+        artifacts::exists(&ctx, &unlisted_sha)
+            .await
+            .expect("exists"),
+        "it was stored after the listing, so it was never a candidate",
     );
 }
 
@@ -415,10 +590,187 @@ async fn retention_keeps_the_serving_generation_and_its_blobs_under_a_run_of_fai
     assert_eq!(newest[0].status, GenerationStatus::Failed);
 
     // The collector reads the same retained set, so the live site's blob
-    // survives a ledger dominated by failures.
-    write_file(&ctx, "site/other.html", "x", None).await;
+    // survives a ledger dominated by failures — and the assertion is
+    // discriminating because that write REPLACES the workspace entry naming
+    // it, leaving the serving generation as its only root.
+    write_file(&ctx, "site/index.html", "replaced", Some(&live_blob)).await;
+    let ws = workspace::load(&ctx).await.expect("load workspace");
+    assert!(
+        !ws.references(&live_blob),
+        "the fixture must leave the workspace naming something else",
+    );
     assert!(
         blobs::exists(&ctx, &live_blob).await.expect("exists"),
-        "the active generation still names it",
+        "a generation inside the window still names it",
+    );
+}
+
+/// The serving generation's manifest is a root in its own right. A collector
+/// that only trusted the workspace would delete the bytes the site is being
+/// served from the moment a generation stopped matching the editable state —
+/// which is what a rollback, and every `BlockSet` intent carrying an explicit
+/// site, produces.
+#[tokio::test]
+async fn a_blob_only_the_active_generation_names_survives_collection() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    // Published straight from a manifest, so the workspace never names it.
+    let (site, served) = site_only_blob(&ctx, "<h1>live</h1>").await;
+    activation::request(
+        &ctx,
+        &shared,
+        GenerationCause::SiteWrite,
+        ActivationIntent::BlockSet {
+            site: Some(site),
+            blocks: Vec::new(),
+        },
+    )
+    .await
+    .expect("the manifest activates");
+
+    // Something genuinely unreachable, so the collection below is doing work.
+    let (orphan, _stored) = blobs::put(&ctx, b"nobody names me").await.expect("put");
+
+    let ws = workspace::load(&ctx).await.expect("load workspace");
+    assert!(
+        ws.files.is_empty() && !ws.references(&served),
+        "the fixture is only meaningful if the workspace does not name it",
+    );
+
+    let report = gc::collect(&ctx, &shared).await.expect("collect");
+    assert_eq!(report.blobs_deleted, 1);
+    assert!(!blobs::exists(&ctx, &orphan).await.expect("exists"));
+    assert!(
+        blobs::exists(&ctx, &served).await.expect("exists"),
+        "the generation that is serving names it, and that is a root",
+    );
+}
+
+/// The builds table is the index of what the artifact store holds, so a row
+/// for bytes that never made it in is a lie in both directions: the collector
+/// would protect an object that does not exist, and `dev_status` would report
+/// it as stored.
+#[tokio::test]
+async fn a_stage_whose_artifact_cannot_be_stored_leaves_no_build_row() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    ctx.fail_next_storage_put("the disk is on fire");
+
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/builds/stage",
+        json!({
+            "block_name": "hello",
+            "artifact_base64": Base64::encode_string(b"\0asm\x01\0\0\0"),
+            "compiler_version": "test",
+            "diagnostics": [],
+        }),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 500);
+
+    assert!(
+        repo::builds::list_in_flight(&ctx)
+            .await
+            .expect("list")
+            .is_empty(),
+        "the row went back out with the bytes that never arrived",
+    );
+    assert!(repo::builds::artifact_index(&ctx)
+        .await
+        .expect("index")
+        .is_empty());
+    assert_eq!(storage_of(&ctx).await["artifacts"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+/// An in-flight generation is kept because an activation might still finish
+/// it. Nothing is running on a process that has just started, so a staged row
+/// at boot is wreckage — and left staged it would keep its blobs against the
+/// workspace quota for the life of the instance, however far down the ledger
+/// it fell.
+#[tokio::test]
+async fn an_orphaned_staged_generation_is_retired_at_boot_and_its_blobs_collected() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    let (site, pinned) = site_only_blob(&ctx, "<h1>never activated</h1>").await;
+    let orphan = stage_generation(&ctx, site).await;
+
+    // Push it well past the retention window.
+    let mut sha = None;
+    for i in 0..21 {
+        sha = Some(write_file(&ctx, "site/index.html", &format!("v{i}"), sha.as_deref()).await);
+    }
+    assert_eq!(
+        generations::get(&ctx, &orphan).await.expect("get").status,
+        GenerationStatus::Staged,
+        "an in-flight row is not retention's to delete",
+    );
+    assert!(
+        blobs::exists(&ctx, &pinned).await.expect("exists"),
+        "and so its blob is pinned — which is the leak",
+    );
+
+    // The journal names nothing, so nothing is owed and the row is wreckage.
+    activation::converge_on_boot(&ctx, &shared)
+        .await
+        .expect("boot");
+    let retired = generations::get(&ctx, &orphan).await.expect("get");
+    assert_eq!(retired.status, GenerationStatus::Failed);
+    assert!(
+        retired
+            .failure_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("abandoned at boot"),
+        "the row must say why it was closed: {retired:?}",
+    );
+
+    // Now it is ordinary history, so the next activation prunes it and the
+    // collector reclaims what only it named.
+    write_file(&ctx, "site/index.html", "v21", sha.as_deref()).await;
+    assert_eq!(
+        generations::get(&ctx, &orphan)
+            .await
+            .expect_err("pruned")
+            .code,
+        wafer_run::ErrorCode::NotFound,
+    );
+    assert!(
+        !blobs::exists(&ctx, &pinned).await.expect("exists"),
+        "nothing names it any more",
+    );
+}
+
+/// The same for builds, which have no journal to be named by: a staged row is
+/// a compile that was running, and none is.
+#[tokio::test]
+async fn an_orphaned_staged_build_is_retired_at_boot_and_its_artifact_collected() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    let bytes = b"\0asm\x01abandoned";
+    let artifact = artifacts::put(&ctx, bytes).await.expect("store");
+    let row = stage_build(&ctx, &artifact, bytes.len() as u64).await;
+
+    activation::converge_on_boot(&ctx, &shared)
+        .await
+        .expect("boot");
+    let retired = repo::builds::get(&ctx, &row).await.expect("get");
+    assert_eq!(retired.status, BuildStatus::Invalid);
+    assert!(
+        retired.diagnostics_json.contains("abandoned at boot"),
+        "the row must say why it was closed: {}",
+        retired.diagnostics_json,
+    );
+
+    gc::collect(&ctx, &shared).await.expect("collect");
+    assert!(
+        !artifacts::exists(&ctx, &artifact).await.expect("exists"),
+        "no compile is coming for it",
     );
 }

@@ -69,9 +69,22 @@ impl GenerationStatus {
     ///
     /// Exhaustive on purpose: a new status has to state which side it is on.
     pub fn survives_retention(self) -> bool {
+        self.is_in_flight() || self == Self::Active
+    }
+
+    /// Whether an activation is still working on this generation.
+    ///
+    /// The journal may name such a row and boot convergence re-runs it
+    /// (design §7.3), so it is a recovery target rather than history. Kept
+    /// separate from [`Self::survives_retention`] because the two are looked
+    /// up differently: the serving generation is one targeted row, the
+    /// in-flight ones are a bounded set (see [`list_in_flight`]).
+    ///
+    /// Exhaustive on purpose: a new status has to state which side it is on.
+    pub fn is_in_flight(self) -> bool {
         match self {
-            Self::Staged | Self::Validating | Self::Activating | Self::Active => true,
-            Self::Failed | Self::Superseded => false,
+            Self::Staged | Self::Validating | Self::Activating => true,
+            Self::Active | Self::Failed | Self::Superseded => false,
         }
     }
 
@@ -311,19 +324,50 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<Generation
 /// the window is collected in full rather than down to this many rows.
 const MAX_LIST_LIMIT: i64 = 200;
 
-/// Every row whose status keeps it regardless of age, newest first.
+/// The generation that is serving, or `None` on a fresh instance.
 ///
-/// The other half of the retained set: [`list_recent`] answers "the newest
-/// `limit`", this answers "and whatever is serving or still in flight,
-/// wherever in the ledger it has fallen to". Filtered in the query rather
-/// than by paging the whole table, because the answer must not depend on how
-/// many generations have happened since.
-pub async fn list_retained_by_status(ctx: &dyn Context) -> Result<Vec<GenerationRow>, WaferError> {
+/// A targeted lookup rather than a slice of a listing, and that is the whole
+/// point: this row is what the site *is*, and it must reach the retained set
+/// no matter how far down the ledger it has fallen or how many other rows
+/// share its status filter. Exactly one row is [`GenerationStatus::Active`]
+/// at a time — the activation that commits a generation supersedes the one it
+/// replaced — so `limit: 1` under the usual ordering is the whole answer, and
+/// the newest wins if a hand-edited row ever made it two.
+pub async fn find_active(ctx: &dyn Context) -> Result<Option<GenerationRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
-            filters: vec![status_in(GenerationStatus::survives_retention)],
+            filters: vec![Filter {
+                field: "status".into(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(GenerationStatus::Active.as_str()),
+            }],
+            sort: newest_first(),
+            limit: 1,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    list.records.first().map(decode).transpose()
+}
+
+/// Every generation an activation has not finished with, newest first.
+///
+/// Staged, validating or activating: rows the journal may be converging on,
+/// which retention therefore keeps whatever their age. Capped at
+/// [`MAX_LIST_LIMIT`] like every listing here, and the cap is safe because the
+/// set is bounded rather than merely usually small —
+/// `activation::converge_on_boot` retires every in-flight row the journal does
+/// not name, so the only rows this can return are the one being converged on
+/// and the at-most-one an activation is running right now.
+pub async fn list_in_flight(ctx: &dyn Context) -> Result<Vec<GenerationRow>, WaferError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            filters: vec![status_in(GenerationStatus::is_in_flight)],
             sort: newest_first(),
             limit: MAX_LIST_LIMIT,
             skip_count: true,
@@ -688,6 +732,16 @@ mod tests {
                 GenerationStatus::Active,
             ],
         );
+        // The serving row is retained but is NOT in flight: it is looked up on
+        // its own, and the in-flight set is what boot retirement bounds.
+        assert!(!GenerationStatus::Active.is_in_flight());
+        assert_eq!(
+            GenerationStatus::ALL
+                .into_iter()
+                .filter(|s| s.is_in_flight())
+                .count(),
+            3,
+        );
         assert_eq!(
             prunable,
             vec![GenerationStatus::Failed, GenerationStatus::Superseded],
@@ -774,7 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_retained_by_status_finds_the_rows_age_alone_would_drop() {
+    async fn the_serving_and_in_flight_rows_are_found_by_status_not_by_age() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
         let staged = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
             .await
@@ -792,16 +846,26 @@ mod tests {
             .await
             .expect("supersede");
 
-        let mut ids: Vec<String> = list_retained_by_status(&ctx)
-            .await
-            .expect("list")
-            .into_iter()
-            .map(|row| row.id)
-            .collect();
-        ids.sort();
-        let mut expected = vec![staged.id, active.id];
-        expected.sort();
-        assert_eq!(ids, expected);
+        assert_eq!(
+            find_active(&ctx).await.expect("find").map(|row| row.id),
+            Some(active.id),
+        );
+        assert_eq!(
+            list_in_flight(&ctx)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![staged.id],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_ledger_is_serving_nothing() {
+        let ctx = TestContext::with_dev(FakeControl::new()).await;
+        assert_eq!(find_active(&ctx).await.expect("find"), None);
+        assert!(list_in_flight(&ctx).await.expect("list").is_empty());
     }
 
     #[tokio::test]
