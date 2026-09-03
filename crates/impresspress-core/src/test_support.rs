@@ -337,25 +337,50 @@ impl TestContext {
     /// starts, exactly as they do at boot.
     #[cfg(feature = "block-dev")]
     pub async fn with_dev(control: Arc<dyn crate::blocks::dev::RuntimeControl>) -> Self {
+        Self::with_admin().await.with_dev_added(control).await
+    }
+
+    /// Add the `impresspress/dev` block to an EXISTING fixture — the dev
+    /// migrations, block registration, storage wiring, `/b/dev` extra route
+    /// and WRAP enforcement [`Self::with_dev`] applies to a fresh context,
+    /// applied instead on top of whatever `self` already carries.
+    ///
+    /// For a test that needs `impresspress/dev` alongside another block's
+    /// own fixture — e.g. `TestContext::with_products().await.with_dev_added(..)`
+    /// for `/b/dev/api/tools.json`, which projects both blocks' endpoints
+    /// into one manifest. [`Self::with_dev`] cannot do this: it always starts
+    /// from a bare `with_admin()` context, so a caller that needs a second
+    /// block already registered would have no way to add it before the dev
+    /// block's WRAP enforcement switches on.
+    ///
+    /// Migrations, not registration order, are what production guarantees
+    /// (admin's `block_settings` table before any block's `apply_if_blessed`
+    /// upsert) — adding dev's migrations after another block's have already
+    /// run is exactly what a deployment that enables the sandbox alongside an
+    /// existing block set does, so this is not a fixture-only shortcut.
+    #[cfg(feature = "block-dev")]
+    pub async fn with_dev_added(
+        mut self,
+        control: Arc<dyn crate::blocks::dev::RuntimeControl>,
+    ) -> Self {
         use crate::blocks::dev;
 
-        let mut ctx = Self::with_admin().await;
-        ctx.apply_block_migrations(
+        self.apply_block_migrations(
             dev::BLOCK_NAME,
             dev::migrations::SQLITE_MIGRATIONS,
             dev::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
         let shared = dev::DevShared::new(control);
-        ctx.dev_shared = Some(shared.clone());
-        ctx.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
+        self.dev_shared = Some(shared.clone());
+        self.register_block(dev::BLOCK_NAME, Arc::new(dev::DevBlock::new(shared)));
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // namespacing wrapper — that wrapper is what turns the block's own
         // `blobs` / `""` folders into `impresspress/dev/…`, and what would
         // refuse a cross-block reach that the grant list did not cover.
         let store = Arc::new(InMemoryStorageService::new());
-        ctx.storage = Some(store.clone());
+        self.storage = Some(store.clone());
         let storage = crate::blocks::storage::create(store, Arc::from("impresspress/admin"));
         // The storage block runs its OWN cross-block check against a grant
         // list the runtime injects after startup. Leaving it empty (the
@@ -364,13 +389,13 @@ impl TestContext {
         // a missing grant from an unconfigured block — and the site publish
         // Task 7 builds on would fail here for the wrong reason.
         storage.update_wrap_grants(&dev::wrap_grants());
-        ctx.register_block("wafer-run/storage", storage);
-        ctx.add_extra_route(ExtraRoute::new(
+        self.register_block("wafer-run/storage", storage);
+        self.add_extra_route(ExtraRoute::new(
             dev::ROUTE_PREFIX.to_string(),
             dev::BLOCK_NAME.to_string(),
             crate::routing::RouteAccess::Admin,
         ));
-        ctx.with_wrap(dev::BLOCK_NAME, dev::wrap_grants(), "impresspress/admin")
+        self.with_wrap(dev::BLOCK_NAME, dev::wrap_grants(), "impresspress/admin")
     }
 
     /// Register a route the way `ImpresspressBuilder::add_route` does, so
@@ -1832,6 +1857,70 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
                 }
             })
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Log capture
+// ---------------------------------------------------------------------------
+
+/// Minimal [`tracing::Subscriber`] that records the rendered `message` field
+/// of every event it sees, so a test can assert on what was (or was not)
+/// logged without pulling in `tracing-subscriber`.
+///
+/// Shared, because more than one route has had to prove it does NOT log:
+/// refusal diagnostics that are static across calls belong at runtime
+/// construction, not on a path a caller can loop (`pipeline`'s
+/// `/b/webmcp/manifest.json`, `blocks::dev::tools`' `/b/dev/api/tools.json`).
+/// Install it with `tracing::subscriber::set_default`, which is scoped to the
+/// current thread — so a `#[tokio::test]` on the multi-thread runtime would
+/// miss events from work that migrated to another worker. Every use so far
+/// runs the awaited call on the test's own thread.
+#[derive(Clone, Default)]
+pub struct MessageCapture(Arc<Mutex<Vec<String>>>);
+
+struct MessageVisitor<'a> {
+    out: &'a mut String,
+}
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            *self.out = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for MessageCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = String::new();
+        event.record(&mut MessageVisitor { out: &mut message });
+        self.0
+            .lock()
+            .expect("MessageCapture mutex poisoned")
+            .push(message);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+impl MessageCapture {
+    /// How many captured messages contain `needle`.
+    pub fn count_containing(&self, needle: &str) -> usize {
+        self.0
+            .lock()
+            .expect("MessageCapture mutex poisoned")
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
     }
 }
 

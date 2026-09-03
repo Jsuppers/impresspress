@@ -195,13 +195,24 @@ impl<'a> Page<'a> {
         )
     }
 
-    /// htmx-aware response: the raw `body` (no chrome) for an htmx partial,
+    /// htmx-aware markup: the raw `body` (no chrome) for an htmx partial,
     /// else the full [`render`](Self::render) document.
-    pub fn response(self, msg: &wafer_run::Message) -> wafer_run::OutputStream {
+    ///
+    /// Split out of [`response`](Self::response) because an `OutputStream`'s
+    /// response meta is fixed when the stream is built — a page that needs
+    /// headers of its own (`/b/dev` and its COOP/COEP/`no-store`) cannot
+    /// amend a response after the fact and must build one around this markup
+    /// instead. See [`shell_document`].
+    pub fn document(self, msg: &wafer_run::Message) -> maud::Markup {
         if is_htmx(msg) {
-            return html_response(self.body);
+            return self.body;
         }
-        html_response(self.render())
+        self.render()
+    }
+
+    /// htmx-aware response: [`document`](Self::document) as `text/html`.
+    pub fn response(self, msg: &wafer_run::Message) -> wafer_run::OutputStream {
+        html_response(self.document(msg))
     }
 }
 
@@ -270,6 +281,24 @@ pub async fn shell_page(
     shell: Shell<'_>,
     body: maud::Markup,
 ) -> wafer_run::OutputStream {
+    html_response(shell_document(ctx, msg, shell, body).await)
+}
+
+/// [`shell_page`]'s markup, before it becomes a response.
+///
+/// Every page that only needs `text/html` should call [`shell_page`]. This
+/// exists for the one that needs more: `/b/dev` must carry
+/// `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` (cross-origin
+/// isolation, without which the in-browser compiler has no `SharedArrayBuffer`)
+/// and `Cache-Control: no-store`, and an `OutputStream`'s meta is fixed when
+/// the stream is built — so the headers have to be on the response as it is
+/// constructed, not bolted onto one that already exists.
+pub async fn shell_document(
+    ctx: &dyn wafer_run::context::Context,
+    msg: &wafer_run::Message,
+    shell: Shell<'_>,
+    body: maud::Markup,
+) -> maud::Markup {
     let config = SiteConfig::load(ctx).await;
     let user = UserInfo::from_message(msg);
     let mut groups = shell.nav.groups();
@@ -296,7 +325,7 @@ pub async fn shell_page(
         },
         body,
     }
-    .response(msg)
+    .document(msg)
 }
 
 /// Minimal `SiteConfig` used by the status-page helpers. They render

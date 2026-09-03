@@ -3,7 +3,7 @@
 //! Asset URLs include a content hash for cache busting:
 //! `/b/static/app-{hash}.css` and `/b/static/htmx-{hash}.min.js`
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::routing::STATIC_PREFIX;
 
@@ -12,6 +12,24 @@ const BASE_CSS: &str = include_str!("assets/base.css");
 const COMPONENTS_CSS: &str = include_str!("assets/components.css");
 const LAYOUT_CSS: &str = include_str!("assets/layout.css");
 const CHARTS_CSS: &str = include_str!("assets/charts.css");
+
+/// `buildRequest`/`toolOptions` — the request-building and tool-option-shaping
+/// logic shared by `webmcp.js` and the `/b/dev` page's `dev.js`. A fragment,
+/// not a script: no IIFE, no `'use strict'`. Never served on its own — always
+/// composed into a caller's IIFE via [`compose_webmcp_script`].
+const WEBMCP_CORE: &str = include_str!("assets/webmcp-core.js");
+
+/// Wraps `WEBMCP_CORE` and a caller-specific `tail` in one IIFE, so the
+/// composed script reads exactly as if it had been written in one file:
+/// `(function () { 'use strict'; <core> <tail> })();`
+///
+/// `pub(crate)` because the second caller is a block's own asset module
+/// (`blocks::dev::assets`), not this one: a tail authored anywhere in the
+/// crate composes through the same function, so there is exactly one
+/// definition of what "a WebMCP script" is on the wire.
+pub(crate) fn compose_webmcp_script(tail: &'static str) -> String {
+    format!("(function () {{\n  'use strict';\n{WEBMCP_CORE}\n{tail}\n}})();\n")
+}
 
 /// Itim font binaries, sourced from `impresspress/site-kit`'s `/fonts/` mirror
 /// and committed here so every impresspress deployment ships its own glyphs
@@ -151,13 +169,27 @@ pub fn htmx_js() -> &'static str {
 /// WebMCP tool-registration script, served on every page. Fetches the
 /// auth-filtered manifest at `/b/webmcp/manifest.json` and registers each
 /// tool via `document.modelContext.registerTool` (no-ops on browsers
-/// without WebMCP support).
+/// without WebMCP support). On a service-worker build the first fetch waits
+/// for the worker to take control of the page (see `assets/webmcp.js`);
+/// `window.__impresspressWebmcp.refresh()` re-fetches the manifest and swaps
+/// out whatever this script previously registered.
+///
+/// Composed at first use from [`WEBMCP_CORE`] (the `buildRequest`/
+/// `toolOptions` fragment) and `assets/webmcp.js` (the tail), via
+/// [`compose_webmcp_script`] — cached so repeat callers don't re-format the
+/// string.
 pub fn webmcp_js() -> &'static str {
-    include_str!("assets/webmcp.js")
+    static SCRIPT: LazyLock<String> =
+        LazyLock::new(|| compose_webmcp_script(include_str!("assets/webmcp.js")));
+    &SCRIPT
 }
 
 /// Short content hash (first 8 chars of hex SHA-256) for cache busting.
-fn short_hash(content: &[u8]) -> String {
+///
+/// `pub(crate)` so `blocks::dev::assets` — the other module that needs an
+/// `ETag` for a stable-path asset — hashes the same way instead of carrying
+/// a second implementation of "what is this content's short hash".
+pub(crate) fn short_hash(content: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(content);
     hash.iter().take(4).map(|b| format!("{b:02x}")).collect()
@@ -180,16 +212,30 @@ pub fn htmx_js_url() -> &'static str {
     })
 }
 
+/// Short content hash of [`webmcp_js`] — the same hash embedded in
+/// [`webmcp_js_url`] and, at the stable path, exposed as the `ETag` of
+/// `GET /b/webmcp/webmcp.js` (`pipeline.rs`). One function so the two
+/// projections of "which version of the script is this" can never drift
+/// apart.
+pub fn webmcp_js_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| short_hash(webmcp_js().as_bytes()))
+}
+
 /// WebMCP script URL with content hash, e.g. `/b/static/webmcp-a1b2c3d4.js`
 pub fn webmcp_js_url() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        format!(
-            "{STATIC_PREFIX}webmcp-{}.js",
-            short_hash(webmcp_js().as_bytes())
-        )
-    })
+    URL.get_or_init(|| format!("{STATIC_PREFIX}webmcp-{}.js", webmcp_js_hash()))
 }
+
+/// Stable (non-content-hashed) path for `webmcp.js`, served by
+/// `pipeline.rs` at `GET /b/webmcp/webmcp.js` — right beside
+/// `/b/webmcp/manifest.json`. Unlike [`webmcp_js_url`], this path never
+/// changes between deploys, so it's the one an agent-written page under
+/// `site/` (served by `wafer-run/web`, not `SystemBlock`'s content-hashed
+/// `/b/static/*` table) can hardcode in a `<script>` tag without first
+/// discovering the current hash.
+pub const WEBMCP_JS_STABLE_PATH: &str = "/b/webmcp/webmcp.js";
 
 /// marked.js (markdown parser), vendored from marked@14 — self-hosted instead of
 /// a jsdelivr CDN `<script>` so there's no external runtime fetch (CSP-friendly,
@@ -701,6 +747,31 @@ mod tests {
         assert!(js.contains("data-drawer-open"));
         // Self-invoking + idempotent guard.
         assert!(js.contains("__drawerInit"));
+    }
+
+    #[test]
+    fn webmcp_js_composes_the_core_fragment_into_one_iife() {
+        let js = super::webmcp_js();
+        assert!(
+            js.starts_with("(function () {\n  'use strict';"),
+            "composed script must start with the IIFE: {js}"
+        );
+        assert!(
+            js.contains("function buildRequest"),
+            "core fragment's buildRequest is missing"
+        );
+        assert!(
+            js.contains("function toolOptions"),
+            "core fragment's toolOptions is missing"
+        );
+        assert!(
+            js.contains("__impresspressWebmcp"),
+            "tail's window.__impresspressWebmcp is missing"
+        );
+        assert!(
+            js.trim_end().ends_with("})();"),
+            "composed script must end with the IIFE close: {js}"
+        );
     }
 
     #[test]

@@ -149,6 +149,17 @@ jobs:
       - name: Run the block-dev suite
         run: cargo test --locked -p impresspress-core --features block-dev,wasm
 
+      # `dev.js` is a TAIL composed into an IIFE with nothing on `window`
+      # (see the file's own header comment), so its internal logic has no
+      # exported function the Rust suite above can call directly —
+      # `test/harness.mjs` reads the same source `dev_js()` composes and
+      # wraps it itself to reach the internal state. Pins the I1 fix (an
+      # abort mid-flight must not drive the poll count negative or leave
+      # `setInterval` running forever) and the M3 fix (a 409 with no
+      # `current_sha256` is a quota refusal, not a hash conflict).
+      - name: Run dev.js unit tests (node --test)
+        run: node --test crates/impresspress-core/src/blocks/dev/assets/test/*.test.mjs
+
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
   # its Rust list actually references — was dead code in CI: nothing anywhere
@@ -318,12 +329,19 @@ jobs:
       - name: Build the proof guest (wasm32-wasip1)
         run: cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
 
+      # `--check` fails fast on a seed/manifest.json that has drifted from
+      # seed/site/** — the same check `build.sh`'s normal path runs before it
+      # builds anything, surfaced as its own step so a stale manifest is
+      # reported without paying for a wasm-pack build first.
+      - name: Check the dev-sandbox seed manifest
+        run: examples/dev-sandbox/build.sh --check
+
       # One script, shared with local runs: wasm-pack with `browser-devtools`,
-      # then the sealed web flow over a throwaway `[dev] enabled` app, then the
-      # seed fixture into `dist/seed/`. Its last stdout line is the dist path.
+      # then the sealed web flow with `[dev] enabled = true` and the welcome
+      # seed overlaid onto `dist/seed/`. Its last stdout line is the dist path.
       - name: Build the dev-sandbox bundle
         run: |
-          DIST="$(crates/impresspress-web/tests/e2e/fixtures/build-dev-bundle.sh | tail -1)"
+          DIST="$(examples/dev-sandbox/build.sh | tail -1)"
           echo "DEV_DIST=$DIST" >> "$GITHUB_ENV"
 
       - name: Setup Node
@@ -363,7 +381,7 @@ jobs:
         env:
           TEST_PORT: 8082
           PROOF_GUEST_WASM: ${{ github.workspace }}/experiments/browser-service-worker-blocks/guest/target/wasm32-wasip1/release/browser_compiled_wafer_block.wasm
-        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts
+        run: npx playwright test --config=tests/playwright.config.ts tests/e2e/dev-foundations.spec.ts tests/e2e/dev-workspace.spec.ts
 
       - name: Stop server
         if: always()

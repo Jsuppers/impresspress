@@ -1,71 +1,22 @@
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext } from '@playwright/test';
 import { ADMIN_STATE_PATH } from './fixtures/auth';
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from './fixtures/global-setup';
+import { MODEL_CONTEXT_POLYFILL } from './fixtures/model-context-polyfill';
+import { SHOP_OFFER, uniqueShopProduct } from './fixtures/shop-fixture';
+import { execute, registeredTools } from './fixtures/webmcp-helpers';
 
 /**
  * WebMCP end-to-end against the real native server (visual-baseline config:
  * port 8093 in CI, admin session via globalSetup).
  *
- * Chromium has no `document.modelContext` yet, so the WebMCP surface is
- * polyfilled with the smallest thing `ui/assets/webmcp.js` needs — a
- * `registerTool` that records what it was given — plus two test-only hooks
- * to read the registrations back and to invoke a tool's `execute`. Everything
- * on the other side of that boundary is real: the served manifest, the
- * registration script, the request `execute` builds, and the endpoint that
- * answers it. What this cannot test is whether an agent *chooses* the right
- * tool from its description; that needs a WebMCP-capable browser and a human
- * (plan 3, task 5).
+ * `MODEL_CONTEXT_POLYFILL` (shared with `smoke.spec.ts`) is the smallest
+ * `document.modelContext` shim `ui/assets/webmcp.js` and `webmcp-core.js`
+ * need. Everything on the other side of that boundary is real: the served
+ * manifest, the registration script, the request `execute` builds, and the
+ * endpoint that answers it. What this cannot test is whether an agent
+ * *chooses* the right tool from its description; that needs a WebMCP-capable
+ * browser and a human (plan 3, task 5).
  */
-
-const MODEL_CONTEXT_POLYFILL = `
-  (function () {
-    const tools = new Map();
-    Object.defineProperty(document, 'modelContext', {
-      configurable: false,
-      writable: false,
-      value: {
-        registerTool(options) {
-          if (!options || typeof options.name !== 'string') {
-            throw new TypeError('registerTool: name is required');
-          }
-          if (typeof options.execute !== 'function') {
-            throw new TypeError('registerTool: execute is required');
-          }
-          tools.set(options.name, options);
-        },
-        // Test hooks — not part of the WebMCP surface.
-        __tools() {
-          return Array.from(tools.values()).map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema,
-            outputSchema: t.outputSchema,
-          }));
-        },
-        __execute(name, args) {
-          const tool = tools.get(name);
-          if (!tool) {
-            throw new Error('no such tool: ' + name);
-          }
-          return tool.execute(args);
-        },
-      },
-    });
-  })();
-`;
-
-type ToolRecord = {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  outputSchema?: Record<string, unknown>;
-};
-
-type ToolResult = {
-  isError?: boolean;
-  content: Array<{ type: string; text: string }>;
-  structuredContent?: Record<string, unknown>;
-};
 
 const PUBLIC_TOOLS = [
   'get_storefront_config',
@@ -79,28 +30,59 @@ const PUBLIC_TOOLS = [
 /** Admin-tier read tools. Must never appear below the Admin tier. */
 const ADMIN_TOOLS = ['list_users', 'list_roles', 'get_site_settings', 'list_audit_log'];
 
-async function registeredTools(page: Page, atLeast: number): Promise<ToolRecord[]> {
-  await page.waitForFunction(
-    (n) => (document as unknown as { modelContext: { __tools(): unknown[] } }).modelContext.__tools().length >= n,
-    atLeast,
-    { timeout: 15_000 },
+test('refresh() re-registers the manifest without disturbing a tool it does not own', async ({ page }) => {
+  // `refresh()` tracks and re-registers exactly the names webmcp.js itself
+  // added from the manifest (see `registered` in `webmcp.js`) — not
+  // everything `document.modelContext` currently knows about. That is
+  // deliberate: `dev.js` (plan 2, task 3) registers its own page-scoped
+  // tools directly against `document.modelContext` on `/b/dev`, and
+  // webmcp.js's `refresh()` runs independently on manifest-generation
+  // changes. If `refresh()` cleared every registered tool it would fight
+  // `dev.js` for ownership of tools it never registered. `stale_tool` here
+  // stands in for exactly that: something else's tool, registered directly
+  // — it must survive a webmcp.js refresh untouched.
+  //
+  // The manifest is identical across both loads, so "unregister then
+  // re-register the same set" and "do nothing" leave the polyfill's
+  // name-keyed Map in the same end state — `after === before` alone can't
+  // tell them apart. Two more assertions make it discriminating: (a)
+  // `generation()` must actually increment (proving a fresh `load()` ran,
+  // not a no-op), and (b) the polyfill's `__unregistered()` call log must
+  // show every manifest tool name dropped exactly once — proving the
+  // unregister half really fired — while `stale_tool` is never in it.
+  await page.addInitScript(MODEL_CONTEXT_POLYFILL);
+  await page.goto('/b/auth/login');
+  await registeredTools(page, 1);
+  const before = await page.evaluate(() => document.modelContext.__tools().map((t) => t.name).sort());
+  const generationBefore = await page.evaluate(() => window.__impresspressWebmcp.generation());
+  await page.evaluate(() =>
+    document.modelContext.registerTool({
+      name: 'stale_tool',
+      description: 'x',
+      inputSchema: { type: 'object' },
+      execute: async () => ({ content: [] }),
+    }),
   );
-  return page.evaluate(
-    () => (document as unknown as { modelContext: { __tools(): ToolRecord[] } }).modelContext.__tools(),
-  );
-}
+  await page.evaluate(() => window.__impresspressWebmcp.refresh());
+  const after = await page.evaluate(() => document.modelContext.__tools().map((t) => t.name).sort());
+  const generationAfter = await page.evaluate(() => window.__impresspressWebmcp.generation());
+  const unregistered = await page.evaluate(() => document.modelContext.__unregistered());
 
-async function execute(page: Page, name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  return page.evaluate(
-    ([toolName, toolArgs]) =>
-      (
-        document as unknown as {
-          modelContext: { __execute(n: string, a: unknown): Promise<ToolResult> };
-        }
-      ).modelContext.__execute(toolName as string, toolArgs),
-    [name, args] as const,
-  );
-}
+  // (a) A real refresh happened, not a no-op that coincidentally left the
+  // same set behind.
+  expect(generationAfter).toBeGreaterThan(generationBefore);
+
+  // (b) Every manifest tool was actually dropped — exactly once each — and
+  // `stale_tool` was never touched by `unregisterTool` at all.
+  for (const name of before) {
+    expect(unregistered.filter((n: string) => n === name), name).toHaveLength(1);
+  }
+  expect(unregistered).not.toContain('stale_tool');
+
+  // End state: the manifest tools are back (re-registered) and the foreign
+  // tool survived untouched.
+  expect(after).toEqual([...before, 'stale_tool'].sort());
+});
 
 /** Bearer for the bootstrap admin — bearer auth is exempt from the CSRF origin policy, cookies are not. */
 async function adminBearer(request: APIRequestContext): Promise<string> {
@@ -114,9 +96,11 @@ async function adminBearer(request: APIRequestContext): Promise<string> {
 }
 
 /**
- * One product with one published, component-priced offer: `pages` (integer)
- * at 1500 minor units per page. Unique slug per run so re-running against the
- * same database never collides.
+ * One product with one published, component-priced offer — the shared
+ * `fixtures/shop-fixture.ts` payload, which `dev-workspace.spec.ts` creates
+ * through the `shop_*` tools instead. `uniqueShopProduct` gives it a
+ * per-run-unique slug so re-running against the same database never collides,
+ * and makes it `active` so the Public tools below can see it.
  */
 async function seedProductWithOffer(
   request: APIRequestContext,
@@ -126,14 +110,7 @@ async function seedProductWithOffer(
 
   const productRes = await request.post('/b/products/api/admin/products', {
     headers: auth,
-    data: {
-      name: `WebMCP e2e print ${stamp}`,
-      slug: `webmcp-e2e-print-${stamp}`,
-      description: 'Seeded by webmcp.spec.ts',
-      currency: 'nzd',
-      status: 'active',
-      fulfillment_kind: 'manual',
-    },
+    data: uniqueShopProduct(stamp),
   });
   expect(productRes.status(), await productRes.text()).toBe(200);
   const productBody = (await productRes.json()) as { id?: string; data?: { id?: string } };
@@ -142,37 +119,7 @@ async function seedProductWithOffer(
 
   const offerRes = await request.post(`/b/products/api/admin/products/${productId}/offers`, {
     headers: auth,
-    data: {
-      name: 'Custom print',
-      mode: 'payment',
-      currency: 'nzd',
-      pricing_model: 'components',
-      usage_type: 'licensed',
-      billing_scheme: 'per_unit',
-      tax_behavior: 'exclusive',
-      variables: [
-        {
-          key: 'pages',
-          kind: 'integer',
-          label: 'Pages',
-          required: true,
-          minimum: '1',
-          maximum: '20',
-          step: '1',
-          sort_order: 0,
-        },
-      ],
-      components: [
-        {
-          key: 'pages',
-          label: 'Printed pages',
-          sort_order: 0,
-          required: true,
-          amount: { type: 'per_unit', input: 'pages', unit_amount_minor: 1500 },
-        },
-      ],
-      checkout: {},
-    },
+    data: SHOP_OFFER,
   });
   expect(offerRes.status(), await offerRes.text()).toBe(200);
   const offerBody = (await offerRes.json()) as { offer?: { id?: string }; id?: string };
