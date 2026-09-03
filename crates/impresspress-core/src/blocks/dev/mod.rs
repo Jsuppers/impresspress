@@ -467,8 +467,8 @@ impl Block for DevBlock {
         // re-check the caller's role.
         match route {
             Route::Page => page::handle(ctx, &msg).await,
-            Route::PageScript => page::handle_script(),
-            Route::PageStylesheet => page::handle_stylesheet(),
+            Route::PageScript => page::handle_script(&msg),
+            Route::PageStylesheet => page::handle_stylesheet(&msg),
             Route::ApiStatus => status::handle(ctx, &self.shared).await,
             Route::ApiFilesList => files::handle_list(ctx, &msg).await,
             Route::ApiFilesRead => files::handle_read(ctx, input).await,

@@ -349,15 +349,24 @@ pub async fn handle_request(
         // quotes are part of the value, not formatting. A bare hash is not a
         // well-formed `ETag`, and a client that echoes it back verbatim in
         // `If-None-Match` — which is the whole point of sending one — offers
-        // something the comparison rules cannot match, so no `304` ever fires
-        // and the `no-cache` revalidation above re-downloads the script every
-        // navigation. `webmcp_js_hash()` itself stays bare: it is the hash,
-        // and `webmcp_js_url()` embeds it in a filename where quotes would be
-        // nonsense.
+        // something the comparison rules cannot match, so no `304` would ever
+        // fire even with a comparison in place. `webmcp_js_hash()` itself
+        // stays bare: it is the hash, and `webmcp_js_url()` embeds it in a
+        // filename where quotes would be nonsense.
         let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
+        // The comparison `http::conditional::not_modified` runs is what
+        // makes the `no-cache` revalidation below actually cheap: a repeat
+        // visitor's `If-None-Match` matching this `ETag` gets a bodyless
+        // `304` instead of the whole script re-downloaded on every
+        // navigation.
+        if let Some(not_modified) = crate::http::conditional::not_modified(&msg, &etag, "no-cache")
+        {
+            return not_modified;
+        }
         return ResponseBuilder::new()
             .set_header("Cache-Control", "no-cache")
             .set_header("ETag", &etag)
+            .set_header("X-Content-Type-Options", "nosniff")
             .body(
                 ui::assets::webmcp_js().as_bytes().to_vec(),
                 "application/javascript; charset=utf-8",
@@ -1729,6 +1738,86 @@ mod discovery_tests {
                 .ends_with(&format!("webmcp-{}.js", ui::assets::webmcp_js_hash())),
             "webmcp_js_hash() must be the same hash webmcp_js_url() embeds: {}",
             ui::assets::webmcp_js_url()
+        );
+        assert_eq!(
+            header("resp.header.X-Content-Type-Options"),
+            Some("nosniff"),
+            "a public, unauthenticated script route must not be MIME-sniffable"
+        );
+    }
+
+    /// The `ETag` the previous test pins is not decorative: a repeat visitor
+    /// who echoes it back in `If-None-Match` gets a bodyless `304`, and a
+    /// stale/foreign value still gets the full `200`.
+    #[tokio::test]
+    async fn webmcp_js_stable_path_answers_conditional_get() {
+        let ctx = TestContext::new().await;
+        let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
+
+        let mut fresh = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
+        fresh.set_meta("http.header.host", "impresspress.example.com");
+        fresh.set_meta("http.header.if-none-match", &etag);
+        let out = handle_request(
+            &ctx,
+            fresh,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        assert!(
+            buf.body.is_empty(),
+            "a matching If-None-Match must produce an empty 304 body"
+        );
+        assert_eq!(
+            buf.meta
+                .iter()
+                .find(|m| m.key == wafer_run::META_RESP_STATUS)
+                .map(|m| m.value.as_str()),
+            Some("304")
+        );
+        assert_eq!(
+            buf.meta
+                .iter()
+                .find(|m| m.key == "resp.header.ETag")
+                .map(|m| m.value.as_str()),
+            Some(etag.as_str()),
+            "a 304 still carries the ETag"
+        );
+
+        let mut stale = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
+        stale.set_meta("http.header.host", "impresspress.example.com");
+        stale.set_meta("http.header.if-none-match", "\"not-the-current-hash\"");
+        let out = handle_request(
+            &ctx,
+            stale,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        assert_eq!(
+            buf.body,
+            ui::assets::webmcp_js().as_bytes(),
+            "a mismatching If-None-Match must fall through to the full 200 body"
+        );
+        assert_eq!(
+            buf.meta
+                .iter()
+                .find(|m| m.key == wafer_run::META_RESP_STATUS)
+                .map(|m| m.value.as_str()),
+            None,
+            "200 is the default status — no resp.status meta is set"
         );
     }
 

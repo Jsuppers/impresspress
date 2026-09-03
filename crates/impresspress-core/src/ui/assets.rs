@@ -185,7 +185,11 @@ pub fn webmcp_js() -> &'static str {
 }
 
 /// Short content hash (first 8 chars of hex SHA-256) for cache busting.
-fn short_hash(content: &[u8]) -> String {
+///
+/// `pub(crate)` so `blocks::dev::assets` — the other module that needs an
+/// `ETag` for a stable-path asset — hashes the same way instead of carrying
+/// a second implementation of "what is this content's short hash".
+pub(crate) fn short_hash(content: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(content);
     hash.iter().take(4).map(|b| format!("{b:02x}")).collect()

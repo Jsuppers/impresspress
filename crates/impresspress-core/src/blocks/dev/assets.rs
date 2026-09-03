@@ -6,7 +6,7 @@
 //! That is also why they are served from `/b/dev/static/*` at the block's own
 //! `Admin` tier instead of the public, content-hashed `/b/static/*` bundle.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// The workspace page's script, authored as a TAIL: no IIFE, no
 /// `'use strict'`, exactly like `ui/assets/webmcp.js`. It is only ever served
@@ -35,4 +35,20 @@ pub fn dev_js() -> &'static str {
 /// The `/b/dev/static/dev.css` stylesheet.
 pub fn dev_css() -> &'static str {
     DEV_CSS
+}
+
+/// Short content hash of [`dev_js`], for `page.rs::asset`'s `ETag` — the
+/// same projection `ui::assets::webmcp_js_hash()` gives `webmcp.js`, so a
+/// rebuilt binary with different script bytes invalidates a repeat
+/// visitor's cached copy instead of serving a `304` for content that
+/// changed.
+pub fn dev_js_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| crate::ui::assets::short_hash(dev_js().as_bytes()))
+}
+
+/// Short content hash of [`dev_css`], for `page.rs::asset`'s `ETag`.
+pub fn dev_css_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| crate::ui::assets::short_hash(dev_css().as_bytes()))
 }

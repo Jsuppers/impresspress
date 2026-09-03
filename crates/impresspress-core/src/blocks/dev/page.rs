@@ -147,16 +147,23 @@ fn body() -> Markup {
 }
 
 /// Serve `/b/dev/static/dev.js`.
-pub fn handle_script() -> OutputStream {
+pub fn handle_script(msg: &Message) -> OutputStream {
     asset(
+        msg,
         assets::dev_js().as_bytes(),
         "application/javascript; charset=utf-8",
+        assets::dev_js_hash(),
     )
 }
 
 /// Serve `/b/dev/static/dev.css`.
-pub fn handle_stylesheet() -> OutputStream {
-    asset(assets::dev_css().as_bytes(), "text/css; charset=utf-8")
+pub fn handle_stylesheet(msg: &Message) -> OutputStream {
+    asset(
+        msg,
+        assets::dev_css().as_bytes(),
+        "text/css; charset=utf-8",
+        assets::dev_css_hash(),
+    )
 }
 
 /// The two page assets are the block's only responses that are not
@@ -165,14 +172,21 @@ pub fn handle_stylesheet() -> OutputStream {
 /// `no-cache` still means "revalidate before every use", so a rebuilt bundle
 /// is never served from a stale cache — these URLs carry no content hash, so
 /// the immutable, year-long `Cache-Control` the hashed `/b/static/*` bundle
-/// uses would be wrong. What it buys over `no-store` is a 304 instead of a
-/// re-download of the whole script on every navigation to the page, which is
-/// the difference §12's rule was never about: the rule exists so a *stale
-/// answer about the workspace* cannot outlive the generation that changed it,
-/// and these bytes describe no generation at all.
-fn asset(bytes: &'static [u8], content_type: &str) -> OutputStream {
+/// uses would be wrong. What it buys over `no-store` is a 304 — via
+/// `http::conditional::not_modified`, the same comparison the
+/// `/b/webmcp/webmcp.js` stable route uses — instead of a re-download of the
+/// whole script on every navigation to the page, which is the difference
+/// §12's rule was never about: the rule exists so a *stale answer about the
+/// workspace* cannot outlive the generation that changed it, and these bytes
+/// describe no generation at all.
+fn asset(msg: &Message, bytes: &'static [u8], content_type: &str, hash: &str) -> OutputStream {
+    let etag = format!("\"{hash}\"");
+    if let Some(not_modified) = crate::http::conditional::not_modified(msg, &etag, "no-cache") {
+        return not_modified;
+    }
     ResponseBuilder::new()
         .set_header("Cache-Control", "no-cache")
+        .set_header("ETag", &etag)
         .set_header("X-Content-Type-Options", "nosniff")
         .body(bytes.to_vec(), content_type)
 }

@@ -188,6 +188,51 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
     );
 }
 
+/// The two page assets each carry an `ETag`, and a matching `If-None-Match`
+/// gets a bodyless `304` — the same conditional-GET comparison
+/// `/b/webmcp/webmcp.js`'s stable route uses, via `http::conditional`.
+#[tokio::test]
+async fn the_page_assets_answer_conditional_get() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+
+    for (path, hash) in [
+        ("/b/dev/static/dev.js", assets::dev_js_hash()),
+        ("/b/dev/static/dev.css", assets::dev_css_hash()),
+    ] {
+        let etag = format!("\"{hash}\"");
+        assert_eq!(
+            output_http_header(ctx.dispatch(admin_msg("retrieve", path)).await, "etag")
+                .await
+                .as_deref(),
+            Some(etag.as_str()),
+            "{path}"
+        );
+
+        let mut fresh = admin_msg("retrieve", path);
+        fresh.set_meta("http.header.if-none-match", &etag);
+        assert_eq!(
+            output_http_status(ctx.dispatch(fresh).await).await,
+            304,
+            "{path}: a matching If-None-Match must produce a 304"
+        );
+        let mut fresh_body = admin_msg("retrieve", path);
+        fresh_body.set_meta("http.header.if-none-match", &etag);
+        assert_eq!(
+            output_html(ctx.dispatch(fresh_body).await).await,
+            "",
+            "{path}: a 304 must carry no body"
+        );
+
+        let mut stale = admin_msg("retrieve", path);
+        stale.set_meta("http.header.if-none-match", "\"not-the-current-hash\"");
+        assert_eq!(
+            output_http_status(ctx.dispatch(stale).await).await,
+            200,
+            "{path}: a mismatching If-None-Match must fall through to the full response"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The script itself
 // ---------------------------------------------------------------------------
