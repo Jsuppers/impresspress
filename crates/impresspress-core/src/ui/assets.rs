@@ -119,15 +119,18 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
         // Square Impresspress mark used as the sidebar/login icon. Bundled
         // locally so the admin renders correctly without internet (the
         // previous default pointed at `https://impresspress.org/images/logo.png`
-        // which 404s offline). Real pixel art -- 32x32 art-pixels, generated
-        // by the `site` repo's `npm run images` (`brand/logo-32.png`).
-        // Templates only ever scale it by whole factors (`.pixel-art`), so
-        // its native size is part of the contract (see the tests below).
+        // which 404s offline). Real pixel art -- 32x32 art-pixels, 11 colours,
+        // taken pixel-for-pixel from the published mark at
+        // `https://impresspress.org/images/logo-32.webp`. Templates only ever
+        // scale it by whole factors (`.pixel-art`), so its native size is part
+        // of the contract (see the tests below).
         "impresspress-logo.png" => include_bytes!("assets/impresspress-logo.png"),
-        // The same mark at 64x64 art-pixels (`brand/logo-64.png`) -- served
-        // as the `2x` `srcset` candidate so high-DPI screens get one device
-        // pixel per art-pixel instead of a nearest-neighbour blow-up of the
-        // 32-cell mark. There is no raster wordmark: brand text is rendered
+        // The same mark at 64x64 (`https://impresspress.org/images/favicon.webp`,
+        // an exact 2x of the 32) -- served as the `2x` `srcset` candidate so a
+        // high-DPI screen maps one source pixel to one device pixel. The art
+        // grid stays 32 cells either way, so this carries no detail the 32
+        // lacks; it spares the browser the scale step, nothing more.
+        // There is no raster wordmark: brand text is rendered
         // as text next to the mark (see `templates::brand_lockup`) -- the
         // old `impresspress-logo-long.png` wordmark was dark-ink artwork
         // illegible on the navy chrome and has been removed outright; rows
