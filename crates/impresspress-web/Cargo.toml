@@ -73,6 +73,22 @@ wafer-block = { workspace = true }
 # LlmBlock pulled tokio/reqwest on wasm32; the LlmService trait refactor
 # made both wasm32-clean and they're now part of the demo's block set.)
 impresspress-core = { path = "../impresspress-core", default-features = false, features = [
+    # `default-features = false` here is about excluding NATIVE-only defaults
+    # from a wasm32 build, not about detaching assets — so `embed-assets` has
+    # to be asked for back explicitly.
+    #
+    # A browser bundle is self-contained: it is downloaded whole, served off a
+    # static directory, and has no second origin to fetch from. Nothing
+    # publishes `ui::assets` for it (`impresspress_bundle::assets` writes only
+    # the loader, the SW template and sql-wasm) and nothing sets
+    # `IMPRESSPRESS_ASSET_BASE_URL`, so without this every `/b/static/*` URL —
+    # the stylesheet, `webmcp.js`, the fonts, the mark — resolves to a route
+    # that is compiled out and 404s.
+    #
+    # Detaching exists for Cloudflare, where R2 or a CDN actually serves the
+    # bytes and the wasm size limit is real. `impresspress-cloudflare` keeps
+    # its own opt-in passthrough for exactly that.
+    "embed-assets",
     "block-files",
     "block-legalpages",
     "block-tickets",
