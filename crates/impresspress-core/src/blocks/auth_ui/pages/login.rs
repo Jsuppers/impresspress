@@ -149,10 +149,13 @@ mod tests {
         msg
     }
 
-    /// Default branding on the sign-in card: the built-in pixel-art icon at
-    /// 64px — the 64-cell rendition at 1:1, served as a plain `<img>` (no
-    /// `srcset`, nothing for the browser to second-guess) — above the app
-    /// name as text. No raster wordmark.
+    // Default branding on the sign-in card: the built-in pixel-art icon at
+    // 64px — the 64-cell rendition at 1:1, served as a plain `<img>` (no
+    // `srcset`, nothing for the browser to second-guess) — above the app
+    // name as text. No raster wordmark.
+    //
+    // Plain comments, not doc comments: the test they described was dropped,
+    // so a `///` block here is an outer attribute with no item to document.
     // Ported from origin/main's `default_branding_is_pixel_art_icon_plus_app_
     // name` during the main merge -- 2026-09-02 -- and dropped rather than
     // adapted: main's test asserted the login page's *form* panel renders

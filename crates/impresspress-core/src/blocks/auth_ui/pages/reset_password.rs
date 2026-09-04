@@ -45,13 +45,13 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             .config_get("WAFER_RUN_SHARED__APP_NAME")
             .unwrap_or("Impresspress")
             .to_string(),
-        logo_url: logo_url.clone(),
+        logo_url,
         logo_icon_url: String::new(),
         favicon_url: crate::ui::assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
-        auth_headline: auth_headline.clone(),
-        auth_tagline: auth_tagline.clone(),
+        auth_headline,
+        auth_tagline,
     };
 
     let markup = ui::layout::page(
