@@ -166,7 +166,7 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         &models,
         default_model.as_str(),
         thread_id,
-        llm_chat_js_url,
+        &llm_chat_js_url,
     );
 
     // Build mobile-friendly crumbs:
@@ -213,16 +213,16 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// the loaded threads and the (optional) active thread id.
 fn render_thread_list_pane(threads: &[db::Record], active_id: Option<&str>) -> Markup {
     html! {
-        div style="display:flex;flex-direction:column;gap:0.75rem;height:100%" {
-            div style="display:flex;align-items:center;justify-content:space-between" {
-                h3 style="font-size:0.875rem;font-weight:600;color:var(--text-muted);margin:0;text-transform:uppercase;letter-spacing:0.05em" {
+        div .thread-pane {
+            div .thread-pane__head {
+                h2 .thread-pane__title {
                     "Threads"
                 }
-                button .btn.btn-sm.btn-primary onclick="createNewThread()" {
+                button .btn.btn--sm.btn--primary onclick="createNewThread()" {
                     (icons::plus())
                 }
             }
-            div #thread-list style="overflow-y:auto;flex:1" {
+            div #thread-list .thread-pane__scroll {
                 (thread_list_items(threads, active_id))
             }
         }
@@ -232,7 +232,7 @@ fn render_thread_list_pane(threads: &[db::Record], active_id: Option<&str>) -> M
 fn thread_list_items(threads: &[db::Record], active_id: Option<&str>) -> Markup {
     html! {
         @if threads.is_empty() {
-            div .text-center .text-muted style="padding:1rem;font-size:0.875rem" {
+            div .text-center .text-muted .thread-pane__empty {
                 "No threads yet."
             }
         } @else {
@@ -243,21 +243,18 @@ fn thread_list_items(threads: &[db::Record], active_id: Option<&str>) -> Markup 
                 @let date = updated_at.get(..10).unwrap_or(updated_at);
                 @let is_active = active_id == Some(id);
                 a
-                    .card
+                    .card .thread-card
                     href={"/b/llm/threads/" (id)}
                     data-thread-id=(id)
                     data-active=(if is_active { "true" } else { "false" })
                     aria-current=[is_active.then_some("page")]
-                    style="display:block;text-decoration:none;color:inherit;margin-bottom:0.375rem;padding:0.625rem 0.75rem;transition:box-shadow 0.15s"
-                    onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.1)'"
-                    onmouseout="this.style.boxShadow=''"
                 {
-                    div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem" {
-                        span style="font-weight:500;font-size:0.875rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1" {
+                    div .thread-card__row {
+                        span .thread-card__title {
                             @if title.is_empty() { "Untitled" } @else { (title) }
                         }
                         @if !date.is_empty() {
-                            span .text-muted style="font-size:0.75rem;flex-shrink:0" { (date) }
+                            span .text-muted .thread-card__date { (date) }
                         }
                     }
                 }
@@ -280,10 +277,10 @@ fn render_messages_pane(_entries: &[db::Record], thread_id: Option<&str>) -> Mar
         // a grey slab inside the white pane and double-scrolled.
         div #messages-area {
             @if thread_id.is_none() {
-                div #no-thread-prompt .text-center style="padding:3rem 1rem" {
-                    div style="font-size:2.5rem;margin-bottom:0.75rem" { "\u{1f4ac}" }
-                    p style="font-size:1.1rem;color:var(--text-primary);margin:0 0 0.5rem" { "Start a new conversation" }
-                    p .text-muted style="margin:0 0 1.5rem" { "Click the " strong { "+" } " button to create a thread, then type your message." }
+                div #no-thread-prompt .chat-empty-state {
+                    div .chat-empty-state__icon { (ui::icons::message_square()) }
+                    p .text-lg .mb-2 { "Start a new conversation" }
+                    p .text-muted .mb-6 { "Click the " strong { "+" } " button to create a thread, then type your message." }
                 }
             }
             // When thread_id is Some, the JS bootstrap fills #messages-area
@@ -306,30 +303,29 @@ fn render_composer(thread_id: Option<&str>) -> Markup {
     html! {
         form
             id="chat-form"
+            class={ "chat-form" @if !enabled { " chat-form--disabled" } }
             onsubmit="return handleChatSubmit(event)"
-            style=(if enabled { "" } else { "opacity:0.4;pointer-events:none" })
             data-thread=(thread_value)
         {
             input type="hidden" name="thread_id" id="active-thread-id" value=(thread_value);
-            div style="display:flex;gap:0.5rem;align-items:flex-end" {
-                div style="flex:1;position:relative" {
+            div .flex .gap-2 .items-end {
+                div .flex-1 .relative {
                     textarea
-                        .form-input
+                        .form-input .resize-none .w-full
                         #chat-input
                         name="message"
                         placeholder=(placeholder)
                         rows="3"
                         required
                         disabled[!enabled]
-                        style="resize:none;width:100%"
                         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.closest('form').requestSubmit();}"
                     {}
                 }
-                div style="display:flex;flex-direction:column;align-items:center;gap:0.25rem" {
-                    button #send-btn .btn.btn-primary type="submit" disabled[!enabled] style="height:fit-content" {
+                div .flex .flex-col .items-center .gap-1 {
+                    button #send-btn .btn.btn--primary .h-fit type="submit" disabled[!enabled] {
                         "Send"
                     }
-                    span #send-status .text-muted style="font-size:0.7rem;white-space:nowrap" {}
+                    span #send-status .text-muted .text-xs .nowrap {}
                 }
             }
         }
@@ -342,13 +338,12 @@ fn render_composer(thread_id: Option<&str>) -> Markup {
 /// chat_page handler.
 fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
     html! {
-        div style="display:flex;flex-direction:column;gap:1rem;padding:0.5rem" {
+        div .flex .flex-col .gap-4 .p-2 {
             div {
-                label .form-label style="display:block;margin-bottom:0.375rem;font-size:0.875rem" { "Model" }
+                label .form-label .d-block .text-sm { "Model" }
                 select
                     #model-picker
-                    .form-input
-                    style="width:100%"
+                    .form-input .w-full
                     name="model"
                     onchange="onModelChange(this.value)"
                 {
@@ -358,29 +353,31 @@ fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
                     }
                     optgroup #local-models-group label="Local (WebLLM)" {}
                 }
-                span #model-status .text-muted style="display:block;margin-top:0.25rem;font-size:0.75rem" {}
+                span #model-status .text-muted .d-block .mt-1 .text-xs {}
             }
 
-            div #model-progress-container style="display:none" {
-                div .card style="padding:0.75rem" {
-                    div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem" {
-                        span style="font-size:0.875rem;font-weight:500" { "Loading model..." }
-                        button #model-unload-btn .btn.btn-sm.btn-ghost onclick="unloadLocalModel()" style="margin-left:auto" {
+            div #model-progress-container .hidden {
+                div .card .p-3 {
+                    div .flex .items-center .gap-2 .mb-2 {
+                        span .text-sm .font-medium { "Loading model..." }
+                        button #model-unload-btn .btn.btn--sm.btn--ghost onclick="unloadLocalModel()" .ml-auto {
                             "Cancel"
                         }
                     }
-                    div style="background:var(--bg-secondary);border-radius:0.25rem;height:6px;overflow:hidden" {
+                    div .model-progress-track {
                         // NB: the token is `--primary-color` — the old
                         // `var(--primary, #3b82f6)` referenced a nonexistent
-                        // var, so the blue fallback ALWAYS won.
-                        div #model-progress-bar style="height:100%;background:var(--primary-color);width:0%;transition:width 0.3s" {}
+                        // var, so the blue fallback ALWAYS won. `.model-progress-fill`'s
+                        // width starts at 0% and is updated at runtime by
+                        // `bar.style.width = pct + '%'` in ui/assets/llm-chat.js.
+                        div #model-progress-bar .model-progress-fill {}
                     }
-                    div #model-progress-text .text-muted style="font-size:0.75rem;margin-top:0.25rem" { "" }
+                    div #model-progress-text .text-muted .text-xs .mt-1 { "" }
                 }
             }
 
-            a .btn.btn-ghost.btn-sm href="/b/llm/settings" style="justify-content:flex-start" {
-                "\u{2699} Settings"
+            a .btn.btn--ghost.btn--sm .justify-start href="/b/llm/settings" {
+                (ui::icons::settings()) " Settings"
             }
         }
     }
@@ -407,34 +404,36 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         ))
 
         // Global defaults — read-only display; set via env vars
-        div .card style="margin-bottom:1.5rem" {
-            h3 style="font-size:1rem;font-weight:600;margin:0 0 1rem" { "Global Defaults" }
-            p .text-muted style="font-size:0.875rem;margin-bottom:1rem" {
+        div .card .mb-6 {
+            h3 .card-title .mb-4 { "Global Defaults" }
+            p .text-muted .text-sm .mb-4 {
                 "Global defaults are configured via environment variables."
             }
-            div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem" {
+            div .form-row {
                 div .form-group {
-                    label .form-label { "Default Provider" }
-                    input
-                        .form-input
+                    // `for`/`id` pair: both fields showed a visible
+                    // `.form-label` but never associated it, so the accessible
+                    // name was empty and a screen reader announced only the
+                    // value.
+                    label .form-label for="llm-default-provider" { "Default Provider" }
+                    input #llm-default-provider
+                        .form-input .form-input--readonly
                         type="text"
                         value=(default_provider)
                         readonly
-                        style="background:var(--bg-secondary)"
                     ;
                     p .form-hint {
                         "Set via " code { (DEFAULT_PROVIDER_VAR) }
                     }
                 }
                 div .form-group {
-                    label .form-label { "Default Model" }
-                    input
-                        .form-input
+                    label .form-label for="llm-default-model" { "Default Model" }
+                    input #llm-default-model
+                        .form-input .form-input--readonly
                         type="text"
                         value=(default_model)
                         placeholder="(provider default)"
                         readonly
-                        style="background:var(--bg-secondary)"
                     ;
                     p .form-hint {
                         "Set via " code { (DEFAULT_MODEL_VAR) }
@@ -445,9 +444,9 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
         // Per-thread overrides
         div .card {
-            h3 style="font-size:1rem;font-weight:600;margin:0 0 1rem" { "Per-Thread Overrides" }
+            h3 .card-title .mb-4 { "Per-Thread Overrides" }
             @if overrides.is_empty() {
-                div .text-center .text-muted style="padding:1.5rem" {
+                div .empty-state {
                     "No thread overrides configured."
                 }
             } @else {
@@ -471,7 +470,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                 @let date = updated.get(..10).unwrap_or(updated);
                                 tr {
                                     td {
-                                        a href={"/b/llm/threads/" (tid)} style="font-family:monospace;font-size:0.8rem" {
+                                        a .font-mono .text-xs href={"/b/llm/threads/" (tid)} {
                                             (tid)
                                         }
                                     }
@@ -479,20 +478,20 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         @if pb.is_empty() {
                                             span .text-muted { "(default)" }
                                         } @else {
-                                            code style="font-size:0.8rem" { (pb) }
+                                            code .text-xs { (pb) }
                                         }
                                     }
                                     td {
                                         @if model.is_empty() {
                                             span .text-muted { "(default)" }
                                         } @else {
-                                            code style="font-size:0.8rem" { (model) }
+                                            code .text-xs { (model) }
                                         }
                                     }
-                                    td .text-muted style="font-size:0.8rem" { (date) }
+                                    td .text-muted .text-xs { (date) }
                                     td {
                                         button
-                                            .btn.btn-sm.btn-danger
+                                            .btn.btn--sm.btn--danger
                                             hx-delete={"/b/llm/api/config/" (ov.id)}
                                             hx-confirm={"Remove override for thread " (tid) "?"}
                                             hx-target="closest tr"
@@ -830,8 +829,8 @@ mod tests {
         assert!(html.contains("Start a new conversation"));
         assert!(html.contains(r#"id="chat-form""#));
         assert!(
-            html.contains("opacity:0.4"),
-            "composer should be disabled style"
+            html.contains("chat-form--disabled"),
+            "composer should carry the disabled-state class"
         );
     }
 
@@ -851,7 +850,7 @@ mod tests {
         .into_string();
         assert!(html.contains(r#"value="some-id""#));
         assert!(!html.contains(r#"id="no-thread-prompt""#));
-        assert!(!html.contains("opacity:0.4"));
+        assert!(!html.contains("chat-form--disabled"));
     }
 
     /// The page body must include the external <script src> for the static
@@ -896,8 +895,8 @@ mod tests {
             "missing external marked.js script tag (expected src={marked_url}): {html}"
         );
 
-        let purify_pos = html.find(purify_url).expect("purify script tag present");
-        let marked_pos = html.find(marked_url).expect("marked script tag present");
+        let purify_pos = html.find(&purify_url).expect("purify script tag present");
+        let marked_pos = html.find(&marked_url).expect("marked script tag present");
         let llm_chat_pos = html.find(url).expect("llm-chat.js script tag present");
         assert!(
             purify_pos < marked_pos,

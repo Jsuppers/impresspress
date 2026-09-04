@@ -432,24 +432,27 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
         match existing.get(&var.key) {
             Some(record) => {
-                // A stored value that still points at the built-in raster
-                // wordmark is a stale pointer *this function wrote*: older
-                // releases seeded `LOGO_URL` with the wordmark's own
-                // content-hashed `/b/static/` URL, and that asset, its
-                // accessor and its route are gone. Left alone it renders a
-                // broken image on every page that shows the brand.
+                // A stored value pointing at our own `/b/static/` route for a
+                // file this build does not serve is a stale pointer *this
+                // function wrote*: built-in asset URLs carry a content hash
+                // and are seeded into the database as defaults, so any release
+                // that changes the artwork — new logo, new favicon, or the
+                // removed raster wordmark whose route is gone outright —
+                // leaves every existing deployment pointing at a 404. Left
+                // alone it renders a broken image on every page that shows
+                // the brand.
                 //
                 // Repaired here rather than in an admin migration because
                 // migrations are gated (`--run-migrations`, see RELEASE.md)
                 // and a broken logo gives an operator no signal to opt in,
                 // whereas `seed_defaults` runs on every boot's `Init`. It
-                // costs one `starts_with` per boot and is idempotent: once
-                // blank, the prefix no longer matches. Scoped to the built-in
-                // route, so a white-labelled URL is never touched.
-                let stale_builtin_wordmark = var.key == crate::config_vars::LOGO_URL_KEY
-                    && record
-                        .str_field("value")
-                        .starts_with(crate::config_vars::REMOVED_BUILTIN_WORDMARK_URL_PREFIX);
+                // costs one manifest scan per stored value per boot and is
+                // idempotent: once repaired the value names a served file, so
+                // it no longer matches. Scoped to the built-in route by
+                // `is_stale_builtin_asset_url`, so a white-labelled URL is
+                // never touched.
+                let stale_builtin_asset =
+                    crate::ui::assets::is_stale_builtin_asset_url(record.str_field("value"));
 
                 // Only refresh metadata when at least one declared field
                 // actually differs. Without this guard every isolate cold-start
@@ -459,7 +462,7 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 let same_desc = record.str_field("description") == var.description;
                 let same_warn = record.str_field("warning") == var.warning;
                 let same_sens = record.i64_field("sensitive") == sensitive as i64;
-                if same_name && same_desc && same_warn && same_sens && !stale_builtin_wordmark {
+                if same_name && same_desc && same_warn && same_sens && !stale_builtin_asset {
                     continue;
                 }
                 let mut fields = serde_json::json!({
@@ -468,14 +471,15 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                     "warning": var.warning,
                     "sensitive": sensitive,
                 });
-                if stale_builtin_wordmark {
+                if stale_builtin_asset {
                     tracing::warn!(
                         key = %var.key,
                         stale = %record.str_field("value"),
-                        "cleared a persisted URL for the removed built-in wordmark; \
-                         the app name now renders as text beside the brand icon"
+                        repaired_to = %var.default,
+                        "repaired a persisted URL for a built-in asset this build \
+                         no longer serves; reset to the declared default"
                     );
-                    fields["value"] = serde_json::Value::String(String::new());
+                    fields["value"] = serde_json::Value::String(var.default.clone());
                 }
                 let data = json_map(fields);
                 let _ = db::upsert_by_field(
@@ -1021,6 +1025,77 @@ mod tests {
                 .as_deref(),
             Some("https://acme.example/wordmark.png"),
             "a white-labelled logo URL must not be cleared"
+        );
+    }
+
+    /// The repair is not specific to the removed wordmark. Any release that
+    /// changes an asset's bytes changes its content hash, and the previous
+    /// hash is already seeded into every existing deployment's database —
+    /// so the sidebar mark and the browser tab icon go dead on upgrade
+    /// exactly like the wordmark did. Unlike the wordmark, these assets still
+    /// exist, so the repair must point them at the *current* default rather
+    /// than blank.
+    #[tokio::test]
+    async fn seed_defaults_repairs_stale_builtin_logo_and_favicon_urls() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // What a release built before the artwork changed would have seeded:
+        // the right route, a hash this build no longer serves.
+        seed_var(
+            &ctx,
+            "WAFER_RUN_SHARED__LOGO_ICON_URL",
+            "/b/static/impresspress-logo-5e884a3a.png",
+            0,
+        )
+        .await;
+        seed_var(
+            &ctx,
+            "WAFER_RUN_SHARED__FAVICON_URL",
+            "/b/static/favicon-2845a6ac.ico",
+            0,
+        )
+        .await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL")
+                .await
+                .as_deref(),
+            Some(crate::ui::assets::logo_icon_url().as_str()),
+            "a stale built-in logo URL must be repaired to the current asset"
+        );
+        assert_eq!(
+            stored_value(&ctx, "WAFER_RUN_SHARED__FAVICON_URL")
+                .await
+                .as_deref(),
+            Some(crate::ui::assets::favicon_url().as_str()),
+            "a stale built-in favicon URL must be repaired to the current asset"
+        );
+    }
+
+    /// A row already naming the current asset is left alone — the repair is
+    /// idempotent, and must not churn a write on every boot.
+    #[tokio::test]
+    async fn seed_defaults_leaves_a_current_builtin_logo_url_untouched() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let current = crate::ui::assets::logo_icon_url();
+        seed_var(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL", &current, 0).await;
+
+        seed_defaults(&ctx).await;
+
+        assert_eq!(
+            stored_value(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL")
+                .await
+                .as_deref(),
+            Some(current.as_str()),
         );
     }
 }

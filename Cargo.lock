@@ -2669,6 +2669,7 @@ dependencies = [
  "wafer-core",
  "wafer-run",
  "wafer-sql-utils",
+ "walkdir",
  "wiremock",
  "zip",
 ]

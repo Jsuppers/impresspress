@@ -1,0 +1,166 @@
+/* tokens.css — design tokens: custom properties and font declarations */
+
+/* ===== Itim Font (bundled; served relative to wherever app.css is hosted) ===== */
+/* These bare filenames are the logical asset keys from build.rs's FILE_ASSETS.
+   build.rs rewrites them to content-hashed filenames when it assembles the
+   bundle. A relative url() resolves against the stylesheet's own URL, so the
+   same bytes are correct whether that stylesheet is served locally or from
+   a CDN path — see impresspress-core::ui::assets and build.rs. */
+@font-face { font-family: 'Itim'; font-style: normal; font-weight: 400; font-display: swap; src: url('itim-latin.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Itim'; font-style: normal; font-weight: 400; font-display: swap; src: url('itim-latin-ext.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+
+/* ===== Variables ===== */
+:root {
+	--primary-color: #fd3534;
+	--primary-hover: #e02523;
+	/* White text on this needs 4.5:1. #fd3534 is only 3.66:1, so button
+	   surfaces use the darker #d92320 (4.99:1) while #fd3534 stays for
+	   accents, borders and large text. */
+	--primary-button: #d92320;
+	--secondary-color: #64748b;
+
+	--navy-900: #02112a;
+	--navy-800: #0a1122;
+	--navy-700: #172136;
+	--sidebar-text-muted: #94a3b8;
+	/* Muted steel blue for the auth-split brand panel's tagline, sampled
+	   from the reference design. 6.08:1 against --navy-900, clears the
+	   4.5:1 AA floor for normal text. */
+	--auth-tagline: #7095c4;
+
+	--accent-success: #10b981;
+	/* Same problem as --accent-danger-text/--accent-warning-text below:
+	   #10b981 (emerald) is only 2.54:1 on white and 2.31:1 on its own
+	   #10b98119 tint -- it fails even the 3:1 non-text floor, so it was
+	   never safe as a foreground anywhere. #166534 is 7.13:1 on white,
+	   6.50:1 on the tint and 6.77:1 on #ecfdf5 (computed); #10b981 stays
+	   for fills and borders. The value is not new -- Task 12c already
+	   picked #166534 twice as a literal (.login-success,
+	   .change-password-success-text) and .badge--tone-green used it too,
+	   so this token unifies three existing literals rather than
+	   introducing a fourth green. */
+	--accent-success-text: #166534;
+	--accent-warning: #f59e0b;
+	--accent-danger: #ef4444;
+	/* Red text on white needs 4.5:1. #ef4444 is only 3.76:1 (and only
+	   3.76:1-ish on its own pale tint backgrounds), so text uses the darker
+	   #b91c1c (6.47:1 on white, 5.70:1 on the #ef444419 tint) while #ef4444
+	   stays for non-text use -- icons, borders, chart marks -- which need
+	   only 3:1. Mirrors how --primary-button relates to --primary-color. */
+	--accent-danger-text: #b91c1c;
+	/* Same problem as --accent-danger-text above: #f59e0b (amber) is only
+	   ~2.3:1 on white, nowhere near the 4.5:1 AA floor for text. #92400e
+	   (amber-800) is 7.09:1 on white and 6.56:1 on the #f59e0b19 tint
+	   (computed) -- the text-safe sibling; #f59e0b stays for non-text use
+	   (icons, borders) which only needs 3:1. */
+	--accent-warning-text: #92400e;
+	/* "Info" reads as the brand accent, not blue -- success/warning/danger
+	   keep their universal hues, but informational chips/toasts/charts sit
+	   inside the warm brand palette (the old #3b82f6 blue clashed on every
+	   page it appeared). This used to be its own --accent-info/
+	   --accent-info-bg pair, but --accent-info was byte-identical to
+	   --primary-color (#fd3534) -- an alias carrying the same too-light-
+	   for-text value under a different name, invisible to a guard that
+	   matched on token name rather than resolved value (Task 15). Retired:
+	   every former --accent-info/--accent-info-bg consumer now references
+	   --primary-color/--primary-button (or a local color-mix of
+	   --primary-color) directly -- "info" was always just the brand
+	   accent, so the separate token added a name without adding a value. */
+
+	--bg-primary: #ffffff;
+	--bg-secondary: #f0f0f0;
+	--bg-sidebar: var(--navy-800);
+	--bg-hover: #f1f5f9;
+
+	--text-primary: #1e293b;
+	/* #64748b was 4.76:1 on white -- only 0.26 above the 4.5:1 AA floor,
+	   so it cleared AA on the page background and failed on every tinted
+	   surface the app actually puts it on: 4.48:1 on --surface-2, 4.34:1
+	   on --bg-hover, 4.18:1 on --bg-secondary (computed). The token had no
+	   headroom, which is why the failures showed up scattered across
+	   .table th, .public-page__version, .editor-status__version and
+	   .admin-dashboard-mobile-hint rather than in one place. #5d6b7f keeps
+	   the same slate hue and is 4.76:1 on --bg-secondary, the darkest tint
+	   in use -- i.e. it now has on the worst surface the headroom the old
+	   value only had on white (5.42:1 there). */
+	--text-secondary: #5d6b7f;
+	--text-muted: #5d6b7f;
+
+	--border-color: #e2e8f0;
+	--border-light: #f1f5f9;
+
+	--sidebar-width: 240px;
+	/* 64, not 72: the collapsed rail's centre line has to be the same axis
+	   everything already sits on when expanded, or collapsing slides the
+	   icons sideways onto a new one. The brand mark fixes that axis at 32px
+	   (16px of `.sidebar__brand` padding + half of the 32px mark), so the
+	   rail is 2x32. The nav icons are then sized and padded to land their
+	   centres on 32 too -- see `.sidebar__nav-icon` in layouts/shell.css. */
+	--sidebar-collapsed-width: 64px;
+
+	/* Numeric 4px scale -- --space-N is N * 4px. Replaces the old
+	   --spacing-xs/sm/md/lg/xl + --space-2xl t-shirt names: a t-shirt scale
+	   can't express gaps that fall between existing steps (12px, 20px)
+	   without inventing awkward names like --spacing-sm-md, and two
+	   coexisting spacing systems was the actual bug this fixes. Every
+	   former --spacing-xs..xl and --space-2xl consumer has been migrated to
+	   the matching step below -- there is no alias, so a stray old name now
+	   fails to resolve instead of silently reintroducing the drift.
+
+	   (This sentence used to read "--spacing-" then a star then a slash.
+	   That sequence closes the comment: CSS comments do not nest and have
+	   no escape, so the first closer wins wherever it appears -- even
+	   mid-word. The parser then read the remaining prose as a declaration
+	   and, recovering, discarded everything up to the next semicolon, which
+	   was the end of `--space-1: 0.25rem;`. That token silently vanished
+	   from :root, and all 55 `var(--space-1)` uses fell back to the `*`
+	   reset's 0 -- which is why the small-button size class (now
+	   `.btn--sm`) and `.topbar__palette` rendered
+	   with no padding at all. The guard in ui/assets.rs now fails the build
+	   if any referenced token is missing from :root.) */
+	--space-1: 0.25rem;  /*  4px */
+	--space-2: 0.5rem;   /*  8px */
+	--space-3: 0.75rem;  /* 12px */
+	--space-4: 1rem;     /* 16px */
+	--space-5: 1.25rem;  /* 20px */
+	--space-6: 1.5rem;   /* 24px */
+	--space-8: 2rem;     /* 32px */
+	--space-12: 3rem;    /* 48px */
+
+	--radius-sm: 4px;
+	--radius-md: 8px;
+	--radius-lg: 12px;
+	--radius-full: 9999px;
+
+	--transition-fast: 0.2s ease;
+	--transition-normal: 0.3s ease;
+
+	--shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+	--shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+	--shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
+
+	--z-dropdown: 100;
+	--z-sidebar: 200;
+	--z-modal: 300;
+	--z-notification: 500;
+
+	/* New type scale — Phase 1, Impresspress UI Cleanup */
+	--text-xs: 0.75rem;    /* 12px — labels */
+	--text-sm: 0.875rem;   /* 14px — table cells, secondary */
+	--text-base: 0.9375rem;/* 15px — body */
+	--text-lg: 1.125rem;   /* 18px — section headings */
+	--text-xl: 1.375rem;   /* 22px — page titles */
+	--text-2xl: 1.75rem;   /* 28px — dashboard hero numbers */
+
+	/* Layered surfaces — same values the codebase already uses ad-hoc */
+	--surface-1: #ffffff;
+	--surface-2: #f8f8f9;
+	--surface-3: #fafafa;
+
+	/* Focus-visible ring */
+	--focus-ring: 0 0 0 2px var(--primary-color);
+
+	--font-ui: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+	           Roboto, 'Helvetica Neue', Arial, sans-serif;
+	--font-brand: 'Itim', var(--font-ui);
+}

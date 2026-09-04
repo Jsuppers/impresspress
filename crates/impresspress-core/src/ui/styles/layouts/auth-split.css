@@ -1,0 +1,252 @@
+/* ===== Login ===== */
+.login-page {
+	min-height: 100vh;
+	display: flex; align-items: center; justify-content: center;
+	background: var(--bg-secondary); padding: var(--space-4);
+}
+
+.login-container {
+	width: 100%; max-width: 420px;
+	background: white;
+	border: 1px solid var(--border-color);
+	/* 2.5rem sits exactly between --space-8 (32px, -8px) and --space-12
+	   (48px, +8px) -- equidistant, so nearest-neighbour is a coin flip, and
+	   an 8px change to the login card's outer padding is visible on a page
+	   this migration was asked to screenshot. Left un-snapped rather than
+	   guessed; a follow-up design pass should pick a side deliberately. */
+	border-radius: 16px; padding: 2.5rem;
+	animation: loginSlideUp 0.4s ease-out;
+}
+
+@keyframes loginSlideUp {
+	from { opacity: 0; transform: translateY(20px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+
+/* `.login-logo` (the per-page auth-card header wrapper) was retired here --
+   no login/signup/reset/verify/bootstrap/change-password page renders a
+   per-page logo header any more (the navy `.auth-split__brand` panel is the
+   only place those pages' logo appears; see `components::auth_panel`).
+   `.login-subtitle` survives on its own (no `.login-logo` wrapper) on the
+   verify/reset-password result pages.
+
+   `.logo-image`/`.login-app-name`/`.login-brand`/`.login-brand__icon`
+   restored/ported from origin/main during the main merge -- 2026-09-02.
+   These are NOT dead: `templates::brand_lockup` (main's helper, shared by
+   every auth card AND `templates::account_card_page` -- the userportal/orgs
+   header) renders exactly these classes, and `WAFER_RUN_SHARED__LOGO_URL`
+   defaults to blank (no bundled wordmark; see `config_vars::LOGO_URL_KEY`),
+   so the blank-fallback branch (`.login-brand` icon + `.login-app-name`
+   text) is account-card pages' default rendering, not an edge case. */
+.login-subtitle {
+	color: var(--text-secondary); font-size: 0.875rem; margin: 0;
+}
+
+/* `brand_lockup`'s configured-wordmark branch (`img .logo-image`) -- used
+   by account-card pages (userportal/orgs) when a deployment sets a custom
+   `WAFER_RUN_SHARED__LOGO_URL`. `components/card.css`'s
+   `.account-card__head .logo-image` narrows `max-width`/`margin-bottom` for
+   that specific context; this is the shared base. */
+.logo-image {
+	height: 48px; width: auto;
+	margin: 0 auto var(--space-4) auto; display: block;
+}
+
+/* `brand_lockup`'s blank-`logo_url` branch (the default): icon + app-name
+   lockup. 64px = the 64-cell pixel-art mark at 1:1 -- must stay a whole
+   multiple of the mark's native cell size or `.pixel-art` (styles/base.css)
+   nearest-neighbour scaling misaligns (same rule as the sidebar icon, see
+   `styles/layouts/shell.css`). */
+.login-brand { display: flex; flex-direction: column; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
+.login-brand__icon { width: 64px; height: 64px; display: block; }
+.login-brand .login-app-name { margin-bottom: 0; }
+
+.login-app-name {
+	font-size: 1.5rem; font-weight: 700; display: block; margin-bottom: var(--space-2);
+	color: var(--text-primary);
+}
+
+/* #dc2626 was only 3.95:1 on this box's #fee2e2 background (computed) --
+   below the 4.5:1 AA floor. `--accent-danger-text` (#b91c1c, 5.30:1 on
+   #fee2e2, computed) replaces it -- the same token this file's
+   `.auth-status__icon--dynamic` failure state and every other danger-text
+   surface already use, so this stops being the one danger-text site with
+   its own untokenized (and non-compliant) literal. */
+.login-error {
+	background: #fee2e2; color: var(--accent-danger-text);
+	padding: var(--space-3) var(--space-4); border-radius: 8px;
+	margin-bottom: var(--space-6); font-size: 0.875rem;
+	display: flex; align-items: center; gap: var(--space-2);
+	animation: shake 0.3s ease-in-out;
+}
+
+/* Success box (signup/reset-password result). No `display` here
+   deliberately: the element starts `hidden` (native attribute, see
+   base.css's `[hidden]` rule) and the shown state is the default block
+   flow — the same shape the `#success` div had when it carried an inline
+   `display:block`. #ecfdf5/#a7f3d0 have no matching design token; carried
+   over unchanged from the original inline styles. #059669 was only 3.58:1
+   on #ecfdf5 (computed) -- below the 4.5:1 AA floor. #166534 (6.77:1 on
+   #ecfdf5, computed) replaces it -- same literal already used two rules
+   down by `.change-password-success-text` (and by `.badge--tone-green`'s
+   text in components/badge.css), so this box's own text now clears AA
+   too instead of being the one sibling left failing. */
+.login-success {
+	background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px;
+	padding: var(--space-3); margin-bottom: var(--space-4); font-size: 0.813rem; color: var(--accent-success-text);
+}
+/* change-password's success box: same box, centered content, larger padding,
+   and its own message styling (child overrides the box's font-size/color,
+   so the two don't need to agree). #16a34a has no matching design token and
+   was only 3.13:1 on the box's #ecfdf5 background (computed, Task 12c) --
+   below the 4.5:1 AA floor. #166534 (6.77:1 on #ecfdf5, computed) replaces
+   it -- same literal already used for .badge--tone-green's text in
+   components/badge.css. */
+.login-success--centered { padding: var(--space-4); text-align: center; }
+.change-password-success-text { font-size: 0.875rem; color: var(--accent-success-text); margin: 0 0 var(--space-4); font-weight: 500; }
+
+/* ===== Auth status result page (reset-password/verify success-or-failure,
+   signup's "check your email") =====
+   `.auth-status__icon`'s colour is a per-render outcome (success vs. failure)
+   computed in Rust, so it's handed to CSS as `--icon-color`/`--icon-bg`
+   custom properties rather than a static class -- the guard's own carve-out
+   for a dynamic runtime value. Signup's icon is always the success state, so
+   it uses the static `--success` modifier instead. */
+.auth-status { text-align: center; }
+.auth-status__icon {
+	width: 48px; height: 48px; border-radius: 50%;
+	display: flex; align-items: center; justify-content: center;
+	margin: 0 auto var(--space-4); font-size: 1.5rem;
+}
+/* The status glyph is now an inline `icons::check()`/`icons::x()` SVG (18x18
+   by default) rather than a text character -- sized up to read clearly in
+   the 48px badge, matching the `.db-table-group__icon svg` override
+   precedent for an icon inside an oversized badge. */
+.auth-status__icon svg { width: 24px; height: 24px; }
+/* Was `.auth-status__icon--dynamic`, coloured by `--icon-color`/`--icon-bg`
+   custom properties set inline from Rust (verify.rs, reset_password.rs) --
+   the no-inline-styles guard's carve-out for a "dynamic runtime value". The
+   value was never open-ended: it was a two-state boolean, `#10b981` for
+   success and `#ef4444` for failure. Being inline put both states outside
+   every CSS-based check, and both were failing: 2.34:1 and 3.39:1 against
+   their own tints (computed). As static modifiers they are covered by the
+   contrast guard like everything else, and they match how signup.rs has
+   always rendered its always-successful icon. */
+.auth-status__icon--success { background: #ecfdf5; color: var(--accent-success-text); }
+/* #fef2f2 replaces the old inline `#ef444415` tint (~#fef0f0 over white) --
+   a hair lighter, and a real red-50 rather than an alpha-suffixed literal. */
+.auth-status__icon--failure { background: #fef2f2; color: var(--accent-danger-text); }
+.auth-status__title { font-size: 1.25rem; font-weight: 700; margin: 0 0 var(--space-2); }
+.auth-status__message { color: var(--text-secondary); font-size: 0.875rem; line-height: 1.6; margin: 0 0 var(--space-6); }
+.auth-status__action { display: inline-block; width: auto; padding: var(--space-3) var(--space-5); text-decoration: none; }
+
+/* ===== Bootstrap-admin page hint (auth_ui/pages/bootstrap.rs) =====
+ * #6b7280/#f3f4f6 have no matching design token; carried over unchanged
+ * (#6b7280 already appears as a literal elsewhere -- see
+ * .form-input-wrapper .input-icon in components/form.css). */
+.bootstrap-hint { font-size: 0.875rem; color: #6b7280; margin-bottom: var(--space-6); text-align: center; }
+.bootstrap-hint code { background: #f3f4f6; padding: 0.125rem var(--space-2); border-radius: 0.25rem; font-size: 0.813rem; }
+
+@keyframes shake {
+	0%, 100% { transform: translateX(0); }
+	25% { transform: translateX(-5px); }
+	75% { transform: translateX(5px); }
+}
+
+.login-form { margin-bottom: var(--space-6); }
+
+.pw-wrap { position: relative; }
+.pw-wrap input { padding-right: 2.5rem; }
+
+.pw-toggle {
+	position: absolute; right: 0.5rem; top: 50%;
+	transform: translateY(-50%);
+	background: none; border: none; cursor: pointer;
+	padding: var(--space-1); color: var(--text-muted);
+	display: flex; align-items: center;
+}
+
+.pw-toggle:hover { color: var(--text-primary); }
+.pw-toggle svg { width: 1.125rem; height: 1.125rem; }
+
+.login-button {
+	width: 100%; padding: var(--space-4) var(--space-6);
+	/* White text needs --primary-button (4.99:1), not --primary-color
+	   (3.66:1, fails WCAG AA) — see no_new_white_text_on_primary_color_background. */
+	background: var(--primary-button); color: white;
+	border: none; border-radius: 10px;
+	font-size: 0.9375rem; font-weight: 600;
+	cursor: pointer; transition: all 0.2s;
+	display: flex; align-items: center; justify-content: center; gap: var(--space-2);
+	box-shadow: 0 1px 3px rgba(217, 35, 32, 0.3);
+}
+
+.login-button:hover:not(:disabled) {
+	background: var(--primary-hover);
+	transform: translateY(-1px);
+	box-shadow: 0 4px 12px rgba(217, 35, 32, 0.3);
+}
+
+.login-button:disabled { cursor: not-allowed; opacity: 0.7; box-shadow: none; }
+
+.signup-link {
+	text-align: center; font-size: 0.875rem;
+	color: var(--text-secondary);
+}
+
+/* --primary-color is 3.66:1 on white (.login-container's background) --
+   below the 4.5:1 AA floor; --primary-button (4.99:1, computed) is the
+   text-safe sibling. */
+.signup-link a {
+	color: var(--primary-button); text-decoration: none;
+	font-weight: 600; transition: color 0.2s;
+}
+
+.signup-link a:hover { color: var(--primary-hover); text-decoration: underline; }
+
+/* Old OAuth button/divider markup (`.oauth-button`, `.oauth-divider`) was
+   retired with `login.rs`'s inline-style cleanup — replaced by the
+   `oauth_button()` component's `.btn-oauth` (styles/components/auth.css)
+   and the plain `.auth-divider` div. `.oauth-buttons` (the button-stack
+   wrapper) moved there too, alongside the component it wraps. */
+
+/* ===== Auth split ===== */
+.auth-split { display: grid; grid-template-columns: 1fr; min-height: 100vh; }
+@media (min-width: 1024px) { .auth-split { grid-template-columns: minmax(280px, 480px) 1fr; } }
+
+.auth-split__brand {
+	background: var(--navy-900);
+	color: #ffffff;
+	display: flex;
+	flex-direction: column;
+	padding: var(--space-12) var(--space-8);
+}
+
+@media (max-width: 720px) { .auth-split__brand { min-height: 12rem; } }
+
+.auth-split__logo { align-self: flex-start; display: flex; align-items: center; gap: var(--space-2); }
+/* Square mark only -- the long dark-ink wordmark PNG was drawn for the old
+   white chrome and is illegible on navy, so this panel never renders it
+   (see `ui::components::auth_panel`; same fix as `.sidebar__brand-icon`). */
+.auth-split__logo-img { height: 2rem; width: 2rem; object-fit: contain; display: block; flex-shrink: 0; }
+.auth-split__logo-name { font-size: var(--text-lg); font-weight: 600; color: #ffffff; }
+
+/* Logo pinned top (default flex flow, unaffected by the auto margins
+   below). Headline+tagline are wrapped in `.auth-split__text` (one flex
+   item) and centered vertically in the remaining space with auto margins
+   on *both* sides -- top and bottom auto margins each absorb half the
+   leftover space, which centers the block without disturbing the logo's
+   position. This is deliberately not `justify-content: space-between` on
+   `.auth-split__brand`'s three children -- that would spread logo /
+   headline / tagline out evenly and strand the headline mid-panel instead
+   of keeping it grouped tightly with the tagline. It's also deliberately
+   not an auto margin on the headline alone -- that only pushes the group
+   to the *bottom* (this shipped and was corrected once already); centering
+   needs the margin on both edges of the group. */
+.auth-split__text { margin: auto 0; }
+.auth-split__headline { font-size: 2.5rem; font-weight: 700; margin: 0; line-height: 1.15; }
+.auth-split__tagline { font-size: var(--text-base); margin: var(--space-2) 0 0; color: var(--auth-tagline); }
+
+.auth-split__form { display: flex; align-items: center; justify-content: center; padding: var(--space-12) var(--space-4); background: #fdfdfd; }
+/* No card: the form sits directly on the surface. */
+.auth-split__form > * { width: 100%; max-width: 26rem; }

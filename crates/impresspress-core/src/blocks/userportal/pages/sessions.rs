@@ -32,7 +32,7 @@ pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let current_hash = current_session_hash(msg);
 
     let body = html! {
-        p .text-muted style="margin:0 0 1rem;font-size:0.875rem" {
+        p .text-muted .m-0 .mb-4 .text-sm {
             "Sessions signed in to your account. Revoke any you don't recognize."
         }
         (render_table(&rows, current_hash.as_deref()))
@@ -98,7 +98,7 @@ fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> M
                         td data-label="Last used" { time datetime=(r.last_used_at) { (r.last_used_at) } }
                         td data-label="Expires" { time datetime=(r.expires_at) { (r.expires_at) } }
                         td data-label="" {
-                            button .btn .btn-ghost .btn-sm
+                            button .btn .btn--ghost .btn--sm
                                 hx-delete=(format!("/b/userportal/sessions/{}", hex_encode(&r.token_hash)))
                                 hx-target="closest tr"
                                 hx-swap="outerHTML"

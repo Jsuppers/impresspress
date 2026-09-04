@@ -1,0 +1,148 @@
+/* Modal */
+.modal-overlay {
+	position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+	background: rgba(0,0,0,0.5); z-index: var(--z-modal);
+	display: flex; align-items: center; justify-content: center;
+	padding: var(--space-4);
+	animation: fadeIn 0.15s ease-out;
+}
+
+.modal-overlay[hidden] { display: none; }
+
+@keyframes fadeIn {
+	from { opacity: 0; }
+	to { opacity: 1; }
+}
+
+.modal {
+	background: white; border-radius: 12px;
+	width: 100%; max-width: 500px; max-height: 90vh;
+	overflow-y: auto;
+	box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+	animation: modalSlideUp 0.2s ease-out;
+}
+
+/* Wider variant — block detail modal (blocks/admin/pages/blocks.rs) needs
+   room for endpoint/config-key tables. */
+.modal--lg { max-width: 700px; max-height: 85vh; overflow-y: auto; }
+
+@keyframes modalSlideUp {
+	from { opacity: 0; transform: translateY(20px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+
+.modal-header {
+	display: flex; align-items: center; justify-content: space-between;
+	padding: var(--space-5) var(--space-6);
+	border-bottom: 1px solid var(--border-color);
+}
+
+.modal-title { font-size: 1.125rem; font-weight: 600; }
+
+.modal-close {
+	background: none; border: none; cursor: pointer;
+	color: var(--text-muted); padding: var(--space-1);
+	border-radius: 4px; transition: all 0.2s;
+	display: flex; align-items: center; justify-content: center;
+}
+
+.modal-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.modal-body { padding: var(--space-6); }
+
+/* Native <dialog> modals (used by the files browser's "New bucket" form,
+   etc). The .modal box rules above target the htmx-driven overlay/box
+   pattern; this block re-centers and pads the native-dialog variant,
+   draws a ::backdrop scrim, and gives the inner form sensible spacing.
+   The screenshot of the bucket modal landing in the top-left corner
+   without backdrop dimming is the symptom that motivated this block. */
+dialog.modal {
+	position: fixed;
+	inset: 0;
+	margin: auto;
+	height: fit-content;
+	padding: var(--space-6);
+	border: 1px solid var(--border-color);
+}
+dialog.modal::backdrop {
+	background: rgba(0, 0, 0, 0.5);
+	backdrop-filter: blur(2px);
+}
+dialog.modal h3 {
+	margin: 0 0 var(--space-4);
+	font-size: 1.125rem;
+	font-weight: 600;
+}
+dialog.modal label {
+	display: block;
+	margin-bottom: var(--space-2);
+}
+dialog.modal label > span {
+	display: block;
+	margin-bottom: var(--space-2);
+	font-size: 0.875rem;
+	font-weight: 500;
+	color: var(--text-primary);
+}
+dialog.modal input[type="text"],
+dialog.modal input[type="email"],
+dialog.modal input[type="number"],
+dialog.modal input[type="password"] {
+	width: 100%;
+	padding: var(--space-2) var(--space-3);
+	border: 1px solid var(--border-color);
+	border-radius: 6px;
+	font-size: 0.875rem;
+	color: var(--text-primary);
+	background: var(--surface-1);
+}
+/* Focus ring comes from the global :where(...):focus-visible rule in
+   base.css (the old `outline: var(--focus-ring)` here was an invalid
+   outline value — --focus-ring is box-shadow syntax — and got dropped). */
+dialog.modal input:focus-visible {
+	border-color: var(--primary-color);
+}
+dialog.modal .form-hint {
+	margin: var(--space-2) 0 var(--space-4);
+}
+dialog.modal .checkbox-label {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-2);
+	margin: var(--space-2) 0 var(--space-5);
+	font-size: 0.875rem;
+	font-weight: normal;
+	color: var(--text-primary);
+}
+dialog.modal .checkbox-label > span {
+	display: inline;
+	margin: 0;
+	font-weight: normal;
+}
+dialog.modal .checkbox-label input[type="checkbox"] {
+	margin-top: 0.2em;
+	accent-color: var(--primary-color);
+}
+dialog.modal .modal-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: var(--space-2);
+	margin-top: var(--space-4);
+}
+dialog.modal .modal-error {
+	display: block;
+	margin: 0 0 var(--space-3);
+	padding: var(--space-2) var(--space-3);
+	border-radius: 6px;
+	background: #fee2e2;
+	color: #991b1b;
+	font-size: 0.875rem;
+}
+
+/* ===== Block detail modal (blocks/admin/pages/blocks.rs) ===== */
+.modal-note { font-size: var(--text-sm); color: var(--text-muted); margin-top: var(--space-4); }
+.modal-description { font-size: var(--text-sm); color: var(--text-muted); line-height: 1.6; margin-bottom: var(--space-4); }
+.modal-section-title { font-size: var(--text-sm); font-weight: 600; margin: var(--space-4) 0 var(--space-2); }
+.modal-tech { font-size: 13px; color: var(--text-muted); }
+dialog.modal .modal-error[hidden] { display: none; }
+

@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 pub use impresspress_core::{
-    PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR,
-    PREPARED_PLAN_MODULE_SHA256_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
-    RELEASE_ASSET_MANIFEST_SHA256_VAR,
+    ui::assets::ASSET_BASE_URL_VAR, PREPARED_APPLICATION_BUILD_SHA256_VAR,
+    PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
+    RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
 };
 
 use super::{
-    assets::ReleaseManifest,
+    assets::{resolve_asset_base_url, ReleaseManifest},
     build::WORKER_BUILD_VERSION,
     prepared::{
         ApplicationArtifactIdentity, PreparedModule, PREPARED_MODULE_DIR, PREPARED_SHIM_FILE,
@@ -450,6 +450,15 @@ fn base_toml(cfg: &CloudflareConfig) -> toml::Value {
     vars.insert(
         wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY.into(),
         Value::String("true".into()),
+    );
+    // Every generated config represents code that can actually run
+    // (`wrangler dev`, the upload-only candidate, or the final promoted
+    // version), so this belongs at the base level rather than only on the
+    // release-bound variants: a lean (no `embed-assets`) Cloudflare build
+    // has nowhere else to learn where its static assets live.
+    vars.insert(
+        ASSET_BASE_URL_VAR.into(),
+        Value::String(resolve_asset_base_url(!cfg.r2.bucket_name.is_empty())),
     );
     root.insert("vars".into(), Value::Table(vars));
 

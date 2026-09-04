@@ -51,25 +51,25 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         name="new_password" required;
                 }
                 div #change-pw-result {}
-                button .btn .btn-primary type="submit" style="width:100%" { "Change password" }
+                button .btn .btn--primary type="submit" .w-full { "Change password" }
             }
         }
         section .account-section {
             h2 .account-section__title { "Email verification" }
             @if email_verified {
-                p .text-muted style="margin:0" {
+                p .text-muted .m-0 {
                     "Email verified"
                     @if !user_email.is_empty() { " — " (user_email) }
                 }
             } @else {
-                p .text-muted style="margin:0 0 0.75rem" {
+                p .text-muted .m-0 .mb-3 {
                     "Email not verified"
                     @if !user_email.is_empty() { " — " (user_email) }
                 }
                 div #resend-verification-result {}
-                button .btn .btn-secondary
+                button .btn .btn--secondary
                     type="button"
-                    style="width:100%"
+                    .w-full
                     onclick=(format!(
                         "(function(b){{b.disabled=true;b.textContent='Sending…';\
                          fetch('/b/auth/api/resend-verification',{{method:'POST',\
@@ -87,7 +87,7 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         section .account-section {
             h2 .account-section__title { "Linked accounts" }
             @if links.is_empty() {
-                p .text-muted style="margin:0" {
+                p .text-muted .m-0 {
                     "No external accounts linked. Sign in with GitHub, Google, or Microsoft to link one."
                 }
             } @else {

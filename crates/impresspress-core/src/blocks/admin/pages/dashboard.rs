@@ -12,6 +12,7 @@ use super::{admin_page, crumb};
 use crate::{
     blocks::{admin::REQUEST_LOGS_TABLE as REQUEST_LOGS, auth::USERS_TABLE as USERS},
     ui::{
+        components, icons,
         shell::Topbar,
         templates::{dashboard_page, PageHeader, StatTile},
         SiteConfig, UserInfo,
@@ -45,53 +46,6 @@ fn to_wire_filters(filters: &[Filter]) -> Vec<wire::FilterNode> {
             })
         })
         .collect()
-}
-
-/// Render a 30-day column bar chart card. `data` is ordered
-/// chronologically; bars are normalized against the max count.
-fn bar_chart_card(
-    title: &str,
-    subtitle: &str,
-    data: &[(String, i64)],
-    color_var: &str,
-    view_href: &str,
-) -> maud::Markup {
-    let max = data.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
-    let fmt_short = |s: &str| -> String {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .map(|d| d.format("%b %-d").to_string())
-            .unwrap_or_else(|_| s.to_string())
-    };
-    let first_label = data.first().map(|(d, _)| fmt_short(d)).unwrap_or_default();
-    let last_label = data.last().map(|(d, _)| fmt_short(d)).unwrap_or_default();
-    html! {
-        section .card {
-            header .card__head {
-                div {
-                    h3 .card__title { (title) }
-                    p style="margin:0;font-size:var(--text-xs);color:var(--text-muted)" { (subtitle) }
-                }
-                a .btn .btn-ghost .btn-sm .card__actions href=(view_href) { "View" }
-            }
-            div .card__body {
-                table .charts-css .column style=(format!("--chart-color: {color_var}")) {
-                    tbody {
-                        @for (day, val) in data {
-                            tr data-tooltip=(format!("{day}: {val}")) {
-                                td style=(format!("--size: {:.4}", *val as f64 / max as f64)) {
-                                    (val)
-                                }
-                            }
-                        }
-                    }
-                }
-                div .charts-css__range {
-                    span { (first_label) }
-                    span { (last_label) }
-                }
-            }
-        }
-    }
 }
 
 /// Trailing 30-day window as `(oldest_day, oldest_day_midnight_iso)`.
@@ -397,39 +351,63 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let errors_str = errors_today.to_string();
     let avg_ms_str = format!("{avg_ms:.0}ms");
 
+    // Sparklines reuse the daily series already fetched for the charts below —
+    // no extra D1 statements. "Avg response" has no per-day series fetched, so
+    // its sparkline is `None` rather than reusing an unrelated metric.
+    let new_users_series: Vec<i64> = new_users_daily.iter().map(|(_, v)| *v).collect();
+    let requests_series: Vec<i64> = requests_daily.iter().map(|(_, v)| *v).collect();
+    let errors_series: Vec<i64> = errors_daily.iter().map(|(_, v)| *v).collect();
+
     let stats = vec![
         StatTile {
             label: "Total Users",
             value: &user_count_str,
-            trend: None,
+            icon: icons::users(),
+            spark: Some(components::sparkline(
+                &new_users_series,
+                "var(--primary-color)",
+            )),
         },
         StatTile {
             label: "New Today",
             value: &new_users_str,
-            trend: None,
+            icon: icons::user_plus(),
+            spark: Some(components::sparkline(
+                &new_users_series,
+                "var(--primary-color)",
+            )),
         },
         StatTile {
             label: "Requests Today",
             value: &requests_str,
-            trend: None,
+            icon: icons::file_text(),
+            spark: Some(components::sparkline(
+                &requests_series,
+                "var(--accent-warning)",
+            )),
         },
         StatTile {
             label: "Errors Today",
             value: &errors_str,
-            trend: None,
+            icon: icons::triangle_alert(),
+            spark: Some(components::sparkline(
+                &errors_series,
+                "var(--accent-danger)",
+            )),
         },
         StatTile {
             label: "Avg Response",
             value: &avg_ms_str,
-            trend: None,
+            icon: icons::activity(),
+            spark: None,
         },
     ];
 
     let recent_users_card = html! {
         section .card {
             header .card__head {
-                h3 .card__title { "Recent Users" }
-                a .btn .btn-ghost .btn-sm href="/b/admin/users" { "View all" }
+                h2 .card__title { "Recent Users" }
+                a .btn .btn--ghost .btn--sm href="/b/admin/users" { "View all" }
             }
             div .card__body {
                 @if recent_users.is_empty() {
@@ -457,8 +435,8 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let recent_errors_card = html! {
         section .card {
             header .card__head {
-                h3 .card__title { "Recent Errors" }
-                a .btn .btn-ghost .btn-sm .card__actions href="/b/admin/logs?status=ERROR" { "View all" }
+                h2 .card__title { "Recent Errors" }
+                a .btn .btn--ghost .btn--sm .card__actions href="/b/admin/logs?status=ERROR" { "View all" }
             }
             div .card__body {
                 @if recent_errors.is_empty() {
@@ -499,9 +477,9 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let charts_section = html! {
         div .dashboard-charts {
-            (bar_chart_card("New users", "Last 30 days", &new_users_daily, "var(--primary-color)", "/b/admin/users"))
-            (bar_chart_card("Requests", "Last 30 days", &requests_daily, "var(--accent-warning)", "/b/admin/logs"))
-            (bar_chart_card("Errors", "Last 30 days", &errors_daily, "var(--accent-danger)", "/b/admin/logs?status=ERROR"))
+            (components::line_chart_card("New users", "Last 30 days", &new_users_daily, "var(--primary-color)", "/b/admin/users"))
+            (components::bar_chart_card("Requests", "Last 30 days", &requests_daily, "var(--accent-warning)", "/b/admin/logs"))
+            (components::line_chart_card("Errors", "Last 30 days", &errors_daily, "var(--accent-danger)", "/b/admin/logs?status=ERROR"))
         }
     };
 
@@ -553,6 +531,31 @@ mod tests {
         REQUEST_LOGS, USERS,
     };
     use crate::test_support::TestContext;
+
+    #[test]
+    fn dashboard_renders_stats_before_charts() {
+        let m = crate::ui::templates::dashboard_page(
+            crate::ui::templates::PageHeader {
+                title: "Dashboard",
+                subtitle: None,
+                primary_action: None,
+            },
+            vec![crate::ui::templates::StatTile {
+                label: "TOTAL USERS",
+                value: "1",
+                icon: maud::html! { span .probe-icon {} },
+                spark: None,
+            }],
+            maud::html! { div .probe-primary {} },
+            maud::html! {},
+            None,
+            None,
+        )
+        .into_string();
+        let stats = m.find("stats-grid").expect("stats grid missing");
+        let charts = m.find("dashboard-grid").expect("charts grid missing");
+        assert!(stats < charts, "stat tiles must precede the charts row");
+    }
 
     async fn seed_user(ctx: &TestContext, id: &str, created_at: &str, deleted_at: Option<&str>) {
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();

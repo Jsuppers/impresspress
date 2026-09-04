@@ -67,11 +67,11 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
         div .card .mt-4 {
             div .card-header {
                 h3 .card-title { "Grants Declared in Code" }
-                p .text-muted style="font-size:13px" {
+                p .text-muted .text-13 {
                     "These grants are declared in block source code via BlockInfo.grants and cannot be modified here."
                 }
             }
-            div .card-body {
+            div .card__body {
                 table .table {
                     thead {
                         tr {
@@ -98,13 +98,13 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                                     }
                                     td {
                                         @if let Some(ref rt) = grant.resource_type {
-                                            span .badge .badge-info style="font-size:11px" { (rt) }
+                                            span .badge .badge-info .text-11 { (rt) }
                                         } @else {
-                                            span .badge .badge-secondary style="font-size:11px" { "all" }
+                                            span .badge .badge-secondary .text-11 { "all" }
                                         }
                                     }
                                     td {
-                                        code style="font-size:12px" { (grant.resource) }
+                                        code .text-xs { (grant.resource) }
                                     }
                                     td {
                                         @if grant.write {
@@ -137,15 +137,15 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
             div .card-header .flex .items-center .justify-between {
                 div {
                     h3 .card-title { "Custom Grants" }
-                    p .text-muted style="font-size:13px" {
+                    p .text-muted .text-13 {
                         "Add grants for third-party or WASM blocks. These are loaded at startup alongside code-declared grants."
                     }
                 }
-                button .btn .btn-primary .btn-sm onclick="openModal('add-grant-modal')" {
+                button .btn .btn--primary .btn--sm onclick="openModal('add-grant-modal')" {
                     (icons::plus()) " Add Grant"
                 }
             }
-            div .card-body {
+            div .card__body {
                 @if grants.is_empty() {
                     p .text-muted { "No custom grants configured." }
                 } @else {
@@ -157,7 +157,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                                 th { "Resource Pattern" }
                                 th { "Access" }
                                 th { "Description" }
-                                th style="width:60px" {}
+                                th .w-60 {}
                             }
                         }
                         tbody {
@@ -178,13 +178,13 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                                     }
                                     td {
                                         @if rt.is_empty() {
-                                            span .badge .badge-secondary style="font-size:11px" { "all" }
+                                            span .badge .badge-secondary .text-11 { "all" }
                                         } @else {
-                                            span .badge .badge-info style="font-size:11px" { (rt) }
+                                            span .badge .badge-info .text-11 { (rt) }
                                         }
                                     }
                                     td {
-                                        code style="font-size:12px" { (resource) }
+                                        code .text-xs { (resource) }
                                     }
                                     td {
                                         @if write {
@@ -193,9 +193,9 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                                             span .badge .badge-success { "read only" }
                                         }
                                     }
-                                    td style="font-size:13px" { (description) }
+                                    td .text-13 { (description) }
                                     td {
-                                        button .btn .btn-danger .btn-sm
+                                        button .btn .btn--danger .btn--sm
                                             hx-delete={"/b/admin/grants/rules/" (id)}
                                             hx-target="#content"
                                             hx-confirm="Delete this grant?"
@@ -244,7 +244,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
 
                 // Update hidden resource field based on selections
                 if (scopeEl.value === 'all') {
-                    specificEl.style.display = 'none';
+                    specificEl.hidden = true;
                     // Auto-fill resource pattern
                     if (type === 'config') {
                         resourceEl.value = block.config_prefix + '*';
@@ -256,7 +256,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         resourceEl.value = block.prefix + '*';
                     }
                 } else {
-                    specificEl.style.display = '';
+                    specificEl.hidden = false;
                     // Populate specific resource dropdown
                     specificSelect.innerHTML = '';
                     var items = [];
@@ -296,7 +296,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                             option value=(name) { (name) }
                         }
                     }
-                    p .text-muted style="font-size:12px;margin-top:4px" {
+                    p .text-muted .text-xs .mt-1 {
                         "The block that will receive this access permission."
                     }
                 }
@@ -310,7 +310,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                             option value=(b.name) { (b.name) }
                         }
                     }
-                    p .text-muted style="font-size:12px;margin-top:4px" {
+                    p .text-muted .text-xs .mt-1 {
                         "Each block owns its own database tables, config keys, and storage. Pick the block whose data you want to share."
                     }
                 }
@@ -335,7 +335,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         option value="specific" { "A specific resource" }
                     }
                 }
-                div .form-group #specific_group style="display:none" {
+                div .form-group #specific_group hidden {
                     label .form-label for="specific_resource" { "Pick a resource" }
                     select .form-input #specific_resource {}
                 }
@@ -346,7 +346,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         input type="checkbox" #write name="write" value="on";
                         " Allow write access"
                     }
-                    p .text-muted style="font-size:12px;margin-top:4px" {
+                    p .text-muted .text-xs .mt-1 {
                         "If unchecked, the block can only read the data."
                     }
                 }
@@ -356,8 +356,8 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         placeholder="e.g. Analytics block needs to read user profiles";
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('add-grant-modal')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Add Grant" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('add-grant-modal')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Add Grant" }
                 }
             }
         }))
@@ -497,18 +497,18 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
 
     html! {
         div .card .mt-4 {
-            div .card-body {
+            div .card__body {
                 @if all_rows.is_empty() {
-                    p .text-muted style="padding:2rem;text-align:center" {
+                    p .text-muted .p-8 .text-center {
                         "No permissions configured yet."
                     }
                 } @else {
                     table .table {
                         thead {
                             tr {
-                                th style="width:110px" { "Type" }
+                                th .w-110 { "Type" }
                                 th { "Permission" }
-                                th style="width:80px" { "Origin" }
+                                th .w-80 { "Origin" }
                             }
                         }
                         tbody {
@@ -523,14 +523,14 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
                                             "Crypto" => "badge-secondary",
                                             _ => "badge-secondary",
                                         };
-                                        span .badge .(badge_class) style="font-size:11px" { (row.type_label) }
+                                        span .badge .(badge_class) .text-11 { (row.type_label) }
                                     }
-                                    td style="font-size:13px" { (row.sentence) }
+                                    td .text-13 { (row.sentence) }
                                     td {
                                         @if row.origin == "code" {
-                                            span .badge .badge-secondary style="font-size:10px" { "code" }
+                                            span .badge .badge-secondary .text-10 { "code" }
                                         } @else {
-                                            span .badge .badge-primary style="font-size:10px" { "custom" }
+                                            span .badge .badge-primary .text-10 { "custom" }
                                         }
                                     }
                                 }

@@ -33,10 +33,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.branch }}
-          # Need a token that can push commits back to the branch.
-          # GITHUB_TOKEN with `contents: write` (above) is sufficient
-          # for non-protected branches.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Need a token that can push commits back to the branch AND whose
+          # push re-triggers CI on the branch.
+          #
+          # GITHUB_TOKEN can push, but GitHub deliberately suppresses workflow
+          # runs for events it raises, so a baseline commit pushed with it
+          # leaves the PR with no CI verdict at all (or one stuck in
+          # `action_required` forever). That defeats the entire point of this
+          # workflow: it exists to turn a red visual-baseline job green, and
+          # with GITHUB_TOKEN it can never cause that job to re-run.
+          #
+          # `BASELINE_PUSH_TOKEN` is a PAT or GitHub App installation token with
+          # `contents: write`. When present its push raises a normal
+          # `pull_request` synchronize event and CI re-runs on the new head.
+          # Falling back to GITHUB_TOKEN keeps the workflow usable without the
+          # secret; the final step below warns when that happened.
+          token: ${{ secrets.BASELINE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Checkout wafer-run
         run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
@@ -135,6 +147,7 @@ jobs:
         run: npm run test:products:update
 
       - name: Commit and push regenerated baselines
+        id: push
         # `${{ inputs.branch }}` is routed through env vars (not interpolated
         # into the script body) to avoid GitHub Actions script-injection.
         env:
@@ -164,6 +177,7 @@ jobs:
           done
           if [ ${#CHANGED[@]} -eq 0 ]; then
             echo "::notice::No baseline drift — nothing to commit."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "Baseline diff detected:"
@@ -171,3 +185,17 @@ jobs:
           git add -- "${CHANGED[@]}"
           git commit -m "test(ui): regen visual baselines from CI render (auto-committed by regen-visual-baselines.yml against ${TARGET_BRANCH})"
           git push origin "HEAD:${TARGET_BRANCH}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      # The token check runs in the shell rather than a step-level `if:` so it
+      # resolves `BASELINE_PUSH_TOKEN` exactly the way the checkout step does.
+      - name: Warn when the push cannot re-trigger CI
+        if: steps.push.outputs.pushed == 'true'
+        env:
+          HAVE_PUSH_TOKEN: ${{ secrets.BASELINE_PUSH_TOKEN != '' }}
+        run: |
+          if [ "$HAVE_PUSH_TOKEN" = "true" ]; then
+            echo "::notice::Pushed with BASELINE_PUSH_TOKEN — CI will re-run on the new head."
+            exit 0
+          fi
+          echo "::warning::Baselines were pushed with GITHUB_TOKEN, so GitHub will not start a CI run for the new commit. The PR keeps its stale failing verdict until someone pushes a further commit under their own credentials. Add a BASELINE_PUSH_TOKEN secret (a PAT or GitHub App installation token with contents: write) to close this loop."

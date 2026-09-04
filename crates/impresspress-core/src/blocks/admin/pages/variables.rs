@@ -19,8 +19,8 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     let active_tab = if tab == "all" { "all" } else { "blocks" };
 
     html! {
-        div style="margin-bottom:0.75rem" {
-            button .btn .btn-primary .btn-sm onclick="openModal('create-var')" {
+        div .mb-3 {
+            button .btn .btn--primary .btn--sm onclick="openModal('create-var')" {
                 (icons::plus()) " Add Variable"
             }
         }
@@ -76,8 +76,8 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
                     }
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('create-var')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('create-var')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }))
@@ -152,16 +152,16 @@ struct VarRow<'a> {
 fn var_row(row: &VarRow) -> Markup {
     html! {
         tr {
-            td .font-medium style="font-size:13px" {
+            td .font-medium .text-13 {
                 code { (row.key) }
                 @if let Some(name) = row.name {
                     @if !name.is_empty() {
                         br;
-                        span .text-muted style="font-size:12px" { (name) }
+                        span .text-muted .text-xs { (name) }
                     }
                 }
             }
-            td style="font-size:13px" {
+            td .text-13 {
                 @match &row.value {
                     ValueState::Masked => code { "********" },
                     ValueState::Plain(v) => code { (v) },
@@ -169,25 +169,25 @@ fn var_row(row: &VarRow) -> Markup {
                 }
             }
             @if row.show_default {
-                td style="font-size:12px" {
+                td .text-xs {
                     @match row.default {
                         Some(d) if !d.is_empty() => code .text-muted { (d) },
                         _ => @if row.auto_generate {
-                            span .badge .badge-info style="font-size:11px" { "auto-generated" }
+                            span .badge .badge-info .text-11 { "auto-generated" }
                         },
                     }
                 }
             }
-            td style="font-size:12px" {
+            td .text-xs {
                 (row.description)
                 @if !row.warning.is_empty() {
-                    div style="color:#92400e;font-size:11px;margin-top:2px" {
+                    div .var-warning-note {
                         "Warning: " (row.warning)
                     }
                 }
             }
             td {
-                button .btn .btn-sm .btn-ghost
+                button .btn .btn--sm .btn--ghost
                     hx-get={"/b/admin/variables/" (row.key) "/edit"}
                     hx-target="#edit-var-modal"
                     hx-swap="innerHTML"
@@ -229,7 +229,7 @@ fn var_table(header: Markup, show_default: bool, body: Markup) -> Markup {
     html! {
         div .card .mt-4 {
             (header)
-            div .card-body {
+            div .card__body {
                 div .table-container {
                     table .table {
                         thead {
@@ -238,7 +238,7 @@ fn var_table(header: Markup, show_default: bool, body: Markup) -> Markup {
                                 th { "Value" }
                                 @if show_default { th { "Default" } }
                                 th { "Description" }
-                                th style="width:50px" {}
+                                th .w-50 {}
                             }
                         }
                         tbody { (body) }
@@ -289,13 +289,13 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                                             span .text-muted { (description) }
                                         }
                                         @if !warning.is_empty() {
-                                            div style="color:#92400e;font-size:0.75rem;margin-top:0.25rem" {
-                                                "\u{26a0} " (warning)
+                                            div .text-warning-strong .text-xs .mt-1 {
+                                                (ui::icons::triangle_alert()) (warning)
                                             }
                                         }
                                     }
                                     td {
-                                        button .btn .btn-sm .btn-ghost
+                                        button .btn .btn--sm .btn--ghost
                                             hx-get={"/b/admin/variables/" (key) "/edit"}
                                             hx-target="#edit-var-modal"
                                             hx-swap="innerHTML"
@@ -381,7 +381,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                             span .badge .badge-warning .mr-2 { "shared" }
                             " Shared Platform Config"
                         }
-                        p .text-muted style="font-size:12px" {
+                        p .text-muted .text-xs {
                             "Any block can read. Only admin can write."
                         }
                     }
@@ -408,7 +408,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                         // grants are looked up by exact resource pattern via the
                         // `grants_by_resource` map built above — used to be a
                         // cubic `blocks × grants × config_keys` loop per render.
-                        p .text-muted style="font-size:12px" {
+                        p .text-muted .text-xs {
                             "Owner: " code { (block.name) }
                             " \u{2014} Admin can read/write all. "
                             @for ck in &block.config_keys {
@@ -416,7 +416,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                                     @if let Some(matches) = grants_by_resource.get(&resource) {
                                         @for (grantee, write) in matches {
                                             @if *grantee != block.name {
-                                                span .badge .badge-secondary .mr-1 style="font-size:11px" {
+                                                span .badge .badge-secondary .mr-1 .text-11 {
                                                     (grantee) ": "
                                                     @if *write { "read+write" } @else { "read" }
                                                 }
@@ -449,7 +449,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                             span .badge .badge-secondary .mr-2 { "unowned" }
                             " Unowned Variables"
                         }
-                        p .text-muted style="font-size:12px" {
+                        p .text-muted .text-xs {
                             "Variables in the database not declared by any block. These may be legacy or manually created."
                         }
                     }
@@ -550,15 +550,13 @@ pub async fn handle_edit_variable_form(
                 div .form-group {
                     label .form-label for="edit-value" { "Value" }
                     @if sensitive {
-                        div style="position:relative" {
+                        div .value-reveal-wrapper {
                             input .form-input #edit-value
                                 type="password"
                                 name="value"
-                                value=(value)
-                                style="padding-right:3rem";
-                            button .btn .btn-ghost .btn-icon
+                                value=(value);
+                            button .btn .btn--ghost .btn--icon .btn-icon-right
                                 type="button"
-                                style="position:absolute;right:0.25rem;top:50%;transform:translateY(-50%)"
                                 onclick="var i=document.getElementById('edit-value');if(i.type==='password'){i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')}else{i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')}"
                                 title="Reveal"
                                 aria-label="Reveal value"
@@ -573,13 +571,13 @@ pub async fn handle_edit_variable_form(
                     input .form-input type="text" #edit-desc name="description" value=(description);
                 }
                 @if !warning.is_empty() {
-                    div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:0.75rem;margin-bottom:1rem;font-size:0.813rem;color:#92400e;display:flex;align-items:center;gap:0.5rem" {
-                        "\u{26a0} " (warning)
+                    div .var-warning-banner {
+                        (ui::icons::triangle_alert()) (warning)
                     }
                 }
                 div .form-actions {
-                    button .btn .btn-secondary type="button" onclick="closeModal('edit-var-modal-overlay')" { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Save" }
+                    button .btn .btn--secondary type="button" onclick="closeModal('edit-var-modal-overlay')" { "Cancel" }
+                    button .btn .btn--primary type="submit" { "Save" }
                 }
             }
         }

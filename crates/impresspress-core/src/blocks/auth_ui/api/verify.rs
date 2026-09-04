@@ -6,10 +6,10 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::auth::{brand_panel, repo::users},
+    blocks::auth::repo::users,
     http::{err_bad_request, err_internal, ok_json},
     ui,
-    ui::templates::auth_split,
+    ui::{components::auth_panel, icons, templates::auth_split},
     util::{hex_encode, sha256_hex},
 };
 
@@ -21,6 +21,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     let app_name = ctx
         .config_get("WAFER_RUN_SHARED__APP_NAME")
         .unwrap_or("Impresspress")
+        .to_string();
+    let auth_headline = ctx
+        .config_get("WAFER_RUN_SHARED__AUTH_HEADLINE")
+        .unwrap_or(crate::config_vars::DEFAULT_AUTH_HEADLINE)
+        .to_string();
+    let auth_tagline = ctx
+        .config_get("WAFER_RUN_SHARED__AUTH_TAGLINE")
+        .unwrap_or(crate::config_vars::DEFAULT_AUTH_TAGLINE)
         .to_string();
 
     // Token comes from query param or body
@@ -57,6 +65,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
             false,
             &logo_url,
             &app_name,
+            &auth_headline,
+            &auth_tagline,
         );
     };
 
@@ -67,6 +77,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
             true,
             &logo_url,
             &app_name,
+            &auth_headline,
+            &auth_tagline,
         );
     }
 
@@ -81,6 +93,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         true,
         &logo_url,
         &app_name,
+        &auth_headline,
+        &auth_tagline,
     )
 }
 
@@ -149,33 +163,41 @@ fn html_respond(
     success: bool,
     logo_url: &str,
     app_name: &str,
+    auth_headline: &str,
+    auth_tagline: &str,
 ) -> OutputStream {
-    let color = if success { "#10b981" } else { "#ef4444" };
+    // Static modifier rather than an inline `--icon-color`/`--icon-bg` pair:
+    // the two states are fixed, so their colours belong in the stylesheet
+    // where the contrast guard can see them (see auth-split.css).
+    let icon_state = if success {
+        "auth-status__icon--success"
+    } else {
+        "auth-status__icon--failure"
+    };
     let config = ui::SiteConfig {
         app_name: app_name.to_string(),
         logo_url: logo_url.to_string(),
         logo_icon_url: String::new(),
-        favicon_url: crate::ui::assets::favicon_url().to_string(),
+        favicon_url: crate::ui::assets::favicon_url(),
         primary_color: String::new(),
         embedded_scripts: Vec::new(),
+        auth_headline: auth_headline.to_string(),
+        auth_tagline: auth_tagline.to_string(),
     };
     let markup = ui::layout::page(
         title,
         &config,
         auth_split(
-            brand_panel(&config, "Verify your email."),
+            auth_panel(&config, Some("Verify your email.")),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        (crate::ui::templates::brand_lockup(logo_url, &config.logo_icon_url, app_name))
-                    }
-                    div style="text-align:center" {
-                        div style={"width:48px;height:48px;background:" (color) "15;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:" (color)} {
-                            @if success { "✓" } @else { "✗" }
+                    div .auth-status {
+                        div class={"auth-status__icon " (icon_state)} aria-hidden="true" {
+                            @if success { (icons::check()) } @else { (icons::x()) }
                         }
-                        h2 style="font-size:1.25rem;font-weight:700;margin:0 0 .5rem" { (title) }
-                        p .login-subtitle style="line-height:1.6;margin:0 0 1.5rem" { (message) }
-                        a .login-button href="/b/auth/login" style="display:inline-block;width:auto;padding:.625rem 1.25rem;text-decoration:none" {
+                        h2 .auth-status__title { (title) }
+                        p .auth-status__message { (message) }
+                        a .login-button .auth-status__action href="/b/auth/login" {
                             "Go to Sign In"
                         }
                     }

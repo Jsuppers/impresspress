@@ -1,0 +1,57 @@
+/* ===== Auth form heading (e.g. "Welcome back") ===== */
+.auth-form__title { font-size: var(--text-2xl); font-weight: 700; margin: 0 0 var(--space-1); color: var(--text-primary); }
+.auth-form__subtitle { font-size: var(--text-base); color: var(--text-secondary); margin: 0 0 var(--space-6); }
+
+/* ===== Alert (auth pages: #error / #info) ===== */
+.alert {
+	display: flex; align-items: center; gap: var(--space-2);
+	padding: var(--space-2) var(--space-4);
+	border-radius: var(--radius-md);
+	margin-bottom: var(--space-4);
+	font-size: var(--text-sm);
+}
+
+/* --accent-danger is 3.76:1 on this tint -- below the 4.5:1 AA floor;
+   --accent-danger-text (5.70:1 on this tint, computed) is the text-safe
+   sibling. */
+.alert--error { background: #ef444419; color: var(--accent-danger-text); }
+/* Same --accent-info alias bug as .badge-info (components/badge.css) --
+   --accent-info-bg/--accent-info are retired; a local 6% color-mix plus
+   --primary-button (4.60:1, computed) is the fix. */
+.alert--info { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
+.alert--success { background: #10b98119; color: var(--accent-success-text); }
+/* --accent-warning (#f59e0b) is only ~2.3:1 on white -- nowhere near the
+   4.5:1 AA floor for text; --accent-warning-text (#92400e, 6.56:1 on this
+   tint, computed) is the text-safe sibling. Mirrors .alert--error above. */
+.alert--warning { background: #f59e0b19; color: var(--accent-warning-text); }
+
+/* ===== OAuth ===== */
+.oauth-buttons {
+	display: flex; flex-direction: column;
+	gap: var(--space-2); margin-bottom: var(--space-4);
+}
+
+.btn-oauth {
+	width: 100%; gap: var(--space-2);
+	padding: var(--space-3) var(--space-4);
+	background: #000; color: #fff;
+	border: 1px solid #000; border-radius: var(--radius-md);
+	font-weight: 500; font-size: 0.95rem;
+}
+
+.btn-oauth:hover:not(:disabled) { background: #1a1a1a; }
+.btn-oauth:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.auth-divider {
+	display: flex; align-items: center; gap: var(--space-2);
+	margin: var(--space-2) 0 var(--space-4);
+	color: var(--text-muted); font-size: var(--text-xs);
+}
+
+.auth-divider::before, .auth-divider::after {
+	content: ""; flex: 1; height: 1px;
+	background: var(--border-color);
+}
+
+/* ===== Auth form row actions (e.g. "Forgot password?") ===== */
+.auth-actions { text-align: right; margin-bottom: var(--space-4); }

@@ -5,13 +5,12 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{pw_field, pw_toggle_js, signup_script, site_config};
 use crate::{
-    blocks::{auth::brand_panel, auth_ui::redirect::is_safe_local_redirect},
-    ui::{self, templates::auth_split},
+    blocks::auth_ui::redirect::is_safe_local_redirect,
+    ui::{self, components::auth_panel, templates::auth_split},
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let app_name = &config.app_name;
     let allow_signup = ctx
         .config_get("WAFER_RUN_SHARED__ALLOW_SIGNUP")
         .unwrap_or("true")
@@ -23,8 +22,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     } else {
         String::new()
     };
-    let logo_url = &config.logo_url;
-
     if !allow_signup {
         return super::login::handle(ctx, msg).await;
     }
@@ -39,21 +36,16 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Sign Up",
         &config,
         auth_split(
-            brand_panel(&config, "Create your account."),
+            auth_panel(&config, Some("Create your account.")),
             html! {
                 div .login-container {
-                    div .login-logo {
-                        (crate::ui::templates::brand_lockup(logo_url, &config.logo_icon_url, app_name))
-                        p .login-subtitle { "Create your " (app_name) " account" }
-                    }
+                    div #error .login-error hidden {}
 
-                    div #error .login-error style="display:none" {}
-
-                    div #success style="text-align:center;display:none" {
-                        div style="width:48px;height:48px;background:#ecfdf5;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.5rem;color:#10b981" { "✓" }
-                        h2 style="font-size:1.25rem;font-weight:700;margin:0 0 .5rem" { "Check your email" }
-                        p #verify-msg style="font-size:.875rem;color:#64748b;line-height:1.6;margin:0 0 1.5rem" {}
-                        a #back-to-signin .login-button href={"/b/auth/login" (redirect_qs)} style="display:inline-block;width:auto;padding:.625rem 1.25rem;text-decoration:none" {
+                    div #success .auth-status hidden {
+                        div .auth-status__icon .auth-status__icon--success aria-hidden="true" { (ui::icons::check()) }
+                        h2 .auth-status__title { "Check your email" }
+                        p #verify-msg .auth-status__message {}
+                        a #back-to-signin .login-button .auth-status__action href={"/b/auth/login" (redirect_qs)} {
                             "Back to Sign In"
                         }
                     }

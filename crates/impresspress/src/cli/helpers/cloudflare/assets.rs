@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use impresspress_core::{routing::STATIC_PREFIX, ui::assets as ui_assets};
 use serde::{Deserialize, Serialize};
 
 /// Source dirs (relative to repo_root) to mirror into out_dir/assets/.
@@ -25,6 +26,77 @@ pub struct ReleaseAssetEntry {
     pub size: u64,
     pub sha256: String,
     pub content_type: String,
+}
+
+/// Where a deployed worker should fetch UI assets (CSS/JS/fonts/logos) from.
+///
+/// With an R2 bucket configured, the worker serves them from its own origin
+/// — no cross-org runtime dependency, and the `/b/static/` URL contract that
+/// pages already emit stays unchanged. Without one there is nowhere to
+/// publish, so fall back to the shared version-pinned CDN.
+pub fn resolve_asset_base_url(has_r2: bool) -> String {
+    if has_r2 {
+        STATIC_PREFIX.to_string()
+    } else {
+        ui_assets::DEFAULT_CDN_BASE_TEMPLATE.to_string()
+    }
+}
+
+/// The UI asset set (`impresspress_core::ui::assets::ASSETS`) as release
+/// entries, keyed by hashed filename (e.g. `app-a1b2c3d4.css`) rather than
+/// the source-relative `logical` name, so the published R2 objects are
+/// immutable and match the URLs `ui::assets::url()` emits.
+///
+/// `ASSETS` is unconditional (`build.rs` lists every asset file on disk
+/// regardless of Cargo features), but `ui_assets::bytes()` returns `None`
+/// for an entry gated behind a block feature the CLI wasn't built with
+/// (`marked.min.js`/`purify.min.js`/`llm-chat.js` need `block-llm`,
+/// `files-browser.js` needs `block-files`) — a supported combination, e.g.
+/// `--no-default-features --features sqlite,embed-assets`. Such entries are
+/// skipped rather than treated as an error, with a warning naming exactly
+/// what was skipped so the omission is visible in the deploy log instead of
+/// silently missing at runtime.
+///
+/// Note: this only fixes the CLI-build-without-`block-*` case. A CLI built
+/// WITH a block feature but deployed against a *worker* built without the
+/// matching feature (or vice versa) is a separate, unresolved seam — the
+/// published set here is always the CLI's, not the worker's, so a mismatch
+/// between the two independent builds can still under- or over-publish.
+/// Left as follow-up; not attempted here.
+///
+/// Gated on `embed-assets` because it calls [`ui_assets::bytes`], which is
+/// itself gated: a CLI built without `embed-assets` has no asset bytes
+/// compiled in at all, so there is nothing here to enumerate. Callers that
+/// need to publish UI assets to R2 (see `r2_upload_ui_assets` and its call
+/// site in `embed_cloudflare::deploy`) branch on the same feature and fail
+/// loudly instead of silently publishing nothing.
+#[cfg(feature = "embed-assets")]
+pub fn ui_asset_entries() -> Vec<ReleaseAssetEntry> {
+    let mut skipped: Vec<&str> = Vec::new();
+    let entries = ui_assets::ASSETS
+        .iter()
+        .filter_map(|e| {
+            let Some(bytes) = ui_assets::bytes(e.logical) else {
+                skipped.push(e.logical);
+                return None;
+            };
+            Some(ReleaseAssetEntry {
+                logical_key: e.filename.to_string(),
+                size: bytes.len() as u64,
+                sha256: impresspress_core::util::sha256_hex(bytes),
+                content_type: e.content_type.to_string(),
+            })
+        })
+        .collect();
+    if !skipped.is_empty() {
+        eprintln!(
+            "warning: skipping {} UI asset(s) with no embedded bytes on this CLI build \
+             (missing block feature(s) — see ui_asset_entries doc): {}",
+            skipped.len(),
+            skipped.join(", "),
+        );
+    }
+    entries
 }
 
 /// Deterministic identity and inventory of the local release asset set.

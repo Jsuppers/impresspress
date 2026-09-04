@@ -103,6 +103,22 @@ pub fn chevron_left() -> Markup {
     icon(r#"<path d="m15 18-6-6 6-6"/>"#)
 }
 
+/// Lucide `arrow-left`. Replaces the bare "\u{2190}" LEFT ARROW character
+/// that "Back" links used to render: a text glyph picks up the body font
+/// rather than the icon set, so its weight and baseline never matched the
+/// Lucide icon sitting next to it in the same button row.
+pub fn arrow_left() -> Markup {
+    icon(r#"<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>"#)
+}
+
+/// Lucide `message-square`. Replaces the "\u{1f4ac}" SPEECH BALLOON emoji in
+/// the LLM chat empty state -- an emoji renders in the platform's colour
+/// emoji font, so it ignored `currentColor` and looked nothing like the rest
+/// of the icon set.
+pub fn message_square() -> Markup {
+    icon(r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>"#)
+}
+
 pub fn chevron_right() -> Markup {
     icon(r#"<path d="m9 18 6-6-6-6"/>"#)
 }
@@ -193,6 +209,12 @@ pub fn arrow_up_right() -> Markup {
     icon(r#"<path d="M7 17 17 7"/><path d="M7 7h10v10"/>"#)
 }
 
+/// Lucide `arrow-right`. Replaces the bare "\u{2192}" RIGHT ARROW that
+/// "continue" links trailed their label with -- the mirror of [`arrow_left`].
+pub fn arrow_right() -> Markup {
+    icon(r#"<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>"#)
+}
+
 pub fn filter() -> Markup {
     icon(r#"<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>"#)
 }
@@ -239,4 +261,28 @@ pub fn link() -> Markup {
 
 pub fn credit_card() -> Markup {
     icon(r#"<rect width="20" height="14" x="2" y="5" rx="2"/><path d="M2 10h20"/>"#)
+}
+
+pub fn user_plus() -> Markup {
+    icon(
+        r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>"#,
+    )
+}
+
+pub fn triangle_alert() -> Markup {
+    icon(
+        r#"<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>"#,
+    )
+}
+
+pub fn activity() -> Markup {
+    icon(
+        r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#,
+    )
+}
+
+pub fn inbox() -> Markup {
+    icon(
+        r#"<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>"#,
+    )
 }

@@ -1,0 +1,877 @@
+/* Page Header */
+.page-header {
+	background: white;
+	border-bottom: 1px solid var(--border-color);
+	padding: var(--space-4) var(--space-8);
+}
+
+
+.page-title {
+	font-size: 1.5rem; font-weight: 600;
+	color: var(--text-primary); margin-bottom: var(--space-2);
+}
+
+.page-subtitle {
+	color: var(--text-secondary);
+	font-size: 0.875rem; margin-bottom: var(--space-8);
+}
+
+/* Cards */
+.card {
+	background: white; border-radius: 8px;
+	border: 1px solid var(--border-color);
+	padding: var(--space-6); margin-bottom: var(--space-6);
+}
+
+.card-header {
+	display: flex; align-items: center; justify-content: space-between;
+	margin-bottom: var(--space-4); padding-bottom: var(--space-4);
+	border-bottom: 1px solid var(--border-color);
+}
+
+.card-title {
+	font-size: 1rem; font-weight: 600; color: var(--text-primary);
+}
+
+/* ===== Card =====
+   NOTE: this rule intentionally does not restate `padding`. The plain-card
+   rule above owns it, and plain cards (`div .card { ...content... }`, still
+   the pattern in variables/permissions/files/messages/tickets) need it.
+
+   But a card built from `.card__head`/`.card__body` gets its padding from
+   those children, and was ALSO inheriting the plain rule's 24px on top:
+   measured on the live dashboard, body content sat 49px in from the card
+   edge instead of 24px, and the head's bottom border floated 25px short of
+   each edge instead of spanning the card. 17 of the admin's cards render
+   through `__body` and every one of them was double-padded -- this is the
+   systemic half of the "padding isn't consistent" report (the `.card-body`
+   -> `.card__body` typo fixed earlier was the local half), and it is also
+   what the `.p-0` overrides on the LLM pages were quietly compensating for.
+
+   Zeroed only when such a child is actually present, so plain cards keep
+   their 24px and no call site has to change. `:has()` is a lighter
+   requirement than the `color-mix()` this bundle already ships (Chrome
+   105 vs 111, Safari 15.4 vs 16.2, Firefox 121 vs 113). */
+.card { background: var(--surface-1); border: 1px solid var(--border-color); border-radius: var(--radius-lg); margin-bottom: var(--space-4); }
+.card:has(> .card__head), .card:has(> .card__body) { padding: 0; }
+.card__head { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); border-bottom: 1px solid var(--border-light); }
+.card__title { margin: 0; font-size: var(--text-lg); font-weight: 500; color: var(--text-primary); }
+.card__subtitle { margin: 0; font-size: var(--text-xs); color: var(--text-muted); }
+.card__actions { margin-left: auto; display: flex; gap: var(--space-2); }
+.card__body { padding: var(--space-6); }
+/* Card nested inside a container that already draws a border/shadow (e.g. a
+ * `<details>` disclosure) — drop the card's own so they don't double up. */
+.card--flat { border: 0; box-shadow: none; }
+/* Card whose single child runs to the card's edge — a `.table-container`,
+ * whose cells supply their own padding, or an `.empty-state`, which supplies
+ * its own. Replaces a bare `.p-0` utility on these two LLM cards: `p-0` said
+ * "no padding" without saying why, and read as a bug next to the `.p-5` on
+ * the card above it. */
+.card--flush { padding: 0; }
+/* Draws attention to a card needing action (e.g. a Stripe restriction). */
+.card--warning { border-color: var(--accent-warning); }
+.card__head--end { align-items: flex-end; flex-wrap: wrap; }
+
+/* ===== Portal dashboard (Phase 4 PR-1) ===== */
+.dashboard-apps-card .card__body { padding: var(--space-4); }
+.dashboard-apps-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+	gap: var(--space-4);
+}
+.dashboard-app-tile {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-4);
+	background: var(--surface-2);
+	border: 1px solid var(--border-light);
+	border-radius: var(--radius-md);
+	text-decoration: none;
+	color: var(--text-primary);
+	transition: background 0.15s, transform 0.05s;
+}
+.dashboard-app-tile:hover { background: var(--surface-3); }
+.dashboard-app-tile:active { transform: translateY(1px); }
+/* --accent-primary is not a token and never has been -- with no fallback
+   this `color` was dropped entirely and the mark inherited the tile's text
+   colour. It meant the brand accent; --primary-button is that accent's
+   AA-safe sibling (4.99:1 on white), which clears the 4.5:1 text floor and
+   the 3:1 non-text floor alike -- so it is correct whether this renders a
+   glyph or an icon. (Nothing currently renders `.dashboard-app-tile*` or
+   `.dashboard-orgs-card*`; that is why the dropped declaration went unseen.) */
+.dashboard-app-tile__icon { flex-shrink: 0; color: var(--primary-button); }
+.dashboard-app-tile__label { font-weight: 500; }
+
+.dashboard-orgs-card .card__head {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+}
+.dashboard-orgs-card .card__head-action {
+	font-size: var(--text-sm);
+	/* Text link: --primary-color is 3.66:1 on white, below AA. */
+	color: var(--primary-button);
+	text-decoration: none;
+}
+.orgs-list { list-style: none; padding: 0; margin: 0; }
+.orgs-list-row {
+	display: flex;
+	gap: var(--space-4);
+	align-items: center;
+	padding: var(--space-2) var(--space-4);
+	border-top: 1px solid var(--border-light);
+}
+.orgs-list-row:first-child { border-top: none; }
+.orgs-list-row__provider {
+	font-size: var(--text-xs);
+	text-transform: uppercase;
+	background: var(--surface-3);
+	padding: 2px var(--space-2);
+	border-radius: var(--radius-sm);
+	color: var(--text-muted);
+}
+.orgs-list-row__name { flex: 1; font-weight: 500; }
+.orgs-list-row__date { font-size: var(--text-xs); color: var(--text-muted); }
+
+/* ===== Security page (Phase 4 PR-2) ===== */
+.security-section { margin-bottom: var(--space-6); }
+.linked-providers-list { list-style: none; padding: 0; margin: 0; }
+.linked-provider {
+	display: flex;
+	gap: var(--space-4);
+	align-items: center;
+	padding: var(--space-2) var(--space-4);
+	border-top: 1px solid var(--border-light);
+}
+.linked-provider:first-child { border-top: none; }
+.linked-provider__name {
+	font-size: var(--text-xs);
+	text-transform: uppercase;
+	background: var(--surface-3);
+	padding: 2px var(--space-2);
+	border-radius: var(--radius-sm);
+	color: var(--text-muted);
+}
+.linked-provider__login { flex: 1; font-weight: 500; }
+.linked-provider__date { font-size: var(--text-xs); color: var(--text-muted); }
+
+/* ===== Phase 4 PR-3: Per-surface mobile rules ===== */
+
+/* Hint banner — hidden on desktop, shown at < 720px (rule below). */
+.admin-dashboard-mobile-hint {
+	display: none;
+	margin: 0 0 var(--space-4);
+	padding: var(--space-2) var(--space-4);
+	background: var(--surface-2);
+	/* Was `var(--accent-primary, var(--primary-color))` -- the fallback was
+	   carrying this rule, since --accent-primary does not exist. */
+	border-left: 3px solid var(--primary-color);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-sm);
+	color: var(--text-secondary);
+}
+
+/* ===== Public page (anonymous chrome) =====
+   Used by `templates::public_page` for legal documents, marketing, and
+   any other public-facing surface that doesn't get the admin/portal shell.
+   Configurable via `--public-page-bg` / `--public-page-accent` set inline
+   by the template when the caller passes color overrides. */
+.public-page-body {
+	margin: 0;
+	background: var(--public-page-bg, var(--surface-2));
+	color: var(--text-primary);
+	min-height: 100vh;
+	display: flex;
+	flex-direction: column;
+	font-family: system-ui, -apple-system, sans-serif;
+	line-height: 1.7;
+}
+.public-page__header {
+	padding: var(--space-3) var(--space-6);
+	position: sticky;
+	top: 0;
+	z-index: var(--z-dropdown);
+	background: transparent;
+}
+.public-page__header-inner {
+	max-width: 800px;
+	margin: 0 auto;
+	display: flex;
+	align-items: center;
+}
+.public-page__back {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	border-radius: var(--radius-md);
+	color: var(--text-secondary);
+	text-decoration: none;
+	transition: background var(--transition-fast), color var(--transition-fast);
+}
+/* The icon (`icons::arrow_left()`, formerly a bare "\u2190" glyph sized by
+   the `font-size: 1.1rem` this rule used to carry -- which an SVG ignores)
+   substitutes for a text link: it carries `aria-label="Go back"`/
+   `title="Go back"` (templates.rs), so it's read as navigation text, not
+   decoration. Fallback was --primary-color, 3.34:1 on
+   --bg-hover -- below AA; --primary-button (4.55:1 on --bg-hover, computed)
+   is the text-safe sibling. A caller-supplied --public-page-accent override
+   is per-deploy config, same as --primary-color itself -- out of this
+   guard's reach either way. */
+.public-page__back:hover,
+.public-page__back:focus-visible {
+	color: var(--public-page-accent, var(--primary-button));
+	background: var(--bg-hover);
+}
+.public-page {
+	flex: 1;
+	max-width: 800px;
+	width: 100%;
+	margin: var(--space-8) auto;
+	padding: 0 var(--space-6);
+}
+.public-page__card {
+	background: var(--surface-1);
+	border-radius: var(--radius-lg);
+	box-shadow: var(--shadow-sm);
+	overflow: hidden;
+}
+.public-page__head {
+	padding: 2.5rem var(--space-12) 0;
+}
+.public-page__head h1 {
+	font-size: 1.85rem;
+	font-weight: 700;
+	color: var(--text-primary);
+	margin: 0 0 var(--space-2);
+	line-height: 1.3;
+}
+.public-page__meta {
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	color: var(--text-muted);
+	font-size: var(--text-sm);
+	padding-bottom: var(--space-6);
+	border-bottom: 1px solid var(--border-light);
+}
+.public-page__version {
+	background: var(--bg-hover);
+	color: var(--text-secondary);
+	padding: 1px var(--space-2);
+	border-radius: 10px;
+	font-size: var(--text-xs);
+	font-weight: 600;
+}
+.public-page__content {
+	padding: var(--space-8) var(--space-12) 2.5rem;
+	font-family: Georgia, 'Times New Roman', serif;
+	font-size: 1.05rem;
+	line-height: 1.85;
+	color: #334155;
+}
+.public-page__content h1 {
+	font-size: 1.6rem;
+	font-weight: 700;
+	margin: var(--space-6) 0 var(--space-3);
+	color: var(--text-primary);
+	font-family: system-ui, sans-serif;
+}
+.public-page__content h2 {
+	font-size: 1.35rem;
+	font-weight: 600;
+	margin: var(--space-8) 0 var(--space-3);
+	color: var(--text-primary);
+	font-family: system-ui, sans-serif;
+}
+.public-page__content h3 {
+	font-size: 1.1rem;
+	font-weight: 600;
+	margin: var(--space-6) 0 var(--space-2);
+	color: var(--text-primary);
+	font-family: system-ui, sans-serif;
+}
+.public-page__content p { margin-bottom: var(--space-4); }
+.public-page__content ul,
+.public-page__content ol { margin: var(--space-2) 0 var(--space-4) var(--space-6); }
+.public-page__content li { margin-bottom: var(--space-1); }
+/* Fallback (no `--public-page-accent` override) was --primary-color, 3.66:1
+   on the card's white background -- below the 4.5:1 AA floor for this
+   prose-link text; --primary-button (4.99:1, computed) is the text-safe
+   sibling. A caller-supplied `--public-page-accent` override is per-deploy
+   config the same way `--primary-color` itself is -- out of this guard's
+   reach either way. */
+.public-page__content a {
+	color: var(--public-page-accent, var(--primary-button));
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+.public-page__content a:hover { opacity: 0.8; }
+.public-page__content blockquote {
+	border-left: 3px solid var(--public-page-accent, var(--primary-color));
+	padding: var(--space-3) var(--space-4);
+	margin: var(--space-4) 0;
+	background: var(--surface-3);
+	border-radius: 0 var(--radius-md) var(--radius-md) 0;
+	color: var(--text-secondary);
+	font-style: italic;
+}
+.public-page__content pre {
+	background: var(--bg-hover);
+	padding: var(--space-4);
+	border-radius: var(--radius-md);
+	overflow-x: auto;
+	font-family: monospace;
+	font-size: 0.9rem;
+	margin: var(--space-4) 0;
+}
+.public-page__content code {
+	background: var(--bg-hover);
+	padding: 2px var(--space-1);
+	border-radius: var(--radius-sm);
+	font-size: 0.9em;
+}
+.public-page__content pre code { background: none; padding: 0; }
+.public-page__content table {
+	width: 100%;
+	border-collapse: collapse;
+	margin: var(--space-4) 0;
+}
+.public-page__content th,
+.public-page__content td {
+	padding: var(--space-2) var(--space-3);
+	text-align: left;
+	border-bottom: 1px solid var(--border-color);
+}
+.public-page__content th {
+	font-weight: 600;
+	background: var(--surface-3);
+}
+.public-page__content hr {
+	border: none;
+	border-top: 1px solid var(--border-color);
+	margin: var(--space-6) 0;
+}
+.public-page__footer {
+	text-align: center;
+	color: var(--text-muted);
+	font-size: 0.8rem;
+	padding: var(--space-6) var(--space-8) var(--space-8);
+}
+/* Fallback was --primary-color, 3.66:1 on the page's default --surface-2
+   background -- below AA; --primary-button (4.70:1 on --surface-2, computed)
+   is the text-safe sibling. See .public-page__content a above re: the
+   override case. */
+.public-page__footer a {
+	color: var(--public-page-accent, var(--primary-button));
+	text-decoration: none;
+}
+@media print {
+	.public-page__header,
+	.public-page__footer { display: none; }
+	.public-page { margin: 0; padding: 0; }
+	.public-page__card { box-shadow: none; border-radius: 0; }
+}
+
+@media (max-width: 640px) {
+	.public-page__head { padding: var(--space-6) var(--space-5) 0; }
+	.public-page__content { padding: var(--space-5) var(--space-5) var(--space-6); }
+	.public-page { padding: 0 var(--space-3); margin: var(--space-4) auto; }
+}
+
+@media (max-width: 720px) {
+	/* Dashboard: apps grid stacks single-column. */
+	.dashboard-apps-grid { grid-template-columns: 1fr; }
+	/* Orgs list rows: provider/name/date stack tightly. */
+	.orgs-list-row { flex-wrap: wrap; gap: var(--space-1); }
+	.orgs-list-row__date { width: 100%; font-size: var(--text-xs); }
+	/* Linked providers list: stack tightly on narrow screens. */
+	.linked-provider { flex-wrap: wrap; gap: var(--space-1); }
+	.linked-provider__date { width: 100%; }
+	/* Admin dashboard hint: shown only at narrow widths. */
+	.admin-dashboard-mobile-hint { display: block; }
+}
+/* ===== Block cards (admin /blocks page) =====
+   The blocks page renders each registered block as a card grid; without
+   these rules the markup falls through to inline flow with no padding/border
+   and the orange "Open" button collides with the next block's name. */
+.block-cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+	gap: var(--space-4);
+	margin-top: var(--space-4);
+}
+.block-cards__filter { margin-top: var(--space-4); max-width: 240px; }
+.block-card {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-2);
+	background: var(--surface-1);
+	border: 1px solid var(--border-light);
+	border-radius: var(--radius-lg);
+	padding: var(--space-4);
+	cursor: pointer;
+	transition: border-color 0.15s, box-shadow 0.15s;
+}
+.block-card:hover { border-color: var(--primary-color); box-shadow: var(--shadow-sm); }
+.block-card--disabled { opacity: 0.6; }
+.block-card__head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); }
+.block-card__title {
+	font-size: var(--text-base); font-weight: 600;
+	margin: 0; color: var(--text-primary);
+	word-break: break-word;
+}
+/* `font-size` here used to size the "\u{2713}"/"\u{2717}" text glyphs; the
+   marks are now `icons::check()`/`icons::x()`, so the size moves to the svg
+   rule below (16px to sit with the card title rather than the icon set's
+   default 18px). */
+.block-card__check { color: var(--accent-success-text); line-height: 0; flex-shrink: 0; }
+.block-card__check svg { width: 16px; height: 16px; }
+.block-card__check--off { color: var(--text-muted); }
+.block-card__summary {
+	font-size: var(--text-sm); color: var(--text-secondary);
+	margin: 0; line-height: 1.5;
+	/* Cap the summary so cards keep a consistent height. */
+	display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+	overflow: hidden;
+}
+.block-card__meta {
+	display: flex; align-items: center; gap: var(--space-2);
+	flex-wrap: wrap;
+	margin-top: auto;
+	padding-top: var(--space-2);
+	border-top: 1px solid var(--border-light);
+	font-size: var(--text-xs);
+	color: var(--text-muted);
+}
+.block-card__runtime {
+	background: var(--surface-3); color: var(--text-secondary);
+	padding: 2px var(--space-2); border-radius: var(--radius-sm);
+	font-weight: 500;
+}
+/* --primary-hover on the old --accent-info-bg tint was 4.11:1 -- below AA
+   (same shape of bug as .badge--tone-brand's pre-existing pair, different
+   background). --accent-info-bg is retired (see tokens.css); a local 6%
+   color-mix plus --primary-button (4.60:1, computed) matches the fix used
+   for .badge-primary/.products-guide__number above. */
+.block-card__runtime--wasm { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
+.block-card__version { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.block-card__open {
+	margin-left: auto;
+	/* Match the meta-row baseline; no absolute positioning so the Open
+	   button can never overlap the next card's title (the previous bug). */
+}
+
+/* ===== Dashboard chart card header (mobile) =====
+   Chart card titles wrap awkwardly when "Last 30 days" rides on the same row.
+   Stack title above metadata at narrow widths. */
+@media (max-width: 720px) {
+	.card .chart-header,
+	.card > header,
+	.chart-card__head {
+		flex-direction: column;
+		align-items: flex-start;
+	}
+}
+
+/* ===== Messages page (Contexts list) =====
+   The `messages_page` template uses BEM classes but had no CSS. Without
+   these rules the New context form lays out as inline-block fragments and
+   the context list looks like raw anchor tags. */
+.messages-new { margin-bottom: var(--space-4); }
+.messages-new__form {
+	display: grid;
+	grid-template-columns: 1fr 2fr auto;
+	gap: var(--space-2);
+	/* Labeled form-groups: align the Create button with the control row,
+	   not the label row. */
+	align-items: end;
+}
+.messages-new__form .form-group { margin-bottom: 0; }
+@media (max-width: 720px) {
+	.messages-new__form { grid-template-columns: 1fr; }
+}
+.messages-list {
+	display: flex; flex-direction: column;
+	gap: var(--space-1);
+	margin-top: var(--space-4);
+}
+.messages-list__empty {
+	padding: var(--space-8) var(--space-4);
+	text-align: center;
+	color: var(--text-muted);
+	border: 1px dashed var(--border-light);
+	border-radius: var(--radius-lg);
+	/* surface-3, not surface-2 — the darker grey read as a heavy dead slab
+	   against the white page card. */
+	background: var(--surface-3);
+}
+.messages-list__item {
+	display: grid;
+	grid-template-columns: auto 1fr auto auto;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-2) var(--space-4);
+	border: 1px solid var(--border-light);
+	border-radius: var(--radius-md);
+	background: var(--surface-1);
+	color: var(--text-primary);
+	text-decoration: none;
+	transition: border-color 0.15s, background-color 0.15s;
+}
+.messages-list__item:hover { border-color: var(--primary-color); background: var(--surface-2); }
+.messages-list__title { font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.messages-list__date { font-size: var(--text-xs); }
+@media (max-width: 720px) {
+	.messages-list__item {
+		grid-template-columns: 1fr auto;
+		grid-template-areas: "title date" "type status";
+		row-gap: var(--space-1);
+	}
+	.messages-list__title { grid-area: title; }
+	.messages-list__date { grid-area: date; text-align: right; }
+	.messages-list__type { grid-area: type; justify-self: start; }
+	.messages-list__status { grid-area: status; justify-self: end; }
+}
+
+/* ===== Account card (userportal single-card layout) ===== */
+
+.account-page {
+	min-height: 100dvh;
+	background: var(--bg-secondary);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: var(--space-4);
+	box-sizing: border-box;
+}
+
+.account-card {
+	width: 100%;
+	max-width: 480px;
+	background: var(--bg-primary);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-lg);
+	box-shadow: var(--shadow-sm);
+	margin: var(--space-4) 0 var(--space-8);
+	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+}
+
+.account-card__head {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-8) var(--space-6) var(--space-5);
+	border-bottom: 1px solid var(--border-light);
+	position: relative;
+}
+
+.account-card__back {
+	position: absolute;
+	top: 0.875rem;
+	left: 0.875rem;
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-1);
+	color: var(--text-secondary);
+	font-size: 0.875rem;
+	text-decoration: none;
+	padding: var(--space-1) var(--space-2);
+	border-radius: var(--radius-md);
+	transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.account-card__back:hover {
+	background: var(--bg-hover);
+	color: var(--text-primary);
+}
+
+.account-card__back svg {
+	width: 16px;
+	height: 16px;
+}
+
+/* Ported from origin/main (ui/assets/components.css) during the main merge
+   -- 2026-09-02. The card header's brand comes from `templates::brand_lockup`,
+   shared with the auth cards. Only the wordmark case needs scoping to this
+   card: cap its width so a wide white-label wordmark can't outgrow the card,
+   and drop the auth-card bottom margin (this header is a flex column with
+   its own gap). The icon lockup keeps its natural 64px -- the built-in mark
+   is pixel art and must not be scaled off a whole multiple of its cell size.
+   Replaces the old `.account-card__logo` rule, which targeted a class
+   `brand_lockup` never renders (it renders `.logo-image`) -- that mismatch
+   predates this merge on both sides. */
+.account-card__head .logo-image {
+	max-width: 220px;
+	margin-bottom: 0;
+}
+
+.account-card__title {
+	margin: 0;
+	font-size: 1.25rem;
+	font-weight: 600;
+	color: var(--text-primary);
+	text-align: center;
+}
+
+.account-card__body {
+	padding: var(--space-4);
+}
+
+.account-card__body > .account-section + .account-section {
+	margin-top: var(--space-6);
+	padding-top: var(--space-6);
+	border-top: 1px solid var(--border-light);
+}
+
+.account-section__title {
+	margin: 0 0 var(--space-3);
+	font-size: 0.95rem;
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.account-card__foot {
+	padding: var(--space-4) var(--space-6) var(--space-6);
+	border-top: 1px solid var(--border-light);
+}
+
+.account-card__signout {
+	width: 100%;
+	padding: var(--space-3) var(--space-4);
+	background: var(--bg-primary);
+	/* --accent-danger text on white is 3.76:1 -- below the 4.5:1 AA floor
+	 * (caught driving account_card_page during the 12d design pass).
+	 * --accent-danger stays elsewhere (badges, alerts, borders -- none of
+	 * them pair it with white text at normal size); --primary-button
+	 * (4.99:1) is this app's one AA-safe red for text and reused here
+	 * rather than inventing a new token for a single site. */
+	color: var(--primary-button);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-md);
+	font-size: 0.95rem;
+	font-weight: 500;
+	cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.account-card__signout:hover {
+	background: var(--bg-hover);
+	border-color: var(--accent-danger);
+}
+
+.account-card__signout svg {
+	width: 18px;
+	height: 18px;
+}
+
+/* ===== Message card (Messages block entry_card) =====
+   Three accent variants keyed off entry kind/role — neutral (default/
+   artifact/status/agent), warning (notification/system), and the brand
+   "user" tint. #fefce8/#eab308 (warning) and #fff1e6 (user) have no
+   matching design token: #fff1e6 is an already-established literal value
+   elsewhere in the codebase (`.form-tabs li.is-active a`, styles/layouts/
+   page.css) for the same "active brand tint" concept, reused verbatim
+   here rather than invented; #fefce8/#eab308 have no precedent elsewhere
+   and are carried over unchanged from the original inline styles — see
+   task-12b report. */
+.message-card--neutral { margin-bottom: var(--space-3); background: var(--surface-3); border-left: 3px solid var(--border-color); }
+.message-card--warning { margin-bottom: var(--space-3); background: #fefce8; border-left: 3px solid #eab308; }
+.message-card--user { margin-bottom: var(--space-3); background: #fff1e6; border-left: 3px solid var(--primary-color); }
+.message-card__content { margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+/* ===== Thread/conversation list pane =====
+   Shared by blocks/llm/pages.rs (chat thread list) and blocks/messages/
+   pages.rs (conversation list) — identical left-rail pane shape in the
+   chat_page template's thread-list slot. */
+.thread-pane { display: flex; flex-direction: column; gap: var(--space-3); height: 100%; }
+.thread-pane__head { display: flex; align-items: center; justify-content: space-between; }
+.thread-pane__title {
+	margin: 0; font-size: var(--text-sm); font-weight: 600; color: var(--text-muted);
+	text-transform: uppercase; letter-spacing: 0.05em;
+}
+.thread-pane__scroll { overflow-y: auto; flex: 1; }
+.thread-pane__empty { padding: var(--space-4); font-size: var(--text-sm); }
+.thread-card {
+	display: block; text-decoration: none; color: inherit;
+	margin-bottom: var(--space-2); padding: var(--space-3) var(--space-3);
+	transition: box-shadow 0.15s;
+}
+/* Was `onmouseover`/`onmouseout="this.style.boxShadow='…'"` in
+ * `messages/pages.rs` and `llm/pages.rs` (task 12e) -- an ordinary hover
+ * effect belongs in CSS, not a JS-assigned literal inline style. */
+.thread-card:hover { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1); }
+.thread-card__row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.thread-card__title {
+	font-weight: 500; font-size: var(--text-sm);
+	overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
+.thread-card__date { font-size: var(--text-xs); flex-shrink: 0; }
+
+/* ===== Chat composer (llm chat_page composer pane) =====
+   Toggled instead of the old `style=(if enabled {""} else
+   {"opacity:0.4;pointer-events:none"}))` inline conditional — see
+   `blocks/admin/pages/blocks.rs`'s `.block-card--disabled` for the same
+   `class={ "x" @if cond { " x--disabled" } }` pattern this follows. */
+.chat-form--disabled { opacity: 0.4; pointer-events: none; }
+
+/* ===== Chat empty state (no thread selected) ===== */
+.chat-empty-state { text-align: center; padding: var(--space-12) var(--space-4); }
+/* Was `font-size: 2.5rem`, sizing a 40px "\u{1f4ac}" emoji glyph. The icon is
+   now `icons::message_square()`; an SVG does not scale with font-size, so the
+   40px is restated as explicit width/height or it would render at the icon
+   set's 18px default. Muted so a large empty-state mark reads as quiet
+   furniture rather than an alert. */
+.chat-empty-state__icon { margin-bottom: var(--space-3); color: var(--text-muted); line-height: 0; }
+.chat-empty-state__icon svg { width: 40px; height: 40px; }
+
+/* ===== Model load progress (llm chat right rail) =====
+   `.model-progress-fill`'s width starts at 0% and is updated at runtime by
+   `bar.style.width = pct + '%'` in ui/assets/llm-chat.js — a
+   template-interpolated JS assignment, not a literal one, so it stays (see
+   task-12b report / task-12e scope note). */
+.model-progress-track { background: var(--bg-secondary); border-radius: 0.25rem; height: 6px; overflow: hidden; }
+.model-progress-fill { height: 100%; background: var(--primary-color); width: 0%; transition: width 0.3s; }
+
+/* ===== Storage quota bar (blocks/files/pages_user/cloudstorage.rs) =====
+   Same shape as .model-progress-track/-fill above; `--fill-pct` is a
+   per-render percentage computed in Rust, handed to CSS as a custom
+   property rather than a literal `width:`. */
+.quota-bar { background: var(--bg-secondary); border-radius: 0.25rem; height: 8px; overflow: hidden; }
+.quota-bar__fill { height: 100%; background: var(--primary-color); width: var(--fill-pct); transition: width 0.3s; }
+
+/* ===== LLM providers table (blocks/llm/ui.rs) =====
+   Long endpoint/model-list cells truncate instead of wrapping and blowing
+   out the table width. */
+.llm-cell--endpoint { max-width: 260px; }
+.llm-cell--models { max-width: 280px; }
+
+/* ===== Messages block: task/notification single-pane entries list ===== */
+.entries-list--scroll { max-height: 60vh; overflow-y: auto; }
+
+/* ===== Legal pages editor status bar (blocks/legalpages/pages.rs) ===== */
+.editor-status__title { font-size: 1.25rem; font-weight: 600; margin: 0; }
+.editor-status__version { background: var(--bg-hover); color: var(--text-muted); }
+
+/* ===== Tickets admin (blocks/tickets/pages.rs) =====
+   The page's own `<style>` blocks (rendered via `html! { style { ... } }`)
+   already carry `max-width: 720px` media-query overrides for
+   `.ticket-filter-grid` / `.ticket-detail-grid` / `.ticket-note-form` — a
+   page-local stylesheet, the same drift pattern flagged for
+   `blocks/products/pages.rs`'s `PRODUCTS_UI_CSS` under task 12e. This section
+   supplies the base (non-media) rules those class names need, kept here
+   rather than folded into the page-local block so the audited stylesheet
+   stays the source of truth for the base declaration; 12e's page-local-style
+   sweep should also pick up these two page-local `<style>` blocks. */
+.ticket-filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: var(--space-2); }
+.ticket-filter-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; max-width: 28rem; margin-top: var(--space-2); }
+.ticket-filter-actions .btn { flex: 1 1 7rem; }
+.ticket-detail-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr); gap: var(--space-5); }
+.ticket-note-form { display: flex; gap: var(--space-2); }
+.ticket-form-grid { display: grid; gap: var(--space-3); }
+.ticket-form-grid--create { margin-top: var(--space-4); max-width: 48rem; }
+.ticket-form-grid--type-create { margin: var(--space-4) 0; max-width: 50rem; }
+.ticket-form-grid--type-edit { margin-top: var(--space-4); }
+
+/* ===== Vector backend-unavailable callout (blocks/vector/pages_ui.rs) =====
+   #fff8e1/#f0d78c/#92400e have no matching design tokens (--accent-warning
+   is #f59e0b, too saturated for a pale banner tint) -- same pattern as
+   auth-split.css's #ecfdf5/#a7f3d0/#059669 pair. 6.67:1 computed (#92400e
+   on #fff8e1), clears the 4.5:1 AA text floor. */
+.callout { margin-bottom: var(--space-4); padding: var(--space-4); border-radius: var(--radius-md); }
+.callout--warning { background: #fff8e1; border: 1px solid #f0d78c; color: #92400e; }
+.callout__code { font-size: 12px; padding: 1px var(--space-1); background: rgba(0,0,0,0.05); border-radius: 3px; }
+
+/* ===== API key reveal card (blocks/auth_ui/api/api_keys.rs) ===== */
+.api-key-card { margin-bottom: var(--space-4); }
+.api-key-copy-hint { margin: 0 0 var(--space-2); color: var(--text-secondary); }
+.api-key-reveal-row { display: flex; gap: var(--space-2); align-items: stretch; }
+.api-key-value { flex: 1 1 auto; padding: var(--space-2); background: var(--bg-secondary); border-radius: var(--radius-md); font-family: ui-monospace, Menlo, monospace; word-break: break-all; user-select: all; }
+.api-key-name-hint { margin: var(--space-2) 0 0; font-size: var(--text-xs); color: var(--text-muted); }
+
+/* ===== Portal buttons admin (blocks/userportal/pages/admin_buttons.rs) ===== */
+.admin-buttons-form-grid { grid-template-columns: 1fr 1fr 1fr auto auto; }
+
+/* ===== Variables admin warnings (blocks/admin/pages/variables.rs) =====
+ * #92400e / #fef3c7 have no matching design token; carried over unchanged
+ * from the original inline styles. The banner's border does match
+ * --accent-warning (#f59e0b) and uses the token. */
+.var-warning-note { color: #92400e; font-size: 11px; margin-top: 2px; }
+.var-warning-banner {
+	background: #fef3c7; border: 1px solid var(--accent-warning);
+	border-radius: 8px; padding: var(--space-3); margin-bottom: var(--space-4);
+	font-size: 0.813rem; color: var(--accent-warning-text);
+	display: flex; align-items: center; gap: var(--space-2);
+}
+/* Sized down from the icon set's 18px default to sit with 0.813rem text.
+   `flex-shrink: 0` keeps the mark round when the message wraps. */
+.var-warning-banner svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+/* ===== Products admin (cards) =====
+ * Migrated from `blocks/products/pages.rs`'s page-local `PRODUCTS_UI_CSS`
+ * `<style>` block (task 12e). The `body:has(.products-tabs) .card` override
+ * below is a compound selector (0,2,0) so it always beats the plain `.card`
+ * rule above regardless of which file loads first -- no source-order
+ * dependency to preserve here, unlike `.products-advanced`/`.mt-0` in
+ * form.css. */
+/* Onboarding guide. The three tiles are cards and now look like cards: they
+   used to carry a bespoke treatment -- 20px padding (--space-5, off the 24px
+   every other card body uses), a 14px radius (the scale has 12px), a
+   diagonal brand-tinted gradient and a 26px drop shadow no other surface in
+   the admin has. Next to the plain white cards on every neighbouring page it
+   read as a different design language rather than the same one. */
+.products-guide { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-4); margin: var(--space-6) 0; }
+.products-guide__item { position: relative; padding: var(--space-6); border: 1px solid var(--border-color); border-radius: var(--radius-lg); background: var(--surface-1); }
+/* At the original 14% mix, --primary-button on this background only reaches
+   4.12:1 (computed) -- below the 4.5:1 AA floor for the "1"/"2"/"3" digit
+   this renders (products/pages.rs). A 6% mix keeps the same pale-pink chip
+   look and gets --primary-button to 4.60:1 (computed). */
+.products-guide__number { display: grid; place-items: center; width: 2rem; height: 2rem; margin-bottom: var(--space-3); border-radius: 999px; background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); font-weight: 750; }
+.products-guide__item h3 { font-size: 1rem; margin: 0 0 var(--space-1); }
+/* These three were bare `<a class="text-sm">`. The bundle sets no rules on
+   `a` at all -- every other link in the admin carries an explicit class --
+   so they fell through to the user-agent default and rendered as underlined
+   browser-blue, the only blue on the page and the only underline. Brand red
+   (--primary-button, 4.99:1 on white; --primary-color is 3.66:1 and fails
+   AA for text), underline on hover only. */
+.products-guide__link {
+	display: inline-flex; align-items: center; gap: var(--space-1);
+	margin-top: var(--space-3);
+	color: var(--primary-button); text-decoration: none; font-weight: 500;
+}
+.products-guide__link:hover { text-decoration: underline; }
+/* Match the 14px label rather than the icon set's 18px default. */
+.products-guide__link svg { width: 14px; height: 14px; }
+.products-guide__item p { margin: 0; line-height: 1.55; }
+.products-callout { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); padding: var(--space-4) var(--space-4); margin: 0 0 var(--space-5); border: 1px solid color-mix(in srgb, var(--primary-color) 28%, var(--border-color)); border-radius: 14px; background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); }
+.products-callout__copy { max-width: 68ch; }
+.products-callout__copy strong { display: block; margin-bottom: var(--space-1); }
+.products-callout__copy p { margin: 0; }
+.products-callout__actions { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; flex: none; }
+.product-template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.product-template-card { display: grid; grid-template-columns: auto 1fr; gap: var(--space-1) var(--space-3); align-items: start; padding: var(--space-4); border: 1px solid var(--border-color); border-radius: 14px; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+.product-template-card:hover { border-color: var(--primary-color); box-shadow: 0 8px 22px rgba(15, 23, 42, .08); transform: translateY(-1px); }
+.product-template-card:has(input:checked) { border-color: var(--primary-color); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-color) 14%, transparent); }
+.product-template-card input { margin-top: var(--space-1); }
+.product-template-card strong, .product-template-card span { grid-column: 2; }
+.product-template-card strong { margin: 0 !important; }
+[data-wizard-step] > .card__head { background: color-mix(in srgb, var(--surface-1) 94%, var(--primary-color) 6%); }
+[data-offer-card] > .card__head { align-items: flex-start; background: linear-gradient(120deg, color-mix(in srgb, var(--surface-1) 94%, var(--primary-color) 6%), var(--surface-1)); }
+body:has(.products-tabs) .card { border-radius: 14px; box-shadow: 0 8px 26px rgba(15, 23, 42, .045); }
+@media (max-width: 760px) {
+	.products-guide { grid-template-columns: 1fr; }
+	.products-callout { flex-direction: column; }
+	.products-callout__actions { width: 100%; }
+	.products-callout__actions .btn { flex: 1; }
+	.product-template-grid { grid-template-columns: 1fr; }
+}
+

@@ -1,0 +1,456 @@
+/* Search Input */
+/* 2.5rem (here and at the other 3 input-with-icon spots below) clears a
+   0.75rem icon offset plus the icon's own ~1rem box -- a computed fit for
+   the icon, not a spacing-rhythm choice, so it's left off the --space-N
+   scale rather than snapped to the nearest step. */
+.search-input { position: relative; }
+.search-input input { padding-left: 2.5rem; }
+
+.search-input-icon {
+	position: absolute; left: 0.75rem; top: 50%;
+	transform: translateY(-50%); color: var(--text-muted);
+}
+
+/* Toggle */
+.toggle {
+	position: relative; display: inline-block;
+	width: 44px; height: 24px;
+}
+
+.toggle input { opacity: 0; width: 0; height: 0; }
+
+.toggle-slider {
+	position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+	background: var(--border-color); border-radius: 24px;
+	cursor: pointer; transition: background 0.2s;
+}
+
+.toggle-slider::before {
+	content: ''; position: absolute;
+	left: 2px; bottom: 2px;
+	width: 20px; height: 20px;
+	background: white; border-radius: 50%;
+	transition: transform 0.2s;
+}
+
+.toggle input:checked + .toggle-slider { background: var(--primary-color); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(20px); }
+
+/* Filter Bar */
+.filter-bar {
+	display: flex; align-items: center; gap: var(--space-4);
+	margin-bottom: var(--space-6); flex-wrap: wrap;
+}
+
+.filter-bar .search-input { flex: 1; min-width: 200px; }
+
+/* ===== Forms ===== */
+.form-group { margin-bottom: var(--space-5); }
+.form-group:last-child { margin-bottom: 0; }
+
+.form-row {
+	display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4);
+}
+
+.form-label {
+	display: flex; align-items: center; gap: var(--space-2);
+	margin-bottom: var(--space-2); font-size: 0.875rem;
+	font-weight: 500; color: #374151;
+}
+
+/* Generated " *" ornaments the visible label text right next to it (e.g.
+   "Email *") rather than substituting for it -- the label itself already
+   conveys the field name, this is a supplementary visual cue. Literal
+   #ef4444 = --accent-danger's value, 3.76:1 on white -- below the 4.5:1 text
+   floor, but this is the "merely ornaments a visible label" case, not text;
+   left as-is and exempted in the contrast guard (ui/assets.rs) rather than
+   darkened. */
+/* #ef4444 is 3.76:1 on white -- below AA, and this asterisk is text, not a
+   non-text indicator. --accent-danger-text (6.47:1) is the same token every
+   other danger-text surface uses. */
+.form-label.required::after { content: ' *'; color: var(--accent-danger-text); }
+
+.form-input,
+.form-select,
+.form-textarea {
+	width: 100%; padding: var(--space-3) var(--space-4);
+	border: 1px solid #e8ecf1; border-radius: 10px;
+	background: #f8fafc; color: #111827;
+	font-size: 0.9rem; transition: all 0.2s ease;
+}
+
+.form-input::placeholder,
+/* #a0aec0 was 2.26:1 on the input's white background. Placeholder text is
+   text and needs 4.5:1; #6b7280 is 4.83:1 (computed) and still reads
+   lighter than the #111827 input value above. */
+.form-textarea::placeholder { color: #6b7280; }
+
+.form-input:hover:not(:disabled),
+.form-select:hover:not(:disabled),
+.form-textarea:hover:not(:disabled) {
+	border-color: #dde3ea; background: #f1f5f9;
+}
+
+.form-input:focus,
+.form-select:focus,
+.form-textarea:focus {
+	border-color: rgba(24, 154, 180, 0.5);
+	background: white;
+	box-shadow: 0 0 0 3px rgba(24, 154, 180, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.form-input:disabled,
+.form-select:disabled,
+.form-textarea:disabled {
+	background: #f3f4f6; color: #6b7280;
+	cursor: not-allowed; border-color: #e5e7eb;
+}
+
+.form-input.error,
+.form-select.error,
+.form-textarea.error { border-color: #ef4444; }
+
+.form-textarea { min-height: 100px; resize: vertical; }
+
+.form-select {
+	appearance: none;
+	background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+	background-repeat: no-repeat;
+	background-position: right 0.75rem center;
+	background-size: 1rem;
+	padding-right: 2.5rem; cursor: pointer;
+}
+
+.form-input-wrapper { position: relative; }
+.form-input-wrapper .form-input { padding-left: 2.5rem; }
+
+.form-input-wrapper .input-icon {
+	position: absolute; left: 0.75rem; top: 50%;
+	transform: translateY(-50%); color: #6b7280; pointer-events: none;
+}
+
+/* Right-side icon variant (e.g. the reveal/hide button on a sensitive
+ * variable's value field) — a standalone wrapper, deliberately NOT composed
+ * with `.form-input-wrapper` above: that class's `.form-input` rule adds
+ * `padding-left: 2.5rem` unconditionally for its left-icon case, which has
+ * no "off" switch and no left icon exists here, so composing the two left
+ * this field with ~26px of dead space on its left edge (caught in review —
+ * see task-12c-report.md). `.form-input-wrapper` has no other caller
+ * (`grep -rln "form-input-wrapper" src --include=*.rs` returns only the one
+ * site this serves), so there's no reuse benefit to composing rather than
+ * standing alone. The button stays clickable (`.input-icon` above is
+ * `pointer-events: none`, which a reveal button can't be). */
+.value-reveal-wrapper { position: relative; }
+.value-reveal-wrapper .form-input { padding-right: var(--space-12); }
+.value-reveal-wrapper .btn-icon-right {
+	position: absolute; right: 0.25rem; top: 50%;
+	transform: translateY(-50%);
+}
+
+.form-hint {
+	display: block; margin-top: var(--space-2);
+	font-size: 0.75rem; color: #6b7280;
+}
+
+/* Literal #ef4444 = --accent-danger's own value, 3.76:1 on white -- below
+   AA for this validation-error text; --accent-danger-text (6.47:1,
+   computed) replaces it. */
+.form-error {
+	display: block; margin-top: var(--space-2);
+	font-size: 0.75rem; color: var(--accent-danger-text);
+}
+
+.form-checkbox, .form-radio {
+	display: inline-flex; align-items: center; gap: var(--space-2);
+	cursor: pointer; font-size: 0.875rem; color: #374151;
+}
+
+.form-checkbox input, .form-radio input {
+	width: 1rem; height: 1rem; cursor: pointer; accent-color: var(--primary-color);
+}
+
+.input-group { display: flex; gap: var(--space-2); }
+.input-group .form-input { flex: 1; }
+
+.form-actions {
+	display: flex; justify-content: flex-end;
+	gap: var(--space-3); margin-top: var(--space-6);
+	padding-top: var(--space-6); border-top: 1px solid #e5e7eb;
+}
+
+/* ===== htmx indicators ===== */
+.htmx-indicator { display: none; }
+.htmx-request .htmx-indicator { display: inline-flex; }
+.htmx-request.htmx-indicator { display: inline-flex; }
+
+/* ===== Products admin (forms) =====
+ * Migrated from `blocks/products/pages.rs`'s page-local `PRODUCTS_UI_CSS`
+ * `<style>` block (task 12e). Declared here, before the Utility section
+ * below, on purpose: `.products-advanced` sets its own `margin-top`, and a
+ * plain `.mt-0` utility (same 0,1,0 specificity) needs to win that tie the
+ * same way every other component-vs-utility pair in this file does — by
+ * losing the source-order tie to the utility declared later. When this
+ * lived in a `<style>` tag rendered inside `<body>` it sat later in the
+ * cascade than this whole stylesheet, so a plain `.mt-0` lost regardless of
+ * order here; that required a `.products-advanced.mt-0` compound override
+ * (0,2,0) to force the win unconditionally. That workaround is gone now
+ * that this rule lives above `.mt-0` in the same file — the ordinary
+ * component-before-utility convention is sufficient again. */
+.products-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0 var(--space-4); }
+.products-form-grid--compact { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+.products-choice-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: var(--space-3); }
+.products-choice { display: flex; gap: var(--space-3); align-items: flex-start; padding: var(--space-3) var(--space-4); border: 1px solid var(--border-color); border-radius: 12px; background: var(--surface-1); cursor: pointer; }
+.products-choice:has(input:checked) { border-color: var(--primary-color); background: color-mix(in srgb, var(--primary-color) 5%, var(--surface-1)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 10%, transparent); }
+.products-choice input { margin-top: var(--space-1); flex: none; }
+.products-choice strong { display: block; font-size: .92rem; }
+.products-choice small { display: block; margin-top: .15rem; line-height: 1.45; }
+.products-actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.products-status-stack { display: flex; align-items: center; gap: var(--space-1); flex-wrap: wrap; }
+.products-advanced { margin-top: var(--space-4); border: 1px solid var(--border-color); border-radius: 12px; background: color-mix(in srgb, var(--surface-1) 97%, var(--border-color) 3%); }
+.products-advanced > summary { cursor: pointer; padding: var(--space-3) var(--space-4); font-weight: 650; list-style-position: inside; }
+.products-advanced[open] > summary { border-bottom: 1px solid var(--border-color); }
+.products-advanced__body { padding: var(--space-4); }
+.products-plain-details { margin-top: var(--space-3); }
+.products-plain-details > summary { cursor: pointer; color: var(--text-muted); font-size: .875rem; font-weight: 600; }
+.products-filter-label { font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin-right: .15rem; }
+.products-checklist { list-style: none; padding: 0; margin: 0; }
+.products-checklist li:last-child { margin-bottom: 0 !important; }
+/* Deleted-product "close manager" (blocks/products/pages.rs) -- ported from
+   origin/main's inline `style="..."` attributes during the main merge,
+   2026-09-02 (the guard `pages_carry_no_static_inline_styles` caught them). */
+.products-payment-link-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.products-payment-link-url { word-break: break-all; }
+.products-code-block { display: block; width: 100%; padding: var(--space-3) var(--space-3); border: 1px solid var(--border-color); border-radius: 10px; background: var(--surface-2); overflow-wrap: anywhere; }
+.products-settings-note { margin-bottom: var(--space-4); }
+body:has(.products-tabs) .filter-bar { margin: var(--space-4) 0; padding: var(--space-3); border: 1px solid var(--border-color); border-radius: 14px; background: var(--surface-1); }
+.product-wizard-progress { margin: 0 0 var(--space-5); }
+.product-wizard-progress ol { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--space-2); list-style: none; padding: 0; margin: 0; }
+.product-wizard-progress li { min-height: 2.25rem; border-radius: 999px; }
+.wizard-step-check { display: inline-flex; margin-right: var(--space-1); }
+.wizard-step-check svg { width: .75rem; height: .75rem; }
+.product-wizard-actions { position: sticky; bottom: 0; z-index: 2; display: flex; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; margin-top: var(--space-4); padding: var(--space-3) 0; border-top: 1px solid var(--border-color); background: var(--surface-1); }
+.product-wizard-actions__buttons { display: flex; gap: var(--space-3); margin-left: auto; }
+/* Rows built client-side by `PRODUCT_MANAGER_JS` (pricing preview, saved
+ * checkout presets, Stripe Payment Links) — previously `row.style.cssText=
+ * '…'` (task 12e). */
+.product-preview-row { display: flex; justify-content: space-between; gap: var(--space-4); padding: var(--space-1) 0; border-bottom: 1px solid var(--border-color); }
+.product-preview-total { display: flex; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 0; font-size: 1.08rem; }
+.product-preset-row { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-2) 0; border-bottom: 1px solid var(--border-color); }
+.product-payment-link-row { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; margin-top: var(--space-2); }
+@media (max-width: 760px) {
+	.products-actions { width: 100%; }
+	.product-wizard-progress { overflow: visible; }
+	.product-wizard-progress ol { min-width: 0; gap: var(--space-1); }
+	.product-wizard-progress li { font-size: .72rem; white-space: nowrap; }
+	.product-wizard-actions { display: grid; }
+	.product-wizard-actions > .btn { width: 100%; }
+	.product-wizard-actions__buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; margin-left: 0; }
+	.product-wizard-actions__buttons:has(#wizard-next:not([hidden])) { grid-template-columns: 1fr; }
+	.product-wizard-actions__buttons .btn { width: 100%; }
+}
+
+/* ===== Legal document editor (blocks/legalpages/pages.rs) =====
+ * Migrated from that file's page-local `EDITOR_CSS` `<style>` block (task
+ * 12e). `white`/`#e2e8f0` were exact matches for --surface-1/--border-color
+ * -- re-typed onto the tokens rather than carried over as literals. */
+.editor-pane { background: var(--surface-1); border: 1px solid var(--border-color); border-radius: 0 6px 6px 6px; min-height: 500px; }
+.editor-textarea { width: 100%; min-height: 500px; padding: var(--space-4); border: none; outline: none; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; line-height: 1.6; background: transparent; }
+.preview-content { padding: var(--space-6); min-height: 500px; font-family: Georgia, 'Times New Roman', serif; line-height: 1.8; }
+
+/* ===== Utility ===== */
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+.text-muted { color: var(--text-muted); }
+/* --accent-danger (#ef4444) is 3.76:1 on white -- below the 4.5:1 AA floor
+   for this normal-size error text; --accent-danger-text (6.47:1, computed)
+   is the text-safe sibling. --accent-danger itself stays for non-text use. */
+.text-danger { color: var(--accent-danger-text); }
+.text-success { color: var(--accent-success-text); }
+/* Strong warning text (variables admin warning notes) — #92400e has no
+ * matching design token; carried over unchanged from the original inline
+ * styles. */
+/* #92400e is --accent-warning-text's own value -- the literal predated the
+   token. Now carries an `icons::triangle_alert()` mark, so it aligns and
+   sizes that icon the way .var-warning-banner does for the same warning. */
+.text-warning-strong {
+	color: var(--accent-warning-text);
+	display: flex; align-items: center; gap: var(--space-1);
+}
+.text-warning-strong svg { width: 14px; height: 14px; flex-shrink: 0; }
+.text-sm { font-size: 0.875rem; }
+.text-xs { font-size: 0.75rem; }
+.text-lg { font-size: var(--text-lg); }
+/* Off-scale small sizes for dense badges/cells (permissions grants table,
+ * database admin panel) that predate the --text-* token scale and don't
+ * land on one of its steps. Named by literal px, matching the existing
+ * .w-80 fixed-width convention below. */
+.text-13 { font-size: 13px; }
+.text-11 { font-size: 11px; }
+.text-10 { font-size: 10px; }
+.text-16 { font-size: 1rem; }
+.font-medium { font-weight: 500; }
+.font-semibold { font-weight: 600; }
+.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.text-capitalize { text-transform: capitalize; }
+.nowrap { white-space: nowrap; }
+.pre-wrap { white-space: pre-wrap; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Margin/gap scale follows the same 0.25rem step as the existing mt-1/mt-2/
+ * mt-4 and gap-2/gap-4 utilities below (n * 0.25rem). */
+.m-0 { margin: 0; }
+.mt-0 { margin-top: 0; }
+.mt-1 { margin-top: var(--space-1); }
+.mt-2 { margin-top: var(--space-2); }
+.mt-3 { margin-top: var(--space-3); }
+.mt-4 { margin-top: var(--space-4); }
+.mt-5 { margin-top: var(--space-5); }
+.mt-6 { margin-top: var(--space-6); }
+.mt-8 { margin-top: var(--space-8); }
+.mb-1 { margin-bottom: var(--space-1); }
+.mb-2 { margin-bottom: var(--space-2); }
+.mb-3 { margin-bottom: var(--space-3); }
+.mb-4 { margin-bottom: var(--space-4); }
+.mb-5 { margin-bottom: var(--space-5); }
+.mb-6 { margin-bottom: var(--space-6); }
+.mb-8 { margin-bottom: var(--space-8); }
+.my-1 { margin: var(--space-1) 0; }
+.my-3 { margin: var(--space-3) 0; }
+.ml-auto { margin-left: auto; }
+.mr-1 { margin-right: var(--space-1); }
+.mr-2 { margin-right: var(--space-2); }
+/* Padding scale, same 0.25rem step as the margin scale above. */
+.p-0 { padding: 0; }
+.p-2 { padding: var(--space-2); }
+.p-3 { padding: var(--space-3); }
+.p-4 { padding: var(--space-4); }
+.p-5 { padding: var(--space-5); }
+.p-6 { padding: var(--space-6); }
+.p-8 { padding: var(--space-8); }
+/* A muted description paragraph directly under a heading — the products
+ * admin pages' most common inline style before this pass (15 sites). */
+.text-subtitle { margin: var(--space-1) 0 0; }
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.flex-1 { flex: 1; }
+.flex-none { flex: 0 0 auto; }
+.flex-wrap { flex-wrap: wrap; }
+.items-center { align-items: center; }
+.items-start { align-items: flex-start; }
+.items-end { align-items: flex-end; }
+.justify-between { justify-content: space-between; }
+.justify-start { justify-content: flex-start; }
+.justify-end { justify-content: flex-end; }
+.gap-1 { gap: var(--space-1); }
+.gap-2 { gap: var(--space-2); }
+.gap-3 { gap: var(--space-3); }
+.gap-4 { gap: var(--space-4); }
+.hidden { display: none; }
+.d-block { display: block; }
+.d-inline-flex { display: inline-flex; }
+.relative { position: relative; }
+.min-h-10 { min-height: 2.5rem; }
+.col-span-full { grid-column: 1 / -1; }
+.form-group--narrow { max-width: 620px; }
+.fieldset-reset { border: 0; padding: 0; margin: 0; }
+.list-compact { margin: var(--space-2) 0; padding-left: var(--space-5); }
+.w-auto { width: auto; }
+.w-full { width: 100%; }
+/* Fixed narrow table column (e.g. a "Method"/"Auth" header cell). */
+.w-30 { width: 30px; }
+.w-50 { width: 50px; }
+.w-60 { width: 60px; }
+.w-70 { width: 70px; }
+.w-80 { width: 80px; }
+.w-96 { width: 96px; }
+.w-110 { width: 110px; }
+.h-fit { height: fit-content; }
+.resize-vertical { resize: vertical; }
+.resize-none { resize: none; }
+.overflow-y-auto { overflow-y: auto; }
+.cursor-pointer { cursor: pointer; }
+/* Read-only display field (e.g. env-var-backed settings the admin can't
+ * edit inline) — visually distinct from an editable .form-input. */
+.form-input--readonly { background: var(--bg-secondary); }
+
+/* ===== Auto-fit grids =====
+ * Named by their `minmax()` pixel floor so call sites read the same value
+ * they select; combine with `.gap-*` and `.mt-*` for spacing. */
+.grid { display: grid; }
+.grid-auto-150 { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.grid-auto-180 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.grid-auto-220 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.grid-auto-240 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.grid-auto-260 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.grid-auto-280 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.grid-auto-320 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+/* Two fixed, unequally-weighted columns — the shipping origin/destination
+ * row is the only user of this shape. */
+.grid-shipping { grid-template-columns: minmax(180px, 1fr) minmax(280px, 2fr); }
+
+/* ===== Disclosure (details/summary) =====
+ * `summary { cursor: pointer }` lives in base.css as a global element
+ * default; these cover the spacing/weight variants around it. */
+.details-block { margin-top: var(--space-4); }
+.details-block--tight { margin: var(--space-3) 0; }
+.details-block--spaced { margin: var(--space-2) 0 var(--space-4); }
+.details-block--divider { border-top: 1px solid var(--border-color); margin-top: var(--space-5); padding-top: var(--space-5); }
+.summary-strong { font-weight: 600; }
+/* A compact heading inside a details body — smaller than the page's h2
+ * default and flush with the content above it. */
+.details-heading { font-size: 1rem; margin-top: 0; }
+
+/* ===== Settings form (ui/settings_form.rs) =====
+ * Section heading between one ConfigVar group and the next. The first
+ * section in a form sits flush against the top of its container
+ * (`--first`); a section with a description tightens its own bottom margin
+ * so the description reads as attached to the heading, not the next one
+ * (`--with-desc`). A collapsible section skips this heading entirely and
+ * uses a bordered `.card` (see below) instead, so it doesn't need either
+ * modifier. */
+.settings-section-heading {
+	font-size: 1rem; font-weight: 600;
+	margin: var(--space-6) 0 var(--space-4);
+	padding-bottom: var(--space-2);
+	border-bottom: 1px solid var(--border-color);
+}
+.settings-section-heading--first { margin-top: 0; }
+.settings-section-heading--with-desc { margin-bottom: var(--space-2); }
+/* One-line explanation under a section heading or a collapsible section's
+ * summary — smaller and lighter than `.form-hint` (a per-field hint), since
+ * it introduces a whole group of fields rather than one. */
+.settings-section-desc { color: var(--text-muted); font-size: 0.85rem; margin: 0 0 var(--space-4); }
+
+/* A collapsible settings section (`SettingsSection::collapsible`) renders as
+ * `details.card`, matching the bordered-box disclosure pattern already used
+ * by the tickets admin (`details .card .p-4 .mt-3`) — `.card`'s own padding
+ * wraps summary + fields uniformly, so no separate body wrapper is needed. */
+
+/* The reveal/hide password field pairs a text input with a color swatch —
+ * only ConfigVar's Color widget renders this shape, so it's a settings-form-
+ * specific row rather than a general-purpose utility. */
+.color-picker-row { display: flex; align-items: center; gap: var(--space-3); }
+.color-picker-row .form-input { flex: 1; }
+.color-swatch-input {
+	width: 40px; height: 36px;
+	border: 1px solid var(--border-color);
+	border-radius: 6px;
+	cursor: pointer;
+	padding: 2px;
+}
+
+@media (max-width: 720px) {
+	/* Forms: two-column form rows stack on narrow screens. */
+	.form-row { grid-template-columns: 1fr; }
+	/* Form inputs / buttons: ≥44px touch target, full-width. */
+	.form-input,
+	.form-control,
+	.btn { min-height: 44px; }
+}
+/* Email/form sensitive input wrapper (e.g. the Mailgun API Key field, and
+ * every ConfigVar Password widget) — previously an inline `display:flex`
+ * row with the input + an eye-toggle button, which needed a narrow-screen
+ * width fix keyed off the inline `style` attribute itself. Migrated to
+ * `.value-reveal-wrapper` (button absolutely positioned over the input via
+ * `.btn-icon-right`, no flex row), which doesn't have that collapse
+ * failure mode — `.form-input`'s own `width: 100%` is enough. */
+

@@ -1,0 +1,97 @@
+/* ===== Buttons =====
+ *
+ * ONE button component. This file used to define `.btn` TWICE -- a legacy
+ * block and a "Canonical buttons (Phase 1)" block below it -- alongside two
+ * complete parallel variant scales that were both in heavy use:
+ *
+ *     .btn-sm  (44 uses)   vs  .btn--sm  (59)
+ *     .btn-primary (28)    vs  .btn--primary (30)
+ *     .btn-secondary (24)  vs  .btn--secondary
+ *     .btn-ghost (25)      vs  .btn--ghost
+ *     .btn-danger (5)      vs  .btn--danger
+ *
+ * Because both `.btn` rules matched every button, each one rendered as a
+ * hybrid: shape, weight and centring from the canonical rule (it came last),
+ * padding, gap and font-size from the legacy one (the canonical rule declares
+ * no padding). Which variant class a given call site used decided its colour
+ * and, for ghost, its text colour and border -- so two buttons written the
+ * "same" way could differ. That is the inconsistency behind "this should be a
+ * common button component with the correct padding".
+ *
+ * The single-dash names are gone; every call site now uses the BEM `--`
+ * modifiers. No alias shim: an alias would be exactly the "implicit mapping
+ * layer" the repo guidelines rule out, and would let the two spellings drift
+ * apart again.
+ *
+ * The base carries `--md`'s padding so a bare `.btn` (no size modifier) is a
+ * medium button rather than an unpadded one.
+ */
+.btn {
+	display: inline-flex; align-items: center; justify-content: center;
+	gap: var(--space-2);
+	padding: var(--space-2) var(--space-4);
+	border: 1px solid transparent; border-radius: var(--radius-full);
+	font-family: inherit; font-size: var(--text-base); font-weight: 400; line-height: 1;
+	cursor: pointer;
+	transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+	text-decoration: none; white-space: nowrap;
+}
+.btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* ── Sizes ─────────────────────────────────────────────── */
+.btn--sm { padding: var(--space-1) var(--space-3); font-size: var(--text-sm); }
+.btn--md { padding: var(--space-2) var(--space-4); font-size: var(--text-base); }
+/* Vertical padding snaps to --space-3, not the nearer --space-2 (0.6rem is
+   9.6px, 1.6px from --space-2's 8px vs 2.4px from --space-3's 12px) --
+   nearest-neighbour would tie .btn--lg's vertical padding with .btn--md's
+   (both 8px), erasing the sm<md<lg size progression the three variants are
+   meant to express. */
+.btn--lg { padding: var(--space-3) var(--space-6); font-size: var(--text-lg); }
+/* Square: an icon-only button, so the horizontal padding matches the
+   vertical rather than the text-button ratio. */
+.btn--icon { padding: var(--space-2); }
+
+/* ── Variants ──────────────────────────────────────────── */
+.btn--primary { background: var(--primary-button); color: #fff; border-color: var(--primary-button); }
+.btn--primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
+
+.btn--secondary { background: var(--surface-1); color: var(--text-primary); border-color: var(--border-color); }
+.btn--secondary:hover:not(:disabled) { background: var(--bg-hover); }
+
+/* Keeps the transparent 1px border the base sets (rather than `border: none`,
+   which the legacy `.btn-ghost` used) so a ghost button is exactly as tall as
+   the solid buttons it sits beside in a row. */
+.btn--ghost { background: transparent; color: var(--text-primary); }
+.btn--ghost:hover:not(:disabled) { background: var(--bg-hover); }
+
+/* --accent-danger (#ef4444) under white text is 3.76:1 -- below AA;
+   --accent-danger-text (6.47:1, computed) is dark enough to serve this role
+   too (contrast is symmetric -- same value either direction), mirroring how
+   --primary-button already does double duty for --primary-color. */
+.btn--danger { background: var(--accent-danger-text); color: #fff; }
+.btn--danger:hover:not(:disabled) { filter: brightness(0.92); }
+
+/* --accent-success (#10b981) under white text is 2.54:1 -- below AA, and
+   below even the 3:1 non-text floor. --accent-success-text (7.13:1, computed)
+   serves this role too, exactly as --accent-danger-text does above. */
+.btn--success { background: var(--accent-success-text); color: #fff; }
+.btn--success:hover:not(:disabled) { filter: brightness(0.92); }
+
+/* ── Quick actions card ────────────────────────────────── */
+.dashboard-top { margin-bottom: var(--space-4); }
+.quick-actions__grid {
+	display: grid;
+	grid-template-columns: repeat(4, 1fr);
+	gap: var(--space-2);
+}
+.quick-actions__grid .btn { width: 100%; }
+@media (max-width: 720px) {
+	.quick-actions__grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 720px) {
+	.btn--block,
+	.btn--primary,
+	.btn--secondary { width: 100%; }
+}

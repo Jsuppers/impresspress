@@ -8,13 +8,16 @@ use super::{
     oauth_provider_label, pw_field, pw_toggle_js, site_config,
 };
 use crate::{
-    blocks::{auth::brand_panel, auth_ui::redirect::is_safe_local_redirect},
-    ui::{self, templates::auth_split},
+    blocks::auth_ui::redirect::is_safe_local_redirect,
+    ui::{
+        self,
+        components::{alert, auth_panel, oauth_button, AlertVariant},
+        templates::auth_split,
+    },
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let app_name = &config.app_name;
     let allow_signup = ctx
         .config_get("WAFER_RUN_SHARED__ALLOW_SIGNUP")
         .unwrap_or("true")
@@ -37,8 +40,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     } else {
         String::new()
     };
-    let logo_url = &config.logo_url;
-
     let signup_redirect = if redirect.is_empty() {
         String::new()
     } else {
@@ -67,36 +68,28 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "Sign In",
         &config,
         auth_split(
-            brand_panel(&config, "Sign in to continue."),
+            // `None`: login is the one auth page that shows the brand
+            // tagline (`config.auth_tagline`, via `auth_panel`'s fallback)
+            // rather than a page-specific line — it reads as the product's
+            // pitch, not a duplicate of the right-column heading pair below
+            // (`.auth-form__title` / `.auth-form__subtitle`, "Welcome back"
+            // / "Sign in to continue."), which is a different sentence.
+            auth_panel(&config, None),
             html! {
-                div .login-container {
-                    div .login-logo {
-                        (crate::ui::templates::brand_lockup(logo_url, &config.logo_icon_url, app_name))
-                        p .login-subtitle { "Sign in to " (app_name) }
-                    }
+                div .auth-form {
+                    h2 .auth-form__title { "Welcome back" }
+                    p .auth-form__subtitle { "Sign in to continue." }
 
-                    div #error .login-error style="display:none" {}
-                    div #info style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:.75rem;margin-bottom:1.5rem;font-size:.813rem;color:#059669;display:none" {}
+                    (alert(AlertVariant::Error, "error", ""))
+                    (alert(AlertVariant::Success, "info", ""))
 
                     @if !oauth_providers.is_empty() {
-                        div .oauth-buttons style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:1rem" {
+                        div .oauth-buttons {
                             @for provider in &oauth_providers {
-                                button
-                                    type="button"
-                                    class="oauth-button"
-                                    data-provider=(provider)
-                                    onclick={"oauthStart('"(provider)"')"}
-                                    style="display:flex;align-items:center;justify-content:center;gap:.5rem;padding:.625rem 1rem;background:#000;color:#fff;border:1px solid #000;border-radius:.5rem;font-weight:500;font-size:.95rem;cursor:pointer;transition:background .15s" {
-                                    (oauth_provider_icon(provider))
-                                    "Continue with " (oauth_provider_label(provider))
-                                }
+                                (oauth_button(provider, oauth_provider_label(provider), oauth_provider_icon(provider)))
                             }
                         }
-                        div style="display:flex;align-items:center;gap:.75rem;margin:.5rem 0 1rem;color:var(--sa-text-muted, #6b7280);font-size:.75rem" {
-                            div style="flex:1;height:1px;background:var(--sa-border, #e5e7eb)" {}
-                            "or"
-                            div style="flex:1;height:1px;background:var(--sa-border, #e5e7eb)" {}
-                        }
+                        div .auth-divider { "or" }
                     }
 
                     form #form .login-form onsubmit="return handleLogin(event)" {
@@ -112,8 +105,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             (pw_field("password", "Enter your password", None))
                         }
 
-                        div style="text-align:right;margin-bottom:1rem" {
-                            button type="button" class="btn btn-ghost btn-sm" onclick="handleForgot()" {
+                        div .auth-actions {
+                            button type="button" class="btn btn--ghost btn--sm" onclick="handleForgot()" {
                                 "Forgot password?"
                             }
                         }
@@ -156,35 +149,23 @@ mod tests {
         msg
     }
 
-    /// Default branding on the sign-in card: the built-in pixel-art icon at
-    /// 64px — the 64-cell rendition at 1:1, served as a plain `<img>` (no
-    /// `srcset`, nothing for the browser to second-guess) — above the app
-    /// name as text. No raster wordmark.
-    #[tokio::test]
-    async fn default_branding_is_pixel_art_icon_plus_app_name() {
-        let ctx = TestContext::new().await;
-        let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
-        assert!(
-            html.contains(r#"class="login-brand__icon pixel-art""#),
-            "{html}"
-        );
-        assert!(
-            html.contains(&format!(
-                r#"<img class="login-brand__icon pixel-art" src="{}" width="64" height="64" alt="">"#,
-                crate::ui::assets::logo_icon_2x_url()
-            )),
-            "{html}"
-        );
-        assert!(!html.contains("srcset"), "{html}");
-        assert!(
-            html.contains(r#"<span class="login-app-name">Impresspress</span>"#),
-            "{html}"
-        );
-        assert!(
-            !html.contains("logo-image"),
-            "no wordmark image by default: {html}"
-        );
-    }
+    // Default branding on the sign-in card: the built-in pixel-art icon at
+    // 64px — the 64-cell rendition at 1:1, served as a plain `<img>` (no
+    // `srcset`, nothing for the browser to second-guess) — above the app
+    // name as text. No raster wordmark.
+    //
+    // Plain comments, not doc comments: the test they described was dropped,
+    // so a `///` block here is an outer attribute with no item to document.
+    // Ported from origin/main's `default_branding_is_pixel_art_icon_plus_app_
+    // name` during the main merge -- 2026-09-02 -- and dropped rather than
+    // adapted: main's test asserted the login page's *form* panel renders
+    // `.login-brand__icon`/`.login-app-name` (main's `brand_lockup`, re-added
+    // to `.login-container`). This branch deliberately retired that per-page
+    // logo header (see `styles/layouts/auth-split.css`'s comment) -- the
+    // navy `.auth-split__brand` aside is the only place branding renders on
+    // this page now, already covered below by
+    // `brand_panel_shows_default_headline_and_tagline_without_duplicating_
+    // subtitle` (see the coordinator's ruling in the merge report).
 
     /// Explicit, safe `?redirect=` params must still be honored — rendered
     /// into the hidden `#redirect` field the login script reads first,
@@ -264,6 +245,35 @@ mod tests {
         assert!(
             html.contains(r#"id="password""#),
             "input must carry the id the label's for= references: {html}"
+        );
+    }
+
+    /// The navy brand panel shows the configurable headline and the brand
+    /// tagline (falls back from `auth_panel(&config, None)`) exactly once
+    /// each, and the right column's "Sign in to continue." is not
+    /// duplicated by the panel.
+    #[tokio::test]
+    async fn brand_panel_shows_default_headline_and_tagline_without_duplicating_subtitle() {
+        let ctx = TestContext::new().await;
+        let msg = login_msg(&[]);
+        let html = output_html(handle(&ctx, &msg).await).await;
+
+        assert_eq!(
+            html.matches("The backend that lifts its own weight.")
+                .count(),
+            1,
+            "headline must appear exactly once: {html}"
+        );
+        assert_eq!(
+            html.matches("One binary. Batteries included. No lock-in.")
+                .count(),
+            1,
+            "brand tagline must appear exactly once: {html}"
+        );
+        assert_eq!(
+            html.matches("Sign in to continue.").count(),
+            1,
+            "right-column subtitle must not be duplicated by the brand panel: {html}"
         );
     }
 

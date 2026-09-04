@@ -4,6 +4,7 @@
 use maud::{html, Markup};
 
 use super::{
+    icons,
     sidebar::{sidebar_grouped, NavGroup},
     UserInfo,
 };
@@ -118,7 +119,7 @@ pub fn shell(
                     data-action="drawer-open"
                     aria-label="Open menu"
                 {
-                    "☰"
+                    (icons::menu())
                 }
                 span .shell__mobile-title { (app_name) }
                 @if topbar.show_palette {

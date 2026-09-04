@@ -1,0 +1,327 @@
+/* Tables */
+.table-container { overflow-x: auto; }
+
+.table { width: 100%; border-collapse: collapse; }
+
+.table th {
+	text-align: left; padding: var(--space-3);
+	background: var(--bg-secondary);
+	border-bottom: 1px solid var(--border-color);
+	font-size: 0.75rem; font-weight: 600;
+	text-transform: uppercase; color: var(--text-muted);
+	letter-spacing: 0.5px;
+}
+
+.table td {
+	padding: var(--space-3);
+	border-bottom: 1px solid var(--border-light);
+	font-size: 0.875rem;
+}
+
+.table tbody tr:hover { background: var(--bg-hover); }
+
+.table th.sortable { cursor: pointer; user-select: none; }
+.table th.sortable:hover { color: var(--text-primary); }
+
+/* Pagination */
+.pagination {
+	display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-6);
+}
+
+.pagination-info {
+	font-size: 0.875rem; color: var(--text-secondary); margin-right: auto;
+}
+
+.pagination-controls { display: flex; gap: var(--space-1); }
+
+.pagination-btn {
+	padding: var(--space-2) var(--space-3);
+	border: 1px solid var(--border-color);
+	background: white; color: var(--text-primary);
+	border-radius: 4px; cursor: pointer; font-size: 0.875rem;
+}
+
+.pagination-btn:hover { background: var(--bg-hover); }
+.pagination-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.pagination-btn.active {
+	background: var(--primary-button); color: white;
+	border-color: var(--primary-button);
+}
+
+/* Empty State */
+/* The bare-text empty state, for a list that just needs one line ("No
+   buckets", "No active shares"). Its richer sibling -- `.empty` below, built
+   by `ui::components::empty_state()` with an icon, title and body -- is the
+   one to reach for when the message needs more than a sentence.
+
+   Padding was `--space-12 --space-6` (48/24) against `.empty`'s 32/16, so
+   moving between two pages showing conceptually the same "nothing here"
+   message changed the amount of breathing room. They share one rhythm now;
+   32/16 is the majority (`.empty` has 32 call sites to this class's 10) and
+   the tighter of the two, which suits a single line of text.
+
+   `.empty-state-icon`/`-title`/`-description` used to live here as this
+   class's own icon/title/body subclasses. They had zero call sites in either
+   tree -- `.empty__icon`/`__title`/`__body` superseded them -- so they are
+   deleted rather than restyled. */
+.empty-state {
+	text-align: center; padding: var(--space-8) var(--space-4);
+	color: var(--text-secondary);
+}
+
+/* ===== Data table ===== */
+.data-table { overflow-x: auto; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--surface-1); }
+.data-table table { width: 100%; border-collapse: collapse; }
+.data-table thead th { position: sticky; top: 0; background: var(--surface-3); text-align: left; padding: var(--space-2) var(--space-3); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); border-bottom: 1px solid var(--border-color); font-weight: 500; }
+.data-table tbody td { padding: var(--space-2) var(--space-3); font-size: var(--text-sm); border-bottom: 1px dashed var(--border-light); color: var(--text-primary); }
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table__row--linked:hover { background: var(--bg-hover); cursor: pointer; }
+.data-table__row-href { width: 3rem; text-align: right; color: var(--text-muted); }
+/* The chevron is the row's accessible link; give it a real touch target
+   (~44px) — the rest of the row is made clickable by the delegated handler
+   in assets.rs, which routes clicks to this anchor. */
+.data-table__row-href a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    margin: -0.75rem -0.5rem;
+    border-radius: 8px;
+}
+.data-table__empty { padding: var(--space-8); }
+/* Caller-declared per-column width (ui/components/table.rs's `TableCol`) --
+   a genuine runtime value, handed to CSS as `--col-width`. */
+.data-table__col-w { width: var(--col-width); }
+/* Folder row name link (blocks/files/pages_user/objects.rs): the folder
+   icon (`icons::folder()`, 18x18) sits inline before the folder name --
+   flex + gap keeps it baseline-aligned with the text instead of the
+   default inline SVG's slight descender offset. */
+.row--folder__link { display: inline-flex; align-items: center; gap: var(--space-2); }
+
+/* ===== Empty state ===== */
+.empty { text-align: center; padding: var(--space-8) var(--space-4); color: var(--text-secondary); }
+/* `font-size: 2.4rem` used to size a text/emoji glyph here. Every call site
+   passes an `ui::icons::*` SVG (`empty_state(icons::package(), ...)`), and an
+   SVG ignores font-size -- so the intended ~38px mark had been rendering at
+   the icon set's 18px default on all 32 of them. The size is restated as
+   explicit width/height on the svg. */
+.empty__icon { color: var(--text-muted); margin-bottom: var(--space-4); line-height: 0; }
+.empty__icon svg { width: 38px; height: 38px; }
+.empty__title { font-size: var(--text-lg); font-weight: 500; color: var(--text-primary); margin: 0 0 var(--space-2); }
+.empty__body { font-size: var(--text-base); margin: 0 0 var(--space-4); }
+
+/* ===== Pagination ===== */
+.pagination { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) 0; font-size: var(--text-sm); color: var(--text-secondary); }
+.pagination__count { margin-right: auto; }
+/* --primary-color is 3.66:1 on white -- below the 4.5:1 AA floor for this
+   text link; --primary-button (4.99:1, computed) is the text-safe sibling. */
+.pagination__prev, .pagination__next { color: var(--primary-button); text-decoration: none; }
+.pagination__prev.is-disabled, .pagination__next.is-disabled { color: var(--text-muted); pointer-events: none; }
+
+/* ── Database admin ─────────────────────────────────────── */
+.db-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 32%) 1fr;
+  gap: var(--space-4);
+  align-items: start;
+}
+.db-pane {
+  background: var(--surface-1);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.db-pane--left { padding: var(--space-3); }
+.db-pane--right { padding: var(--space-3); min-height: 360px; }
+.db-pane__head { margin-bottom: var(--space-2); }
+.db-pane__head input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font-size: 13px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+.db-table-list { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow-y: auto; }
+.db-table-list__item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2);
+  border-radius: 4px;
+  text-decoration: none;
+  color: inherit;
+  font-size: 13px;
+}
+.db-table-list__item:hover { background: var(--bg-secondary, #f8f9fa); }
+.db-table-list__item.is-active { background: #fef9e7; border: 1px solid #f0d78c; }
+.db-table-list__name { font-weight: 500; word-break: break-all; }
+.db-table-list__empty { padding: var(--space-2); }
+
+/* Grouped tables (left pane) — one card per `org__block` prefix.
+   No inner max-height: groups expand to fit all their rows and the page
+   itself scrolls. The earlier 60vh + overflow-y clipped rows mid-line at
+   the scroll edges, which read like the list was broken. */
+.db-table-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.db-table-group {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--surface-1);
+  overflow: hidden;
+}
+.db-table-group__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-secondary, #f8f9fa);
+  border-bottom: 1px solid var(--border-color);
+}
+.db-table-group__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--primary-color);
+  flex: 0 0 auto;
+}
+.db-table-group__icon svg { width: 16px; height: 16px; }
+.db-table-group__title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.db-table-group__title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary, #0f172a);
+  word-break: break-all;
+}
+.db-table-group__org {
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+.db-table-group__count {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  background: var(--primary-button);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+.db-table-group__list {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+}
+.db-panel { padding: var(--space-1) 0; }
+.db-panel__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+.db-panel__head h3 { font-size: 14px; margin: 0; word-break: break-all; }
+.db-panel-body { padding-top: var(--space-2); }
+.db-sql { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-3); }
+.db-sql__input {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  padding: var(--space-3);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: #0f172a;
+  color: #cbd5e1;
+  resize: vertical;
+}
+.db-sql__actions { display: flex; align-items: center; gap: var(--space-3); }
+.db-sql-results { border-top: 1px solid var(--border-color); padding-top: var(--space-3); }
+@media (max-width: 720px) {
+  .db-layout { grid-template-columns: 1fr; }
+}
+
+/* ===== Sessions page (Phase 4 PR-2) ===== */
+.session-row td:last-child { text-align: right; white-space: nowrap; }
+
+@media (max-width: 720px) {
+	/* Sessions / orgs tables → card list. The data-table doesn't fit at
+	   360px; collapse rows to stacked cards using ::before from data-label. */
+	.data-table { display: block; }
+	.data-table thead { display: none; }
+	.data-table tbody, .data-table tr { display: block; }
+	.data-table tr {
+		border: 1px solid var(--border-light);
+		border-radius: var(--radius-md);
+		margin-bottom: var(--space-2);
+		padding: var(--space-2);
+		background: var(--surface-1);
+	}
+	.data-table td {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: var(--space-2);
+		border: none;
+		padding: var(--space-1) 0;
+		text-align: right;
+		/* min-width: 0 lets the value shrink below its intrinsic content width;
+		   overflow-wrap: anywhere allows long unbroken values (ISO timestamps,
+		   share-tokens, file keys) to wrap rather than push the parent card
+		   past the viewport edge. Without this, seeded data with long
+		   non-wrapping strings (e.g. /b/storage/photos/) overflowed the 375px
+		   mobile viewport by ~20px, causing horizontal scroll on real mobile
+		   and width-drift in CI baselines. */
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+	.data-table td::before {
+		content: attr(data-label);
+		color: var(--text-muted);
+		font-size: var(--text-xs);
+		text-transform: uppercase;
+		text-align: left;
+		flex-shrink: 0;
+	}
+	.data-table td:last-child { padding-top: var(--space-2); }
+}
+/* ===== Mobile table fallback =====
+   `.table-container` already has `overflow-x: auto`, but several admin
+   pages render `.table` directly (Logs, Network, Permissions) without the
+   wrapper. Apply the same scroll behavior to the parent .card so the page
+   body never blows out the viewport on narrow screens. */
+@media (max-width: 720px) {
+	.card > .table,
+	.card .table:not(.table-container .table) {
+		display: block;
+		overflow-x: auto;
+		-webkit-overflow-scrolling: touch;
+	}
+	/* Permissions / Crypto pills: prevent column wrap that wastes space. */
+	.table th, .table td { white-space: nowrap; }
+}
+
+/* ===== Users table: don't wrap the Created date column ===== */
+.users-table td[data-label="Created"],
+.users-table .col-created { white-space: nowrap; }
+
+/* ===== Sessions row (userportal) — less cramped =====
+   The data-table → card collapse on mobile leaves a row that's tight.
+   Give each cell breathing room and a clear value alignment. */
+.session-row td { padding: var(--space-2) 0; }
+@media (max-width: 720px) {
+	.session-row { padding: var(--space-4) !important; row-gap: var(--space-1); }
+	.session-row td { padding: var(--space-1) 0; }
+	.session-row td:last-child { padding-top: var(--space-2); }
+	.session-row .btn { width: auto; min-width: 88px; }
+}
+

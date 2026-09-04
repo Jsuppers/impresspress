@@ -1099,13 +1099,20 @@ mod tests {
         // member of `routing::ROUTES`.
         let dev = run("dev", &info("site/dev"));
         assert!(codes(&dev).contains(&ROUTE_COLLISION), "{dev:?}");
-        // `/b/admin` is a built-in prefix with NO trailing slash, and the
-        // router matches by `starts_with` rather than by whole segments — so
-        // it really does swallow `/b/admins/…`, and `admins` is not an
-        // available block name either. Refusing it at staging is the only
-        // place that can be said out loud.
-        let admins = run("admins", &info("site/admins"));
-        assert!(codes(&admins).contains(&ROUTE_COLLISION), "{admins:?}");
+        // `admins` is now ACCEPTED, and that is a fix rather than a
+        // regression. This used to collide: `/b/admin` was registered as a
+        // second, slash-less route and the router matched by `starts_with`,
+        // so `/b/admin` really did swallow `/b/admins/…` and staging had to
+        // refuse the name on the router's behalf.
+        //
+        // `routing::route_prefix_matches` now matches the bare form by
+        // EQUALITY (`prefix.strip_suffix('/') == Some(path)`) instead, so
+        // `/b/admin/` serves exactly `/b/admin` and everything genuinely
+        // under it. `/b/admins/` is not under it by any of the three arms.
+        // The hazard was closed at the router, which is the only place it
+        // could be closed for every caller rather than for blocks that
+        // happen to go through staging — so the name is free.
+        assert!(run("admins", &info("site/admins")).is_ok());
         // A name that shares a leading substring with a slash-terminated
         // built-in prefix does NOT collide: `/b/storag/` is not under
         // `/b/storage/` and vice versa.

@@ -188,6 +188,36 @@ pub fn dispatch_path<H: Copy>(
     path: &str,
     table: &[EndpointRoute<H>],
 ) -> Option<H> {
+    if let Some(h) = dispatch_exact(msg, action, path, table) {
+        return Some(h);
+    }
+    // Index routes are declared with a trailing slash (`/b/messages/`), and
+    // `match_template` compares segment counts, so `/b/messages` -- three
+    // segments against the template's four -- could not match it and 404'd
+    // while `/b/messages/` served fine. The sidebar always links the slashed
+    // form, so this only bit someone typing or bookmarking the bare path, but
+    // it bit inconsistently: `admin`, `userportal` and `products` route
+    // through their own hand-written prefix matchers and tolerate it, while
+    // every block on this shared table (`messages`, `vector`) did not. Fixing
+    // it here rather than by adding a second row to two route tables keeps
+    // the tables a faithful mirror of `info().endpoints` and covers blocks
+    // added later.
+    //
+    // Only retried after an exact match has already failed, so no request
+    // that resolves today can be re-routed by this.
+    if !path.ends_with('/') {
+        return dispatch_exact(msg, action, &format!("{path}/"), table);
+    }
+    None
+}
+
+/// The strict, single-pass matcher behind [`dispatch_path`].
+fn dispatch_exact<H: Copy>(
+    msg: &mut Message,
+    action: &str,
+    path: &str,
+    table: &[EndpointRoute<H>],
+) -> Option<H> {
     for route in table {
         if action_for_method(route.method) != action {
             continue;
@@ -479,6 +509,63 @@ mod tests {
             EndpointRoute::new(HttpMethod::Post, "/b/messages/api/contexts", 2u8),
         ];
         assert_eq!(dispatch(&mut msg, &table), Some(2u8));
+    }
+
+    #[test]
+    fn dispatch_matches_an_index_route_without_its_trailing_slash() {
+        // `/b/messages` used to 404 while `/b/messages/` served the page:
+        // `match_template` compares segment counts, and the bare path has one
+        // fewer. Only `messages` and `vector` were affected -- the blocks on
+        // this shared table -- while admin/userportal/products tolerated it
+        // via their own prefix matchers.
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/messages");
+        let table = [EndpointRoute::new(HttpMethod::Get, "/b/messages/", 1u8)];
+        assert_eq!(dispatch(&mut msg, &table), Some(1u8));
+    }
+
+    #[test]
+    fn dispatch_slash_retry_does_not_invent_a_route() {
+        // The retry only appends a slash; it must not make an unrelated path
+        // resolve. `/b/messages/api` has no route with or without one.
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/messages/api");
+        let table = [
+            EndpointRoute::new(HttpMethod::Get, "/b/messages/", 1u8),
+            EndpointRoute::new(HttpMethod::Get, "/b/messages/api/contexts", 2u8),
+        ];
+        assert_eq!(dispatch(&mut msg, &table), None);
+    }
+
+    #[test]
+    fn dispatch_slash_retry_never_shadows_an_exact_match() {
+        // An exact match is always taken first, so adding the retry cannot
+        // re-route a request that already resolved.
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/x/thing");
+        let table = [
+            EndpointRoute::new(HttpMethod::Get, "/b/x/thing", 1u8),
+            EndpointRoute::new(HttpMethod::Get, "/b/x/thing/", 2u8),
+        ];
+        assert_eq!(dispatch(&mut msg, &table), Some(1u8));
+    }
+
+    #[test]
+    fn dispatch_slash_retry_does_not_bind_an_empty_path_param() {
+        // `/b/vector/api/indexes` must not reach `{name}` by growing a slash
+        // and binding an empty segment.
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/vector/api/indexes");
+        let table = [EndpointRoute::new(
+            HttpMethod::Get,
+            "/b/vector/api/indexes/{name}",
+            1u8,
+        )];
+        assert_eq!(dispatch(&mut msg, &table), None);
     }
 
     #[test]

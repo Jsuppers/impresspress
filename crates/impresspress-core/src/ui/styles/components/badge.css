@@ -1,0 +1,54 @@
+/* Badges */
+.badge {
+	display: inline-flex; align-items: center;
+	padding: var(--space-1) var(--space-2); border-radius: 4px;
+	font-size: 0.75rem; font-weight: 500;
+}
+
+.badge-success { background: #10b98119; color: var(--accent-success-text); }
+/* Own (lighter) tint rather than the shared --accent-info-bg: at that var's
+   9.8%-alpha strength, --primary-button on top only reaches 4.35:1 here
+   (computed) -- below the 4.5:1 AA floor. A 6% color-mix keeps the same
+   pale-pink badge look and gets --primary-button to 4.60:1 (computed). */
+.badge-primary { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
+.badge-danger { background: #ef444419; color: var(--accent-danger-text); }
+/* --accent-warning (#f59e0b) on its own tint is 1.99:1 -- the worst pair in
+   the stylesheet. --accent-warning-text (6.56:1 here, computed) is the
+   text-safe sibling and already existed; this rule simply never adopted it,
+   the way .alert--warning did. */
+.badge-warning { background: #f59e0b19; color: var(--accent-warning-text); }
+/* --accent-info was #fd3534, byte-identical to --primary-color -- the
+   white-on-red bug (Task 12a) hiding behind an alias, here in the reverse
+   (text) direction. --accent-info/--accent-info-bg are retired (see
+   tokens.css); a local 6% color-mix plus --primary-button (4.60:1,
+   computed) matches .badge-primary's fix above. */
+.badge-info { background: color-mix(in srgb, var(--primary-color) 6%, var(--surface-1)); color: var(--primary-button); }
+.badge-secondary { background: #e2e8f0; color: #334155; }
+.badge--center { justify-content: center; }
+
+/* ===== Tone badges (blocks/admin/pages/blocks.rs block-detail modal) =====
+   HTTP-method and auth-level chips used the same five literal colour pairs
+   under two different Rust match arms (HttpMethod::Get/Post/Patch/Delete and
+   AuthLevel::Public/Admin/Authenticated) — the tones below are shared across
+   both call sites rather than re-declared per-enum. None of these five
+   colours has a matching design token; carried over unchanged from the
+   original inline styles (#fff1e6 already has precedent as a literal "brand
+   tint" — see card.css's .message-card--user — the other four do not and are
+   flagged here). --primary-hover (#e02523) on #fff1e6 is only 4.26:1
+   (computed, Task 12c) -- below the 4.5:1 AA floor; --primary-button
+   (4.51:1, computed, same as .form-tabs li.is-active a in layouts/page.css)
+   is this app's established AA-safe red for text on this exact tint. */
+.badge--tone-brand { background: #fff1e6; color: var(--primary-button); }
+.badge--tone-green { background: #dcfce7; color: var(--accent-success-text); }
+.badge--tone-amber { background: #fef3c7; color: #92400e; }
+.badge--tone-red { background: #fce4ec; color: #c62828; }
+/* Slate tone reuses --bg-hover (#f1f5f9 is already that token's value) but
+   #475569 has no matching token — carried over unchanged. */
+.badge--tone-slate { background: var(--bg-hover); color: #475569; }
+
+/* ===== Avatar ===== */
+.avatar { display: inline-flex; align-items: center; justify-content: center; border-radius: var(--radius-full); background: var(--primary-button); color: #fff; font-weight: 600; }
+.avatar--sm { width: 22px; height: 22px; font-size: var(--text-xs); }
+.avatar--md { width: 32px; height: 32px; font-size: var(--text-sm); }
+.avatar--lg { width: 48px; height: 48px; font-size: var(--text-lg); }
+

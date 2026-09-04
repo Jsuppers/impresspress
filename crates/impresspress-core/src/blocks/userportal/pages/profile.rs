@@ -34,22 +34,21 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let body = html! {
         section .account-section {
-            div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem" {
-                div .user-avatar style="width:56px;height:56px;font-size:1.25rem;flex-shrink:0" {
+            div .profile-header {
+                div .user-avatar .user-avatar--lg {
                     @if !avatar_url.is_empty() {
-                        img src=(avatar_url) alt="Avatar"
-                            style="width:100%;height:100%;border-radius:50%;object-fit:cover";
+                        img src=(avatar_url) alt="Avatar";
                     } @else if let Some(u) = &user {
                         (u.avatar_initial())
                     }
                 }
-                div style="flex:1;min-width:0" {
-                    div style="font-weight:600;font-size:1rem" {
+                div .profile-header__meta {
+                    div .font-semibold .text-16 {
                         @if display_name.is_empty() { (email) } @else { (display_name) }
                     }
-                    div .text-muted style="font-size:0.875rem" { (email) }
+                    div .text-muted .text-sm { (email) }
                     @if let Some(u) = &user {
-                        div style="margin-top:0.375rem;display:flex;gap:0.25rem;flex-wrap:wrap" {
+                        div .profile-header__roles {
                             @for role in &u.roles {
                                 (components::status_badge(role))
                             }
@@ -65,7 +64,7 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     input .form-input #display-name type="text" name="name"
                         value=(display_name) placeholder="Enter your name";
                 }
-                button .btn .btn-primary type="submit" style="width:100%" { "Save" }
+                button .btn .btn--primary type="submit" .w-full { "Save" }
             }
         }
     };

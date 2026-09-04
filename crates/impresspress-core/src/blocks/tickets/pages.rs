@@ -78,8 +78,8 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
             None,
         ))
         form method="get" action="/b/tickets/admin/tickets"
-            style="margin-bottom:1rem" {
-            div .ticket-filter-grid style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.5rem" {
+            .mb-4 {
+            div .ticket-filter-grid {
                 select .form-input name="status" {
                     option value="" { "All statuses" }
                     @for status in ["new", "triaged", "investigating", "resolved", "rejected", "spam", "duplicate"] {
@@ -109,10 +109,10 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 input .form-input .ticket-filter-assignee name="assignee_id" value=(msg.query("assignee_id"))
                     placeholder="Assignee ID" maxlength="160";
             }
-            div style="display:flex;gap:.5rem;flex-wrap:wrap;max-width:28rem;margin-top:.5rem" {
-                button .btn .btn-secondary type="submit" style="flex:1 1 7rem" { "Filter" }
-                a .btn .btn-ghost href="/b/tickets/admin/types" style="flex:1 1 7rem;text-align:center" { "Manage types" }
-                a .btn .btn-ghost href="/b/tickets/admin/settings" style="flex:1 1 7rem;text-align:center" { "Settings" }
+            div .ticket-filter-actions {
+                button .btn .btn--secondary type="submit" { "Filter" }
+                a .btn .btn--ghost href="/b/tickets/admin/types" { "Manage types" }
+                a .btn .btn--ghost href="/b/tickets/admin/settings" { "Settings" }
             }
         }
         div .table-container {
@@ -150,10 +150,10 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
             tickets.total_count as u32,
             &pagination_base,
         ))
-        details style="margin-top:1.5rem" {
+        details .mt-6 {
             summary { "Create internal ticket" }
             form data-json-form data-endpoint="/b/tickets/api/admin/tickets"
-                style="display:grid;gap:.75rem;margin-top:1rem;max-width:48rem" {
+                .ticket-form-grid .ticket-form-grid--create {
                 input type="hidden" name="source" value="admin";
                 label { "Type" select .form-input name="type_id" required {
                     @for kind in &types {
@@ -170,7 +170,7 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         option value=(priority) { (priority) }
                     }
                 } }
-                button .btn .btn-primary type="submit" { "Create ticket" }
+                button .btn .btn--primary type="submit" { "Create ticket" }
             }
         }
         script { (PreEscaped(ADMIN_FORM_JS)) }
@@ -228,21 +228,24 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header(
             service::str_field(ticket, "reference"),
             Some(report.subject.as_str()),
-            Some(html! { a .btn .btn-ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
+            Some(html! { a .btn .btn--ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
         ))
         @if escalation != "none" {
-            div .alert .alert-warning style="margin-bottom:1rem" {
-                strong { "Human review required: " } (escalation)
-                ". Do not automatically contact the reporter or change content."
+            div .alert .alert--warning .mb-4 {
+                span aria-hidden="true" { (ui::icons::triangle_alert()) }
+                div {
+                    strong { "Human review required: " } (escalation)
+                    ". Do not automatically contact the reporter or change content."
+                }
             }
         }
-        div .ticket-detail-grid style="display:grid;grid-template-columns:minmax(0,2fr) minmax(18rem,1fr);gap:1.25rem" {
-            section .card style="padding:1rem" {
+        div .ticket-detail-grid {
+            section .card .p-4 {
                 h2 { "Original report" }
                 dl {
                     dt { "Type" } dd { (service::str_field(ticket, "type_title_snapshot")) }
                     dt { "Subject" } dd { (&report.subject) }
-                    dt { "Description" } dd style="white-space:pre-wrap" {
+                    dt { "Description" } dd .pre-wrap {
                         (&report.description)
                     }
                     @if !report.source_path.is_empty() {
@@ -262,11 +265,11 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     }
                 }
             }
-            aside .card style="padding:1rem" {
+            aside .card .p-4 {
                 h2 { "Workflow" }
                 form data-json-form data-ticket-workflow data-current-status=(service::str_field(ticket, "status"))
                     data-endpoint=(endpoint) data-method="PATCH"
-                    style="display:grid;gap:.75rem" {
+                    .ticket-form-grid {
                     label { "Status" select #ticket-workflow-status .form-input name="status" {
                         option value="" { "Keep current" }
                         @for status in ["new", "triaged", "investigating", "resolved", "rejected", "spam", "duplicate"] {
@@ -300,38 +303,37 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     label { "Reason" textarea .form-input name="reason" maxlength="4000" {} }
                     label { input type="checkbox" name="legal_hold"
                         checked[service::bool_field(ticket, "legal_hold")]; " Legal hold" }
-                    button .btn .btn-primary type="submit" { "Update workflow" }
+                    button .btn .btn--primary type="submit" { "Update workflow" }
                 }
             }
         }
-        section style="margin-top:1.25rem" {
+        section .mt-5 {
             h2 { "Internal note" }
-            form .ticket-note-form data-json-form data-endpoint=(note_endpoint)
-                style="display:flex;gap:.5rem" {
+            form .ticket-note-form data-json-form data-endpoint=(note_endpoint) {
                 textarea .form-input name="note" maxlength="4000" required {}
-                button .btn .btn-secondary type="submit" { "Add note" }
+                button .btn .btn--secondary type="submit" { "Add note" }
             }
         }
-        section style="margin-top:1.25rem" {
+        section .mt-5 {
             h2 { "Timeline" }
-            @if detail.events_truncated { p .alert .alert-warning { "Older events are not shown." } }
+            @if detail.events_truncated { p .alert .alert--warning { span aria-hidden="true" { (ui::icons::triangle_alert()) } "Older events are not shown." } }
             @for event in &detail.events {
-                article .card style="padding:.75rem;margin-bottom:.5rem" {
+                article .card .p-3 .mb-2 {
                     strong { (service::str_field(event, "event_type")) }
                     " · " (service::str_field(event, "actor_type"))
                     " · " (short_date(service::str_field(event, "created_at")))
                     @if !service::str_field(event, "body").is_empty() {
-                        p style="white-space:pre-wrap" { (service::str_field(event, "body")) }
+                        p .pre-wrap { (service::str_field(event, "body")) }
                     }
                 }
             }
         }
-        section style="margin-top:1.25rem" {
+        section .mt-5 {
             h2 { "Analyses" }
-            @if detail.analyses_truncated { p .alert .alert-warning { "Older analyses are not shown." } }
+            @if detail.analyses_truncated { p .alert .alert--warning { span aria-hidden="true" { (ui::icons::triangle_alert()) } "Older analyses are not shown." } }
             @if detail.analyses.is_empty() { p .text-muted { "No analysis has been attached." } }
             @for analysis in &detail.analyses {
-                article .card style="padding:.75rem;margin-bottom:.5rem" {
+                article .card .p-3 .mb-2 {
                     h3 { (service::str_field(analysis, "source")) }
                     dl .ticket-analysis-meta {
                         dt { "Analysis ID" } dd { code { (&analysis.id) } }
@@ -359,7 +361,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         }
                     }
                     h4 { "Advisory summary" }
-                    p style="white-space:pre-wrap" { (service::str_field(analysis, "summary")) }
+                    p .pre-wrap { (service::str_field(analysis, "summary")) }
                     h4 { "Suggested actions" }
                     pre .ticket-analysis-actions {
                         (pretty_json_field(analysis, "suggested_actions_json"))
@@ -395,12 +397,12 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header(
             "Ticket types",
             Some("Configure public report categories and internal work types"),
-            Some(html! { a .btn .btn-ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
+            Some(html! { a .btn .btn--ghost href="/b/tickets/admin/tickets" { "Back to inbox" } }),
         ))
         details {
             summary { "Create type" }
             form data-json-form data-endpoint="/b/tickets/api/admin/types"
-                style="display:grid;gap:.75rem;margin:1rem 0;max-width:50rem" {
+                .ticket-form-grid .ticket-form-grid--type-create {
                 label { "Immutable key" input .form-input name="key" pattern="[a-z0-9][a-z0-9_-]{0,46}[a-z0-9]" required; }
                 label { "Title" input .form-input name="title" minlength="2" maxlength="80" required; }
                 label { "Description" textarea .form-input name="description" maxlength="500" data-keep-empty="true" {} }
@@ -420,12 +422,12 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 label { input type="checkbox" name="requires_contact"; " Requires contact email" }
                 label { input type="checkbox" name="requests_evidence"; " Requests evidence" }
                 label { "Sort order" input .form-input type="number" name="sort_order" value="0"; }
-                button .btn .btn-primary type="submit" { "Create type" }
+                button .btn .btn--primary type="submit" { "Create type" }
             }
         }
         @for kind in &types {
             @let endpoint = format!("/b/tickets/api/admin/types/{}", kind.id);
-            details .card style="padding:1rem;margin-top:.75rem" {
+            details .card .p-4 .mt-3 {
                 summary {
                     strong { (service::str_field(kind, "title")) }
                     " · " code { (service::str_field(kind, "key")) }
@@ -433,7 +435,7 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     @if service::bool_field(kind, "public_visible") { span .badge { "public" } }
                 }
                 form data-json-form data-endpoint=(endpoint) data-method="PATCH"
-                    style="display:grid;gap:.75rem;margin-top:1rem" {
+                    .ticket-form-grid .ticket-form-grid--type-edit {
                     input type="hidden" name="key" value=(service::str_field(kind, "key"));
                     label { "Title" input .form-input name="title" value=(service::str_field(kind, "title")) required; }
                     label { "Description" textarea .form-input name="description" data-keep-empty="true" {
@@ -464,7 +466,7 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     label { input type="checkbox" name="requests_evidence" checked[service::bool_field(kind, "requests_evidence")]; " Requests evidence" }
                     label { "Sort order" input .form-input type="number" name="sort_order"
                         value=(number_field(kind, "sort_order")); }
-                    button .btn .btn-secondary type="submit" { "Save type" }
+                    button .btn .btn--secondary type="submit" { "Save type" }
                 }
             }
         }
@@ -482,21 +484,28 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Some("Public reporting security and retention"),
             None,
         ))
-        div .card style="padding:1rem;margin-bottom:1rem" {
+        div .card .p-4 .mb-4 {
             h3 { "Security readiness" }
             @if readiness.ready {
-                div .alert .alert-success { "Ready for public submissions." }
+                div .alert .alert--success {
+                    span aria-hidden="true" { (ui::icons::check()) }
+                    "Ready for public submissions."
+                }
             } @else {
-                div .alert .alert-warning {
-                    ul { @for reason in &readiness.reasons { li { (reason) } } }
+                div .alert .alert--warning {
+                    span aria-hidden="true" { (ui::icons::triangle_alert()) }
+                    div {
+                        strong { "Not ready: " }
+                        ul { @for reason in &readiness.reasons { li { (reason) } } }
+                    }
                 }
             }
             p {
                 "Configuration changes use the central Variables screen so this block keeps "
                 "the reviewed HTTP contract to one read-only settings route."
             }
-            a .btn .btn-secondary href="/b/admin/settings/variables" { "Manage variables" }
-            a .btn .btn-ghost href="/b/tickets/submit" target="_blank" rel="noopener" {
+            a .btn .btn--secondary href="/b/admin/settings/variables" { "Manage variables" }
+            a .btn .btn--ghost href="/b/tickets/submit" target="_blank" rel="noopener" {
                 "Open public form"
             }
         }

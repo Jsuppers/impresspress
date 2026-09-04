@@ -1,0 +1,48 @@
+/* Toast Notifications */
+.toast-container {
+	position: fixed; bottom: 1rem; right: 1rem;
+	z-index: var(--z-notification);
+	display: flex; flex-direction: column; gap: var(--space-2);
+}
+
+.toast {
+	padding: var(--space-3) var(--space-4);
+	border-radius: 8px; font-size: 0.875rem;
+	box-shadow: var(--shadow-md);
+	display: flex; align-items: center; gap: var(--space-2);
+	animation: toastSlideIn 0.3s ease-out;
+	min-width: 250px; max-width: 400px;
+}
+
+@keyframes toastSlideIn {
+	from { opacity: 0; transform: translateX(100%); }
+	to { opacity: 1; transform: translateX(0); }
+}
+
+/* Literal #10b981 = --accent-success's own value, 2.54:1 under white text.
+   --accent-success-text (7.13:1, computed) replaces it -- same reasoning as
+   .toast-error below. */
+.toast-success { background: var(--accent-success-text); color: white; }
+/* Literal #ef4444 = --accent-danger's own value, 3.76:1 under white text --
+   below AA. --accent-danger-text (6.47:1, computed) replaces it; contrast is
+   symmetric so the same "AA-safe as text" token works as a background under
+   white text too. */
+.toast-error { background: var(--accent-danger-text); color: white; }
+/* #f59e0b under white text is 2.15:1. --accent-warning-text (7.09:1,
+   computed) -- same symmetric-contrast reasoning as .toast-error. */
+.toast-warning { background: var(--accent-warning-text); color: white; }
+/* --accent-info was #fd3534 -- byte-identical to --primary-color, so this
+   was the white-on-red bug (Task 12a) hiding behind an alias name a
+   token-name-based guard couldn't see. --accent-info/--accent-info-bg are
+   retired (see tokens.css); --primary-button (4.99:1, computed) is the
+   direct fix, matching every other "info == brand accent" surface. */
+.toast-info { background: var(--primary-button); color: white; }
+
+.toast-dismiss {
+	margin-left: auto; background: none; border: none;
+	color: inherit; cursor: pointer; opacity: 0.7;
+	padding: var(--space-1);
+}
+
+.toast-dismiss:hover { opacity: 1; }
+

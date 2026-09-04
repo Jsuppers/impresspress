@@ -26,7 +26,7 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let refresh_action = html! {
-        button .btn .btn-secondary .btn-sm
+        button .btn .btn--secondary .btn--sm
             hx-get={"/b/admin/logs?tab=" (active_tab)}
             hx-target="#content"
         { (icons::refresh_cw()) " Refresh" }
@@ -133,7 +133,7 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                         tbody {
                             @if list.records.is_empty() {
                                 tr {
-                                    td colspan="6" .text-center .text-muted style="padding: 2rem;" { "No request logs yet" }
+                                    td colspan="6" .text-center .text-muted .p-8 { "No request logs yet" }
                                 }
                             }
                             @for record in &list.records {
@@ -222,7 +222,7 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                         tbody {
                             @if list.records.is_empty() {
                                 tr {
-                                    td colspan="5" .text-center .text-muted style="padding: 2rem;" { "No audit logs yet" }
+                                    td colspan="5" .text-center .text-muted .p-8 { "No audit logs yet" }
                                 }
                             }
                             @for record in &list.records {

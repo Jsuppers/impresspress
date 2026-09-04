@@ -12,6 +12,8 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "embed-assets")]
+use impresspress_core::ui::assets as ui_assets;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -722,6 +724,64 @@ pub struct R2ReleaseUploadReport {
     pub deployment_record_key: String,
 }
 
+/// Report for [`r2_upload_ui_assets`].
+#[cfg(feature = "embed-assets")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UiAssetUploadReport {
+    pub uploaded: usize,
+}
+
+/// Publish the embedded UI asset set (CSS/JS/fonts/logos) to R2 at their
+/// hashed filenames, as plain bucket-root keys.
+///
+/// Unlike [`r2_upload_release`], these objects are deliberately NOT wrapped
+/// under a shared content-addressed `immutable_prefix`: each object's own
+/// filename already carries its content hash (baked in by `build.rs`), so
+/// every object is already immutable and content-addressed on its own — and
+/// a plain root-level key is exactly what `impresspress_cloudflare::run_with_config`
+/// reads back to resolve `/b/static/{filename}` on a lean (no `embed-assets`)
+/// worker once `IMPRESSPRESS_ASSET_BASE_URL` points at `/b/static/` (see
+/// [`super::assets::resolve_asset_base_url`]).
+///
+/// Gated on `embed-assets`: publishing the CLI's UI asset bytes requires the
+/// CLI itself to have those bytes compiled in. This is independent of the
+/// *worker* build, which is intentionally built lean (without
+/// `embed-assets`) and instead reads these objects back from R2 at runtime.
+/// See the call site in `cli::flows::embed_cloudflare::deploy` for what
+/// happens when the CLI is built without this feature.
+#[cfg(feature = "embed-assets")]
+pub fn r2_upload_ui_assets(bucket: &str) -> Result<UiAssetUploadReport> {
+    let mut client = WranglerR2Client { bucket };
+    r2_upload_ui_assets_with_client(&mut client, OBJECT_RETRY_SECS)
+}
+
+#[cfg(feature = "embed-assets")]
+fn r2_upload_ui_assets_with_client<C: R2ObjectClient>(
+    client: &mut C,
+    retry_delays: &[u64],
+) -> Result<UiAssetUploadReport> {
+    let entries = super::assets::ui_asset_entries();
+    for entry in &entries {
+        let bytes = ui_assets::ASSETS
+            .iter()
+            .find(|e| e.filename == entry.logical_key)
+            .and_then(|e| ui_assets::bytes(e.logical))
+            .with_context(|| format!("no embedded bytes for UI asset {}", entry.logical_key))?;
+        with_object_retries(
+            &entry.logical_key,
+            retry_delays,
+            |client| {
+                client.put_bytes(&entry.logical_key, bytes, &entry.content_type)?;
+                verify_remote_sha256(client, &entry.logical_key, &entry.sha256)
+            },
+            client,
+        )?;
+    }
+    Ok(UiAssetUploadReport {
+        uploaded: entries.len(),
+    })
+}
+
 /// Upload and byte-verify a deterministic release bundle before candidate
 /// initialization.
 ///
@@ -1086,6 +1146,8 @@ mod tests {
         task::JoinSet,
     };
 
+    #[cfg(feature = "embed-assets")]
+    use super::r2_upload_ui_assets_with_client;
     use super::{
         artifact_sha256, free_plan_ten_ms_compatible_config, parse_labeled_line,
         r2_upload_release_with_client, resolve_secret, smoke_authenticated_concurrency,
@@ -1093,6 +1155,8 @@ mod tests {
         R2ObjectClient, CONCURRENT_SMOKE_MAX_IN_FLIGHT, CONCURRENT_SMOKE_TOTAL_REQUESTS,
         FREE_PLAN_CPU_LIMIT_ERROR, FREE_PLAN_CPU_LIMIT_ERROR_CODE,
     };
+    #[cfg(feature = "embed-assets")]
+    use crate::cli::helpers::cloudflare::assets::ui_asset_entries;
     use crate::cli::helpers::cloudflare::assets::ReleaseManifest;
 
     fn configured_smoke_paths() -> Vec<String> {
@@ -1454,6 +1518,29 @@ mod tests {
             err.to_string().contains("changed during upload"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn ui_asset_upload_publishes_every_entry_at_its_plain_hashed_filename() {
+        let mut r2 = MemoryR2::default();
+
+        let report = r2_upload_ui_assets_with_client(&mut r2, &[]).unwrap();
+
+        let entries = ui_asset_entries();
+        assert_eq!(report.uploaded, entries.len());
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            // Plain bucket-root key — NOT wrapped under the release
+            // manifest's shared `.impresspress/releases/v1/{hash}/` prefix.
+            // Each object's own filename already carries its content hash.
+            assert_eq!(r2.objects[&entry.logical_key].len(), entry.size as usize);
+            assert_eq!(
+                impresspress_core::util::sha256_hex(&r2.objects[&entry.logical_key]),
+                entry.sha256
+            );
+            assert!(!entry.logical_key.contains('/'), "expected a flat key");
+        }
     }
 
     #[test]

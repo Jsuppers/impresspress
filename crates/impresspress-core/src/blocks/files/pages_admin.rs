@@ -92,10 +92,10 @@ pub struct AdminStats {
 pub fn render_admin_overview_stats(stats: &AdminStats) -> Markup {
     html! {
         div .stats-grid {
-            (components::stat_card("Buckets", &stats.buckets.to_string(), icons::folder()))
-            (components::stat_card("Files", &stats.files.to_string(), icons::file_text()))
-            (components::stat_card("Total Size", &format_bytes(stats.total_size_bytes), icons::hard_drive()))
-            (components::stat_card("Active Shares", &stats.shares.to_string(), icons::globe()))
+            (components::stat_card("Buckets", &stats.buckets.to_string(), icons::folder(), None))
+            (components::stat_card("Files", &stats.files.to_string(), icons::file_text(), None))
+            (components::stat_card("Total Size", &format_bytes(stats.total_size_bytes), icons::hard_drive(), None))
+            (components::stat_card("Active Shares", &stats.shares.to_string(), icons::globe(), None))
         }
     }
 }
@@ -126,8 +126,8 @@ pub fn render_admin_overview_quotas_hint(quotas_count: i64) -> Markup {
         return html! {};
     }
     html! {
-        div .card style="padding:1rem" {
-            p .text-muted style="font-size:0.875rem" {
+        div .card .p-4 {
+            p .text-muted .text-sm {
                 (quotas_count) " user(s) with custom quotas configured."
             }
         }

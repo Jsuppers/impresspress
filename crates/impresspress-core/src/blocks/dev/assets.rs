@@ -67,11 +67,16 @@ pub fn dev_css() -> &'static str {
     DEV_CSS
 }
 
-/// Short content hash of [`dev_js`], for `page.rs::asset`'s `ETag` — the
-/// same projection `ui::assets::webmcp_js_hash()` gives `webmcp.js`, so a
-/// rebuilt binary with different script bytes invalidates a repeat
-/// visitor's cached copy instead of serving a `304` for content that
-/// changed.
+/// Short content hash of [`dev_js`], for `page.rs::asset`'s `ETag`, so a
+/// rebuilt binary with different script bytes invalidates a repeat visitor's
+/// cached copy instead of serving a `304` for content that changed.
+///
+/// Hashed here rather than read off a manifest entry because these assets are
+/// deliberately block-local: they are served from `/b/dev/static/*` at this
+/// block's own `Admin` tier, never from the public `/b/static/` bundle, so
+/// there is no manifest entry to read. `ui::assets::short_hash` is the same
+/// projection `build.rs` applies to manifest assets, so a hash means the same
+/// thing on both sides.
 pub fn dev_js_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
     HASH.get_or_init(|| crate::ui::assets::short_hash(dev_js().as_bytes()))

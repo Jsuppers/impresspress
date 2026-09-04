@@ -1,0 +1,78 @@
+/* base.css — reset, html/body defaults, and global element rules */
+
+/* ===== Reset ===== */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+/* The `hidden` attribute must always win: any component rule that sets its
+ * own `display` (e.g. an alert styled `display:block`) would otherwise
+ * override the UA's `[hidden] { display: none }` and render an empty,
+ * styled-but-blank element (the bug behind phantom colored bars above
+ * empty admin tables). */
+[hidden] { display: none !important; }
+html, body {
+	height: 100%;
+	font-family: var(--font-ui);
+	background: var(--bg-secondary);
+	color: var(--text-primary);
+}
+input, textarea, select, [contenteditable="true"] {
+	/* Form controls don't inherit the body's font-family by default -- browsers
+	 * apply their own UA form-control stack instead (most visibly, `textarea`'s
+	 * UA default is `monospace`, which reads as a jarring mismatch next to a
+	 * `.form-input` sibling in the same section -- caught rendering the
+	 * `form_page` template preview during the 12d design pass). `button`
+	 * already sets this itself (see `.btn` in components/button.css); this
+	 * covers every other native form control app-wide. */
+	font-family: inherit;
+	-webkit-user-select: text !important;
+	user-select: text !important;
+}
+/* Native disclosure triangle: the browser doesn't set a pointer cursor by
+ * default even though the whole element is clickable. */
+summary { cursor: pointer; }
+
+/* Visually-hidden but still screen-reader-accessible content (e.g. a
+ * `<legend>` that exists for accessibility structure but would be visual
+ * clutter if shown, such as `blocks/products/pages.rs`'s template-picker
+ * fieldset legend). `display:none`/`visibility:hidden` are deliberately
+ * NOT used here -- both pull the element out of the accessibility tree,
+ * which defeats the point; this is the standard clip-rect pattern instead. */
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	clip-path: inset(50%);
+	white-space: nowrap;
+	border: 0;
+}
+
+/* Anti-spam honeypot field (blocks/tickets/public.rs's public report form):
+ * deliberately NOT `display:none`/`[hidden]` -- some bots skip fields hidden
+ * that way but still fill in ones only moved off-screen, which is what
+ * makes this trap effective. Sighted users never see it; `aria-hidden` on
+ * the wrapper keeps screen-reader users from encountering it too. */
+.honeypot { position: absolute; left: -10000px; }
+
+/* ===== Keyboard focus ===== */
+/* Keyboard-focus ring — low specificity so component rules can refine it. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+	outline: 2px solid var(--primary-color);
+	outline-offset: 2px;
+}
+
+/* Ported from origin/main (ui/assets/base.css) during the main merge --
+   2026-09-02. Pixel-art images (the built-in brand mark): scale by
+   nearest-neighbour so the art-pixels stay square. Only applied to art we
+   know is pixel art -- never to a white-labelled logo URL. Declared last so
+   `pixelated` wins in browsers that also understand `crisp-edges`. Consumer:
+   `templates::brand_icon`'s `class={ (class) " pixel-art" }`, used by both
+   the sidebar brand icon (`styles/layouts/shell.css`) and the auth-card
+   icon+text lockup (`styles/layouts/auth-split.css`'s `.login-brand__icon`). */
+.pixel-art {
+	image-rendering: -webkit-optimize-contrast;
+	image-rendering: crisp-edges;
+	image-rendering: pixelated;
+}

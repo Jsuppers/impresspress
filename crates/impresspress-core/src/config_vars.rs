@@ -26,20 +26,10 @@ pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 /// Named because two other places have to agree with the declaration below:
 /// [`crate::ui::SiteConfig::load`] reads it, and
 /// [`crate::blocks::admin::settings::seed_defaults`] repairs rows that still
-/// carry the removed built-in wordmark's URL.
+/// carry a built-in asset URL this build no longer serves — the removed
+/// raster wordmark included (see
+/// [`crate::ui::assets::is_stale_builtin_asset_url`]).
 pub const LOGO_URL_KEY: &str = "WAFER_RUN_SHARED__LOGO_URL";
-
-/// URL prefix of the built-in raster wordmark that releases up to and
-/// including 0.1.x served at `/b/static/impresspress-logo-long-{hash}.png`.
-///
-/// The asset, its accessor and its route are all gone — brand text is text
-/// now, and only the square mark is art. The prefix survives here for exactly
-/// one reason: older releases *seeded this URL into the database* as
-/// `LOGO_URL_KEY`'s default, so an upgraded deployment still points at a route
-/// that no longer exists. `seed_defaults` matches on this prefix (the trailing
-/// segment is a content hash that varied per release, so only the prefix is
-/// stable) and clears those rows back to blank.
-pub const REMOVED_BUILTIN_WORDMARK_URL_PREFIX: &str = "/b/static/impresspress-logo-long-";
 
 /// Shared config key: cross-origin origins allowed to call the API.
 ///
@@ -69,6 +59,17 @@ pub const CSP_DIRECTIVES_KEY: &str = "WAFER_RUN_SHARED__CSP_DIRECTIVES";
 pub const DEFAULT_CSP_DIRECTIVES: &str = "script-src https://js.stripe.com; \
      frame-src https://js.stripe.com https://hooks.stripe.com https://checkout.stripe.com; \
      connect-src https://api.stripe.com https://r.stripe.com";
+
+/// Default headline for the auth-split brand panel (login/signup/reset/etc.
+/// left-hand navy column) — see [`crate::ui::components::auth_panel`].
+/// White-label deployments override via `WAFER_RUN_SHARED__AUTH_HEADLINE`.
+pub const DEFAULT_AUTH_HEADLINE: &str = "The backend that lifts its own weight.";
+
+/// Default sub-line under [`DEFAULT_AUTH_HEADLINE`] on the login page (the
+/// only auth-split page that doesn't already pass its own page-specific
+/// tagline). Overridable via `WAFER_RUN_SHARED__AUTH_TAGLINE`; blank hides
+/// the tagline entirely.
+pub const DEFAULT_AUTH_TAGLINE: &str = "One binary. Batteries included. No lock-in.";
 
 /// Shared config variables readable by all blocks, writable only by admin.
 ///
@@ -134,8 +135,8 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Text),
         ConfigVar::new(
             "WAFER_RUN_SHARED__LOGO_ICON_URL",
-            "Small icon logo (used when sidebar is collapsed)",
-            crate::ui::assets::logo_icon_url(),
+            "Small icon logo (sidebar brand mark; the only mark shown when the sidebar is collapsed)",
+            &crate::ui::assets::logo_icon_url(),
         )
         .name("Logo Icon URL")
         .input_type(InputType::Url),
@@ -147,9 +148,25 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Auth Logo URL")
         .input_type(InputType::Url),
         ConfigVar::new(
+            "WAFER_RUN_SHARED__AUTH_HEADLINE",
+            "Headline on the login/signup/etc. left-hand brand panel",
+            DEFAULT_AUTH_HEADLINE,
+        )
+        .name("Auth Headline")
+        .input_type(InputType::Text),
+        ConfigVar::new(
+            "WAFER_RUN_SHARED__AUTH_TAGLINE",
+            "Sub-line under the brand panel headline, shown on the login page \
+             (other auth pages default to their own page-specific line); \
+             blank hides it",
+            DEFAULT_AUTH_TAGLINE,
+        )
+        .name("Auth Tagline")
+        .input_type(InputType::Text),
+        ConfigVar::new(
             "WAFER_RUN_SHARED__FAVICON_URL",
             "Browser tab icon",
-            crate::ui::assets::favicon_url(),
+            &crate::ui::assets::favicon_url(),
         )
         .name("Favicon URL")
         .input_type(InputType::Url),

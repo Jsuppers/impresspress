@@ -16,7 +16,6 @@
 //!   the four `*_TABLE` re-exports from `repo/{api_keys,rate_limits,tokens,
 //!   users}.rs`, `DUMMY_HASH`).
 //! - `helpers` — token/cookie/role utilities consumed by `auth_ui::api::*`.
-//! - `brand_panel` — shared UI panel consumed by `auth_ui::pages::*`.
 //! - `authenticate_api_key` — called by `crate::pipeline` to populate auth
 //!   meta from an `Authorization: Bearer <api-key>` header.
 
@@ -974,23 +973,6 @@ pub async fn authenticate_api_key(
     msg.set_meta(META_AUTH_USER_ID, &key_row.user_id);
     msg.set_meta(META_AUTH_USER_EMAIL, &user.email);
     msg.set_meta(META_AUTH_USER_ROLES, &roles_str);
-}
-
-use crate::ui::{templates::BrandPanel, SiteConfig};
-
-/// Shared brand panel used by `auth_ui::pages::*` (login / signup / reset /
-/// OAuth / change-password / bootstrap).
-/// Shared auth-split brand panel. `tagline` is page-specific — every caller
-/// passes copy that matches what the page actually does (e.g. "Sign in to
-/// continue." on the login page, "Create your account." on signup); it used
-/// to be hardcoded to the login copy and rendered unchanged on signup,
-/// bootstrap, password-reset, and verify pages too.
-pub(crate) fn brand_panel<'a>(config: &'a SiteConfig, tagline: &'a str) -> BrandPanel<'a> {
-    BrandPanel {
-        logo_html: None,
-        headline: &config.app_name,
-        tagline: Some(tagline),
-    }
 }
 
 #[cfg(test)]

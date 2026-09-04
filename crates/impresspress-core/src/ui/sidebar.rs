@@ -53,11 +53,24 @@ pub struct NavGroup {
 /// Grouped sidebar — same layout as `sidebar(...)`, but items are
 /// partitioned into labeled groups. The brand at top, the user pinned
 /// at bottom (when `user` is `Some`).
+/// `logo_url` (the header/email wordmark, `WAFER_RUN_SHARED__LOGO_URL`) is
+/// accepted but intentionally unused here: the navy sidebar always renders
+/// the icon + white text brand, never an `<img>` of that wordmark PNG (see
+/// the `.sidebar__brand` block below). The parameter is kept so this
+/// signature still matches `shell()`'s, which threads the same `SiteConfig`
+/// fields through to every chrome surface.
+///
+/// `.sidebar__brand--text` is unconditional (not toggled on `logo_url`, as
+/// origin/main's equivalent does for its own wordmark-image branch): this
+/// branch never has a second, wordmark-image code path for the CSS modifier
+/// to switch away from, so applying it unconditionally is the same outcome
+/// with one fewer state. `logo_icon_2x_url`/`brand_icon` (the retina pixel-art
+/// icon) are ported from origin/main during the main merge — 2026-09-02.
 pub fn sidebar_grouped(
     groups: &[NavGroup],
     user: Option<&crate::ui::UserInfo>,
     current_path: &str,
-    logo_url: &str,
+    _logo_url: &str,
     logo_icon_url: &str,
     app_name: &str,
 ) -> maud::Markup {
@@ -65,18 +78,17 @@ pub fn sidebar_grouped(
 
     html! {
         nav .sidebar aria-label="Primary" {
-            // No wordmark image (the default) => icon + app name as text, and
-            // the icon stays visible when expanded (`--text`). A configured
-            // wordmark keeps the old layout: wordmark expanded, icon collapsed.
-            div .sidebar__brand .sidebar__brand--text[logo_url.is_empty()] {
+            div .sidebar__brand .sidebar__brand--text {
                 @if !logo_icon_url.is_empty() {
                     (crate::ui::templates::brand_icon(logo_icon_url, "sidebar__brand-icon", 32))
                 }
-                @if !logo_url.is_empty() {
-                    img src=(logo_url) alt=(app_name) .sidebar__brand-wordmark;
-                } @else {
-                    span .sidebar__brand-name { (app_name) }
-                }
+                // The navy sidebar always shows the white text wordmark, never
+                // an `<img>` of `logo_url` — that PNG is dark-ink artwork drawn
+                // for the old white sidebar and is illegible on navy (task-11
+                // review finding). `logo_url` (header/email wordmark) is a
+                // different surface's concern; the sidebar only ever needs the
+                // square icon (`logo_icon_url`) plus this text.
+                span .sidebar__brand-name { (app_name) }
             }
             div .sidebar__panel {
                 div .sidebar__groups {
@@ -124,7 +136,7 @@ pub fn sidebar_grouped(
                             }
                         }
                     }
-                    div .profile-menu #profile-menu style="display:none" {
+                    div .profile-menu #profile-menu hidden {
                         div .profile-menu-header {
                             div .profile-menu-avatar { (u.avatar_initial()) }
                             div .profile-menu-info {
@@ -155,13 +167,14 @@ pub fn sidebar_grouped(
         script { (maud::PreEscaped(r#"
 function toggleProfileMenu() {
     var m = document.getElementById('profile-menu');
-    if (m) m.style.display = m.style.display === 'none' ? 'block' : 'none';
+    if (!m) return;
+    m.hidden = !m.hidden;
 }
 document.addEventListener('click', function(e) {
     var m = document.getElementById('profile-menu');
     var b = document.getElementById('user-menu-btn');
     if (m && b && !b.contains(e.target) && !m.contains(e.target)) {
-        m.style.display = 'none';
+        m.hidden = true;
     }
 });
 function toggleSidebar() {
@@ -230,7 +243,7 @@ mod tests {
             None,
             "/",
             "",
-            crate::ui::assets::logo_icon_url(),
+            &crate::ui::assets::logo_icon_url(),
             "Impresspress",
         )
         .into_string();
@@ -261,22 +274,46 @@ mod tests {
         assert!(!s.contains("<picture>"), "{s}");
     }
 
-    /// A configured wordmark keeps the pre-existing layout: wordmark image,
-    /// icon only when collapsed, no text lockup.
+    // Ported from origin/main's `wordmark_replaces_the_text_lockup` during the
+    // main merge -- 2026-09-02 -- and dropped rather than adapted: main's
+    // test asserted a configured `logo_url` replaces the icon+text lockup
+    // with `<img class="sidebar__brand-wordmark">`. That's exactly the
+    // navy-illegibility bug `grouped_sidebar_with_logo_url_never_renders_
+    // the_wordmark_image` (below) regression-tests against -- the two
+    // assertions are mutually exclusive, and this branch's fix wins (see
+    // the coordinator's ruling in the merge report).
+
     #[test]
-    fn wordmark_replaces_the_text_lockup() {
+    fn grouped_sidebar_with_logo_url_never_renders_the_wordmark_image() {
+        // Regression for the navy-sidebar illegibility bug: `logo_url` is
+        // non-empty by default (`WAFER_RUN_SHARED__LOGO_URL` defaults to the
+        // long dark-ink wordmark PNG drawn for the old white sidebar), so
+        // this is the DEFAULT path, not an edge case. Before the fix, a
+        // non-empty `logo_url` rendered `<img class="sidebar__brand-wordmark">`
+        // instead of the white `.sidebar__brand-name` text, which is nearly
+        // invisible against the navy panel.
+        let groups = vec![NavGroup {
+            label: None,
+            items: vec![item("Users", "/b/admin/users")],
+        }];
         let s = sidebar_grouped(
-            &[],
+            &groups,
             None,
-            "/",
-            "https://acme.test/wordmark.png",
-            crate::ui::assets::logo_icon_url(),
-            "Acme",
+            "/b/admin/users",
+            "https://example.com/impresspress-logo-long.png",
+            "https://example.com/impresspress-logo.png",
+            "Impresspress",
         )
         .into_string();
-        assert!(s.contains("sidebar__brand-wordmark"), "{s}");
-        assert!(!s.contains("sidebar__brand--text"), "{s}");
-        assert!(!s.contains("sidebar__brand-name"), "{s}");
+        assert!(
+            !s.contains("sidebar__brand-wordmark"),
+            "navy sidebar must never render the dark-ink wordmark image, even \
+             with a logo_url configured: {s}"
+        );
+        assert!(
+            s.contains("sidebar__brand-name"),
+            "navy sidebar must always render the white text brand name: {s}"
+        );
     }
 
     #[test]

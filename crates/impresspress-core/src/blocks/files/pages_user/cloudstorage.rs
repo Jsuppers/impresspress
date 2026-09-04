@@ -47,7 +47,7 @@ pub fn render_quota_card(q: &QuotaInfo) -> Markup {
                 (q.used_bytes) " / " (q.limit_bytes) " bytes"
                 " · " (pct) "%"
             }
-            div .quota-bar { div .quota-bar__fill style={"width: " (pct) "%"} {} }
+            div .quota-bar { div .quota-bar__fill style={"--fill-pct:" (pct) "%"} {} }
         }
     }
 }

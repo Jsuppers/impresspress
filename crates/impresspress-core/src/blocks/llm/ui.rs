@@ -65,13 +65,13 @@ pub(super) async fn providers_page(
         // Add-provider form. Posts JSON via htmx json-enc so the existing
         // `POST /b/llm/api/providers` handler accepts the body without any
         // form-urlencoded translation layer.
-        div .card style="margin-bottom:1.5rem;padding:1.25rem" {
-            h3 style="font-size:1rem;font-weight:600;margin:0 0 0.75rem" { "Add provider" }
+        div .card .mb-6 {
+            h3 .card-title .mb-3 { "Add provider" }
             (add_provider_form())
         }
 
         // Providers table. Rendered by a pure helper for testability.
-        div .card style="padding:0" {
+        div .card .card--flush {
             (render_providers_table(&configs))
         }
     };
@@ -97,7 +97,7 @@ fn add_provider_form() -> Markup {
             hx-swap="none"
             hx-on--after-request="if(event.detail.successful){location.reload()}"
         {
-            div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem" {
+            div .form-row .gap-3 {
                 div .form-group {
                     label .form-label for="new-name" { "Name" }
                     input
@@ -138,7 +138,7 @@ fn add_provider_form() -> Markup {
                         "Admin variable name holding the API key. Leave empty for providers that don't need auth."
                     }
                 }
-                div .form-group style="grid-column:1/-1" {
+                div .form-group .col-span-full {
                     label .form-label for="new-models" { "Models (comma-separated)" }
                     // htmx's json-enc extension turns this into a plain string;
                     // the server expects a JSON array, so we transform on
@@ -154,15 +154,15 @@ fn add_provider_form() -> Markup {
                         "Optional. Leave empty and use \"Discover models\" after creation."
                     }
                 }
-                div .form-group style="grid-column:1/-1" {
-                    label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer" {
+                div .form-group .col-span-full {
+                    label .form-checkbox {
                         input type="checkbox" name="enabled" id="new-enabled" checked value="true";
-                        " Enabled"
+                        "Enabled"
                     }
                 }
             }
-            div style="margin-top:0.75rem;display:flex;justify-content:flex-end" {
-                button .btn.btn-primary type="submit" { "Add provider" }
+            div .flex .justify-end .mt-3 {
+                button .btn.btn--primary type="submit" { "Add provider" }
             }
             // Normalize `models` CSV → JSON array, and coerce `enabled`
             // checkbox to a bool before htmx serialises. Both transforms
@@ -201,7 +201,7 @@ document.currentScript.closest('form').addEventListener('htmx:configRequest', fu
 fn render_providers_table(configs: &[(String, ProviderConfig)]) -> Markup {
     html! {
         @if configs.is_empty() {
-            div .text-center .text-muted style="padding:2rem" {
+            div .empty-state {
                 "No providers configured yet. Use the form above to add one."
             }
         } @else {
@@ -244,21 +244,21 @@ fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
             td {
                 span .badge.badge-info { (cfg.protocol.as_str()) }
             }
-            td style="font-size:0.8rem;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" {
+            td .text-xs .truncate .llm-cell--endpoint {
                 (cfg.endpoint)
             }
             td {
                 @if let Some(kv) = cfg.key_var.as_deref() {
-                    code style="font-size:0.75rem" { (kv) }
+                    code .text-xs { (kv) }
                 } @else {
-                    span .text-muted style="font-size:0.75rem" { "(none)" }
+                    span .text-muted .text-xs { "(none)" }
                 }
             }
-            td style="font-size:0.8rem;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" {
+            td .text-xs .truncate .llm-cell--models {
                 @if model_count == 0 {
                     span .text-muted { (models_label) }
                 } @else {
-                    span .badge.badge-info style="margin-right:0.5rem" { (model_count) }
+                    span .badge.badge-info .mr-2 { (model_count) }
                     span .text-muted { (models_label) }
                 }
             }
@@ -270,9 +270,9 @@ fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
                 }
             }
             td {
-                div style="display:flex;gap:0.375rem;flex-wrap:wrap" {
+                div .flex .gap-2 .flex-wrap {
                     button
-                        .btn.btn-sm.btn-secondary
+                        .btn.btn--sm.btn--secondary
                         hx-post={"/b/llm/api/providers/" (id) "/discover-models"}
                         hx-confirm={"Discover models for \"" (cfg.name) "\" from its /v1/models endpoint?"}
                         hx-on--after-request="if(event.detail.successful){location.reload()}"
@@ -280,7 +280,7 @@ fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
                         "Discover"
                     }
                     button
-                        .btn.btn-sm.btn-danger
+                        .btn.btn--sm.btn--danger
                         hx-delete={"/b/llm/api/providers/" (id)}
                         hx-confirm={"Delete provider \"" (cfg.name) "\"?"}
                         hx-target="closest tr"
@@ -344,12 +344,12 @@ fn render_models_table(models: &[ModelInfo]) -> Markup {
     html! {
         @if models.is_empty() {
             div .card {
-                div .text-center .text-muted style="padding:2rem" {
+                div .empty-state {
                     "No models available. Configure a provider and run \"Discover models\" to populate this list."
                 }
             }
         } @else {
-            div .card style="padding:0" {
+            div .card .card--flush {
                 div .table-container {
                     table .table {
                         thead {
@@ -404,17 +404,17 @@ fn model_row(model: &ModelInfo) -> Markup {
                 span .badge.badge-info { (backend_id) }
                 @if display_name != model_id {
                     " "
-                    code style="font-size:0.75rem" { (model_id) }
+                    code .text-xs { (model_id) }
                 }
             }
             td {
-                div style="display:flex;gap:0.25rem;flex-wrap:wrap" {
+                div .flex .gap-1 .flex-wrap {
                     @if cap_streaming { span .badge.badge-info { "streaming" } }
                     @if cap_tools { span .badge.badge-info { "tools" } }
                     @if cap_vision { span .badge.badge-info { "vision" } }
                     @if cap_json { span .badge.badge-info { "json" } }
                     @if !(cap_streaming || cap_tools || cap_vision || cap_json) {
-                        span .text-muted style="font-size:0.75rem" { "—" }
+                        span .text-muted .text-xs { "—" }
                     }
                 }
             }
@@ -434,9 +434,9 @@ fn model_row(model: &ModelInfo) -> Markup {
                 }
             }
             td {
-                div style="display:flex;gap:0.375rem;flex-wrap:wrap" {
+                div .flex .gap-2 .flex-wrap {
                     button
-                        .btn.btn-sm.btn-secondary
+                        .btn.btn--sm.btn--secondary
                         hx-post=(load_url)
                         hx-swap="none"
                         hx-confirm={"Load model \"" (model_id) "\" on backend \"" (backend_id) "\"?"}
@@ -444,7 +444,7 @@ fn model_row(model: &ModelInfo) -> Markup {
                         "Load"
                     }
                     button
-                        .btn.btn-sm.btn-ghost
+                        .btn.btn--sm.btn--ghost
                         hx-post=(unload_url)
                         hx-swap="none"
                         hx-confirm={"Unload model \"" (model_id) "\" on backend \"" (backend_id) "\"?"}

@@ -102,14 +102,14 @@ fn body() -> Markup {
             section #dev-files .dev-pane {
                 h2 { "Files" }
                 ul #dev-file-list {}
-                button #dev-new-file .btn .btn-secondary type="button" { "New file" }
+                button #dev-new-file .btn .btn--secondary type="button" { "New file" }
             }
             section #dev-editor .dev-pane {
                 h2 #dev-editor-title { "Editor" }
                 textarea #dev-editor-text spellcheck="false" {}
                 div .dev-editor-actions {
-                    button #dev-save .btn .btn-primary type="button" { "Save" }
-                    button #dev-delete .btn .btn-danger type="button" { "Delete" }
+                    button #dev-save .btn .btn--primary type="button" { "Save" }
+                    button #dev-delete .btn .btn--danger type="button" { "Delete" }
                 }
             }
             section #dev-preview .dev-pane {
@@ -179,14 +179,14 @@ fn body() -> Markup {
                 // select whose only clue is its first option is
                 // unreachable by anything that is not looking at it.
                 select #dev-compile-block aria-label="Block to compile" {}
-                button #dev-compile .btn .btn-secondary type="button" disabled { "Compile block" }
-                button #dev-export .btn .btn-secondary type="button" disabled { "Export" }
-                button #dev-refresh-tools .btn .btn-secondary type="button" { "Refresh tools" }
+                button #dev-compile .btn .btn--secondary type="button" disabled { "Compile block" }
+                button #dev-export .btn .btn--secondary type="button" disabled { "Export" }
+                button #dev-refresh-tools .btn .btn--secondary type="button" { "Refresh tools" }
                 // Filled in by `dev.js` from the compiler manifest, and left
                 // empty when there is none — the version is the pinned rubrc
                 // sha every compiler URL carries, so it is what a bug report
                 // about a build needs to quote.
-                span #dev-compiler-version .dev-compiler-version {}
+                span #dev-compiler-version {}
             }
         }
         link rel="stylesheet" href="/b/dev/static/dev.css";
@@ -372,7 +372,7 @@ mod tests {
         let html = body().into_string();
         assert!(
             html.contains(
-                r#"<button class="btn btn-secondary" id="dev-compile" type="button" disabled>"#
+                r#"<button class="btn btn--secondary" id="dev-compile" type="button" disabled>"#
             ),
             "the Compile button must ship disabled; {html}"
         );

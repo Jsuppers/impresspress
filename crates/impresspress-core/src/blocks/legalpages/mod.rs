@@ -677,6 +677,8 @@ mod tests {
             favicon_url: "/favicon.ico".to_string(),
             primary_color: String::new(),
             embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
         }
     }
 

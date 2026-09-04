@@ -154,43 +154,42 @@ pub(super) fn editor_markup_for_test(
 
     html! {
         // Status bar (compact, top of page)
-        div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem" {
-            div style="display:flex;align-items:center;gap:0.5rem" {
-                h2 style="font-size:1.25rem;font-weight:600;margin:0" { (default_title) }
+        div .flex .items-center .justify-between .mb-3 {
+            div .flex .items-center .gap-2 {
+                h2 .editor-status__title { (default_title) }
                 span #status-badge .badge .(badge_class) { (badge_text) }
-                span .badge style="font-size:0.7rem;background:#f1f5f9;color:#64748b;cursor:pointer"
+                span .badge .editor-status__version .text-xs .cursor-pointer
                     title="Click to change version"
                     onclick="promptVersion()"
                 { "v" span #version-display { (version) } }
                 @if !updated_at.is_empty() {
-                    span .text-muted style="font-size:0.8rem" {
+                    span .text-muted .text-xs {
                         " \u{00b7} " (updated_at.get(..10).unwrap_or(updated_at))
                     }
                 }
             }
-            div style="display:flex;gap:0.5rem" {
-                a .btn .btn-sm .btn-ghost
+            div .flex .gap-2 {
+                a .btn .btn--sm .btn--ghost
                     href={"/b/legalpages/" (doc_type)}
                     target="_blank"
                 {
                     "Open public page"
                 }
-                button #btn-save .btn .btn-sm .btn-secondary onclick="saveDocument(false)" {
+                button #btn-save .btn .btn--sm .btn--secondary onclick="saveDocument(false)" {
                     "Save Draft"
                 }
-                button #btn-publish .btn .btn-sm .btn-primary onclick="saveDocument(true)" {
+                button #btn-publish .btn .btn--sm .btn--primary onclick="saveDocument(true)" {
                     "Publish"
                 }
             }
         }
 
         // Title input
-        input #title-input .form-input
+        input #title-input .form-input .text-lg .font-semibold .mb-2
             type="text"
             name="title"
             value=(title)
-            placeholder="Document title"
-            style="font-size:1.1rem;font-weight:600;margin-bottom:0.5rem";
+            placeholder="Document title";
 
         // Hidden fields used by save handler JS
         input #doc-type type="hidden" value=(doc_type);
@@ -198,7 +197,6 @@ pub(super) fn editor_markup_for_test(
         input #doc-version type="hidden" value=(version);
 
         // Tab strip
-        style { (PreEscaped(EDITOR_CSS)) }
         div .editor-tabs {
             button .editor-tab .editor-tab--active type="button"
                 data-tab="edit"
@@ -219,7 +217,7 @@ pub(super) fn editor_markup_for_test(
         }
 
         // Preview pane (vanilla JS fetch target)
-        div #editor-preview-pane .editor-pane style="display:none" {
+        div #editor-preview-pane .editor-pane .hidden {
             div #editor-preview .preview-content {
                 p .text-muted { "Click Preview above to render." }
             }
@@ -229,35 +227,6 @@ pub(super) fn editor_markup_for_test(
     }
 }
 
-const EDITOR_CSS: &str = r#"
-.editor-tabs {
-    display: flex; gap: 4px; margin-bottom: -1px; border-bottom: 1px solid #e2e8f0;
-}
-.editor-tab {
-    background: none; border: 1px solid transparent; border-bottom: none;
-    border-radius: 6px 6px 0 0; padding: 6px 14px; cursor: pointer;
-    font-size: 0.875rem; color: #64748b;
-}
-.editor-tab:hover { background: #f1f5f9; color: #1e293b; }
-.editor-tab--active {
-    background: white; border-color: #e2e8f0; color: #1e293b; font-weight: 600;
-}
-.editor-pane {
-    background: white; border: 1px solid #e2e8f0; border-radius: 0 6px 6px 6px;
-    min-height: 500px;
-}
-.editor-textarea {
-    width: 100%; min-height: 500px; padding: 1rem;
-    border: none; outline: none; resize: vertical;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.9rem; line-height: 1.6; background: transparent;
-}
-.preview-content {
-    padding: 1.5rem; min-height: 500px; font-family: Georgia, 'Times New Roman', serif;
-    line-height: 1.8;
-}
-"#;
-
 const EDITOR_JS: &str = r#"
 (function() {
     // Preview wiring: vanilla JS fetch (no json-enc htmx extension loaded)
@@ -265,8 +234,8 @@ const EDITOR_JS: &str = r#"
         document.querySelectorAll('.editor-tab').forEach(function(t) {
             t.classList.toggle('editor-tab--active', t.dataset.tab === name);
         });
-        document.getElementById('editor-edit-pane').style.display = (name === 'edit') ? '' : 'none';
-        document.getElementById('editor-preview-pane').style.display = (name === 'preview') ? '' : 'none';
+        document.getElementById('editor-edit-pane').classList.toggle('hidden', name !== 'edit');
+        document.getElementById('editor-preview-pane').classList.toggle('hidden', name !== 'preview');
         if (name === 'preview') {
             var content = document.getElementById('editor').value;
             fetch('/b/legalpages/admin/render-preview', {
@@ -281,7 +250,7 @@ const EDITOR_JS: &str = r#"
             .then(function(html) { document.getElementById('editor-preview').innerHTML = html; })
             .catch(function(err) {
                 document.getElementById('editor-preview').innerHTML =
-                    '<p style="color:#ef4444">Preview failed: ' + err.message + '</p>';
+                    '<p class="text-danger">Preview failed: ' + err.message + '</p>';
             });
         }
     };
@@ -365,15 +334,15 @@ pub async fn endpoints_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header("API Endpoints", Some("Available endpoints for legal pages"), None))
 
         // Public endpoints
-        h3 style="font-size:1rem;font-weight:600;margin-bottom:0.5rem" { "Public Endpoints" }
-        p .text-muted style="font-size:0.875rem;margin-bottom:0.75rem" {
+        h3 .card-title .mb-2 { "Public Endpoints" }
+        p .text-muted .text-sm .mb-3 {
             "These endpoints are publicly accessible and return formatted HTML pages."
         }
-        div .table-container style="margin-bottom:2rem" {
+        div .table-container .mb-8 {
             table .table {
                 thead {
                     tr {
-                        th style="width:80px" { "Method" }
+                        th .w-80 { "Method" }
                         th { "Endpoint" }
                         th { "Description" }
                     }
@@ -394,15 +363,15 @@ pub async fn endpoints_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
 
         // Admin API
-        h3 style="font-size:1rem;font-weight:600;margin-bottom:0.5rem" { "Admin API Endpoints" }
-        p .text-muted style="font-size:0.875rem;margin-bottom:0.75rem" {
+        h3 .card-title .mb-2 { "Admin API Endpoints" }
+        p .text-muted .text-sm .mb-3 {
             "These endpoints require admin authentication and return JSON responses."
         }
         div .table-container {
             table .table {
                 thead {
                     tr {
-                        th style="width:80px" { "Method" }
+                        th .w-80 { "Method" }
                         th { "Endpoint" }
                         th { "Description" }
                     }
@@ -438,8 +407,8 @@ pub async fn endpoints_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
 
         // Document schema
-        h3 style="font-size:1rem;font-weight:600;margin:2rem 0 0.5rem" { "Document Schema" }
-        p .text-muted style="font-size:0.875rem;margin-bottom:0.75rem" {
+        h3 .card-title .mt-8 .mb-2 { "Document Schema" }
+        p .text-muted .text-sm .mb-3 {
             "Each legal document has the following fields."
         }
         div .table-container {
@@ -636,16 +605,16 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // The live-preview links ride in the form's `extra` slot so they stay
     // inside the settings form (above the Save button), as before.
     let preview = html! {
-        div .card style="margin-bottom:1.25rem;padding:1rem" {
-            h4 style="font-size:0.9rem;font-weight:600;margin-bottom:0.5rem" { "Preview" }
-            p .text-muted style="font-size:0.8rem;margin-bottom:0.75rem" {
+        div .card .mb-5 .p-4 {
+            h4 .text-sm .font-semibold .mb-2 { "Preview" }
+            p .text-muted .text-xs .mb-3 {
                 "See how your changes look on the public pages."
             }
-            div style="display:flex;gap:0.5rem" {
-                a .btn .btn-sm .btn-ghost href="/b/legalpages/privacy" target="_blank" {
+            div .flex .gap-2 {
+                a .btn .btn--sm .btn--ghost href="/b/legalpages/privacy" target="_blank" {
                     (icons::eye()) " Privacy Policy"
                 }
-                a .btn .btn-sm .btn-ghost href="/b/legalpages/terms" target="_blank" {
+                a .btn .btn--sm .btn--ghost href="/b/legalpages/terms" target="_blank" {
                     (icons::eye()) " Terms of Service"
                 }
             }
@@ -658,7 +627,8 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (components::page_header("Settings", Some("Customize the public legal pages appearance"), None))
 
         @if saved {
-            div .alert .alert-success style="margin-bottom:1rem" {
+            div .alert .alert--success .mb-4 {
+                span aria-hidden="true" { (icons::check()) }
                 "Settings saved successfully."
             }
         }

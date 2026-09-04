@@ -258,7 +258,7 @@ fn form_markup(
                 input type="hidden" name="source_path" value=(source_path);
                 input type="hidden" name="subject_type" value=(subject_type);
                 input type="hidden" name="subject_id" value=(subject_id);
-                div style="position:absolute;left:-10000px" aria-hidden="true" {
+                div .honeypot aria-hidden="true" {
                     label for="website" { "Website" }
                     input #website type="text" name="website" tabindex="-1" autocomplete="off";
                 }
@@ -322,7 +322,7 @@ fn form_markup(
                 }
                 div .cf-turnstile data-sitekey=(site_key) data-action="ticket_submit" {}
                 noscript { p { "JavaScript is required only for the anti-spam challenge." } }
-                button .btn .btn-primary type="submit" { "Submit report" }
+                button .btn .btn--primary type="submit" { "Submit report" }
             }
             @if !support_email.is_empty() {
                 p .text-muted { "You can also email " (support_email_link(support_email)) "." }

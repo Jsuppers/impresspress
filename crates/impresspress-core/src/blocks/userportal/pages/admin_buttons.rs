@@ -53,25 +53,25 @@ pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStrea
         ))
 
         // Add button form
-        div .card style="margin-bottom:1.5rem;padding:1.25rem" {
-            h3 style="margin:0 0 1rem;font-size:1rem" { "Add Button" }
+        div .card .mb-6 {
+            h3 .text-16 .m-0 .mb-4 { "Add Button" }
             form
                 hx-post="/b/userportal/admin/buttons"
                 hx-target="#buttons-table"
                 hx-swap="outerHTML"
-                style="display:grid;grid-template-columns:1fr 1fr 1fr auto auto;gap:0.75rem;align-items:end"
+                .grid .admin-buttons-form-grid .items-end .gap-3
             {
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="label" { "Label" }
                     input .form-input #label type="text" name="label"
                         placeholder="e.g. My Products" required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="path" { "Path" }
                     input .form-input #path type="text" name="path"
                         placeholder="e.g. /b/products/mine" required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="icon" { "Icon" }
                     select .form-input #icon name="icon" {
                         @for &(value, display) in ICON_OPTIONS {
@@ -79,12 +79,12 @@ pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStrea
                         }
                     }
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label for="sort_order" { "Order" }
                     input .form-input #sort_order type="number" name="sort_order"
-                        value="0" style="width:5rem";
+                        value="0" .w-80;
                 }
-                button .btn .btn-primary type="submit" style="white-space:nowrap" {
+                button .btn .btn--primary type="submit" .nowrap {
                     (icons::plus()) " Add"
                 }
             }
@@ -122,7 +122,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                 th { "Icon" }
                                 th { "Path" }
                                 th { "Order" }
-                                th style="width:6rem" { "Actions" }
+                                th .w-96 { "Actions" }
                             }
                         }
                         tbody {
@@ -130,7 +130,7 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                 tr {
                                     td .font-medium { (btn.str_field("label")) }
                                     td {
-                                        span .nav-icon style="display:inline-flex" {
+                                        span .nav-icon .d-inline-flex {
                                             (nav_icon(btn.str_field("icon")))
                                         }
                                         " "
@@ -139,8 +139,8 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                     td { code { (btn.str_field("path")) } }
                                     td { (btn.i64_field("sort_order")) }
                                     td {
-                                        div style="display:flex;gap:0.25rem" {
-                                            button .btn .btn-ghost .btn-sm
+                                        div .flex .gap-1 {
+                                            button .btn .btn--ghost .btn--sm
                                                 hx-get=(format!("/b/userportal/admin/buttons/{}/edit", btn.id))
                                                 hx-target=(format!("#edit-modal-{}", btn.id))
                                                 hx-swap="innerHTML"
@@ -148,13 +148,12 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
                                             {
                                                 (icons::edit())
                                             }
-                                            button .btn .btn-ghost .btn-sm
+                                            button .btn .btn--ghost .btn--sm .text-danger
                                                 hx-delete=(format!("/b/userportal/admin/buttons/{}", btn.id))
                                                 hx-target="#buttons-table"
                                                 hx-swap="outerHTML"
                                                 hx-confirm="Delete this button?"
                                                 title="Delete"
-                                                style="color:var(--danger)"
                                             {
                                                 (icons::trash())
                                             }
@@ -262,19 +261,19 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                 hx-put=(format!("/b/userportal/admin/buttons/{id}"))
                 hx-target="#buttons-table"
                 hx-swap="outerHTML"
-                style="display:flex;flex-direction:column;gap:0.75rem"
+                .flex .flex-col .gap-3
             {
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Label" }
                     input .form-input type="text" name="label"
                         value=(record.str_field("label")) required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Path" }
                     input .form-input type="text" name="path"
                         value=(record.str_field("path")) required;
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Icon" }
                     select .form-input name="icon" {
                         @for &(value, display) in ICON_OPTIONS {
@@ -282,22 +281,26 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                         }
                     }
                 }
-                div .form-group style="margin:0" {
+                div .form-group .m-0 {
                     label .form-label { "Order" }
                     input .form-input type="number" name="sort_order"
                         value=(record.i64_field("sort_order"));
                 }
-                div style="display:flex;gap:0.5rem;justify-content:flex-end" {
-                    button .btn .btn-secondary type="button"
-                        onclick=(format!("document.getElementById('edit-btn-{id}').style.display='none'"))
+                div .flex .gap-2 .justify-end {
+                    button .btn .btn--secondary type="button"
+                        onclick=(format!("closeModal('edit-btn-{id}')"))
                     { "Cancel" }
-                    button .btn .btn-primary type="submit" { "Save" }
+                    button .btn .btn--primary type="submit" { "Save" }
                 }
             }
         }))
-        // Auto-show the modal
+        // Auto-show the modal. `components::modal()` renders the boolean
+        // `hidden` attribute (base.css: `[hidden] { display: none !important; }`),
+        // so revealing it needs `hidden = false` via the shared `openModal`
+        // helper (ui/assets.rs `modal_js()`), not a plain `style.display`
+        // assignment -- that loses to `!important` and the modal never opens.
         script { (maud::PreEscaped(format!(
-            "document.getElementById('edit-btn-{id}').style.display='flex';"
+            "openModal('edit-btn-{id}');"
         ))) }
     };
 
@@ -325,4 +328,83 @@ pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
     }
 
     buttons_table_response(ctx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+    use wafer_core::clients::database as db;
+
+    use super::*;
+    use crate::{
+        blocks::userportal::UserPortalBlock,
+        test_support::{output_html, TestContext},
+    };
+
+    async fn ctx_with_userportal() -> TestContext {
+        let mut ctx = TestContext::with_userportal().await;
+        ctx.register_block(
+            "impresspress/userportal",
+            std::sync::Arc::new(UserPortalBlock::new()),
+        );
+        ctx
+    }
+
+    fn button_data(label: &str, icon: &str, path: &str) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert("label".to_string(), json!(label));
+        m.insert("icon".to_string(), json!(icon));
+        m.insert("path".to_string(), json!(path));
+        m.insert("sort_order".to_string(), json!(0));
+        m
+    }
+
+    /// Regression test for the six-week-silent bug (task 12e): the edit
+    /// modal is `components::modal()`, which renders the boolean `hidden`
+    /// attribute (`[hidden] { display: none !important; }` in base.css).
+    /// A plain `el.style.display='flex'` inline-style toggle can never beat
+    /// that `!important`, so the modal could never actually open even
+    /// though the fragment rendered "successfully". This asserts the
+    /// fragment routes through the shared `openModal`/`closeModal` helpers
+    /// (which flip the `hidden` IDL property, not `style.display`) instead
+    /// of reintroducing a hand-rolled inline-style toggle.
+    #[tokio::test]
+    async fn edit_button_form_opens_via_shared_modal_helpers_not_inline_style() {
+        let ctx = ctx_with_userportal().await;
+        let record = db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+
+        // The handler takes `id` directly (the real route,
+        // `GET /b/userportal/admin/buttons/{id}/edit`, is parsed and
+        // dispatched by `userportal/mod.rs` before reaching this function).
+        let resp = handle_edit_button_form(&ctx, &record.id).await;
+        let html = output_html(resp).await;
+
+        // The modal container itself must still start hidden via the real
+        // `hidden` attribute (not an inline style) -- `components::modal()`
+        // renders `id=(id) hidden` in that order.
+        assert!(
+            html.contains(&format!(r#"id="edit-btn-{}" hidden"#, record.id)),
+            "modal must render the boolean `hidden` attribute:\n{html}"
+        );
+        // Auto-show and Cancel must route through the shared helpers.
+        assert!(
+            html.contains(&format!("openModal('edit-btn-{}')", record.id)),
+            "auto-show script must call the shared openModal helper:\n{html}"
+        );
+        assert!(
+            html.contains(&format!("closeModal('edit-btn-{}')", record.id)),
+            "Cancel button must call the shared closeModal helper:\n{html}"
+        );
+        // The exact bug: a plain inline `style.display` toggle always loses
+        // to `[hidden] { display: none !important; }`, so the modal could
+        // never open. Any reintroduction of that pattern must fail this.
+        assert!(
+            !html.contains("style.display"),
+            "modal must not be toggled via a plain inline style.display assignment:\n{html}"
+        );
+    }
 }

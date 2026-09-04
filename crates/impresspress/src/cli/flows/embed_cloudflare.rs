@@ -295,6 +295,42 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     );
     deployment_gate.assets_verified()?;
 
+    // Publish impresspress's own UI asset set (CSS/JS/fonts/logos) to R2 at
+    // their hashed filenames. Independent of this app's release-asset gate
+    // above: these are the shared static assets a lean (no `embed-assets`)
+    // Cloudflare build drops at compile time, and `IMPRESSPRESS_ASSET_BASE_URL`
+    // (set in every generated wrangler config via
+    // `assets::resolve_asset_base_url`, see `wrangler::base_toml`) points
+    // `/b/static/` at wherever they land here — served back out by
+    // `impresspress_cloudflare::run_with_config`'s R2 read-through
+    // (`static_asset_target` / `serve_static_asset_from_r2`), not by the
+    // (compiled-out) embedded byte path.
+    if !cfg.r2.bucket_name.is_empty() {
+        #[cfg(feature = "embed-assets")]
+        {
+            let ui_asset_upload = cf_deploy::r2_upload_ui_assets(&cfg.r2.bucket_name)?;
+            println!(
+                "-> published {} UI asset object(s) to R2",
+                ui_asset_upload.uploaded
+            );
+        }
+        // An R2 bucket is configured, so the deployed worker expects to read
+        // its UI assets (CSS/JS/fonts/logos) back from R2 at
+        // `/b/static/{filename}`. Without `embed-assets`, this CLI binary
+        // has no asset bytes compiled in to publish there — proceeding would
+        // silently leave the bucket empty and every `/b/static/` request on
+        // the live site 404ing. Fail the deploy loudly instead, before any
+        // candidate is promoted, rather than let this ship broken.
+        #[cfg(not(feature = "embed-assets"))]
+        bail!(
+            "cloudflare.r2.bucket_name is configured, but this `impresspress` CLI binary was \
+             built without the `embed-assets` feature, so it has no UI asset bytes to publish \
+             to R2. Rebuild the CLI with default features (or explicitly with \
+             `--features embed-assets`) before running `deploy cloudflare` against an \
+             R2-backed target."
+        );
+    }
+
     // 3. One authenticated request owns every mutation: migrate, seed, reload
     //    final structural state, and export the strict immutable plan.
     let prepared_response =

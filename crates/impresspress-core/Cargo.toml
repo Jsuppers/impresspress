@@ -29,8 +29,14 @@ default = [
     "block-tickets",
     "block-userportal",
     "block-products",
+    "embed-assets",
 ]
 sqlite = []
+# Compile the static assets (CSS/JS/fonts/logos) into the binary. On by
+# default so a native single-file binary stays self-contained. The Cloudflare
+# build runs `--no-default-features`, so it drops ~370 KB of embedded assets
+# automatically — the same fail-safe-lean pattern the block features use.
+embed-assets = []
 postgres = []
 # Exposes `impresspress_core::test_support::TestContext` (the shared in-memory
 # SQLite + block harness) as part of the public API so the `tests/`
@@ -235,6 +241,9 @@ tracing = "0.1"
 [lints]
 workspace = true
 
+[build-dependencies]
+sha2 = { workspace = true }
+
 [dev-dependencies]
 # Self dev-dependency with `test-support` so the `tests/` integration crates
 # can `use impresspress_core::test_support::TestContext` (the shared in-memory
@@ -261,6 +270,9 @@ base64ct = { version = "1", features = ["alloc"] }
 axum = "0.8"
 # Mock upstream OAuth providers in integration tests.
 wiremock = "0.6"
+# Guard test (ui::mod::tests::pages_carry_no_static_inline_styles) walks
+# src/blocks and src/ui looking for stray inline `style=` attributes.
+walkdir = "2"
 # Reads back `blocks::dev::zip`'s stored-entry archives in its own tests
 # (`default-features = false` — the writer needs no compression backend, so
 # the reader shouldn't pull one in either).

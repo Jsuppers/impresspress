@@ -592,6 +592,61 @@ where
     .await
 }
 
+/// Resolve a `/b/static/…` request path to the R2 object key and content
+/// type for that asset, or `None` if the path is not a known asset.
+///
+/// The manifest lookup IS the security boundary: a filename absent from
+/// `ASSETS` returns `None` before any key is constructed, so no request
+/// input ever reaches a storage key — mirrors the exact-match discipline of
+/// `impresspress_core::blocks::system`'s embedded-path lookup (no
+/// prefix/suffix scanning), just resolved to an R2 object key instead of
+/// `'static` bytes. `ASSETS` itself is unconditionally available (`build.rs`
+/// always generates the manifest; only the bytes behind it are feature-gated
+/// — see `impresspress_core::ui::assets`), so this works even though this
+/// crate builds `impresspress-core` with `embed-assets` off.
+#[cfg(not(feature = "embed-assets"))]
+pub(crate) fn static_asset_target(path: &str) -> Option<(&'static str, &'static str)> {
+    let filename = path.strip_prefix(impresspress_core::routing::STATIC_PREFIX)?;
+    let e = impresspress_core::ui::assets::ASSETS
+        .iter()
+        .find(|e| e.filename == filename)?;
+    Some((e.filename, e.content_type))
+}
+
+/// Stream a resolved `/b/static/` asset straight off the R2 bucket binding.
+/// `key` and `content_type` come only from [`static_asset_target`]'s
+/// manifest lookup — this never constructs a storage key from raw request
+/// input. Headers match the embedded path (`impresspress-core`'s
+/// `blocks::system`) exactly: the manifest's content type plus a one-year
+/// immutable cache lifetime, safe because every filename carries a content
+/// hash.
+///
+/// A miss in R2 (object absent) is a 404 — that should not happen for a key
+/// straight from the manifest on a correctly deployed bucket, but the
+/// request must not 500 if a deploy's R2 upload and Worker version somehow
+/// drift.
+#[cfg(not(feature = "embed-assets"))]
+async fn serve_static_asset_from_r2(
+    env: &worker::Env,
+    key: &str,
+    content_type: &str,
+) -> worker::Result<worker::Response> {
+    let bucket = env.bucket(runner::R2_BINDING)?;
+    let Some(object) = bucket.get(key).execute().await? else {
+        return worker::Response::error("not found", 404);
+    };
+    let body = object
+        .body()
+        .ok_or_else(|| worker::Error::RustError(format!("R2 object {key} has no body")))?;
+    let bytes = body.bytes().await?;
+
+    let mut response = worker::Response::from_bytes(bytes)?;
+    let headers = response.headers_mut();
+    headers.set("Content-Type", content_type)?;
+    headers.set("Cache-Control", "public, max-age=31536000, immutable")?;
+    Ok(response)
+}
+
 /// Variant of [`run`] with explicit request-current Worker configuration.
 ///
 /// Workers cannot enumerate `Env`, so consumers pass the small allowlist of
@@ -615,6 +670,20 @@ where
         Arc<dyn StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
+    // `std::env` is stubbed to always-empty on `wasm32-unknown-unknown`, so
+    // `impresspress_core::ui::assets::base_url()` can never observe
+    // `IMPRESSPRESS_ASSET_BASE_URL` through it here. `worker::Env::var` is
+    // the one channel that does carry a Worker `[vars]` entry, so read it
+    // and push it into `base_url()`'s platform override before any code
+    // path below can render a page (and therefore call `base_url()`).
+    // Idempotent (see `set_base_url_override`'s doc) — safe to call on
+    // every request, including the fresh-runtime `/_deploy/*` funnels.
+    impresspress_core::ui::assets::set_base_url_override(
+        env.var(impresspress_core::ui::assets::ASSET_BASE_URL_VAR)
+            .ok()
+            .map(|v| v.to_string()),
+    );
+
     if req.path() == "/_deploy/verify" {
         return prepared_verify_endpoint(&req, &env).await;
     }
@@ -659,6 +728,19 @@ where
         if !allowed || host_is_version_preview(&req, &env)? {
             return worker::Response::error("not found", 404);
         }
+    }
+
+    // Serve `/b/static/` assets straight from the R2 bucket binding,
+    // bypassing Wafer block dispatch entirely — same shape as the
+    // `/_deploy/*` special cases above, because this is the one place with a
+    // live `env` and its R2 binding; `impresspress-core`'s `Context` has no
+    // storage capability (see `static_asset_target`'s doc and this crate's
+    // `embed-assets` feature comment in `Cargo.toml`). Runs AFTER the
+    // workers.dev lockdown so a preview host keeps hiding CSS/JS along with
+    // everything else, matching how the embedded path behaves on that host.
+    #[cfg(not(feature = "embed-assets"))]
+    if let Some((key, content_type)) = static_asset_target(&req.path()) {
+        return serve_static_asset_from_r2(&env, key, content_type).await;
     }
 
     // Isolate-scoped init (request-log mode) — no-op after the first call;
@@ -1946,5 +2028,46 @@ mod request_config_tests {
         ]);
         assert_eq!(config_identity_hash(&left), config_identity_hash(&right));
         assert_ne!(config_identity_hash(&left), config_identity_hash(&changed));
+    }
+}
+
+/// Tests for [`static_asset_target`] — the pure decision seam behind the
+/// `/b/static/` R2 read-through in `run_with_config`. A worker `fetch`
+/// handler is awkward to unit-test, so this covers only the manifest-lookup
+/// security boundary; the R2 fetch itself is validated end-to-end by a real
+/// Cloudflare deploy (same posture as this crate's other `worker::Env`-driven
+/// paths — see `database.rs`'s module note).
+#[cfg(all(test, not(feature = "embed-assets")))]
+mod static_asset_target_tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    #[wasm_bindgen_test]
+    fn static_asset_target_resolves_a_known_asset() {
+        let e = impresspress_core::ui::assets::entry("app.css");
+        let path = format!(
+            "{}{}",
+            impresspress_core::routing::STATIC_PREFIX,
+            e.filename
+        );
+        let (key, ct) = static_asset_target(&path).expect("known asset must resolve");
+        assert_eq!(
+            key, e.filename,
+            "R2 key is the flat hashed filename Task 4 uploads"
+        );
+        assert_eq!(ct, e.content_type);
+    }
+
+    #[wasm_bindgen_test]
+    fn static_asset_target_rejects_unknown_and_traversal_before_building_a_key() {
+        for p in [
+            "/b/static/app-deadbeef.css",
+            "/b/static/../../etc/passwd",
+            "/b/static/",
+            "/not-static/app.css",
+        ] {
+            assert!(static_asset_target(p).is_none(), "must not resolve: {p}");
+        }
     }
 }

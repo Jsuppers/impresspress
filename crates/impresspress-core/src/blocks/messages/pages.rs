@@ -29,54 +29,33 @@ pub fn entry_card(record: &db::Record) -> Markup {
     // system = warning yellow). The old palette hardcoded sky/indigo blues
     // that clashed with the orange brand. Keep in sync with
     // `messageCardHtml` in ui/assets/llm-chat.js — same cards, JS-rendered.
-    let (bg_style, badge_class) = match kind {
-        "artifact" => (
-            "background:var(--surface-3);border-left:3px solid var(--border-color)",
-            "badge",
-        ),
-        "notification" => (
-            "background:#fefce8;border-left:3px solid #eab308",
-            "badge-warning",
-        ),
-        "status" => (
-            "background:var(--surface-3);border-left:3px solid var(--border-color)",
-            "badge",
-        ),
+    let (card_variant, badge_class) = match kind {
+        "artifact" => ("message-card--neutral", "badge"),
+        "notification" => ("message-card--warning", "badge-warning"),
+        "status" => ("message-card--neutral", "badge"),
         _ => match role {
-            "user" => (
-                "background:#fff1e6;border-left:3px solid var(--primary-color)",
-                "badge",
-            ),
-            "agent" | "assistant" => (
-                "background:var(--surface-3);border-left:3px solid var(--border-color)",
-                "badge",
-            ),
-            "system" => (
-                "background:#fefce8;border-left:3px solid #eab308",
-                "badge-warning",
-            ),
-            _ => (
-                "background:var(--surface-3);border-left:3px solid var(--border-color)",
-                "badge",
-            ),
+            "user" => ("message-card--user", "badge"),
+            "agent" | "assistant" => ("message-card--neutral", "badge"),
+            "system" => ("message-card--warning", "badge-warning"),
+            _ => ("message-card--neutral", "badge"),
         },
     };
 
     html! {
-        div .card style={"margin-bottom:0.75rem;" (bg_style)} {
-            div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem" {
-                span .badge .(badge_class) style="text-transform:capitalize" { (kind) }
+        div .card .(card_variant) {
+            div .flex .items-center .gap-2 .mb-2 {
+                span .badge .(badge_class) .text-capitalize { (kind) }
                 @if !role.is_empty() {
-                    span .badge style="text-transform:capitalize" { (role) }
+                    span .badge .text-capitalize { (role) }
                 }
                 @if kind == "artifact" && !content_type.is_empty() && content_type != "text/plain" {
-                    span .text-muted style="font-size:0.7rem" { (content_type) }
+                    span .text-muted .text-xs { (content_type) }
                 }
                 @if !date.is_empty() {
-                    span .text-muted style="font-size:0.75rem;margin-left:auto" { (date) }
+                    span .text-muted .text-xs .ml-auto { (date) }
                 }
             }
-            p style="margin:0;white-space:pre-wrap;word-break:break-word" { (content) }
+            p .message-card__content { (content) }
         }
     }
 }
@@ -100,7 +79,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     let content = html! {
         section .card .messages-new {
             header .card__head {
-                h3 .card__title { "New context" }
+                h2 .card__title { "New context" }
             }
             div .card__body {
                 form .messages-new__form
@@ -121,7 +100,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
                         label .form-label for="new-context-title" { "Title" }
                         input .form-input .messages-new__title #new-context-title type="text" name="title" placeholder="e.g. Deploy planning" required;
                     }
-                    button .btn .btn-primary type="submit" { "Create" }
+                    button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }
@@ -329,16 +308,16 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
     let post_url = format!("/b/messages/api/contexts/{context_id}/entries");
 
     html! {
-        div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1.5rem" {
-            a .btn .btn-ghost .btn-sm href="/b/messages/" { "\u{2190} Back" }
-            h2 .page-title style="margin:0" { (display_title) }
-            span .badge style="text-transform:capitalize" { (context_type) }
+        div .flex .items-center .gap-3 .mb-6 {
+            a .btn .btn--ghost .btn--sm href="/b/messages/" { (ui::icons::arrow_left()) " Back" }
+            h2 .page-title .m-0 { (display_title) }
+            span .badge .text-capitalize { (context_type) }
             span .badge { (context_status) }
         }
 
-        div #entries-list style="margin-bottom:1.5rem;max-height:60vh;overflow-y:auto" {
+        div #entries-list .entries-list--scroll .mb-6 {
             @if entries.is_empty() {
-                div .text-center .text-muted style="padding:2rem" {
+                div .text-center .text-muted .p-8 {
                     "No entries yet. Add one below."
                 }
             } @else {
@@ -349,7 +328,7 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
         }
 
         div .card {
-            h3 style="font-size:0.9rem;font-weight:600;margin:0 0 0.75rem;color:var(--text-muted)" {
+            h3 .text-sm .font-semibold .text-muted .mb-3 {
                 "Add Entry"
             }
             form
@@ -358,28 +337,27 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
                 hx-swap="beforeend"
                 hx-on--after-request="if(event.detail.successful){this.reset();var list=document.getElementById('entries-list');list.scrollTop=list.scrollHeight;}"
             {
-                div style="display:flex;gap:0.5rem;margin-bottom:0.5rem" {
-                    select .form-input name="kind" style="width:auto" {
+                div .flex .gap-2 .mb-2 {
+                    select .form-input .w-auto name="kind" {
                         option value="message" { "message" }
                         option value="artifact" { "artifact" }
                         option value="notification" { "notification" }
                         option value="status" { "status" }
                     }
-                    select .form-input name="role" style="width:auto" {
+                    select .form-input .w-auto name="role" {
                         option value="user" { "user" }
                         option value="agent" { "agent" }
                         option value="system" { "system" }
                     }
                 }
-                div style="display:flex;gap:0.5rem;align-items:flex-end" {
-                    textarea .form-input
+                div .flex .gap-2 .items-end {
+                    textarea .form-input .flex-1 .resize-vertical
                         name="content"
                         placeholder="Entry content"
                         rows="3"
                         required
-                        style="flex:1;resize:vertical"
                     {}
-                    button .btn .btn-primary type="submit" { "Add" }
+                    button .btn .btn--primary type="submit" { "Add" }
                 }
             }
         }
@@ -388,15 +366,15 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
 
 fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) -> Markup {
     html! {
-        div style="display:flex;flex-direction:column;gap:0.75rem;height:100%" {
-            div style="display:flex;align-items:center;justify-content:space-between" {
-                h3 style="font-size:0.875rem;font-weight:600;color:var(--text-muted);margin:0;text-transform:uppercase;letter-spacing:0.05em" {
+        div .thread-pane {
+            div .thread-pane__head {
+                h2 .thread-pane__title {
                     "Conversations"
                 }
             }
-            div #conversation-list style="overflow-y:auto;flex:1" {
+            div #conversation-list .thread-pane__scroll {
                 @if siblings.is_empty() {
-                    div .text-center .text-muted style="padding:1rem;font-size:0.875rem" {
+                    div .text-center .text-muted .thread-pane__empty {
                         "No conversations yet."
                     }
                 } @else {
@@ -407,21 +385,18 @@ fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) ->
                         @let date = updated_at.get(..10).unwrap_or(updated_at);
                         @let is_active = id == active_id;
                         a
-                            .card
+                            .card .thread-card
                             href={"/b/messages/contexts/" (id)}
                             data-context-id=(id)
                             data-active=(if is_active { "true" } else { "false" })
                             aria-current=[is_active.then_some("page")]
-                            style="display:block;text-decoration:none;color:inherit;margin-bottom:0.375rem;padding:0.625rem 0.75rem;transition:box-shadow 0.15s"
-                            onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.1)'"
-                            onmouseout="this.style.boxShadow=''"
                         {
-                            div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem" {
-                                span style="font-weight:500;font-size:0.875rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1" {
+                            div .thread-card__row {
+                                span .thread-card__title {
                                     @if title.is_empty() { "Untitled" } @else { (title) }
                                 }
                                 @if !date.is_empty() {
-                                    span .text-muted style="font-size:0.75rem;flex-shrink:0" { (date) }
+                                    span .text-muted .thread-card__date { (date) }
                                 }
                             }
                         }
@@ -434,14 +409,15 @@ fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) ->
 
 fn render_conversation_messages(entries: &[db::Record]) -> Markup {
     // The `chat_page` template's `.chat-messages` wrapper already owns
-    // scroll, padding, and background for this pane (see layout.css
-    // `.page--chat .chat-messages`). We just need the #entries-list ID
+    // scroll, padding, and background for this pane (see
+    // styles/layouts/page.css `.page--chat .chat-messages`). We just need
+    // the #entries-list ID
     // for the htmx composer's hx-target — no extra scroll container or
     // we double-scroll and end up with a boxed-inside-boxed look.
     html! {
         div #entries-list {
             @if entries.is_empty() {
-                div .text-center .text-muted style="padding:2rem" {
+                div .text-center .text-muted .p-8 {
                     "No messages yet. Send the first one below."
                 }
             } @else {
@@ -469,17 +445,16 @@ fn render_conversation_composer(post_url: &str) -> Markup {
             // direct API) can still post other kinds/roles.
             input type="hidden" name="kind" value="message";
             input type="hidden" name="role" value="user";
-            div style="display:flex;gap:0.5rem;align-items:flex-end" {
+            div .flex .gap-2 .items-end {
                 textarea
-                    .form-input
+                    .form-input .flex-1 .resize-none
                     name="content"
                     placeholder="Type your message..."
                     rows="3"
                     required
-                    style="flex:1;resize:none"
                     onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.closest('form').requestSubmit();}"
                 {}
-                button .btn .btn-primary type="submit" style="height:fit-content" { "Send" }
+                button .btn .btn--primary .h-fit type="submit" { "Send" }
             }
         }
     }

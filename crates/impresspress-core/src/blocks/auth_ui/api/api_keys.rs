@@ -126,22 +126,21 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
                         });\
                     }";
                 let markup = maud::html! {
-                    div .card style="margin-bottom: var(--spacing-md)" {
-                        div .card__head { h3 .card__title { "Key created — save it now" } }
+                    div .card .api-key-card {
+                        div .card__head { h2 .card__title { "Key created — save it now" } }
                         div .card__body {
-                            p style="margin:0 0 var(--spacing-sm); font-size: 13px; color: var(--text-secondary)" {
+                            p .api-key-copy-hint .text-13 {
                                 "This is the only time the full key will be shown. Copy it now."
                             }
-                            div style="display:flex; gap: var(--spacing-sm); align-items: stretch" {
-                                code #new-api-key style="flex:1 1 auto; padding: var(--spacing-sm); background: var(--bg-secondary); border-radius: var(--radius-md); font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; user-select: all" {
+                            div .api-key-reveal-row {
+                                code #new-api-key .api-key-value .text-13 {
                                     (key_for_display)
                                 }
-                                button type="button" .btn .btn-secondary .btn-sm
-                                    style="flex: 0 0 auto"
+                                button type="button" .btn .btn--secondary .btn--sm .flex-none
                                     onclick=(copy_js)
                                 { "Copy" }
                             }
-                            p style="margin: var(--spacing-sm) 0 0; font-size: var(--text-xs); color: var(--text-muted)" {
+                            p .api-key-name-hint {
                                 "Name: " (name)
                             }
                         }
