@@ -278,7 +278,16 @@ pub fn webmcp_js_url() -> String {
 /// `format!` — the same shape `css()` has, and for the same reason: the
 /// manifest hash has to describe the bytes that are actually served, and
 /// without `embed-assets` there are no runtime bytes to compose from.
-#[cfg(feature = "embed-assets")]
+///
+/// UNGATED, unlike every other asset's bytes. This one is the deployment's
+/// agent entry point: [`WEBMCP_JS_STABLE_PATH`] promises a URL that never
+/// moves and always resolves, and a page that hardcodes it is by definition
+/// one this pipeline does not render and cannot inject anything into. Making
+/// those bytes conditional would make the promise conditional too — the
+/// browser bundle and the sandbox's own generated shop both load exactly that
+/// path, and a detached build would leave them with a script that never
+/// arrives. Roughly 10 KB, against the ~326 KB the detachable set saves; the
+/// content-hashed `/b/static/` copy stays detachable for rendered pages.
 pub fn webmcp_js() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/webmcp.js"))
 }
@@ -304,11 +313,13 @@ pub fn webmcp_js_hash() -> &'static str {
 /// get `ui::layout`'s injection and have no way to discover the current
 /// content hash, so they need one URL that never moves between deploys.
 ///
-/// It resolves in every build configuration. With `embed-assets` the
-/// pipeline answers with the bytes and an `ETag`; without it, the bytes live
-/// in R2 or on a CDN, so the pipeline redirects to [`webmcp_js_url`] rather
-/// than 404ing — which is what keeps this path usable as a public contract on
-/// Cloudflare, where the asset bytes are deliberately not in the binary.
+/// It resolves in every build configuration, by serving [`webmcp_js`]'s bytes
+/// directly. A redirect to the content-hashed URL was tried instead, to keep
+/// the bytes detachable, and it does not hold: the browser bundle serves this
+/// pipeline's responses from inside a service worker, where a cross-route
+/// redirect is one more thing that has to work before an agent's page gets
+/// any tools at all. A path whose entire purpose is "hardcode me" must not
+/// depend on the asset base being reachable.
 pub const WEBMCP_JS_STABLE_PATH: &str = "/b/webmcp/webmcp.js";
 
 /// The shared `buildRequest`/`toolOptions` fragment.
@@ -922,11 +933,7 @@ mod tests {
                         continue; // container, not a leaf -- e.g. @media
                     }
                     let prefix: String = chars[..open].iter().collect();
-                    let selector = prefix
-                        .rsplit(|c| c == '{' || c == '}')
-                        .next()
-                        .unwrap_or(&prefix)
-                        .trim();
+                    let selector = prefix.rsplit(['{', '}']).next().unwrap_or(&prefix).trim();
                     blocks.push((selector.to_string(), body));
                 }
                 _ => {}
@@ -1769,7 +1776,6 @@ mod tests {
     /// calls `toolOptions` and `buildRequest`, which only exist in the core —
     /// so serving either one raw would be a broken page, silently.
     #[test]
-    #[cfg(feature = "embed-assets")]
     fn webmcp_js_is_the_core_and_tail_composed_into_one_iife() {
         let js = super::webmcp_js();
         assert!(
@@ -1808,7 +1814,6 @@ mod tests {
     /// a cache would then hold the wrong script under a URL that claims to be
     /// immutable.
     #[test]
-    #[cfg(feature = "embed-assets")]
     fn webmcp_manifest_hash_describes_the_composed_bytes() {
         let served = super::webmcp_js().as_bytes();
         let entry = super::entry("webmcp.js");

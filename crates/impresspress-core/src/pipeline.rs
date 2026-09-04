@@ -345,51 +345,34 @@ pub async fn handle_request(
     // manifest: the script bytes don't vary by caller, only the manifest it
     // fetches does, so there's no identity to resolve here.
     if path == ui::assets::WEBMCP_JS_STABLE_PATH {
-        // With `embed-assets` the bytes are in the binary and this answers
-        // directly. Without it they were published to R2 or a CDN instead, so
-        // the only honest answer is where they actually live: a redirect to
-        // the content-hashed URL, which the Cloudflare adapter serves off its
-        // R2 binding. Either way the stable path resolves, which is what lets
-        // a page this pipeline never renders hardcode it — see
-        // `WEBMCP_JS_STABLE_PATH`.
-        #[cfg(not(feature = "embed-assets"))]
+        // Served from embedded bytes in every build. `ui::assets::webmcp_js`
+        // is deliberately ungated for this reason — see its doc comment.
+        //
+        // RFC 9110 §8.8.3: an entity-tag is an opaque *quoted-string*, so the
+        // quotes are part of the value, not formatting. A bare hash is not a
+        // well-formed `ETag`, and a client that echoes it back verbatim in
+        // `If-None-Match` — which is the whole point of sending one — offers
+        // something the comparison rules cannot match, so no `304` would ever
+        // fire even with a comparison in place. `webmcp_js_hash()` itself
+        // stays bare: it is the hash, and `webmcp_js_url()` embeds it in a
+        // filename where quotes would be nonsense.
+        let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
+        // The comparison `http::conditional::not_modified` runs is what makes
+        // the `no-cache` revalidation below actually cheap: a repeat visitor's
+        // `If-None-Match` matching this `ETag` gets a bodyless `304` instead
+        // of the whole script re-downloaded on every navigation.
+        if let Some(not_modified) = crate::http::conditional::not_modified(&msg, &etag, "no-cache")
         {
-            // 302, not 301: the target carries a content hash that changes
-            // whenever the script does, so the mapping is temporary by nature
-            // and must not be cached permanently by an intermediary.
-            return crate::http::redirect(302, &ui::assets::webmcp_js_url());
+            return not_modified;
         }
-        #[cfg(feature = "embed-assets")]
-        {
-            // RFC 9110 §8.8.3: an entity-tag is an opaque *quoted-string*, so
-            // the quotes are part of the value, not formatting. A bare hash is
-            // not a well-formed `ETag`, and a client that echoes it back
-            // verbatim in `If-None-Match` — which is the whole point of
-            // sending one — offers something the comparison rules cannot
-            // match, so no `304` would ever fire even with a comparison in
-            // place. `webmcp_js_hash()` itself stays bare: it is the hash, and
-            // `webmcp_js_url()` embeds it in a filename where quotes would be
-            // nonsense.
-            let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
-            // The comparison `http::conditional::not_modified` runs is what
-            // makes the `no-cache` revalidation below actually cheap: a repeat
-            // visitor's `If-None-Match` matching this `ETag` gets a bodyless
-            // `304` instead of the whole script re-downloaded on every
-            // navigation.
-            if let Some(not_modified) =
-                crate::http::conditional::not_modified(&msg, &etag, "no-cache")
-            {
-                return not_modified;
-            }
-            return ResponseBuilder::new()
-                .set_header("Cache-Control", "no-cache")
-                .set_header("ETag", &etag)
-                .set_header("X-Content-Type-Options", "nosniff")
-                .body(
-                    ui::assets::webmcp_js().as_bytes().to_vec(),
-                    "application/javascript; charset=utf-8",
-                );
-        }
+        return ResponseBuilder::new()
+            .set_header("Cache-Control", "no-cache")
+            .set_header("ETag", &etag)
+            .set_header("X-Content-Type-Options", "nosniff")
+            .body(
+                ui::assets::webmcp_js().as_bytes().to_vec(),
+                "application/javascript; charset=utf-8",
+            );
     }
 
     // 2a. CSRF: cookie-authenticated unsafe-method requests must pass the
