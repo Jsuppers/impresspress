@@ -1,0 +1,109 @@
+name: Deploy dev-sandbox
+
+on:
+  push:
+    branches: [main]
+    # Every input this job actually builds from. A path missing here is not a
+    # skipped run — it is dev.impresspress.org silently left on stale code
+    # until some unrelated change happens to trip the filter.
+    paths:
+      - 'examples/dev-sandbox/**'
+      - 'crates/impresspress-web/**'
+      - 'crates/impresspress-core/**'
+      - 'crates/impresspress-browser/**'
+      - 'crates/impresspress-bundle/**'
+      # `cargo install --path crates/impresspress` below builds the CLI that
+      # `build.sh` then runs; the bundle it produces depends on the CLI's
+      # asset overlay (`cli/helpers/overlays.rs`) closely enough that
+      # build.sh's own failure message names a stale CLI as the cause.
+      - 'crates/impresspress/**'
+      # The workspace manifest and the lockfile the `--locked` install
+      # resolves against: a wafer-run pin bump changes what every crate above
+      # compiles to without touching one of their paths.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/deploy-dev-sandbox.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev-sandbox
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pin explicitly — unpinned "latest" falls back to v0.9.1 on a GitHub
+          # API flake, and v0.9.1 can't parse `license.workspace = true`.
+          # This is live push-to-main infra; matches ci.yml's pin.
+          version: 'v0.15.0'
+
+      # `cargo install --path crates/impresspress` runs the impresspress build.rs,
+      # which `include_bytes!`s the impresspress-web wasm. Build it first so
+      # build.rs finds it in the canonical pkg/ location. This is the ordinary
+      # (feature-off) pkg/ the CLI itself needs to compile — the dev-sandbox's
+      # own feature-on wasm goes into pkg-dev/, built separately by build.sh below.
+      - name: Pre-build impresspress-web wasm (build.rs prereq)
+        working-directory: crates/impresspress-web
+        run: wasm-pack build --target web --release --out-dir pkg
+
+      - name: Install impresspress CLI
+        run: cargo install --path crates/impresspress --locked
+
+      # `build.sh` and the verifier both run through node, and
+      # `verify-compiler-assets.mjs` is what proves the toolchain this deploy
+      # is about to serve is the one that was built. 22 because
+      # `build-compiler.sh` refuses anything older and the scripts share a
+      # floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The compiler is NOT built here, and cannot be: composing it is ~35
+      # minutes of `wasm-opt -Oz` peaking at 12.6 GB of RSS, and this runner
+      # has 7 GB. The optimized tree is built once per pin by a developer and
+      # published as a release asset (`compiler/pack-dist.sh` prints the
+      # command; `compiler/README.md` § "Publishing the compiler" is the
+      # procedure), and this fetches it and verifies every byte of it against
+      # the manifest inside.
+      #
+      # No cache and no fallback on purpose. There is exactly one tree this
+      # deploy may serve — the one that was verified and published for
+      # `compiler/PIN.json`'s version — so a missing asset stops the deploy
+      # with instructions rather than composing something new, restoring
+      # something older, or shipping a `--fast` component. This job never sets
+      # `IMPRESSPRESS_COMPILER_ALLOW_FAST`, and `fetch-dist.sh` would refuse a
+      # `--fast` tree even if it were set.
+      - name: Fetch the published compiler dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: examples/dev-sandbox/compiler/fetch-dist.sh
+
+      # `compiler_is_current` matches `compiler/PIN.json` against the tree the
+      # step above put in place, so this builds the wasm and assembles the
+      # bundle without touching the compiler.
+      - name: Build examples/dev-sandbox
+        run: examples/dev-sandbox/build.sh
+
+      - name: Deploy to Cloudflare Workers
+        # Pinned to v3's tagged commit, not the floating major tag — this
+        # job holds CLOUDFLARE_API_TOKEN, the same reasoning as the
+        # wasm-pack-action pin above ("live push-to-main infra").
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3
+        with:
+          workingDirectory: examples/dev-sandbox
+          command: deploy
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

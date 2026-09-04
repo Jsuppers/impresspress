@@ -130,6 +130,84 @@ async fn insert_if_absent(
     Ok(true)
 }
 
+/// Write `value` for `key`, overwriting whatever is stored.
+///
+/// The counterpart to [`seed_variable_if_absent`], and the one to reach for
+/// when a value is a **fact about this deployment** rather than a default an
+/// operator may override. `seed_variable_if_absent` cannot express that: by
+/// the time a platform's post-admin seed hook runs, the admin block's
+/// `lifecycle(Init)` has already written every declared [`crate::config_vars`]
+/// default, so "insert if absent" on a declared key is a guaranteed no-op.
+/// That is exactly how the browser sandbox's
+/// `WAFER_RUN_SHARED__HAS_LANDING_PAGE = "true"` silently lost to the declared
+/// `"false"` (Plan 1 Task 10).
+///
+/// Only `value` (and `updated_at`) is written on an existing row: `name`,
+/// `description` and `sensitive` describe the variable, not the deployment,
+/// and an operator's edit to them survives. The metadata arguments are used
+/// only when the row has to be created — the same shape
+/// [`seed_variable_if_absent`] takes, so the two read alike at a call site.
+///
+/// Returns `Ok(true)` when the stored value actually changed. A boot that
+/// re-asserts a value it already holds performs no write at all, which is what
+/// keeps this callable unconditionally on every boot.
+pub async fn set_variable(
+    db: &Arc<dyn DatabaseService>,
+    key: &str,
+    value: &str,
+    name: &str,
+    description: &str,
+    sensitive: bool,
+) -> Result<bool, String> {
+    let opts = ListOptions {
+        filters: vec![wafer_block::db::Filter {
+            field: "key".to_string(),
+            operator: wafer_block::db::FilterOp::Equal,
+            value: serde_json::Value::String(key.to_string()),
+        }],
+        limit: 1,
+        offset: 0,
+        skip_count: true,
+        ..Default::default()
+    };
+    // `list` tolerates a missing table, exactly as `insert_if_absent` relies on.
+    let listed = db
+        .list(VARIABLES_TABLE, &opts)
+        .await
+        .map_err(|e| format!("list {VARIABLES_TABLE} for key `{key}`: {e}"))?;
+
+    let Some(existing) = listed.records.first() else {
+        let block = crate::config_vars::key_block_prefix(key);
+        let data = build_variable_row(key, value, name, description, "", sensitive, &block);
+        db.create(VARIABLES_TABLE, data)
+            .await
+            .map_err(|e| format!("insert variable `{key}`: {e}"))?;
+        return Ok(true);
+    };
+    // `DatabaseService::list` yields `interfaces::database::service::Record`,
+    // which `util::RecordExt` is not implemented for (that is
+    // `clients::database::Record`), so the column is read the same way
+    // `load_all_variables` reads it two functions below.
+    let stored = existing
+        .data
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if stored == value {
+        return Ok(false);
+    }
+    let mut data: HashMap<String, serde_json::Value> = HashMap::new();
+    data.insert("value".into(), serde_json::Value::String(value.to_string()));
+    data.insert(
+        "updated_at".into(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    db.update(VARIABLES_TABLE, &existing.id, data)
+        .await
+        .map_err(|e| format!("update variable `{key}`: {e}"))?;
+    Ok(true)
+}
+
 /// Auto-generate random 32-byte hex secrets for every [`wafer_block::ConfigVar`]
 /// declared with `.auto_generate()` that lacks a row in the admin variables
 /// table. Shared by all three targets.
@@ -624,5 +702,174 @@ mod wrap_grants_tests {
             load_wrap_grants_from_db(&db).await.is_empty(),
             "a schema_table_exists error must degrade to an empty grant set"
         );
+    }
+}
+
+#[cfg(test)]
+mod set_variable_tests {
+    use super::*;
+
+    /// A `DatabaseService` with the admin schema applied, built the way
+    /// `wrap_grants_tests` builds its own: the real embedded migration files
+    /// through the pre-wafer DDL runner, so the row shape under test is the
+    /// one production writes.
+    async fn migrated_db() -> Arc<dyn DatabaseService> {
+        let db: Arc<dyn DatabaseService> = Arc::new(
+            wafer_block_sqlite::service::SQLiteDatabaseService::open_in_memory()
+                .expect("open in-memory sqlite"),
+        );
+        crate::migration_helper::apply_ddl_via_service(
+            &db,
+            crate::blocks::admin::migrations::ddl_files("sqlite"),
+        )
+        .await
+        .expect("apply admin migrations");
+        db
+    }
+
+    async fn value_of(db: &Arc<dyn DatabaseService>, key: &str) -> Option<String> {
+        load_all_variables(db).await.expect("load").remove(key)
+    }
+
+    /// One column of a listed row, read the way the module itself reads them.
+    fn field<'a>(
+        row: &'a wafer_core::interfaces::database::service::Record,
+        column: &str,
+    ) -> &'a str {
+        row.data
+            .get(column)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    }
+
+    /// The bug this function exists for, stated as a test: a declared default
+    /// is already in the table when the platform hook runs, and the platform's
+    /// value has to win.
+    #[tokio::test]
+    async fn a_forced_write_overrides_a_value_seed_if_absent_would_have_kept() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+
+        // What the admin block's `Init` does with the declared default.
+        assert!(
+            seed_variable_if_absent(&db, key, "false", "Has Landing Page", "declared", false)
+                .await
+                .expect("seed the declared default"),
+            "the declared default is the first writer"
+        );
+
+        // What `seed_variable_if_absent` would do from the platform hook —
+        // nothing. This is the assertion that makes the fix load-bearing.
+        assert!(
+            !seed_variable_if_absent(&db, key, "true", "Has Landing Page", "declared", false)
+                .await
+                .expect("second seed"),
+            "seeding cannot beat a row that is already there"
+        );
+        assert_eq!(value_of(&db, key).await.as_deref(), Some("false"));
+
+        assert!(
+            set_variable(&db, key, "true", "Has Landing Page", "declared", false)
+                .await
+                .expect("force-set"),
+            "the value changed, so the row was written"
+        );
+        assert_eq!(value_of(&db, key).await.as_deref(), Some("true"));
+    }
+
+    /// Callable unconditionally on every boot: the second call writes nothing.
+    #[tokio::test]
+    async fn re_asserting_the_same_value_is_not_a_write() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+        assert!(set_variable(&db, key, "true", "n", "d", false)
+            .await
+            .expect("create"));
+        assert!(
+            !set_variable(&db, key, "true", "n", "d", false)
+                .await
+                .expect("re-assert"),
+            "an unchanged value must not be written again"
+        );
+        assert_eq!(value_of(&db, key).await.as_deref(), Some("true"));
+    }
+
+    /// On a key with no row at all it creates one, `block` column included —
+    /// the same row shape `seed_variable_if_absent` produces.
+    #[tokio::test]
+    async fn an_absent_key_is_created_with_its_block_column() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+        assert!(
+            set_variable(&db, key, "true", "Has Landing Page", "d", false)
+                .await
+                .expect("create")
+        );
+
+        let opts = ListOptions {
+            filters: vec![wafer_block::db::Filter {
+                field: "key".to_string(),
+                operator: wafer_block::db::FilterOp::Equal,
+                value: serde_json::Value::String(key.to_string()),
+            }],
+            limit: 2,
+            ..Default::default()
+        };
+        let listed = db.list(VARIABLES_TABLE, &opts).await.expect("list");
+        assert_eq!(listed.records.len(), 1, "exactly one row per key");
+        let row = &listed.records[0];
+        assert_eq!(field(row, "value"), "true");
+        assert_eq!(field(row, "name"), "Has Landing Page");
+        assert_eq!(
+            field(row, "block"),
+            crate::config_vars::key_block_prefix(key)
+        );
+    }
+
+    /// An operator's edit to the *description* survives a forced value write:
+    /// only `value` and `updated_at` are touched.
+    #[tokio::test]
+    async fn a_forced_write_keeps_the_metadata_the_row_already_had() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+        seed_variable_if_absent(
+            &db,
+            key,
+            "false",
+            "Has Landing Page",
+            "operator wording",
+            false,
+        )
+        .await
+        .expect("seed");
+
+        set_variable(
+            &db,
+            key,
+            "true",
+            "A Different Name",
+            "different wording",
+            false,
+        )
+        .await
+        .expect("force-set");
+
+        let opts = ListOptions {
+            filters: vec![wafer_block::db::Filter {
+                field: "key".to_string(),
+                operator: wafer_block::db::FilterOp::Equal,
+                value: serde_json::Value::String(key.to_string()),
+            }],
+            limit: 1,
+            ..Default::default()
+        };
+        let row = &db.list(VARIABLES_TABLE, &opts).await.expect("list").records[0];
+        assert_eq!(field(row, "value"), "true", "the value is the platform's");
+        assert_eq!(
+            field(row, "description"),
+            "operator wording",
+            "metadata describes the variable, not the deployment"
+        );
+        assert_eq!(field(row, "name"), "Has Landing Page");
     }
 }

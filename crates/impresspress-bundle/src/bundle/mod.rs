@@ -8,9 +8,20 @@ use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result};
 
+/// URL prefix the development sandbox's seed bundle is served under, added to
+/// the service worker's bypass list whenever [`AppConfig::dev_enabled`].
+///
+/// The same value as `impresspress_core::blocks::dev::seed::ROOT`. It is
+/// restated rather than imported because this crate deliberately depends on no
+/// impresspress crate — it is native bundling tooling that the wasm32 runtime
+/// never compiles — and pulling `impresspress-core` in for one string would
+/// invert that.
+pub const SEED_BYPASS_PREFIX: &str = "/seed/";
+
 /// Consumer-supplied configuration that controls how templates are rendered.
 /// All fields are optional; sensible defaults are derived from the discovered
 /// wasm-pack output pair when omitted.
+#[derive(Default)]
 pub struct AppConfig {
     /// Log prefix shown in sw.js / loader.js console messages
     /// (e.g. `"impresspress-web"`). Defaults to the discovered base name.
@@ -43,6 +54,15 @@ pub struct AppConfig {
     /// action; other apps surface the error to the user instead and let
     /// them choose whether to clear data.
     pub opfs_wipe_on_recovery: bool,
+    /// Whether the Service Worker boots the runtime with the browser
+    /// development sandbox on: `sw.js.tmpl`'s `__DEV_ENABLED__` placeholder
+    /// renders one constant, `const DEV_ENABLED = true;`, which both
+    /// `initialize({ dev: DEV_ENABLED })` and the isolation-header
+    /// passthrough read. **Default: false.**
+    /// Driven by `[dev] enabled` in `impresspress.toml`; the runtime still
+    /// needs to have been compiled with `impresspress-web/browser-devtools`
+    /// for the flag to register anything.
+    pub dev_enabled: bool,
 }
 
 /// Discover the wasm-pack output pair (`{base}.js` + `{base}_bg.wasm`) in
@@ -202,16 +222,14 @@ pub fn run(pkg_dir: &Path, repo_dir: &Path, app: AppConfig) -> Result<()> {
             ),
         );
     }
-    let manifest = manifest::AssetManifest {
-        build_id: build_id.clone(),
-        assets: manifest_assets,
-    };
-    manifest.write(&pkg_dir.join("asset-manifest.json"))?;
-
-    // 5. Render templates.
+    // 5. Render templates. BEFORE the manifest is written, because the
+    //    manifest now enumerates the directory and the rendered `sw.js` /
+    //    `loader.js` / `index.html` have to be in it — a listing taken first
+    //    would name three `*.tmpl` files that no longer exist and omit the
+    //    three real ones.
     let base_name = pair.as_ref().map(|(b, _, _)| b.as_str()).unwrap_or("app");
     let vars = build_template_vars(
-        build_id,
+        build_id.clone(),
         wasm_js_val,
         wasm_bin_val,
         wasm_js_prefix_val,
@@ -221,6 +239,37 @@ pub fn run(pkg_dir: &Path, repo_dir: &Path, app: AppConfig) -> Result<()> {
     render_if_exists(pkg_dir, "sw.js.tmpl", "sw.js", &vars)?;
     render_if_exists(pkg_dir, "loader.js.tmpl", "loader.js", &vars)?;
     render_if_exists(pkg_dir, "index.html.tmpl", "index.html", &vars)?;
+
+    // 6. The manifest, last: `assets` (the two logical names templates
+    //    reference) plus `files` (the whole shell, for a runtime that needs
+    //    to enumerate the static files it was shipped inside of — see
+    //    `AssetManifest::files`).
+    //
+    //    `asset-manifest.json` names itself in `files`. That is deliberate
+    //    and costs nothing: the listing is of NAMES, taken before the file
+    //    is written, and the name is fixed — so a consumer copying every
+    //    listed file gets the manifest too, which is what a faithful copy of
+    //    the shell means. Nothing an overlay adds afterwards
+    //    (`impresspress`'s `apply_overlays`, which lays the sandbox's `seed/`
+    //    and compiler tree down after this returns) is listed either — it is
+    //    not there yet when the listing is taken.
+    //
+    //    `run` is NOT the only writer into this directory, though: `embed ×
+    //    web` bundles in place in wasm-pack's own `--out-dir`, so the npm
+    //    metadata wasm-pack wrote is already sitting beside the assets.
+    //    `list_dist_files` holds those back — see `is_package_metadata`.
+    let mut files = manifest::list_dist_files(pkg_dir)?;
+    let manifest_name = "asset-manifest.json".to_string();
+    if !files.contains(&manifest_name) {
+        files.push(manifest_name);
+        files.sort();
+    }
+    let manifest = manifest::AssetManifest {
+        build_id,
+        assets: manifest_assets,
+        files,
+    };
+    manifest.write(&pkg_dir.join("asset-manifest.json"))?;
 
     Ok(())
 }
@@ -287,11 +336,24 @@ fn build_template_vars(
     // list is empty we expand to the empty string, leaving the existing
     // bypass expression intact. Each entry is quoted and escaped defensively
     // against single quotes in the path.
-    let extra_bypass = if app.extra_bypass_prefix.is_empty() {
+    // The development sandbox's seed bundle is served by the static host, not
+    // by the runtime: on a cold boot the service worker fetches
+    // `/seed/manifest.json` and imports generation 0 from it, and a page
+    // asking for the same files must reach the host too. A runtime that
+    // intercepted the prefix would answer from the published site — which,
+    // on the boot that needs the seed, is empty. Added here rather than by
+    // every consumer, so "the sandbox is on" is the only thing an app has to
+    // say. See `impresspress_core::blocks::dev::seed::ROOT`, which this
+    // crate cannot import (it depends on nothing of impresspress's).
+    let mut prefixes: Vec<&str> = app.extra_bypass_prefix.iter().map(String::as_str).collect();
+    if app.dev_enabled && !prefixes.contains(&SEED_BYPASS_PREFIX) {
+        prefixes.push(SEED_BYPASS_PREFIX);
+    }
+    let extra_bypass = if prefixes.is_empty() {
         String::new()
     } else {
         let mut out = String::new();
-        for prefix in &app.extra_bypass_prefix {
+        for prefix in prefixes {
             let escaped = prefix.replace('\\', "\\\\").replace('\'', "\\'");
             out.push_str(" || url.pathname.startsWith('");
             out.push_str(&escaped);
@@ -326,6 +388,16 @@ fn build_template_vars(
     vars.insert(
         "OPFS_WIPE_ON_RECOVERY".to_string(),
         if app.opfs_wipe_on_recovery {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        },
+    );
+    // Rendered into `initialize({ dev: __DEV_ENABLED__ })` — a JS boolean
+    // literal, not a string, so the runtime reads it back as `Some(bool)`.
+    vars.insert(
+        "DEV_ENABLED".to_string(),
+        if app.dev_enabled {
             "true".to_string()
         } else {
             "false".to_string()

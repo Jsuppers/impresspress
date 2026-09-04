@@ -1,0 +1,4444 @@
+{
+  "schema_version": 1,
+  "tools": [
+    {
+      "description": "List products with their status (`draft`, `active`, `archived`) and moderation state.",
+      "inputSchema": {
+        "properties": {
+          "group_id": {
+            "description": "Exact-match filter on the product's group.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "default": 1,
+            "description": "1-based page number. Values below 1 clamp to 1.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 20,
+            "description": "Rows per page, capped at 100.",
+            "format": "uint32",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "search": {
+            "description": "`LIKE '%…%'` filter on the product name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Exact-match filter on the publication state.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/products/api/admin/products",
+        "path_params": [],
+        "query_params": [
+          "group_id",
+          "page",
+          "page_size",
+          "search",
+          "status"
+        ]
+      },
+      "name": "shop_list_products",
+      "outputSchema": {
+        "description": "One page of product rows.",
+        "properties": {
+          "page": {
+            "description": "1-based index of this page.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Rows per page used to compute `page`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "records": {
+            "description": "Products on this page, newest first.",
+            "items": {
+              "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
+              "properties": {
+                "approval_status": {
+                  "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+                  "enum": [
+                    "draft",
+                    "pending",
+                    "approved",
+                    "rejected",
+                    "suspended"
+                  ],
+                  "type": "string"
+                },
+                "category": {
+                  "type": "string"
+                },
+                "created_at": {
+                  "description": "RFC 3339 creation timestamp.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "created_by": {
+                  "description": "Id of the user who created the row.",
+                  "type": "string"
+                },
+                "currency": {
+                  "description": "ISO 4217 presentment currency.",
+                  "type": "string"
+                },
+                "current_version": {
+                  "description": "Version counter of the product's immutable offer definitions.",
+                  "format": "int64",
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "deleted_at": {
+                  "description": "RFC 3339 soft-delete timestamp, or `null` unless the product has been\nsoft-deleted.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": {
+                  "type": "string"
+                },
+                "fulfillment_kind": {
+                  "description": "How a purchase is fulfilled.",
+                  "enum": [
+                    "none",
+                    "manual",
+                    "download",
+                    "entitlement",
+                    "webhook"
+                  ],
+                  "type": "string"
+                },
+                "group_id": {
+                  "description": "Group the product is listed under, or empty.",
+                  "type": "string"
+                },
+                "group_template_id": {
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Stable product identifier.",
+                  "type": "string"
+                },
+                "image_url": {
+                  "type": "string"
+                },
+                "metadata": {
+                  "additionalProperties": true,
+                  "description": "Free-form key/value metadata attached by the product builder.",
+                  "type": "object"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "owner_id": {
+                  "description": "Owning seller's user id; empty for platform products.",
+                  "type": "string"
+                },
+                "owner_kind": {
+                  "description": "`platform` for an administrator-owned product, `user` for a seller's.",
+                  "enum": [
+                    "platform",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "product_template_id": {
+                  "description": "Product builder template this product was created from.",
+                  "type": "string"
+                },
+                "published_at": {
+                  "description": "RFC 3339 timestamp the product last became active, or `null`.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "requires": {
+                  "description": "Id of a product the buyer must already own before checkout, or empty.",
+                  "type": "string"
+                },
+                "seller_account_id": {
+                  "description": "Seller account the product sells through; empty for platform products.",
+                  "type": "string"
+                },
+                "slug": {
+                  "description": "URL slug, unique per owner among non-deleted products. Empty when the\nproduct has none.",
+                  "type": "string"
+                },
+                "status": {
+                  "description": "Publication state: `draft`, `pending_review` (seller product awaiting\nmoderation), `active` (in the public catalog) or `archived`.",
+                  "enum": [
+                    "draft",
+                    "pending_review",
+                    "active",
+                    "archived"
+                  ],
+                  "type": "string"
+                },
+                "stock": {
+                  "description": "Units in stock; `0` when inventory is not tracked.",
+                  "format": "int64",
+                  "type": "integer"
+                },
+                "stripe_product_id": {
+                  "description": "Stripe Product id once the catalog has been synchronized, or empty.",
+                  "type": "string"
+                },
+                "submitted_at": {
+                  "description": "RFC 3339 timestamp the seller last submitted the product for\nmoderation, or `null`.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type_id": {
+                  "description": "Product type (taxonomy) id, or empty.",
+                  "type": "string"
+                },
+                "updated_at": {
+                  "description": "RFC 3339 timestamp of the last modification.",
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "description",
+                "slug",
+                "currency",
+                "status",
+                "category",
+                "tags",
+                "metadata",
+                "image_url",
+                "stock",
+                "group_id",
+                "type_id",
+                "group_template_id",
+                "product_template_id",
+                "requires",
+                "created_by",
+                "owner_kind",
+                "owner_id",
+                "seller_account_id",
+                "approval_status",
+                "fulfillment_kind",
+                "stripe_product_id",
+                "current_version",
+                "submitted_at",
+                "published_at",
+                "deleted_at",
+                "created_at",
+                "updated_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "total_count": {
+            "description": "Total products matching the filters, across all pages.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "records",
+          "total_count",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Create a product. It starts in `draft` status and is invisible to shoppers until `shop_update_product` sets `status: \"active\"`.",
+      "inputSchema": {
+        "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "currency": {
+            "description": "ISO 4217 currency. A seller product defaults to the platform default\ncurrency when omitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fulfillment_kind": {
+            "enum": [
+              "none",
+              "manual",
+              "download",
+              "entitlement",
+              "webhook",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_id": {
+            "description": "Group to list the product under. A seller may only use a group they\nown.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_template_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form key/value metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "product_template_id": {
+            "description": "Product builder template. A seller product defaults to the seeded\n`default` template when omitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires": {
+            "description": "Id of a product the buyer must already own before checkout.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Initial publication state. Defaults to `draft`; a seller product is\nalways created as `draft` regardless of this value.",
+            "enum": [
+              "draft",
+              "pending_review",
+              "active",
+              "archived",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stock": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "type_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "category",
+          "currency",
+          "description",
+          "fulfillment_kind",
+          "group_id",
+          "group_template_id",
+          "image_url",
+          "metadata",
+          "name",
+          "product_template_id",
+          "requires",
+          "slug",
+          "status",
+          "stock",
+          "tags",
+          "type_id"
+        ],
+        "method": "post",
+        "path": "/b/products/api/admin/products",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "shop_create_product",
+      "outputSchema": {
+        "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
+        "properties": {
+          "approval_status": {
+            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+            "enum": [
+              "draft",
+              "pending",
+              "approved",
+              "rejected",
+              "suspended"
+            ],
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "created_at": {
+            "description": "RFC 3339 creation timestamp.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "description": "Id of the user who created the row.",
+            "type": "string"
+          },
+          "currency": {
+            "description": "ISO 4217 presentment currency.",
+            "type": "string"
+          },
+          "current_version": {
+            "description": "Version counter of the product's immutable offer definitions.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "deleted_at": {
+            "description": "RFC 3339 soft-delete timestamp, or `null` unless the product has been\nsoft-deleted.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "fulfillment_kind": {
+            "description": "How a purchase is fulfilled.",
+            "enum": [
+              "none",
+              "manual",
+              "download",
+              "entitlement",
+              "webhook"
+            ],
+            "type": "string"
+          },
+          "group_id": {
+            "description": "Group the product is listed under, or empty.",
+            "type": "string"
+          },
+          "group_template_id": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable product identifier.",
+            "type": "string"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form key/value metadata attached by the product builder.",
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_id": {
+            "description": "Owning seller's user id; empty for platform products.",
+            "type": "string"
+          },
+          "owner_kind": {
+            "description": "`platform` for an administrator-owned product, `user` for a seller's.",
+            "enum": [
+              "platform",
+              "user"
+            ],
+            "type": "string"
+          },
+          "product_template_id": {
+            "description": "Product builder template this product was created from.",
+            "type": "string"
+          },
+          "published_at": {
+            "description": "RFC 3339 timestamp the product last became active, or `null`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires": {
+            "description": "Id of a product the buyer must already own before checkout, or empty.",
+            "type": "string"
+          },
+          "seller_account_id": {
+            "description": "Seller account the product sells through; empty for platform products.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "URL slug, unique per owner among non-deleted products. Empty when the\nproduct has none.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Publication state: `draft`, `pending_review` (seller product awaiting\nmoderation), `active` (in the public catalog) or `archived`.",
+            "enum": [
+              "draft",
+              "pending_review",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "stock": {
+            "description": "Units in stock; `0` when inventory is not tracked.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "stripe_product_id": {
+            "description": "Stripe Product id once the catalog has been synchronized, or empty.",
+            "type": "string"
+          },
+          "submitted_at": {
+            "description": "RFC 3339 timestamp the seller last submitted the product for\nmoderation, or `null`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type_id": {
+            "description": "Product type (taxonomy) id, or empty.",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "RFC 3339 timestamp of the last modification.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "slug",
+          "currency",
+          "status",
+          "category",
+          "tags",
+          "metadata",
+          "image_url",
+          "stock",
+          "group_id",
+          "type_id",
+          "group_template_id",
+          "product_template_id",
+          "requires",
+          "created_by",
+          "owner_kind",
+          "owner_id",
+          "seller_account_id",
+          "approval_status",
+          "fulfillment_kind",
+          "stripe_product_id",
+          "current_version",
+          "submitted_at",
+          "published_at",
+          "deleted_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Update a product's fields, including `status`. Set `status: \"active\"` to make a draft product visible to shoppers, or `\"archived\"` to retire it without deleting it.",
+      "inputSchema": {
+        "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "currency": {
+            "description": "ISO 4217 currency.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fulfillment_kind": {
+            "enum": [
+              "none",
+              "manual",
+              "download",
+              "entitlement",
+              "webhook",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_template_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form key/value metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_template_id": {
+            "description": "Product builder template.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires": {
+            "description": "Id of a product the buyer must already own before checkout.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Publication state. A seller may set `draft`, `active` or `archived`;\n`active` on a moderated product submits it for review instead.",
+            "enum": [
+              "draft",
+              "pending_review",
+              "active",
+              "archived",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stock": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "type_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "category",
+          "currency",
+          "description",
+          "fulfillment_kind",
+          "group_id",
+          "group_template_id",
+          "image_url",
+          "metadata",
+          "name",
+          "product_template_id",
+          "requires",
+          "slug",
+          "status",
+          "stock",
+          "tags",
+          "type_id"
+        ],
+        "method": "patch",
+        "path": "/b/products/api/admin/products/{id}",
+        "path_params": [
+          "id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_update_product",
+      "outputSchema": {
+        "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
+        "properties": {
+          "approval_status": {
+            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+            "enum": [
+              "draft",
+              "pending",
+              "approved",
+              "rejected",
+              "suspended"
+            ],
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "created_at": {
+            "description": "RFC 3339 creation timestamp.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "description": "Id of the user who created the row.",
+            "type": "string"
+          },
+          "currency": {
+            "description": "ISO 4217 presentment currency.",
+            "type": "string"
+          },
+          "current_version": {
+            "description": "Version counter of the product's immutable offer definitions.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "deleted_at": {
+            "description": "RFC 3339 soft-delete timestamp, or `null` unless the product has been\nsoft-deleted.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "fulfillment_kind": {
+            "description": "How a purchase is fulfilled.",
+            "enum": [
+              "none",
+              "manual",
+              "download",
+              "entitlement",
+              "webhook"
+            ],
+            "type": "string"
+          },
+          "group_id": {
+            "description": "Group the product is listed under, or empty.",
+            "type": "string"
+          },
+          "group_template_id": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable product identifier.",
+            "type": "string"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form key/value metadata attached by the product builder.",
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_id": {
+            "description": "Owning seller's user id; empty for platform products.",
+            "type": "string"
+          },
+          "owner_kind": {
+            "description": "`platform` for an administrator-owned product, `user` for a seller's.",
+            "enum": [
+              "platform",
+              "user"
+            ],
+            "type": "string"
+          },
+          "product_template_id": {
+            "description": "Product builder template this product was created from.",
+            "type": "string"
+          },
+          "published_at": {
+            "description": "RFC 3339 timestamp the product last became active, or `null`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires": {
+            "description": "Id of a product the buyer must already own before checkout, or empty.",
+            "type": "string"
+          },
+          "seller_account_id": {
+            "description": "Seller account the product sells through; empty for platform products.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "URL slug, unique per owner among non-deleted products. Empty when the\nproduct has none.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Publication state: `draft`, `pending_review` (seller product awaiting\nmoderation), `active` (in the public catalog) or `archived`.",
+            "enum": [
+              "draft",
+              "pending_review",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "stock": {
+            "description": "Units in stock; `0` when inventory is not tracked.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "stripe_product_id": {
+            "description": "Stripe Product id once the catalog has been synchronized, or empty.",
+            "type": "string"
+          },
+          "submitted_at": {
+            "description": "RFC 3339 timestamp the seller last submitted the product for\nmoderation, or `null`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type_id": {
+            "description": "Product type (taxonomy) id, or empty.",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "RFC 3339 timestamp of the last modification.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "slug",
+          "currency",
+          "status",
+          "category",
+          "tags",
+          "metadata",
+          "image_url",
+          "stock",
+          "group_id",
+          "type_id",
+          "group_template_id",
+          "product_template_id",
+          "requires",
+          "created_by",
+          "owner_kind",
+          "owner_id",
+          "seller_account_id",
+          "approval_status",
+          "fulfillment_kind",
+          "stripe_product_id",
+          "current_version",
+          "submitted_at",
+          "published_at",
+          "deleted_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Soft-delete a product, hiding it from shoppers immediately. Call `shop_restore_product` to undo.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "delete",
+        "path": "/b/products/api/admin/products/{id}",
+        "path_params": [
+          "id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_delete_product",
+      "outputSchema": {
+        "description": "Response body of every CRUD delete.",
+        "properties": {
+          "deleted": {
+            "description": "Always `true`: a delete that did not happen is an error response.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Restore a soft-deleted product, undoing `shop_delete_product` and clearing `deleted_at`. The product is not editable through `shop_update_product` until this call succeeds.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "post",
+        "path": "/b/products/api/admin/products/{id}/restore",
+        "path_params": [
+          "id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_restore_product",
+      "outputSchema": {
+        "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
+        "properties": {
+          "approval_status": {
+            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+            "enum": [
+              "draft",
+              "pending",
+              "approved",
+              "rejected",
+              "suspended"
+            ],
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "created_at": {
+            "description": "RFC 3339 creation timestamp.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "description": "Id of the user who created the row.",
+            "type": "string"
+          },
+          "currency": {
+            "description": "ISO 4217 presentment currency.",
+            "type": "string"
+          },
+          "current_version": {
+            "description": "Version counter of the product's immutable offer definitions.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "deleted_at": {
+            "description": "RFC 3339 soft-delete timestamp, or `null` unless the product has been\nsoft-deleted.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "fulfillment_kind": {
+            "description": "How a purchase is fulfilled.",
+            "enum": [
+              "none",
+              "manual",
+              "download",
+              "entitlement",
+              "webhook"
+            ],
+            "type": "string"
+          },
+          "group_id": {
+            "description": "Group the product is listed under, or empty.",
+            "type": "string"
+          },
+          "group_template_id": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable product identifier.",
+            "type": "string"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form key/value metadata attached by the product builder.",
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_id": {
+            "description": "Owning seller's user id; empty for platform products.",
+            "type": "string"
+          },
+          "owner_kind": {
+            "description": "`platform` for an administrator-owned product, `user` for a seller's.",
+            "enum": [
+              "platform",
+              "user"
+            ],
+            "type": "string"
+          },
+          "product_template_id": {
+            "description": "Product builder template this product was created from.",
+            "type": "string"
+          },
+          "published_at": {
+            "description": "RFC 3339 timestamp the product last became active, or `null`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires": {
+            "description": "Id of a product the buyer must already own before checkout, or empty.",
+            "type": "string"
+          },
+          "seller_account_id": {
+            "description": "Seller account the product sells through; empty for platform products.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "URL slug, unique per owner among non-deleted products. Empty when the\nproduct has none.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Publication state: `draft`, `pending_review` (seller product awaiting\nmoderation), `active` (in the public catalog) or `archived`.",
+            "enum": [
+              "draft",
+              "pending_review",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "stock": {
+            "description": "Units in stock; `0` when inventory is not tracked.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "stripe_product_id": {
+            "description": "Stripe Product id once the catalog has been synchronized, or empty.",
+            "type": "string"
+          },
+          "submitted_at": {
+            "description": "RFC 3339 timestamp the seller last submitted the product for\nmoderation, or `null`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type_id": {
+            "description": "Product type (taxonomy) id, or empty.",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "RFC 3339 timestamp of the last modification.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "slug",
+          "currency",
+          "status",
+          "category",
+          "tags",
+          "metadata",
+          "image_url",
+          "stock",
+          "group_id",
+          "type_id",
+          "group_template_id",
+          "product_template_id",
+          "requires",
+          "created_by",
+          "owner_kind",
+          "owner_id",
+          "seller_account_id",
+          "approval_status",
+          "fulfillment_kind",
+          "stripe_product_id",
+          "current_version",
+          "submitted_at",
+          "published_at",
+          "deleted_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "List a product's pricing offers, draft and published.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "product_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/products/api/admin/products/{product_id}/offers",
+        "path_params": [
+          "product_id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_list_offers",
+      "outputSchema": {
+        "properties": {
+          "offers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "offer": {
+                  "properties": {
+                    "billing_scheme": {
+                      "type": "string"
+                    },
+                    "checkout": {
+                      "type": "object"
+                    },
+                    "components": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "currency": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "interval_count": {
+                      "type": "integer"
+                    },
+                    "mode": {
+                      "enum": [
+                        "payment",
+                        "subscription"
+                      ],
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "pricing_model": {
+                      "enum": [
+                        "fixed",
+                        "components"
+                      ],
+                      "type": "string"
+                    },
+                    "product_id": {
+                      "type": "string"
+                    },
+                    "recurring_interval": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "stripe_price_id": {
+                      "type": "string"
+                    },
+                    "stripe_product_id": {
+                      "type": "string"
+                    },
+                    "tax_behavior": {
+                      "type": "string"
+                    },
+                    "usage_type": {
+                      "type": "string"
+                    },
+                    "variables": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "product_id",
+                    "version",
+                    "name",
+                    "mode",
+                    "currency",
+                    "pricing_model",
+                    "interval_count",
+                    "usage_type",
+                    "billing_scheme",
+                    "tax_behavior",
+                    "variables",
+                    "components",
+                    "checkout",
+                    "stripe_product_id",
+                    "stripe_price_id"
+                  ],
+                  "type": "object"
+                },
+                "status": {
+                  "enum": [
+                    "draft",
+                    "active",
+                    "archived"
+                  ],
+                  "type": "string"
+                },
+                "sync_error": {
+                  "type": "string"
+                },
+                "sync_status": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "sync_status",
+                "sync_error",
+                "offer"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "offers"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Create a pricing offer for a product. It starts in `draft` status, unpurchasable until `shop_publish_offer` publishes it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "billing_scheme": {
+            "enum": [
+              "per_unit",
+              "tiered"
+            ],
+            "type": "string"
+          },
+          "checkout": {
+            "type": "object"
+          },
+          "components": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "interval_count": {
+            "default": 1,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "payment",
+              "subscription"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pricing_model": {
+            "enum": [
+              "fixed",
+              "components"
+            ],
+            "type": "string"
+          },
+          "product_id": {
+            "type": "string"
+          },
+          "recurring_interval": {
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "year",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_behavior": {
+            "enum": [
+              "unspecified",
+              "inclusive",
+              "exclusive"
+            ],
+            "type": "string"
+          },
+          "usage_type": {
+            "enum": [
+              "licensed",
+              "metered"
+            ],
+            "type": "string"
+          },
+          "variables": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "billing_scheme",
+          "components",
+          "currency",
+          "mode",
+          "name",
+          "pricing_model",
+          "product_id",
+          "tax_behavior",
+          "usage_type"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "billing_scheme",
+          "checkout",
+          "components",
+          "currency",
+          "interval_count",
+          "mode",
+          "name",
+          "pricing_model",
+          "recurring_interval",
+          "tax_behavior",
+          "usage_type",
+          "variables"
+        ],
+        "method": "post",
+        "path": "/b/products/api/admin/products/{product_id}/offers",
+        "path_params": [
+          "product_id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_create_offer",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offer": {
+            "properties": {
+              "billing_scheme": {
+                "type": "string"
+              },
+              "checkout": {
+                "type": "object"
+              },
+              "components": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "currency": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "interval_count": {
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "payment",
+                  "subscription"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "pricing_model": {
+                "enum": [
+                  "fixed",
+                  "components"
+                ],
+                "type": "string"
+              },
+              "product_id": {
+                "type": "string"
+              },
+              "recurring_interval": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stripe_price_id": {
+                "type": "string"
+              },
+              "stripe_product_id": {
+                "type": "string"
+              },
+              "tax_behavior": {
+                "type": "string"
+              },
+              "usage_type": {
+                "type": "string"
+              },
+              "variables": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "id",
+              "product_id",
+              "version",
+              "name",
+              "mode",
+              "currency",
+              "pricing_model",
+              "interval_count",
+              "usage_type",
+              "billing_scheme",
+              "tax_behavior",
+              "variables",
+              "components",
+              "checkout",
+              "stripe_product_id",
+              "stripe_price_id"
+            ],
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "draft",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "sync_error": {
+            "type": "string"
+          },
+          "sync_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "sync_status",
+          "sync_error",
+          "offer"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Update a draft offer's pricing definition. Only a `draft` offer is editable this way — a published offer must be archived with `shop_archive_offer` and recreated with `shop_create_offer` to change its pricing.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "billing_scheme": {
+            "enum": [
+              "per_unit",
+              "tiered"
+            ],
+            "type": "string"
+          },
+          "checkout": {
+            "type": "object"
+          },
+          "components": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "interval_count": {
+            "default": 1,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "payment",
+              "subscription"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "offer_id": {
+            "type": "string"
+          },
+          "pricing_model": {
+            "enum": [
+              "fixed",
+              "components"
+            ],
+            "type": "string"
+          },
+          "product_id": {
+            "type": "string"
+          },
+          "recurring_interval": {
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "year",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_behavior": {
+            "enum": [
+              "unspecified",
+              "inclusive",
+              "exclusive"
+            ],
+            "type": "string"
+          },
+          "usage_type": {
+            "enum": [
+              "licensed",
+              "metered"
+            ],
+            "type": "string"
+          },
+          "variables": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "billing_scheme",
+          "components",
+          "currency",
+          "mode",
+          "name",
+          "offer_id",
+          "pricing_model",
+          "product_id",
+          "tax_behavior",
+          "usage_type"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "billing_scheme",
+          "checkout",
+          "components",
+          "currency",
+          "interval_count",
+          "mode",
+          "name",
+          "pricing_model",
+          "recurring_interval",
+          "tax_behavior",
+          "usage_type",
+          "variables"
+        ],
+        "method": "patch",
+        "path": "/b/products/api/admin/products/{product_id}/offers/{offer_id}",
+        "path_params": [
+          "offer_id",
+          "product_id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_update_offer",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offer": {
+            "properties": {
+              "billing_scheme": {
+                "type": "string"
+              },
+              "checkout": {
+                "type": "object"
+              },
+              "components": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "currency": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "interval_count": {
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "payment",
+                  "subscription"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "pricing_model": {
+                "enum": [
+                  "fixed",
+                  "components"
+                ],
+                "type": "string"
+              },
+              "product_id": {
+                "type": "string"
+              },
+              "recurring_interval": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stripe_price_id": {
+                "type": "string"
+              },
+              "stripe_product_id": {
+                "type": "string"
+              },
+              "tax_behavior": {
+                "type": "string"
+              },
+              "usage_type": {
+                "type": "string"
+              },
+              "variables": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "id",
+              "product_id",
+              "version",
+              "name",
+              "mode",
+              "currency",
+              "pricing_model",
+              "interval_count",
+              "usage_type",
+              "billing_scheme",
+              "tax_behavior",
+              "variables",
+              "components",
+              "checkout",
+              "stripe_product_id",
+              "stripe_price_id"
+            ],
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "draft",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "sync_error": {
+            "type": "string"
+          },
+          "sync_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "sync_status",
+          "sync_error",
+          "offer"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Publish a draft offer, making it purchasable by shoppers.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offer_id": {
+            "type": "string"
+          },
+          "product_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "offer_id",
+          "product_id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "post",
+        "path": "/b/products/api/admin/products/{product_id}/offers/{offer_id}/publish",
+        "path_params": [
+          "offer_id",
+          "product_id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_publish_offer",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offer": {
+            "properties": {
+              "billing_scheme": {
+                "type": "string"
+              },
+              "checkout": {
+                "type": "object"
+              },
+              "components": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "currency": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "interval_count": {
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "payment",
+                  "subscription"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "pricing_model": {
+                "enum": [
+                  "fixed",
+                  "components"
+                ],
+                "type": "string"
+              },
+              "product_id": {
+                "type": "string"
+              },
+              "recurring_interval": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stripe_price_id": {
+                "type": "string"
+              },
+              "stripe_product_id": {
+                "type": "string"
+              },
+              "tax_behavior": {
+                "type": "string"
+              },
+              "usage_type": {
+                "type": "string"
+              },
+              "variables": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "id",
+              "product_id",
+              "version",
+              "name",
+              "mode",
+              "currency",
+              "pricing_model",
+              "interval_count",
+              "usage_type",
+              "billing_scheme",
+              "tax_behavior",
+              "variables",
+              "components",
+              "checkout",
+              "stripe_product_id",
+              "stripe_price_id"
+            ],
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "draft",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "sync_error": {
+            "type": "string"
+          },
+          "sync_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "sync_status",
+          "sync_error",
+          "offer"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Archive an offer, removing it from sale immediately without deleting its history.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offer_id": {
+            "type": "string"
+          },
+          "product_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "offer_id",
+          "product_id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "delete",
+        "path": "/b/products/api/admin/products/{product_id}/offers/{offer_id}",
+        "path_params": [
+          "offer_id",
+          "product_id"
+        ],
+        "query_params": []
+      },
+      "name": "shop_archive_offer",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offer": {
+            "properties": {
+              "billing_scheme": {
+                "type": "string"
+              },
+              "checkout": {
+                "type": "object"
+              },
+              "components": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "currency": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "interval_count": {
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "payment",
+                  "subscription"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "pricing_model": {
+                "enum": [
+                  "fixed",
+                  "components"
+                ],
+                "type": "string"
+              },
+              "product_id": {
+                "type": "string"
+              },
+              "recurring_interval": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stripe_price_id": {
+                "type": "string"
+              },
+              "stripe_product_id": {
+                "type": "string"
+              },
+              "tax_behavior": {
+                "type": "string"
+              },
+              "usage_type": {
+                "type": "string"
+              },
+              "variables": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "id",
+              "product_id",
+              "version",
+              "name",
+              "mode",
+              "currency",
+              "pricing_model",
+              "interval_count",
+              "usage_type",
+              "billing_scheme",
+              "tax_behavior",
+              "variables",
+              "components",
+              "checkout",
+              "stripe_product_id",
+              "stripe_price_id"
+            ],
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "draft",
+              "active",
+              "archived"
+            ],
+            "type": "string"
+          },
+          "sync_error": {
+            "type": "string"
+          },
+          "sync_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "sync_status",
+          "sync_error",
+          "offer"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "List the product groups used to organize the catalog.",
+      "inputSchema": {
+        "properties": {
+          "page": {
+            "default": 1,
+            "description": "1-based page number. Values below 1 clamp to 1.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 20,
+            "description": "Rows per page, capped at 100.",
+            "format": "uint32",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/products/api/admin/groups",
+        "path_params": [],
+        "query_params": [
+          "page",
+          "page_size"
+        ]
+      },
+      "name": "shop_list_groups",
+      "outputSchema": {
+        "description": "One page of group rows.",
+        "properties": {
+          "page": {
+            "description": "1-based index of this page.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Rows per page used to compute `page`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "records": {
+            "description": "Groups on this page.",
+            "items": {
+              "description": "A product group row: every column of `impresspress__products__groups`.",
+              "properties": {
+                "created_at": {
+                  "description": "RFC 3339 creation timestamp.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "created_by": {
+                  "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "group_template_id": {
+                  "description": "Group template the group was created from.",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Stable group identifier.",
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "description": "`active` unless the group has been retired.",
+                  "type": "string"
+                },
+                "updated_at": {
+                  "description": "RFC 3339 timestamp of the last modification.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "user_id": {
+                  "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "description",
+                "group_template_id",
+                "user_id",
+                "status",
+                "created_by",
+                "created_at",
+                "updated_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "total_count": {
+            "description": "Total groups matching the filters, across all pages.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "records",
+          "total_count",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Create a product group. Assign a product to it by setting that product's `group_id` with `shop_update_product`.",
+      "inputSchema": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_template_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "description": "Owner of the group. Defaults to the administrator creating it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "description",
+          "group_template_id",
+          "name",
+          "status",
+          "user_id"
+        ],
+        "method": "post",
+        "path": "/b/products/api/admin/groups",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "shop_create_group",
+      "outputSchema": {
+        "description": "A product group row: every column of `impresspress__products__groups`.",
+        "properties": {
+          "created_at": {
+            "description": "RFC 3339 creation timestamp.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "description": "Id of the user who created the row: the administrator on the admin\ntier (the owner is `user_id`), the owner on the owner tier.",
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "group_template_id": {
+            "description": "Group template the group was created from.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable group identifier.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`active` unless the group has been retired.",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "RFC 3339 timestamp of the last modification.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "Id of the user who owns the group. The owner tier lists and edits\nonly groups whose `user_id` is the caller.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "group_template_id",
+          "user_id",
+          "status",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Read the sandbox state: active generation, runtime generation, active blocks, any activation in progress. Call this first.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/status",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_status",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/status`.",
+        "properties": {
+          "activation": {
+            "additionalProperties": false,
+            "description": "The activation in progress, if any.",
+            "properties": {
+              "detail": {
+                "description": "Human-readable detail for the progress panel.",
+                "type": "string"
+              },
+              "generation_id": {
+                "description": "The generation being activated.",
+                "type": "string"
+              },
+              "phase": {
+                "description": "Which phase it has reached.",
+                "oneOf": [
+                  {
+                    "const": "idle",
+                    "description": "Nothing in flight.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Hashes, manifests and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "building_runtime",
+                    "description": "A candidate runtime is being constructed from the block set.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "publishing",
+                    "description": "The site files are being written into `wafer-run/web/site`.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "The generation is live.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "The activation was abandoned; the previous generation is still live.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "generation_id",
+              "phase",
+              "detail"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "active_generation": {
+            "additionalProperties": false,
+            "description": "The active generation, or null on a fresh instance.",
+            "properties": {
+              "activated_at": {
+                "description": "RFC 3339 time the generation went live, or null if it never did.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blocks": {
+                "description": "Number of blocks in the generation's block manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cause": {
+                "description": "What created this generation.",
+                "oneOf": [
+                  {
+                    "const": "site_write",
+                    "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "site_delete",
+                    "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_compile",
+                    "description": "A successful compile stage; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_remove",
+                    "description": "A block was removed; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rollback",
+                    "description": "A republish of an earlier generation's manifests.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "seed",
+                    "description": "Generation 0, imported from the seed bundle on cold boot.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "created_at": {
+                "description": "RFC 3339 creation time.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Generation id.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "site_files": {
+                "description": "Number of files in the generation's site manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "description": "Where the generation sits in its lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "staged",
+                    "description": "Recorded, not yet examined.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Blobs, artifacts and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "activating",
+                    "description": "The runtime swap and site publish are in progress.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "Currently serving.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "Abandoned; `failure_message` says why.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "superseded",
+                    "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "parent_id",
+              "cause",
+              "status",
+              "created_at",
+              "activated_at",
+              "site_files",
+              "blocks"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "blocks": {
+            "description": "Blocks in the active generation.",
+            "items": {
+              "additionalProperties": false,
+              "description": "A block serving in the active generation.",
+              "properties": {
+                "artifact_sha256": {
+                  "description": "SHA-256 of the artifact the block was loaded from, hex-encoded.",
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Registered block name.",
+                  "type": "string"
+                },
+                "routes": {
+                  "description": "Route prefixes the block serves, with the access tier the router\nenforces for each.",
+                  "items": {
+                    "description": "One route prefix a dynamically-registered block serves.",
+                    "properties": {
+                      "access": {
+                        "description": "Access tier the router enforces for the prefix.",
+                        "oneOf": [
+                          {
+                            "const": "Public",
+                            "description": "No auth check; anyone may reach the route.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "Authenticated",
+                            "description": "A resolved user identity is required.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "Admin",
+                            "description": "The `admin` role is required.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "prefix": {
+                        "description": "Route prefix, normalized and under `/b/{block}/`.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "prefix",
+                      "access"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "name",
+                "artifact_sha256",
+                "routes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "runtime_generation": {
+            "description": "Bumped on every runtime rebuild; the page refreshes tool registrations\nwhen it changes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "seed_error": {
+            "description": "Why this instance's seed import was refused, if it was.\n\n`None` on every healthy instance — including one that never had a seed\nbundle to import. A sandbox whose seed was refused boots with an empty\nsite and no other sign of it (`dev_runtime::install` logs and carries\non, because a sandbox that refuses to boot is one whose `/b/dev` page\n— the only thing that could fix it — never comes up), so this is what\nmakes the cause readable through `dev_status` instead of only through\nthe service worker's console. Read from the same row an admin sees on\n`/b/admin/settings/variables`, which is the only surface an exported\nsite has (it has no `/b/dev`). `dev.js` does not render it: the page\npolls this endpoint several times a second, so a log line would need\nits own \"said this already\" state, and the agent that would act on a\nrefused seed reads `dev_status` rather than the log.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "storage": {
+            "additionalProperties": false,
+            "description": "What the sandbox's content stores hold right now.",
+            "properties": {
+              "artifacts": {
+                "description": "How many compiled block artifacts are stored.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "artifacts_bytes": {
+                "description": "Total size of those artifacts, in bytes.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "blobs": {
+                "description": "How many content-addressed blobs are stored. Includes blobs no file\nnames any more but a retained generation still does.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "blobs_bytes": {
+                "description": "Total size of those blobs, in bytes.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "retained_generations": {
+                "description": "How many generations the ledger is keeping: the retention window, plus\nanything older that is still serving or still in flight.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "workspace_files": {
+                "description": "How many files the workspace currently holds.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "blobs",
+              "blobs_bytes",
+              "artifacts",
+              "artifacts_bytes",
+              "workspace_files",
+              "retained_generations"
+            ],
+            "type": "object"
+          },
+          "wafer_guest_version": {
+            "description": "`wafer_guest.rs` version the block scaffolder currently writes.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "active_generation",
+          "runtime_generation",
+          "blocks",
+          "activation",
+          "storage",
+          "wafer_guest_version",
+          "seed_error"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "List files in the sandbox workspace, optionally filtered to those whose path starts with `prefix` (e.g. `site/` or `blocks/hello/`).",
+      "inputSchema": {
+        "properties": {
+          "prefix": {
+            "description": "List only files whose workspace path starts with this prefix, e.g.\n`site/` or `blocks/hello/`. Omit to list the whole workspace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/files",
+        "path_params": [],
+        "query_params": [
+          "prefix"
+        ]
+      },
+      "name": "dev_list_files",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/files`.",
+        "properties": {
+          "files": {
+            "description": "Matching files, in path order.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One file in the workspace: where it is, which blob holds it, how big it is\nand what it is served as.\n\nThe same type is what a generation's site manifest is made of — a\ngeneration *is* the workspace's `site/` entries, frozen — so there is one\ndefinition rather than a wire type and a stored type that have to be kept\nin step.",
+              "properties": {
+                "content_type": {
+                  "description": "Content type the file is served with.",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Where the file lives. Workspace-relative (`site/index.html`) in the\nfiles API; relative to its area's root (`index.html`) in a\ngeneration's site manifest and in a block's source listing.",
+                  "type": "string"
+                },
+                "sha256": {
+                  "description": "SHA-256 of the file's content-addressed blob, hex-encoded.",
+                  "type": "string"
+                },
+                "size": {
+                  "description": "Size in bytes.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "size",
+                "content_type"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Read one workspace file's content and its SHA-256. Pass the hash back as `expected_sha256` on `dev_write_file` or `dev_delete_file` to avoid overwriting an edit you have not seen.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Workspace-relative path, e.g. `site/index.html`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "path"
+        ],
+        "method": "post",
+        "path": "/b/dev/api/files/read",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_read_file",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `POST /b/dev/api/files/read`.",
+        "properties": {
+          "content": {
+            "description": "The file's content, in `encoding`.",
+            "type": "string"
+          },
+          "encoding": {
+            "description": "How `content` is encoded. Text files come back as `utf8`; anything\nelse, including text that is not valid UTF-8, comes back as `base64`.",
+            "oneOf": [
+              {
+                "const": "utf8",
+                "description": "`content` is the file's text. The default.",
+                "type": "string"
+              },
+              {
+                "const": "base64",
+                "description": "`content` is the file's bytes, standard base64 with padding.",
+                "type": "string"
+              }
+            ]
+          },
+          "path": {
+            "description": "Workspace-relative path that was read.",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "SHA-256 of the content, hex-encoded. Pass it back as\n`expected_sha256` to write over what you just read.",
+            "type": "string"
+          },
+          "size": {
+            "description": "Size in bytes of the decoded content.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "sha256",
+          "size",
+          "encoding",
+          "content"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Write a workspace file under `site/` or `blocks/<name>/`. Writing under `site/` publishes a new generation immediately, live on the sandbox; writing under `blocks/` only stages source — nothing serves it until the block is compiled and staged.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "The file's content, in `encoding`.",
+            "type": "string"
+          },
+          "encoding": {
+            "default": "utf8",
+            "description": "How `content` is encoded. Defaults to `utf8`.",
+            "oneOf": [
+              {
+                "const": "utf8",
+                "description": "`content` is the file's text. The default.",
+                "type": "string"
+              },
+              {
+                "const": "base64",
+                "description": "`content` is the file's bytes, standard base64 with padding.",
+                "type": "string"
+              }
+            ]
+          },
+          "expected_sha256": {
+            "default": null,
+            "description": "The SHA-256 you expect the file to have right now, or `null` if you\nexpect it not to exist yet. A mismatch is a `409` carrying the hash\nthe file actually has, so a caller that has fallen behind re-reads\ninstead of silently overwriting an edit it never saw.\n\nOmitting the field means the same as `null` — serde defaults an\nabsent `Option` to `None`, and `#[serde(default)]` says so in the\nsource rather than leaving it to a rule the schema does not show. That\nis a safe default rather than a lax one: over a file that exists,\n\"I expect nothing here\" is itself a conflict.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Workspace-relative path under `site/` or `blocks/<name>/`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "path"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "content",
+          "encoding",
+          "expected_sha256",
+          "path"
+        ],
+        "method": "post",
+        "path": "/b/dev/api/files/write",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_write_file",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `POST /b/dev/api/files/write`.",
+        "properties": {
+          "generation": {
+            "additionalProperties": false,
+            "description": "The generation this write published, when it published one. A write\nunder `site/` publishes; a write under `blocks/` does not — only a\ncompile turns block source into a published block.",
+            "properties": {
+              "activated_at": {
+                "description": "RFC 3339 time the generation went live, or null if it never did.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blocks": {
+                "description": "Number of blocks in the generation's block manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cause": {
+                "description": "What created this generation.",
+                "oneOf": [
+                  {
+                    "const": "site_write",
+                    "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "site_delete",
+                    "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_compile",
+                    "description": "A successful compile stage; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_remove",
+                    "description": "A block was removed; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rollback",
+                    "description": "A republish of an earlier generation's manifests.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "seed",
+                    "description": "Generation 0, imported from the seed bundle on cold boot.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "created_at": {
+                "description": "RFC 3339 creation time.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Generation id.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "site_files": {
+                "description": "Number of files in the generation's site manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "description": "Where the generation sits in its lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "staged",
+                    "description": "Recorded, not yet examined.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Blobs, artifacts and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "activating",
+                    "description": "The runtime swap and site publish are in progress.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "Currently serving.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "Abandoned; `failure_message` says why.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "superseded",
+                    "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "parent_id",
+              "cause",
+              "status",
+              "created_at",
+              "activated_at",
+              "site_files",
+              "blocks"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Workspace-relative path that was written.",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "SHA-256 of the stored content, hex-encoded. Pass it as the next\nwrite's `expected_sha256`.",
+            "type": "string"
+          },
+          "size": {
+            "description": "Size in bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "sha256",
+          "size",
+          "generation"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Delete a workspace file. Requires the file's current SHA-256 as `expected_sha256`; a mismatch is refused so you never delete over an edit you have not seen. Deleting under `site/` publishes a new generation; deleting under `blocks/` does not.",
+      "inputSchema": {
+        "properties": {
+          "expected_sha256": {
+            "description": "The SHA-256 you expect the file to have right now. A mismatch — a\nfile that changed, or is already gone — is a `409`.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Workspace-relative path to remove.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_sha256",
+          "path"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "expected_sha256",
+          "path"
+        ],
+        "method": "post",
+        "path": "/b/dev/api/files/delete",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_delete_file",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `POST /b/dev/api/files/delete`.",
+        "properties": {
+          "generation": {
+            "additionalProperties": false,
+            "description": "The generation this delete published, when it published one. A delete\nunder `site/` publishes; a delete under `blocks/` does not.",
+            "properties": {
+              "activated_at": {
+                "description": "RFC 3339 time the generation went live, or null if it never did.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blocks": {
+                "description": "Number of blocks in the generation's block manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cause": {
+                "description": "What created this generation.",
+                "oneOf": [
+                  {
+                    "const": "site_write",
+                    "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "site_delete",
+                    "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_compile",
+                    "description": "A successful compile stage; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_remove",
+                    "description": "A block was removed; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rollback",
+                    "description": "A republish of an earlier generation's manifests.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "seed",
+                    "description": "Generation 0, imported from the seed bundle on cold boot.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "created_at": {
+                "description": "RFC 3339 creation time.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Generation id.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "site_files": {
+                "description": "Number of files in the generation's site manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "description": "Where the generation sits in its lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "staged",
+                    "description": "Recorded, not yet examined.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Blobs, artifacts and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "activating",
+                    "description": "The runtime swap and site publish are in progress.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "Currently serving.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "Abandoned; `failure_message` says why.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "superseded",
+                    "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "parent_id",
+              "cause",
+              "status",
+              "created_at",
+              "activated_at",
+              "site_files",
+              "blocks"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Workspace-relative path that was removed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "generation"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "List the publication ledger, newest first: every generation the sandbox has created.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "description": "How many generations to return, newest first. Defaults to the\nretention window (20) and is capped at 200.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/generations",
+        "path_params": [],
+        "query_params": [
+          "limit"
+        ]
+      },
+      "name": "dev_list_generations",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/generations`.",
+        "properties": {
+          "generations": {
+            "description": "Matching generations, newest first.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One entry in the publication ledger, as the status and generation views\npublish it.",
+              "properties": {
+                "activated_at": {
+                  "description": "RFC 3339 time the generation went live, or null if it never did.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "blocks": {
+                  "description": "Number of blocks in the generation's block manifest.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cause": {
+                  "description": "What created this generation.",
+                  "oneOf": [
+                    {
+                      "const": "site_write",
+                      "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "site_delete",
+                      "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "block_compile",
+                      "description": "A successful compile stage; the block set changed.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "block_remove",
+                      "description": "A block was removed; the block set changed.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "rollback",
+                      "description": "A republish of an earlier generation's manifests.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "seed",
+                      "description": "Generation 0, imported from the seed bundle on cold boot.",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "created_at": {
+                  "description": "RFC 3339 creation time.",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Generation id.",
+                  "type": "string"
+                },
+                "parent_id": {
+                  "description": "The generation this one was derived from, or null for the first.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "site_files": {
+                  "description": "Number of files in the generation's site manifest.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "description": "Where the generation sits in its lifecycle.",
+                  "oneOf": [
+                    {
+                      "const": "staged",
+                      "description": "Recorded, not yet examined.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "validating",
+                      "description": "Blobs, artifacts and guests are being checked.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "activating",
+                      "description": "The runtime swap and site publish are in progress.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "active",
+                      "description": "Currently serving.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "failed",
+                      "description": "Abandoned; `failure_message` says why.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "superseded",
+                      "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "parent_id",
+                "cause",
+                "status",
+                "created_at",
+                "activated_at",
+                "site_files",
+                "blocks"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generations"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Read one generation's full manifest — its site files and its blocks — and what it changed relative to the generation it was derived from.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "The generation's id, as `GET /b/dev/api/generations` reports it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/generations/{id}",
+        "path_params": [
+          "id"
+        ],
+        "query_params": []
+      },
+      "name": "dev_get_generation",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/generations/{id}`.",
+        "properties": {
+          "diff_from_parent": {
+            "additionalProperties": false,
+            "description": "What this generation changed relative to the one it was derived from.\nA generation with no parent adds everything it holds.",
+            "properties": {
+              "added_blocks": {
+                "description": "Blocks the generation adds.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "added_paths": {
+                "description": "Site paths the generation adds.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "changed_blocks": {
+                "description": "Blocks whose spec changed.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "changed_paths": {
+                "description": "Site paths whose content hash changed.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "removed_blocks": {
+                "description": "Blocks the generation drops.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "removed_paths": {
+                "description": "Site paths the generation drops.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "added_paths",
+              "changed_paths",
+              "removed_paths",
+              "added_blocks",
+              "changed_blocks",
+              "removed_blocks"
+            ],
+            "type": "object"
+          },
+          "manifest": {
+            "additionalProperties": false,
+            "description": "The manifest the generation publishes: its site files and its blocks.",
+            "properties": {
+              "blocks": {
+                "description": "The blocks the generation's runtime is built from.",
+                "items": {
+                  "description": "Everything the host needs to put one compiled guest into a runtime.\n\nThis is also the block entry of the generation manifest (design §11.3), so\na stored `block_manifest_json` decodes straight into `Vec<DynamicBlockSpec>`\nwith no intermediate shape.",
+                  "properties": {
+                    "artifact_sha256": {
+                      "description": "SHA-256 of the `wasm32-wasip1` artifact, hex-encoded.",
+                      "type": "string"
+                    },
+                    "capabilities": {
+                      "description": "Capabilities the guest is loaded under. Deny-by-default; the caller\nvalidates the declared set against the block's own namespace before\nthis ever reaches [`RuntimeControl`].\n\n`BlockCapabilities` is a producer type that derives neither\n`JsonSchema` nor `PartialEq`. It is published as a free-form object\nhere, and compared field-by-field in the `PartialEq` impl below."
+                    },
+                    "name": {
+                      "description": "Registered block name (`site/{name}`).",
+                      "type": "string"
+                    },
+                    "routes": {
+                      "description": "Route prefixes the block serves.",
+                      "items": {
+                        "description": "One route prefix a dynamically-registered block serves.",
+                        "properties": {
+                          "access": {
+                            "description": "Access tier the router enforces for the prefix.",
+                            "oneOf": [
+                              {
+                                "const": "Public",
+                                "description": "No auth check; anyone may reach the route.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "Authenticated",
+                                "description": "A resolved user identity is required.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "Admin",
+                                "description": "The `admin` role is required.",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "prefix": {
+                            "description": "Route prefix, normalized and under `/b/{block}/`.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "prefix",
+                          "access"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "wafer_guest_version": {
+                      "description": "`wafer_guest.rs` ABI version the artifact was built against.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "artifact_sha256",
+                    "routes",
+                    "capabilities",
+                    "wafer_guest_version"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "generation_id": {
+                "description": "The generation this manifest describes.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "schema_version": {
+                "description": "Manifest schema version. `1` for every manifest this build writes.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "site": {
+                "additionalProperties": false,
+                "description": "The files the generation publishes.",
+                "properties": {
+                  "files": {
+                    "default": [],
+                    "description": "Every file the generation publishes, path relative to the site root.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One file in the workspace: where it is, which blob holds it, how big it is\nand what it is served as.\n\nThe same type is what a generation's site manifest is made of — a\ngeneration *is* the workspace's `site/` entries, frozen — so there is one\ndefinition rather than a wire type and a stored type that have to be kept\nin step.",
+                      "properties": {
+                        "content_type": {
+                          "description": "Content type the file is served with.",
+                          "type": "string"
+                        },
+                        "path": {
+                          "description": "Where the file lives. Workspace-relative (`site/index.html`) in the\nfiles API; relative to its area's root (`index.html`) in a\ngeneration's site manifest and in a block's source listing.",
+                          "type": "string"
+                        },
+                        "sha256": {
+                          "description": "SHA-256 of the file's content-addressed blob, hex-encoded.",
+                          "type": "string"
+                        },
+                        "size": {
+                          "description": "Size in bytes.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "sha256",
+                        "size",
+                        "content_type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "files"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "schema_version",
+              "generation_id",
+              "parent_id",
+              "site",
+              "blocks"
+            ],
+            "type": "object"
+          },
+          "summary": {
+            "additionalProperties": false,
+            "description": "The ledger entry.",
+            "properties": {
+              "activated_at": {
+                "description": "RFC 3339 time the generation went live, or null if it never did.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blocks": {
+                "description": "Number of blocks in the generation's block manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cause": {
+                "description": "What created this generation.",
+                "oneOf": [
+                  {
+                    "const": "site_write",
+                    "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "site_delete",
+                    "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_compile",
+                    "description": "A successful compile stage; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_remove",
+                    "description": "A block was removed; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rollback",
+                    "description": "A republish of an earlier generation's manifests.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "seed",
+                    "description": "Generation 0, imported from the seed bundle on cold boot.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "created_at": {
+                "description": "RFC 3339 creation time.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Generation id.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "site_files": {
+                "description": "Number of files in the generation's site manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "description": "Where the generation sits in its lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "staged",
+                    "description": "Recorded, not yet examined.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Blobs, artifacts and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "activating",
+                    "description": "The runtime swap and site publish are in progress.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "Currently serving.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "Abandoned; `failure_message` says why.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "superseded",
+                    "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "parent_id",
+              "cause",
+              "status",
+              "created_at",
+              "activated_at",
+              "site_files",
+              "blocks"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "summary",
+          "manifest",
+          "diff_from_parent"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Republish an earlier generation as the active one, reverting every site and block change made since. Call `dev_list_generations` first to find the `id` to roll back to.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "The generation's id, as `GET /b/dev/api/generations` reports it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "post",
+        "path": "/b/dev/api/generations/{id}/rollback",
+        "path_params": [
+          "id"
+        ],
+        "query_params": []
+      },
+      "name": "dev_rollback",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of every endpoint whose whole job is to activate a generation.",
+        "properties": {
+          "generation": {
+            "additionalProperties": false,
+            "description": "The generation that went live.",
+            "properties": {
+              "activated_at": {
+                "description": "RFC 3339 time the generation went live, or null if it never did.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blocks": {
+                "description": "Number of blocks in the generation's block manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cause": {
+                "description": "What created this generation.",
+                "oneOf": [
+                  {
+                    "const": "site_write",
+                    "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "site_delete",
+                    "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_compile",
+                    "description": "A successful compile stage; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_remove",
+                    "description": "A block was removed; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rollback",
+                    "description": "A republish of an earlier generation's manifests.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "seed",
+                    "description": "Generation 0, imported from the seed bundle on cold boot.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "created_at": {
+                "description": "RFC 3339 creation time.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Generation id.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "site_files": {
+                "description": "Number of files in the generation's site manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "description": "Where the generation sits in its lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "staged",
+                    "description": "Recorded, not yet examined.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Blobs, artifacts and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "activating",
+                    "description": "The runtime swap and site publish are in progress.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "Currently serving.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "Abandoned; `failure_message` says why.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "superseded",
+                    "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "parent_id",
+              "cause",
+              "status",
+              "created_at",
+              "activated_at",
+              "site_files",
+              "blocks"
+            ],
+            "type": "object"
+          },
+          "progress": {
+            "description": "One entry per phase the activation passed through, with how long it\ntook. The last is always `active`.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One phase of an activation, with how long it took.\n\nPublished in every mutating tool result (design §7.5) so the page can show\nwhere the time went without a push channel.",
+              "properties": {
+                "detail": {
+                  "description": "Human-readable detail for the progress panel.",
+                  "type": "string"
+                },
+                "ms": {
+                  "description": "Milliseconds spent in it.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "phase": {
+                  "description": "The phase this step covers.",
+                  "oneOf": [
+                    {
+                      "const": "idle",
+                      "description": "Nothing in flight.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "validating",
+                      "description": "Hashes, manifests and guests are being checked.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "building_runtime",
+                      "description": "A candidate runtime is being constructed from the block set.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "publishing",
+                      "description": "The site files are being written into `wafer-run/web/site`.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "active",
+                      "description": "The generation is live.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "failed",
+                      "description": "The activation was abandoned; the previous generation is still live.",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "phase",
+                "ms",
+                "detail"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generation",
+          "progress"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Scaffold a new backend block from a template (`hello` or `table`) under blocks/<name>/. Compile it with dev_compile_block.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "The block's short name, e.g. `newsletter`. It becomes the directory\n`blocks/<name>/`, the crate name, the block id `site/<name>`, the\nroute prefix `/b/<name>/` and the collection prefix `site__<name>__`.\n2 to 32 characters: a lowercase letter followed by lowercase letters,\ndigits and hyphens, with no doubled hyphen and no trailing hyphen.",
+            "type": "string"
+          },
+          "template": {
+            "description": "Which starting point to write. `hello` is one public `GET` and\nnothing else; `table` is a newsletter block with a database table, an\nagent tool and two admin reads — start there for anything that stores\ndata.",
+            "oneOf": [
+              {
+                "const": "hello",
+                "description": "One public `GET` and nothing else — the smallest block that serves.",
+                "type": "string"
+              },
+              {
+                "const": "table",
+                "description": "A newsletter block: a claimed collection, a table created in `init`,\na public write endpoint with an agent tool, and two admin reads.",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "template"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [
+          "name",
+          "template"
+        ],
+        "method": "post",
+        "path": "/b/dev/api/blocks",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_create_block",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `POST /b/dev/api/blocks`.",
+        "properties": {
+          "files": {
+            "description": "The files that were written, in path order. Read or edit them through\nthe files API; the block does not serve until it is compiled.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One file in the workspace: where it is, which blob holds it, how big it is\nand what it is served as.\n\nThe same type is what a generation's site manifest is made of — a\ngeneration *is* the workspace's `site/` entries, frozen — so there is one\ndefinition rather than a wire type and a stored type that have to be kept\nin step.",
+              "properties": {
+                "content_type": {
+                  "description": "Content type the file is served with.",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Where the file lives. Workspace-relative (`site/index.html`) in the\nfiles API; relative to its area's root (`index.html`) in a\ngeneration's site manifest and in a block's source listing.",
+                  "type": "string"
+                },
+                "sha256": {
+                  "description": "SHA-256 of the file's content-addressed blob, hex-encoded.",
+                  "type": "string"
+                },
+                "size": {
+                  "description": "Size in bytes.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "size",
+                "content_type"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "The block's short name, as written.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Remove a compiled block from the running site and activate the resulting generation. Its source under `blocks/<name>/` is untouched — this only takes the compiled block out of what serves.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "The block's short name, e.g. `hello` for the block registered as\n`site/hello`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "post",
+        "path": "/b/dev/api/blocks/{name}/remove",
+        "path_params": [
+          "name"
+        ],
+        "query_params": []
+      },
+      "name": "dev_remove_block",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of every endpoint whose whole job is to activate a generation.",
+        "properties": {
+          "generation": {
+            "additionalProperties": false,
+            "description": "The generation that went live.",
+            "properties": {
+              "activated_at": {
+                "description": "RFC 3339 time the generation went live, or null if it never did.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blocks": {
+                "description": "Number of blocks in the generation's block manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cause": {
+                "description": "What created this generation.",
+                "oneOf": [
+                  {
+                    "const": "site_write",
+                    "description": "A `site/**` write. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "site_delete",
+                    "description": "A `site/**` delete. Site-only — no runtime rebuild.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_compile",
+                    "description": "A successful compile stage; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "block_remove",
+                    "description": "A block was removed; the block set changed.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rollback",
+                    "description": "A republish of an earlier generation's manifests.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "seed",
+                    "description": "Generation 0, imported from the seed bundle on cold boot.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "created_at": {
+                "description": "RFC 3339 creation time.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Generation id.",
+                "type": "string"
+              },
+              "parent_id": {
+                "description": "The generation this one was derived from, or null for the first.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "site_files": {
+                "description": "Number of files in the generation's site manifest.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "description": "Where the generation sits in its lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "staged",
+                    "description": "Recorded, not yet examined.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "validating",
+                    "description": "Blobs, artifacts and guests are being checked.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "activating",
+                    "description": "The runtime swap and site publish are in progress.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "active",
+                    "description": "Currently serving.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "Abandoned; `failure_message` says why.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "superseded",
+                    "description": "No longer serving — replaced by a later generation.\n\nWritten by the activation that replaced it, and by nothing else. It is\nnot an ageing marker: a generation that falls out of the retention\nwindow is deleted rather than relabelled, so a `failed` generation\nstill reads as `failed` for as long as the ledger keeps it.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "parent_id",
+              "cause",
+              "status",
+              "created_at",
+              "activated_at",
+              "site_files",
+              "blocks"
+            ],
+            "type": "object"
+          },
+          "progress": {
+            "description": "One entry per phase the activation passed through, with how long it\ntook. The last is always `active`.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One phase of an activation, with how long it took.\n\nPublished in every mutating tool result (design §7.5) so the page can show\nwhere the time went without a push channel.",
+              "properties": {
+                "detail": {
+                  "description": "Human-readable detail for the progress panel.",
+                  "type": "string"
+                },
+                "ms": {
+                  "description": "Milliseconds spent in it.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "phase": {
+                  "description": "The phase this step covers.",
+                  "oneOf": [
+                    {
+                      "const": "idle",
+                      "description": "Nothing in flight.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "validating",
+                      "description": "Hashes, manifests and guests are being checked.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "building_runtime",
+                      "description": "A candidate runtime is being constructed from the block set.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "publishing",
+                      "description": "The site files are being written into `wafer-run/web/site`.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "active",
+                      "description": "The generation is live.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "failed",
+                      "description": "The activation was abandoned; the previous generation is still live.",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "phase",
+                "ms",
+                "detail"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generation",
+          "progress"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "The authoring reference for backend blocks: API, host services, limits, and the two templates. Read it before writing Rust.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/reference",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_read_reference",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/reference`.",
+        "properties": {
+          "markdown": {
+            "description": "The authoring guide, as Markdown: the API, the host services, the\nnamespace rules, the limits, the diagnostic codes, and both templates\nin full.",
+            "type": "string"
+          },
+          "wafer_guest_version": {
+            "description": "The `WAFER_GUEST_VERSION` of the support module this reference\ndocuments and `POST /b/dev/api/blocks` writes.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "wafer_guest_version",
+          "markdown"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "What exporting the site right now would produce: every file of the bundle with its size, the totals, and the rows of each data table. A read — use `dev_export` to actually download it.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "invocation": {
+        "body_params": [],
+        "method": "get",
+        "path": "/b/dev/api/export/manifest",
+        "path_params": [],
+        "query_params": []
+      },
+      "name": "dev_export_manifest",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Response of `GET /b/dev/api/export/manifest` — what\n`GET /b/dev/api/export` would produce, without producing it.",
+        "properties": {
+          "blocks": {
+            "description": "How many compiled blocks the export carries. Each contributes its\n`.wasm` plus its whole source tree.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "files": {
+            "description": "Every entry of the archive, in the order it is written.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One entry of the export bundle: where it lands in the zip, and how big it\nis.",
+              "properties": {
+                "bytes": {
+                  "description": "The entry's uncompressed size in bytes. The archive stores entries\nuncompressed, so this is also what it costs in the zip.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Path inside the archive (`sw.js`, `seed/site/index.html`).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "bytes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "generation_id": {
+            "description": "The generation the export is a snapshot of — the one that is live now.\nThe downloaded file is named after its first eight characters.",
+            "type": "string"
+          },
+          "shell_files": {
+            "description": "How many of `files` are the runtime shell (the service worker, the\nwasm, the loader — everything that makes the folder runnable).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "site_files": {
+            "description": "How many are the site's own files, under `seed/site/`.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tables": {
+            "additionalProperties": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Rows the data snapshot carries, per table — products, offers,\nsettings and accounts (`seed/data.json`).",
+            "type": "object"
+          },
+          "total_bytes": {
+            "description": "Total size of every entry's content. The archive itself is slightly\nlarger: each entry carries a local header and a central directory\nrecord naming it.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation_id",
+          "files",
+          "total_bytes",
+          "shell_files",
+          "site_files",
+          "blocks",
+          "tables"
+        ],
+        "type": "object"
+      }
+    }
+  ]
+}

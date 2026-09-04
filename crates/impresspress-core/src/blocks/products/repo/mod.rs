@@ -17,6 +17,7 @@ pub(crate) mod provider_operations;
 pub(crate) mod purchases;
 pub(crate) mod refunds;
 pub(crate) mod seller_accounts;
+pub(crate) mod stripe_events;
 pub(crate) mod subscription_items;
 pub(crate) mod subscriptions;
 pub(crate) mod variables;

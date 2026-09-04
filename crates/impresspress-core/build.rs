@@ -43,11 +43,6 @@ const FILE_ASSETS: &[(&str, &str, &str)] = &[
         "application/javascript; charset=utf-8",
     ),
     (
-        "assets/webmcp.js",
-        "webmcp.js",
-        "application/javascript; charset=utf-8",
-    ),
-    (
         "assets/marked.min.js",
         "marked.min.js",
         "application/javascript; charset=utf-8",
@@ -90,6 +85,31 @@ const FILE_ASSETS: &[(&str, &str, &str)] = &[
     ("assets/favicon.ico", "favicon.ico", "image/x-icon"),
 ];
 
+/// The WebMCP script is COMPOSED, not served raw.
+///
+/// `webmcp-core.js` is a fragment — the shared `buildRequest`/`toolOptions`
+/// logic, with no IIFE and no `'use strict'`. `webmcp.js` is a tail written to
+/// run inside that wrapper. Neither half is a valid script on its own, so the
+/// only bytes that may ever reach a browser are the composed ones.
+///
+/// Composing here rather than at runtime is what keeps the manifest honest:
+/// the hash in `/b/static/webmcp-{hash}.js` is the hash of the bytes actually
+/// served. Hashing at runtime cannot work at all without `embed-assets` --
+/// the bytes are not in the binary, so there is nothing left to hash, yet the
+/// content-hashed URL still has to resolve.
+const WEBMCP_CORE: &str = "assets/webmcp-core.js";
+const WEBMCP_TAIL: &str = "assets/webmcp.js";
+
+/// Wrap the shared core and a tail in one IIFE.
+///
+/// Byte-for-byte the composition `ui::assets::compose_webmcp_module` applies
+/// for the sandbox's module variant, so both WebMCP scripts this crate serves
+/// are wrapped identically and `buildRequest`/`toolOptions` behave the same in
+/// each. A test in `ui::assets` pins the composed output's shape.
+fn compose_webmcp(core: &str, tail: &str) -> String {
+    format!("(function () {{\n  'use strict';\n{core}\n{tail}\n}})();\n")
+}
+
 fn short_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -109,7 +129,7 @@ fn hashed_name(logical: &str, hash: &str) -> String {
 fn main() {
     let ui = PathBuf::from("src/ui");
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let mut entries: Vec<(String, String, String, usize)> = Vec::new();
+    let mut entries: Vec<(String, String, String, String, usize)> = Vec::new();
 
     // --- single files -----------------------------------------------------
     let mut font_names = Vec::new();
@@ -118,12 +138,33 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         let bytes =
             fs::read(&path).unwrap_or_else(|e| panic!("missing asset {}: {e}", path.display()));
-        let name = hashed_name(logical, &short_hash(&bytes));
+        let hash = short_hash(&bytes);
+        let name = hashed_name(logical, &hash);
         if logical.ends_with(".woff2") {
             font_names.push((logical.to_string(), name.clone()));
         }
-        entries.push((logical.to_string(), name, ct.to_string(), bytes.len()));
+        entries.push((logical.to_string(), name, hash, ct.to_string(), bytes.len()));
     }
+
+    // --- composed WebMCP script ------------------------------------------
+    let core_path = ui.join(WEBMCP_CORE);
+    let tail_path = ui.join(WEBMCP_TAIL);
+    println!("cargo:rerun-if-changed={}", core_path.display());
+    println!("cargo:rerun-if-changed={}", tail_path.display());
+    let core = fs::read_to_string(&core_path)
+        .unwrap_or_else(|e| panic!("missing asset {}: {e}", core_path.display()));
+    let tail = fs::read_to_string(&tail_path)
+        .unwrap_or_else(|e| panic!("missing asset {}: {e}", tail_path.display()));
+    let webmcp = compose_webmcp(&core, &tail);
+    let webmcp_hash = short_hash(webmcp.as_bytes());
+    entries.push((
+        "webmcp.js".into(),
+        hashed_name("webmcp.js", &webmcp_hash),
+        webmcp_hash,
+        "application/javascript; charset=utf-8".into(),
+        webmcp.len(),
+    ));
+    fs::write(out.join("webmcp.js"), &webmcp).expect("write webmcp.js");
 
     // --- CSS bundle -------------------------------------------------------
     // Font URLs are rewritten to bare hashed filenames, which resolve relative
@@ -143,10 +184,12 @@ fn main() {
     }
     assert!(!css.contains("__ITIM"), "stale placeholder left in bundle");
 
-    let css_name = hashed_name("app.css", &short_hash(css.as_bytes()));
+    let css_hash = short_hash(css.as_bytes());
+    let css_name = hashed_name("app.css", &css_hash);
     entries.push((
         "app.css".into(),
         css_name,
+        css_hash,
         "text/css; charset=utf-8".into(),
         css.len(),
     ));
@@ -157,14 +200,15 @@ fn main() {
         "pub struct AssetEntry {\n\
          \x20   pub logical: &'static str,\n\
          \x20   pub filename: &'static str,\n\
+         \x20   pub hash: &'static str,\n\
          \x20   pub content_type: &'static str,\n\
          \x20   pub len: usize,\n\
          }\n\
          pub const ASSETS: &[AssetEntry] = &[\n",
     );
-    for (logical, name, ct, len) in &entries {
+    for (logical, name, hash, ct, len) in &entries {
         src.push_str(&format!(
-            "    AssetEntry {{ logical: {logical:?}, filename: {name:?}, content_type: {ct:?}, len: {len} }},\n"
+            "    AssetEntry {{ logical: {logical:?}, filename: {name:?}, hash: {hash:?}, content_type: {ct:?}, len: {len} }},\n"
         ));
     }
     src.push_str("];\n");

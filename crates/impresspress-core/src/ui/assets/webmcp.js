@@ -4,124 +4,39 @@
 // declarations and filtered to this session's auth level, so whatever
 // arrives here is exactly what this visitor is allowed to invoke. The
 // script's only job is translating that into registerTool calls.
-(function () {
-  'use strict';
 
-  // Browsers without WebMCP get nothing. This ships on every page, so it
-  // must never throw on an unsupported browser.
-  if (!('modelContext' in document) || typeof document.modelContext.registerTool !== 'function') {
-    return;
-  }
+// Browsers without WebMCP get nothing. This ships on every page, so it
+// must never throw on an unsupported browser.
+if (!('modelContext' in document) || typeof document.modelContext.registerTool !== 'function') {
+  return;
+}
 
-  // Substitute {name} path segments, and collect the rest into query or body
-  // according to the provenance the server recorded.
-  function buildRequest(invocation, args) {
-    var path = invocation.path;
-    (invocation.path_params || []).forEach(function (name) {
-      // split/join, not String.replace: replace with a string pattern
-      // substitutes only the FIRST match, so a template repeating a
-      // placeholder (`/x/{id}/{id}`) would keep a literal `{id}` in the URL
-      // and 404 forever. The producer dedups placeholder names before
-      // comparing them against the declared path params, so such a template
-      // passes its eligibility check and reaches us intact.
-      path = path.split('{' + name + '}').join(encodeURIComponent(args[name]));
-    });
+function register(tool) {
+  document.modelContext.registerTool(toolOptions(tool));
+}
 
-    var query = new URLSearchParams();
-    (invocation.query_params || []).forEach(function (name) {
-      if (args[name] !== undefined && args[name] !== null) {
-        query.append(name, args[name]);
+// Names this script itself registered, so `refresh()` can drop exactly what
+// it added rather than guessing at the agent's whole tool set. `generation`
+// counts completed `load()` calls — a caller can poll it to notice a refresh
+// landed without threading a callback through `refresh()`'s promise.
+var registered = [];
+var generation = 0;
+
+function unregisterAll() {
+  if (typeof document.modelContext.unregisterTool === 'function') {
+    registered.forEach(function (name) {
+      try {
+        document.modelContext.unregisterTool(name);
+      } catch (e) {
+        // already gone
       }
     });
-    var qs = query.toString();
-    if (qs) {
-      path += '?' + qs;
-    }
-
-    var init = { method: invocation.method.toUpperCase(), headers: {} };
-
-    var bodyNames = invocation.body_params || [];
-    if (bodyNames.length > 0) {
-      var body = {};
-      bodyNames.forEach(function (name) {
-        if (args[name] !== undefined) {
-          body[name] = args[name];
-        }
-      });
-      init.headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(body);
-    }
-
-    // Same-origin, so the session cookie rides along and the server applies
-    // the same authorization it would to any other request. The manifest
-    // filter is a UX affordance; the endpoint is still the real gate.
-    init.credentials = 'same-origin';
-
-    return { url: path, init: init };
   }
+  registered = [];
+}
 
-  function register(tool) {
-    // `outputSchema` is optional in the manifest — the producer only
-    // projects it when the endpoint's declared response schema is a
-    // self-contained JSON object it can vouch for (see wafer-core's
-    // `agent_output_schema`). A tool without one must still register
-    // cleanly, so the key is only set on `options` when present rather than
-    // passed through as `undefined`.
-    var options = {
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-      execute: async function (args) {
-        var req = buildRequest(tool.invocation, args || {});
-        var response = await fetch(req.url, req.init);
-        var text = await response.text();
-
-        if (!response.ok) {
-          // `isError` is what tells the agent this is a failure. Without it
-          // the harness treats the body as a normal result, and a model can
-          // relay `Request failed (403): ...` to the customer as if it were
-          // product data.
-          return {
-            isError: true,
-            content: [{
-              type: 'text',
-              text: 'Request failed (' + response.status + '): ' + text
-            }]
-          };
-        }
-
-        var result = { content: [{ type: 'text', text: text }] };
-
-        // When the tool declared an `outputSchema`, the response body IS
-        // the JSON value that schema describes (the endpoint's declared
-        // response schema and its actual response body are the same
-        // contract) — parse it into `structuredContent` so a client can
-        // validate/consume it as data instead of re-parsing the text block
-        // itself. `content` still carries the raw text unconditionally, both
-        // as the backward-compatible fallback for a client that ignores
-        // `structuredContent` and for a tool with no `outputSchema` at all.
-        // A body that fails to parse as JSON is a server-side schema/
-        // response mismatch, not something retrying fixes, so it just falls
-        // back to text-only rather than failing the call.
-        if (tool.outputSchema) {
-          try {
-            result.structuredContent = JSON.parse(text);
-          } catch (e) {
-            // Leave structuredContent unset; `content` above still carries
-            // the raw text.
-          }
-        }
-
-        return result;
-      }
-    };
-    if (tool.outputSchema) {
-      options.outputSchema = tool.outputSchema;
-    }
-    document.modelContext.registerTool(options);
-  }
-
-  fetch('/b/webmcp/manifest.json', { credentials: 'same-origin' })
+function load() {
+  return fetch('/b/webmcp/manifest.json', { credentials: 'same-origin' })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (manifest) {
       if (!manifest || !Array.isArray(manifest.tools)) {
@@ -133,6 +48,7 @@
       manifest.tools.forEach(function (tool) {
         try {
           register(tool);
+          registered.push(tool.name);
         } catch (e) {
           // One tool the browser rejected is not a reason to lose the rest.
         }
@@ -141,5 +57,82 @@
     .catch(function () {
       // A failed manifest fetch means no tools. That is a degraded page,
       // not a broken one — never surface it to the visitor.
+    })
+    .then(function () {
+      // Bumped on EVERY settled load, degraded ones included, and after the
+      // `.catch` so nothing above can skip it. `generation` counts completed
+      // `load()` calls — a poller waiting for a refresh to land is waiting
+      // for the call to finish, not for it to find tools, and a load that
+      // ends with zero tools has finished. Bumping only on the success path
+      // would hang every such poller (`webmcp.spec.ts` is one) on exactly
+      // the degraded page this file otherwise takes care to tolerate.
+      generation += 1;
     });
-})();
+}
+
+// Drops every tool this script registered and re-fetches the manifest. A
+// page that changes what it can offer mid-session (e.g. the dev sandbox's
+// workspace tools, which come and go with what is loaded) calls this instead
+// of forcing a reload — the alternative is stale tool descriptions the agent
+// can no longer act on, or worse, ones that still work but no longer mean
+// what their description says.
+function refresh() {
+  unregisterAll();
+  return load();
+}
+
+window.__impresspressWebmcp = {
+  refresh: refresh,
+  generation: function () { return generation; }
+};
+
+var sw = navigator.serviceWorker;
+
+// Resolves once this document is CONTROLLED by a service worker — not
+// merely once one is active.
+//
+// The distinction is the whole point. `navigator.serviceWorker.ready`
+// resolves on `registration.active`, which is populated at the *activating*
+// state, while `sw.js.tmpl` calls `clients.claim()` inside its `activate`
+// handler's `waitUntil`. So `ready` can resolve before the claim has taken
+// effect, and a fetch issued in that window goes to the network rather than
+// to the wasm router. On a host with SPA fallback (`not_found_handling =
+// "single-page-application"`, which `examples/dev-sandbox/wrangler.toml`
+// sets) the network answers `index.html` with **200** — `r.ok` is true,
+// `r.json()` throws, the `.catch` swallows it, and the page silently ends up
+// with no tools at all. `controller` is the signal that actually means "my
+// fetches reach the worker"; `controllerchange` is when it arrives.
+function whenControlled() {
+  if (sw.controller) {
+    return Promise.resolve();
+  }
+  return new Promise(function (resolve) {
+    sw.addEventListener('controllerchange', function onChange() {
+      sw.removeEventListener('controllerchange', onChange);
+      resolve();
+    });
+  });
+}
+
+if (sw && sw.controller) {
+  // Already controlled — a repeat visit. Nothing to wait for.
+  load();
+} else if (sw) {
+  // In a service-worker build the first paint beats the worker: the manifest
+  // route (`/b/webmcp/manifest.json`) is served by the worker, so fetching
+  // it before the worker controls the page misses the wasm router (see
+  // `whenControlled`).
+  //
+  // A native server also exposes `navigator.serviceWorker` (it is a
+  // standard browser API, not something the SW build adds), but there is no
+  // registration and no worker that will ever claim this page — waiting for
+  // one would hang forever. `getRegistration()` tells the two apart: it
+  // resolves with `undefined` when nothing is registered, so the native path
+  // falls through to `load()` immediately.
+  sw.getRegistration()
+    .then(function (r) { return r ? whenControlled() : null; })
+    .then(load, load);
+} else {
+  // No Service Worker support at all (or it was stripped by the embedder).
+  load();
+}

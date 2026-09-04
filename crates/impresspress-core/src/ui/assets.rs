@@ -105,11 +105,9 @@ pub fn bytes(logical: &str) -> Option<&'static [u8]> {
         "app.css" => css().as_bytes(),
         // htmx 2.x minified JS.
         "htmx.min.js" => include_str!("assets/htmx.min.js").as_bytes(),
-        // WebMCP tool-registration script, served on every page. Fetches the
-        // auth-filtered manifest at `/b/webmcp/manifest.json` and registers
-        // each tool via `document.modelContext.registerTool` (no-ops on
-        // browsers without WebMCP support).
-        "webmcp.js" => include_str!("assets/webmcp.js").as_bytes(),
+        // The COMPOSED WebMCP script, assembled by `build.rs` from
+        // `webmcp-core.js` and `webmcp.js` — see `webmcp_js`.
+        "webmcp.js" => webmcp_js().as_bytes(),
         // Itim font binaries, sourced from `impresspress/site-kit`'s
         // `/fonts/` mirror and committed here so every impresspress
         // deployment ships its own glyphs (no cross-origin runtime
@@ -263,6 +261,100 @@ pub fn htmx_js_url() -> String {
 /// WebMCP script URL with content hash, e.g. `/b/static/webmcp-a1b2c3d4.js`
 pub fn webmcp_js_url() -> String {
     url("webmcp.js")
+}
+
+/// The composed WebMCP tool-registration script, served on every page.
+///
+/// Fetches the auth-filtered manifest at `/b/webmcp/manifest.json` and
+/// registers each tool via `document.modelContext.registerTool` (no-ops on
+/// browsers without WebMCP support). On a service-worker build the first
+/// fetch waits for the worker to take control of the page (see
+/// `assets/webmcp.js`); `window.__impresspressWebmcp.refresh()` re-fetches
+/// the manifest and swaps out whatever this script previously registered.
+///
+/// `build.rs` composes it from `assets/webmcp-core.js` (the shared
+/// `buildRequest`/`toolOptions` fragment) and `assets/webmcp.js` (the tail),
+/// so this is one `include_str!` of a finished artifact rather than a runtime
+/// `format!` — the same shape `css()` has, and for the same reason: the
+/// manifest hash has to describe the bytes that are actually served, and
+/// without `embed-assets` there are no runtime bytes to compose from.
+#[cfg(feature = "embed-assets")]
+pub fn webmcp_js() -> &'static str {
+    include_str!(concat!(env!("OUT_DIR"), "/webmcp.js"))
+}
+
+/// Short content hash of the composed WebMCP script.
+///
+/// Read straight off the manifest rather than hashed here, so the `ETag` at
+/// [`WEBMCP_JS_STABLE_PATH`] and the hash embedded in [`webmcp_js_url`] are
+/// the same string by construction and cannot drift. Ungated on purpose:
+/// identity is manifest knowledge, so it still answers in a build that
+/// carries no asset bytes at all.
+pub fn webmcp_js_hash() -> &'static str {
+    entry("webmcp.js").hash
+}
+
+/// Stable (non-content-hashed) path for the WebMCP script, served by
+/// `pipeline.rs` at `GET /b/webmcp/webmcp.js` — right beside
+/// `/b/webmcp/manifest.json`.
+///
+/// This is the path anything that is NOT server-rendered by this pipeline
+/// hardcodes in a `<script>` tag: a page under `site/` (served by
+/// `wafer-run/web`), an agent-written page, a user-built block. Those never
+/// get `ui::layout`'s injection and have no way to discover the current
+/// content hash, so they need one URL that never moves between deploys.
+///
+/// It resolves in every build configuration. With `embed-assets` the
+/// pipeline answers with the bytes and an `ETag`; without it, the bytes live
+/// in R2 or on a CDN, so the pipeline redirects to [`webmcp_js_url`] rather
+/// than 404ing — which is what keeps this path usable as a public contract on
+/// Cloudflare, where the asset bytes are deliberately not in the binary.
+pub const WEBMCP_JS_STABLE_PATH: &str = "/b/webmcp/webmcp.js";
+
+/// The shared `buildRequest`/`toolOptions` fragment.
+///
+/// A fragment, not a script: no IIFE, no `'use strict'`. The classic script
+/// is composed from it by `build.rs`; this runtime copy exists only for the
+/// sandbox's module variant below, which cannot be a manifest asset because
+/// it is served from the block's own `/b/dev/static/` tier. Gated with its
+/// only caller so a build without the sandbox does not carry it.
+#[cfg(feature = "block-dev")]
+const WEBMCP_CORE: &str = include_str!("assets/webmcp-core.js");
+
+/// Compose the shared core and a `tail` into an ES **module**.
+///
+/// `imports` is emitted verbatim ahead of the IIFE — the only place an
+/// `import` declaration may stand, since it must be at a module's top level.
+/// Everything after it is byte-identical to what `build.rs` produces for the
+/// classic script: the same IIFE, the same `'use strict'`, the same core, the
+/// same tail. The tail is therefore written once and reads the same whichever
+/// wrapper it goes through; what changes is only that the bindings `imports`
+/// introduces are in scope inside the closure.
+///
+/// Runtime rather than build-time because its caller's assets are block-local
+/// by design (`blocks::dev::assets`): they are served from `/b/dev/static/*`
+/// at the block's own `Admin` tier, never from the public content-hashed
+/// manifest, and a build without `block-dev` must not carry them at all.
+#[cfg(feature = "block-dev")]
+pub(crate) fn compose_webmcp_module(imports: &'static str, tail: &'static str) -> String {
+    format!("{imports}\n(function () {{\n  'use strict';\n{WEBMCP_CORE}\n{tail}\n}})();\n")
+}
+
+/// Short content hash (first 8 chars of hex SHA-256).
+///
+/// `pub(crate)` for `blocks::dev::assets`, which needs an `ETag` for its
+/// block-local, stable-path assets and so has nothing in the manifest to read
+/// a hash from. Manifest assets must NOT use this — their identity is
+/// [`AssetEntry::hash`], fixed at build time. Same projection `build.rs`
+/// applies, so a hash means the same thing on both sides of the build.
+///
+/// Gated with that caller: no manifest asset may use it, so a build without
+/// the sandbox has nothing left to hash at runtime.
+#[cfg(feature = "block-dev")]
+pub(crate) fn short_hash(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(content);
+    hash.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 /// marked.js URL with content hash, e.g. `/b/static/marked-a1b2c3d4.min.js`
@@ -1668,4 +1760,96 @@ mod tests {
             "font url must be relative, not absolute"
         );
     }
+
+    /// The script served at `/b/static/webmcp-{hash}.js` is the COMPOSED one:
+    /// the shared core fragment and the tail inside a single IIFE.
+    ///
+    /// `build.rs` does that composition, so this pins the artifact rather than
+    /// a runtime function. Neither half is a valid script alone — the tail
+    /// calls `toolOptions` and `buildRequest`, which only exist in the core —
+    /// so serving either one raw would be a broken page, silently.
+    #[test]
+    #[cfg(feature = "embed-assets")]
+    fn webmcp_js_is_the_core_and_tail_composed_into_one_iife() {
+        let js = super::webmcp_js();
+        assert!(
+            js.starts_with("(function () {\n  'use strict';"),
+            "composed script must start with the IIFE: {js:.60}"
+        );
+        assert!(
+            js.contains("function buildRequest"),
+            "core fragment's buildRequest is missing"
+        );
+        assert!(
+            js.contains("function toolOptions"),
+            "core fragment's toolOptions is missing"
+        );
+        assert!(
+            js.contains("__impresspressWebmcp"),
+            "tail's window.__impresspressWebmcp is missing"
+        );
+        assert!(
+            js.trim_end().ends_with("})();"),
+            "composed script must end with the IIFE close"
+        );
+        assert_eq!(
+            js.matches("'use strict';").count(),
+            1,
+            "one strict directive, not one per half"
+        );
+    }
+
+    /// The manifest's hash for `webmcp.js` is the hash of the bytes actually
+    /// served.
+    ///
+    /// This is the whole reason composition moved into `build.rs`. Composing
+    /// at runtime and hashing the raw tail would advertise
+    /// `/b/static/webmcp-{hash}.js` for content that hash never described, and
+    /// a cache would then hold the wrong script under a URL that claims to be
+    /// immutable.
+    #[test]
+    #[cfg(feature = "embed-assets")]
+    fn webmcp_manifest_hash_describes_the_composed_bytes() {
+        let served = super::webmcp_js().as_bytes();
+        let entry = super::entry("webmcp.js");
+        assert_eq!(
+            entry.len,
+            served.len(),
+            "manifest length does not match the served script"
+        );
+        assert!(
+            super::webmcp_js_url().ends_with(&format!("webmcp-{}.js", entry.hash)),
+            "url must embed the manifest hash: {}",
+            super::webmcp_js_url()
+        );
+    }
+
+    /// The module variant puts the imports first and leaves the IIFE alone.
+    ///
+    /// Composed here from a stub tail rather than through `dev_js()`, so this
+    /// pins the FUNCTION's contract: whatever a caller passes as `imports`
+    /// comes out ahead of an IIFE wrapped exactly the way `build.rs` wraps the
+    /// classic script. `tests/dev_page.rs` pins the other end — that the
+    /// `/b/dev` script really is composed this way and really is served as a
+    /// module.
+    #[test]
+    #[cfg(feature = "block-dev")]
+    fn compose_webmcp_module_puts_the_imports_before_an_unchanged_iife() {
+        let module = super::compose_webmcp_module("import { X } from '/x.js';", "var used = X;");
+        assert!(
+            module.starts_with("import { X } from '/x.js';\n(function () {\n  'use strict';\n"),
+            "imports must precede the IIFE: {module:.80}"
+        );
+        assert!(module.trim_end().ends_with("})();"));
+        assert_eq!(
+            module.matches("'use strict';").count(),
+            1,
+            "one strict directive, not one per half"
+        );
+        assert!(
+            module.contains("function buildRequest") && module.contains("function toolOptions"),
+            "the module variant must carry the same core fragment"
+        );
+    }
 }
+

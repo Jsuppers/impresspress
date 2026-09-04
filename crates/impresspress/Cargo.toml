@@ -119,6 +119,13 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+# `block-dev` for the test targets only: `tests/seed_bypass_prefix.rs` asserts
+# that the bundler's service-worker bypass prefix and the dev block's own seed
+# URL root are the same string, and the latter lives behind that feature. Not
+# a regular dependency, so no shipped binary gains the sandbox from it.
+impresspress-core = { path = "../impresspress-core", default-features = false, features = [
+    "block-dev",
+] }
 
 [lints]
 workspace = true

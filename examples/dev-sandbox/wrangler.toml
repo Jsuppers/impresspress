@@ -1,0 +1,9 @@
+name = "impresspress-dev-sandbox"
+compatibility_date = "2026-05-01"
+main = "worker.js"
+routes = [{ pattern = "dev.impresspress.org", custom_domain = true }]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"

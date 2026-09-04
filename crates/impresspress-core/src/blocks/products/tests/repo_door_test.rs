@@ -154,6 +154,13 @@ const TABLE_IDENT_ALLOWED: &[&str] = &[
     "blocks/products/tests/repo_door_test.rs",
     "blocks/products/tests/seller_governance_tests.rs",
     "blocks/products/tests/stripe_tests.rs",
+    // the data snapshot's export allowlist (`blocks/dev/data_snapshot.rs`)
+    // needs the table's name for its own `TABLE_ALLOWLIST`/`TABLE_EXCLUDED`
+    // bookkeeping and as a `DataSnapshot` JSON key; every actual read/write
+    // it does still goes through `list_all`/`upsert_from_snapshot`
+    // (re-exported from this module), never a query built on the name
+    // directly
+    "blocks/dev/data_snapshot.rs",
 ];
 
 #[test]

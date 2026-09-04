@@ -216,13 +216,24 @@ impl<'a> Page<'a> {
         )
     }
 
-    /// htmx-aware response: the raw `body` (no chrome) for an htmx partial,
+    /// htmx-aware markup: the raw `body` (no chrome) for an htmx partial,
     /// else the full [`render`](Self::render) document.
-    pub fn response(self, msg: &wafer_run::Message) -> wafer_run::OutputStream {
+    ///
+    /// Split out of [`response`](Self::response) because an `OutputStream`'s
+    /// response meta is fixed when the stream is built — a page that needs
+    /// headers of its own (`/b/dev` and its COOP/COEP/`no-store`) cannot
+    /// amend a response after the fact and must build one around this markup
+    /// instead. See [`shell_document`].
+    pub fn document(self, msg: &wafer_run::Message) -> maud::Markup {
         if is_htmx(msg) {
-            return html_response(self.body);
+            return self.body;
         }
-        html_response(self.render())
+        self.render()
+    }
+
+    /// htmx-aware response: [`document`](Self::document) as `text/html`.
+    pub fn response(self, msg: &wafer_run::Message) -> wafer_run::OutputStream {
+        html_response(self.document(msg))
     }
 }
 
@@ -291,6 +302,24 @@ pub async fn shell_page(
     shell: Shell<'_>,
     body: maud::Markup,
 ) -> wafer_run::OutputStream {
+    html_response(shell_document(ctx, msg, shell, body).await)
+}
+
+/// [`shell_page`]'s markup, before it becomes a response.
+///
+/// Every page that only needs `text/html` should call [`shell_page`]. This
+/// exists for the one that needs more: `/b/dev` must carry
+/// `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` (cross-origin
+/// isolation, without which the in-browser compiler has no `SharedArrayBuffer`)
+/// and `Cache-Control: no-store`, and an `OutputStream`'s meta is fixed when
+/// the stream is built — so the headers have to be on the response as it is
+/// constructed, not bolted onto one that already exists.
+pub async fn shell_document(
+    ctx: &dyn wafer_run::context::Context,
+    msg: &wafer_run::Message,
+    shell: Shell<'_>,
+    body: maud::Markup,
+) -> maud::Markup {
     let config = SiteConfig::load(ctx).await;
     let user = UserInfo::from_message(msg);
     let mut groups = shell.nav.groups();
@@ -317,7 +346,7 @@ pub async fn shell_page(
         },
         body,
     }
-    .response(msg)
+    .document(msg)
 }
 
 /// Minimal `SiteConfig` used by the status-page helpers. They render
@@ -1053,7 +1082,27 @@ mod tests {
                     // ui/styles/, since that directory holds only .css
                     // files, not .rs -- so any hit here is an offender).
                     if line.contains("_CSS:") && line.contains("&str") {
-                        css_const_offenders.push(loc());
+                        // A const bound to `include_str!` of a real `.css`
+                        // file is not drift. What this vector exists to catch
+                        // is CSS written as a Rust string literal, where no
+                        // stylesheet tooling -- and no central audit, and not
+                        // the class guard below -- can ever see it. A `.css`
+                        // file is visible to all three; it just belongs to a
+                        // block instead of the shared bundle.
+                        //
+                        // A block owning its stylesheet is deliberate, not a
+                        // shortcut: `blocks::dev`'s assets are served from its
+                        // own `/b/dev/static/` tier at the block's `Admin`
+                        // access, and must be absent entirely from a build
+                        // without `block-dev`. Folding them into `ui/styles/`
+                        // would ship sandbox CSS to every deployment,
+                        // including the Cloudflare build that deliberately
+                        // carries no block-dev at all.
+                        let from_stylesheet_file =
+                            line.contains("include_str!") && line.contains(".css");
+                        if !from_stylesheet_file {
+                            css_const_offenders.push(loc());
+                        }
                     }
 
                     // Vector 2: a literal-value `.style.<prop> = …`
@@ -1674,15 +1723,73 @@ mod tests {
     /// classes, not an unbounded stylesheet audit.
     #[test]
     fn pages_use_only_classes_defined_in_the_stylesheet() {
-        let styles_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/styles");
+        // The shared bundle, plus any stylesheet a block owns and serves
+        // itself. The invariant is that a class used in markup has a rule in
+        // some stylesheet that reaches the page rendering it -- NOT that every
+        // class lives in the shared bundle. `blocks::dev` serves its own
+        // `dev.css` from `/b/dev/static/`, so its `.dev-*` rules are as real
+        // to that page as `ui/styles/` is to an admin page; requiring them in
+        // the shared bundle would ship them to builds that do not have the
+        // block. Scanning both is what keeps this guard honest without
+        // forcing that.
+        let blocks_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks");
+
+        /// The block a path under `src/blocks/` belongs to (`"dev"` for
+        /// `src/blocks/dev/assets/dev.css`), or `None` for anything outside.
+        fn owning_block(path: &str, blocks_root: &str) -> Option<String> {
+            path.strip_prefix(blocks_root)?
+                .trim_start_matches(std::path::MAIN_SEPARATOR)
+                .split(std::path::MAIN_SEPARATOR)
+                .next()
+                .filter(|seg| !seg.is_empty() && !seg.ends_with(".rs"))
+                .map(str::to_string)
+        }
+
+        // The shared bundle, which reaches every page this crate renders.
         let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entry in walkdir::WalkDir::new(styles_root)
+        for entry in walkdir::WalkDir::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/styles"
+        ))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
+        {
+            let src = std::fs::read_to_string(entry.path()).unwrap();
+            collect_css_classes(&strip_css_comments_for_class_scan(&src), &mut defined);
+        }
+
+        // Stylesheets a block owns and serves itself, kept PER BLOCK rather
+        // than merged into `defined`.
+        //
+        // `blocks/dev/assets/dev.css` is served from `/b/dev/static/` and
+        // reaches the sandbox page and nothing else, so `.dev-pane` used from
+        // an admin page is still an offender. Merging every block's
+        // stylesheet into one vocabulary would hide exactly that mistake,
+        // which is the failure this guard exists to catch — a class in markup
+        // with no rule on the page that renders it.
+        //
+        // A block owning a stylesheet is deliberate: folding these into
+        // `ui/styles/` would ship sandbox CSS to every deployment, including
+        // builds compiled without `block-dev` at all.
+        let mut block_local: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = Default::default();
+        for entry in walkdir::WalkDir::new(blocks_root)
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
         {
+            let path = entry.path().display().to_string();
+            let Some(owner) = owning_block(&path, blocks_root) else {
+                continue;
+            };
             let src = std::fs::read_to_string(entry.path()).unwrap();
-            collect_css_classes(&strip_css_comments_for_class_scan(&src), &mut defined);
+            collect_css_classes(
+                &strip_css_comments_for_class_scan(&src),
+                block_local.entry(owner).or_default(),
+            );
         }
 
         let roots = [
@@ -1755,7 +1862,13 @@ mod tests {
 
         let mut offenders = Vec::new();
         for (class, (file, line, snippet)) in &used {
-            if defined.contains(class) || exempt.contains(class.as_str()) {
+            // A rule in the owning block's own stylesheet counts, because that
+            // sheet is served with that block's pages. A rule in some OTHER
+            // block's stylesheet does not.
+            let served_locally = owning_block(file, blocks_root)
+                .and_then(|owner| block_local.get(&owner))
+                .is_some_and(|classes| classes.contains(class));
+            if defined.contains(class) || served_locally || exempt.contains(class.as_str()) {
                 continue;
             }
             offenders.push(format!("{file}:{line}: .{class}  ({snippet})"));

@@ -1,7 +1,10 @@
 //! Locates the precompiled impresspress-web wasm in the workspace target dir
 //! and copies it into OUT_DIR for include_bytes! consumption from main.
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
@@ -64,9 +67,107 @@ fn main() {
         )
     });
 
+    // 3. Inline-JS snippets.
+    //
+    // A `wasm-pack --target web` output is THREE things, not two: the wasm,
+    // the JS glue, and the `snippets/<crate>-<hash>/…` tree the glue imports
+    // from (`impresspress-browser`'s `#[wasm_bindgen(module = "/js/bridge.js")]`
+    // lands there). The glue's very first statement is
+    //
+    //     import { … } from './snippets/impresspress-browser-<hash>/js/bridge.js';
+    //
+    // so a bundle shipped without the tree fails to load its module at all,
+    // `sw.js` self-destructs, and the app serves its boot shell forever. The
+    // sealed × web flow writes what this crate bakes, so the tree has to be
+    // baked too — otherwise the *default* sealed bundle is broken and only an
+    // `IMPRESSPRESS_WEB_PKG_DIR` override can produce a working one.
+    //
+    // Emitted as a generated `&[(&str, &[u8])]` of (path relative to
+    // `snippets/`, contents) so `include_bytes!` still does the embedding and
+    // no file list is written by hand.
+    //
+    // Absence is checked here, exactly as for the wasm and the glue above,
+    // because the three are one artifact: `impresspress-browser` declares its
+    // bridge with `#[wasm_bindgen(module = "/js/bridge.js")]`, so a correct
+    // wasm-pack run ALWAYS emits this tree. An empty one means a stale or
+    // half-written `pkg/`, never a legitimate build with no inline JS — and
+    // baking it silently moves the failure above into a browser, minutes
+    // later, instead of stopping the build.
+    let snippets_root = workspace_root.join("crates/impresspress-web/pkg/snippets");
+    let mut snippets: Vec<(String, PathBuf)> = Vec::new();
+    collect_files(&snippets_root, &snippets_root, &mut snippets);
+    if snippets.is_empty() {
+        eprintln!(
+            "\nerror: impresspress-web inline-JS snippets not found under {}.\nThe JS glue \
+             imports from `./snippets/…`, so a bundle baked without them cannot load its own \
+             module.\nRun \"just build\" first.\n",
+            snippets_root.display()
+        );
+        std::process::exit(1);
+    }
+    // Sorted so the generated file — and therefore the build — is
+    // deterministic regardless of directory iteration order.
+    snippets.sort();
+
+    // One raw literal, so the generated file is not indented by this file's
+    // own formatting.
+    let mut generated = String::from(
+        r#"/// Precompiled impresspress-web inline-JS snippets, baked at build time:
+/// `(path relative to snippets/, contents)`.
+///
+/// The CLI's sealed x web flow writes these into `dist/snippets/`. The JS glue
+/// imports from there, so a bundle without them cannot load its own module.
+///
+/// Never empty: `build.rs` refuses to bake an empty list, because a bundle
+/// missing this tree cannot load its own module.
+pub static IMPRESSPRESS_WEB_SNIPPETS: &[(&str, &[u8])] = &[
+"#,
+    );
+    for (rel, abs) in &snippets {
+        println!("cargo:rerun-if-changed={}", abs.display());
+        generated.push_str(&format!(
+            "    ({:?}, include_bytes!({:?})),\n",
+            rel,
+            abs.display().to_string()
+        ));
+    }
+    generated.push_str("];\n");
+    let snippets_dst = out_dir.join("impresspress-web-snippets.rs");
+    fs::write(&snippets_dst, generated)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", snippets_dst.display()));
+
     // Re-run if the source wasm or JS changes.
     println!("cargo:rerun-if-changed={}", wasm_src.display());
     println!("cargo:rerun-if-changed={}", js_src.display());
+    // A file ADDED to or REMOVED from the tree changes the directory itself,
+    // which the per-file lines above cannot notice.
+    println!("cargo:rerun-if-changed={}", snippets_root.display());
     // Allow override during developer iteration via env.
     println!("cargo:rerun-if-env-changed=IMPRESSPRESS_WEB_WASM_OVERRIDE_FOR_BUILD");
+}
+
+/// Collect every file under `dir` as `(path relative to `root`, absolute path)`.
+///
+/// A missing directory yields nothing rather than failing here; the caller is
+/// what decides that nothing is an error, because the caller is what knows
+/// this crate's `pkg/` always has one.
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            // `/` separators: the value is used as a URL path component by the
+            // consumer, and this build runs on the platforms the CLI ships from.
+            let rel = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push((rel, path));
+        }
+    }
 }

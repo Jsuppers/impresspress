@@ -249,9 +249,14 @@ impl ImpresspressBuilder {
             serde_json::json!({ "allow_anonymous": false }),
         );
 
-        // 5b. Apply platform-specific block configs
-        for (name, config) in self.block_configs {
-            wafer.add_block_config(&name, config);
+        // 5b. Apply platform-specific block configs.
+        //
+        // By reference: step 12 needs the same list again, because
+        // `register_site_main` has to MERGE into what a consumer declared for
+        // the two middleware blocks rather than replace it, and the runtime
+        // offers no way to read a block's config back off the `Wafer`.
+        for (name, config) in &self.block_configs {
+            wafer.add_block_config(name, config.clone());
         }
 
         // 6. Register the framework AuthBlock — not in the feature-block
@@ -392,6 +397,22 @@ impl ImpresspressBuilder {
             );
         }
 
+        // The dev sandbox's page-scoped manifest (`GET
+        // /b/dev/api/tools.json`) is projected from a curated selection
+        // list rather than from `agent_tool` annotations, so its refusals
+        // are invisible to the pass above — a `SELECTIONS` row naming a
+        // block this build did not compile in, or a typo in one, refuses
+        // there and nowhere else. Same reasoning as above applies to where
+        // it is logged: that route re-derives its document on every GET (it
+        // is `no-store`, and the page fetches it on load and again behind
+        // its "Refresh tools" button), so logging per request would emit the
+        // same static facts as many times as the page is asked. Computed and
+        // logged here instead, once, from the same `block_infos` snapshot —
+        // and skipped entirely when the dev block is not registered, since
+        // a runtime that never serves the route has nothing to report.
+        #[cfg(feature = "block-dev")]
+        crate::blocks::dev::tools::log_selection_refusals(&block_infos);
+
         let router = ImpresspressRouterBlock::with_extra_routes(
             self.jwt_secret.clone(),
             feature_config,
@@ -470,8 +491,15 @@ impl ImpresspressBuilder {
         }
 
         // 12. Register site-main flow, configuring its wafer-run/cors and
-        // security-headers steps from the shared config read at step 2.
-        crate::flows::register_site_main(&mut wafer, &cors_allowed_origins, &csp_directives)?;
+        // security-headers steps from the shared config read at step 2 —
+        // merged into whatever the consumer declared for those blocks at step
+        // 5b, never replacing it (see `flows::site_main_block_configs`).
+        crate::flows::register_site_main(
+            &mut wafer,
+            &cors_allowed_origins,
+            &csp_directives,
+            &self.block_configs,
+        )?;
 
         // Consumer-declared final overrides intentionally run after
         // `register_site_main`, which may replace earlier router/web configs.

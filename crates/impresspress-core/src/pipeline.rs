@@ -17,6 +17,7 @@ use crate::{
     features::FeatureConfig,
     http::ResponseBuilder,
     routing::{self, ExtraRoute},
+    ui,
 };
 
 /// How the pipeline persists the per-request audit row.
@@ -332,6 +333,65 @@ pub async fn handle_request(
             .json(&body);
     }
 
+    // WebMCP registration script at a stable path — beside the manifest
+    // above for the same reason the discovery documents sit here: it needs
+    // no routing through `SystemBlock`/`route_to_block` at all. SSR pages get
+    // `webmcp.js` injected by `ui::layout` at the content-hashed URL
+    // `ui::assets::webmcp_js_url()` embeds (`/b/static/webmcp-{hash}.js`,
+    // served by `SystemBlock`'s `CORE_TABLE`), which changes every deploy. A
+    // page written under `site/` — served by `wafer-run/web`, not this
+    // pipeline — never gets that injection and has no way to discover the
+    // current hash, so it needs one path that never moves. Public like the
+    // manifest: the script bytes don't vary by caller, only the manifest it
+    // fetches does, so there's no identity to resolve here.
+    if path == ui::assets::WEBMCP_JS_STABLE_PATH {
+        // With `embed-assets` the bytes are in the binary and this answers
+        // directly. Without it they were published to R2 or a CDN instead, so
+        // the only honest answer is where they actually live: a redirect to
+        // the content-hashed URL, which the Cloudflare adapter serves off its
+        // R2 binding. Either way the stable path resolves, which is what lets
+        // a page this pipeline never renders hardcode it — see
+        // `WEBMCP_JS_STABLE_PATH`.
+        #[cfg(not(feature = "embed-assets"))]
+        {
+            // 302, not 301: the target carries a content hash that changes
+            // whenever the script does, so the mapping is temporary by nature
+            // and must not be cached permanently by an intermediary.
+            return crate::http::redirect(302, &ui::assets::webmcp_js_url());
+        }
+        #[cfg(feature = "embed-assets")]
+        {
+            // RFC 9110 §8.8.3: an entity-tag is an opaque *quoted-string*, so
+            // the quotes are part of the value, not formatting. A bare hash is
+            // not a well-formed `ETag`, and a client that echoes it back
+            // verbatim in `If-None-Match` — which is the whole point of
+            // sending one — offers something the comparison rules cannot
+            // match, so no `304` would ever fire even with a comparison in
+            // place. `webmcp_js_hash()` itself stays bare: it is the hash, and
+            // `webmcp_js_url()` embeds it in a filename where quotes would be
+            // nonsense.
+            let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
+            // The comparison `http::conditional::not_modified` runs is what
+            // makes the `no-cache` revalidation below actually cheap: a repeat
+            // visitor's `If-None-Match` matching this `ETag` gets a bodyless
+            // `304` instead of the whole script re-downloaded on every
+            // navigation.
+            if let Some(not_modified) =
+                crate::http::conditional::not_modified(&msg, &etag, "no-cache")
+            {
+                return not_modified;
+            }
+            return ResponseBuilder::new()
+                .set_header("Cache-Control", "no-cache")
+                .set_header("ETag", &etag)
+                .set_header("X-Content-Type-Options", "nosniff")
+                .body(
+                    ui::assets::webmcp_js().as_bytes().to_vec(),
+                    "application/javascript; charset=utf-8",
+                );
+        }
+    }
+
     // 2a. CSRF: cookie-authenticated unsafe-method requests must pass the
     // Fetch-Metadata/Origin/Referer policy before any block sees them. Bearer
     // -authenticated callers (`cookie_authenticated == false`) are exempt — see
@@ -548,6 +608,7 @@ mod discovery_tests {
             anon_msg, bearer_for_roles, collect_or_panic, discovery_json, discovery_json_as,
             real_block_infos, TestContext, TEST_JWT_SECRET,
         },
+        ui,
     };
 
     #[tokio::test]
@@ -1641,6 +1702,144 @@ mod discovery_tests {
         );
     }
 
+    /// The stable `/b/webmcp/webmcp.js` route beside the manifest: a page
+    /// written under `site/` (no SSR `ui::layout` injection, so no way to
+    /// discover the content-hashed `/b/static/webmcp-{hash}.js`) can
+    /// hardcode this path and get the same script.
+    #[tokio::test]
+    async fn webmcp_js_is_served_at_the_stable_path_for_anonymous_callers() {
+        let ctx = TestContext::new().await;
+        let mut msg = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
+        msg.set_meta("http.header.host", "impresspress.example.com");
+        let out = handle_request(
+            &ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+
+        assert_eq!(
+            buf.body,
+            ui::assets::webmcp_js().as_bytes(),
+            "stable-path route must serve the same composed script as the hashed URL"
+        );
+
+        let header = |key: &str| {
+            buf.meta
+                .iter()
+                .find(|m| m.key == key)
+                .map(|m| m.value.as_str())
+        };
+        assert_eq!(
+            header(wafer_run::META_RESP_CONTENT_TYPE),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            header("resp.header.Cache-Control"),
+            Some("no-cache"),
+            "stable path must be revalidated every load, not cached like the immutable hashed URL"
+        );
+        let expected_etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
+        assert_eq!(
+            header("resp.header.ETag"),
+            Some(expected_etag.as_str()),
+            "ETag must be the hash webmcp_js_url() embeds, as an RFC 9110 quoted-string"
+        );
+        assert!(
+            ui::assets::webmcp_js_url()
+                .ends_with(&format!("webmcp-{}.js", ui::assets::webmcp_js_hash())),
+            "webmcp_js_hash() must be the same hash webmcp_js_url() embeds: {}",
+            ui::assets::webmcp_js_url()
+        );
+        assert_eq!(
+            header("resp.header.X-Content-Type-Options"),
+            Some("nosniff"),
+            "a public, unauthenticated script route must not be MIME-sniffable"
+        );
+    }
+
+    /// The `ETag` the previous test pins is not decorative: a repeat visitor
+    /// who echoes it back in `If-None-Match` gets a bodyless `304`, and a
+    /// stale/foreign value still gets the full `200`.
+    #[tokio::test]
+    async fn webmcp_js_stable_path_answers_conditional_get() {
+        let ctx = TestContext::new().await;
+        let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
+
+        let mut fresh = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
+        fresh.set_meta("http.header.host", "impresspress.example.com");
+        fresh.set_meta("http.header.if-none-match", &etag);
+        let out = handle_request(
+            &ctx,
+            fresh,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        assert!(
+            buf.body.is_empty(),
+            "a matching If-None-Match must produce an empty 304 body"
+        );
+        assert_eq!(
+            buf.meta
+                .iter()
+                .find(|m| m.key == wafer_run::META_RESP_STATUS)
+                .map(|m| m.value.as_str()),
+            Some("304")
+        );
+        assert_eq!(
+            buf.meta
+                .iter()
+                .find(|m| m.key == "resp.header.ETag")
+                .map(|m| m.value.as_str()),
+            Some(etag.as_str()),
+            "a 304 still carries the ETag"
+        );
+
+        let mut stale = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
+        stale.set_meta("http.header.host", "impresspress.example.com");
+        stale.set_meta("http.header.if-none-match", "\"not-the-current-hash\"");
+        let out = handle_request(
+            &ctx,
+            stale,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let buf = collect_or_panic(out).await;
+        assert_eq!(
+            buf.body,
+            ui::assets::webmcp_js().as_bytes(),
+            "a mismatching If-None-Match must fall through to the full 200 body"
+        );
+        assert_eq!(
+            buf.meta
+                .iter()
+                .find(|m| m.key == wafer_run::META_RESP_STATUS)
+                .map(|m| m.value.as_str()),
+            None,
+            "200 is the default status — no resp.status meta is set"
+        );
+    }
+
     #[tokio::test]
     async fn webmcp_manifest_reflects_an_authenticated_caller() {
         let ctx = TestContext::with_auth().await;
@@ -1823,55 +2022,11 @@ mod discovery_tests {
     // for the "still reported somewhere" half of this fix).
     // -------------------------------------------------------------------
 
-    /// Minimal `tracing::Subscriber` that records the rendered `message`
-    /// field of every event it sees, so a test can assert on what was (or
-    /// was not) logged without pulling in `tracing-subscriber`.
-    #[derive(Clone, Default)]
-    struct MessageCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    struct MessageVisitor<'a> {
-        out: &'a mut String,
-    }
-
-    impl tracing::field::Visit for MessageVisitor<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                *self.out = format!("{value:?}");
-            }
-        }
-    }
-
-    impl tracing::Subscriber for MessageCapture {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut message = String::new();
-            event.record(&mut MessageVisitor { out: &mut message });
-            self.0
-                .lock()
-                .expect("MessageCapture mutex poisoned")
-                .push(message);
-        }
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    impl MessageCapture {
-        fn count_containing(&self, needle: &str) -> usize {
-            self.0
-                .lock()
-                .expect("MessageCapture mutex poisoned")
-                .iter()
-                .filter(|m| m.contains(needle))
-                .count()
-        }
-    }
+    /// The shared log-capture subscriber. Lives in `test_support` because
+    /// `blocks::dev::tools` proves the same "this route must log nothing"
+    /// property about `/b/dev/api/tools.json` and needs the identical
+    /// machinery.
+    use crate::test_support::MessageCapture;
 
     /// The exact text `generate_webmcp`'s wrapper (and now
     /// `builder::registration::build()`) attaches to the refusal warning —
@@ -2006,11 +2161,11 @@ mod csrf_wiring_tests {
     }
 
     fn extra_route() -> Vec<ExtraRoute> {
-        vec![ExtraRoute {
-            prefix: "/x/csrf-probe".to_string(),
-            access: RouteAccess::Public,
-            block_name: "test/csrf-probe".to_string(),
-        }]
+        vec![ExtraRoute::new(
+            "/x/csrf-probe",
+            "test/csrf-probe",
+            RouteAccess::Public,
+        )]
     }
 
     #[tokio::test]
@@ -2193,11 +2348,11 @@ mod streaming_audit_tests {
     }
 
     fn route(prefix: &str, block: &str) -> Vec<ExtraRoute> {
-        vec![ExtraRoute {
-            prefix: prefix.to_string(),
-            access: RouteAccess::Public,
-            block_name: block.to_string(),
-        }]
+        vec![ExtraRoute::new(
+            prefix.to_string(),
+            block.to_string(),
+            RouteAccess::Public,
+        )]
     }
 
     async fn drive(ctx: &TestContext, path: &str, routes: &[ExtraRoute]) {

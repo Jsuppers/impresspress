@@ -186,6 +186,10 @@ impl ImpresspressBuilder {
                 block: route.block.to_string(),
                 dispatch_to: route.dispatch_to.to_string(),
                 router_final: route.is_router_final(),
+                // Built-in routes are never consumer routes; the undeclared
+                // policy for them is `declared_access`'s own fail-closed
+                // default, gated by `router_final` above.
+                refine_undeclared: false,
             })
             .chain(self.extra_routes.iter().map(|route| PreparedRoute {
                 prefix: route.prefix.clone(),
@@ -193,6 +197,7 @@ impl ImpresspressBuilder {
                 block: route.block_name.clone(),
                 dispatch_to: route.block_name.clone(),
                 router_final: false,
+                refine_undeclared: route.refines_undeclared(),
             }))
             .collect();
 
@@ -362,10 +367,20 @@ impl ImpresspressBuilder {
 
         self.extra_routes = plan.structure.routes[plan.structure.built_in_route_count..]
             .iter()
-            .map(|route| ExtraRoute {
-                prefix: route.prefix.clone(),
-                access: route.access.into(),
-                block_name: route.block.clone(),
+            .map(|route| {
+                if route.refine_undeclared {
+                    ExtraRoute::refined(
+                        route.prefix.clone(),
+                        route.block.clone(),
+                        route.access.into(),
+                    )
+                } else {
+                    ExtraRoute::new(
+                        route.prefix.clone(),
+                        route.block.clone(),
+                        route.access.into(),
+                    )
+                }
             })
             .collect();
 
@@ -516,15 +531,14 @@ mod tests {
             .unwrap();
 
         let target = ImpresspressBuilder::new();
-        let error = match target.apply_prepared_plan(
+        let Err(error) = target.apply_prepared_plan(
             &plan,
             "example",
             &hash('b'),
             &lock,
             &PreparedReleaseAssets::absent(),
-        ) {
-            Ok(_) => panic!("route drift should fail plan import"),
-            Err(error) => error,
+        ) else {
+            panic!("route drift should fail plan import");
         };
         assert!(matches!(error, PreparedPlanError::StructureMismatch(_)));
     }
@@ -610,7 +624,7 @@ mod tests {
         );
 
         let matching = ImpresspressBuilder::new()
-            .final_block_config("wafer-run/router", config.clone())
+            .final_block_config("wafer-run/router", config)
             .apply_prepared_plan(
                 &plan,
                 "example",
