@@ -16,7 +16,14 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: 0,
   workers: 1,
-  reporter: [['list']],
+  // Paths below are resolved relative to THIS config file's directory
+  // (`tests/`), not the working directory. CI uploads the report and the
+  // actual/diff PNGs from the crate root, so both are lifted one level out
+  // of `tests/`. Without this the html report was never written at all and
+  // every `Upload Playwright report on failure` step in ci.yml uploaded
+  // nothing, leaving screenshot failures with no diff images to inspect.
+  reporter: [['list'], ['html', { open: 'never', outputFolder: '../playwright-report' }]],
+  outputDir: '../test-results',
   timeout: 60_000,
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
