@@ -1747,13 +1747,10 @@ mod tests {
 
         // The shared bundle, which reaches every page this crate renders.
         let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entry in walkdir::WalkDir::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/ui/styles"
-        ))
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
+        for entry in walkdir::WalkDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/styles"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
         {
             let src = std::fs::read_to_string(entry.path()).unwrap();
             collect_css_classes(&strip_css_comments_for_class_scan(&src), &mut defined);
@@ -1772,10 +1769,8 @@ mod tests {
         // A block owning a stylesheet is deliberate: folding these into
         // `ui/styles/` would ship sandbox CSS to every deployment, including
         // builds compiled without `block-dev` at all.
-        let mut block_local: std::collections::HashMap<
-            String,
-            std::collections::HashSet<String>,
-        > = Default::default();
+        let mut block_local: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            Default::default();
         for entry in walkdir::WalkDir::new(blocks_root)
             .into_iter()
             .filter_map(Result::ok)
