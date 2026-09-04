@@ -342,12 +342,34 @@ fn store_if_current(guard: &BuildGuard, rt: Rc<ReadyRuntime>) -> bool {
     true
 }
 
+/// Returned when the config-version key cannot be READ.
+///
+/// A constant, deliberately: every isolate that hits a KV error converges on
+/// the same value, so a KV outage costs at most one rebuild per isolate rather
+/// than one per probe.
+const VERSION_UNAVAILABLE: &str = "<kv-unavailable>";
+
 /// Current KV config-version stamp. Missing key ⇒ stamp a fresh one so all
 /// isolates converge on the same generation.
+///
+/// A read ERROR is NOT a missing key. Minting on error — which is what `_`
+/// used to do — hands back a fresh random stamp, and the caller compares it
+/// against `rt.version` to decide whether to rebuild. They never match, so one
+/// transient KV failure forced EVERY isolate onto the multi-second dynamic
+/// build path, on every probe, until a `put` finally landed. The doc comment
+/// above described the intended behaviour; the match arm was wider than the
+/// comment.
 async fn current_version(kv: &Arc<dyn impresspress_core::kv::KvBackend>) -> String {
     match kv.get(CONFIG_VERSION_KEY).await {
         Ok(Some(v)) => v,
-        _ => {
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "config-version read failed; holding the current generation rather than re-minting"
+            );
+            VERSION_UNAVAILABLE.to_string()
+        }
+        Ok(None) => {
             let v = crate::kv_cached_db::new_version_stamp();
             if let Err(e) =
                 impresspress_core::kv::put_version_stamp_with_retry(kv.as_ref(), &v).await
