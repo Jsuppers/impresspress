@@ -531,8 +531,6 @@ crate::impresspress_feature_block! {
                     super::auth_ui::AUTH_UI_BLOCK_ID,
                     user_roles::TABLE,
                 ),
-                wafer_run::ResourceGrant::read(super::auth::AUTH_BLOCK_ID, variables::TABLE),
-                wafer_run::ResourceGrant::read("impresspress/userportal", block_settings::TABLE),
                 // Every block may upsert its own migration state into block_settings.
                 wafer_run::ResourceGrant::read_write("*", block_settings::TABLE),
                 // Infrastructure logging: storage wrapper + pipeline write logs
@@ -1083,6 +1081,37 @@ mod grant_tests {
             "admin block must not declare a typed Storage grant for impresspress/files \
              — the files block self-admits its own namespace via WRAP Rule 3 (Wave 26 \
              / c18). Found: {storage_grant_for_files:?}"
+        );
+    }
+
+    /// Two grants nothing reads through. The framework auth block reads its
+    /// configuration through the config client
+    /// (`config_client::get_default`), never the variables table; userportal
+    /// reads the enablement map from the config snapshot
+    /// (`features::BLOCK_SETTINGS_CONFIG_KEY`), never the block_settings
+    /// table. The WRAP audit (`scripts/audit-wrap-grants.sh`), which also
+    /// walks `platform_state` references, finds no such access from either
+    /// block. A grant with no reader is standing permission for one to
+    /// appear without review, so neither row is declared.
+    #[test]
+    fn admin_declares_no_grant_nothing_reads_through() {
+        use crate::{
+            blocks::auth::AUTH_BLOCK_ID,
+            platform_state::{block_settings, variables},
+        };
+
+        let grants = AdminBlock::new().info().grants;
+        let stale: Vec<_> = grants
+            .iter()
+            .filter(|g| {
+                (g.grantee == AUTH_BLOCK_ID && g.resource == variables::TABLE)
+                    || (g.grantee == "impresspress/userportal"
+                        && g.resource == block_settings::TABLE)
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "admin must not grant a table nothing reads through: {stale:?}"
         );
     }
 
