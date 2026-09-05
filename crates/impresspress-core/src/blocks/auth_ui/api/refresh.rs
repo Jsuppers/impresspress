@@ -86,13 +86,25 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         // SEC-039: a revoked token surfaced. If the family still has a live
         // row, an attacker is replaying a stolen token after legitimate
         // rotation. Burn the whole family.
-        if let Ok(true) = tokens::family_has_live_row(ctx, &row.family).await {
+        //
+        // Both steps fail closed. An outage on the live-row check or on the
+        // revoke would leave the attacker's rotated family usable, so it is
+        // reported as an error rather than as the ordinary "revoked"
+        // rejection a replayed token gets — the same rule logout applies to
+        // its revocation writes.
+        let family_live = match tokens::family_has_live_row(ctx, &row.family).await {
+            Ok(live) => live,
+            Err(e) => return err_internal("Refresh could not check the token family", e),
+        };
+        if family_live {
             tracing::warn!(
                 user_id = %row.user_id,
                 family = %row.family,
                 "refresh: token reuse detected; revoking entire family"
             );
-            let _ = tokens::revoke_family(ctx, &row.family).await;
+            if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
+                return err_internal("Refresh could not revoke the token family", e);
+            }
         }
         return error_response(ErrorCode::InvalidToken, "Refresh token has been revoked");
     }
@@ -172,4 +184,110 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             token_type: TokenType::Bearer,
             expires_in: issued.access_lifetime,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::auth_ui::api::{login, signup},
+        test_support::{
+            collect_or_panic, output_is_error, output_json, FailingDbOpContext, TestContext,
+        },
+    };
+
+    fn json_input(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(value.to_string().into_bytes())
+    }
+
+    fn refresh_with(token: &str) -> InputStream {
+        json_input(serde_json::json!({ "refresh_token": token }))
+    }
+
+    /// Sign up and log in through the real handlers, returning the login's
+    /// refresh token — a live generation-0 row in a fresh family.
+    async fn fresh_refresh_token(ctx: &TestContext) -> String {
+        let creds = serde_json::json!({
+            "email": "reuse@example.com",
+            "password": "correct-horse-battery",
+        });
+        collect_or_panic(signup::handle(ctx, json_input(creds.clone())).await).await;
+        let resp = output_json(login::handle(ctx, json_input(creds)).await).await;
+        resp["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("login must return a refresh token: {resp}"))
+            .to_string()
+    }
+
+    /// Rotate once, so `first` is a revoked row whose family still has a
+    /// live successor — the SEC-039 replay setup.
+    async fn rotated_pair(ctx: &TestContext) -> (String, String) {
+        let first = fresh_refresh_token(ctx).await;
+        let resp = output_json(handle(ctx, refresh_with(&first)).await).await;
+        let second = resp["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("rotation must return a new refresh token: {resp}"))
+            .to_string();
+        (first, second)
+    }
+
+    #[tokio::test]
+    async fn replaying_a_rotated_token_burns_the_whole_family() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let (first, second) = rotated_pair(&ctx).await;
+        let family = tokens::find_by_token(&ctx, &first)
+            .await
+            .expect("token lookup")
+            .expect("the rotated-away row is kept as a tombstone")
+            .family;
+
+        assert!(
+            output_is_error(handle(&ctx, refresh_with(&first)).await, "Unauthenticated").await,
+            "a rotated-away token must be refused"
+        );
+
+        assert!(
+            !tokens::family_has_live_row(&ctx, &family)
+                .await
+                .expect("live-row check"),
+            "reuse must revoke every row in the family"
+        );
+        assert!(
+            output_is_error(handle(&ctx, refresh_with(&second)).await, "Unauthenticated").await,
+            "the live successor must be unusable once reuse was detected"
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_check_outage_is_not_reported_as_a_plain_rejection() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let (first, _second) = rotated_pair(&ctx).await;
+        // The token lookup and the live-row check are both `database.list`
+        // on the tokens table: let the lookup through, fail the check.
+        let failing =
+            FailingDbOpContext::new(ctx, vec![("database.list", tokens::TABLE)]).after_passing(1);
+
+        let out = handle(&failing, refresh_with(&first)).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed reuse check leaves the replayed family live; \
+             it must surface as an error, not as an ordinary 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn family_revoke_outage_is_not_reported_as_a_plain_rejection() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let (first, _second) = rotated_pair(&ctx).await;
+        let failing = FailingDbOpContext::new(ctx, vec![("database.update_where", tokens::TABLE)]);
+
+        let out = handle(&failing, refresh_with(&first)).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed family revoke leaves the attacker's token live; \
+             it must surface as an error, not as an ordinary 401"
+        );
+    }
 }

@@ -1304,6 +1304,10 @@ pub struct FailingDbOpContext {
     /// `InvalidArgument` a repository guard raised, say — and pin how the
     /// handler above translates it.
     error: WaferError,
+    /// How many matching calls to let through before failing (see
+    /// [`FailingDbOpContext::after_passing`]). Shared across clones so a
+    /// handler's `clone_arc` sees the same countdown.
+    passes_before_failing: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Request-body shape shared by every `wafer-run/database` wire request:
@@ -1340,7 +1344,27 @@ impl FailingDbOpContext {
             inner,
             failing,
             error,
+            passes_before_failing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Let the first `n` matching calls through untouched and fail only from
+    /// the `n + 1`th on. A handler whose guarded call is preceded by another
+    /// call of the same op on the same table (a lookup, then a check) needs
+    /// this to isolate the second one.
+    pub fn after_passing(self, n: usize) -> Self {
+        self.passes_before_failing
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Consume one allowed pass. `true` when this matching call should still
+    /// reach the inner context.
+    fn let_one_pass(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.passes_before_failing
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
     }
 }
 
@@ -1366,6 +1390,7 @@ impl Context for FailingDbOpContext {
                 .failing
                 .iter()
                 .any(|(op, table)| *op == msg.action() && *table == collection)
+                && !self.let_one_pass()
             {
                 return OutputStream::error(self.error.clone());
             }
@@ -1391,6 +1416,25 @@ impl Context for FailingDbOpContext {
 
     fn clone_arc(&self) -> Arc<dyn Context> {
         Arc::new(self.clone())
+    }
+}
+
+impl TestContext {
+    /// [`TestContext::with_auth`] plus a real `wafer-run/crypto` block, so
+    /// handlers that mint or verify JWTs (login, signup, refresh) run end to
+    /// end against a fixed test secret.
+    pub async fn with_auth_and_crypto() -> Self {
+        let mut ctx = Self::with_auth().await;
+        let svc = Arc::new(
+            wafer_block_crypto::service::Argon2JwtCryptoService::new(
+                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
+            )
+            .expect("test secret is long enough"),
+        );
+        let crypto_block: Arc<dyn wafer_run::Block> =
+            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
+        ctx.register_block("wafer-run/crypto", crypto_block);
+        ctx
     }
 }
 
