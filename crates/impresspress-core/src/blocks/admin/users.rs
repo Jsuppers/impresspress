@@ -13,42 +13,8 @@ use crate::{
     http::{err_bad_request, err_internal, err_not_found, ok_json},
 };
 
-/// `path` is the normalized `/admin/users[...]` sub-path passed explicitly by
-/// the admin dispatcher (no `req.resource` rewrite). The leaf handlers read the
-/// user id from `req.param.id`, which this dispatcher binds from `path`.
-pub async fn handle(
-    ctx: &dyn Context,
-    msg: &Message,
-    path: &str,
-    input: InputStream,
-) -> OutputStream {
-    let action = msg.action();
-
-    match (action, path) {
-        ("retrieve", "/admin/users") => handle_list(ctx, msg).await,
-        ("retrieve", _) if path.starts_with("/admin/users/") => {
-            handle_get(ctx, msg, user_id_from(path)).await
-        }
-        ("update", _) if path.starts_with("/admin/users/") => {
-            handle_update(ctx, msg, user_id_from(path), input).await
-        }
-        ("delete", _) if path.starts_with("/admin/users/") => {
-            handle_delete(ctx, msg, user_id_from(path)).await
-        }
-        _ => err_not_found("not found"),
-    }
-}
-
-/// Extract the first `/`-bounded user-id segment after `/admin/users/`.
-fn user_id_from(path: &str) -> &str {
-    let rest = path.strip_prefix("/admin/users/").unwrap_or("");
-    match rest.find('/') {
-        Some(idx) => &rest[..idx],
-        None => rest,
-    }
-}
-
-async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
+/// `GET /b/admin/api/users`.
+pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let query = AdminUserListQuery::from_message(msg);
 
     let mut filters = vec![Filter {
@@ -98,7 +64,10 @@ async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
-async fn handle_get(ctx: &dyn Context, _msg: &Message, id: &str) -> OutputStream {
+/// `GET /b/admin/api/users/{id}`. `{id}` is read only as the route table
+/// bound it.
+pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing user ID");
     }
@@ -125,12 +94,14 @@ async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
     }
 }
 
-async fn handle_update(
+/// `PATCH /b/admin/api/users/{id}`. `{id}` is read only as the route table
+/// bound it.
+pub(super) async fn handle_update(
     ctx: &dyn Context,
     msg: &Message,
-    id: &str,
     input: InputStream,
 ) -> OutputStream {
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing user ID");
     }
@@ -162,7 +133,10 @@ async fn handle_update(
     }
 }
 
-async fn handle_delete(ctx: &dyn Context, msg: &Message, id: &str) -> OutputStream {
+/// `DELETE /b/admin/api/users/{id}`. `{id}` is read only as the route table
+/// bound it.
+pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing user ID");
     }
@@ -180,7 +154,10 @@ mod tests {
     use wafer_core::clients::database as db;
 
     use super::*;
-    use crate::test_support::{admin_msg, output_json, TestContext};
+    use crate::{
+        blocks::admin::test_support::routed,
+        test_support::{admin_msg, output_json, TestContext},
+    };
 
     /// Seed one user row carrying every column the table has, including the
     /// two the API must never publish.
@@ -233,7 +210,8 @@ mod tests {
         seed_user(&ctx).await;
 
         let body =
-            output_json(handle_list(&ctx, &admin_msg("retrieve", "/admin/users")).await).await;
+            output_json(handle_list(&ctx, &admin_msg("retrieve", "/b/admin/api/users")).await)
+                .await;
 
         let row = body["records"][0]
             .as_object()
@@ -276,7 +254,8 @@ mod tests {
         seed_user(&ctx).await;
 
         let body =
-            output_json(handle_list(&ctx, &admin_msg("retrieve", "/admin/users")).await).await;
+            output_json(handle_list(&ctx, &admin_msg("retrieve", "/b/admin/api/users")).await)
+                .await;
         let raw = body.to_string();
 
         for leaked in ["verification_token", "3d1f0ac0deadbeef", "password_hash"] {
@@ -297,7 +276,8 @@ mod tests {
         seed_user(&ctx).await;
 
         let body =
-            output_json(handle_list(&ctx, &admin_msg("retrieve", "/admin/users")).await).await;
+            output_json(handle_list(&ctx, &admin_msg("retrieve", "/b/admin/api/users")).await)
+                .await;
 
         assert_eq!(
             body["records"][0]["email_verified"],
@@ -341,10 +321,8 @@ mod tests {
         let input = InputStream::from_bytes(
             serde_json::to_vec(&serde_json::json!({"name": "Ada Updated"})).unwrap(),
         );
-        let body = output_json(
-            handle_update(&ctx, &admin_msg("update", "/admin/users"), &id, input).await,
-        )
-        .await;
+        let msg = routed(admin_msg("update", &format!("/b/admin/api/users/{id}")));
+        let body = output_json(handle_update(&ctx, &msg, input).await).await;
 
         assert_eq!(body["id"], serde_json::json!(id));
         assert_eq!(body["name"], serde_json::json!("Ada Updated"));

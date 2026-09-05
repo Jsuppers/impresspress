@@ -26,43 +26,8 @@ pub(crate) const PERMISSIONS_TABLE: &str = "impresspress__admin__permissions";
 /// User → role assignment table (many-to-many via row per pair).
 pub(crate) const USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
-/// `path` is the normalized `/admin/iam/...` sub-path, passed explicitly (no
-/// `req.resource` rewrite). Id-bearing leaves take their id from it.
-pub async fn handle(
-    ctx: &dyn Context,
-    msg: &Message,
-    path: &str,
-    input: InputStream,
-) -> OutputStream {
-    let action = msg.action();
-
-    match (action, path) {
-        // Roles
-        ("retrieve", "/admin/iam/roles") => handle_list_roles(ctx).await,
-        ("create", "/admin/iam/roles") => handle_create_role(ctx, msg, input).await,
-        ("update", _) if path.starts_with("/admin/iam/roles/") => {
-            handle_update_role(ctx, msg, path, input).await
-        }
-        ("delete", _) if path.starts_with("/admin/iam/roles/") => {
-            handle_delete_role(ctx, msg, path).await
-        }
-        // Permissions
-        ("retrieve", "/admin/iam/permissions") => handle_list_permissions(ctx).await,
-        ("create", "/admin/iam/permissions") => handle_create_permission(ctx, input).await,
-        ("delete", _) if path.starts_with("/admin/iam/permissions/") => {
-            handle_delete_permission(ctx, path).await
-        }
-        // User-role assignments
-        ("retrieve", "/admin/iam/user-roles") => handle_list_user_roles(ctx, msg).await,
-        ("create", "/admin/iam/user-roles") => handle_assign_role(ctx, msg, input).await,
-        ("delete", _) if path.starts_with("/admin/iam/user-roles/") => {
-            handle_remove_role(ctx, msg, path).await
-        }
-        _ => err_not_found("not found"),
-    }
-}
-
-async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
+/// `GET /b/admin/api/iam/roles`.
+pub(super) async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
     let opts = ListOptions {
         sort: vec![SortField {
             field: "name".to_string(),
@@ -82,7 +47,12 @@ async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
     }
 }
 
-async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
+/// `POST /b/admin/api/iam/roles`.
+pub(super) async fn handle_create_role(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     let raw = input.collect_to_bytes().await;
     let body: CreateRoleRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
@@ -108,13 +78,14 @@ async fn handle_create_role(ctx: &dyn Context, msg: &Message, input: InputStream
     }
 }
 
-async fn handle_update_role(
+/// `PATCH /b/admin/api/iam/roles/{id}`. `{id}` is read only as the route
+/// table bound it.
+pub(super) async fn handle_update_role(
     ctx: &dyn Context,
     msg: &Message,
-    path: &str,
     input: InputStream,
 ) -> OutputStream {
-    let id = path.strip_prefix("/admin/iam/roles/").unwrap_or("");
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing role ID");
     }
@@ -256,8 +227,10 @@ async fn cascade_role_rename(
     Ok(())
 }
 
-async fn handle_delete_role(ctx: &dyn Context, msg: &Message, path: &str) -> OutputStream {
-    let id = path.strip_prefix("/admin/iam/roles/").unwrap_or("");
+/// `DELETE /b/admin/api/iam/roles/{id}`. `{id}` is read only as the route
+/// table bound it.
+pub(super) async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
     // System-role guard, delete, and audit-log write live in the shared ops
     // layer (the JSON path previously logged nothing).
     match super::ops::delete_role(ctx, msg, id).await {
@@ -266,7 +239,8 @@ async fn handle_delete_role(ctx: &dyn Context, msg: &Message, path: &str) -> Out
     }
 }
 
-async fn handle_list_permissions(ctx: &dyn Context) -> OutputStream {
+/// `GET /b/admin/api/iam/permissions`.
+pub(super) async fn handle_list_permissions(ctx: &dyn Context) -> OutputStream {
     match db::list_all(ctx, PERMISSIONS_TABLE, vec![]).await {
         Ok(records) => {
             let total_count = records.len() as i64;
@@ -281,7 +255,11 @@ async fn handle_list_permissions(ctx: &dyn Context) -> OutputStream {
     }
 }
 
-async fn handle_create_permission(ctx: &dyn Context, input: InputStream) -> OutputStream {
+/// `POST /b/admin/api/iam/permissions`.
+pub(super) async fn handle_create_permission(
+    ctx: &dyn Context,
+    input: InputStream,
+) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct Req {
         name: String,
@@ -305,8 +283,10 @@ async fn handle_create_permission(ctx: &dyn Context, input: InputStream) -> Outp
     }
 }
 
-async fn handle_delete_permission(ctx: &dyn Context, path: &str) -> OutputStream {
-    let id = path.strip_prefix("/admin/iam/permissions/").unwrap_or("");
+/// `DELETE /b/admin/api/iam/permissions/{id}`. `{id}` is read only as the
+/// route table bound it.
+pub(super) async fn handle_delete_permission(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing permission ID");
     }
@@ -317,7 +297,8 @@ async fn handle_delete_permission(ctx: &dyn Context, path: &str) -> OutputStream
     }
 }
 
-async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> OutputStream {
+/// `GET /b/admin/api/iam/user-roles`.
+pub(super) async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.query("user_id").to_string();
     let mut filters = Vec::new();
     if !user_id.is_empty() {
@@ -341,7 +322,12 @@ async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> OutputStrea
     }
 }
 
-async fn handle_assign_role(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
+/// `POST /b/admin/api/iam/user-roles`.
+pub(super) async fn handle_assign_role(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct Req {
         user_id: String,
@@ -418,8 +404,10 @@ async fn handle_assign_role(ctx: &dyn Context, msg: &Message, input: InputStream
     }
 }
 
-async fn handle_remove_role(ctx: &dyn Context, msg: &Message, path: &str) -> OutputStream {
-    let id = path.strip_prefix("/admin/iam/user-roles/").unwrap_or("");
+/// `DELETE /b/admin/api/iam/user-roles/{id}`. `{id}` is read only as the
+/// route table bound it.
+pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing user-role ID");
     }
@@ -505,7 +493,19 @@ mod tests {
     use wafer_run::{BlockInfo, WaferError};
 
     use super::*;
-    use crate::test_support::{admin_msg, output_is_error, output_json, TestContext};
+    use crate::{
+        blocks::admin::test_support::routed,
+        test_support::{admin_msg, output_is_error, output_json, TestContext},
+    };
+
+    /// `PATCH /b/admin/api/iam/roles/{role_id}`, with `{id}` bound by the
+    /// table the way it is on the wire.
+    fn update_role_msg(role_id: &str) -> Message {
+        routed(admin_msg(
+            "update",
+            &format!("/b/admin/api/iam/roles/{role_id}"),
+        ))
+    }
 
     /// Wraps a `TestContext` and turns every `db::get` call
     /// (`ServiceOp::DATABASE_GET`, wire kind `"database.get"`) into a
@@ -568,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn list_roles_publishes_exactly_the_contract_fields() {
         let ctx = TestContext::with_admin().await;
-        let msg = crate::test_support::admin_msg("create", "/admin/iam/roles");
+        let msg = crate::test_support::admin_msg("create", "/b/admin/api/iam/roles");
         let created = super::super::ops::create_role(
             &ctx,
             &msg,
@@ -655,7 +655,7 @@ mod tests {
 
         let out = super::super::ops::delete_role(
             &failing,
-            &admin_msg("delete", "/admin/iam/roles"),
+            &admin_msg("delete", "/b/admin/api/iam/roles"),
             &role_id,
         )
         .await;
@@ -690,7 +690,7 @@ mod tests {
         let created = output_json(
             handle_create_role(
                 &ctx,
-                &admin_msg("create", "/admin/iam/roles"),
+                &admin_msg("create", "/b/admin/api/iam/roles"),
                 body_input(serde_json::json!({ "name": "editor", "permissions": ["posts.write"] })),
             )
             .await,
@@ -701,7 +701,7 @@ mod tests {
         // Grant it to a user, the way the admin UI does.
         let assigned = handle_assign_role(
             &ctx,
-            &admin_msg("create", "/admin/iam/user-roles"),
+            &admin_msg("create", "/b/admin/api/iam/user-roles"),
             body_input(serde_json::json!({ "user_id": "user_1", "role": "editor" })),
         )
         .await;
@@ -712,8 +712,7 @@ mod tests {
 
         let out = handle_update_role(
             &ctx,
-            &admin_msg("update", "/admin/iam/roles"),
-            &format!("/admin/iam/roles/{role_id}"),
+            &update_role_msg(&role_id),
             body_input(serde_json::json!({ "name": "editor-v2" })),
         )
         .await;
@@ -747,7 +746,7 @@ mod tests {
         let created = output_json(
             handle_create_role(
                 &ctx,
-                &admin_msg("create", "/admin/iam/roles"),
+                &admin_msg("create", "/b/admin/api/iam/roles"),
                 body_input(serde_json::json!({ "name": "auditor", "permissions": [] })),
             )
             .await,
@@ -757,8 +756,7 @@ mod tests {
 
         let out = handle_update_role(
             &ctx,
-            &admin_msg("update", "/admin/iam/roles"),
-            &format!("/admin/iam/roles/{role_id}"),
+            &update_role_msg(&role_id),
             body_input(serde_json::json!({ "description": "reads everything" })),
         )
         .await;
@@ -788,11 +786,9 @@ mod tests {
         // Attempt to rename the system role while the protective guard read
         // (db::get) is failing. The mutation must be rejected — not silently
         // let through because the guard couldn't be evaluated.
-        let path = format!("/admin/iam/roles/{role_id}");
         let out = handle_update_role(
             &failing,
-            &admin_msg("update", "/admin/iam/roles"),
-            &path,
+            &update_role_msg(&role_id),
             body_input(serde_json::json!({"name": "renamed-admin"})),
         )
         .await;
@@ -828,11 +824,9 @@ mod tests {
         let ctx = TestContext::with_admin().await;
         let role_id = seed_system_role(&ctx).await;
 
-        let path = format!("/admin/iam/roles/{role_id}");
         let out = handle_update_role(
             &ctx,
-            &admin_msg("update", "/admin/iam/roles"),
-            &path,
+            &update_role_msg(&role_id),
             body_input(serde_json::json!({"name": "renamed-admin"})),
         )
         .await;
@@ -842,11 +836,9 @@ mod tests {
     #[tokio::test]
     async fn update_role_missing_row_returns_not_found() {
         let ctx = TestContext::with_admin().await;
-        let path = "/admin/iam/roles/does-not-exist".to_string();
         let out = handle_update_role(
             &ctx,
-            &admin_msg("update", "/admin/iam/roles"),
-            &path,
+            &update_role_msg("does-not-exist"),
             body_input(serde_json::json!({"description": "x"})),
         )
         .await;
@@ -864,11 +856,9 @@ mod tests {
         }));
         let created = db::create(&ctx, ROLES_TABLE, data).await.unwrap();
 
-        let path = format!("/admin/iam/roles/{}", created.id);
         let out = handle_update_role(
             &ctx,
-            &admin_msg("update", "/admin/iam/roles"),
-            &path,
+            &update_role_msg(&created.id),
             body_input(serde_json::json!({"name": "renamed-editor"})),
         )
         .await;
@@ -911,7 +901,7 @@ mod tests {
         let ctx = TestContext::with_admin().await;
         let out = handle_create_role(
             &ctx,
-            &admin_msg("create", "/admin/iam/roles"),
+            &admin_msg("create", "/b/admin/api/iam/roles"),
             body_input(serde_json::json!({
                 "name": "editor",
                 "description": "Can edit content",
@@ -935,19 +925,18 @@ mod tests {
         let created = output_json(
             handle_create_role(
                 &ctx,
-                &admin_msg("create", "/admin/iam/roles"),
+                &admin_msg("create", "/b/admin/api/iam/roles"),
                 body_input(serde_json::json!({"name": "editor"})),
             )
             .await,
         )
         .await;
-        let path = format!("/admin/iam/roles/{}", created["id"].as_str().unwrap());
+        let role_id = created["id"].as_str().unwrap();
 
         let updated = output_json(
             handle_update_role(
                 &ctx,
-                &admin_msg("update", "/admin/iam/roles"),
-                &path,
+                &update_role_msg(role_id),
                 body_input(serde_json::json!({"permissions": ["posts.read", "posts.write"]})),
             )
             .await,
@@ -961,8 +950,7 @@ mod tests {
 
         let out = handle_update_role(
             &ctx,
-            &admin_msg("update", "/admin/iam/roles"),
-            &path,
+            &update_role_msg(role_id),
             body_input(serde_json::json!({"permissions": "posts.*"})),
         )
         .await;
@@ -978,18 +966,18 @@ mod tests {
         let created = output_json(
             handle_create_role(
                 &ctx,
-                &admin_msg("create", "/admin/iam/roles"),
+                &admin_msg("create", "/b/admin/api/iam/roles"),
                 body_input(serde_json::json!({"name": "editor"})),
             )
             .await,
         )
         .await;
-        let path = format!("/admin/iam/roles/{}", created["id"].as_str().unwrap());
+        let msg = routed(admin_msg(
+            "delete",
+            &format!("/b/admin/api/iam/roles/{}", created["id"].as_str().unwrap()),
+        ));
 
-        let body = output_json(
-            handle_delete_role(&ctx, &admin_msg("delete", "/admin/iam/roles"), &path).await,
-        )
-        .await;
+        let body = output_json(handle_delete_role(&ctx, &msg).await).await;
         assert_eq!(body, serde_json::json!({"deleted": true}));
     }
 
@@ -1016,7 +1004,7 @@ mod tests {
         .id;
         assert_eq!(users::auth_version(&ctx, &uid).await.unwrap(), 0);
 
-        let msg = admin_msg("create", "/admin/iam/user-roles");
+        let msg = admin_msg("create", "/b/admin/api/iam/user-roles");
         let out = handle_assign_role(
             &ctx,
             &msg,
@@ -1056,7 +1044,7 @@ mod tests {
         .unwrap()
         .id;
 
-        let msg = admin_msg("create", "/admin/iam/user-roles");
+        let msg = admin_msg("create", "/b/admin/api/iam/user-roles");
         let assigned = output_json(
             handle_assign_role(
                 &ctx,
@@ -1074,9 +1062,11 @@ mod tests {
         // removal's OWN bump is what this test proves.
         let before_remove = users::auth_version(&ctx, &uid).await.unwrap();
 
-        let remove_path = format!("/admin/iam/user-roles/{role_row_id}");
-        let remove_msg = admin_msg("delete", &remove_path);
-        let out = handle_remove_role(&ctx, &remove_msg, &remove_path).await;
+        let remove_msg = routed(admin_msg(
+            "delete",
+            &format!("/b/admin/api/iam/user-roles/{role_row_id}"),
+        ));
+        let out = handle_remove_role(&ctx, &remove_msg).await;
         assert!(
             !output_is_error(out, "Internal").await,
             "remove must succeed"

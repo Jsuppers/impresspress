@@ -511,12 +511,10 @@ pub async fn handle_create_variable(
     variables_page(ctx, msg).await
 }
 
-/// GET /b/admin/variables/{key}/edit -- return modal edit form content
-pub async fn handle_edit_variable_form(
-    ctx: &dyn Context,
-    _msg: &Message,
-    var_key: &str,
-) -> OutputStream {
+/// `GET /b/admin/variables/{key}/edit` -- return modal edit form content.
+/// `{key}` is read only as the route table bound it.
+pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let var_key = msg.var("key");
     let Ok(record) = db::get_by_field(
         ctx,
         VARIABLES,
@@ -588,13 +586,15 @@ pub async fn handle_edit_variable_form(
     ui::html_response(markup)
 }
 
-/// PUT /b/admin/variables/{key} -- update variable value
+/// `PUT`/`PATCH /b/admin/variables/{key}` -- update variable value (the row
+/// is declared `PATCH`; the edit form sends `PUT`, which maps to the same
+/// `update` action). `{key}` is read only as the route table bound it.
 pub async fn handle_update_variable(
     ctx: &dyn Context,
     msg: &Message,
     input: InputStream,
-    var_key: &str,
 ) -> OutputStream {
+    let var_key = msg.var("key");
     let bytes = input.collect_to_bytes().await;
     let body = parse_form_body(&bytes);
 

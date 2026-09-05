@@ -291,8 +291,10 @@ async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
     single_user_row(&record, &roles, "")
 }
 
-/// POST /b/admin/users/{id}/disable
-pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message, user_id: &str) -> OutputStream {
+/// `POST /b/admin/users/{id}/disable`. `{id}` is read only as the route
+/// table bound it.
+pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.var("id");
     // Self-disable guard, update, and audit-log write live in the shared ops
     // layer (single source of truth shared with the JSON surface).
     if let Err(out) = ops::set_user_disabled(ctx, msg, user_id, true).await {
@@ -302,8 +304,10 @@ pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message, user_id: &str
     ui::html_response_with_toast(row, "User disabled", "success")
 }
 
-/// POST /b/admin/users/{id}/enable
-pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message, user_id: &str) -> OutputStream {
+/// `POST /b/admin/users/{id}/enable`. `{id}` is read only as the route
+/// table bound it.
+pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.var("id");
     if let Err(out) = ops::set_user_disabled(ctx, msg, user_id, false).await {
         return out;
     }
@@ -311,8 +315,10 @@ pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message, user_id: &str)
     ui::html_response_with_toast(row, "User enabled", "success")
 }
 
-/// DELETE /b/admin/users/{id}
-pub async fn handle_user_delete(ctx: &dyn Context, msg: &Message, user_id: &str) -> OutputStream {
+/// `DELETE /b/admin/users/{id}`. `{id}` is read only as the route table
+/// bound it.
+pub async fn handle_user_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.var("id");
     // Self-delete guard, soft-delete, and audit-log write live in the shared
     // ops layer.
     if let Err(out) = ops::delete_user(ctx, msg, user_id).await {
@@ -350,7 +356,10 @@ pub async fn handle_create_role(
         )
 }
 
-pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message, role_id: &str) -> OutputStream {
+/// `DELETE /b/admin/iam/roles/{id}` (from the roles tab). `{id}` is read only
+/// as the route table bound it.
+pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let role_id = msg.var("id");
     // System-role guard, delete, and audit-log write live in the shared ops
     // layer.
     if let Err(out) = ops::delete_role(ctx, msg, role_id).await {
@@ -505,8 +514,12 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                                     }
                                     td {
                                         @if revoked.is_empty() {
+                                            // Revocation is auth-ui's
+                                            // `PATCH /b/auth/api/api-keys/{id}`
+                                            // (`Route::RevokeApiKey`); an admin
+                                            // may revoke another user's key.
                                             button .btn .btn--sm .btn--secondary
-                                                hx-post={"/b/auth/api/api-keys/" (record.id) "/revoke"}
+                                                hx-patch={"/b/auth/api/api-keys/" (record.id)}
                                                 hx-target="#users-tab-content"
                                                 hx-confirm="Revoke this API key?"
                                             { "Revoke" }
@@ -536,5 +549,60 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                 }
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::auth::repo::{api_keys, users},
+        test_support::{admin_msg, output_html, TestContext},
+    };
+
+    /// The API-keys tab must revoke through the route auth-ui declares
+    /// (`PATCH /b/auth/api/api-keys/{id}`, `Route::RevokeApiKey`). The old
+    /// control posted to `.../{id}/revoke`, a path no block ever served, so
+    /// the button answered 404 in every deployment.
+    #[tokio::test]
+    async fn api_keys_tab_revokes_through_the_declared_patch_route() {
+        let ctx = TestContext::with_auth().await;
+        let owner = users::insert(
+            &ctx,
+            users::NewUser {
+                email: "owner@example.com".into(),
+                display_name: "Owner".into(),
+                avatar_url: None,
+                role: "user".into(),
+            },
+        )
+        .await
+        .expect("seed user");
+        let key = api_keys::insert(
+            &ctx,
+            api_keys::NewApiKey {
+                user_id: &owner.id,
+                name: "ci",
+                key_hash: "hash-1",
+                key_prefix: "ipk_abc",
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("seed api key");
+
+        let mut msg = admin_msg("retrieve", "/b/admin/users");
+        msg.set_meta("req.query.tab", "api-keys");
+        let html = output_html(users_page(&ctx, &msg).await).await;
+
+        let expected = format!("hx-patch=\"/b/auth/api/api-keys/{}\"", key.id);
+        assert!(
+            html.contains(&expected),
+            "the revoke control must PATCH the declared api-key route: {html}"
+        );
+        assert!(
+            !html.contains("/revoke"),
+            "no admin control may target the unserved `/revoke` path: {html}"
+        );
     }
 }

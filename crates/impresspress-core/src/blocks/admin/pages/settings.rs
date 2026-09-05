@@ -9,8 +9,8 @@
 //! browser drops a nested form's start tag, silently breaking the tab's
 //! Save/Add (see the `tabbed_page` docs and the tests below).
 //!
-//! Routes:
-//!   /b/admin/settings              → 308 redirect to /b/admin/settings/email
+//! Routes (rows of the admin block's `ROUTES`, one literal row per tab):
+//!   /b/admin/settings/             → 308 redirect to /b/admin/settings/email
 //!   /b/admin/settings/email        → email::settings_body
 //!   /b/admin/settings/network      → network::settings_body
 //!   /b/admin/settings/variables    → variables::settings_body
