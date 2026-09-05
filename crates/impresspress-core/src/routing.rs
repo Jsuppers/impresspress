@@ -280,17 +280,15 @@ pub const ROUTES: &[Route] = &[
     Route::new("/health", RouteAccess::Public, "impresspress/system"),
     // Static assets are content-hashed, immutable, and session-less by
     // design (CSS/JS/fonts/logo for the logged-out login/signup pages).
-    // `SystemBlock::info().endpoints` declares them with MID-SEGMENT hash
-    // placeholders (e.g. `/b/static/app-{hash}.css`) — `{name}` only binds a
-    // WHOLE path segment in `endpoint_match::match_template`, so a real
-    // request like `/b/static/app-abc123.css` never matches any declared
-    // endpoint. That makes `declared_access` fall back to its fail-closed
-    // `Authenticated` default, which combined via `RouteAccess::max` would
-    // 403 every anonymous asset request (code review 2026-07-16, C1: "the
-    // logged-out login/signup pages load with no CSS/JS/fonts/logo").
-    // `router_declared_public` is the fix: it makes this route's own
-    // `Public` access final, so the fail-closed default is never consulted.
-    // Covers the whole `/b/static/*` prefix (this is a prefix route).
+    // `SystemBlock::info().endpoints` now declares them as one whole-segment
+    // row, `GET /b/static/{filename}` (public), which `declared_access`
+    // resolves on its own — the earlier mid-segment `app-{hash}.css`
+    // declarations could never match a request, and this carve-out was the
+    // fix for the resulting fail-closed 403 on every anonymous asset (code
+    // review 2026-07-16, C1). It is kept only until `router_final` itself is
+    // removed in phase 1's final PR (see
+    // `docs/superpowers/specs/2026-09-05-route-table-single-source-design.md`,
+    // section 4); the declared row is what makes that removal safe.
     Route::router_declared_public(STATIC_PREFIX, "impresspress/system"),
     // Inspector — runtime debugging UI (admin only). Feature-gated as
     // `impresspress/inspector` but dispatches to the `wafer-run/inspector` block.
@@ -1631,6 +1629,40 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
+    /// A block's `dispatch` serves `GET /b/llm` from the `/b/llm/` row (the
+    /// matcher retries a bare index path with a trailing slash), and that row
+    /// is declared `Admin`. The router must gate the bare form at the same
+    /// level, not at the fail-closed `Authenticated` default it falls back to
+    /// when no declaration matches.
+    #[tokio::test]
+    async fn bare_index_path_is_gated_at_the_declared_level() {
+        use crate::test_support::{auth_msg, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("impresspress/llm", std::sync::Arc::new(DispatchProbeBlock));
+        let block_infos =
+            vec![
+                wafer_run::BlockInfo::new("impresspress/llm", "0.0.1", "http-handler@v1", "t")
+                    .endpoints(vec![
+                        wafer_run::BlockEndpoint::get("/b/llm/").auth(AuthLevel::Admin)
+                    ]),
+            ];
+
+        let out = route_to_block(
+            &ctx,
+            auth_msg("retrieve", "/b/llm", "user_1"),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "a logged-in non-admin must not reach the admin chat page through the bare index path"
+        );
+    }
+
     #[tokio::test]
     async fn anonymous_static_asset_request_is_not_denied() {
         use crate::test_support::{anon_msg, TestContext};
@@ -1641,11 +1673,11 @@ mod tests {
             std::sync::Arc::new(DispatchProbeBlock),
         );
 
-        // No `BlockInfo` passed at all — proves the fix doesn't depend on
-        // `declared_access` matching. `SystemBlock::info().endpoints` uses
-        // MID-SEGMENT hash placeholders (`/b/static/app-{hash}.css`) that
-        // `match_template` can't bind to a real path anyway (see C1); the
-        // `router_declared_public` route must keep this reachable regardless.
+        // No `BlockInfo` passed at all — proves the carve-out does not depend
+        // on `declared_access` matching. `SystemBlock::info().endpoints` now
+        // declares `GET /b/static/{filename}` (public), which would resolve
+        // this path on its own; the carve-out stays until `router_final` is
+        // removed in phase 1's final PR, and this test goes with it.
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", "/b/static/app-abc123.css"),
@@ -1701,9 +1733,10 @@ mod tests {
     #[test]
     fn static_prefix_route_is_router_declared_public() {
         // Direct check on the ROUTES entry itself (companion to the dispatch
-        // test above): the static prefix must use the `router_final` escape
-        // hatch, not a plain `Route::new(_, Public, _)`, or the fail-closed
-        // `declared_access` default would still win via `RouteAccess::max`.
+        // test above): while `router_final` exists the static prefix uses it.
+        // Since the system block declares `GET /b/static/{filename}` this is
+        // belt and braces, not the thing keeping assets public; phase 1's
+        // final PR deletes `router_final` and this test with it.
         let static_route = ROUTES
             .iter()
             .find(|r| r.prefix == STATIC_PREFIX)

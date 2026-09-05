@@ -462,6 +462,26 @@ pub fn endpoint_auth(
     action: &str,
     path: &str,
 ) -> Option<AuthLevel> {
+    if let Some(level) = endpoint_auth_exact(endpoints, action, path) {
+        return Some(level);
+    }
+    // Mirror `dispatch_path`'s trailing-slash retry, and only after an exact
+    // match has failed. A block's `dispatch` serves `GET /b/llm` from its
+    // `/b/llm/` row, so the router must gate the bare form at that row's
+    // declared level; without this it fell back to the `Authenticated`
+    // default and a logged-in non-admin reached an `Admin` page.
+    if !path.ends_with('/') {
+        return endpoint_auth_exact(endpoints, action, &format!("{path}/"));
+    }
+    None
+}
+
+/// The strict, single-pass resolver behind [`endpoint_auth`].
+fn endpoint_auth_exact(
+    endpoints: &[wafer_run::BlockEndpoint],
+    action: &str,
+    path: &str,
+) -> Option<AuthLevel> {
     let mut strictest: Option<AuthLevel> = None;
     for ep in endpoints {
         if action_for_method(ep.method) != action {
@@ -1020,5 +1040,44 @@ mod tests {
         ];
         assert_eq!(dispatch(&mut msg, &table), Some(7u8));
         assert_eq!(msg.var("id"), "t-1");
+    }
+
+    /// The router and the block must agree on which row serves a request.
+    /// `dispatch_path` retries a bare index path with a trailing slash, so
+    /// `GET /b/llm` reaches the `Admin` chat page; `endpoint_auth` has to
+    /// resolve the same row, or the router gates the request at the
+    /// fail-closed `Authenticated` default and a logged-in non-admin gets an
+    /// admin page.
+    #[test]
+    fn endpoint_auth_matches_an_index_route_without_its_trailing_slash() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![BlockEndpoint::get("/b/llm/").auth(AuthLevel::Admin)];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/llm"),
+            Some(AuthLevel::Admin)
+        );
+    }
+
+    #[test]
+    fn endpoint_auth_slash_retry_never_shadows_an_exact_match() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![
+            BlockEndpoint::get("/b/x/thing").auth(AuthLevel::Public),
+            BlockEndpoint::get("/b/x/thing/").auth(AuthLevel::Admin),
+        ];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/x/thing"),
+            Some(AuthLevel::Public)
+        );
+    }
+
+    #[test]
+    fn endpoint_auth_slash_retry_does_not_bind_an_empty_path_param() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![BlockEndpoint::get("/b/vector/api/indexes/{name}").auth(AuthLevel::Admin)];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/vector/api/indexes"),
+            None
+        );
     }
 }

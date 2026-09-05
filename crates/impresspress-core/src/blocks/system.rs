@@ -331,8 +331,8 @@ mod tests {
         assert!(crate::test_support::output_is_error(out, "NotFound").await);
     }
 
-    /// Nothing under `/b/static/` with more than one segment is served, so a
-    /// traversal never reaches the manifest lookup.
+    /// A literal nested path has more than one segment after the prefix, so
+    /// no row matches it and it 404s before any lookup.
     #[test]
     fn a_nested_static_path_matches_no_row() {
         let url = "/b/static/../../etc/passwd";
@@ -340,6 +340,30 @@ mod tests {
         msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
         msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
         assert!(crate::endpoint_match::dispatch(&mut msg, ROUTES).is_none());
+    }
+
+    /// A percent-encoded traversal is one segment on the wire, so it DOES
+    /// match the `{filename}` row and reaches `serve_asset` decoded. What
+    /// keeps it harmless is not the matcher but the lookup: `static_asset`
+    /// is an exact-match allowlist over the build-time manifest and never
+    /// touches a filesystem, so the decoded name finds nothing and 404s.
+    #[tokio::test]
+    #[cfg(feature = "embed-assets")]
+    async fn an_encoded_traversal_binds_but_finds_no_manifest_entry() {
+        let url = "/b/static/..%2F..%2Fetc%2Fpasswd";
+        let mut msg = Message::new(format!("retrieve:{url}"));
+        msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
+        msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
+        assert!(matches!(
+            crate::endpoint_match::dispatch(&mut msg, ROUTES),
+            Some(Route::Asset)
+        ));
+        assert_eq!(msg.var("filename"), "../../etc/passwd");
+
+        let out = SystemBlock::new()
+            .handle(&NopCtx, msg, InputStream::empty())
+            .await;
+        assert!(crate::test_support::output_is_error(out, "NotFound").await);
     }
 
     #[cfg(feature = "embed-assets")]
