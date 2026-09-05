@@ -1047,3 +1047,77 @@ async fn tickets_openapi_does_not_publish_the_honeypot() {
         "unknown keys must be tolerated on this input or the honeypot cannot be read: {request}"
     );
 }
+
+/// Every `{...}` placeholder in a published path names an `in: path`
+/// parameter declared on that path item or one of its operations, and every
+/// `in: path` parameter has a placeholder in the template.
+///
+/// A trailing `...` on a placeholder is impresspress's matcher syntax for a
+/// rest segment (`{key...}` binds the remainder of the path; see
+/// `endpoint_match`), and the parameter it binds is named without the marker,
+/// so the marker is stripped before comparing. Rendering a rest placeholder
+/// as a plain `{key}` belongs to the upstream projection in wafer-core, which
+/// should strip it; until it does, this pins that a rest-param row is never
+/// published without its parameter, nor a parameter without its placeholder.
+#[tokio::test]
+async fn path_placeholders_and_path_parameters_agree() {
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+    let paths = doc["paths"].as_object().expect("openapi paths object");
+
+    fn path_param_names(node: &serde_json::Value, out: &mut Vec<String>) {
+        let Some(params) = node.get("parameters").and_then(|p| p.as_array()) else {
+            return;
+        };
+        for p in params {
+            if p["in"] == "path" {
+                if let Some(name) = p["name"].as_str() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    let mut saw_rest_placeholder = false;
+    let mut mismatches = Vec::new();
+    for (path, item) in paths {
+        let mut placeholders: Vec<String> = path
+            .split('/')
+            .filter_map(|seg| seg.strip_prefix('{')?.strip_suffix('}'))
+            .map(|name| match name.strip_suffix("...") {
+                Some(rest) => {
+                    saw_rest_placeholder = true;
+                    rest.to_string()
+                }
+                None => name.to_string(),
+            })
+            .collect();
+        placeholders.sort();
+        placeholders.dedup();
+
+        let mut declared = Vec::new();
+        path_param_names(item, &mut declared);
+        for (key, operation) in item.as_object().expect("path item object") {
+            if key != "parameters" {
+                path_param_names(operation, &mut declared);
+            }
+        }
+        declared.sort();
+        declared.dedup();
+
+        if placeholders == declared {
+            continue;
+        }
+        mismatches.push(format!(
+            "{path}: template placeholders {placeholders:?} vs declared `in: path` parameters \
+             {declared:?}"
+        ));
+    }
+
+    assert!(
+        saw_rest_placeholder,
+        "expected at least one rest placeholder (files' `{{key...}}`) so the marker-stripping \
+         branch is exercised and this test cannot pass vacuously"
+    );
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}

@@ -225,6 +225,15 @@
     "get": {
       "parameters": [
         {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Context ID",
+            "type": "string"
+          }
+        },
+        {
           "in": "query",
           "name": "kind",
           "required": false,
@@ -277,6 +286,17 @@
       ]
     },
     "post": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Context ID",
+            "type": "string"
+          }
+        }
+      ],
       "requestBody": {
         "content": {
           "application/json": {

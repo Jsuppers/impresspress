@@ -29,6 +29,10 @@
 //! - `{name}` matches exactly one path segment and binds it to `req.param.name`.
 //! - `{name...}` (trailing, "rest") matches one or more remaining segments
 //!   (joined by `/`) and binds the whole remainder to `req.param.name`.
+//! - `{name...}/` (rest followed by a trailing slash, a folder-style listing)
+//!   requires the path to end in `/` and binds the non-empty remainder before
+//!   that final slash, so `/b/x/y/` matches `/b/x/{name}/` and not
+//!   `/b/x/{name}/{rest...}/`.
 //! - A trailing `/` in the template requires a trailing `/` in the path
 //!   (templates and paths are compared segment-by-segment, with the empty
 //!   trailing segment from a trailing slash preserved).
@@ -65,8 +69,10 @@ pub fn action_for_method(method: HttpMethod) -> &'static str {
 /// (in template order) when it matches, or `None` when it does not.
 ///
 /// Both inputs are split on `/`; a trailing slash therefore yields a trailing
-/// empty segment that must match on both sides. `{name...}` (rest) is only
-/// valid as the final template segment and greedily binds the remainder.
+/// empty segment that must match on both sides. `{name...}` (rest) is valid
+/// as the final template segment, where it greedily binds the remainder, or
+/// as `{name...}/`, where the path must end in `/` and it binds the non-empty
+/// remainder before that slash.
 ///
 /// Values are returned **as they appear in `path`**, so still percent-encoded
 /// — matching must happen on the encoded form (see the module docs). Callers
@@ -78,10 +84,14 @@ pub fn match_template<'p>(template: &str, path: &'p str) -> Option<Vec<(String, 
     let mut params: Vec<(String, &'p str)> = Vec::new();
 
     for (i, t) in t_segs.iter().enumerate() {
-        // Trailing rest-parameter: bind every remaining path segment.
+        // Rest-parameter: bind every remaining path segment.
         if let Some(name) = t.strip_suffix("...}").and_then(|s| s.strip_prefix('{')) {
-            // Must be the final template segment.
-            if i != t_segs.len() - 1 {
+            // Either the final template segment, or the second-to-last with
+            // an empty final segment: `{rest...}/`, the folder-listing shape,
+            // where the path must end in `/` too.
+            let last = t_segs.len() - 1;
+            let folder = i + 1 == last && t_segs[last].is_empty();
+            if i != last && !folder {
                 return None;
             }
             // Need at least one remaining segment, and it must be non-empty
@@ -90,7 +100,13 @@ pub fn match_template<'p>(template: &str, path: &'p str) -> Option<Vec<(String, 
             if rest_start >= p_segs.len() {
                 return None;
             }
-            let joined = &path[byte_offset_of_segment(path, rest_start)..];
+            let mut joined = &path[byte_offset_of_segment(path, rest_start)..];
+            if folder {
+                // The trailing slash is the template's, not the value's; what
+                // precedes it must be non-empty, so `/b/x/y/` still resolves
+                // to `/b/x/{name}/` alone and `/b/x/y//` binds nothing.
+                joined = joined.strip_suffix('/')?;
+            }
             if joined.is_empty() {
                 return None;
             }
@@ -1049,6 +1065,95 @@ mod tests {
         assert_eq!(
             endpoint_auth(&eps, "retrieve", "/b/vector/api/indexes"),
             None
+        );
+    }
+
+    /// `files` declares `GET /b/storage/{bucket}/{prefix...}/` for nested
+    /// folder pages: a rest parameter followed by a trailing slash. The path
+    /// must end in `/`, and the bound remainder is what sits between the
+    /// fixed prefix and that final slash.
+    #[test]
+    fn rest_param_may_be_followed_by_a_trailing_slash() {
+        let m = match_template(
+            "/b/storage/{bucket}/{prefix...}/",
+            "/b/storage/photos/2024/x/",
+        )
+        .unwrap();
+        assert_eq!(
+            names(&m),
+            vec![
+                ("bucket".to_string(), "photos".to_string()),
+                ("prefix".to_string(), "2024/x".to_string()),
+            ]
+        );
+    }
+
+    /// The slash form is exact: a path without the trailing slash does not
+    /// match it. (`dispatch_path`'s slash retry then finds it, see below.)
+    #[test]
+    fn rest_param_with_trailing_slash_requires_the_slash() {
+        assert!(match_template(
+            "/b/storage/{bucket}/{prefix...}/",
+            "/b/storage/photos/2024/x"
+        )
+        .is_none());
+    }
+
+    /// The remainder before the final slash must be non-empty, so a bare
+    /// bucket page keeps resolving to `/b/storage/{bucket}/` alone and an
+    /// empty segment is never bound.
+    #[test]
+    fn rest_param_with_trailing_slash_requires_a_non_empty_remainder() {
+        assert!(match_template("/b/storage/{bucket}/{prefix...}/", "/b/storage/photos/").is_none());
+        assert!(
+            match_template("/b/storage/{bucket}/{prefix...}/", "/b/storage/photos//").is_none()
+        );
+    }
+
+    /// A single-segment path such as the public share link never reaches the
+    /// folder row, and a rest parameter that is neither last nor followed
+    /// only by the trailing slash still matches nothing.
+    #[test]
+    fn rest_param_with_trailing_slash_does_not_match_a_single_segment_path() {
+        assert!(
+            match_template("/b/storage/{bucket}/{prefix...}/", "/b/storage/direct/abc").is_none()
+        );
+        assert!(match_template("/b/x/{rest...}/y", "/b/x/a/b/y").is_none());
+    }
+
+    /// `GET /b/storage/photos/2024/x` (no slash) is served by the folder row
+    /// through the same retry that serves `/b/messages` from `/b/messages/`.
+    #[test]
+    fn dispatch_slash_retry_reaches_a_folder_listing() {
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/storage/photos/2024/x");
+        let table = [
+            EndpointRoute::new(HttpMethod::Get, "/b/storage/{bucket}/", 1u8),
+            EndpointRoute::new(HttpMethod::Get, "/b/storage/{bucket}/{prefix...}/", 2u8),
+        ];
+        assert_eq!(dispatch(&mut msg, &table), Some(2u8));
+        assert_eq!(msg.var("bucket"), "photos");
+        assert_eq!(msg.var("prefix"), "2024/x");
+    }
+
+    /// With the folder row declared `Authenticated` beside the `Public` share
+    /// link, strictest-match must not raise the share link: the folder
+    /// template requires a trailing slash the share path does not have.
+    #[test]
+    fn endpoint_auth_keeps_a_public_share_link_public_beside_a_folder_listing() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![
+            BlockEndpoint::get("/b/storage/direct/{token}").auth(AuthLevel::Public),
+            BlockEndpoint::get("/b/storage/{bucket}/{prefix...}/").auth(AuthLevel::Authenticated),
+        ];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/storage/direct/abc"),
+            Some(AuthLevel::Public)
+        );
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/storage/photos/2024/x/"),
+            Some(AuthLevel::Authenticated)
         );
     }
 }

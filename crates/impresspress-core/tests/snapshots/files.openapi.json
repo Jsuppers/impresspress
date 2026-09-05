@@ -108,7 +108,7 @@
       ]
     }
   },
-  "/b/storage/api/buckets/{name}/objects/{key}": {
+  "/b/storage/api/buckets/{name}/objects/{key...}": {
     "get": {
       "description": "Returns the raw object bytes with the stored Content-Type — not a JSON envelope.",
       "parameters": [

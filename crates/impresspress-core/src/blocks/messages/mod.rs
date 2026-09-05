@@ -74,6 +74,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         Route::ListEntries,
     )
     .summary("List entries in context")
+    .path_params(context_id_path_schema)
     .query_params(list_entries_query_schema)
     .tags(&["entries"]),
     EndpointRoute::authenticated(
@@ -82,6 +83,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         Route::AddEntry,
     )
     .summary("Add entry to context")
+    .path_params(context_id_path_schema)
     .input(request_schema_of::<contracts::AddEntryRequest>)
     .tags(&["entries"]),
     EndpointRoute::authenticated(

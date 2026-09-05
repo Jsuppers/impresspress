@@ -7,7 +7,10 @@ use crate::{
     http::{err_bad_request, err_internal, ok_json},
 };
 
-pub(super) async fn handle_search(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_search(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     let query = msg.query("q").to_string();
     if query.is_empty() {
         return err_bad_request("Missing search query");
@@ -28,7 +31,10 @@ pub(super) async fn handle_search(ctx: &dyn Context, msg: &Message) -> OutputStr
     }
 }
 
-pub(super) async fn handle_recent(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_recent(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     match repo::views::list_recent_for_user(ctx, msg.user_id(), 20).await {
         Ok(result) => ok_json(&result),
         Err(e) => err_internal("Database error", e),

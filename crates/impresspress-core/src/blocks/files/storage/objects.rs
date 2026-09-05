@@ -42,7 +42,10 @@ async fn collect_with_cap(
     Ok(out)
 }
 
-pub(super) async fn handle_list_objects(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_list_objects(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     let bucket = extract_bucket_name(msg);
     let bucket = bucket.as_str();
     if bucket.is_empty() {
@@ -89,7 +92,10 @@ pub(super) async fn handle_list_objects(ctx: &dyn Context, msg: &Message) -> Out
     }
 }
 
-pub(super) async fn handle_get_object(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_get_object(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     let bucket = extract_bucket_name(msg);
     let bucket = bucket.as_str();
     let key = extract_object_key(msg);
@@ -137,7 +143,7 @@ fn resolved_content_type(info: &store::ObjectInfo) -> String {
     }
 }
 
-pub(super) async fn handle_upload_object(
+pub(in crate::blocks::files) async fn handle_upload_object(
     ctx: &dyn Context,
     msg: &Message,
     input: InputStream,
@@ -275,7 +281,10 @@ pub(super) async fn handle_upload_object(
     }
 }
 
-pub(super) async fn handle_delete_object(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_delete_object(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     let bucket = extract_bucket_name(msg);
     let bucket = bucket.as_str();
     let key = extract_object_key(msg);

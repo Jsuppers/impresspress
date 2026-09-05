@@ -1,3 +1,10 @@
+//! The cloud-storage JSON API: a user's share links and quota, and the admin
+//! views over every user's shares, access logs and quotas. Dispatch lives in
+//! the block's one route table (`blocks/files/mod.rs`); the admin handlers
+//! are declared `Admin` there and gated by the router from that declaration
+//! (until this PR they were reached through the admin block's `call_block`
+//! delegation on synthetic paths that never existed on the wire).
+
 use std::collections::HashMap;
 
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
@@ -5,30 +12,7 @@ use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream}
 use super::repo;
 use crate::http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json};
 
-pub async fn handle(ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
-    let action = msg.action();
-    let path = msg.path();
-
-    match (action, path) {
-        // User-facing cloud storage
-        ("retrieve", "/b/cloudstorage/shares") => handle_list_shares(ctx, &msg).await,
-        ("create", "/b/cloudstorage/shares") => handle_create_share(ctx, &msg, input).await,
-        ("delete", _) if path.starts_with("/b/cloudstorage/shares/") => {
-            handle_delete_share(ctx, &msg).await
-        }
-        ("retrieve", "/b/cloudstorage/quota") => handle_get_quota(ctx, &msg).await,
-        // Admin cloud storage
-        ("retrieve", "/admin/b/cloudstorage/shares") => handle_admin_list_shares(ctx, &msg).await,
-        ("retrieve", "/admin/b/cloudstorage/access-logs") => handle_access_logs(ctx, &msg).await,
-        ("retrieve", "/admin/b/cloudstorage/quotas") => handle_admin_quotas(ctx, &msg).await,
-        ("update", _) if path.starts_with("/admin/b/cloudstorage/quotas/") => {
-            handle_update_quota(ctx, &msg, input).await
-        }
-        _ => err_not_found("not found"),
-    }
-}
-
-async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match repo::shares::list_for_user(ctx, msg.user_id(), 100).await {
         Ok(result) => ok_json(&result),
         Err(e) => err_internal("Database error", e),
@@ -43,7 +27,11 @@ async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// already-expired share.
 const MAX_SHARE_EXPIRY_HOURS: i64 = 24 * 365;
 
-async fn handle_create_share(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
+pub(super) async fn handle_create_share(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct Req {
         bucket: String,
@@ -138,9 +126,8 @@ async fn handle_create_share(ctx: &dyn Context, msg: &Message, input: InputStrea
     }
 }
 
-async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let path = msg.path();
-    let id = path.strip_prefix("/b/cloudstorage/shares/").unwrap_or("");
+pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing share ID");
     }
@@ -169,7 +156,7 @@ async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
-async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(super) async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let quota = match super::quota::get_user_quota(ctx, msg.user_id()).await {
         Ok(quota) => quota,
         Err(e) => return err_internal("Quota lookup failed", e),
@@ -184,7 +171,7 @@ async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }))
 }
 
-async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(super) async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
     let offset = ((page - 1) * page_size) as i64;
     match repo::shares::list_recent(ctx, page_size as i64, offset).await {
@@ -193,7 +180,7 @@ async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStr
     }
 }
 
-async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(super) async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(50);
     let share_id = msg.query("share_id").to_string();
     let share_id = (!share_id.is_empty()).then_some(share_id.as_str());
@@ -205,18 +192,21 @@ async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
-async fn handle_admin_quotas(ctx: &dyn Context, _msg: &Message) -> OutputStream {
+pub(super) async fn handle_admin_quotas(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     match repo::quota::list(ctx, 1000).await {
         Ok(result) => ok_json(&result),
         Err(e) => err_internal("Database error", e),
     }
 }
 
-async fn handle_update_quota(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let path = msg.path();
-    let user_id = path
-        .strip_prefix("/admin/b/cloudstorage/quotas/")
-        .unwrap_or("");
+pub(super) async fn handle_update_quota(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
+    // `{id}` in `PATCH /b/cloudstorage/admin/quotas/{id}` is the user whose
+    // quota is set.
+    let user_id = msg.var("id");
     if user_id.is_empty() {
         return err_bad_request("Missing user ID");
     }
@@ -256,14 +246,10 @@ mod tests {
     use wafer_core::interfaces::storage::service as storage_service;
     use wafer_run::InputStream;
 
-    use super::*;
+    use super::{super::test_support::routed, *};
     use crate::test_support::{
         auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
     };
-
-    fn empty_input() -> InputStream {
-        InputStream::from_bytes(Vec::new())
-    }
 
     /// Seed one share row owned by `owner` and return its id.
     async fn seed_share(ctx: &TestContext, owner: &str) -> String {
@@ -461,8 +447,12 @@ mod tests {
         let failing =
             FailingDbOpContext::new(ctx.clone(), vec![("database.get", repo::shares::TABLE)]);
 
-        let msg = auth_msg("delete", &format!("/b/cloudstorage/shares/{id}"), "u2");
-        let out = handle(&failing, msg, empty_input()).await;
+        let msg = routed(auth_msg(
+            "delete",
+            &format!("/b/cloudstorage/shares/{id}"),
+            "u2",
+        ));
+        let out = handle_delete_share(&failing, &msg).await;
 
         assert!(
             output_is_error(out, "Internal").await,
@@ -479,8 +469,12 @@ mod tests {
         let ctx = TestContext::with_files().await;
         let id = seed_share(&ctx, "u1").await;
 
-        let msg = auth_msg("delete", &format!("/b/cloudstorage/shares/{id}"), "u2");
-        let out = handle(&ctx, msg, empty_input()).await;
+        let msg = routed(auth_msg(
+            "delete",
+            &format!("/b/cloudstorage/shares/{id}"),
+            "u2",
+        ));
+        let out = handle_delete_share(&ctx, &msg).await;
 
         assert!(output_is_error(out, "PermissionDenied").await);
         assert!(repo::shares::find_by_id(&ctx, &id).await.is_ok());
@@ -489,8 +483,12 @@ mod tests {
     #[tokio::test]
     async fn delete_missing_share_is_not_found() {
         let ctx = TestContext::with_files().await;
-        let msg = auth_msg("delete", "/b/cloudstorage/shares/no-such-share", "u1");
-        assert!(output_is_error(handle(&ctx, msg, empty_input()).await, "NotFound").await);
+        let msg = routed(auth_msg(
+            "delete",
+            "/b/cloudstorage/shares/no-such-share",
+            "u1",
+        ));
+        assert!(output_is_error(handle_delete_share(&ctx, &msg).await, "NotFound").await);
     }
 
     /// `/b/cloudstorage/quota` must not report zero usage during an outage.
@@ -500,7 +498,7 @@ mod tests {
         let failing = FailingDbOpContext::new(ctx, vec![("database.sum", repo::objects::TABLE)]);
 
         let msg = auth_msg("retrieve", "/b/cloudstorage/quota", "u1");
-        let out = handle(&failing, msg, empty_input()).await;
+        let out = handle_get_quota(&failing, &msg).await;
 
         assert!(
             output_is_error(out, "Internal").await,

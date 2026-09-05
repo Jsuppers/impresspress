@@ -73,11 +73,11 @@ export interface ListSharesResult {
  * Aligned to the real `impresspress/files` cloud-storage surface in
  * `crates/impresspress-core/src/blocks/files/cloud.rs`: per-object share
  * links and the caller's own quota/usage. There is no user-facing
- * access-log or access-stats endpoint (`/admin/b/cloudstorage/access-logs`
- * is admin-only and reached through the admin block's delegated HTTP
- * surface, not this one; `access-stats` does not exist at all) — both were
- * removed rather than pointed at a route that would 404 or silently expose
- * the wrong auth boundary.
+ * access-log or access-stats endpoint (`GET /b/cloudstorage/admin/access-logs`
+ * is declared `Admin` by the files block and is not part of this surface;
+ * `access-stats` does not exist at all) — both were removed rather than
+ * pointed at a route that would 404 or silently expose the wrong auth
+ * boundary.
  */
 export class CloudStorageExtension extends ExtensionsService {
   /** Create a share link for an object. `POST /b/cloudstorage/shares`. */
