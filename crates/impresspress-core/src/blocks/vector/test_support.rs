@@ -80,6 +80,22 @@ impl Block for StubVectorBlock {
     }
 }
 
+/// Run `msg` through the block's own route table so `{name}` / `{index}` /
+/// `{id}` are bound the way they are on the wire, then hand the message to
+/// a handler directly. Panics when no row matches: a test that sends an
+/// unroutable path would otherwise exercise the handler's "missing name"
+/// branch by accident.
+pub(super) fn routed(mut msg: Message) -> Message {
+    let route = crate::endpoint_match::dispatch(&mut msg, super::ROUTES);
+    assert!(
+        route.is_some(),
+        "no vector route matches {} {}",
+        msg.action(),
+        msg.path()
+    );
+    msg
+}
+
 /// Stub embedding block: answers `embedding.embed` with one
 /// `[0.5; dimensions]` vector per input text, labelled `model`.
 pub(super) struct StubEmbeddingBlock {

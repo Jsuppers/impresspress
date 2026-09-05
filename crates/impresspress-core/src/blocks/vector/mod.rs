@@ -7,9 +7,9 @@ pub mod service;
 #[cfg(test)]
 mod test_support;
 
-use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, HttpMethod, InstanceMode};
+use wafer_run::{BlockInfo, HttpMethod, InstanceMode};
 
-use crate::endpoint_match::{self, EndpointRoute};
+use crate::endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute};
 
 /// In-block dispatch targets. UI pages and the JSON API now share ONE matcher
 /// table; the per-route access tier comes from the declared endpoint
@@ -29,45 +29,84 @@ enum Route {
     ApiDeleteSingle,
 }
 
-/// Method + path-template dispatch table, mirroring `info().endpoints`. The
-/// specific `api/indexes/{name}` delete precedes the generic
-/// `api/{index}/{id}` delete so index-deletes win (the old ordering
-/// invariant). The matcher binds `{name}`/`{index}`/`{id}` into `req.param.*`.
+/// The block's HTTP surface: what `handle()` dispatches on and what
+/// `info().endpoints` is generated from. The specific `api/indexes/{name}`
+/// delete precedes the generic `api/{index}/{id}` delete so index-deletes
+/// win (the old ordering invariant). The matcher binds `{name}` / `{index}`
+/// / `{id}` into `req.param.*` for the handlers' `msg.var` readers.
+///
+/// The two SSR pages are `Admin` and the JSON API is `Authenticated`; the
+/// central router enforces that from the declaration, so the block holds no
+/// `user_id` / `is_admin` preamble.
 const ROUTES: &[EndpointRoute<Route>] = &[
-    EndpointRoute::new(HttpMethod::Get, "/b/vector/", Route::IndexListPage),
-    EndpointRoute::new(HttpMethod::Get, "/b/vector/{name}/", Route::IndexDetailPage),
-    EndpointRoute::new(
+    // UI pages
+    EndpointRoute::admin(HttpMethod::Get, "/b/vector/", Route::IndexListPage)
+        .summary("Vector indexes admin list"),
+    EndpointRoute::admin(HttpMethod::Get, "/b/vector/{name}/", Route::IndexDetailPage)
+        .summary("Vector index detail"),
+    // The admin modal posts this same endpoint as a URL-encoded form with
+    // an `HX-Request` header and gets the index list back as HTML. The
+    // schemas describe the programmatic JSON path; the form path builds the
+    // same request type through `contracts::CreateIndexRequest::from_form`.
+    EndpointRoute::authenticated(
         HttpMethod::Post,
         "/b/vector/api/indexes",
         Route::ApiCreateIndex,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Create a vector index")
+    .input(request_schema_of::<contracts::CreateIndexRequest>)
+    .output(response_schema_of::<contracts::CreateIndexResponse>),
+    EndpointRoute::authenticated(
         HttpMethod::Get,
         "/b/vector/api/indexes",
         Route::ApiListIndexes,
-    ),
-    EndpointRoute::new(HttpMethod::Post, "/b/vector/api/upsert", Route::ApiUpsert),
-    EndpointRoute::new(HttpMethod::Post, "/b/vector/api/query", Route::ApiQuery),
-    EndpointRoute::new(HttpMethod::Post, "/b/vector/api/ingest", Route::ApiIngest),
-    EndpointRoute::new(HttpMethod::Post, "/b/vector/api/embed", Route::ApiEmbed),
-    EndpointRoute::new(HttpMethod::Get, "/b/vector/api/stats", Route::ApiStats),
-    EndpointRoute::new(
+    )
+    .summary("List indexes")
+    .output(response_schema_of::<contracts::IndexListResponse>),
+    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/upsert", Route::ApiUpsert)
+        .summary("Upsert pre-computed vectors")
+        .input(request_schema_of::<contracts::UpsertRequest>)
+        .output(response_schema_of::<contracts::AckResponse>),
+    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/query", Route::ApiQuery)
+        .summary("Search vectors")
+        .input(request_schema_of::<contracts::QueryRequest>)
+        .output(response_schema_of::<contracts::QueryResponse>),
+    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/ingest", Route::ApiIngest)
+        .summary("Chunk + embed + upsert a document")
+        .input(request_schema_of::<contracts::IngestRequest>)
+        .output(response_schema_of::<contracts::IngestResponse>),
+    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/embed", Route::ApiEmbed)
+        .summary("Generate embeddings for raw text")
+        .input(request_schema_of::<contracts::EmbedRequest>)
+        .output(response_schema_of::<contracts::EmbedResponse>),
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/vector/api/stats", Route::ApiStats)
+        .summary("Index stats and usage")
+        .output(response_schema_of::<contracts::IndexStatsResponse>),
+    // Deletes: the specific `indexes/{name}` row before the generic
+    // `{index}/{id}` row.
+    EndpointRoute::authenticated(
         HttpMethod::Delete,
         "/b/vector/api/indexes/{name}",
         Route::ApiDeleteIndex,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Delete an index")
+    .path_params(index_name_path_schema)
+    .output(response_schema_of::<contracts::AckResponse>),
+    EndpointRoute::authenticated(
         HttpMethod::Delete,
         "/b/vector/api/{index}/{id}",
         Route::ApiDeleteSingle,
-    ),
+    )
+    .summary("Delete a single vector")
+    .path_params(vector_id_path_schema)
+    .output(response_schema_of::<contracts::AckResponse>),
 ];
 
 /// Path-parameter schema for `DELETE /b/vector/api/indexes/{name}`.
 ///
 /// Hand-written rather than derived: the handler reads the name with
-/// `path_param(msg, "name", ..)` by name, so a struct declared only to feed
-/// `.path_params::<T>()` would have no runtime user (the `tickets` /
+/// `msg.var("name")` by name, so a struct declared only to feed
+/// `request_schema_of::<T>` would have no runtime user (the `tickets` /
 /// `messages` precedent).
 fn index_name_path_schema() -> serde_json::Value {
     serde_json::json!({
@@ -130,62 +169,7 @@ crate::impresspress_feature_block! {
             "impresspress/transformers-embed".into(),
         ])
         .category(wafer_run::BlockCategory::Feature)
-        .endpoints(vec![
-            BlockEndpoint::get("/b/vector/")
-                .summary("Vector indexes admin list")
-                .auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/vector/{name}/")
-                .summary("Vector index detail")
-                .auth(AuthLevel::Admin),
-            // The admin modal posts this same endpoint as a URL-encoded form
-            // with an `HX-Request` header and gets the index list back as
-            // HTML. The schemas describe the programmatic JSON path; the
-            // form path builds the same request type through
-            // `contracts::CreateIndexRequest::from_form`.
-            BlockEndpoint::post("/b/vector/api/indexes")
-                .summary("Create a vector index")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::CreateIndexRequest>()
-                .output::<contracts::CreateIndexResponse>(),
-            BlockEndpoint::get("/b/vector/api/indexes")
-                .summary("List indexes")
-                .auth(AuthLevel::Authenticated)
-                .output::<contracts::IndexListResponse>(),
-            BlockEndpoint::delete("/b/vector/api/indexes/{name}")
-                .summary("Delete an index")
-                .auth(AuthLevel::Authenticated)
-                .path_params_schema(index_name_path_schema())
-                .output::<contracts::AckResponse>(),
-            BlockEndpoint::post("/b/vector/api/upsert")
-                .summary("Upsert pre-computed vectors")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::UpsertRequest>()
-                .output::<contracts::AckResponse>(),
-            BlockEndpoint::post("/b/vector/api/query")
-                .summary("Search vectors")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::QueryRequest>()
-                .output::<contracts::QueryResponse>(),
-            BlockEndpoint::post("/b/vector/api/ingest")
-                .summary("Chunk + embed + upsert a document")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::IngestRequest>()
-                .output::<contracts::IngestResponse>(),
-            BlockEndpoint::post("/b/vector/api/embed")
-                .summary("Generate embeddings for raw text")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::EmbedRequest>()
-                .output::<contracts::EmbedResponse>(),
-            BlockEndpoint::delete("/b/vector/api/{index}/{id}")
-                .summary("Delete a single vector")
-                .auth(AuthLevel::Authenticated)
-                .path_params_schema(vector_id_path_schema())
-                .output::<contracts::AckResponse>(),
-            BlockEndpoint::get("/b/vector/api/stats")
-                .summary("Index stats and usage")
-                .auth(AuthLevel::Authenticated)
-                .output::<contracts::IndexStatsResponse>(),
-        ])
+        .endpoints(endpoint_match::declare(ROUTES))
         .can_disable(true)
         .default_enabled(true)
     },
@@ -224,4 +208,24 @@ crate::impresspress_feature_block! {
         )
         .await
     },
+}
+
+#[cfg(test)]
+mod table_tests {
+    use wafer_run::Block as _;
+
+    use super::*;
+
+    /// `info().endpoints` is generated from `ROUTES`; nothing else declares
+    /// an endpoint for this block.
+    #[test]
+    fn info_endpoints_come_from_the_table() {
+        let declared = VectorBlock::new().info().endpoints;
+        assert_eq!(declared.len(), ROUTES.len());
+        for (ep, row) in declared.iter().zip(ROUTES) {
+            assert_eq!(ep.method, row.method, "{}", row.template);
+            assert_eq!(ep.path, row.template);
+            assert_eq!(ep.auth, row.auth, "{}", row.template);
+        }
+    }
 }

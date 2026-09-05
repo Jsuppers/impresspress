@@ -30,9 +30,9 @@
 //!
 //! `DELETE /b/vector/api/indexes/{name}` and `DELETE /b/vector/api/{index}/{id}`
 //! both map to the `delete` action and both live under `/b/vector/api/`.
-//! The dispatcher checks the `indexes/` prefix first so the more specific
-//! route wins; only after that do we fall through to the generic
-//! `{index}/{id}` handler.
+//! The block's `ROUTES` table (mod.rs) lists the specific `indexes/{name}`
+//! row first so it wins; `{name}` / `{index}` / `{id}` reach the handlers
+//! here only as `endpoint_match::dispatch` bound them.
 
 use wafer_block::{
     db::{Filter, FilterOp, ListOptions},
@@ -56,10 +56,7 @@ use super::{
     ingestion::{self, DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_RATIO},
     service::{self, REGISTRY_TABLE, TABLE_PREFIX},
 };
-use crate::{
-    http::{err_bad_request, err_internal, err_internal_no_cause, err_not_found, ok_json},
-    util::path_param,
-};
+use crate::http::{err_bad_request, err_internal, err_internal_no_cause, err_not_found, ok_json};
 
 // Per-route dispatch now lives in `VectorBlock::handle` via the shared
 // `endpoint_match` table; the JSON handlers below are called directly from
@@ -272,7 +269,7 @@ pub(super) async fn delete_index(ctx: &dyn Context, msg: &Message) -> OutputStre
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
-    let name = path_param(msg, "name", "/b/vector/api/indexes/");
+    let name = msg.var("name");
     if name.is_empty() {
         return err_bad_request("index name is required");
     }
@@ -368,22 +365,11 @@ pub(super) async fn delete_single(ctx: &dyn Context, msg: &Message) -> OutputStr
     }
 }
 
-/// Extract `{index}` and `{id}` from `/b/vector/api/{index}/{id}`.
-///
-/// Prefers the router-populated path variables when available, falling back
-/// to string-splitting for direct handler invocation (e.g. in tests).
+/// `({index}, {id})` as the block's route table bound them for
+/// `/b/vector/api/{index}/{id}`. Either is empty when the request matched
+/// no row.
 fn extract_index_and_id(msg: &Message) -> (&str, &str) {
-    let index = msg.var("index");
-    let id = msg.var("id");
-    if !index.is_empty() && !id.is_empty() {
-        return (index, id);
-    }
-
-    let rest = msg.path().strip_prefix("/b/vector/api/").unwrap_or("");
-    let mut parts = rest.split('/');
-    let index_part = parts.next().unwrap_or("");
-    let id_part = parts.next().unwrap_or("");
-    (index_part, id_part)
+    (msg.var("index"), msg.var("id"))
 }
 
 // ---------------------------------------------------------------------------
@@ -947,7 +933,7 @@ mod contract_tests {
 
     use super::*;
     use crate::{
-        blocks::vector::test_support::{StubEmbeddingBlock, StubVectorBlock},
+        blocks::vector::test_support::{routed, StubEmbeddingBlock, StubVectorBlock},
         test_support::{auth_msg, output_is_error, output_json, TestContext},
     };
 
@@ -1239,7 +1225,7 @@ mod contract_tests {
             output_json(
                 delete_index(
                     &ctx,
-                    &auth_msg("delete", "/b/vector/api/indexes/docs", "user-1")
+                    &routed(auth_msg("delete", "/b/vector/api/indexes/docs", "user-1"))
                 )
                 .await
             )
@@ -1248,11 +1234,31 @@ mod contract_tests {
         );
         assert_eq!(
             output_json(
-                delete_single(&ctx, &auth_msg("delete", "/b/vector/api/docs/a", "user-1")).await
+                delete_single(
+                    &ctx,
+                    &routed(auth_msg("delete", "/b/vector/api/docs/a", "user-1"))
+                )
+                .await
             )
             .await,
             serde_json::json!({ "ok": true })
         );
+    }
+
+    /// The delete handlers read the variables the table bound, nothing else.
+    #[test]
+    fn delete_routes_bind_their_path_vars() {
+        let m = routed(auth_msg("delete", "/b/vector/api/indexes/docs", "user-1"));
+        assert_eq!(m.var("name"), "docs");
+
+        let m2 = routed(auth_msg("delete", "/b/vector/api/docs/a", "user-1"));
+        assert_eq!(extract_index_and_id(&m2), ("docs", "a"));
+
+        // A message that never went through the table binds nothing; the
+        // handlers then answer InvalidArgument rather than parse the path.
+        let m3 = auth_msg("delete", "/b/vector/api/docs/a", "user-1");
+        assert_eq!(extract_index_and_id(&m3), ("", ""));
+        assert_eq!(m3.var("name"), "");
     }
 
     #[tokio::test]
