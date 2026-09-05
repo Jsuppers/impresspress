@@ -110,14 +110,6 @@ impl Route {
             router_final: true,
         }
     }
-
-    /// Whether the prefix declaration is the complete authorization decision.
-    ///
-    /// Exposed within the crate so deployment-plan export can preserve the
-    /// exact route policy without making this implementation detail public.
-    pub(crate) const fn is_router_final(&self) -> bool {
-        self.router_final
-    }
 }
 
 /// Access tier for a route.
@@ -263,7 +255,7 @@ impl ExtraRoute {
     /// [`RouteAccess::Authenticated`].
     ///
     /// Exposed within the crate so deployment-plan export can round-trip the
-    /// exact route policy, as it already does for [`Route::is_router_final`].
+    /// exact route policy.
     pub(crate) const fn refines_undeclared(&self) -> bool {
         self.refine_undeclared
     }
