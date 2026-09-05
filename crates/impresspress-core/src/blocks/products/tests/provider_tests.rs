@@ -226,7 +226,7 @@ fn admin_refund_msg(
     body: serde_json::Value,
 ) -> (wafer_run::Message, wafer_run::InputStream) {
     let (mut msg, input) = create_msg(
-        &format!("/admin/b/products/purchases/{purchase_id}/refund"),
+        &format!("/b/products/api/admin/purchases/{purchase_id}/refund"),
         "admin_1",
         body,
     );
@@ -237,8 +237,8 @@ fn admin_refund_msg(
 #[tokio::test]
 async fn admin_stripe_status_distinguishes_configuration_modes_without_secrets() {
     let ctx = ctx().await;
-    let (msg, input) = admin_get_msg("/admin/b/products/stripe/status");
-    let unconfigured = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stripe/status");
+    let unconfigured = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(unconfigured["state"], "not_configured");
     assert_eq!(unconfigured["configured"], false);
     assert!(unconfigured.get("secret_key").is_none());
@@ -262,8 +262,8 @@ async fn admin_stripe_status_distinguishes_configuration_modes_without_secrets()
         &mut ctx,
         vec![express_account("acct_platform", true, true, true)],
     );
-    let (msg, input) = admin_get_msg("/admin/b/products/stripe/status");
-    let connected = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stripe/status");
+    let connected = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(connected["state"], "connected_test");
     assert_eq!(connected["account_id"], "acct_platform");
     assert_eq!(connected["livemode"], false);
@@ -300,8 +300,8 @@ async fn admin_stripe_status_rejects_test_live_key_mismatch_before_network() {
         &mut ctx,
         vec![express_account("acct_unused", true, true, true)],
     );
-    let (msg, input) = admin_get_msg("/admin/b/products/stripe/status");
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stripe/status");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["state"], "misconfigured");
     assert_eq!(body["livemode"], true);
     assert!(body["error"].as_str().unwrap().contains("different modes"));
@@ -326,8 +326,8 @@ async fn admin_stripe_status_safely_reports_malformed_response_and_timeout() {
         ])
         .await;
         let requests = register_broken_response(&mut ctx, response);
-        let (msg, input) = admin_get_msg("/admin/b/products/stripe/status");
-        let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+        let (msg, input) = admin_get_msg("/b/products/api/admin/stripe/status");
+        let body = output_to_json(dispatch(&ctx, msg, input).await).await;
         assert_eq!(body["state"], "misconfigured");
         assert!(body["error"].as_str().unwrap().contains(expected));
         assert!(!body.to_string().contains("private-invalid-json"));
@@ -360,14 +360,14 @@ async fn seller_onboarding_creates_one_owned_express_account_and_single_use_link
         ],
     );
     let (msg, input) = create_msg(
-        "/b/products/seller/onboarding",
+        "/b/products/api/seller/onboarding",
         "seller_new",
         serde_json::json!({
             "return_url": "https://shop.example/seller/stripe/return",
             "refresh_url": "https://shop.example/seller/stripe/refresh"
         }),
     );
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["url"], "https://connect.stripe.com/setup/test-link");
     assert_eq!(body["expires_at"], 1_900_000_000_i64);
     assert_eq!(body["account"]["user_id"], "seller_new");
@@ -422,20 +422,14 @@ async fn seller_onboarding_validates_origin_and_feature_gate_before_provider_cal
         vec![express_account("acct_unused", false, false, false)],
     );
     let (msg, input) = create_msg(
-        "/b/products/seller/onboarding",
+        "/b/products/api/seller/onboarding",
         "seller_bad_origin",
         serde_json::json!({
             "return_url": "https://attacker.example/complete",
             "refresh_url": "https://shop.example/refresh"
         }),
     );
-    assert!(
-        output_is_error(
-            dispatch_user(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     assert!(requests.lock().unwrap().is_empty());
     assert!(
         repo::seller_accounts::get_for_user(&ctx, "seller_bad_origin")
@@ -445,10 +439,10 @@ async fn seller_onboarding_validates_origin_and_feature_gate_before_provider_cal
     );
 
     let ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false")]).await;
-    let (msg, input) = get_msg("/b/products/seller/account", "seller_disabled");
+    let (msg, input) = get_msg("/b/products/api/seller/account", "seller_disabled");
     assert!(
         output_is_error(
-            dispatch_user(&ctx, msg, input).await,
+            dispatch(&ctx, msg, input).await,
             ErrorCode::PermissionDenied
         )
         .await
@@ -493,11 +487,11 @@ async fn seller_dashboard_refreshes_only_the_callers_account_and_returns_express
         ],
     );
     let (msg, input) = create_msg(
-        "/b/products/seller/dashboard",
+        "/b/products/api/seller/dashboard",
         "seller_dashboard",
         serde_json::json!({}),
     );
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         body["url"],
         "https://connect.stripe.com/express/dashboard-link"
@@ -550,7 +544,7 @@ async fn buyer_billing_portal_uses_owned_order_customer_and_connected_account() 
             "order_id": "purchase_portal"
         }),
     );
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         body["url"],
         "https://billing.stripe.com/p/session/test_portal"
@@ -605,7 +599,7 @@ async fn buyer_billing_portal_rejects_cross_user_order_before_provider_call() {
     );
     assert!(
         output_is_error(
-            dispatch_user(&ctx, msg, input).await,
+            dispatch(&ctx, msg, input).await,
             ErrorCode::PermissionDenied
         )
         .await
@@ -652,13 +646,7 @@ async fn buyer_billing_portal_requires_order_when_customer_contexts_differ() {
         "buyer_multi",
         serde_json::json!({"return_url": "https://shop.example/account"}),
     );
-    assert!(
-        output_is_error(
-            dispatch_user(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     assert!(requests.lock().unwrap().is_empty());
 }
 
@@ -687,13 +675,7 @@ async fn buyer_billing_portal_rejects_mode_mismatch_and_untrusted_return_origin(
             "order_id": "purchase_live"
         }),
     );
-    assert!(
-        output_is_error(
-            dispatch_user(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
 
     let (msg, input) = create_msg(
         "/b/products/billing-portal",
@@ -703,13 +685,7 @@ async fn buyer_billing_portal_rejects_mode_mismatch_and_untrusted_return_origin(
             "order_id": "purchase_live"
         }),
     );
-    assert!(
-        output_is_error(
-            dispatch_user(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     assert!(requests.lock().unwrap().is_empty());
 }
 
@@ -748,7 +724,7 @@ async fn connected_account_partial_refund_is_provider_first_exact_and_idempotent
         "idempotency_key": "partial_refund_1"
     });
     let (msg, input) = admin_refund_msg("purchase_partial", request_body.clone());
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["status"], "succeeded");
     assert_eq!(body["provider_refund_id"], "re_partial");
     assert_eq!(body["amount_minor"], 2500);
@@ -791,7 +767,7 @@ async fn connected_account_partial_refund_is_provider_first_exact_and_idempotent
     }
 
     let (msg, input) = admin_refund_msg("purchase_partial", request_body);
-    let replay = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let replay = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(replay["provider_refund_id"], "re_partial");
     assert_eq!(
         requests.lock().unwrap().len(),
@@ -828,7 +804,7 @@ async fn full_refund_after_partial_only_refunds_the_exact_remaining_amount() {
         })],
     );
     let (msg, input) = admin_refund_msg("purchase_remaining", serde_json::json!({}));
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["status"], "succeeded");
     assert_eq!(body["amount_minor"], 7500);
     assert_eq!(body["refunded_total_minor"], 10_000);
@@ -873,7 +849,7 @@ async fn pending_refund_preserves_purchase_and_blocks_a_different_operation() {
         "purchase_pending_refund",
         serde_json::json!({"amount_minor": 1000, "idempotency_key": "operation_a"}),
     );
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["status"], "pending");
     assert_eq!(body["refunded_total_minor"], 0);
     let purchase = repo::purchases::get(&ctx, "purchase_pending_refund")
@@ -886,13 +862,7 @@ async fn pending_refund_preserves_purchase_and_blocks_a_different_operation() {
         "purchase_pending_refund",
         serde_json::json!({"amount_minor": 500, "idempotency_key": "operation_b"}),
     );
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
@@ -936,11 +906,11 @@ async fn provider_reconciliation_recovers_pending_refund_with_one_atomic_lease()
         "purchase_reconcile_refund",
         serde_json::json!({"amount_minor": 1250, "idempotency_key": "recovery"}),
     );
-    let pending = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let pending = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(pending["status"], "pending");
 
-    let (list, input) = admin_get_msg("/admin/b/products/provider-operations");
-    let listed = output_to_json(dispatch_admin(&ctx, list, input).await).await;
+    let (list, input) = admin_get_msg("/b/products/api/admin/provider-operations");
+    let listed = output_to_json(dispatch(&ctx, list, input).await).await;
     assert_eq!(listed["total_count"], 1);
     assert_eq!(listed["records"][0]["operation_type"], "refund.reconcile");
     assert_eq!(listed["records"][0]["status"], "pending");
@@ -978,11 +948,11 @@ async fn provider_reconciliation_recovers_pending_refund_with_one_atomic_lease()
     .unwrap();
 
     let (mut reconcile, input) = admin_create_msg(
-        "/admin/b/products/provider-operations/reconcile",
+        "/b/products/api/admin/provider-operations/reconcile",
         serde_json::json!({}),
     );
     reconcile.set_meta("req.query.limit", "1");
-    let result = output_to_json(dispatch_admin(&ctx, reconcile, input).await).await;
+    let result = output_to_json(dispatch(&ctx, reconcile, input).await).await;
     assert_eq!(result["claimed"], 1);
     assert_eq!(result["succeeded"], 1);
     assert_eq!(result["retry_scheduled"], 0);
@@ -1033,13 +1003,7 @@ async fn stripe_rejection_and_mode_mismatch_never_mark_purchase_refunded() {
         "purchase_rejected_refund",
         serde_json::json!({"idempotency_key": "rejected"}),
     );
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     let purchase = repo::purchases::get(&ctx, "purchase_rejected_refund")
         .await
         .unwrap();
@@ -1060,13 +1024,7 @@ async fn stripe_rejection_and_mode_mismatch_never_mark_purchase_refunded() {
         "purchase_live_refund",
         serde_json::json!({"idempotency_key": "wrong_mode"}),
     );
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     assert_eq!(
         requests.lock().unwrap().len(),
         1,
@@ -1125,7 +1083,7 @@ async fn ambiguous_stripe_refund_failure_stays_retryable_with_the_same_key() {
             serde_json::json!({"amount_minor": 1000, "idempotency_key": "ambiguous"}),
         );
         assert!(
-            output_is_error(dispatch_admin(&ctx, msg, input).await, ErrorCode::Internal).await,
+            output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::Internal).await,
             "HTTP {status} must surface as a retryable internal error"
         );
 
@@ -1156,11 +1114,11 @@ async fn ambiguous_stripe_refund_failure_stays_retryable_with_the_same_key() {
         );
 
         let (mut reconcile, input) = admin_create_msg(
-            "/admin/b/products/provider-operations/reconcile",
+            "/b/products/api/admin/provider-operations/reconcile",
             serde_json::json!({}),
         );
         reconcile.set_meta("req.query.limit", "1");
-        let result = output_to_json(dispatch_admin(&ctx, reconcile, input).await).await;
+        let result = output_to_json(dispatch(&ctx, reconcile, input).await).await;
         assert_eq!(result["claimed"], 1);
         assert_eq!(result["succeeded"], 1);
 
@@ -1218,13 +1176,7 @@ async fn card_level_stripe_rejection_fails_the_refund_deterministically() {
         "purchase_declined_refund",
         serde_json::json!({"idempotency_key": "declined"}),
     );
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     let ledger = repo::refunds::list_for_purchase(&ctx, "purchase_declined_refund")
         .await
         .unwrap();
@@ -1272,24 +1224,12 @@ async fn refund_validation_rejects_over_refund_and_unknown_fields_before_stripe(
         "purchase_validate_refund",
         serde_json::json!({"amount_minor": 501, "idempotency_key": "too_much"}),
     );
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     let (msg, input) = admin_refund_msg(
         "purchase_validate_refund",
         serde_json::json!({"amount_minor": 100, "unexpected": true}),
     );
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await);
     assert!(requests.lock().unwrap().is_empty());
     assert!(
         repo::refunds::list_for_purchase(&ctx, "purchase_validate_refund")

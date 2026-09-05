@@ -1,4 +1,4 @@
-//! Group CRUD: admin (`/admin/b/products/groups`) and user-owned
+//! Group CRUD: admin (`/b/products/api/admin/groups`) and user-owned
 //! (`/b/products/groups`, gated on `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS`),
 //! plus the "products in a user's group" listing and the read-only
 //! group-templates listing.
@@ -27,15 +27,12 @@ use crate::{
     http::{err_bad_request, err_internal, err_unauthorized, ok_json},
 };
 
-/// User-owned group rows: `/b/products/groups/{id}`, owned via `user_id`.
+/// User-owned group rows (`/b/products/groups/{id}`), owned via `user_id`.
 const USER_GROUP: crud::OwnedResource<'static> = crud::OwnedResource {
     collection: GROUPS_TABLE,
-    path_prefix: "/b/products/groups/",
     owner_field: "user_id",
     label: "Group",
 };
-
-const ADMIN_GROUP_PREFIX: &str = "/admin/b/products/groups/";
 
 // --- Groups (admin) ---
 
@@ -85,7 +82,7 @@ pub(super) async fn handle_update_group(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = match crud::path_id(msg, ADMIN_GROUP_PREFIX, "Group") {
+    let id = match crud::path_id(msg, "Group") {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -100,7 +97,14 @@ pub(super) async fn handle_update_group(
 }
 
 pub(super) async fn handle_delete_group(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete(ctx, msg, GROUPS_TABLE, ADMIN_GROUP_PREFIX, "Group").await
+    let id = match crud::path_id(msg, "Group") {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match crud::delete_record(ctx, GROUPS_TABLE, id, "Group").await {
+        Ok(deleted) => ok_json(&deleted),
+        Err(response) => response,
+    }
 }
 
 // --- User's own groups ---
@@ -195,24 +199,16 @@ pub(super) async fn handle_user_update_group(
 }
 
 pub(super) async fn handle_user_delete_group(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete_owned(ctx, msg, &USER_GROUP).await
+    match crud::delete_owned(ctx, msg, &USER_GROUP).await {
+        Ok(deleted) => ok_json(&deleted),
+        Err(response) => response,
+    }
 }
 
 // Products in a user's group
 pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    // Path: /b/products/groups/{id}/products — prefer the matcher-bound `{id}`.
-    let group_id = {
-        let var = msg.var("id");
-        if var.is_empty() {
-            msg.path()
-                .strip_prefix("/b/products/groups/")
-                .unwrap_or("")
-                .strip_suffix("/products")
-                .unwrap_or("")
-        } else {
-            var
-        }
-    };
+    // `/b/products/groups/{id}/products`: `{id}` as the table bound it.
+    let group_id = msg.var("id");
     if group_id.is_empty() {
         return err_bad_request("Missing group ID");
     }

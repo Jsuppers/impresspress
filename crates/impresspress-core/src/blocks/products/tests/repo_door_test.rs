@@ -73,10 +73,11 @@ const LITERAL_ALLOWED: &[&str] = &[
     "blocks/products/repo/products.rs",
     // this file: needs the literal in order to scan for it
     "blocks/products/tests/repo_door_test.rs",
-    // seeds rows (including soft-deleted ones) straight into the table so the
-    // handler tests have something to act on; fixture setup, not a production
-    // read that has to respect the soft-delete filter
+    // seed rows (including soft-deleted ones) straight into the table so the
+    // handler tests and the page link guard have something to act on; fixture
+    // setup, not a production read that has to respect the soft-delete filter
     "blocks/products/tests/handler_tests.rs",
+    "blocks/products/tests/page_link_tests.rs",
     // the migration runner's own tests. They necessarily work below the repo
     // layer: migration 020 exists to repair a `deleted_at = ''` row, and the
     // repo layer is precisely what can no longer produce one, so the only way

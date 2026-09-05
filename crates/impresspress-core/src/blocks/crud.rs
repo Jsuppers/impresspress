@@ -1,24 +1,14 @@
 //! Generic CRUD helpers for block handlers.
 //!
-//! Two layers:
-//!
-//! * The `Result`-returning primitives (`read_json_body`, `list_page`,
-//!   `get_record`, `create_record`, `update_record`, `delete_record` and the
-//!   `*_owned` variants) do one database step each and hand back either the
-//!   row or a ready-to-send error response. A handler that publishes a typed
-//!   view composes them: parse a typed request, turn it into the column map,
-//!   run the step, project the row through `View::from_record`.
-//! * The `crud_*` functions are the untyped one-liners built on top of them:
-//!   the request body is whatever JSON object arrived, written as a column
-//!   map, and the response is the database layer's own `Record` envelope or
-//!   [`Deleted`]. They read the record id from the request path with a
-//!   prefix fallback (`path_id`), which only `products` still relies on:
-//!   `crud_delete` and `crud_delete_owned` are its callers and the only
-//!   one-liners left. `legalpages` and `messages` read `{id}` as their route
-//!   tables bound it and compose the primitives directly; the one-liners
-//!   they used to call were deleted with their last caller. The two that
-//!   remain go, with the prefix fallback, once `products` dispatches on wire
-//!   paths too. A block whose JSON API is typed uses the primitives directly.
+//! `Result`-returning primitives (`read_json_body`, `list_page`,
+//! `get_record`, `create_record`, `update_record`, `delete_record` and the
+//! `*_owned` variants) do one database step each and hand back either the
+//! row or a ready-to-send error response. A handler that publishes a typed
+//! view composes them: parse a typed request, turn it into the column map,
+//! run the step, project the row through `View::from_record`. The record id
+//! is read only as the block's route table bound it (`path_id`, `msg.var`);
+//! the untyped `crud_*` one-liners that used to strip it off the path went
+//! with their last caller.
 //!
 // audit-allow-file: pure pass-through helpers — every db::* call here takes
 // the table name as a `collection: &str` parameter from the caller. WRAP
@@ -33,7 +23,7 @@ use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use crate::{
-    http::{err_bad_request, err_internal, err_not_found, err_unauthorized, ok_json},
+    http::{err_bad_request, err_internal, err_not_found, err_unauthorized},
     util::{field_as_string, stamp_created, stamp_updated},
 };
 
@@ -51,29 +41,12 @@ impl Deleted {
     }
 }
 
-/// Extract the record id that follows `path_prefix` in the request path.
-/// Returns `""` when the prefix doesn't match or nothing follows it.
-/// Extract the record id for a CRUD route. Prefers the router-populated
-/// `req.param.id` (set by `endpoint_match::dispatch` when the block uses the
-/// shared matcher) and falls back to stripping `path_prefix` off the resource
-/// path for callers/tests that build the message by hand. Mirrors
-/// [`crate::util::path_param`] but keeps the trailing-segment
-/// behaviour of the old prefix-strip for the fallback.
-fn id_from_path<'m>(msg: &'m Message, path_prefix: &str) -> &'m str {
-    let var = msg.var("id");
-    if !var.is_empty() {
-        return var;
-    }
-    msg.path().strip_prefix(path_prefix).unwrap_or("")
-}
-
-/// The record id for a CRUD route, or the 400 a missing id turns into.
-pub fn path_id<'m>(
-    msg: &'m Message,
-    path_prefix: &str,
-    not_found_label: &str,
-) -> Result<&'m str, OutputStream> {
-    let id = id_from_path(msg, path_prefix);
+/// The record id for a CRUD route — `{id}` as the block's route table bound
+/// it — or the 400 a missing id turns into. The matcher never binds an empty
+/// segment, so the guard only fires for a handler called with a message that
+/// did not go through the table.
+pub fn path_id<'m>(msg: &'m Message, not_found_label: &str) -> Result<&'m str, OutputStream> {
+    let id = msg.var("id");
     if id.is_empty() {
         return Err(err_bad_request(&format!(
             "Missing {} ID",
@@ -215,41 +188,17 @@ pub async fn delete_record(
 }
 
 // ---------------------------------------------------------------------------
-// Untyped one-liners over the primitives
-// ---------------------------------------------------------------------------
-
-/// Delete a record by ID extracted from the path.
-pub async fn crud_delete(
-    ctx: &dyn Context,
-    msg: &Message,
-    collection: &str,
-    path_prefix: &str,
-    not_found_label: &str,
-) -> OutputStream {
-    let id = match path_id(msg, path_prefix, not_found_label) {
-        Ok(id) => id,
-        Err(response) => return response,
-    };
-    match delete_record(ctx, collection, id, not_found_label).await {
-        Ok(deleted) => ok_json(&deleted),
-        Err(response) => response,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Owner-scoped CRUD helpers
 // ---------------------------------------------------------------------------
 
-/// Identifies an owner-scoped resource for the `crud_*_owned` helpers.
+/// Identifies an owner-scoped resource for the `*_owned` helpers.
 ///
 /// Owner-scoped resources are user-facing rows where access requires the
 /// requesting user to match the row's owner column (e.g. a user's own
-/// products or groups).
+/// products or groups). The record is the `{id}` the route table bound.
 pub struct OwnedResource<'a> {
     /// Table the records live in.
     pub collection: &'a str,
-    /// Path prefix preceding the record id (e.g. `"/b/products/products/"`).
-    pub path_prefix: &'a str,
     /// Column holding the owning user's id (e.g. `"created_by"`).
     pub owner_field: &'a str,
     /// Human-readable label for error messages (e.g. `"Product"`).
@@ -293,7 +242,7 @@ pub async fn get_owned(
     msg: &Message,
     res: &OwnedResource<'_>,
 ) -> Result<Record, OutputStream> {
-    let id = path_id(msg, res.path_prefix, res.label)?;
+    let id = path_id(msg, res.label)?;
     verify_owner(
         ctx,
         res.collection,
@@ -313,7 +262,7 @@ pub async fn update_owned(
     res: &OwnedResource<'_>,
     data: HashMap<String, serde_json::Value>,
 ) -> Result<Record, OutputStream> {
-    let id = path_id(msg, res.path_prefix, res.label)?.to_string();
+    let id = path_id(msg, res.label)?.to_string();
     verify_owner(
         ctx,
         res.collection,
@@ -333,7 +282,7 @@ pub async fn delete_owned(
     msg: &Message,
     res: &OwnedResource<'_>,
 ) -> Result<Deleted, OutputStream> {
-    let id = path_id(msg, res.path_prefix, res.label)?.to_string();
+    let id = path_id(msg, res.label)?.to_string();
     verify_owner(
         ctx,
         res.collection,
@@ -344,16 +293,4 @@ pub async fn delete_owned(
     )
     .await?;
     delete_record(ctx, res.collection, &id, res.label).await
-}
-
-/// Delete an owner-scoped record by ID extracted from the path.
-pub async fn crud_delete_owned(
-    ctx: &dyn Context,
-    msg: &Message,
-    res: &OwnedResource<'_>,
-) -> OutputStream {
-    match delete_owned(ctx, msg, res).await {
-        Ok(deleted) => ok_json(&deleted),
-        Err(resp) => resp,
-    }
 }

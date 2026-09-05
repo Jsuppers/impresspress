@@ -48,16 +48,7 @@ pub(super) async fn handle_catalog(ctx: &dyn Context, msg: &Message) -> OutputSt
 }
 
 pub(super) async fn handle_get_product_public(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = {
-        let var = msg.var("id");
-        if var.is_empty() {
-            msg.path()
-                .strip_prefix("/b/products/catalog/")
-                .unwrap_or("")
-        } else {
-            var
-        }
-    };
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }

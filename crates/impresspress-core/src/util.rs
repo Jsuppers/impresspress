@@ -22,27 +22,6 @@ pub fn now_millis() -> u64 {
     chrono::Utc::now().timestamp_millis() as u64
 }
 
-/// Extract a single path id from a request, preferring the router-populated
-/// `var` and falling back to stripping `prefix` off `msg.path()` and taking the
-/// first remaining segment.
-///
-/// Native axum routing populates path variables (`msg.var("id")`); the
-/// Cloudflare/browser adapters register a single block prefix and leave path
-/// extraction to the handler, so the prefix-strip fallback covers them (and
-/// direct handler calls in tests). Returns `""` when neither yields a value.
-pub fn path_param<'a>(msg: &'a wafer_run::Message, var: &str, prefix: &str) -> &'a str {
-    let v = msg.var(var);
-    if !v.is_empty() {
-        return v;
-    }
-    msg.path()
-        .strip_prefix(prefix)
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("")
-}
-
 /// Convert a serde_json::json!({...}) value into a HashMap for the database client.
 pub fn json_map(val: serde_json::Value) -> HashMap<String, serde_json::Value> {
     match val {

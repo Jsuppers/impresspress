@@ -1,4 +1,4 @@
-//! Product CRUD: admin (`/admin/b/products/products`) and user-owned
+//! Product CRUD: admin (`/b/products/api/admin/products`) and user-owned
 //! (`/b/products/products`, gated on `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS`).
 //!
 //! Every response is a `contracts::ProductView` (or a list of them) built
@@ -27,7 +27,7 @@ use crate::{
         err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
         err_unauthorized, ok_json,
     },
-    util::{field_as_string, now_rfc3339, path_param, stamp_created, stamp_updated, RecordExt},
+    util::{field_as_string, now_rfc3339, stamp_created, stamp_updated, RecordExt},
 };
 
 // Columns the products table owns internally: the row's identity, ownership,
@@ -365,8 +365,6 @@ async fn verify_deleted_product_owner(
     }
 }
 
-const ADMIN_PRODUCT_PREFIX: &str = "/admin/b/products/products/";
-
 // --- Product CRUD (admin) ---
 
 pub(super) async fn handle_list_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -376,7 +374,7 @@ pub(super) async fn handle_list_products(ctx: &dyn Context, msg: &Message) -> Ou
 }
 
 pub(super) async fn handle_get_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = path_param(msg, "id", ADMIN_PRODUCT_PREFIX);
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
@@ -421,7 +419,7 @@ pub(super) async fn handle_update_product(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = path_param(msg, "id", ADMIN_PRODUCT_PREFIX);
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
@@ -446,7 +444,7 @@ pub(super) async fn handle_update_product(
 }
 
 pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = path_param(msg, "id", ADMIN_PRODUCT_PREFIX);
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
@@ -461,18 +459,16 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
 /// without which a deleted product would be unreachable by any UI.
 ///
 /// `POST /b/products/api/admin/products/{id}/restore`, declared
-/// `AuthLevel::Admin` and dispatched from `ADMIN_ROUTES`, so the one wire
-/// path that reaches this handler is the one its declaration matches.
-/// It previously sat on `USER_ROUTES` (declared under `/b/products/api/`,
-/// dispatched from the user table). `ProductsBlock::handle` also enters
-/// `handle_user` with the RAW path, so the same handler answered at
+/// `AuthLevel::Admin` in `routes::ROUTES`, which is also the only thing
+/// `ProductsBlock::handle` dispatches on — so the one wire path that reaches
+/// this handler is the one its declaration matches. It previously sat on a
+/// separate user dispatch table that the block entered from two wire
+/// spellings, so the same handler also answered at
 /// `/b/products/products/{id}/restore` — a spelling matching no declaration
 /// at all, and so resolving to the `Authenticated` fallback. That was a live
 /// privilege escalation: any logged-in user could resurrect any soft-deleted
-/// product. An Admin-tier route must not live on the user dispatch table for
-/// exactly that reason, and
-/// `dispatch_tables_are_backed_by_declared_endpoints` now fails the build if
-/// one does.
+/// product. One table over the declared wire paths is what closed it;
+/// `routes::table_tests` pins that the former second spellings 404.
 pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
     if id.is_empty() {
@@ -864,7 +860,7 @@ pub(super) async fn handle_user_list_products(ctx: &dyn Context, msg: &Message) 
 }
 
 pub(super) async fn handle_user_get_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = path_param(msg, "id", "/b/products/products/");
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }
@@ -1058,7 +1054,7 @@ pub(super) async fn handle_user_update_product(
 }
 
 pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = path_param(msg, "id", "/b/products/products/").to_string();
+    let id = msg.var("id").to_string();
     if id.is_empty() {
         return err_bad_request("Missing product ID");
     }

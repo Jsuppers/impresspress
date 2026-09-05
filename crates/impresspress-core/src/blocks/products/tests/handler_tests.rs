@@ -13,7 +13,7 @@ use super::harness::*;
 async fn admin_create_product() {
     let ctx = ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Cloud Hosting",
             "description": "Managed hosting",
@@ -21,7 +21,7 @@ async fn admin_create_product() {
         }),
     );
 
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     assert!(body["id"].as_str().is_some());
     assert_eq!(body["name"], "Cloud Hosting");
@@ -35,22 +35,22 @@ async fn admin_list_products() {
 
     // Create two products
     let (msg1, input1) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Product A"
         }),
     );
-    dispatch_admin(&ctx, msg1, input1).await;
+    dispatch(&ctx, msg1, input1).await;
     let (msg2, input2) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Product B"
         }),
     );
-    dispatch_admin(&ctx, msg2, input2).await;
+    dispatch(&ctx, msg2, input2).await;
 
-    let (list_msg, list_input) = admin_get_msg("/admin/b/products/products");
-    let out = dispatch_admin(&ctx, list_msg, list_input).await;
+    let (list_msg, list_input) = admin_get_msg("/b/products/api/admin/products");
+    let out = dispatch(&ctx, list_msg, list_input).await;
     let body = output_to_json(out).await;
     assert!(body["records"].as_array().unwrap().len() >= 2);
 }
@@ -60,19 +60,19 @@ async fn admin_get_product() {
     let ctx = ctx().await;
 
     let (create_msg_data, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Widget"
         }),
     );
-    let create_out = dispatch_admin(&ctx, create_msg_data, create_input).await;
+    let create_out = dispatch(&ctx, create_msg_data, create_input).await;
     let id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let (get_msg_data, get_input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
-    let out = dispatch_admin(&ctx, get_msg_data, get_input).await;
+    let (get_msg_data, get_input) = admin_get_msg(&format!("/b/products/api/admin/products/{id}"));
+    let out = dispatch(&ctx, get_msg_data, get_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["name"], "Widget");
 }
@@ -82,12 +82,12 @@ async fn admin_update_product() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Old Name"
         }),
     );
-    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -95,14 +95,14 @@ async fn admin_update_product() {
 
     let (mut update, update_input) = request_msg(
         "update",
-        &format!("/admin/b/products/products/{id}"),
+        &format!("/b/products/api/admin/products/{id}"),
         "admin_1",
         serde_json::json!({
             "name": "New Name"
         }),
     );
     update.set_meta("auth.user_roles", "admin");
-    let out = dispatch_admin(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["name"], "New Name");
 }
@@ -112,26 +112,27 @@ async fn admin_delete_product() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "To Delete"
         }),
     );
-    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let (mut del, del_input) = delete_msg(&format!("/admin/b/products/products/{id}"), "admin_1");
+    let (mut del, del_input) =
+        delete_msg(&format!("/b/products/api/admin/products/{id}"), "admin_1");
     del.set_meta("auth.user_roles", "admin");
-    let out = dispatch_admin(&ctx, del, del_input).await;
+    let out = dispatch(&ctx, del, del_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["deleted"], true);
 
     // Verify it's gone
-    let (get, get_input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
-    let out = dispatch_admin(&ctx, get, get_input).await;
+    let (get, get_input) = admin_get_msg(&format!("/b/products/api/admin/products/{id}"));
+    let out = dispatch(&ctx, get, get_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -149,8 +150,8 @@ async fn admin_product_detail_404s_for_a_soft_deleted_product() {
     seed(&ctx, "impresspress__products__products", "gone", gone).await;
     soft_delete_product(&ctx, "gone").await;
 
-    let (msg, input) = admin_get_msg("/admin/b/products/products/gone");
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/products/gone");
+    let out = dispatch(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -165,10 +166,10 @@ async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Oops" }),
     );
-    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -177,12 +178,12 @@ async fn admin_update_product_does_not_resurrect_via_deleted_at_null() {
 
     let (mut update, update_input) = request_msg(
         "update",
-        &format!("/admin/b/products/products/{id}"),
+        &format!("/b/products/api/admin/products/{id}"),
         "admin_1",
         serde_json::json!({ "deleted_at": null }),
     );
     update.set_meta("auth.user_roles", "admin");
-    let out = dispatch_admin(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(
         output_is_error(out, ErrorCode::InvalidArgument).await,
         "an admin PATCH must not resurrect a soft-deleted product"
@@ -202,10 +203,10 @@ async fn admin_update_product_refuses_a_soft_deleted_product() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Oops" }),
     );
-    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -214,12 +215,12 @@ async fn admin_update_product_refuses_a_soft_deleted_product() {
 
     let (mut update, update_input) = request_msg(
         "update",
-        &format!("/admin/b/products/products/{id}"),
+        &format!("/b/products/api/admin/products/{id}"),
         "admin_1",
         serde_json::json!({ "name": "New Name" }),
     );
     update.set_meta("auth.user_roles", "admin");
-    let out = dispatch_admin(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(
         output_is_error(out, ErrorCode::NotFound).await,
         "a soft-deleted product must not be editable through the normal admin PATCH"
@@ -239,10 +240,10 @@ async fn admin_update_product_refuses_deleted_at_in_the_request_body() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Still Live" }),
     );
-    let create_out = dispatch_admin(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -250,12 +251,12 @@ async fn admin_update_product_refuses_deleted_at_in_the_request_body() {
 
     let (mut update, update_input) = request_msg(
         "update",
-        &format!("/admin/b/products/products/{id}"),
+        &format!("/b/products/api/admin/products/{id}"),
         "admin_1",
         serde_json::json!({ "name": "New Name", "deleted_at": "2026-09-01T00:00:00Z" }),
     );
     update.set_meta("auth.user_roles", "admin");
-    let out = dispatch_admin(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(
         output_is_error(out, ErrorCode::InvalidArgument).await,
         "a PATCH naming deleted_at must be refused, not partly applied"
@@ -300,9 +301,9 @@ async fn admin_delete_keeps_the_row_and_its_order_history_resolvable() {
     )
     .await;
 
-    let (mut del, del_input) = delete_msg("/admin/b/products/products/sold", "admin_1");
+    let (mut del, del_input) = delete_msg("/b/products/api/admin/products/sold", "admin_1");
     del.set_meta("auth.user_roles", "admin");
-    let body = output_to_json(dispatch_admin(&ctx, del, del_input).await).await;
+    let body = output_to_json(dispatch(&ctx, del, del_input).await).await;
     assert_eq!(body["deleted"], true);
 
     let row = wafer_core::clients::database::get(&ctx, "impresspress__products__products", "sold")
@@ -335,12 +336,12 @@ async fn admin_delete_removes_the_product_from_the_catalog() {
     sold.insert("status".to_string(), serde_json::json!("active"));
     seed(&ctx, "impresspress__products__products", "sold", sold).await;
 
-    let (mut del, del_input) = delete_msg("/admin/b/products/products/sold", "admin_1");
+    let (mut del, del_input) = delete_msg("/b/products/api/admin/products/sold", "admin_1");
     del.set_meta("auth.user_roles", "admin");
-    dispatch_admin(&ctx, del, del_input).await;
+    dispatch(&ctx, del, del_input).await;
 
     let (msg, input) = get_msg("/b/products/catalog", "");
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(body["records"].as_array().unwrap().is_empty());
 }
 
@@ -355,18 +356,18 @@ async fn admin_delete_frees_the_products_slug() {
     first.insert("slug".to_string(), serde_json::json!("jacket"));
     seed(&ctx, "impresspress__products__products", "first", first).await;
 
-    let (mut del, del_input) = delete_msg("/admin/b/products/products/first", "admin_1");
+    let (mut del, del_input) = delete_msg("/b/products/api/admin/products/first", "admin_1");
     del.set_meta("auth.user_roles", "admin");
-    dispatch_admin(&ctx, del, del_input).await;
+    dispatch(&ctx, del, del_input).await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Second",
             "slug": "jacket"
         }),
     );
-    let body = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    let body = output_to_json(dispatch(&ctx, create, create_input).await).await;
     assert_eq!(body["slug"], "jacket", "the reused slug must not conflict");
 }
 
@@ -379,18 +380,18 @@ async fn admin_create_and_list_groups() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/groups",
+        "/b/products/api/admin/groups",
         serde_json::json!({
             "name": "Electronics"
         }),
     );
-    let out = dispatch_admin(&ctx, create, create_input).await;
+    let out = dispatch(&ctx, create, create_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["name"], "Electronics");
     assert_eq!(body["user_id"], "admin_1");
 
-    let (list, list_input) = admin_get_msg("/admin/b/products/groups");
-    let list_out = dispatch_admin(&ctx, list, list_input).await;
+    let (list, list_input) = admin_get_msg("/b/products/api/admin/groups");
+    let list_out = dispatch(&ctx, list, list_input).await;
     let list_body = output_to_json(list_out).await;
     assert_eq!(list_body["records"].as_array().unwrap().len(), 1);
 }
@@ -404,15 +405,15 @@ async fn admin_create_and_list_types() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/types",
+        "/b/products/api/admin/types",
         serde_json::json!({
             "name": "subscription", "display_name": "Subscription"
         }),
     );
-    dispatch_admin(&ctx, create, create_input).await;
+    dispatch(&ctx, create, create_input).await;
 
-    let (list, list_input) = admin_get_msg("/admin/b/products/types");
-    let out = dispatch_admin(&ctx, list, list_input).await;
+    let (list, list_input) = admin_get_msg("/b/products/api/admin/types");
+    let out = dispatch(&ctx, list, list_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["records"].as_array().unwrap().len(), 1);
 }
@@ -449,8 +450,8 @@ async fn admin_stats() {
     )
     .await;
 
-    let (msg, input) = admin_get_msg("/admin/b/products/stats");
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    let out = dispatch(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["total_products"].as_i64().unwrap(), 2);
     assert_eq!(body["active_products"].as_i64().unwrap(), 1);
@@ -501,8 +502,8 @@ async fn admin_stats_never_combine_currencies() {
         .unwrap();
     }
 
-    let (msg, input) = admin_get_msg("/admin/b/products/stats");
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     let analytics = body["currency_analytics"].as_array().unwrap();
     assert_eq!(analytics.len(), 2);
     assert_eq!(analytics[0]["currency"], "NZD");
@@ -685,8 +686,8 @@ async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
         .await;
     }
 
-    let (msg, input) = get_msg("/b/products/seller/stats", "seller_user_1");
-    let stats = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let (msg, input) = get_msg("/b/products/api/seller/stats", "seller_user_1");
+    let stats = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(stats["seller_account_id"], "seller_stats_1");
     assert_eq!(stats["currency_analytics"][0]["gross_volume_minor"], 4200);
     assert_eq!(stats["currency_analytics"][0]["open_dispute_count"], 1);
@@ -725,8 +726,8 @@ async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
         .iter()
         .any(|failure| failure["order_id"] == "seller_pi_failure_other"));
 
-    let (msg, input) = get_msg("/b/products/seller/orders", "seller_user_1");
-    let orders = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let (msg, input) = get_msg("/b/products/api/seller/orders", "seller_user_1");
+    let orders = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(orders["total_count"], 3);
     let order_ids = orders["records"]
         .as_array()
@@ -741,34 +742,37 @@ async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
     assert!(!order_ids.contains(&"seller_failure_other"));
     assert!(!order_ids.contains(&"seller_pi_failure_other"));
 
-    let (msg, input) = get_msg("/b/products/seller/orders/seller_order_2", "seller_user_1");
+    let (msg, input) = get_msg(
+        "/b/products/api/seller/orders/seller_order_2",
+        "seller_user_1",
+    );
     assert!(
         output_is_error(
-            dispatch_user(&ctx, msg, input).await,
+            dispatch(&ctx, msg, input).await,
             ErrorCode::PermissionDenied
         )
         .await
     );
 
     let (msg, input) = create_msg(
-        "/b/products/seller/orders/seller_order_2/refund",
+        "/b/products/api/seller/orders/seller_order_2/refund",
         "seller_user_1",
         serde_json::json!({"amount_minor": 1000}),
     );
     assert!(
         output_is_error(
-            dispatch_user(&ctx, msg, input).await,
+            dispatch(&ctx, msg, input).await,
             ErrorCode::PermissionDenied
         )
         .await
     );
 
     let (msg, input) = create_msg(
-        "/b/products/seller/orders/seller_order_1/refund",
+        "/b/products/api/seller/orders/seller_order_1/refund",
         "seller_user_1",
         serde_json::json!({"amount_minor": 1200, "note": "Customer request"}),
     );
-    let refund = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let refund = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(refund["amount_minor"], 1200);
     assert_eq!(refund["refunded_total_minor"], 1200);
 }
@@ -783,8 +787,8 @@ async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
 async fn admin_stats_repository_failure_surfaces_as_internal_error() {
     let ctx = ctx().await.break_reads();
 
-    let (msg, input) = admin_get_msg("/admin/b/products/stats");
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    let out = dispatch(&ctx, msg, input).await;
     assert!(
         output_is_error(out, ErrorCode::Internal).await,
         "a genuine repository failure must surface as Internal, not a fabricated all-zero stats body"
@@ -810,8 +814,8 @@ async fn stats_do_not_count_soft_deleted_products() {
     seed(&ctx, "impresspress__products__products", "gone", gone).await;
     soft_delete_product(&ctx, "gone").await;
 
-    let (msg, input) = admin_get_msg("/admin/b/products/stats");
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["total_products"].as_i64().unwrap(), 1);
     assert_eq!(body["active_products"].as_i64().unwrap(), 1);
 }
@@ -836,7 +840,7 @@ async fn user_create_product_in_own_group() {
             "name": "My Store"
         }),
     );
-    let group_out = dispatch_user(&ctx, create_group, cg_input).await;
+    let group_out = dispatch(&ctx, create_group, cg_input).await;
     let group_id = output_to_json(group_out).await["id"]
         .as_str()
         .unwrap()
@@ -844,14 +848,14 @@ async fn user_create_product_in_own_group() {
 
     // Create a product in that group
     let (create_prod, cp_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({
             "name": "Widget",
             "group_id": group_id
         }),
     );
-    let out = dispatch_user(&ctx, create_prod, cp_input).await;
+    let out = dispatch(&ctx, create_prod, cp_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["name"], "Widget");
     assert_eq!(body["created_by"], "user_1");
@@ -869,7 +873,7 @@ async fn user_cannot_create_product_in_other_users_group() {
             "name": "User1 Store"
         }),
     );
-    let group_out = dispatch_user(&ctx, create_group, cg_input).await;
+    let group_out = dispatch(&ctx, create_group, cg_input).await;
     let group_id = output_to_json(group_out).await["id"]
         .as_str()
         .unwrap()
@@ -877,14 +881,14 @@ async fn user_cannot_create_product_in_other_users_group() {
 
     // user_2 tries to create a product in user_1's group
     let (create_prod, cp_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_2",
         serde_json::json!({
             "name": "Sneaky Product",
             "group_id": group_id
         }),
     );
-    let out = dispatch_user(&ctx, create_prod, cp_input).await;
+    let out = dispatch(&ctx, create_prod, cp_input).await;
     assert!(output_is_error(out, ErrorCode::InvalidArgument).await);
 }
 
@@ -894,21 +898,21 @@ async fn user_cannot_see_other_users_products() {
 
     // user_1 creates a product
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({
             "name": "Private Product"
         }),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let prod_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
     // user_2 tries to get it
-    let (get, get_input) = get_msg(&format!("/b/products/products/{prod_id}"), "user_2");
-    let out = dispatch_user(&ctx, get, get_input).await;
+    let (get, get_input) = get_msg(&format!("/b/products/api/products/{prod_id}"), "user_2");
+    let out = dispatch(&ctx, get, get_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -917,26 +921,26 @@ async fn user_cannot_update_other_users_products() {
     let ctx = user_products_ctx().await;
 
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({
             "name": "My Product"
         }),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let prod_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
     let (update, update_input) = update_msg(
-        &format!("/b/products/products/{prod_id}"),
+        &format!("/b/products/api/products/{prod_id}"),
         "user_2",
         serde_json::json!({
             "name": "Hijacked!"
         }),
     );
-    let out = dispatch_user(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -945,20 +949,20 @@ async fn user_cannot_delete_other_users_products() {
     let ctx = user_products_ctx().await;
 
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({
             "name": "My Product"
         }),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let prod_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let (del, del_input) = delete_msg(&format!("/b/products/products/{prod_id}"), "user_2");
-    let out = dispatch_user(&ctx, del, del_input).await;
+    let (del, del_input) = delete_msg(&format!("/b/products/api/products/{prod_id}"), "user_2");
+    let out = dispatch(&ctx, del, del_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -970,20 +974,20 @@ async fn user_delete_own_product_soft_deletes_instead_of_hard_deleting() {
     let ctx = user_products_ctx().await;
 
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({
             "name": "My Product"
         }),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let prod_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let (del, del_input) = delete_msg(&format!("/b/products/products/{prod_id}"), "user_1");
-    let body = output_to_json(dispatch_user(&ctx, del, del_input).await).await;
+    let (del, del_input) = delete_msg(&format!("/b/products/api/products/{prod_id}"), "user_1");
+    let body = output_to_json(dispatch(&ctx, del, del_input).await).await;
     assert_eq!(body["deleted"], true);
 
     let row =
@@ -1002,23 +1006,23 @@ async fn user_list_only_own_products() {
 
     // user_1 creates a product
     let (c1, c1_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({"name": "U1 Product"}),
     );
-    dispatch_user(&ctx, c1, c1_input).await;
+    dispatch(&ctx, c1, c1_input).await;
 
     // user_2 creates a product
     let (c2, c2_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_2",
         serde_json::json!({"name": "U2 Product"}),
     );
-    dispatch_user(&ctx, c2, c2_input).await;
+    dispatch(&ctx, c2, c2_input).await;
 
     // user_1 lists — should only see their own
-    let (list, list_input) = get_msg("/b/products/products", "user_1");
-    let out = dispatch_user(&ctx, list, list_input).await;
+    let (list, list_input) = get_msg("/b/products/api/products", "user_1");
+    let out = dispatch(&ctx, list, list_input).await;
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
@@ -1030,11 +1034,11 @@ async fn user_update_prevents_ownership_change() {
     let ctx = user_products_ctx().await;
 
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({"name": "Mine"}),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let prod_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -1043,14 +1047,14 @@ async fn user_update_prevents_ownership_change() {
     // Try to change created_by — the whole request must be refused, not
     // silently reduced to the fields the caller does own.
     let (update, update_input) = update_msg(
-        &format!("/b/products/products/{prod_id}"),
+        &format!("/b/products/api/products/{prod_id}"),
         "user_1",
         serde_json::json!({
             "name": "Updated",
             "created_by": "attacker"
         }),
     );
-    let out = dispatch_user(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(output_is_error(out, ErrorCode::InvalidArgument).await);
 
     let record = super::super::repo::products::get(&ctx, &prod_id)
@@ -1076,17 +1080,17 @@ async fn user_list_only_own_groups() {
         "user_1",
         serde_json::json!({"name": "U1 Group"}),
     );
-    dispatch_user(&ctx, g1, g1_input).await;
+    dispatch(&ctx, g1, g1_input).await;
 
     let (g2, g2_input) = create_msg(
         "/b/products/groups",
         "user_2",
         serde_json::json!({"name": "U2 Group"}),
     );
-    dispatch_user(&ctx, g2, g2_input).await;
+    dispatch(&ctx, g2, g2_input).await;
 
     let (list, list_input) = get_msg("/b/products/groups", "user_1");
-    let out = dispatch_user(&ctx, list, list_input).await;
+    let out = dispatch(&ctx, list, list_input).await;
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
@@ -1102,7 +1106,7 @@ async fn user_cannot_update_other_users_group() {
         "user_1",
         serde_json::json!({"name": "My Group"}),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let group_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -1115,7 +1119,7 @@ async fn user_cannot_update_other_users_group() {
             "name": "Stolen"
         }),
     );
-    let out = dispatch_user(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -1128,7 +1132,7 @@ async fn user_group_update_prevents_ownership_change() {
         "user_1",
         serde_json::json!({"name": "My Group"}),
     );
-    let create_out = dispatch_user(&ctx, create, create_input).await;
+    let create_out = dispatch(&ctx, create, create_input).await;
     let group_id = output_to_json(create_out).await["id"]
         .as_str()
         .unwrap()
@@ -1142,7 +1146,7 @@ async fn user_group_update_prevents_ownership_change() {
             "user_id": "attacker"
         }),
     );
-    let out = dispatch_user(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["user_id"], "user_1");
 }
@@ -1166,7 +1170,7 @@ async fn catalog_only_shows_active_products() {
     seed(&ctx, "impresspress__products__products", "p_draft", d2).await;
 
     let (msg, input) = get_msg("/b/products/catalog", "");
-    let out = dispatch_user(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
@@ -1183,7 +1187,7 @@ async fn catalog_get_hides_non_active() {
     seed(&ctx, "impresspress__products__products", "p_hidden", d).await;
 
     let (msg, input) = get_msg("/b/products/catalog/p_hidden", "");
-    let out = dispatch_user(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -1278,7 +1282,7 @@ async fn catalog_list_omits_a_soft_deleted_active_product() {
     soft_delete_product(&ctx, "gone").await;
 
     let (msg, input) = get_msg("/b/products/catalog", "");
-    let out = dispatch_user(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     let ids: Vec<&str> = body["records"]
         .as_array()
@@ -1300,7 +1304,7 @@ async fn catalog_detail_404s_for_a_soft_deleted_active_product() {
     soft_delete_product(&ctx, "gone").await;
 
     let (msg, input) = get_msg("/b/products/catalog/gone", "");
-    let out = dispatch_user(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -1349,10 +1353,10 @@ async fn restore_endpoint_returns_the_product_to_the_catalog() {
     soft_delete_product(&ctx, "oops").await;
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/oops/restore",
+        "/b/products/api/admin/products/oops/restore",
         serde_json::json!({}),
     );
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["id"], "oops");
     assert!(
         body["deleted_at"].is_null(),
@@ -1360,7 +1364,7 @@ async fn restore_endpoint_returns_the_product_to_the_catalog() {
     );
 
     let (catalog_msg, catalog_input) = get_msg("/b/products/catalog", "");
-    let catalog_body = output_to_json(dispatch_user(&ctx, catalog_msg, catalog_input).await).await;
+    let catalog_body = output_to_json(dispatch(&ctx, catalog_msg, catalog_input).await).await;
     assert_eq!(catalog_body["records"].as_array().unwrap().len(), 1);
 }
 
@@ -1369,10 +1373,10 @@ async fn restore_endpoint_404s_for_an_unknown_product_id() {
     let ctx = ctx().await;
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/missing/restore",
+        "/b/products/api/admin/products/missing/restore",
         serde_json::json!({}),
     );
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -1392,20 +1396,20 @@ async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Live" }),
     );
-    let created = output_to_json(dispatch_admin(&ctx, create, create_input).await).await;
+    let created = output_to_json(dispatch(&ctx, create, create_input).await).await;
     let id = created["id"]
         .as_str()
         .expect("created product id")
         .to_string();
 
     let (msg, input) = admin_create_msg(
-        &format!("/admin/b/products/products/{id}/restore"),
+        &format!("/b/products/api/admin/products/{id}/restore"),
         serde_json::json!({}),
     );
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         body["id"], id,
         "restoring a live product answers 200 with it: {body}"
@@ -1420,26 +1424,25 @@ async fn restore_endpoint_is_a_no_op_for_a_product_that_was_never_deleted() {
 /// through EVERY wire path that reaches a restore handler — not merely
 /// through the one path a declaration happens to match.
 ///
-/// `ProductsBlock::handle` enters `handle_user` from two prefixes: the
-/// `/b/products/api`-stripped one and the raw `/b/products/...` one. A
-/// `USER_ROUTES` entry therefore answers at two spellings while
-/// `declared_access` only ever matches the declared one, so restore declared
-/// `Admin` at `/b/products/api/products/{id}/restore` left
-/// `POST /b/products/products/{id}/restore` resolving to the undeclared
-/// fallback tier (`Authenticated`): any logged-in user could resurrect any
-/// soft-deleted product — straight back into the public catalog, and
-/// purchasable, when it was active/approved. Product ids are not secret;
+/// Two routes reach a restore handler: the admin one, declared `Admin`, and
+/// the seller one, declared `Authenticated`. The block serves each at
+/// exactly one wire spelling now (`routes::ROUTES`; the former second
+/// spelling of every seller route is pinned 404 by
+/// `the_former_alias_spelling_of_a_seller_route_is_not_found`), which is
+/// what closed the escalation this test was written for: `handle` used to
+/// enter the user table from the raw `/b/products/...` path as well, so the
+/// seller restore answered at an undeclared spelling that resolved to
+/// `declared_access`'s fallback tier. Product ids are not secret;
 /// `/b/products/catalog` hands them out.
 ///
-/// The seller restore endpoint now answers at both `/b/products/...`
-/// spellings on purpose, so what stops `user_1` there is OWNERSHIP, not the
-/// tier. Seller products are enabled below precisely so the feature flag's
-/// 403 cannot stand in for that check: the product seeded here is
-/// platform-owned (blank `owner_id`/`created_by`), which
-/// `handlers::is_owned_by` refuses for every caller.
+/// The seller restore admits every logged-in caller, so what stops `user_1`
+/// there is OWNERSHIP, not the tier. Seller products are enabled below
+/// precisely so the feature flag's 403 cannot stand in for that check: the
+/// product seeded here is platform-owned (blank `owner_id`/`created_by`),
+/// which `handlers::is_owned_by` refuses for every caller.
 ///
 /// Driven through `dispatch_routed` (the real `route_to_block`) because that
-/// is where the tier is enforced — a `dispatch_user` test cannot see this
+/// is where the tier is enforced — a `dispatch` test cannot see this
 /// boundary at all, which is exactly how the escalation shipped.
 #[tokio::test]
 async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() {
@@ -1452,7 +1455,6 @@ async fn restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it() 
     soft_delete_product(&ctx, "gone").await;
 
     for path in [
-        "/b/products/products/gone/restore",
         "/b/products/api/products/gone/restore",
         "/b/products/api/admin/products/gone/restore",
     ] {
@@ -1526,10 +1528,10 @@ async fn restore_reports_a_slug_conflict_instead_of_an_opaque_error() {
     .await;
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/original/restore",
+        "/b/products/api/admin/products/original/restore",
         serde_json::json!({}),
     );
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     let error = match out.collect_buffered().await {
         Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
         other => panic!("restore over a claimed slug must fail: {other:?}"),
@@ -1579,14 +1581,14 @@ async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
         serde_json::to_vec(&serde_json::json!({"name": "after"})).unwrap()
     }));
     let (msg, _) = update_msg(
-        "/admin/b/products/products/racer",
+        "/b/products/api/admin/products/racer",
         "admin_1",
         serde_json::json!({}),
     );
     let mut msg = msg;
     msg.set_meta("auth.user_roles", "admin");
 
-    let out = dispatch_admin(ctx.as_ref(), msg, input).await;
+    let out = dispatch(ctx.as_ref(), msg, input).await;
     assert!(
         output_is_error(out, ErrorCode::NotFound).await,
         "a PATCH whose row was deleted before the write must 404, not report success"
@@ -1806,10 +1808,10 @@ async fn restore_names_a_slug_claimed_after_a_pre_check_would_have_looked() {
     };
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/original/restore",
+        "/b/products/api/admin/products/original/restore",
         serde_json::json!({}),
     );
-    let out = dispatch_admin(&racing, msg, input).await;
+    let out = dispatch(&racing, msg, input).await;
     let error = match out.collect_buffered().await {
         Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
         other => panic!("restore over a slug claimed mid-flight must fail: {other:?}"),
@@ -1868,10 +1870,10 @@ async fn restore_lands_when_the_claimant_vanishes_before_the_probe() {
     };
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/original/restore",
+        "/b/products/api/admin/products/original/restore",
         serde_json::json!({}),
     );
-    let body = output_to_json(dispatch_admin(&racing, msg, input).await).await;
+    let body = output_to_json(dispatch(&racing, msg, input).await).await;
     assert_eq!(
         body["id"], "original",
         "a collision that has gone by the time it is probed must not become a 500: {body}"
@@ -1928,10 +1930,10 @@ async fn restore_reports_a_conflict_when_the_slug_is_reclaimed_before_the_retry(
     };
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/original/restore",
+        "/b/products/api/admin/products/original/restore",
         serde_json::json!({}),
     );
-    let out = dispatch_admin(&racing, msg, input).await;
+    let out = dispatch(&racing, msg, input).await;
     let error = match out.collect_buffered().await {
         Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
         other => panic!("a retry over a re-claimed slug must fail: {other:?}"),
@@ -1997,10 +1999,10 @@ async fn restore_of_a_slugless_product_reports_the_write_failure_not_a_slug_conf
     let ctx = ctx.break_writes();
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/slugless/restore",
+        "/b/products/api/admin/products/slugless/restore",
         serde_json::json!({}),
     );
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     let error = match out.collect_buffered().await {
         Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
         other => panic!("a restore whose write failed must fail: {other:?}"),
@@ -2075,10 +2077,10 @@ async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
     let ctx = ctx.break_list_reads();
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/original/restore",
+        "/b/products/api/admin/products/original/restore",
         serde_json::json!({}),
     );
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     assert!(
         output_is_error(out, ErrorCode::Internal).await,
         "a probe that could not run must fail the restore, not be read as a clear slug"
@@ -2103,23 +2105,23 @@ async fn user_group_products_list() {
         "user_1",
         serde_json::json!({"name": "Store"}),
     );
-    let gr = dispatch_user(&ctx, cg, cg_input).await;
+    let gr = dispatch(&ctx, cg, cg_input).await;
     let gid = output_to_json(gr).await["id"].as_str().unwrap().to_string();
 
     // Create product in group
     let (cp, cp_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({
             "name": "In Group",
             "group_id": gid
         }),
     );
-    dispatch_user(&ctx, cp, cp_input).await;
+    dispatch(&ctx, cp, cp_input).await;
 
     // List products in group
     let (list, list_input) = get_msg(&format!("/b/products/groups/{gid}/products"), "user_1");
-    let out = dispatch_user(&ctx, list, list_input).await;
+    let out = dispatch(&ctx, list, list_input).await;
     let body = output_to_json(out).await;
     assert!(!body["records"].as_array().unwrap().is_empty());
 }
@@ -2133,12 +2135,12 @@ async fn user_cannot_list_other_users_group_products() {
         "user_1",
         serde_json::json!({"name": "Private"}),
     );
-    let gr = dispatch_user(&ctx, cg, cg_input).await;
+    let gr = dispatch(&ctx, cg, cg_input).await;
     let gid = output_to_json(gr).await["id"].as_str().unwrap().to_string();
 
     // user_2 tries to list user_1's group products
     let (list, list_input) = get_msg(&format!("/b/products/groups/{gid}/products"), "user_2");
-    let out = dispatch_user(&ctx, list, list_input).await;
+    let out = dispatch(&ctx, list, list_input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -2151,15 +2153,15 @@ async fn user_products_rejected_when_disabled() {
     let ctx = ctx().await; // no ALLOW_USER_PRODUCTS config → defaults to false
 
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({"name": "Test"}),
     );
-    let out = dispatch_user(&ctx, create, create_input).await;
+    let out = dispatch(&ctx, create, create_input).await;
     assert!(output_is_error(out, ErrorCode::PermissionDenied).await);
 
-    let (list, list_input) = get_msg("/b/products/products", "user_1");
-    let out = dispatch_user(&ctx, list, list_input).await;
+    let (list, list_input) = get_msg("/b/products/api/products", "user_1");
+    let out = dispatch(&ctx, list, list_input).await;
     assert!(output_is_error(out, ErrorCode::PermissionDenied).await);
 
     let (group, group_input) = create_msg(
@@ -2167,7 +2169,7 @@ async fn user_products_rejected_when_disabled() {
         "user_1",
         serde_json::json!({"name": "Group"}),
     );
-    let out = dispatch_user(&ctx, group, group_input).await;
+    let out = dispatch(&ctx, group, group_input).await;
     assert!(output_is_error(out, ErrorCode::PermissionDenied).await);
 }
 
@@ -2181,7 +2183,7 @@ async fn catalog_still_works_when_user_products_disabled() {
     seed(&ctx, "impresspress__products__products", "p1", d).await;
 
     let (msg, input) = get_msg("/b/products/catalog", "");
-    let out = dispatch_user(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     let body = output_to_json(out).await;
     assert_eq!(body["records"].as_array().unwrap().len(), 1);
 }
@@ -2193,8 +2195,8 @@ async fn catalog_still_works_when_user_products_disabled() {
 #[tokio::test]
 async fn unknown_admin_route() {
     let ctx = ctx().await;
-    let (msg, input) = admin_get_msg("/admin/b/products/nonexistent");
-    let out = dispatch_admin(&ctx, msg, input).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/nonexistent");
+    let out = dispatch(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -2202,7 +2204,7 @@ async fn unknown_admin_route() {
 async fn unknown_user_route() {
     let ctx = ctx().await;
     let (msg, input) = get_msg("/b/products/nonexistent", "user_1");
-    let out = dispatch_user(&ctx, msg, input).await;
+    let out = dispatch(&ctx, msg, input).await;
     assert!(output_is_error(out, ErrorCode::NotFound).await);
 }
 
@@ -2300,10 +2302,10 @@ async fn overview_shows_add_product_cta_when_enabled_and_empty() {
 async fn overview_hides_empty_state_once_products_exist() {
     let ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
     let (c, c_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Cloud Hosting" }),
     );
-    dispatch_admin(&ctx, c, c_input).await;
+    dispatch(&ctx, c, c_input).await;
 
     let (msg, _input) = admin_get_msg("/b/products/admin/");
     let html = output_to_html(super::super::pages::overview(&ctx, &msg).await).await;
@@ -2410,7 +2412,7 @@ async fn seller_product_wizard_reuses_builder_with_seller_routes_and_moderation_
 async fn admin_product_manager_renders_product_offer_lifecycle_and_payment_link_controls() {
     let test_ctx = ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Managed plan",
             "slug": "managed-plan",
@@ -2419,9 +2421,9 @@ async fn admin_product_manager_renders_product_offer_lifecycle_and_payment_link_
             "fulfillment_kind": "entitlement"
         }),
     );
-    let product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let product = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
-    let offer_collection = format!("/admin/b/products/products/{product_id}/offers");
+    let offer_collection = format!("/b/products/api/admin/products/{product_id}/offers");
     let definition = |name: &str| {
         serde_json::json!({
             "name": name,
@@ -2446,15 +2448,15 @@ async fn admin_product_manager_renders_product_offer_lifecycle_and_payment_link_
         })
     };
     let (msg, input) = admin_create_msg(&offer_collection, definition("Published price"));
-    let active = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let active = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let active_id = active["offer"]["id"].as_str().unwrap();
     let (msg, input) = admin_create_msg(
         &format!("{offer_collection}/{active_id}/publish"),
         serde_json::json!({}),
     );
-    output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let (msg, input) = admin_create_msg(&offer_collection, definition("Editable price"));
-    let draft = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let draft = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let draft_id = draft["offer"]["id"].as_str().unwrap();
 
     let (msg, _input) = admin_get_msg(&format!("/b/products/admin/products/{product_id}"));
@@ -2534,7 +2536,7 @@ async fn admin_product_manager_renders_product_offer_lifecycle_and_payment_link_
 async fn seller_product_manager_is_owner_isolated_and_uses_seller_endpoints() {
     let test_ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;
     let (msg, input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "seller_owner",
         serde_json::json!({
             "name": "Seller product",
@@ -2542,7 +2544,7 @@ async fn seller_product_manager_is_owner_isolated_and_uses_seller_endpoints() {
             "currency": "USD"
         }),
     );
-    let product = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let product = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
 
     let (owner_msg, _input) = get_msg(
@@ -2569,7 +2571,7 @@ async fn seller_product_manager_is_owner_isolated_and_uses_seller_endpoints() {
 async fn admin_product_duplicate_copies_safe_metadata_and_non_archived_offers_as_drafts() {
     let test_ctx = ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Original product",
             "slug": "original-product",
@@ -2578,9 +2580,9 @@ async fn admin_product_duplicate_copies_safe_metadata_and_non_archived_offers_as
             "fulfillment_kind": "download"
         }),
     );
-    let source = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let source = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let source_id = source["id"].as_str().unwrap();
-    let collection = format!("/admin/b/products/products/{source_id}/offers");
+    let collection = format!("/b/products/api/admin/products/{source_id}/offers");
     let offer_definition = |name: &str, amount: i64| {
         serde_json::json!({
             "name": name,
@@ -2604,25 +2606,25 @@ async fn admin_product_duplicate_copies_safe_metadata_and_non_archived_offers_as
         })
     };
     let (msg, input) = admin_create_msg(&collection, offer_definition("Current price", 2599));
-    let current = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let current = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let current_id = current["offer"]["id"].as_str().unwrap();
     let (msg, input) = admin_create_msg(
         &format!("{collection}/{current_id}/publish"),
         serde_json::json!({}),
     );
-    output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let (msg, input) = admin_create_msg(&collection, offer_definition("Old price", 1999));
-    let old = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let old = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let old_id = old["offer"]["id"].as_str().unwrap();
     let (mut msg, input) = delete_msg(&format!("{collection}/{old_id}"), "admin_1");
     msg.set_meta("auth.user_roles", "admin");
-    output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    output_to_json(dispatch(&test_ctx, msg, input).await).await;
 
     let (msg, input) = admin_create_msg(
-        &format!("/admin/b/products/products/{source_id}/duplicate"),
+        &format!("/b/products/api/admin/products/{source_id}/duplicate"),
         serde_json::json!({}),
     );
-    let duplicated = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let duplicated = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let copy = &duplicated["product"];
     assert_ne!(copy["id"], source["id"]);
     assert_eq!(copy["name"], "Original product copy");
@@ -2655,25 +2657,19 @@ async fn seller_product_duplicate_preserves_owner_moderation_and_rejects_other_s
     ])
     .await;
     let (msg, input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "seller_a",
         serde_json::json!({"name": "Owned product", "slug": "owned-product"}),
     );
-    let source = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let source = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let source_id = source["id"].as_str().unwrap();
-    let path = format!("/b/products/products/{source_id}/duplicate");
+    let path = format!("/b/products/api/products/{source_id}/duplicate");
 
     let (msg, input) = create_msg(&path, "seller_b", serde_json::json!({}));
-    assert!(
-        output_is_error(
-            dispatch_user(&test_ctx, msg, input).await,
-            ErrorCode::NotFound
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&test_ctx, msg, input).await, ErrorCode::NotFound).await);
 
     let (msg, input) = create_msg(&path, "seller_a", serde_json::json!({}));
-    let duplicated = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let duplicated = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     assert_eq!(duplicated["product"]["owner_kind"], "user");
     assert_eq!(duplicated["product"]["owner_id"], "seller_a");
     assert_eq!(duplicated["product"]["created_by"], "seller_a");
@@ -2685,7 +2681,7 @@ async fn seller_product_duplicate_preserves_owner_moderation_and_rejects_other_s
 async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
     let test_ctx = ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Team plan",
             "slug": "team-plan",
@@ -2695,11 +2691,11 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
             "product_template_id": "simple_subscription"
         }),
     );
-    let product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let product = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
     assert_eq!(product["status"], "draft");
 
-    let offer_collection = format!("/admin/b/products/products/{product_id}/offers");
+    let offer_collection = format!("/b/products/api/admin/products/{product_id}/offers");
     let (msg, input) = admin_create_msg(
         &offer_collection,
         serde_json::json!({
@@ -2731,7 +2727,7 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
             }
         }),
     );
-    let managed = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let managed = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let offer_id = managed["offer"]["id"].as_str().unwrap();
     assert_eq!(
         managed["offer"]["components"][0]["amount"]["unit_amount_minor"],
@@ -2743,18 +2739,18 @@ async fn admin_wizard_sequence_creates_and_publishes_subscription_offer() {
         &format!("{offer_collection}/{offer_id}/publish"),
         serde_json::json!({}),
     );
-    let published = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let published = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     assert_eq!(published["status"], "active");
     let (msg, input) = update_msg(
-        &format!("/admin/b/products/products/{product_id}"),
+        &format!("/b/products/api/admin/products/{product_id}"),
         "admin_1",
         serde_json::json!({"status": "active"}),
     );
-    let active_product = output_to_json(dispatch_admin(&test_ctx, msg, input).await).await;
+    let active_product = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     assert_eq!(active_product["status"], "active");
 
     let (msg, input) = get_msg(&format!("/b/products/storefront/{product_id}"), "");
-    let storefront = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let storefront = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     assert_eq!(storefront["offers"][0]["mode"], "subscription");
     assert_eq!(storefront["offers"][0]["recurring_interval"], "month");
 }
@@ -2767,7 +2763,7 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
     ])
     .await;
     let (msg, input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "seller_wizard",
         serde_json::json!({
             "name": "Custom engraving",
@@ -2777,12 +2773,12 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
             "product_template_id": "configurable_product"
         }),
     );
-    let product = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let product = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let product_id = product["id"].as_str().unwrap();
     assert_eq!(product["owner_id"], "seller_wizard");
     assert_eq!(product["approval_status"], "draft");
 
-    let offer_collection = format!("/b/products/products/{product_id}/offers");
+    let offer_collection = format!("/b/products/api/products/{product_id}/offers");
     let (msg, input) = create_msg(
         &offer_collection,
         "seller_wizard",
@@ -2829,7 +2825,7 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
             "checkout": {"collect_billing_address": true}
         }),
     );
-    let managed = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let managed = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     let offer_id = managed["offer"]["id"].as_str().unwrap();
     assert_eq!(managed["offer"]["pricing_model"], "components");
 
@@ -2838,24 +2834,20 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
         "seller_wizard",
         serde_json::json!({}),
     );
-    let offer = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let offer = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     assert_eq!(offer["status"], "active");
     let (msg, input) = update_msg(
-        &format!("/b/products/products/{product_id}"),
+        &format!("/b/products/api/products/{product_id}"),
         "seller_wizard",
         serde_json::json!({"status": "active"}),
     );
-    let pending = output_to_json(dispatch_user(&test_ctx, msg, input).await).await;
+    let pending = output_to_json(dispatch(&test_ctx, msg, input).await).await;
     assert_eq!(pending["status"], "pending_review");
     assert_eq!(pending["approval_status"], "pending");
 
     let (msg, input) = get_msg(&format!("/b/products/storefront/{product_id}"), "");
     assert!(
-        output_is_error(
-            dispatch_user(&test_ctx, msg, input).await,
-            ErrorCode::NotFound
-        )
-        .await,
+        output_is_error(dispatch(&test_ctx, msg, input).await, ErrorCode::NotFound).await,
         "pending seller products must stay out of the public storefront"
     );
 }
@@ -2868,10 +2860,10 @@ async fn seller_wizard_sequence_creates_configurable_offer_then_enters_moderatio
 async fn manage_products_uses_data_table_with_mobile_labels() {
     let ctx = ctx().await;
     let (c, c_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Widget" }),
     );
-    dispatch_admin(&ctx, c, c_input).await;
+    dispatch(&ctx, c, c_input).await;
 
     let (msg, _input) = admin_get_msg("/b/products/admin/manage");
     let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
@@ -3025,7 +3017,7 @@ async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
 /// Drives the real path: `manage_products` renders the row, the `hx-post`
 /// target is read back out of that HTML verbatim (no hand-built URL, so a
 /// change to either half of the encoding is caught), and it goes through
-/// `route_to_block` → `ProductsBlock::handle` → `endpoint_match::dispatch_path`
+/// `route_to_block` → `ProductsBlock::handle` → `endpoint_match::dispatch`
 /// → `handle_restore_product` → the repository.
 ///
 /// The id carries `/`, `?` and `#`, which end a path segment for three
@@ -3034,7 +3026,7 @@ async fn manage_products_deleted_view_offers_restore_not_an_edit_link() {
 /// `Uri::path`, `url::Url::path` on Cloudflare, `Url.pathname` in the Service
 /// Worker — so `%2F` reaches the matcher intact and the route does not split;
 /// the decode owed is on the matched `{id}`, and that is what
-/// `dispatch_path` now does.
+/// `dispatch` does.
 #[tokio::test]
 async fn the_restore_url_the_deleted_view_renders_restores_that_product() {
     let ctx = ctx().await;
@@ -3616,8 +3608,8 @@ async fn admin_can_inspect_and_replay_dead_letter_webhooks_without_payload_discl
     )
     .await;
 
-    let (list, list_input) = admin_get_msg("/admin/b/products/webhook-events");
-    let body = output_to_json(dispatch_admin(&ctx, list, list_input).await).await;
+    let (list, list_input) = admin_get_msg("/b/products/api/admin/webhook-events");
+    let body = output_to_json(dispatch(&ctx, list, list_input).await).await;
     assert_eq!(body["total_count"], 1);
     assert_eq!(body["records"][0]["id"], "evt_route_replay");
     let encoded = serde_json::to_string(&body).unwrap();
@@ -3627,10 +3619,10 @@ async fn admin_can_inspect_and_replay_dead_letter_webhooks_without_payload_discl
     assert!(!encoded.contains("payload_sha256"));
 
     let (replay, replay_input) = admin_create_msg(
-        "/admin/b/products/webhook-events/evt_route_replay/replay",
+        "/b/products/api/admin/webhook-events/evt_route_replay/replay",
         serde_json::json!({}),
     );
-    let replayed = output_to_json(dispatch_admin(&ctx, replay, replay_input).await).await;
+    let replayed = output_to_json(dispatch(&ctx, replay, replay_input).await).await;
     assert_eq!(replayed["received"], true);
 
     let event = wafer_core::clients::database::get(
@@ -3985,102 +3977,6 @@ fn every_products_json_endpoint_has_discovery_schema() {
     );
 }
 
-#[test]
-fn dispatch_tables_are_backed_by_declared_endpoints() {
-    // Central auth enforcement matches the on-the-wire path against the
-    // endpoints DECLARED in `BlockInfo`; an undeclared path falls back to
-    // `Authenticated`, not `Admin`. The dispatch tables are matched AFTER
-    // that gate, so a dispatch entry without a matching declaration is a
-    // reachable route with the wrong tier (PR #59 shipped exactly this: a
-    // stale PATCH refund alias only in the dispatch table, refundable by any
-    // logged-in user). Drive both tables against the real `BlockInfo` so the
-    // two surfaces cannot drift again.
-    use wafer_run::{AuthLevel, Block};
-
-    use crate::endpoint_match;
-
-    let info = super::super::ProductsBlock::new().info();
-
-    for route in super::super::handlers::ADMIN_ROUTES {
-        let declared_path =
-            route
-                .template
-                .replacen("/admin/b/products", "/b/products/api/admin", 1);
-        assert!(
-            info.endpoints.iter().any(|endpoint| {
-                endpoint.method == route.method
-                    && endpoint.path == declared_path
-                    && endpoint.auth == AuthLevel::Admin
-            }),
-            "admin dispatch route {:?} {} has no declared Admin endpoint {}",
-            route.method,
-            route.template,
-            declared_path,
-        );
-    }
-
-    // A user dispatch route answers at BOTH wire spellings, because
-    // `ProductsBlock::handle` enters `handle_user` from `/b/products/api/...`
-    // (normalized) AND from the raw `/b/products/...` path. Declaring only
-    // one of them is legal — the other then resolves to `declared_access`'s
-    // `Authenticated` fallback — but only while that fallback is no weaker
-    // than the declaration. Restore was declared `Admin` at the `/api/`
-    // spelling alone and was therefore reachable at `Authenticated` through
-    // the raw one: any logged-in user could resurrect any soft-deleted
-    // product. So the rule is not "some spelling is declared" (which that
-    // route satisfied) but "EVERY spelling that reaches the handler is
-    // enforced at least as strictly as the strictest declaration" — which
-    // in practice keeps `Admin` routes off this table entirely, where they
-    // belong on `ADMIN_ROUTES` behind the single `/b/products/api/admin`
-    // prefix.
-    for route in super::super::handlers::USER_ROUTES {
-        let api_path = route.template.replacen("/b/products", "/b/products/api", 1);
-        let action = endpoint_match::action_for_method(route.method);
-        let spellings = [
-            (
-                api_path.as_str(),
-                endpoint_match::endpoint_auth(&info.endpoints, action, &api_path),
-            ),
-            (
-                route.template,
-                endpoint_match::endpoint_auth(&info.endpoints, action, route.template),
-            ),
-        ];
-        assert!(
-            spellings.iter().any(|(_, declared)| declared.is_some()),
-            "user dispatch route {:?} {} declared neither as {} nor as {}",
-            route.method,
-            route.template,
-            api_path,
-            route.template,
-        );
-        let strictest = spellings
-            .iter()
-            .filter_map(|(_, declared)| *declared)
-            .max_by_key(|auth| auth_rank(*auth))
-            .expect("at least one spelling is declared");
-        for (spelling, declared) in spellings {
-            // Undeclared spellings get `declared_access`'s fail-closed
-            // fallback, mirroring routing.rs:567's `route.access.max(..)`
-            // (the `/b/products` prefix tier is `Public`, so the fallback is
-            // the whole decision).
-            let enforced = declared.unwrap_or(AuthLevel::Authenticated);
-            assert!(
-                auth_rank(enforced) >= auth_rank(strictest),
-                "user dispatch route {:?} {} is enforced at {:?} on the {} spelling but \
-                 declared {:?} elsewhere — the weaker spelling reaches the same handler, \
-                 so the declaration is not the tier a caller actually faces. Move it to \
-                 ADMIN_ROUTES (one prefix, one spelling) or declare every spelling.",
-                route.method,
-                route.template,
-                enforced,
-                spelling,
-                strictest,
-            );
-        }
-    }
-}
-
 // ============================================================
 // Typed row projection
 // ============================================================
@@ -4094,7 +3990,7 @@ async fn product_endpoints_publish_the_flat_product_view() {
 
     let ctx = ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({
             "name": "Flat",
             "tags": ["a", "b"],
@@ -4103,7 +3999,7 @@ async fn product_endpoints_publish_the_flat_product_view() {
             "fulfillment_kind": "download"
         }),
     );
-    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let created = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(
         created.get("data").is_none(),
         "rows are flat views, not {{id, data}} records: {created}"
@@ -4126,12 +4022,12 @@ async fn product_endpoints_publish_the_flat_product_view() {
     assert_eq!(serde_json::to_value(&view).unwrap(), created);
 
     let id = view.id.clone();
-    let (msg, input) = admin_get_msg(&format!("/admin/b/products/products/{id}"));
-    let fetched = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg(&format!("/b/products/api/admin/products/{id}"));
+    let fetched = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(fetched, created);
 
-    let (msg, input) = admin_get_msg("/admin/b/products/products");
-    let list = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/products");
+    let list = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(list["total_count"], 1);
     assert_eq!(list["page"], 1);
     assert_eq!(list["page_size"], 20);
@@ -4139,12 +4035,12 @@ async fn product_endpoints_publish_the_flat_product_view() {
 
     let (mut msg, input) = request_msg(
         "update",
-        &format!("/admin/b/products/products/{id}"),
+        &format!("/b/products/api/admin/products/{id}"),
         "admin_1",
         serde_json::json!({"description": "Renamed", "tags": ["c"]}),
     );
     msg.set_meta("auth.user_roles", "admin");
-    let updated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let updated = output_to_json(dispatch(&ctx, msg, input).await).await;
     let updated_view: ProductView =
         serde_json::from_value(updated.clone()).expect("update response is a ProductView");
     assert_eq!(updated_view.description, "Renamed");
@@ -4182,13 +4078,9 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
     });
     let mut body = smuggled.clone();
     body["name"] = serde_json::json!("Sneaky");
-    let (msg, input) = create_msg("/b/products/products", "seller_a", body);
+    let (msg, input) = create_msg("/b/products/api/products", "seller_a", body);
     assert!(
-        output_is_error(
-            dispatch_user(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await,
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await,
         "a create naming these columns is refused outright, not quietly stripped"
     );
 
@@ -4196,11 +4088,11 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
     // columns from the server, which is the other half of the property: the
     // values are not merely unreachable from a request body, they are set.
     let (msg, input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "seller_a",
         serde_json::json!({"name": "Honest"}),
     );
-    let created = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let created = output_to_json(dispatch(&ctx, msg, input).await).await;
     let id = created["id"].as_str().expect("created id").to_string();
 
     let assert_untouched = |row: &wafer_core::clients::database::Record| {
@@ -4220,13 +4112,13 @@ async fn seller_writes_cannot_set_ownership_moderation_or_provider_columns() {
         .expect("created row");
     assert_untouched(&row);
 
-    let (msg, input) = update_msg(&format!("/b/products/products/{id}"), "seller_a", smuggled);
+    let (msg, input) = update_msg(
+        &format!("/b/products/api/products/{id}"),
+        "seller_a",
+        smuggled,
+    );
     assert!(
-        output_is_error(
-            dispatch_user(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await,
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await,
         "and so is an update naming them"
     );
     let row = wafer_core::clients::database::get(&ctx, TABLE, &id)
@@ -4245,7 +4137,7 @@ async fn seller_patch_treats_explicit_null_fields_as_absent() {
 
     let ctx = user_products_ctx().await;
     let (msg, input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "seller_a",
         serde_json::json!({
             "name": "Kept",
@@ -4254,12 +4146,12 @@ async fn seller_patch_treats_explicit_null_fields_as_absent() {
             "stock": 7
         }),
     );
-    let created = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let created = output_to_json(dispatch(&ctx, msg, input).await).await;
     let id = created["id"].as_str().expect("created id").to_string();
     assert_eq!(created["stock"], 7, "{created}");
 
     let (msg, input) = update_msg(
-        &format!("/b/products/products/{id}"),
+        &format!("/b/products/api/products/{id}"),
         "seller_a",
         serde_json::json!({
             "name": "Renamed",
@@ -4268,7 +4160,7 @@ async fn seller_patch_treats_explicit_null_fields_as_absent() {
             "stock": null
         }),
     );
-    let updated = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let updated = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(updated["name"], "Renamed", "{updated}");
     assert_eq!(updated["description"], "Original", "{updated}");
     assert_eq!(updated["category"], "tools", "{updated}");
@@ -4293,13 +4185,9 @@ async fn typed_product_writes_reject_values_outside_the_contract() {
         serde_json::json!({"name": "x", "stock": "many"}),
         serde_json::json!({"name": "x", "tags": "not-a-list"}),
     ] {
-        let (msg, input) = admin_create_msg("/admin/b/products/products", body.clone());
+        let (msg, input) = admin_create_msg("/b/products/api/admin/products", body.clone());
         assert!(
-            output_is_error(
-                dispatch_admin(&ctx, msg, input).await,
-                ErrorCode::InvalidArgument
-            )
-            .await,
+            output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await,
             "{body} must be refused"
         );
     }
@@ -4313,10 +4201,10 @@ async fn group_endpoints_publish_the_flat_group_view() {
 
     let ctx = user_products_ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/groups",
+        "/b/products/api/admin/groups",
         serde_json::json!({"name": "Admin group", "description": "d", "user_id": "someone"}),
     );
-    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let created = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(created.get("data").is_none(), "{created}");
     let view: GroupView = serde_json::from_value(created.clone()).expect("GroupView");
     assert_eq!(view.name, "Admin group");
@@ -4326,18 +4214,18 @@ async fn group_endpoints_publish_the_flat_group_view() {
 
     let (mut msg, input) = request_msg(
         "update",
-        &format!("/admin/b/products/groups/{}", view.id),
+        &format!("/b/products/api/admin/groups/{}", view.id),
         "admin_1",
         serde_json::json!({"description": "changed"}),
     );
     msg.set_meta("auth.user_roles", "admin");
-    let updated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let updated = output_to_json(dispatch(&ctx, msg, input).await).await;
     let updated_view: GroupView = serde_json::from_value(updated.clone()).expect("GroupView");
     assert_eq!(updated_view.description, "changed");
     assert_eq!(updated_view.name, "Admin group");
 
-    let (msg, input) = admin_get_msg("/admin/b/products/groups");
-    let list = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/groups");
+    let list = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(list["total_count"], 1);
     assert_eq!(list["page_size"], 20);
     assert_eq!(list["records"][0], updated);
@@ -4349,7 +4237,7 @@ async fn group_endpoints_publish_the_flat_group_view() {
         "user_1",
         serde_json::json!({"name": "Mine", "user_id": "attacker"}),
     );
-    let own = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let own = output_to_json(dispatch(&ctx, msg, input).await).await;
     let own_view: GroupView = serde_json::from_value(own.clone()).expect("GroupView");
     assert_eq!(own_view.user_id, "user_1");
     assert!(
@@ -4359,16 +4247,16 @@ async fn group_endpoints_publish_the_flat_group_view() {
     assert_eq!(serde_json::to_value(&own_view).unwrap(), own);
 
     let (msg, input) = get_msg(&format!("/b/products/groups/{}", own_view.id), "user_1");
-    let fetched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let fetched = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(fetched, own);
 
     let (msg, input) = get_msg("/b/products/groups", "user_1");
-    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let list = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(list["records"][0], own);
     assert_eq!(list["total_count"], 1);
 
     let (msg, input) = delete_msg(&format!("/b/products/groups/{}", own_view.id), "user_1");
-    let deleted = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let deleted = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(deleted, serde_json::json!({"deleted": true}));
 }
 
@@ -4382,10 +4270,10 @@ async fn group_creates_record_the_caller_as_created_by() {
     let ctx = user_products_ctx().await;
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/groups",
+        "/b/products/api/admin/groups",
         serde_json::json!({"name": "Assigned", "user_id": "someone", "created_by": "attacker"}),
     );
-    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let created = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(created["user_id"], "someone");
     assert_eq!(
         created["created_by"], "admin_1",
@@ -4397,7 +4285,7 @@ async fn group_creates_record_the_caller_as_created_by() {
         "user_1",
         serde_json::json!({"name": "Mine", "created_by": "attacker"}),
     );
-    let own = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let own = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(own["user_id"], "user_1");
     assert_eq!(
         own["created_by"], "user_1",
@@ -4413,10 +4301,10 @@ async fn type_endpoints_publish_the_flat_type_view() {
 
     let ctx = ctx().await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/types",
+        "/b/products/api/admin/types",
         serde_json::json!({"name": "subscription", "description": "Recurring", "is_system": true}),
     );
-    let created = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let created = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(created.get("data").is_none(), "{created}");
     let view: ProductTypeView = serde_json::from_value(created.clone()).expect("ProductTypeView");
     assert_eq!(view.name, "subscription");
@@ -4438,35 +4326,26 @@ async fn type_endpoints_publish_the_flat_type_view() {
     }
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/types",
+        "/b/products/api/admin/types",
         serde_json::json!({"name": "plain"}),
     );
-    let plain = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let plain = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(plain["is_system"], false, "the table default is reported");
 
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/types",
+        "/b/products/api/admin/types",
         serde_json::json!({"name": "bad", "is_system": 1}),
     );
     assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::InvalidArgument
-        )
-        .await,
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::InvalidArgument).await,
         "is_system is a boolean on the wire"
     );
 
     for (msg, input) in [
-        admin_get_msg("/admin/b/products/types"),
+        admin_get_msg("/b/products/api/admin/types"),
         get_msg("/b/products/types", "user_1"),
     ] {
-        let out = if msg.path().starts_with("/admin/") {
-            dispatch_admin(&ctx, msg, input).await
-        } else {
-            dispatch_user(&ctx, msg, input).await
-        };
-        let list = output_to_json(out).await;
+        let list = output_to_json(dispatch(&ctx, msg, input).await).await;
         assert_eq!(list["total_count"], 2, "{list}");
         assert_eq!(list["page_size"], 20);
         let names: Vec<&str> = list["records"]
@@ -4478,9 +4357,12 @@ async fn type_endpoints_publish_the_flat_type_view() {
         assert!(names.contains(&"subscription") && names.contains(&"plain"));
     }
 
-    let (mut msg, input) = delete_msg(&format!("/admin/b/products/types/{}", view.id), "admin_1");
+    let (mut msg, input) = delete_msg(
+        &format!("/b/products/api/admin/types/{}", view.id),
+        "admin_1",
+    );
     msg.set_meta("auth.user_roles", "admin");
-    let deleted = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let deleted = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(deleted, serde_json::json!({"deleted": true}));
 }
 
@@ -4494,7 +4376,7 @@ async fn group_templates_publish_the_documented_list_envelope() {
 
     let ctx = ctx().await;
     let (msg, input) = get_msg("/b/products/group-templates", "user_1");
-    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let list = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(list.is_object(), "an envelope, not a bare array: {list}");
     let records = list["records"].as_array().expect("records");
     assert_eq!(list["total_count"], records.len());
@@ -4544,7 +4426,7 @@ async fn subscription_status_publishes_the_typed_projection() {
     .await;
 
     let (msg, input) = get_msg("/b/products/subscription", "user_1");
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     let typed: SubscriptionStatusResponse =
         serde_json::from_value(body.clone()).expect("SubscriptionStatusResponse");
     assert_eq!(serde_json::to_value(&typed).unwrap(), body);
@@ -4561,7 +4443,7 @@ async fn subscription_status_publishes_the_typed_projection() {
     assert!(!encoded.contains("user_id"), "{body}");
 
     let (msg, input) = get_msg("/b/products/subscription", "user_2");
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body, serde_json::json!({"subscription": null}));
 }
 
@@ -4612,7 +4494,7 @@ async fn public_catalog_withholds_ownership_moderation_and_provider_columns() {
     .await;
 
     let (msg, input) = get_msg("/b/products/catalog/p_public", "");
-    let detail = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let detail = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(detail.get("data").is_none(), "{detail}");
     let view: CatalogProductView =
         serde_json::from_value(detail.clone()).expect("CatalogProductView");
@@ -4622,7 +4504,7 @@ async fn public_catalog_withholds_ownership_moderation_and_provider_columns() {
     assert_eq!(view.published_at.as_deref(), Some("2026-07-02T00:00:00Z"));
 
     let (msg, input) = get_msg("/b/products/catalog", "");
-    let list = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let list = output_to_json(dispatch(&ctx, msg, input).await).await;
     let typed: CatalogProductListResponse =
         serde_json::from_value(list.clone()).expect("CatalogProductListResponse");
     assert_eq!(serde_json::to_value(&typed).unwrap(), list);
@@ -4675,18 +4557,12 @@ async fn empty_timestamp_columns_read_as_null() {
         ]),
     )
     .await;
-    let (msg, input) = admin_get_msg("/admin/b/products/products/p_blank_ts");
-    let body = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let (msg, input) = admin_get_msg("/b/products/api/admin/products/p_blank_ts");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(body["published_at"].is_null(), "{body}");
     assert_eq!(body["submitted_at"], "2026-07-01T00:00:00Z");
     assert!(body["deleted_at"].is_null());
 }
-
-// The strictness ordering below is `endpoint_match::auth_rank`, not a copy of
-// it. A copy would go on asserting against its own idea of strictness after
-// the router's changed, leaving this gate green while the thing it guards
-// weakened.
-use crate::endpoint_match::auth_rank;
 
 // ============================================================
 // The request body cannot rewrite a product's identity
@@ -4705,22 +4581,22 @@ async fn admin_patch_cannot_rewrite_a_products_id() {
     let ctx = ctx().await;
 
     let (create, create_input) = admin_create_msg(
-        "/admin/b/products/products",
+        "/b/products/api/admin/products",
         serde_json::json!({ "name": "Original" }),
     );
-    let id = output_to_json(dispatch_admin(&ctx, create, create_input).await).await["id"]
+    let id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
     let (mut update, update_input) = request_msg(
         "update",
-        &format!("/admin/b/products/products/{id}"),
+        &format!("/b/products/api/admin/products/{id}"),
         "admin_1",
         serde_json::json!({ "id": "p_hijacked", "name": "Renamed" }),
     );
     update.set_meta("auth.user_roles", "admin");
-    let out = dispatch_admin(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(
         output_is_error(out, ErrorCode::InvalidArgument).await,
         "a body that names an unsettable field must be refused outright"
@@ -4752,21 +4628,21 @@ async fn seller_patch_cannot_rewrite_a_products_id() {
     let ctx = user_products_ctx().await;
 
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({ "name": "Original" }),
     );
-    let id = output_to_json(dispatch_user(&ctx, create, create_input).await).await["id"]
+    let id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
         .as_str()
         .unwrap()
         .to_string();
 
     let (update, update_input) = update_msg(
-        &format!("/b/products/products/{id}"),
+        &format!("/b/products/api/products/{id}"),
         "user_1",
         serde_json::json!({ "id": "p_hijacked", "name": "Renamed" }),
     );
-    let out = dispatch_user(&ctx, update, update_input).await;
+    let out = dispatch(&ctx, update, update_input).await;
     assert!(
         output_is_error(out, ErrorCode::InvalidArgument).await,
         "a body that names an unsettable field must be refused outright"
@@ -4867,12 +4743,12 @@ async fn a_repo_invalid_argument_reaches_the_caller_as_a_400_carrying_its_messag
     seed(&ctx, "impresspress__products__products", "p_admin", row).await;
     let refusing_ctx = refusing(&ctx).await;
     let (mut msg, input) = update_msg(
-        "/admin/b/products/products/p_admin",
+        "/b/products/api/admin/products/p_admin",
         "admin_1",
         serde_json::json!({ "name": "Renamed" }),
     );
     msg.set_meta("auth.user_roles", "admin");
-    let message = refusal_message(dispatch_admin(&refusing_ctx, msg, input).await).await;
+    let message = refusal_message(dispatch(&refusing_ctx, msg, input).await).await;
     assert!(
         message.contains(REFUSAL),
         "the admin PATCH must pass the refusal's own message through: {message}"
@@ -4881,21 +4757,21 @@ async fn a_repo_invalid_argument_reaches_the_caller_as_a_400_carrying_its_messag
     // 2. the seller PATCH
     let ctx = user_products_ctx().await;
     let (create, create_input) = create_msg(
-        "/b/products/products",
+        "/b/products/api/products",
         "user_1",
         serde_json::json!({ "name": "Original" }),
     );
-    let id = output_to_json(dispatch_user(&ctx, create, create_input).await).await["id"]
+    let id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
         .as_str()
         .unwrap()
         .to_string();
     let refusing_ctx = refusing(&ctx).await;
     let (msg, input) = update_msg(
-        &format!("/b/products/products/{id}"),
+        &format!("/b/products/api/products/{id}"),
         "user_1",
         serde_json::json!({ "name": "Renamed" }),
     );
-    let message = refusal_message(dispatch_user(&refusing_ctx, msg, input).await).await;
+    let message = refusal_message(dispatch(&refusing_ctx, msg, input).await).await;
     assert!(
         message.contains(REFUSAL),
         "the seller PATCH must pass the refusal's own message through: {message}"
@@ -4937,10 +4813,10 @@ async fn a_repo_invalid_argument_reaches_the_caller_as_a_400_carrying_its_messag
     .await;
     let refusing_ctx = refusing(&ctx).await;
     let (msg, input) = admin_create_msg(
-        "/admin/b/products/products/p_pending/approve",
+        "/b/products/api/admin/products/p_pending/approve",
         serde_json::json!({}),
     );
-    let message = refusal_message(dispatch_admin(&refusing_ctx, msg, input).await).await;
+    let message = refusal_message(dispatch(&refusing_ctx, msg, input).await).await;
     assert!(
         message.contains(REFUSAL),
         "product moderation must pass the refusal's own message through: {message}"
@@ -5096,7 +4972,7 @@ async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhe
     let html = output_to_html(
         super::super::pages::product_manager(
             &ctx,
-            &crate::test_support::auth_msg("read", "/b/products/products/assigned", "user_1"),
+            &crate::test_support::auth_msg("read", "/b/products/api/products/assigned", "user_1"),
             "assigned",
             false,
         )
@@ -5108,16 +4984,16 @@ async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhe
         "the owner's product page already renders for them: {html}"
     );
 
-    let (msg, input) = get_msg("/b/products/products/assigned/offers", "user_1");
-    let listed = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let (msg, input) = get_msg("/b/products/api/products/assigned/offers", "user_1");
+    let listed = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(
         listed["offers"].is_array(),
         "the owner's offer routes already accept them: {listed}"
     );
 
     // GET
-    let (msg, input) = get_msg("/b/products/products/assigned", "user_1");
-    let fetched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let (msg, input) = get_msg("/b/products/api/products/assigned", "user_1");
+    let fetched = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         fetched["id"], "assigned",
         "the owner must be able to read the product their own page renders: {fetched}"
@@ -5125,19 +5001,19 @@ async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhe
 
     // PATCH
     let (msg, input) = update_msg(
-        "/b/products/products/assigned",
+        "/b/products/api/products/assigned",
         "user_1",
         serde_json::json!({ "name": "Renamed" }),
     );
-    let patched = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let patched = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         patched["name"], "Renamed",
         "the owner must be able to edit it: {patched}"
     );
 
     // DELETE
-    let (msg, input) = delete_msg("/b/products/products/assigned", "user_1");
-    let deleted = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let (msg, input) = delete_msg("/b/products/api/products/assigned", "user_1");
+    let deleted = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         deleted["deleted"], true,
         "the owner must be able to delete it: {deleted}"
@@ -5145,13 +5021,13 @@ async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhe
 
     // And the rule is still a rule: a third party is neither owner nor
     // creator and gets the same 404 from every one of those doors.
-    let (msg, input) = get_msg("/b/products/products/assigned", "user_2");
-    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
-    let (msg, input) = get_msg("/b/products/products/assigned/offers", "user_2");
-    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    let (msg, input) = get_msg("/b/products/api/products/assigned", "user_2");
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    let (msg, input) = get_msg("/b/products/api/products/assigned/offers", "user_2");
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::NotFound).await);
     let stranger = super::super::pages::product_manager(
         &ctx,
-        &crate::test_support::auth_msg("read", "/b/products/products/assigned", "user_2"),
+        &crate::test_support::auth_msg("read", "/b/products/api/products/assigned", "user_2"),
         "assigned",
         false,
     )
@@ -5304,83 +5180,98 @@ async fn the_restore_url_a_sellers_deleted_view_renders_restores_that_product() 
 
 /// The negative half, and the reason every assertion in this section goes
 /// through the router: a seller must not restore a product that is not
-/// theirs, on ANY spelling that reaches the handler.
-///
-/// `ProductsBlock::handle` enters `handle_user` from the `/b/products/api`-
-/// stripped path AND from the raw `/b/products/...` one, so a `USER_ROUTES`
-/// entry answers at two URLs. Both are `Authenticated` here (the declared
-/// one by declaration, the raw one by `declared_access`'s fail-closed
-/// fallback), which means the tier admits every logged-in caller and
-/// OWNERSHIP is the only thing between seller B and seller A's catalog.
+/// theirs. The route is `Authenticated`, which admits every logged-in
+/// caller, so OWNERSHIP is the only thing between seller B and seller A's
+/// catalog.
 #[tokio::test]
-async fn a_seller_cannot_restore_another_sellers_product_on_any_wire_spelling() {
+async fn a_seller_cannot_restore_another_sellers_product() {
     let ctx = user_products_ctx().await;
     seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
 
-    for path in [
-        "/b/products/products/a_product/restore",
-        "/b/products/api/products/a_product/restore",
-    ] {
-        let (msg, input) = create_msg(path, "seller_b", serde_json::json!({}));
-        assert!(
-            dispatch_routed(&ctx, msg, input)
-                .await
-                .collect_buffered()
-                .await
-                .is_err(),
-            "seller B restored seller A's product through {path}"
-        );
-        assert!(
-            is_soft_deleted(&ctx, "a_product").await,
-            "seller B's refused restore must leave seller A's product deleted ({path})"
-        );
-    }
+    let path = "/b/products/api/products/a_product/restore";
+    let (msg, input) = create_msg(path, "seller_b", serde_json::json!({}));
+    assert!(
+        dispatch_routed(&ctx, msg, input)
+            .await
+            .collect_buffered()
+            .await
+            .is_err(),
+        "seller B restored seller A's product through {path}"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "a_product").await,
+        "seller B's refused restore must leave seller A's product deleted"
+    );
 
-    // Positive control on BOTH spellings, so the refusals above cannot be
-    // passing merely because nothing routes anywhere. Re-deleted in between,
-    // since the first restore leaves nothing for the second to restore.
-    for path in [
-        "/b/products/products/a_product/restore",
-        "/b/products/api/products/a_product/restore",
-    ] {
-        let (msg, input) = create_msg(path, "seller_a", serde_json::json!({}));
-        let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
-        assert_eq!(
-            body["id"], "a_product",
-            "the owner must be able to restore through {path}: {body}"
-        );
-        assert!(!is_soft_deleted(&ctx, "a_product").await);
-        soft_delete_product(&ctx, "a_product").await;
-    }
+    // Positive control, so the refusal above cannot be passing merely
+    // because nothing routes anywhere.
+    let (msg, input) = create_msg(path, "seller_a", serde_json::json!({}));
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], "a_product",
+        "the owner must be able to restore through {path}: {body}"
+    );
+    assert!(!is_soft_deleted(&ctx, "a_product").await);
 }
 
-/// An unauthenticated caller is refused by the router itself: the declared
-/// spelling is `Authenticated`, and the undeclared raw spelling gets
-/// `declared_access`'s `Authenticated` fallback rather than the `/b/products`
-/// prefix's `Public` tier. Pinned because the seller restore endpoint is the
-/// first *write* to live on a public prefix under an owner check alone — if
-/// the tier ever slipped to Public, `is_owned_by`'s empty-`user_id` guard
+/// Every seller route used to answer at a second, undeclared spelling:
+/// `ProductsBlock::handle` entered the user dispatch table from the raw
+/// `/b/products/...` path as well as the `/b/products/api`-stripped one, so
+/// `POST /b/products/products/{id}/restore` reached the seller restore
+/// handler at `declared_access`'s fallback tier while only the `/api/`
+/// spelling was declared — the gap the restore escalation shipped through.
+/// The route table now has one spelling per handler, the declared one; the
+/// former alias is not a route and answers 404 from the block itself, before
+/// any gate or handler runs. Pinned here, with the owner on the alias, so
+/// the second spelling cannot silently come back.
+#[tokio::test]
+async fn the_former_alias_spelling_of_a_seller_route_is_not_found() {
+    let ctx = user_products_ctx().await;
+    seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
+
+    let alias = "/b/products/products/a_product/restore";
+    let (msg, input) = create_msg(alias, "seller_a", serde_json::json!({}));
+    assert!(
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::NotFound).await,
+        "the owner's POST to the former alias {alias} must be NotFound from the block"
+    );
+    assert!(
+        is_soft_deleted(&ctx, "a_product").await,
+        "a 404 on the alias must not have reached the restore handler"
+    );
+
+    // Positive control on the declared spelling, through the router.
+    let declared = "/b/products/api/products/a_product/restore";
+    let (msg, input) = create_msg(declared, "seller_a", serde_json::json!({}));
+    let body = output_to_json(dispatch_routed(&ctx, msg, input).await).await;
+    assert_eq!(
+        body["id"], "a_product",
+        "the owner must be able to restore through {declared}: {body}"
+    );
+    assert!(!is_soft_deleted(&ctx, "a_product").await);
+}
+
+/// An unauthenticated caller is refused by the router itself: the route is
+/// declared `Authenticated`. Pinned because the seller restore endpoint is
+/// the first *write* to live on a public prefix under an owner check alone —
+/// if the tier ever slipped to Public, `is_owned_by`'s empty-`user_id` guard
 /// would be the only thing left.
 #[tokio::test]
 async fn an_anonymous_caller_cannot_restore_a_deleted_product() {
     let ctx = user_products_ctx().await;
     seed_deleted_seller_product(&ctx, "a_product", "seller_a", "Seller A's product").await;
 
-    for path in [
-        "/b/products/products/a_product/restore",
-        "/b/products/api/products/a_product/restore",
-    ] {
-        let (msg, input) = create_msg(path, "", serde_json::json!({}));
-        assert!(
-            dispatch_routed(&ctx, msg, input)
-                .await
-                .collect_buffered()
-                .await
-                .is_err(),
-            "an anonymous POST to {path} must not restore a product"
-        );
-        assert!(is_soft_deleted(&ctx, "a_product").await);
-    }
+    let path = "/b/products/api/products/a_product/restore";
+    let (msg, input) = create_msg(path, "", serde_json::json!({}));
+    assert!(
+        dispatch_routed(&ctx, msg, input)
+            .await
+            .collect_buffered()
+            .await
+            .is_err(),
+        "an anonymous POST to {path} must not restore a product"
+    );
+    assert!(is_soft_deleted(&ctx, "a_product").await);
 }
 
 /// The seller half of `the_close_manager_archives_a_deleted_products_offer_
