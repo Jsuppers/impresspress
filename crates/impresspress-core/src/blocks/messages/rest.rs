@@ -1,9 +1,12 @@
 //! REST endpoint handlers for the messages block.
 //!
 //! Thin layer: parse HTTP request → call service → format JSON response.
-//! Pure-CRUD shells (get context/entry, delete entry) go through the shared
-//! `blocks::crud` helpers instead.
+//! Every id-bearing handler reads `{id}` as the block's route table bound it
+//! and verifies the caller owns the row through [`owned_record`] before
+//! touching it; the pure-CRUD shells compose the id-taking `blocks::crud`
+//! primitives on that verified row.
 
+use wafer_core::clients::database::Record;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use super::{
@@ -13,14 +16,7 @@ use super::{
 use crate::{
     blocks::crud,
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    util::path_param,
 };
-
-/// Path prefix preceding the context id in the REST routes.
-const CONTEXTS_PREFIX: &str = "/b/messages/api/contexts/";
-
-/// Path prefix preceding the entry id in the REST routes.
-const ENTRIES_PREFIX: &str = "/b/messages/api/entries/";
 
 /// Convert empty string to None (msg.query() returns "" for missing params).
 fn non_empty(s: &str) -> Option<String> {
@@ -29,6 +25,29 @@ fn non_empty(s: &str) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// The row `{id}` names in `table`, once the caller's ownership of it is
+/// verified, or the 400 / 401 / 404 to send instead.
+///
+/// The id is read only as `endpoint_match::dispatch` bound it. A message
+/// that never went through the table binds nothing and is refused here
+/// rather than parsed out of the path. `label` is the resource name the
+/// error texts use (`"Context"`, `"Entry"`).
+async fn owned_record(
+    ctx: &dyn Context,
+    msg: &Message,
+    table: &str,
+    label: &str,
+) -> Result<Record, OutputStream> {
+    let id = msg.var("id");
+    if id.is_empty() {
+        return Err(err_bad_request(&format!(
+            "Missing {} ID",
+            label.to_lowercase()
+        )));
+    }
+    crud::verify_owner(ctx, table, id, "owner_id", msg.user_id(), label).await
 }
 
 // ---------------------------------------------------------------------------
@@ -77,36 +96,17 @@ pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream
 }
 
 pub async fn get_context(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_get_owned(
-        ctx,
-        msg,
-        &crud::OwnedResource {
-            collection: service::CONTEXTS_TABLE,
-            path_prefix: CONTEXTS_PREFIX,
-            owner_field: "owner_id",
-            label: "Context",
-        },
-    )
-    .await
+    match owned_record(ctx, msg, service::CONTEXTS_TABLE, "Context").await {
+        Ok(record) => ok_json(&record),
+        Err(resp) => resp,
+    }
 }
 
 pub async fn update_context(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let id = path_param(msg, "id", CONTEXTS_PREFIX).to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing context ID");
-    }
-    if let Err(resp) = crud::verify_owner(
-        ctx,
-        service::CONTEXTS_TABLE,
-        &id,
-        "owner_id",
-        msg.user_id(),
-        "Context",
-    )
-    .await
-    {
-        return resp;
-    }
+    let id = match owned_record(ctx, msg, service::CONTEXTS_TABLE, "Context").await {
+        Ok(record) => record.id,
+        Err(resp) => return resp,
+    };
     let raw = input.collect_to_bytes().await;
     let body: UpdateContextRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
@@ -120,22 +120,10 @@ pub async fn update_context(ctx: &dyn Context, msg: &Message, input: InputStream
 }
 
 pub async fn delete_context(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = path_param(msg, "id", CONTEXTS_PREFIX).to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing context ID");
-    }
-    if let Err(resp) = crud::verify_owner(
-        ctx,
-        service::CONTEXTS_TABLE,
-        &id,
-        "owner_id",
-        msg.user_id(),
-        "Context",
-    )
-    .await
-    {
-        return resp;
-    }
+    let id = match owned_record(ctx, msg, service::CONTEXTS_TABLE, "Context").await {
+        Ok(record) => record.id,
+        Err(resp) => return resp,
+    };
     match service::delete_context(ctx, &id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Context not found"),
@@ -148,22 +136,10 @@ pub async fn delete_context(ctx: &dyn Context, msg: &Message) -> OutputStream {
 // ---------------------------------------------------------------------------
 
 pub async fn list_entries(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let context_id = path_param(msg, "id", CONTEXTS_PREFIX).to_string();
-    if context_id.is_empty() {
-        return err_bad_request("Missing context ID");
-    }
-    if let Err(resp) = crud::verify_owner(
-        ctx,
-        service::CONTEXTS_TABLE,
-        &context_id,
-        "owner_id",
-        msg.user_id(),
-        "Context",
-    )
-    .await
-    {
-        return resp;
-    }
+    let context_id = match owned_record(ctx, msg, service::CONTEXTS_TABLE, "Context").await {
+        Ok(record) => record.id,
+        Err(resp) => return resp,
+    };
     let (_, page_size, offset) = msg.pagination_params(100);
     let params = ListEntriesParams {
         kind: non_empty(msg.query("kind")),
@@ -178,22 +154,10 @@ pub async fn list_entries(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let context_id = path_param(msg, "id", CONTEXTS_PREFIX).to_string();
-    if context_id.is_empty() {
-        return err_bad_request("Missing context ID");
-    }
-    if let Err(resp) = crud::verify_owner(
-        ctx,
-        service::CONTEXTS_TABLE,
-        &context_id,
-        "owner_id",
-        msg.user_id(),
-        "Context",
-    )
-    .await
-    {
-        return resp;
-    }
+    let context_id = match owned_record(ctx, msg, service::CONTEXTS_TABLE, "Context").await {
+        Ok(record) => record.id,
+        Err(resp) => return resp,
+    };
     let raw = input.collect_to_bytes().await;
     let body: AddEntryRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
@@ -218,31 +182,21 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
 }
 
 pub async fn get_entry(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_get_owned(
-        ctx,
-        msg,
-        &crud::OwnedResource {
-            collection: service::ENTRIES_TABLE,
-            path_prefix: ENTRIES_PREFIX,
-            owner_field: "owner_id",
-            label: "Entry",
-        },
-    )
-    .await
+    match owned_record(ctx, msg, service::ENTRIES_TABLE, "Entry").await {
+        Ok(record) => ok_json(&record),
+        Err(resp) => resp,
+    }
 }
 
 pub async fn delete_entry(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete_owned(
-        ctx,
-        msg,
-        &crud::OwnedResource {
-            collection: service::ENTRIES_TABLE,
-            path_prefix: ENTRIES_PREFIX,
-            owner_field: "owner_id",
-            label: "Entry",
-        },
-    )
-    .await
+    let id = match owned_record(ctx, msg, service::ENTRIES_TABLE, "Entry").await {
+        Ok(record) => record.id,
+        Err(resp) => return resp,
+    };
+    match crud::delete_record(ctx, service::ENTRIES_TABLE, &id, "Entry").await {
+        Ok(deleted) => ok_json(&deleted),
+        Err(resp) => resp,
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +389,29 @@ mod tests {
     }
 
     // --- Tests ---
+
+    /// Handlers read the id the table bound, nothing else: an unrouted
+    /// message with an id in its path is refused, and the same message
+    /// routed through `ROUTES` reaches the row.
+    #[tokio::test]
+    async fn handlers_read_only_the_bound_id() {
+        use crate::{blocks::messages::test_support::routed, test_support::auth_msg};
+
+        let ctx = messages_ctx().await;
+        let created = create_as(&ctx, "user-a", serde_json::json!({"type": "task"})).await;
+        let ctx_id = created["id"].as_str().expect("id").to_string();
+        let path = format!("/b/messages/api/contexts/{ctx_id}");
+
+        let unrouted = get_context(&ctx, &auth_msg("retrieve", &path, "user-a")).await;
+        assert_eq!(
+            status_of(unrouted).await,
+            400,
+            "an unrouted message binds no id and must be refused, not parsed"
+        );
+
+        let bound = get_context(&ctx, &routed(auth_msg("retrieve", &path, "user-a"))).await;
+        assert_eq!(status_of(bound).await, 200);
+    }
 
     #[tokio::test]
     async fn context_is_owner_scoped_across_users() {
