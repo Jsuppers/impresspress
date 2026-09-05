@@ -119,13 +119,14 @@ pub async fn delete_for_bucket(ctx: &dyn Context, bucket: &str) -> Result<(), Wa
 }
 
 /// Delete the object row for `(bucket, key)` (object-deletion metadata
-/// cleanup).
+/// cleanup). Returns how many rows were removed, so the caller can tell a
+/// cleanup from a delete of something that never existed.
 pub async fn delete_by_bucket_key(
     ctx: &dyn Context,
     bucket: &str,
     key: &str,
-) -> Result<(), WaferError> {
-    db::delete_by_filters(
+) -> Result<i64, WaferError> {
+    db::delete_by_filters_count(
         ctx,
         TABLE,
         vec![
