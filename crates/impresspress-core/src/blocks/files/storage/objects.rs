@@ -290,130 +290,37 @@ pub(super) async fn handle_delete_object(ctx: &dyn Context, msg: &Message) -> Ou
         return err_forbidden("Access denied to this bucket");
     }
 
-    match store::delete(ctx, bucket, key).await {
-        Ok(()) => {
-            // Clean up metadata
-            repo::objects::delete_by_bucket_key(ctx, bucket, key)
-                .await
-                .ok();
-            ok_json(&serde_json::json!({"deleted": true}))
-        }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Object not found"),
-        Err(e) => err_internal("Delete failed", e),
+    // Storage first, tolerating "already gone": if an earlier attempt removed
+    // the blob but failed the metadata cleanup below, the retry must still
+    // reach that cleanup instead of stopping at "not found".
+    let blob_existed = match store::delete(ctx, bucket, key).await {
+        Ok(()) => true,
+        Err(e) if e.code == ErrorCode::NotFound => false,
+        Err(e) => return err_internal("Delete failed", e),
+    };
+
+    // The metadata cleanup is reported, never swallowed: a surviving row
+    // keeps charging the uploader's quota for a blob that no longer exists.
+    let rows_removed = match repo::objects::delete_by_bucket_key(ctx, bucket, key).await {
+        Ok(rows) => rows,
+        Err(e) => return err_internal("Delete failed to clean up object metadata", e),
+    };
+
+    if !blob_existed && rows_removed == 0 {
+        return err_not_found("Object not found");
     }
+    ok_json(&serde_json::json!({"deleted": true}))
 }
 
 #[cfg(test)]
 mod integration_tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
+    use super::{
+        super::test_helpers::{ctx_with_storage, seed_bucket, seed_object_row},
+        *,
     };
-
-    use async_trait::async_trait;
-    use wafer_core::{
-        interfaces::storage::service::{
-            FolderInfo, ListOptions as StoreListOptions, ObjectInfo, ObjectList, StorageError,
-            StorageService,
-        },
-        service_blocks::storage::StorageBlock,
+    use crate::test_support::{
+        auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
     };
-
-    use super::{super::test_helpers::seed_bucket, *};
-    use crate::test_support::{auth_msg, output_json, TestContext};
-
-    /// `(folder, key)` → `(bytes, content_type)`.
-    type MemObjects = HashMap<(String, String), (Vec<u8>, String)>;
-
-    /// In-memory [`StorageService`] so upload tests exercise the production
-    /// `wafer-run/storage` [`StorageBlock`] wire protocol end-to-end (the
-    /// typed `store::put`/`store::get` clients round-trip through the real
-    /// handler) without touching the filesystem.
-    #[derive(Default)]
-    struct MemStorage {
-        objects: Mutex<MemObjects>,
-    }
-
-    #[async_trait]
-    impl StorageService for MemStorage {
-        async fn put(
-            &self,
-            folder: &str,
-            key: &str,
-            data: &[u8],
-            content_type: &str,
-        ) -> Result<(), StorageError> {
-            self.objects.lock().unwrap().insert(
-                (folder.to_string(), key.to_string()),
-                (data.to_vec(), content_type.to_string()),
-            );
-            Ok(())
-        }
-
-        async fn get(
-            &self,
-            folder: &str,
-            key: &str,
-        ) -> Result<(Vec<u8>, ObjectInfo), StorageError> {
-            let guard = self.objects.lock().unwrap();
-            let (data, content_type) = guard
-                .get(&(folder.to_string(), key.to_string()))
-                .ok_or(StorageError::NotFound)?;
-            Ok((
-                data.clone(),
-                ObjectInfo {
-                    key: key.to_string(),
-                    size: data.len() as i64,
-                    content_type: content_type.clone(),
-                    last_modified: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                        .expect("epoch"),
-                },
-            ))
-        }
-
-        async fn delete(&self, folder: &str, key: &str) -> Result<(), StorageError> {
-            self.objects
-                .lock()
-                .unwrap()
-                .remove(&(folder.to_string(), key.to_string()));
-            Ok(())
-        }
-
-        async fn list(
-            &self,
-            _folder: &str,
-            _opts: &StoreListOptions,
-        ) -> Result<ObjectList, StorageError> {
-            Ok(ObjectList {
-                objects: vec![],
-                total_count: 0,
-                next_cursor: None,
-            })
-        }
-
-        async fn create_folder(&self, _name: &str, _public: bool) -> Result<(), StorageError> {
-            Ok(())
-        }
-
-        async fn delete_folder(&self, _name: &str) -> Result<(), StorageError> {
-            Ok(())
-        }
-
-        async fn list_folders(&self) -> Result<Vec<FolderInfo>, StorageError> {
-            Ok(vec![])
-        }
-    }
-
-    /// `TestContext::with_files()` plus a real `wafer-run/storage` block over
-    /// [`MemStorage`], so `handle_upload_object` can complete its `store::put`.
-    async fn ctx_with_storage() -> TestContext {
-        let mut ctx = TestContext::with_files().await;
-        ctx.register_block(
-            "wafer-run/storage",
-            Arc::new(StorageBlock::new(Arc::new(MemStorage::default()))),
-        );
-        ctx
-    }
 
     /// A download served via `handle_get_object` must take the STREAMING
     /// response shape: the `resp.stream` opt-in marker and the object's real
@@ -512,6 +419,108 @@ mod integration_tests {
         }
         msg.set_meta("req.content_type", content_type);
         msg
+    }
+
+    /// Build the message the router produces for
+    /// `DELETE /b/storage/api/buckets/{bucket}/objects/{key}`.
+    fn delete_msg(bucket: &str, key: &str) -> Message {
+        let mut msg = auth_msg(
+            "delete",
+            &format!("/b/storage/api/buckets/{bucket}/objects/{key}"),
+            "alice",
+        );
+        msg.set_meta("req.param.name", bucket);
+        msg.set_meta("req.param.key", key);
+        msg
+    }
+
+    /// One stored object with its metadata row, owned by `alice`.
+    async fn ctx_with_stored_object() -> TestContext {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        store::put(&ctx, "assets", "pic.png", b"PNGDATA", "image/png")
+            .await
+            .expect("seed object");
+        seed_object_row(&ctx, "assets", "pic.png", "alice", 7).await;
+        ctx
+    }
+
+    /// Both wire ops a filtered metadata delete can use, so the fault
+    /// matches whichever the repository issues.
+    fn object_row_delete_ops() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("database.delete_where", repo::objects::TABLE),
+            ("database.delete_where_count", repo::objects::TABLE),
+        ]
+    }
+
+    #[tokio::test]
+    async fn delete_object_removes_blob_and_metadata_row() {
+        let ctx = ctx_with_stored_object().await;
+
+        let out = handle_delete_object(&ctx, &delete_msg("assets", "pic.png")).await;
+
+        assert_eq!(output_json(out).await["deleted"], serde_json::json!(true));
+        assert!(
+            store::get(&ctx, "assets", "pic.png").await.is_err(),
+            "the blob must be gone"
+        );
+        assert_eq!(
+            repo::objects::count_for_uploader(&ctx, "alice")
+                .await
+                .expect("count"),
+            0,
+            "the metadata row must be gone"
+        );
+    }
+
+    /// A surviving row keeps charging the uploader's quota for a blob that
+    /// no longer exists, so a failed cleanup is reported, never swallowed.
+    #[tokio::test]
+    async fn delete_object_reports_metadata_cleanup_failure() {
+        let ctx = ctx_with_stored_object().await;
+        let failing = FailingDbOpContext::new(ctx.clone(), object_row_delete_ops());
+
+        let out = handle_delete_object(&failing, &delete_msg("assets", "pic.png")).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a metadata cleanup failure must not be reported as a successful delete"
+        );
+    }
+
+    /// After a failed cleanup the blob may already be gone; a retry must
+    /// still finish the cleanup instead of stopping at "object not found".
+    #[tokio::test]
+    async fn delete_object_retry_finishes_cleanup_after_partial_failure() {
+        let ctx = ctx_with_stored_object().await;
+        let failing = FailingDbOpContext::new(ctx.clone(), object_row_delete_ops());
+        let first = handle_delete_object(&failing, &delete_msg("assets", "pic.png")).await;
+        assert!(output_is_error(first, "Internal").await);
+
+        let retry = handle_delete_object(&ctx, &delete_msg("assets", "pic.png")).await;
+
+        assert_eq!(
+            output_json(retry).await["deleted"],
+            serde_json::json!(true),
+            "the retry must complete the cleanup"
+        );
+        assert_eq!(
+            repo::objects::count_for_uploader(&ctx, "alice")
+                .await
+                .expect("count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_missing_object_is_not_found() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let out = handle_delete_object(&ctx, &delete_msg("assets", "missing.png")).await;
+
+        assert!(output_is_error(out, "NotFound").await);
     }
 
     /// Fetch the single object-metadata row (asserting there is exactly
