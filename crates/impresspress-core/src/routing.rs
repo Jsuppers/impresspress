@@ -1663,27 +1663,33 @@ mod tests {
         );
     }
 
+    /// An anonymous asset request reaches dispatch from the system block's
+    /// own declaration: `SystemBlock::info()` declares
+    /// `GET /b/static/{filename}` public, and `declared_access` resolves the
+    /// bound filename to that row. Driven with the real `info()`, so a
+    /// router entry that merely restates it is redundant.
     #[tokio::test]
     async fn anonymous_static_asset_request_is_not_denied() {
-        use crate::test_support::{anon_msg, TestContext};
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::system::SystemBlock,
+            test_support::{anon_msg, TestContext},
+        };
 
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/system",
             std::sync::Arc::new(DispatchProbeBlock),
         );
+        let block_infos = vec![SystemBlock::new().info()];
 
-        // No `BlockInfo` passed at all — proves the carve-out does not depend
-        // on `declared_access` matching. `SystemBlock::info().endpoints` now
-        // declares `GET /b/static/{filename}` (public), which would resolve
-        // this path on its own; the carve-out stays until `router_final` is
-        // removed in phase 1's final PR, and this test goes with it.
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", "/b/static/app-abc123.css"),
             InputStream::empty(),
             &AllEnabled,
-            &[],
+            &block_infos,
             &[],
         )
         .await;
@@ -1696,14 +1702,20 @@ mod tests {
 
     #[tokio::test]
     async fn webmcp_script_asset_is_publicly_reachable() {
-        use crate::test_support::{anon_msg, TestContext};
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::system::SystemBlock,
+            test_support::{anon_msg, TestContext},
+        };
 
         // The WebMCP registration script (`crates/impresspress-core/src/ui/
         // assets/webmcp.js`, served under `/b/static/`) must load for
         // anonymous visitors, or tools silently never register on the
         // public storefront. Drive a real anonymous request through
         // `route_to_block` against the actual URL the page embeds
-        // (`assets::webmcp_js_url()`), the same way
+        // (`assets::webmcp_js_url()`) and the system block's real
+        // declaration, the same way
         // `anonymous_static_asset_request_is_not_denied` proves this for the
         // static prefix generally.
         let mut ctx = TestContext::new().await;
@@ -1711,13 +1723,14 @@ mod tests {
             "impresspress/system",
             std::sync::Arc::new(DispatchProbeBlock),
         );
+        let block_infos = vec![SystemBlock::new().info()];
 
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", &crate::ui::assets::webmcp_js_url()),
             InputStream::empty(),
             &AllEnabled,
-            &[],
+            &block_infos,
             &[],
         )
         .await;
@@ -1748,24 +1761,33 @@ mod tests {
         );
     }
 
+    /// The Stripe webhook is verified by HMAC signature inside its handler,
+    /// not by a session. The products block declares
+    /// `POST /b/products/webhooks` public and the router reads that
+    /// declaration; driven with the block's real `info()`, an anonymous
+    /// POST reaches dispatch.
     #[tokio::test]
-    async fn stripe_webhook_carveout_stays_reachable_with_no_session() {
-        use crate::test_support::{anon_msg, TestContext};
+    async fn stripe_webhook_stays_reachable_with_no_session() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::products::ProductsBlock,
+            test_support::{anon_msg, TestContext},
+        };
 
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/products",
             std::sync::Arc::new(DispatchProbeBlock),
         );
+        let block_infos = vec![ProductsBlock::new().info()];
 
-        // No BlockInfo passed at all — `router_declared_public` routes never
-        // consult `declared_access`, so this must dispatch regardless.
         let out = route_to_block(
             &ctx,
             anon_msg("create", "/b/products/webhooks"),
             InputStream::empty(),
             &AllEnabled,
-            &[],
+            &block_infos,
             &[],
         )
         .await;
@@ -1776,23 +1798,15 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
-    /// The webhook is reachable anonymously from the products block's own
-    /// declaration, with no router carve-out involved: `endpoint_auth` and
-    /// `declared_access` resolve `POST /b/products/webhooks` to `Public` from
-    /// `ProductsBlock::new().info()` alone, and `route_to_block` dispatches
-    /// an anonymous POST with that info. Today the
-    /// `router_declared_public("/b/products/webhooks", ..)` entry still
-    /// short-circuits the access decision, so the dispatch half passes for
-    /// two reasons; the resolution half is the one that lets PR 7 delete the
-    /// carve-out and keep this test green.
-    #[tokio::test]
-    async fn stripe_webhook_is_public_from_the_products_declaration_alone() {
-        use wafer_run::{AuthLevel, Block};
+    /// The resolution behind `stripe_webhook_stays_reachable_with_no_session`:
+    /// `endpoint_auth` and `declared_access` resolve
+    /// `POST /b/products/webhooks` to `Public` from
+    /// `ProductsBlock::new().info()` alone, with no router entry involved.
+    #[test]
+    fn stripe_webhook_is_public_from_the_products_declaration_alone() {
+        use wafer_run::{AuthLevel, Block as _};
 
-        use crate::{
-            blocks::products::ProductsBlock,
-            test_support::{anon_msg, TestContext},
-        };
+        use crate::{blocks::products::ProductsBlock, test_support::anon_msg};
 
         let block_infos = vec![ProductsBlock::new().info()];
         assert_eq!(
@@ -1813,26 +1827,6 @@ mod tests {
             RouteAccess::Public,
             "the router resolves the webhook public from the declaration"
         );
-
-        let mut ctx = TestContext::new().await;
-        ctx.register_block(
-            "impresspress/products",
-            std::sync::Arc::new(DispatchProbeBlock),
-        );
-        let out = route_to_block(
-            &ctx,
-            anon_msg("create", "/b/products/webhooks"),
-            InputStream::empty(),
-            &AllEnabled,
-            &block_infos,
-            &[],
-        )
-        .await;
-        let buf = out
-            .collect_buffered()
-            .await
-            .expect("an anonymous Stripe webhook POST must dispatch");
-        assert_eq!(buf.body, b"DISPATCHED");
     }
 
     #[tokio::test]
@@ -2018,18 +2012,7 @@ mod tests {
 
         let info = crate::blocks::auth_ui::AuthUiBlock::new().info();
 
-        let public = [
-            ("retrieve", "/b/auth/reset-password"),
-            ("retrieve", "/b/auth/oauth/callback"),
-            ("retrieve", "/b/auth/api/verify"),
-            ("create", "/b/auth/api/verify"),
-            ("create", "/b/auth/api/resend-verification"),
-            ("create", "/b/auth/api/forgot-password"),
-            ("create", "/b/auth/api/reset-password"),
-            ("retrieve", "/b/auth/api/oauth/providers"),
-            ("create", "/b/auth/api/oauth/sync-user"),
-        ];
-        for (action, path) in public {
+        for (action, path) in AUTH_UI_SESSION_LESS_PATHS {
             assert_eq!(
                 endpoint_match::endpoint_auth(&info.endpoints, action, path),
                 Some(AuthLevel::Public),
@@ -2050,13 +2033,256 @@ mod tests {
             .map(|r| r.prefix)
             .collect();
         carved_out.sort_unstable();
-        let mut covered: Vec<&str> = public.iter().map(|(_, path)| *path).collect();
+        let mut covered: Vec<&str> = AUTH_UI_SESSION_LESS_PATHS
+            .iter()
+            .map(|(_, path)| *path)
+            .collect();
         covered.sort_unstable();
         covered.dedup();
         assert_eq!(
             carved_out, covered,
             "the auth-ui carve-outs in ROUTES and the paths this test asserts public must be the same set"
         );
+    }
+
+    /// The nine auth-ui `(action, path)` pairs that legitimately have no
+    /// session: each handler gates itself by a token, signature or shared
+    /// secret, and the block declares each `public`.
+    const AUTH_UI_SESSION_LESS_PATHS: &[(&str, &str)] = &[
+        ("retrieve", "/b/auth/reset-password"),
+        ("retrieve", "/b/auth/oauth/callback"),
+        ("retrieve", "/b/auth/api/verify"),
+        ("create", "/b/auth/api/verify"),
+        ("create", "/b/auth/api/resend-verification"),
+        ("create", "/b/auth/api/forgot-password"),
+        ("create", "/b/auth/api/reset-password"),
+        ("retrieve", "/b/auth/api/oauth/providers"),
+        ("create", "/b/auth/api/oauth/sync-user"),
+    ];
+
+    /// Each session-less auth-ui path reaches dispatch anonymously from the
+    /// auth-ui declaration alone, driven through `route_to_block` with the
+    /// block's real `info()`. This is the router-level proof behind
+    /// `auth_ui_declares_every_path_the_router_carves_out`: a router entry
+    /// that merely restates one of these rows is redundant.
+    #[tokio::test]
+    async fn auth_ui_session_less_paths_dispatch_anonymously_from_the_declaration() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::auth_ui::AuthUiBlock,
+            test_support::{anon_msg, TestContext},
+        };
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/auth-ui",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = vec![AuthUiBlock::new().info()];
+
+        for (action, path) in AUTH_UI_SESSION_LESS_PATHS {
+            let out = route_to_block(
+                &ctx,
+                anon_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = out.collect_buffered().await.unwrap_or_else(|terminal| {
+                panic!("anonymous {action} {path} must dispatch from the declaration, got {terminal:?}")
+            });
+            assert_eq!(buf.body, b"DISPATCHED", "{action} {path}");
+        }
+    }
+
+    /// The two api-key rows were never carved out: they were reachable only
+    /// because `declared_access`'s fail-closed default happens to be the
+    /// level the handler wants. Now the block declares them `authenticated`
+    /// and the router enforces exactly that from the declaration.
+    #[tokio::test]
+    async fn auth_ui_api_key_rows_need_a_session_from_the_declaration() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::auth_ui::AuthUiBlock,
+            test_support::{anon_msg, auth_msg, output_is_error, TestContext},
+        };
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/auth-ui",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = vec![AuthUiBlock::new().info()];
+        let path = "/b/auth/api/api-keys/k-1";
+
+        for action in ["update", "delete"] {
+            let denied = route_to_block(
+                &ctx,
+                anon_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            assert!(
+                output_is_error(denied, "PermissionDenied").await,
+                "anonymous {action} {path} must be denied"
+            );
+
+            let admitted = route_to_block(
+                &ctx,
+                auth_msg(action, path, "user_1"),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = admitted
+                .collect_buffered()
+                .await
+                .unwrap_or_else(|terminal| {
+                    panic!("{action} {path} must dispatch, got {terminal:?}")
+                });
+            assert_eq!(buf.body, b"DISPATCHED", "{action} {path}");
+        }
+    }
+
+    /// `/b/admin/settings` carried its own `Admin` prefix entry. Every path
+    /// under it is gated `Admin` regardless: by the `/b/admin/` entry, and by
+    /// the admin block's own rows, which are all `admin`. Driven with the
+    /// real `all_block_infos()`, for a declared tab, the redirecting index
+    /// and an undeclared path, so the dedicated entry is redundant.
+    #[tokio::test]
+    async fn admin_settings_paths_are_denied_without_the_admin_role() {
+        use crate::test_support::{admin_msg, anon_msg, auth_msg, output_is_error, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/admin",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = crate::blocks::all_block_infos();
+
+        let declared = ["/b/admin/settings/", "/b/admin/settings/email"];
+        let undeclared = "/b/admin/settings/not-a-tab";
+        for path in declared.iter().copied().chain(std::iter::once(undeclared)) {
+            for (label, msg) in [
+                ("anonymous", anon_msg("retrieve", path)),
+                ("non-admin", auth_msg("retrieve", path, "user_1")),
+            ] {
+                let out = route_to_block(
+                    &ctx,
+                    msg,
+                    InputStream::empty(),
+                    &AllEnabled,
+                    &block_infos,
+                    &[],
+                )
+                .await;
+                assert!(
+                    output_is_error(out, "PermissionDenied").await,
+                    "{label} GET {path} must be denied"
+                );
+            }
+        }
+        for path in declared {
+            let out = route_to_block(
+                &ctx,
+                admin_msg("retrieve", path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = out.collect_buffered().await.unwrap_or_else(|terminal| {
+                panic!("admin GET {path} must dispatch, got {terminal:?}")
+            });
+            assert_eq!(buf.body, b"DISPATCHED", "admin GET {path}");
+        }
+    }
+
+    /// `/b/legalpages/admin` and `/b/legalpages/api` carried `Admin` prefix
+    /// entries because the block's handlers do not re-check `is_admin`.
+    /// Every row the block declares under those prefixes is `admin`, so the
+    /// declaration gates each path at the same level. Driven with the real
+    /// `all_block_infos()` for a representative row of every shape (pages,
+    /// page writes, the JSON collection, an `{id}` row), plus the public
+    /// terms page to show the public rows are not over-gated.
+    #[tokio::test]
+    async fn legalpages_admin_and_api_paths_are_denied_without_the_admin_role() {
+        use crate::test_support::{admin_msg, anon_msg, auth_msg, output_is_error, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/legalpages",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = crate::blocks::all_block_infos();
+
+        const ADMIN_ROWS: &[(&str, &str)] = &[
+            ("retrieve", "/b/legalpages/admin"),
+            ("retrieve", "/b/legalpages/admin/terms"),
+            ("create", "/b/legalpages/admin/save"),
+            ("retrieve", "/b/legalpages/api/documents"),
+            ("create", "/b/legalpages/api/documents"),
+            ("update", "/b/legalpages/api/documents/d-1"),
+            ("delete", "/b/legalpages/api/documents/d-1"),
+        ];
+        for (action, path) in ADMIN_ROWS {
+            for (label, msg) in [
+                ("anonymous", anon_msg(action, path)),
+                ("non-admin", auth_msg(action, path, "user_1")),
+            ] {
+                let out = route_to_block(
+                    &ctx,
+                    msg,
+                    InputStream::empty(),
+                    &AllEnabled,
+                    &block_infos,
+                    &[],
+                )
+                .await;
+                assert!(
+                    output_is_error(out, "PermissionDenied").await,
+                    "{label} {action} {path} must be denied"
+                );
+            }
+            let out = route_to_block(
+                &ctx,
+                admin_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = out.collect_buffered().await.unwrap_or_else(|terminal| {
+                panic!("admin {action} {path} must dispatch, got {terminal:?}")
+            });
+            assert_eq!(buf.body, b"DISPATCHED", "admin {action} {path}");
+        }
+
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", "/b/legalpages/terms"),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        let buf = out
+            .collect_buffered()
+            .await
+            .expect("the public terms page must dispatch anonymously");
+        assert_eq!(buf.body, b"DISPATCHED");
     }
 
     /// Shared dummy block for the tests above: always dispatches successfully
