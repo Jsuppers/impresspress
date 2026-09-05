@@ -267,7 +267,7 @@ pub const ENDPOINT_REFERENCE: &[(&str, &str, &str)] = &[
 ///
 /// Hand-written rather than derived: every handler reads the id with
 /// `msg.var("id")` by name, so a struct declared only to feed
-/// `.path_params::<T>()` would have no runtime user.
+/// `request_schema_of::<T>` would have no runtime user.
 fn id_path_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",

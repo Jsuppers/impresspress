@@ -13,12 +13,12 @@
 //!   map, and the response is the database layer's own `Record` envelope or
 //!   [`Deleted`]. They read the record id from the request path with a
 //!   prefix fallback (`path_id`), which only `products` still relies on:
-//!   `crud_delete` and `crud_delete_owned` are its callers. `legalpages` and
-//!   `messages` read `{id}` as their route tables bound it and compose the
-//!   primitives directly, so `crud_get`, `crud_update` and `crud_get_owned`
-//!   have no caller left; they go, with the prefix fallback, once `products`
-//!   dispatches on wire paths too. A block whose JSON API is typed uses the
-//!   primitives directly.
+//!   `crud_delete` and `crud_delete_owned` are its callers and the only
+//!   one-liners left. `legalpages` and `messages` read `{id}` as their route
+//!   tables bound it and compose the primitives directly; the one-liners
+//!   they used to call were deleted with their last caller. The two that
+//!   remain go, with the prefix fallback, once `products` dispatches on wire
+//!   paths too. A block whose JSON API is typed uses the primitives directly.
 //!
 // audit-allow-file: pure pass-through helpers — every db::* call here takes
 // the table name as a `collection: &str` parameter from the caller. WRAP
@@ -218,47 +218,6 @@ pub async fn delete_record(
 // Untyped one-liners over the primitives
 // ---------------------------------------------------------------------------
 
-/// Get a single record by ID extracted from the path.
-pub async fn crud_get(
-    ctx: &dyn Context,
-    msg: &Message,
-    collection: &str,
-    path_prefix: &str,
-    not_found_label: &str,
-) -> OutputStream {
-    let id = match path_id(msg, path_prefix, not_found_label) {
-        Ok(id) => id,
-        Err(response) => return response,
-    };
-    match get_record(ctx, collection, id, not_found_label).await {
-        Ok(record) => ok_json(&record),
-        Err(response) => response,
-    }
-}
-
-/// Update a record by ID extracted from the path, with auto-updated_at.
-pub async fn crud_update(
-    ctx: &dyn Context,
-    msg: &Message,
-    input: InputStream,
-    collection: &str,
-    path_prefix: &str,
-    not_found_label: &str,
-) -> OutputStream {
-    let id = match path_id(msg, path_prefix, not_found_label) {
-        Ok(id) => id,
-        Err(response) => return response,
-    };
-    let body: HashMap<String, serde_json::Value> = match read_json_body(input).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    match update_record(ctx, collection, id, body, not_found_label).await {
-        Ok(record) => ok_json(&record),
-        Err(response) => response,
-    }
-}
-
 /// Delete a record by ID extracted from the path.
 pub async fn crud_delete(
     ctx: &dyn Context,
@@ -385,18 +344,6 @@ pub async fn delete_owned(
     )
     .await?;
     delete_record(ctx, res.collection, &id, res.label).await
-}
-
-/// Get a single owner-scoped record by ID extracted from the path.
-pub async fn crud_get_owned(
-    ctx: &dyn Context,
-    msg: &Message,
-    res: &OwnedResource<'_>,
-) -> OutputStream {
-    match get_owned(ctx, msg, res).await {
-        Ok(record) => ok_json(&record),
-        Err(resp) => resp,
-    }
 }
 
 /// Delete an owner-scoped record by ID extracted from the path.
