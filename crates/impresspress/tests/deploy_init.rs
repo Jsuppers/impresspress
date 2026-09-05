@@ -1,6 +1,6 @@
 //! Integration test for `impresspress_core::deploy_init::deploy_init` over a
-//! real, file-backed SQLite `DatabaseService` — mirroring the native boot
-//! path in `crates/impresspress/src/cli/server.rs::run` (steps 5-11), but
+//! real, file-backed SQLite `DatabaseService`, built through the same
+//! `impresspress::cli::server::build_native_runtime` the binary uses, but
 //! calling `deploy_init` instead of `builder::boot` so per-block outcomes
 //! are captured into a report.
 //!
@@ -11,37 +11,39 @@
 //! the block-settings hash-gate makes the second `deploy_init` call an
 //! all-ok no-op.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
-use impresspress_core::{
-    builder::{BootHooks, ImpresspressBuilder},
-    deploy_init::deploy_init,
-};
-use wafer_core::interfaces::{config::service::ConfigService, database::service::DatabaseService};
+use impresspress::cli::server::{build_native_runtime, NativeBootHooks, NativeRuntime};
+use impresspress_core::{builder::BootHooks, deploy_init::deploy_init};
+use impresspress_native::InfraConfig;
+use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::Wafer;
 
-/// Native's `BootHooks`: native seeds the variables / block_settings tables
-/// pre-wafer (see `build_runtime` below), so there is nothing left to seed
-/// once admin's `Init` has run. Mirrors `impresspress::cli::server::NativeBootHooks`,
-/// which is private to that module.
-struct NoopBootHooks;
-
-#[wafer_block::wafer_async_trait]
-impl BootHooks for NoopBootHooks {
-    async fn seed_after_admin_init(&self, _wafer: &mut Wafer) -> Result<(), String> {
-        Ok(())
+/// The infra config `run()` would read from the environment, pointed at
+/// the test's temp paths. `listen` is unused here: `deploy_init` never binds.
+fn infra_for(db_path: &Path, storage_root: &Path) -> InfraConfig {
+    InfraConfig {
+        listen: "127.0.0.1:0".to_string(),
+        db_type: "sqlite".to_string(),
+        db_path: db_path
+            .to_str()
+            .expect("db path is valid utf-8")
+            .to_string(),
+        db_url: None,
+        storage_type: "local".to_string(),
+        storage_root: storage_root
+            .to_str()
+            .expect("storage root is valid utf-8")
+            .to_string(),
     }
 }
 
-/// Build one WAFER runtime over the sqlite file at `db_path`, mirroring
-/// `impresspress::cli::server::run`'s steps 5-11 (database construction, the
-/// pre-wafer admin-table DDL, variable seeding, block-settings hash-gate
-/// load, and `ImpresspressBuilder::build()`), minus the native-only http-listener
-/// bind / observability hooks / shutdown loop that `deploy_init` doesn't need.
-///
-/// Returns the sealed-but-not-yet-inited `Wafer`, its `ImpresspressStorageBlock`,
-/// and the `DatabaseService` handle (so the test can inspect
-/// `block_settings` rows directly afterwards).
+/// Build one WAFER runtime over the sqlite file at `db_path` through the
+/// binary's own `build_native_runtime` (no process-env vars to seed in this
+/// harness; auto-generated secrets, including the JWT secret, are still
+/// seeded). Returns the built-but-not-yet-inited `Wafer`, its
+/// `ImpresspressStorageBlock`, and the `DatabaseService` handle so the test
+/// can inspect `block_settings` rows directly afterwards.
 async fn build_runtime(
     db_path: &Path,
     storage_root: &Path,
@@ -50,73 +52,17 @@ async fn build_runtime(
     Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
     Arc<dyn DatabaseService>,
 ) {
-    let db_path_str = db_path.to_str().expect("db path is valid utf-8");
-
-    let database = impresspress_native::make_database_service("sqlite", db_path_str, None)
+    let infra = infra_for(db_path, storage_root);
+    let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
 
-    // Pre-wafer admin DDL — same migration-file-runner exception `server.rs`
-    // uses, so the variables / block_settings tables exist before
-    // `seed_and_load_variables` and `load_and_seed_block_settings` read them.
-    impresspress_core::migration_helper::apply_ddl_via_service(
-        &database,
-        impresspress_core::blocks::admin::migrations::ddl_files("sqlite"),
-    )
-    .await
-    .expect("apply admin tables pre-wafer");
-
-    // No process-env vars to seed in this harness; auto-generated secrets
-    // (incl. the JWT secret) are still seeded by `seed_and_load_variables`.
-    let vars = impresspress_core::boot::seed_and_load_variables(&database, &[])
+    let NativeRuntime {
+        wafer,
+        storage_block,
+    } = build_native_runtime(&infra, database.clone(), &[], false)
         .await
-        .expect("seed and load variables");
-
-    let jwt_secret = vars
-        .get(impresspress_core::blocks::auth::JWT_SECRET_KEY)
-        .cloned()
-        .expect("JWT secret auto-seeded");
-
-    let features = impresspress_core::features::load_and_seed_block_settings(&database)
-        .await
-        .expect("load block settings");
-
-    let config_service = wafer_core::service_blocks::config::EnvConfigService::new();
-    for (key, value) in &vars {
-        config_service.set(key, value);
-    }
-    config_service.set(
-        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
-        &features.to_config_json(),
-    );
-
-    let mut snapshot: HashMap<String, String> = vars.clone();
-    snapshot.insert(
-        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY.to_string(),
-        features.to_config_json(),
-    );
-
-    let storage_root_str = storage_root.to_str().expect("storage root is valid utf-8");
-    let storage = impresspress_native::make_storage_service("local", storage_root_str)
-        .await
-        .expect("construct local storage service");
-
-    let (mut wafer, storage_block) = ImpresspressBuilder::new()
-        .database(database.clone())
-        .storage(storage)
-        .config(Arc::new(config_service))
-        .config_source(Arc::new(wafer_run::StaticConfigSource::new(vars.clone())))
-        .crypto(
-            impresspress_native::make_jwt_crypto_service(jwt_secret).expect("jwt crypto service"),
-        )
-        .network(impresspress_native::make_fetch_network_service().expect("network service"))
-        .logger(impresspress_native::make_tracing_logger())
-        .block_settings(features)
-        .sqlite_db_path(db_path_str)
-        .build()
         .expect("build impresspress runtime");
-
-    wafer.set_config_snapshot(snapshot);
 
     (wafer, storage_block, database)
 }
@@ -130,7 +76,7 @@ async fn deploy_init_first_run_ok_and_second_run_idempotent() {
 
     // --- First run: fresh DB, everything must init ok. ---
     let (mut wafer, storage_block, db) = build_runtime(&db_path, &storage_root).await;
-    let report = deploy_init(&mut wafer, &storage_block, &NoopBootHooks)
+    let report = deploy_init(&mut wafer, &storage_block, &NativeBootHooks)
         .await
         .expect("seal");
 
@@ -185,7 +131,7 @@ async fn deploy_init_first_run_ok_and_second_run_idempotent() {
 
     // --- Idempotency: second run over the same DB, via a REBUILT runtime, is all-ok. ---
     let (mut wafer2, storage_block2, _db2) = build_runtime(&db_path, &storage_root).await;
-    let report2 = deploy_init(&mut wafer2, &storage_block2, &NoopBootHooks)
+    let report2 = deploy_init(&mut wafer2, &storage_block2, &NativeBootHooks)
         .await
         .expect("seal 2");
 

@@ -5,18 +5,26 @@
 //! admin variables / block_settings tables pre-wafer through the shared
 //! `impresspress_core` seeders, builds the WAFER runtime, registers the HTTP
 //! listener, and runs the `serve_until_shutdown` loop.
+//!
+//! The runtime construction itself lives in [`build_native_runtime`], shared
+//! with the integration tests in `tests/` so the runtime they exercise is the
+//! one the binary builds.
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
-use impresspress_core::builder::{self, ImpresspressBuilder};
+use impresspress_core::{
+    blocks::storage::ImpresspressStorageBlock,
+    builder::{self, ImpresspressBuilder},
+};
 use impresspress_native::{
     collect_app_env_vars, init_tracing, load_dotenv, register_http_listener,
     register_observability_hooks, serve_until_shutdown, InfraConfig,
 };
-use wafer_core::interfaces::config::service::ConfigService;
+use wafer_core::interfaces::{config::service::ConfigService, database::service::DatabaseService};
+use wafer_run::Wafer;
 
-use crate::cli::server_config::{filter_to_declared_keys, load_wrap_grants};
+use crate::cli::server_config::filter_to_declared_keys;
 
 /// Boot the native server end-to-end. The body mirrors the previous
 /// `main()` exactly; the signature is `pub async fn run()` so the new
@@ -59,8 +67,8 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     //    seeded values at `build()` time — exactly like the Cloudflare target
     //    reads its config pre-build. Boot then runs through the shared
     //    `impresspress_core::builder::boot` funnel (below), so the post-admin-init
-    //    seed hook is a no-op. The same `Arc` is handed to the builder below,
-    //    so seeding and the runtime share one connection/pool.
+    //    seed hook is a no-op. The same `Arc` is handed to the builder, so
+    //    seeding and the runtime share one connection/pool.
     let database = impresspress_native::make_database_service(
         &infra.db_type,
         &infra.db_path,
@@ -69,6 +77,75 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     .await
     .context("construct database service")?;
 
+    // 5b-7b. Seed, load, and build the runtime (shared with the tests).
+    let NativeRuntime {
+        mut wafer,
+        storage_block,
+    } = build_native_runtime(&infra, database, &env_vars, run_migrations).await?;
+
+    // 8. Native-only: register http-listener.
+    //    impresspress dispatches all HTTP traffic through the `site-main` flow
+    //    (see crates/impresspress-core/src/flows/site_main.rs).
+    register_http_listener(&mut wafer, &infra.listen, "site-main");
+
+    // 9. Register observability hooks
+    register_observability_hooks(&mut wafer);
+
+    // 11. Boot through the shared funnel, then run the native-only Start
+    //     lifecycle + socket bind. `builder::boot` owns the invariant
+    //     seal → init_block(admin) → seed-hook → init_all_blocks → post_start
+    //     ordering shared with the Cloudflare/browser targets, replacing the
+    //     bespoke `start_with_priority(&[admin])`. Admin-first init guarantees
+    //     admin's migrations (which create impresspress__admin__block_settings +
+    //     the variables table) run before any other block's Init writes to
+    //     block_settings via migration_helper. Without it, HashMap key-
+    //     iteration order could put another block first, hit a hard
+    //     'no such table' error (impresspress #182 made write_state propagate
+    //     strictly), skip auth's bootstrap, and surface as a login 401 on the
+    //     freshly-booted server in CI E2E.
+    //
+    //     `boot` runs `post_start` (WRAP-grant injection into storage) for us.
+    //     Native then runs the Start lifecycle and binds the HTTP socket — the
+    //     steps `boot` deliberately omits because the stateless targets
+    //     dispatch per-request instead of binding (wafer-run #239 exposed them
+    //     as `run_start_lifecycle` + `bind_all`).
+    builder::boot(&mut wafer, &storage_block, &NativeBootHooks)
+        .await
+        .context("boot WAFER runtime")?;
+    wafer.run_start_lifecycle().await;
+    let wafer = wafer.bind_all();
+    tracing::info!("WAFER runtime started — all blocks resolved");
+
+    // 13. Wait for shutdown signal, then graceful shutdown
+    serve_until_shutdown(&wafer)
+        .await
+        .context("await shutdown signal")?;
+    tracing::info!("impresspress shutdown complete");
+
+    Ok(())
+}
+
+/// What [`build_native_runtime`] produces: the runtime, built but not yet
+/// sealed or booted, and the storage block `builder::boot` / `deploy_init`
+/// need to run the lifecycle.
+pub struct NativeRuntime {
+    pub wafer: Wafer,
+    pub storage_block: Arc<ImpresspressStorageBlock>,
+}
+
+/// Build the native runtime over an already-constructed platform database
+/// service: pre-wafer admin DDL, variable seeding, the block-settings
+/// hash-gate load, admin-created WRAP grants, and `ImpresspressBuilder::build()`.
+///
+/// `run()` calls this with the service it built from `infra`; the integration
+/// tests call it with a service they seeded first, so what they exercise is
+/// the runtime the binary builds rather than a copy of these steps.
+pub async fn build_native_runtime(
+    infra: &InfraConfig,
+    database: Arc<dyn DatabaseService>,
+    env_vars: &[(String, String)],
+    run_migrations: bool,
+) -> anyhow::Result<NativeRuntime> {
     // Create the admin variables / block_settings tables pre-wafer by running
     // admin's migration-file SQL through the service (migration-file-runner
     // exception). Reuses the embedded `.sql` constants admin's gated `Init`
@@ -82,7 +159,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 
     // Seed env/auto-gen/JWT variables + run the #222 block-settings hash-gate,
     // all through the shared `impresspress_core` seeders over the service.
-    let vars = impresspress_core::boot::seed_and_load_variables(&database, &env_vars)
+    let vars = impresspress_core::boot::seed_and_load_variables(&database, env_vars)
         .await
         .map_err(|e| anyhow!("seed and load variables: {e}"))?;
     tracing::info!(vars = vars.len(), "variables loaded from database");
@@ -186,6 +263,19 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
             .await
             .context("construct storage service")?;
 
+    // 10. Load admin-created WRAP grants through the platform database
+    //     service — the same reader the Cloudflare target uses — so every
+    //     backend is covered. (Reading `infra.db_path` as a SQLite file
+    //     found nothing on Postgres, where that path is just the unused
+    //     default.) The builder installs them before the runtime is sealed.
+    let db_grants = impresspress_core::boot::load_wrap_grants_from_db(&database).await;
+    if !db_grants.is_empty() {
+        tracing::info!(
+            count = db_grants.len(),
+            "loaded custom WRAP grants from database"
+        );
+    }
+
     let (mut wafer, storage_block) = ImpresspressBuilder::new()
         .database(database)
         .storage(storage)
@@ -198,6 +288,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
         )
         .logger(impresspress_native::make_tracing_logger())
         .block_settings(features)
+        .wrap_grants(db_grants)
         // Hand the SQLite path to the builder so the `native-embedding`
         // feature can open a dedicated connection for `SqliteVecService`.
         // Ignored when the feature is off.
@@ -211,56 +302,10 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     //     data (see snapshot construction above).
     wafer.set_config_snapshot(snapshot);
 
-    // 8. Native-only: register http-listener.
-    //    impresspress dispatches all HTTP traffic through the `site-main` flow
-    //    (see crates/impresspress-core/src/flows/site_main.rs).
-    register_http_listener(&mut wafer, &infra.listen, "site-main");
-
-    // 9. Register observability hooks
-    register_observability_hooks(&mut wafer);
-
-    // 10. Load custom WRAP grants from DB
-    let db_grants = load_wrap_grants(&infra.db_path);
-    if !db_grants.is_empty() {
-        tracing::info!(
-            count = db_grants.len(),
-            "loaded custom WRAP grants from database"
-        );
-        wafer.add_wrap_grants(db_grants);
-    }
-
-    // 11. Boot through the shared funnel, then run the native-only Start
-    //     lifecycle + socket bind. `builder::boot` owns the invariant
-    //     seal → init_block(admin) → seed-hook → init_all_blocks → post_start
-    //     ordering shared with the Cloudflare/browser targets, replacing the
-    //     bespoke `start_with_priority(&[admin])`. Admin-first init guarantees
-    //     admin's migrations (which create impresspress__admin__block_settings +
-    //     the variables table) run before any other block's Init writes to
-    //     block_settings via migration_helper. Without it, HashMap key-
-    //     iteration order could put another block first, hit a hard
-    //     'no such table' error (impresspress #182 made write_state propagate
-    //     strictly), skip auth's bootstrap, and surface as a login 401 on the
-    //     freshly-booted server in CI E2E.
-    //
-    //     `boot` runs `post_start` (WRAP-grant injection into storage) for us.
-    //     Native then runs the Start lifecycle and binds the HTTP socket — the
-    //     steps `boot` deliberately omits because the stateless targets
-    //     dispatch per-request instead of binding (wafer-run #239 exposed them
-    //     as `run_start_lifecycle` + `bind_all`).
-    builder::boot(&mut wafer, &storage_block, &NativeBootHooks)
-        .await
-        .context("boot WAFER runtime")?;
-    wafer.run_start_lifecycle().await;
-    let wafer = wafer.bind_all();
-    tracing::info!("WAFER runtime started — all blocks resolved");
-
-    // 13. Wait for shutdown signal, then graceful shutdown
-    serve_until_shutdown(&wafer)
-        .await
-        .context("await shutdown signal")?;
-    tracing::info!("impresspress shutdown complete");
-
-    Ok(())
+    Ok(NativeRuntime {
+        wafer,
+        storage_block,
+    })
 }
 
 /// Native [`BootHooks`](builder::BootHooks). Native seeds the variables /
@@ -271,11 +316,11 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 /// ordering and `post_start`; native only needs an empty hook to satisfy the
 /// signature, plus the native-only `run_start_lifecycle` + `bind_all` steps
 /// it runs after `boot` returns.
-struct NativeBootHooks;
+pub struct NativeBootHooks;
 
 #[wafer_block::wafer_async_trait]
 impl builder::BootHooks for NativeBootHooks {
-    async fn seed_after_admin_init(&self, _wafer: &mut wafer_run::Wafer) -> Result<(), String> {
+    async fn seed_after_admin_init(&self, _wafer: &mut Wafer) -> Result<(), String> {
         Ok(())
     }
 }

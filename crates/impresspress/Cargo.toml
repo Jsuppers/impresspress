@@ -98,7 +98,6 @@ reqwest = { workspace = true }
 tracing = { workspace = true }
 
 # Config loading
-rusqlite = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
