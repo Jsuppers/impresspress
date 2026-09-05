@@ -11,7 +11,6 @@ use crate::{
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
-        SiteConfig, UserInfo,
     },
 };
 
@@ -23,8 +22,6 @@ fn encode_block_name(name: &str) -> String {
 }
 
 pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
-    let user = UserInfo::from_message(msg);
     let tab = msg.query("tab");
     let active_tab = match tab {
         "services" => "services",
@@ -221,10 +218,9 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     );
 
     admin_page(
+        ctx,
+        msg,
         "Blocks",
-        &config,
-        "/b/admin/blocks",
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Blocks"),
             primary_action: Some(page_action),
@@ -232,8 +228,8 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             show_palette: true,
         },
         body,
-        msg,
     )
+    .await
 }
 
 /// POST /b/admin/blocks/{name}/toggle -- toggle a block's enabled state

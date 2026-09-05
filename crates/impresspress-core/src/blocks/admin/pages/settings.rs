@@ -22,17 +22,12 @@ use super::{admin_page, crumb, email, network, permissions, variables};
 use crate::ui::{
     shell::Topbar,
     templates::{tabbed_page, FormSection, PageHeader},
-    SiteConfig, UserInfo,
 };
 
 /// Render the settings page for the given tab. `tab` is one of
 /// "email" / "network" / "variables" / "permissions"; unknown values
 /// fall back to "email".
 pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
-    let user = UserInfo::from_message(msg);
-    let path = msg.path().to_string();
-
     let active = match tab {
         "email" | "network" | "variables" | "permissions" => tab,
         _ => "email",
@@ -85,10 +80,9 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
     );
 
     admin_page(
+        ctx,
+        msg,
         "Settings",
-        &config,
-        &path,
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Settings"),
             primary_action: None,
@@ -96,8 +90,8 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
             show_palette: true,
         },
         form_body,
-        msg,
     )
+    .await
 }
 
 fn tab_title(active: &str) -> &'static str {
