@@ -243,7 +243,14 @@ pub async fn handle_toggle_feature(
     block_name: &str,
 ) -> OutputStream {
     // Read current state and toggle via shared helper (audit finding #12).
-    let current_enabled = super::super::settings::block_settings::is_enabled(ctx, block_name).await;
+    // An unreadable state is an error, not "enabled": the write below is
+    // derived from it, so a guess here would flip the block off the back of
+    // an outage.
+    let current_enabled =
+        match super::super::settings::block_settings::is_enabled(ctx, block_name).await {
+            Ok(enabled) => enabled,
+            Err(e) => return crate::http::err_internal("Failed to read block setting", e),
+        };
     let new_enabled = !current_enabled;
 
     // Persist first. Only write the audit event — and only re-render the
@@ -282,7 +289,11 @@ pub async fn handle_block_detail(
     let block_opt = blocks.iter().find(|b| b.name == block_name);
 
     // Check block enabled state via shared helper (audit finding #12).
-    let is_enabled = super::super::settings::block_settings::is_enabled(ctx, block_name).await;
+    let is_enabled = match super::super::settings::block_settings::is_enabled(ctx, block_name).await
+    {
+        Ok(enabled) => enabled,
+        Err(e) => return crate::http::err_internal("Failed to read block setting", e),
+    };
 
     let encoded = encode_block_name(block_name);
 
@@ -520,7 +531,7 @@ mod toggle_feature_tests {
     use wafer_core::clients::database as db;
 
     use super::*;
-    use crate::test_support::{admin_msg, TestContext};
+    use crate::test_support::{admin_msg, output_is_error, FailingDbOpContext, TestContext};
 
     async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
         db::list_all(
@@ -544,7 +555,8 @@ mod toggle_feature_tests {
 
         assert!(
             super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
-                .await,
+                .await
+                .expect("read block setting"),
             "no row yet ⇒ defaults enabled"
         );
 
@@ -556,10 +568,42 @@ mod toggle_feature_tests {
 
         assert!(
             !super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
-                .await,
+                .await
+                .expect("read block setting"),
             "toggle must have persisted the disabled state"
         );
         assert_eq!(audit_count(&ctx, "block.disable").await, 1);
+    }
+
+    /// The state written by a toggle is derived from the state read. When
+    /// that read fails, the handler must refuse rather than assume "enabled"
+    /// and write "disabled": no row changes, no audit event claims it did.
+    #[tokio::test]
+    async fn toggle_refuses_when_current_state_cannot_be_read() {
+        let ctx = TestContext::with_admin().await;
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![(
+                "database.list",
+                super::super::super::settings::BLOCK_SETTINGS_TABLE,
+            )],
+        );
+        let msg = admin_msg("create", "/admin/blocks/impresspress--files/toggle");
+
+        let out = handle_toggle_feature(&failing, &msg, "impresspress/files").await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "an unreadable block state must surface as an error"
+        );
+        assert!(
+            super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
+                .await
+                .expect("read block setting"),
+            "nothing may be written when the current state could not be read"
+        );
+        assert_eq!(audit_count(&ctx, "block.disable").await, 0);
+        assert_eq!(audit_count(&ctx, "block.enable").await, 0);
     }
 
     /// The core regression: a genuine persistence failure during the toggle

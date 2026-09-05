@@ -20,16 +20,19 @@ use crate::{
 pub mod block_settings {
     use wafer_block::db::{Filter, FilterOp, ListOptions};
     use wafer_core::clients::database as db;
-    use wafer_run::context::Context;
+    use wafer_run::{context::Context, WaferError};
 
     use super::BLOCK_SETTINGS_TABLE as TABLE;
 
     /// Return whether `block_name` is enabled.
     ///
     /// Reads the `enabled` column from [`BLOCK_SETTINGS_TABLE`]. Defaults to
-    /// `true` when no row exists (all blocks are enabled by default).
-    pub async fn is_enabled(ctx: &dyn Context, block_name: &str) -> bool {
-        db::list(
+    /// `true` when no row exists (all blocks are enabled by default). A
+    /// read failure is returned, never mapped to "enabled": the toggle
+    /// handler derives the state it writes from this answer, so guessing
+    /// here would flip a block on the strength of an outage.
+    pub async fn is_enabled(ctx: &dyn Context, block_name: &str) -> Result<bool, WaferError> {
+        let rows = db::list(
             ctx,
             TABLE,
             &ListOptions {
@@ -43,15 +46,13 @@ pub mod block_settings {
                 ..Default::default()
             },
         )
-        .await
-        .ok()
-        .and_then(|rows| {
-            rows.records
-                .first()
-                .and_then(|r| r.data.get("enabled").and_then(|v| v.as_i64()))
-        })
-        .map(|v| v != 0)
-        .unwrap_or(true)
+        .await?;
+        Ok(rows
+            .records
+            .first()
+            .and_then(|r| r.data.get("enabled").and_then(|v| v.as_i64()))
+            .map(|v| v != 0)
+            .unwrap_or(true))
     }
 
     /// Persist the `enabled` flag for `block_name` in [`BLOCK_SETTINGS_TABLE`].
@@ -545,7 +546,7 @@ mod tests {
     use wafer_block::db::{Filter, FilterOp};
 
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::test_support::{FailingDbOpContext, TestContext};
 
     /// Seed one `variables` row with an explicit `sensitive` flag.
     async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
@@ -786,10 +787,30 @@ mod tests {
             .await
             .expect("apply admin migrations");
 
-        let enabled = block_settings::is_enabled(&ctx, "impresspress/nonexistent").await;
+        let enabled = block_settings::is_enabled(&ctx, "impresspress/nonexistent")
+            .await
+            .expect("no row is not an error");
         assert!(
             enabled,
             "is_enabled should return true when no block_settings row exists"
+        );
+    }
+
+    /// A read failure is not "enabled": the toggle handler writes the
+    /// opposite of whatever this returns, so an outage must be an error.
+    #[tokio::test]
+    async fn block_settings_is_enabled_surfaces_read_errors() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        let failing = FailingDbOpContext::new(ctx, vec![("database.list", BLOCK_SETTINGS_TABLE)]);
+
+        assert!(
+            block_settings::is_enabled(&failing, "impresspress/files")
+                .await
+                .is_err(),
+            "an unreadable block_settings table must not read as enabled"
         );
     }
 
@@ -843,7 +864,9 @@ mod tests {
             .await
             .expect("set_enabled false");
         assert!(
-            !block_settings::is_enabled(&ctx, name).await,
+            !block_settings::is_enabled(&ctx, name)
+                .await
+                .expect("read block setting"),
             "is_enabled should return false after set_enabled(false)"
         );
 
@@ -852,7 +875,9 @@ mod tests {
             .await
             .expect("set_enabled true");
         assert!(
-            block_settings::is_enabled(&ctx, name).await,
+            block_settings::is_enabled(&ctx, name)
+                .await
+                .expect("read block setting"),
             "is_enabled should return true after set_enabled(true)"
         );
     }
