@@ -19,9 +19,6 @@ pub(crate) use logs::{AUDIT_LOGS_TABLE, REQUEST_LOGS_TABLE, STORAGE_ACCESS_LOGS_
 /// have run before the runner seeds `auto_generate` secrets).
 pub const ADMIN_BLOCK_ID: &str = "impresspress/admin";
 
-/// WRAP grant rows (block-to-resource access tokens).
-pub const WRAP_GRANTS_TABLE: &str = "impresspress__admin__wrap_grants";
-
 use wafer_run::{
     context::Context, BlockInfo, ErrorCode, HttpMethod, InputStream, InstanceMode, Message,
     OutputStream,
@@ -30,7 +27,7 @@ use wafer_run::{
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    platform_state::{block_settings, variables},
+    platform_state::{block_settings, variables, wrap_grants},
 };
 
 /// Path-parameter schema for the `/iam/roles/{id}` routes.
@@ -518,7 +515,7 @@ crate::impresspress_feature_block! {
                 CollectionSchema::new(REQUEST_LOGS_TABLE),
                 CollectionSchema::new(STORAGE_ACCESS_LOGS_TABLE),
                 CollectionSchema::new(block_settings::TABLE),
-                CollectionSchema::new(WRAP_GRANTS_TABLE),
+                CollectionSchema::new(wrap_grants::TABLE),
             ])
             .grants(vec![
                 wafer_run::ResourceGrant::read_write(super::auth::AUTH_BLOCK_ID, USER_ROLES_TABLE),
@@ -709,8 +706,6 @@ fn redirect_308(target: &str) -> OutputStream {
 // WRAP grant handlers
 // ---------------------------------------------------------------------------
 
-use wafer_core::clients::database as db;
-
 use crate::util::parse_form_body;
 
 async fn handle_create_wrap_grant(
@@ -733,18 +728,22 @@ async fn handle_create_wrap_grant(
         return err_bad_request("Grantee and resource are required");
     }
 
-    let mut data = std::collections::HashMap::new();
-    data.insert("grantee".into(), serde_json::json!(grantee));
-    data.insert("resource".into(), serde_json::json!(resource));
-    data.insert("write".into(), serde_json::json!(if write { 1 } else { 0 }));
-    data.insert("resource_type".into(), serde_json::json!(resource_type));
-    data.insert("description".into(), serde_json::json!(description));
-
     // Persist first; only render the (now-updated) page and write the audit
     // event after a confirmed successful write. Previously `let _ =
     // db::create(..)` discarded the result, so a failed insert still
     // re-rendered the permissions page as if the grant had been added.
-    let record = match db::create(ctx, WRAP_GRANTS_TABLE, data).await {
+    let record = match wrap_grants::create(
+        ctx,
+        wrap_grants::NewWrapGrant {
+            grantee,
+            resource,
+            write,
+            resource_type,
+            description,
+        },
+    )
+    .await
+    {
         Ok(record) => record,
         Err(e) => return err_internal("Database error", e),
     };
@@ -775,7 +774,7 @@ async fn handle_delete_wrap_grant(ctx: &dyn Context, mut msg: Message) -> Output
     // confirmed successful delete. Previously `let _ = db::delete(..)`
     // discarded the result, so deleting an already-gone (or unwritable)
     // grant still re-rendered the page as a success.
-    match db::delete(ctx, WRAP_GRANTS_TABLE, grant_id).await {
+    match wrap_grants::delete(ctx, grant_id).await {
         Ok(()) => {}
         Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Grant not found"),
         Err(e) => return err_internal("Database error", e),
@@ -921,14 +920,9 @@ mod wrap_grant_mutation_tests {
             .await
             .expect("a valid grant create must succeed, not error");
 
-        let rows = db::list_all(&ctx, WRAP_GRANTS_TABLE, vec![])
-            .await
-            .expect("list wrap grants");
+        let rows = wrap_grants::list(&ctx).await.expect("list wrap grants");
         assert_eq!(rows.len(), 1, "the grant must have been persisted");
-        assert_eq!(
-            rows[0].data.get("grantee").and_then(|v| v.as_str()),
-            Some("impresspress/files")
-        );
+        assert_eq!(rows[0].grantee, "impresspress/files");
         assert_eq!(audit_count(&ctx, "wrap_grant.create").await, 1);
     }
 
@@ -948,9 +942,7 @@ mod wrap_grant_mutation_tests {
             "empty grantee/resource must be rejected as a bad request"
         );
 
-        let rows = db::list_all(&ctx, WRAP_GRANTS_TABLE, vec![])
-            .await
-            .expect("list wrap grants");
+        let rows = wrap_grants::list(&ctx).await.expect("list wrap grants");
         assert!(rows.is_empty(), "no grant row must be persisted");
         assert_eq!(audit_count(&ctx, "wrap_grant.create").await, 0);
     }
@@ -977,15 +969,18 @@ mod wrap_grant_mutation_tests {
     async fn delete_wrap_grant_success_removes_row_and_audits() {
         let ctx = TestContext::with_admin().await;
 
-        let mut data = std::collections::HashMap::new();
-        data.insert("grantee".into(), serde_json::json!("impresspress/files"));
-        data.insert("resource".into(), serde_json::json!("some_table"));
-        data.insert("write".into(), serde_json::json!(0));
-        data.insert("resource_type".into(), serde_json::json!(""));
-        data.insert("description".into(), serde_json::json!(""));
-        let record = db::create(&ctx, WRAP_GRANTS_TABLE, data)
-            .await
-            .expect("seed grant row");
+        let record = wrap_grants::create(
+            &ctx,
+            wrap_grants::NewWrapGrant {
+                grantee: "impresspress/files".to_string(),
+                resource: "some_table".to_string(),
+                write: false,
+                resource_type: String::new(),
+                description: String::new(),
+            },
+        )
+        .await
+        .expect("seed grant row");
 
         let msg = routed(admin_msg(
             "delete",
@@ -997,9 +992,7 @@ mod wrap_grant_mutation_tests {
             .await
             .expect("delete of an existing grant must succeed");
 
-        let rows = db::list_all(&ctx, WRAP_GRANTS_TABLE, vec![])
-            .await
-            .expect("list wrap grants");
+        let rows = wrap_grants::list(&ctx).await.expect("list wrap grants");
         assert!(rows.is_empty(), "the grant row must have been removed");
         assert_eq!(audit_count(&ctx, "wrap_grant.delete").await, 1);
     }
@@ -1695,17 +1688,18 @@ mod page_link_tests {
         )
         .await
         .expect("seed variable");
-        let mut grant = crate::util::json_map(serde_json::json!({
-            "grantee": "impresspress/probe",
-            "resource": "impresspress__probe__things",
-            "write": 0,
-            "resource_type": "",
-            "description": "",
-        }));
-        crate::util::stamp_created(&mut grant);
-        let grant = db::create(&ctx, WRAP_GRANTS_TABLE, grant)
-            .await
-            .expect("seed grant");
+        let grant = wrap_grants::create(
+            &ctx,
+            wrap_grants::NewWrapGrant {
+                grantee: "impresspress/probe".to_string(),
+                resource: "impresspress__probe__things".to_string(),
+                write: false,
+                resource_type: String::new(),
+                description: String::new(),
+            },
+        )
+        .await
+        .expect("seed grant");
         let mut request = crate::util::json_map(serde_json::json!({
             "flow_id": "f-1",
             "method": "GET",

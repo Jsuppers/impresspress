@@ -6,10 +6,7 @@
 //! logic lives here so it's host-testable; `impresspress-cloudflare` is
 //! excluded from `cargo test --workspace`.
 
-use crate::{
-    blocks::admin::WRAP_GRANTS_TABLE,
-    platform_state::{block_settings, variables},
-};
+use crate::platform_state::{block_settings, variables, wrap_grants};
 
 /// Tables that this wrapper caches in KV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +38,7 @@ pub const CONFIG_VERSION_KEY: &str = "cfg:v1:config_version";
 /// grants at build). Tables read fresh per request (roles, permissions,
 /// user_roles) do NOT bump.
 pub fn bumps_config_version(table: &str) -> bool {
-    table == variables::TABLE || table == block_settings::TABLE || table == WRAP_GRANTS_TABLE
+    table == variables::TABLE || table == block_settings::TABLE || table == wrap_grants::TABLE
 }
 
 use wafer_block::db::{Filter, FilterOp, ListOptions};

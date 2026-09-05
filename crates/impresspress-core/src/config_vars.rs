@@ -320,7 +320,7 @@ pub fn screaming_block(name: &str) -> String {
 /// exactly as the backfill would.
 ///
 /// This MUST stay byte-for-byte equivalent to migration 002's `CASE` so a
-/// row seeded by [`crate::boot`] and a row backfilled by the migration land on
+/// row seeded by [`crate::platform_state::variables`] and a row backfilled by the migration land on
 /// the same `block` value (and therefore the same `D1ConfigSource` per-block
 /// cache key).
 pub fn key_block_prefix(key: &str) -> String {

@@ -966,7 +966,8 @@ where
         let plan_draft = if prepare_plan && report.ok {
             let final_settings =
                 impresspress_core::platform_state::block_settings::load(&built.db).await?;
-            let final_grants = impresspress_core::boot::load_wrap_grants_from_db(&built.db).await;
+            let final_grants =
+                impresspress_core::platform_state::wrap_grants::load(&built.db).await;
             built.plan_exporter.publish_block_settings(final_settings)?;
             built.plan_exporter.publish_wrap_grants(&final_grants)?;
             let identity = prepared_runtime_identity(&env)?;
@@ -1081,7 +1082,7 @@ struct BuiltRuntime {
 /// ignored. Shared by the request-path per-isolate cache
 /// (`runtime_cache::get_or_build`) and the `/_deploy/init` boot funnel.
 pub(crate) async fn apply_db_wrap_grants(built: &mut BuiltRuntime) {
-    let db_grants = impresspress_core::boot::load_wrap_grants_from_db(&built.db).await;
+    let db_grants = impresspress_core::platform_state::wrap_grants::load(&built.db).await;
     if !db_grants.is_empty() {
         built.wafer.add_wrap_grants(db_grants);
     }

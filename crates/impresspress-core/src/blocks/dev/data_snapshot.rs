@@ -58,7 +58,7 @@ use crate::{
     blocks::{
         admin::{
             AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE,
-            USER_ROLES_TABLE, WRAP_GRANTS_TABLE,
+            USER_ROLES_TABLE,
         },
         auth::repo::{
             api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, oauth_pkce, orgs, pats,
@@ -74,7 +74,7 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
-    platform_state::{block_settings, variables},
+    platform_state::{block_settings, variables, wrap_grants},
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -214,7 +214,7 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     admin_schema::REQUEST_LOGS_TABLE,
     AUDIT_LOGS_TABLE,
     STORAGE_ACCESS_LOGS_TABLE,
-    WRAP_GRANTS_TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot
+    wrap_grants::TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot
     // --- auth: session/credential plumbing scoped to this running
     // instance (bearer material this instance issued, not the owner's own
     // login — see `local_credentials` above), plus multi-tenant org
