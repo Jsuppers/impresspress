@@ -19,9 +19,10 @@ Success is measured three ways, in this order:
 1. Two per-block snapshots under `crates/impresspress-core/tests/snapshots/`
    are byte-identical before and after each PR: the existing OpenAPI
    snapshot (the schema contract) and a new endpoint-surface snapshot (the
-   auth contract, see Testing). The only allowed diff is a PR that
+   auth contract, see Testing). The only allowed diffs are a PR that
    deliberately adds a declaration for a path the block already served, and
-   that diff is reviewed line by line.
+   PR 1's replacement of `system`'s per-asset lines by one `{filename}` row;
+   each such diff is reviewed line by line.
 2. `grep` finds no `starts_with("/b`, `strip_prefix("/b`, hand-written
    `match (action, path)` arms, or `path_param(` calls in
    `crates/impresspress-core/src/blocks/`. Only the shared matcher reads a
@@ -134,21 +135,29 @@ hand.
 exists for the products block's rewritten sub-path; once products dispatches
 on wire paths (PR 6) it has no caller and PR 7 deletes it.
 
-### 2. Core: the matcher accepts an in-segment parameter
+### 2. Core: no new template syntax; system declares one asset row
 
-`match_template` learns one more shape. A template segment may contain a
-single `{name}` with literal text on either side, such as
-`app-{hash}.css`. It matches a path segment that starts with the literal
-prefix, ends with the literal suffix, and has at least one byte between them;
-the bytes between are bound to `name`. A segment is still all-literal, one
-whole-segment `{name}`, one trailing `{name...}`, or one in-segment `{name}`.
-Two parameters in one segment, or `{name...}` with surrounding text, is a
-template error and does not match anything.
+The one block whose declarations were unmatchable is `system`, which declares
+each embedded asset as `/b/static/app-{hash}.css` with the parameter inside a
+segment. Rather than teach the matcher in-segment parameters, `system`
+declares one row, `GET /b/static/{filename}`, and the handler looks the bound
+filename up in the build-time asset manifest by exact match, which is what it
+does today. Two reasons:
 
-This is what lets `system` declare `/b/static/app-{hash}.css` and have a
-real request match it. `endpoint_auth` then resolves the asset to the
-declared `Public`, which is what lets PR 7 delete the router carve-out for
-`STATIC_PREFIX`.
+- Asset filenames are content-hashed, so the exact-filename lookup already is
+  the hash check: a stale URL is a 404 and never receives new bytes under an
+  `immutable` cache header.
+- Per-asset rows would make `itim-latin-{hash}.woff2` also match
+  `itim-latin-ext-abc.woff2` (literal prefix, literal suffix, everything
+  between bound), and `impresspress-logo-{hash}.png` also match the `-2x-`
+  logo. The right answer would depend on table order, which is the hazard the
+  exact lookup was introduced to remove.
+
+The system surface snapshot therefore changes in PR 1 from the per-asset lines
+to two lines, `GET /health public` and `GET /b/static/{filename} public`. The
+router's access decision for an asset request is unchanged: `endpoint_auth`
+resolves the bound filename to the declared `Public`, which is what lets PR 7
+delete the `STATIC_PREFIX` carve-out.
 
 `normalize_template` is deleted. The one colon-style template
 (`userportal`'s `:hash`) is rewritten to `{hash}` in the PR that migrates
@@ -176,6 +185,11 @@ never a stripped or re-rooted form. Path variables are read only through
 `msg.var("id")` after `dispatch` bound them. Every `path_param(msg, "id",
 "/b/x/")` call and every `strip_prefix` on a path is deleted with the arm it
 served.
+
+One path read stays outside the matcher: `llm`'s
+`/b/llm/api/internal/default-target`, answered only when `ctx.caller_id()` is
+set, is an inter-block call and not an HTTP endpoint. Declaring it would
+publish it. It keeps its handler-owned guard, with a comment saying why.
 
 Three blocks need a specific decision.
 
@@ -277,10 +291,9 @@ Test-first, per PR:
   today.
 - **Core.** `endpoint_match` tests cover: `declare` maps every field
   (including a schema producer being called and `agent_tool` being set);
-  in-segment `{hash}` matches `app-abc.css` and binds `abc`, rejects
-  `app-.css`, rejects a segment with the wrong suffix, and rejects a
-  template with two parameters in one segment; the three constructors set
-  the auth they name; `normalize_template` no longer exists.
+  `schema_of::<T>` produces the same value as `BlockEndpoint::input::<T>`;
+  the three constructors set the auth they name and `new` sets `Admin`;
+  `normalize_template` no longer exists.
 - **Router.** The existing routing tests that assert a carve-out
   (`static_prefix_route_is_router_declared_public`,
   `stripe_webhook_carveout_stays_reachable_with_no_session`,
@@ -310,12 +323,13 @@ Seven PRs against `main`, each independently green and mergeable:
 
 1. **Core + llm + system.** Add the endpoint-surface snapshot test and
    commit the baseline for every block before any other change. Extend
-   `EndpointRoute`, add `declare` and `schema_of`, add in-segment
-   parameters. Migrate `llm` (already has a table; it gains metadata and
-   drops its `info()` list) and `system` (the first block whose declaration
-   becomes matchable). Both snapshots byte-identical for every block. The
-   static carve-out is not removed yet, because the router still has the
-   `router_final` branch; PR 7 removes it.
+   `EndpointRoute`, add `declare` and `schema_of`. Migrate `llm` (already has
+   a table; it gains metadata and drops its `info()` list) and `system` (one
+   `{filename}` row replaces the per-asset declarations, see section 2).
+   Both snapshots byte-identical for every block except `system`'s surface
+   snapshot, which changes as section 2 describes. The static carve-out is
+   not removed yet, because the router still has the `router_final` branch;
+   PR 7 removes it.
 2. **messages, vector, legalpages, tickets, dev.** Blocks whose tables
    already exist or whose dispatch is a flat match. Snapshots byte-identical.
 3. **userportal + auth-ui.** Colon template rewritten, `normalize_template`
@@ -329,7 +343,8 @@ Seven PRs against `main`, each independently green and mergeable:
 6. **products.** Two-hop dispatch merged, handler gates moved to enum data,
    webhook carve-out no longer needed.
 7. **Router cleanup.** Delete `router_declared_public`, `router_final`,
-   `PreparedRoute.router_final`, `EndpointRoute::new`, `dispatch_path`;
+   `PreparedRoute.router_final`, `EndpointRoute::new`, `dispatch_path`,
+   `util::path_param`;
    bump the plan schema version; drop any prefix entry the blocks' rows
    fully express; decide whether the prefix table is derived or kept.
 
