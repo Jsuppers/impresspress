@@ -19,11 +19,7 @@ use crate::{
         LlmBlock,
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    util::path_param,
 };
-
-/// Path prefix preceding the provider id in the JSON API routes.
-const PROVIDERS_PREFIX: &str = "/b/llm/api/providers/";
 
 /// Reload all enabled providers from the DB and push the snapshot into the
 /// in-memory provider router via [`ProviderAdmin::configure`].
@@ -178,7 +174,7 @@ pub(in crate::blocks::llm) async fn update_provider(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = path_param(msg, "id", PROVIDERS_PREFIX).to_string();
+    let id = msg.var("id").to_string();
     if id.is_empty() {
         return err_bad_request("Missing provider ID");
     }
@@ -250,7 +246,7 @@ pub(in crate::blocks::llm) async fn delete_provider(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
-    let id = path_param(msg, "id", PROVIDERS_PREFIX).to_string();
+    let id = msg.var("id").to_string();
     if id.is_empty() {
         return err_bad_request("Missing provider ID");
     }
@@ -277,7 +273,7 @@ pub(in crate::blocks::llm) async fn discover_models(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
-    let id = path_param(msg, "id", PROVIDERS_PREFIX).to_string();
+    let id = msg.var("id").to_string();
     if id.is_empty() {
         return err_bad_request("Missing provider ID");
     }
@@ -333,7 +329,9 @@ mod tests {
     use crate::{
         blocks::llm::{
             providers::config::ProviderProtocol,
-            routes::test_support::{admin_msg, stub_block, PanicCtx, RecordingProviderAdmin},
+            routes::test_support::{
+                admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
+            },
         },
         test_support::{output_json, TestContext},
     };
@@ -410,7 +408,7 @@ mod tests {
     async fn update_provider_rejects_an_empty_protocol() {
         let block = stub_block();
         let ctx = PanicCtx;
-        let msg = admin_msg("update", "/b/llm/api/providers/row-1");
+        let msg = routed(admin_msg("update", "/b/llm/api/providers/row-1"));
         let input = InputStream::from_bytes(br#"{"protocol":""}"#.to_vec());
 
         let out = update_provider(&block, &ctx, &msg, input).await;
@@ -493,7 +491,7 @@ mod tests {
     async fn update_provider_refuses_an_inline_api_key() {
         let block = stub_block();
         let ctx = PanicCtx;
-        let msg = admin_msg("update", "/b/llm/api/providers/row-1");
+        let msg = routed(admin_msg("update", "/b/llm/api/providers/row-1"));
         let input = InputStream::from_bytes(br#"{"api_key":"sk-inline"}"#.to_vec());
 
         let out = update_provider(&block, &ctx, &msg, input).await;
@@ -543,37 +541,23 @@ mod tests {
         }
     }
 
+    /// Provider handlers read the id the table bound, nothing else.
     #[test]
-    fn extract_provider_id_from_path() {
-        // Direct id at end of path
-        let mut m = Message::new("update:/b/llm/api/providers/abc123");
-        m.set_meta(wafer_run::META_REQ_RESOURCE, "/b/llm/api/providers/abc123");
-        assert_eq!(path_param(&m, "id", PROVIDERS_PREFIX), "abc123");
+    fn provider_id_is_bound_by_the_table() {
+        let m = routed(admin_msg("update", "/b/llm/api/providers/abc123"));
+        assert_eq!(m.var("id"), "abc123");
 
-        // Id followed by a sub-resource (discover-models)
-        let mut m2 = Message::new("create:/b/llm/api/providers/abc123/discover-models");
-        m2.set_meta(
-            wafer_run::META_REQ_RESOURCE,
+        let m2 = routed(admin_msg(
+            "create",
             "/b/llm/api/providers/abc123/discover-models",
-        );
-        assert_eq!(path_param(&m2, "id", PROVIDERS_PREFIX), "abc123");
+        ));
+        assert_eq!(m2.var("id"), "abc123");
 
-        // Empty when no id provided
-        let mut m3 = Message::new("delete:/b/llm/api/providers/");
-        m3.set_meta(wafer_run::META_REQ_RESOURCE, "/b/llm/api/providers/");
-        assert_eq!(path_param(&m3, "id", PROVIDERS_PREFIX), "");
-
-        // `msg.var("id")` takes precedence
-        let mut m4 = Message::new("update:/b/llm/api/providers/from-path");
-        m4.set_meta(
-            wafer_run::META_REQ_RESOURCE,
-            "/b/llm/api/providers/from-path",
-        );
-        m4.set_meta(
-            format!("{}id", wafer_run::META_REQ_PARAM_PREFIX),
-            "from-var",
-        );
-        assert_eq!(path_param(&m4, "id", PROVIDERS_PREFIX), "from-var");
+        // A path with no id segment matches no row and binds nothing; the
+        // handler then answers InvalidArgument (see `update_provider_requires_id`).
+        let mut m3 = admin_msg("delete", "/b/llm/api/providers/");
+        assert!(crate::endpoint_match::dispatch(&mut m3, crate::blocks::llm::ROUTES).is_none());
+        assert_eq!(m3.var("id"), "");
     }
 
     // -----------------------------------------------------------------
@@ -668,7 +652,7 @@ mod tests {
             update_provider(
                 &block,
                 &ctx,
-                &admin_msg("update", &format!("/b/llm/api/providers/{id}")),
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
                 json_input(serde_json::json!({ "models": ["gpt-4o-mini"] })),
             )
             .await,
@@ -678,10 +662,10 @@ mod tests {
             discover_models(
                 &block,
                 &ctx,
-                &admin_msg(
+                &routed(admin_msg(
                     "create",
                     &format!("/b/llm/api/providers/{id}/discover-models"),
-                ),
+                )),
             )
             .await,
         )
@@ -746,7 +730,7 @@ mod tests {
             update_provider(
                 &block,
                 &ctx,
-                &admin_msg("update", &format!("/b/llm/api/providers/{id}")),
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
                 json_input(serde_json::json!({
                     "models": ["gpt-4o-mini"],
                     "enabled": false,
@@ -768,10 +752,10 @@ mod tests {
             discover_models(
                 &block,
                 &ctx,
-                &admin_msg(
+                &routed(admin_msg(
                     "create",
                     &format!("/b/llm/api/providers/{id}/discover-models"),
-                ),
+                )),
             )
             .await,
         )
@@ -785,7 +769,7 @@ mod tests {
             delete_provider(
                 &block,
                 &ctx,
-                &admin_msg("delete", &format!("/b/llm/api/providers/{id}")),
+                &routed(admin_msg("delete", &format!("/b/llm/api/providers/{id}"))),
             )
             .await,
         )

@@ -22,25 +22,14 @@ use crate::{
     http::{err_bad_request, err_internal, ok_json},
 };
 
-/// Extract `(backend_id, model_id)` from
-/// `/b/llm/api/models/{backend_id}/{model_id}[/suffix]`.
-///
-/// Prefers the router-supplied path variables when available, falling back
-/// to splitting `msg.path()` on `/`. Both ids may contain
-/// backend-specific characters (`-`, `_`, `.`, but not `/`), so a single
-/// split-on-`/` round yields the right segments.
+/// `(backend_id, model_id)` as bound by the block's route table for
+/// `/b/llm/api/models/{backend_id}/{model_id}/...`. Either is empty when the
+/// request matched no row.
 fn extract_model_path(msg: &Message) -> (String, String) {
-    let backend_var = msg.var("backend_id");
-    let model_var = msg.var("model_id");
-    if !backend_var.is_empty() && !model_var.is_empty() {
-        return (backend_var.to_string(), model_var.to_string());
-    }
-    let path = msg.path();
-    let suffix = path.strip_prefix("/b/llm/api/models/").unwrap_or("");
-    let mut parts = suffix.splitn(3, '/');
-    let backend = parts.next().unwrap_or("").to_string();
-    let model = parts.next().unwrap_or("").to_string();
-    (backend, model)
+    (
+        msg.var("backend_id").to_string(),
+        msg.var("model_id").to_string(),
+    )
 }
 
 /// `GET /b/llm/api/models` — aggregated list across all registered LLM
@@ -135,7 +124,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::llm::routes::test_support::{
-            admin_msg, stub_block, user_msg, PanicCtx, StubLlmServiceBlock,
+            admin_msg, routed, stub_block, user_msg, PanicCtx, StubLlmServiceBlock,
         },
         test_support::{output_json, TestContext},
     };
@@ -228,7 +217,10 @@ mod tests {
                 model_status(
                     &stub_block(),
                     &ctx,
-                    &user_msg("retrieve", "/b/llm/api/models/openai-main/gpt-4o/status"),
+                    &routed(user_msg(
+                        "retrieve",
+                        "/b/llm/api/models/openai-main/gpt-4o/status",
+                    )),
                 )
                 .await,
             )
@@ -246,7 +238,10 @@ mod tests {
             unload_model(
                 &stub_block(),
                 &ctx,
-                &admin_msg("create", "/b/llm/api/models/openai-main/gpt-4o/unload"),
+                &routed(admin_msg(
+                    "create",
+                    "/b/llm/api/models/openai-main/gpt-4o/unload",
+                )),
             )
             .await,
         )
@@ -306,54 +301,32 @@ mod tests {
         }
     }
 
+    /// Model handlers read the ids the table bound, nothing else.
     #[test]
-    fn extract_model_path_from_suffix() {
-        // Straight {backend_id}/{model_id}/status
-        let mut m = Message::new("retrieve:/b/llm/api/models/openai/gpt-4o/status");
-        m.set_meta(
-            wafer_run::META_REQ_RESOURCE,
+    fn model_path_is_bound_by_the_table() {
+        let m = routed(user_msg(
+            "retrieve",
             "/b/llm/api/models/openai/gpt-4o/status",
-        );
+        ));
         assert_eq!(
             extract_model_path(&m),
             ("openai".to_string(), "gpt-4o".to_string())
         );
 
-        // Load sub-resource with a model id containing dots/dashes
-        let mut m2 = Message::new("create:/b/llm/api/models/webllm/llama-3.1-8b/load");
-        m2.set_meta(
-            wafer_run::META_REQ_RESOURCE,
+        // A model id with dots and dashes is one segment.
+        let m2 = routed(admin_msg(
+            "create",
             "/b/llm/api/models/webllm/llama-3.1-8b/load",
-        );
+        ));
         assert_eq!(
             extract_model_path(&m2),
             ("webllm".to_string(), "llama-3.1-8b".to_string())
         );
 
-        // Missing model_id
-        let mut m3 = Message::new("create:/b/llm/api/models/openai/");
-        m3.set_meta(wafer_run::META_REQ_RESOURCE, "/b/llm/api/models/openai/");
-        let (b, m_id) = extract_model_path(&m3);
-        assert_eq!(b, "openai");
-        assert_eq!(m_id, "");
-
-        // Router-provided path variables take precedence over the path string.
-        let mut m4 = Message::new("create:/b/llm/api/models/from-path/ignored/load");
-        m4.set_meta(
-            wafer_run::META_REQ_RESOURCE,
-            "/b/llm/api/models/from-path/ignored/load",
-        );
-        m4.set_meta(
-            format!("{}backend_id", wafer_run::META_REQ_PARAM_PREFIX),
-            "from-var",
-        );
-        m4.set_meta(
-            format!("{}model_id", wafer_run::META_REQ_PARAM_PREFIX),
-            "var-model",
-        );
-        assert_eq!(
-            extract_model_path(&m4),
-            ("from-var".to_string(), "var-model".to_string())
-        );
+        // Missing model id: no row matches, nothing is bound, the handler
+        // answers InvalidArgument (see `unload_model_requires_path_vars`).
+        let mut m3 = admin_msg("create", "/b/llm/api/models/openai/");
+        assert!(crate::endpoint_match::dispatch(&mut m3, crate::blocks::llm::ROUTES).is_none());
+        assert_eq!(extract_model_path(&m3), (String::new(), String::new()));
     }
 }

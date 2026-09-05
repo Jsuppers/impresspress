@@ -21,18 +21,11 @@ use crate::{
 // Unified chat page (handles `/b/llm/` and `/b/llm/threads/{id}`)
 // ---------------------------------------------------------------------------
 
-/// Parse the optional thread id from a `/b/llm/{...}` URL.
-///
-/// Returns `Some(id)` for `/b/llm/threads/{id}` (and ignores any trailing
-/// path segments), `None` for `/b/llm/` and `/b/llm`.
-fn parse_thread_id(path: &str) -> Option<&str> {
-    let after = path.strip_prefix("/b/llm/threads/")?;
-    let id = after.split('/').next().unwrap_or("");
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+/// The thread the page shows: the `{id}` the route table bound for
+/// `/b/llm/threads/{id}`, or `None` on the root chat page, whose row binds
+/// nothing.
+fn selected_thread(msg: &Message) -> Option<&str> {
+    Some(msg.var("id")).filter(|id| !id.is_empty())
 }
 
 /// Pure render helper for the unified chat page body.
@@ -108,8 +101,7 @@ fn render_page_body(
 /// composer / right rail). The optional thread id from the URL drives
 /// composer enablement and message preloading.
 pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let path = msg.path().to_string();
-    let thread_id = parse_thread_id(&path);
+    let thread_id = selected_thread(msg);
 
     // Load thread list (sidebar) — most-recently-updated first, capped at 50.
     let opts = ListOptions {
@@ -795,28 +787,32 @@ mod tests {
 
     // ----- Task 3: parse_thread_id + render_page_body -----
 
-    #[test]
-    fn parse_thread_id_root_returns_none() {
-        assert_eq!(parse_thread_id("/b/llm/"), None);
-        assert_eq!(parse_thread_id("/b/llm"), None);
+    /// The page reads the thread id the route table bound for
+    /// `/b/llm/threads/{id}`; the root chat page binds nothing.
+    fn routed_page_msg(path: &str) -> Message {
+        let mut msg = Message::new(format!("retrieve:{path}"));
+        msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
+        msg.set_meta(wafer_run::META_REQ_RESOURCE, path);
+        assert!(
+            crate::endpoint_match::dispatch(&mut msg, crate::blocks::llm::ROUTES).is_some(),
+            "no llm route matches GET {path}"
+        );
+        msg
     }
 
     #[test]
-    fn parse_thread_id_thread_path_returns_id() {
-        assert_eq!(parse_thread_id("/b/llm/threads/abc-123"), Some("abc-123"));
+    fn selected_thread_is_none_at_the_root_page() {
+        assert_eq!(selected_thread(&routed_page_msg("/b/llm/")), None);
+        // The bare form is routed through the matcher's trailing-slash retry.
+        assert_eq!(selected_thread(&routed_page_msg("/b/llm")), None);
     }
 
     #[test]
-    fn parse_thread_id_strips_trailing_segments() {
+    fn selected_thread_is_the_bound_id_on_a_thread_page() {
         assert_eq!(
-            parse_thread_id("/b/llm/threads/abc-123/extra"),
+            selected_thread(&routed_page_msg("/b/llm/threads/abc-123")),
             Some("abc-123")
         );
-    }
-
-    #[test]
-    fn parse_thread_id_blank_id_returns_none() {
-        assert_eq!(parse_thread_id("/b/llm/threads/"), None);
     }
 
     /// At root URL, the page body shows the no-thread prompt and a

@@ -114,6 +114,22 @@ pub(super) fn user_msg(action: &str, path: &str) -> Message {
     m
 }
 
+/// Run `msg` through the block's own route table so `{id}` / `{backend_id}`
+/// / `{model_id}` are bound the way they are on the wire, then hand the
+/// message to a handler directly. Panics when no row matches: a test that
+/// sends an unroutable path would otherwise exercise the handler's
+/// "missing id" branch by accident.
+pub(super) fn routed(mut msg: Message) -> Message {
+    let route = crate::endpoint_match::dispatch(&mut msg, crate::blocks::llm::ROUTES);
+    assert!(
+        route.is_some(),
+        "no llm route matches {} {}",
+        msg.action(),
+        msg.path()
+    );
+    msg
+}
+
 /// `ProviderAdmin` that keeps whatever `configure` hands it — including the
 /// `api_key` that `reload_provider_service` resolves from `key_var` — and
 /// answers `discover_models` with a fixed two-model list.
