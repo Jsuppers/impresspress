@@ -29,6 +29,7 @@
 
 pub mod block_settings;
 pub mod request_logs;
+pub mod user_roles;
 pub mod variables;
 pub mod wrap_grants;
 

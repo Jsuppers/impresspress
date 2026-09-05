@@ -407,7 +407,7 @@ impl AuthService for AuthServiceImpl {
         let uid = self.require_user(msg).await?;
         // Admin is determined by the SAME merged role resolution the HTTP
         // `is_admin` path uses — `get_user_roles` merges the inline `users.role`
-        // with `USER_ROLES_TABLE` rows. So a user granted admin via the roles
+        // with `user_roles::TABLE` rows. So a user granted admin via the roles
         // table (the admin IAM UI) is admin to trait consumers too, not only to
         // `/b/admin` routes. [F19]
         let has = match role {
@@ -542,9 +542,9 @@ mod tests {
     #[tokio::test]
     async fn get_user_roles_reflects_admin_granted_only_via_roles_table() {
         // The scenario F19 fixes: a user whose inline `users.role` is NOT
-        // "admin" but who has an admin row in USER_ROLES_TABLE must resolve
+        // "admin" but who has an admin row in user_roles::TABLE must resolve
         // to admin via the merged resolver that `require_role` now uses.
-        use crate::blocks::admin::USER_ROLES_TABLE;
+        use crate::platform_state::user_roles;
 
         let ctx = Arc::new(TestContext::with_admin().await);
         // Apply auth migrations so the `users` table exists.
@@ -567,10 +567,7 @@ mod tests {
         .expect("insert user");
 
         // Grant admin ONLY via the roles table.
-        let mut row = std::collections::HashMap::new();
-        row.insert("user_id".to_string(), serde_json::json!(user.id));
-        row.insert("role".to_string(), serde_json::json!("admin"));
-        db::create(&*ctx, USER_ROLES_TABLE, row)
+        user_roles::assign(&*ctx, &user.id, "admin", "")
             .await
             .expect("assign admin via roles table");
 
@@ -590,8 +587,8 @@ mod tests {
         // End-to-end version of the resolver test above: a real
         // `wafer_session`-cookied Message for a user whose inline
         // `users.role` is "user" but who has an admin row in
-        // USER_ROLES_TABLE must satisfy `require_role(Role::Admin)`.
-        use crate::blocks::admin::USER_ROLES_TABLE;
+        // user_roles::TABLE must satisfy `require_role(Role::Admin)`.
+        use crate::platform_state::user_roles;
 
         let ctx = Arc::new(TestContext::with_admin().await);
         let service = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
@@ -612,10 +609,7 @@ mod tests {
         .await
         .expect("insert user");
 
-        let mut row = std::collections::HashMap::new();
-        row.insert("user_id".to_string(), serde_json::json!(user.id));
-        row.insert("role".to_string(), serde_json::json!("admin"));
-        db::create(&*ctx, USER_ROLES_TABLE, row)
+        user_roles::assign(&*ctx, &user.id, "admin", "")
             .await
             .expect("assign admin via roles table");
 

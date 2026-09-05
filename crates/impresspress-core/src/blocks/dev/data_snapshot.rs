@@ -55,10 +55,7 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 use crate::blocks::products::TABLE as PRODUCTS_COLLECTION;
 use crate::{
     blocks::{
-        admin::{
-            AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE,
-            USER_ROLES_TABLE,
-        },
+        admin::{AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE},
         auth::repo::{
             api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, oauth_pkce, orgs, pats,
             provider_links, rate_limits, sessions, tokens, users,
@@ -73,7 +70,7 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
-    platform_state::{block_settings, request_logs, variables, wrap_grants},
+    platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -188,7 +185,7 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     // module docs for why `local_credentials` travels with `users`. ---
     (users::TABLE, Mode::Replace),
     (local_credentials::TABLE, Mode::Replace),
-    (USER_ROLES_TABLE, Mode::Replace),
+    (user_roles::TABLE, Mode::Replace),
 ];
 
 /// Every table the products, admin and auth blocks declare that
@@ -619,7 +616,7 @@ pub struct ImportReport {
 /// A fixed list rather than the snapshot's own (incidental, alphabetical)
 /// `BTreeMap` order — `"impresspress__admin__user_roles"` sorts before
 /// `"wafer_run__auth__users"`, which is exactly backwards.
-const REPLACE_ORDER: &[&str] = &[users::TABLE, local_credentials::TABLE, USER_ROLES_TABLE];
+const REPLACE_ORDER: &[&str] = &[users::TABLE, local_credentials::TABLE, user_roles::TABLE];
 
 #[cfg(test)]
 mod replace_order_tests {

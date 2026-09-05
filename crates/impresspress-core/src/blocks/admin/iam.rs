@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
+use wafer_block::db::{ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
@@ -14,6 +14,7 @@ use super::{
 use crate::{
     blocks::auth::bump_auth_version,
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
+    platform_state::user_roles::{self, Assigned},
     util::{json_map, RecordExt},
 };
 
@@ -22,9 +23,6 @@ pub(crate) const ROLES_TABLE: &str = "impresspress__admin__roles";
 
 /// Per-role permission rows (resource + actions tuples).
 pub(crate) const PERMISSIONS_TABLE: &str = "impresspress__admin__permissions";
-
-/// User → role assignment table (many-to-many via row per pair).
-pub(crate) const USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
 /// `GET /b/admin/api/iam/roles`.
 pub(super) async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
@@ -179,39 +177,20 @@ async fn cascade_role_rename(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), OutputStream> {
-    let grants = match db::list_all(
-        ctx,
-        USER_ROLES_TABLE,
-        vec![Filter {
-            field: "role".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(old_name.to_string()),
-        }],
-    )
-    .await
-    {
+    let grants = match user_roles::list_by_role(ctx, old_name).await {
         Ok(rows) => rows,
         Err(e) => return Err(err_internal("Database error", e)),
     };
 
     for grant in &grants {
-        let mut data = HashMap::new();
-        data.insert(
-            "role".to_string(),
-            serde_json::Value::String(new_name.to_string()),
-        );
-        crate::util::stamp_updated(&mut data);
-        if let Err(e) = db::update(ctx, USER_ROLES_TABLE, &grant.id, data).await {
+        if let Err(e) = user_roles::rename_role(ctx, &grant.id, new_name).await {
             return Err(err_internal(
                 "Role renamed but its grants did not follow",
                 e,
             ));
         }
 
-        let user_id = grant.str_field("user_id");
-        if user_id.is_empty() {
-            continue;
-        }
+        let user_id = grant.user_id.as_str();
         if let Err(e) = bump_auth_version(ctx, user_id).await {
             tracing::error!(
                 user_id = %user_id,
@@ -300,16 +279,22 @@ pub(super) async fn handle_delete_permission(ctx: &dyn Context, msg: &Message) -
 /// `GET /b/admin/api/iam/user-roles`.
 pub(super) async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.query("user_id").to_string();
-    let mut filters = Vec::new();
-    if !user_id.is_empty() {
-        filters.push(Filter {
-            field: "user_id".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(user_id),
-        });
-    }
-    match db::list_all(ctx, USER_ROLES_TABLE, filters).await {
-        Ok(records) => {
+    let rows = if user_id.is_empty() {
+        user_roles::list_all(ctx).await
+    } else {
+        user_roles::list_for_user(ctx, &user_id).await
+    };
+    match rows {
+        Ok(rows) => {
+            // Echoed in the `{id, data}` record envelope this endpoint has
+            // always published; declared without a schema until it is typed.
+            let records: Vec<db::Record> = rows
+                .iter()
+                .map(|row| db::Record {
+                    id: row.id.clone(),
+                    data: row.to_data(),
+                })
+                .collect();
             let total_count = records.len() as i64;
             ok_json(&db::RecordList {
                 records,
@@ -339,42 +324,10 @@ pub(super) async fn handle_assign_role(
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
-    // Check if already assigned
-    let existing = db::list_all(
-        ctx,
-        USER_ROLES_TABLE,
-        vec![
-            Filter {
-                field: "user_id".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(body.user_id.clone()),
-            },
-            Filter {
-                field: "role".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(body.role.clone()),
-            },
-        ],
-    )
-    .await;
-    match existing {
-        Ok(records) => {
-            if !records.is_empty() {
-                return err_conflict("Role already assigned to user");
-            }
-        }
-        Err(e) => return err_internal("Database error", e),
-    }
-
     let assigned = format!("users/{}/roles/{}", body.user_id, body.role);
-    let data = json_map(serde_json::json!({
-        "user_id": body.user_id,
-        "role": body.role,
-        "assigned_at": crate::util::now_rfc3339(),
-        "assigned_by": msg.user_id()
-    }));
-    match db::create(ctx, USER_ROLES_TABLE, data).await {
-        Ok(record) => {
+    match user_roles::assign(ctx, &body.user_id, &body.role, msg.user_id()).await {
+        Ok(Assigned::AlreadyAssigned) => err_conflict("Role already assigned to user"),
+        Ok(Assigned::Created(row)) => {
             // P2c: a role grant is a security-relevant change — bump the
             // affected user's auth_version so any already-issued access JWT
             // (minted with the old role set) is invalidated instead of
@@ -398,7 +351,12 @@ pub(super) async fn handle_assign_role(
                 msg.remote_addr(),
             )
             .await;
-            ok_json(&record)
+            // Echoed in the `{id, data}` record envelope this endpoint has
+            // always published; declared without a schema until it is typed.
+            ok_json(&db::Record {
+                id: row.id.clone(),
+                data: row.to_data(),
+            })
         }
         Err(e) => err_internal("Database error", e),
     }
@@ -415,16 +373,14 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
     // Prevent admins from removing their own admin role (self-lockout).
     // Also captures the affected user id so a successful removal can bump
     // their auth_version (P2c) below.
-    let role_user = match db::get(ctx, USER_ROLES_TABLE, id).await {
-        Ok(record) => {
-            let role_user = record.str_field("user_id").to_string();
-            let role_name = record.str_field("role").to_string();
-            if role_user == msg.user_id() && role_name == "admin" {
+    let role_user = match user_roles::get(ctx, id).await {
+        Ok(Some(grant)) => {
+            if grant.user_id == msg.user_id() && grant.role == "admin" {
                 return err_bad_request("Cannot remove your own admin role");
             }
-            role_user
+            grant.user_id
         }
-        Err(e) if e.code == ErrorCode::NotFound => {
+        Ok(None) => {
             return err_not_found("User-role assignment not found");
         }
         Err(e) => {
@@ -432,7 +388,7 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
         }
     };
 
-    match db::delete(ctx, USER_ROLES_TABLE, id).await {
+    match user_roles::remove(ctx, id).await {
         Ok(()) => {
             // P2c: role removal (demotion) is exactly the change this
             // mechanism exists for — bump so a JWT minted with the removed
@@ -490,6 +446,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use wafer_block::db::{Filter, FilterOp};
     use wafer_run::{BlockInfo, WaferError};
 
     use super::*;
@@ -718,18 +675,10 @@ mod tests {
         .await;
         assert!(out.collect_buffered().await.is_ok(), "rename must succeed");
 
-        let rows = db::list_all(
-            &ctx,
-            USER_ROLES_TABLE,
-            vec![Filter {
-                field: "user_id".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!("user_1"),
-            }],
-        )
-        .await
-        .expect("list assignments");
-        let names: Vec<&str> = rows.iter().map(|r| r.str_field("role")).collect();
+        let rows = user_roles::list_for_user(&ctx, "user_1")
+            .await
+            .expect("list assignments");
+        let names: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
         assert_eq!(
             names,
             vec!["editor-v2"],

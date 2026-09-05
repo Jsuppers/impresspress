@@ -22,11 +22,10 @@
 
 use std::collections::HashMap;
 
-use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
-use super::{logs::audit_log, ROLES_TABLE, USER_ROLES_TABLE};
+use super::{logs::audit_log, ROLES_TABLE};
 /// SSRF URL validator for `InputType::Url` writes. The single implementation
 /// lives in [`crate::util::validate_url_value`]; re-exported here so the admin
 /// variable create/update paths and the generic settings form
@@ -45,15 +44,18 @@ pub(super) use crate::util::{is_sensitive_key, MASKED_VALUE};
 use crate::{
     blocks::auth::{bump_auth_version, USERS_TABLE},
     http::{err_bad_request, err_forbidden, err_internal, err_not_found},
-    platform_state::variables::{self, NewVariable, VariablePatch, VariableRow},
+    platform_state::{
+        user_roles,
+        variables::{self, NewVariable, VariablePatch, VariableRow},
+    },
     util::RecordExt,
 };
 
 /// Bulk-fetch the roles assigned to each of `user_ids` in a single `In`-filter
 /// query, bucketed back into a `user_id -> [role]` map.
 ///
-/// Replaces the per-user `list_all(USER_ROLES_TABLE, …)` loop that both the
-/// JSON `users::handle_list` / `get_user` paths and the SSR
+/// Replaces the per-user roles-table loop that both the JSON
+/// `users::handle_list` / `get_user` paths and the SSR
 /// `pages/users.rs::user_row_fragment` re-implemented. The single-row lookup is
 /// the `user_ids = [one]` case, so this is the only roles-fetch helper.
 ///
@@ -67,22 +69,9 @@ pub(super) async fn fetch_roles(
     if user_ids.is_empty() {
         return out;
     }
-    let values: Vec<serde_json::Value> = user_ids
-        .iter()
-        .map(|id| serde_json::Value::String((*id).to_string()))
-        .collect();
-    let filters = vec![Filter {
-        field: "user_id".to_string(),
-        operator: FilterOp::In,
-        value: serde_json::Value::Array(values),
-    }];
-    if let Ok(rows) = db::list_all(ctx, USER_ROLES_TABLE, filters).await {
-        for rec in &rows {
-            let uid = rec.str_field("user_id").to_string();
-            let role = rec.str_field("role").to_string();
-            if !uid.is_empty() && !role.is_empty() {
-                out.entry(uid).or_default().push(role);
-            }
+    if let Ok(rows) = user_roles::list_for_users(ctx, user_ids).await {
+        for row in rows {
+            out.entry(row.user_id).or_default().push(row.role);
         }
     }
     out
@@ -489,6 +478,8 @@ pub(super) async fn update_variable(
 
 #[cfg(test)]
 mod tests {
+    use wafer_block::db::{Filter, FilterOp};
+
     use super::*;
     // `is_sensitive_key_honors_flag_and_suffix` lives in `crate::util`'s test
     // module now, alongside the function it tests (moved when

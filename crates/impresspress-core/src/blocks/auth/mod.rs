@@ -27,10 +27,9 @@ pub mod service;
 
 use std::{collections::HashMap, time::Duration};
 
-use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::{config as config_client, crypto, database as db};
 
-use crate::util::{hex_encode, json_map};
+use crate::util::hex_encode;
 
 /// Refresh-token lifetime (7 days). Mirrored in [`helpers::generate_tokens`]
 /// when signing the JWT and in [`helpers::store_refresh_token`] when writing
@@ -60,7 +59,7 @@ pub(crate) use repo::{api_keys::TABLE as API_KEYS_TABLE, users::TABLE as USERS_T
 /// Pre-computed Argon2id hash used for timing equalization when user is not found.
 pub(crate) const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-use crate::blocks::admin::USER_ROLES_TABLE;
+use crate::platform_state::user_roles;
 
 // ---------------------------------------------------------------------------
 // auth_version — invalidates already-issued access JWTs on account/role
@@ -305,12 +304,12 @@ pub(crate) mod helpers {
     use super::*;
 
     /// Resolve `user_id`'s merged role set: the inline `users.role` (the
-    /// bootstrap path) plus any rows in the legacy `USER_ROLES_TABLE`
+    /// bootstrap path) plus any rows in the legacy `user_roles::TABLE`
     /// (multi-role history / admin-IAM grants), deduped since both can
     /// produce `"admin"` for the bootstrapped admin.
     ///
     /// Both reads propagate `Err` instead of swallowing it (SB-3): a WRAP
-    /// denial or transient DB error on `USER_ROLES_TABLE` must not look
+    /// denial or transient DB error on `user_roles::TABLE` must not look
     /// identical to "user has no roles" — that would silently 403 every
     /// admin (`AuthServiceImpl::require_role`), re-insert a duplicate admin
     /// row on every login (`ensure_admin_role`), and stamp empty roles on
@@ -341,19 +340,12 @@ pub(crate) mod helpers {
             }
         }
 
-        let filters = vec![Filter {
-            field: "user_id".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(user_id.to_string()),
-        }];
-        let records = db::list_all(ctx, USER_ROLES_TABLE, filters)
+        let grants = user_roles::list_for_user(ctx, user_id)
             .await
             .map_err(|e| repo::RepoError::Db(format!("get_user_roles: roles table lookup: {e}")))?;
-        for rec in &records {
-            if let Some(role) = rec.data.get("role").and_then(|v| v.as_str()) {
-                if !roles.iter().any(|r| r == role) {
-                    roles.push(role.to_string());
-                }
+        for grant in grants {
+            if !roles.contains(&grant.role) {
+                roles.push(grant.role);
             }
         }
         Ok(roles)
@@ -376,7 +368,7 @@ pub(crate) mod helpers {
     ///
     /// Propagates [`repo::RepoError`] (SB-3) when the underlying roles read
     /// fails — a WRAP denial or DB error must not be mistaken for "user has
-    /// no admin row yet" and drive a duplicate insert into `USER_ROLES_TABLE`.
+    /// no admin row yet" and drive a duplicate insert into `user_roles::TABLE`.
     pub(crate) async fn ensure_admin_role(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
@@ -399,13 +391,9 @@ pub(crate) mod helpers {
             return Ok(roles);
         }
 
-        // Email matches and admin role is missing — grant it.
-        let role_data = json_map(serde_json::json!({
-            "user_id": user_id,
-            "role": "admin",
-            "assigned_at": crate::util::now_rfc3339(),
-        }));
-        match db::create(ctx, USER_ROLES_TABLE, role_data).await {
+        // Email matches and admin role is missing — grant it, through the
+        // table's single writer, with no admin behind the grant.
+        match user_roles::assign(ctx, user_id, "admin", "").await {
             Ok(_) => {
                 tracing::info!(
                     user_id = %user_id,
@@ -1016,9 +1004,9 @@ mod api_key_lifecycle_tests {
     #[tokio::test]
     async fn active_user_key_authenticates() {
         // SB-3: `get_user_roles` now surfaces (rather than swallows) a
-        // denied read of the admin-owned USER_ROLES_TABLE, so this WRAP
+        // denied read of the admin-owned user_roles::TABLE, so this WRAP
         // fixture must carry the real grant admin declares for the auth
-        // block (`ResourceGrant::read_write(AUTH_BLOCK_ID, USER_ROLES_TABLE)`
+        // block (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)`
         // in `blocks/admin/mod.rs`) — sourced from the real block so the
         // fixture can't drift from production.
         use wafer_run::Block;
@@ -1077,7 +1065,7 @@ mod get_user_roles_error_surfacing_tests {
         // Auth owns `wafer_run__auth__users` (Rule 3 own-resource — always
         // reachable) but not `impresspress__admin__user_roles` (admin-owned).
         // In production, admin's own block-level grant
-        // (`ResourceGrant::read_write(AUTH_BLOCK_ID, USER_ROLES_TABLE)` in
+        // (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)` in
         // `blocks/admin/mod.rs`) makes that read succeed; passing no grants
         // here simulates that grant regressing/missing.
         let ctx = TestContext::with_auth().await.with_wrap(

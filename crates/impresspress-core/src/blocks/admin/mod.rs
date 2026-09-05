@@ -8,7 +8,7 @@ mod pages;
 mod settings;
 mod users;
 
-pub(crate) use iam::{PERMISSIONS_TABLE, ROLES_TABLE, USER_ROLES_TABLE};
+pub(crate) use iam::{PERMISSIONS_TABLE, ROLES_TABLE};
 pub(crate) use logs::{AUDIT_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
 
 /// Registered name of the admin block.
@@ -27,7 +27,7 @@ use wafer_run::{
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    platform_state::{block_settings, request_logs, variables, wrap_grants},
+    platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
 
 /// Path-parameter schema for the `/iam/roles/{id}` routes.
@@ -509,7 +509,7 @@ crate::impresspress_feature_block! {
             .collections(vec![
                 CollectionSchema::new(ROLES_TABLE),
                 CollectionSchema::new(PERMISSIONS_TABLE),
-                CollectionSchema::new(USER_ROLES_TABLE),
+                CollectionSchema::new(user_roles::TABLE),
                 CollectionSchema::new(variables::TABLE),
                 CollectionSchema::new(AUDIT_LOGS_TABLE),
                 CollectionSchema::new(request_logs::TABLE),
@@ -518,7 +518,7 @@ crate::impresspress_feature_block! {
                 CollectionSchema::new(wrap_grants::TABLE),
             ])
             .grants(vec![
-                wafer_run::ResourceGrant::read_write(super::auth::AUTH_BLOCK_ID, USER_ROLES_TABLE),
+                wafer_run::ResourceGrant::read_write(super::auth::AUTH_BLOCK_ID, user_roles::TABLE),
                 // auth-ui's login/refresh/OAuth-callback handlers call the
                 // shared `ensure_admin_role`/`get_user_roles` helpers
                 // directly (not via the framework `wafer-run/auth`
@@ -529,7 +529,7 @@ crate::impresspress_feature_block! {
                 // previously silently swallowed into an empty roles list).
                 wafer_run::ResourceGrant::read_write(
                     super::auth_ui::AUTH_UI_BLOCK_ID,
-                    USER_ROLES_TABLE,
+                    user_roles::TABLE,
                 ),
                 wafer_run::ResourceGrant::read(super::auth::AUTH_BLOCK_ID, variables::TABLE),
                 wafer_run::ResourceGrant::read("impresspress/userportal", block_settings::TABLE),
@@ -1098,19 +1098,21 @@ mod grant_tests {
         // surface as a real error (500 on login), exposing this
         // pre-existing missing grant. Pin the grant's presence so it can't
         // silently regress again.
-        use super::{super::auth_ui::AUTH_UI_BLOCK_ID, USER_ROLES_TABLE};
+        use super::super::auth_ui::AUTH_UI_BLOCK_ID;
+        use crate::platform_state::user_roles;
 
         let admin = AdminBlock::new();
         let grants = admin.info().grants;
+        let table = user_roles::TABLE;
 
         let auth_ui_user_roles_grant = grants
             .iter()
-            .find(|g| g.grantee == AUTH_UI_BLOCK_ID && g.resource == USER_ROLES_TABLE);
+            .find(|g| g.grantee == AUTH_UI_BLOCK_ID && g.resource == table);
 
         assert!(
             auth_ui_user_roles_grant.is_some_and(|g| g.write),
             "admin block must declare a read_write grant for {AUTH_UI_BLOCK_ID} on \
-             {USER_ROLES_TABLE} (login path) — found: {auth_ui_user_roles_grant:?}"
+             {table} (login path) — found: {auth_ui_user_roles_grant:?}"
         );
     }
 }

@@ -5,7 +5,7 @@
 //! not exist in a default-feature build, so these tests must not compile
 //! there.
 //!
-//! `PRODUCTS_TABLE`/`OFFERS_TABLE`/`PURCHASES_TABLE`/`ADMIN_USER_ROLES_TABLE`
+//! `PRODUCTS_TABLE`/`OFFERS_TABLE`/`PURCHASES_TABLE`
 //! below restate table names `impresspress-core` keeps `pub(crate)` (the
 //! products ones are further gated by that block's own door tests —
 //! `blocks/products/tests/repo_door_test.rs` — which refuse a re-export
@@ -28,7 +28,7 @@ use impresspress_core::{
         },
         products::ProductsBlock,
     },
-    platform_state::variables,
+    platform_state::{user_roles, variables},
     test_support::TestContext,
     util::json_map,
 };
@@ -47,7 +47,6 @@ const PRODUCT_VERSIONS_TABLE: &str = "impresspress__products__product_versions";
 const CHECKOUT_PRESETS_TABLE: &str = "impresspress__products__checkout_presets";
 const PRODUCTS_VARIABLES_TABLE: &str = "impresspress__products__variables";
 const PURCHASES_TABLE: &str = "impresspress__products__purchases";
-const ADMIN_USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
 // ---------------------------------------------------------------------------
 // Coverage: every declared table has a decision.
@@ -229,7 +228,7 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
 
     seed_row(
         ctx,
-        ADMIN_USER_ROLES_TABLE,
+        user_roles::TABLE,
         "role_owner_admin",
         json!({ "user_id": user_id, "role": "admin" }),
     )
@@ -493,7 +492,7 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
     .await;
     seed_row(
         &dst,
-        ADMIN_USER_ROLES_TABLE,
+        user_roles::TABLE,
         "role_fresh_bootstrap",
         json!({ "user_id": "user_fresh_bootstrap", "role": "admin" }),
     )
@@ -501,7 +500,7 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
 
     let report = data_snapshot::import(&dst, &snap).await.unwrap();
     assert_eq!(report.tables[users::TABLE], 1);
-    assert_eq!(report.tables[ADMIN_USER_ROLES_TABLE], 1);
+    assert_eq!(report.tables[user_roles::TABLE], 1);
 
     let users_rows = db::list_all(&dst, users::TABLE, Vec::new()).await.unwrap();
     assert_eq!(
@@ -511,7 +510,7 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
     );
     assert_eq!(users_rows[0].id, admin_id);
 
-    let role_rows = db::list_all(&dst, ADMIN_USER_ROLES_TABLE, Vec::new())
+    let role_rows = db::list_all(&dst, user_roles::TABLE, Vec::new())
         .await
         .unwrap();
     assert_eq!(
