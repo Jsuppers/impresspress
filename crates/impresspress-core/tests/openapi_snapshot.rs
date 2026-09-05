@@ -1048,14 +1048,6 @@ async fn tickets_openapi_does_not_publish_the_honeypot() {
     );
 }
 
-/// Published paths whose template carries a placeholder with no `in: path`
-/// parameter declared, known before [`path_placeholders_and_path_parameters_agree`]
-/// existed. Each is published debt: a consumer cannot build the URL from the
-/// document alone. The list may only shrink. An entry that no longer
-/// mismatches must be removed (the test fails on a stale entry), and a new
-/// gap is fixed on the row (`.path_params(..)`) rather than listed here.
-const KNOWN_PLACEHOLDER_GAPS: &[&str] = &["/b/messages/api/contexts/{id}/entries"];
-
 /// Every `{...}` placeholder in a published path names an `in: path`
 /// parameter declared on that path item or one of its operations, and every
 /// `in: path` parameter has a placeholder in the template.
@@ -1088,7 +1080,6 @@ async fn path_placeholders_and_path_parameters_agree() {
 
     let mut saw_rest_placeholder = false;
     let mut mismatches = Vec::new();
-    let mut unused_exemptions: Vec<&str> = KNOWN_PLACEHOLDER_GAPS.to_vec();
     for (path, item) in paths {
         let mut placeholders: Vec<String> = path
             .split('/')
@@ -1117,10 +1108,6 @@ async fn path_placeholders_and_path_parameters_agree() {
         if placeholders == declared {
             continue;
         }
-        if let Some(i) = unused_exemptions.iter().position(|p| p == path) {
-            unused_exemptions.remove(i);
-            continue;
-        }
         mismatches.push(format!(
             "{path}: template placeholders {placeholders:?} vs declared `in: path` parameters \
              {declared:?}"
@@ -1133,9 +1120,4 @@ async fn path_placeholders_and_path_parameters_agree() {
          branch is exercised and this test cannot pass vacuously"
     );
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    assert!(
-        unused_exemptions.is_empty(),
-        "KNOWN_PLACEHOLDER_GAPS entries that no longer mismatch (or are no longer published) \
-         must be removed: {unused_exemptions:?}"
-    );
 }
