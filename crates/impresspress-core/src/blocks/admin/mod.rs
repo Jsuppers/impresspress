@@ -9,7 +9,7 @@ mod settings;
 mod users;
 
 pub(crate) use iam::{PERMISSIONS_TABLE, ROLES_TABLE, USER_ROLES_TABLE};
-pub(crate) use logs::{AUDIT_LOGS_TABLE, REQUEST_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
+pub(crate) use logs::{AUDIT_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
 
 /// Registered name of the admin block.
 ///
@@ -27,7 +27,7 @@ use wafer_run::{
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    platform_state::{block_settings, variables, wrap_grants},
+    platform_state::{block_settings, request_logs, variables, wrap_grants},
 };
 
 /// Path-parameter schema for the `/iam/roles/{id}` routes.
@@ -512,7 +512,7 @@ crate::impresspress_feature_block! {
                 CollectionSchema::new(USER_ROLES_TABLE),
                 CollectionSchema::new(variables::TABLE),
                 CollectionSchema::new(AUDIT_LOGS_TABLE),
-                CollectionSchema::new(REQUEST_LOGS_TABLE),
+                CollectionSchema::new(request_logs::TABLE),
                 CollectionSchema::new(STORAGE_ACCESS_LOGS_TABLE),
                 CollectionSchema::new(block_settings::TABLE),
                 CollectionSchema::new(wrap_grants::TABLE),
@@ -537,7 +537,7 @@ crate::impresspress_feature_block! {
                 wafer_run::ResourceGrant::read_write("*", block_settings::TABLE),
                 // Infrastructure logging: storage wrapper + pipeline write logs
                 wafer_run::ResourceGrant::read_write("*", STORAGE_ACCESS_LOGS_TABLE),
-                wafer_run::ResourceGrant::read_write("*", REQUEST_LOGS_TABLE),
+                wafer_run::ResourceGrant::read_write("*", request_logs::TABLE),
                 // Default: allow all blocks to make outbound network requests.
                 // Remove this grant via the admin UI to restrict network access.
                 wafer_run::ResourceGrant::read("*", "*")
@@ -1700,21 +1700,21 @@ mod page_link_tests {
         )
         .await
         .expect("seed grant");
-        let mut request = crate::util::json_map(serde_json::json!({
-            "flow_id": "f-1",
-            "method": "GET",
-            "path": "/probe",
-            "status": "OK",
-            "status_code": 200,
-            "duration_ms": 5,
-            "error_message": "",
-            "client_ip": "203.0.113.7",
-            "user_id": "",
-        }));
-        crate::util::stamp_created(&mut request);
-        db::create(&ctx, REQUEST_LOGS_TABLE, request)
-            .await
-            .expect("seed request log");
+        request_logs::insert(
+            &ctx,
+            &request_logs::NewRequestLog {
+                method: "GET",
+                path: "/probe",
+                status_label: "OK",
+                status_code: 200,
+                error_message: "",
+                duration_ms: 5,
+                client_ip: "203.0.113.7",
+                user_id: "",
+            },
+        )
+        .await
+        .expect("seed request log");
         // `can_disable` is what makes the detail fragment render the toggle.
         ctx.register_block_info(
             PROBE_BLOCK,

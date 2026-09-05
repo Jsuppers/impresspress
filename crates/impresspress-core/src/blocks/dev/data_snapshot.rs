@@ -54,7 +54,6 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 // `TABLE_IDENT_ALLOWED` with the same justification given there.
 use crate::blocks::products::TABLE as PRODUCTS_COLLECTION;
 use crate::{
-    admin_schema,
     blocks::{
         admin::{
             AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE,
@@ -74,7 +73,7 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
-    platform_state::{block_settings, variables, wrap_grants},
+    platform_state::{block_settings, request_logs, variables, wrap_grants},
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -211,7 +210,7 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     // --- admin: operational logs, and infrastructure state the runtime
     // re-derives at every boot rather than something anyone authored. ---
     block_settings::TABLE, // per-block enable flag + migration-hash tracking
-    admin_schema::REQUEST_LOGS_TABLE,
+    request_logs::TABLE,
     AUDIT_LOGS_TABLE,
     STORAGE_ACCESS_LOGS_TABLE,
     wrap_grants::TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot

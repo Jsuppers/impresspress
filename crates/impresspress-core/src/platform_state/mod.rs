@@ -28,5 +28,16 @@
 //! WRAP schema owner.
 
 pub mod block_settings;
+pub mod request_logs;
 pub mod variables;
 pub mod wrap_grants;
+
+/// One page of typed rows plus the envelope `db::paginated_list` returns,
+/// for the admin pages' pagination controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    pub rows: Vec<T>,
+    pub total_count: i64,
+    pub page: i64,
+    pub page_size: i64,
+}

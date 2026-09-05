@@ -6,7 +6,7 @@
 use std::cell::Cell;
 
 use wafer_block::http_codec;
-use wafer_core::clients::{config as config_client, database as db};
+use wafer_core::clients::config as config_client;
 use wafer_run::{
     context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockInfo, ErrorCode,
     InputStream, Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
@@ -16,13 +16,14 @@ use crate::{
     endpoint_match,
     features::FeatureConfig,
     http::ResponseBuilder,
+    platform_state::request_logs::{self, NewRequestLog},
     routing::{self, ExtraRoute},
     ui,
 };
 
 /// How the pipeline persists the per-request audit row.
 ///
-/// `Inline` (default; native): `db::create` awaited on the response path —
+/// `Inline` (default; native): `request_logs::insert` awaited on the response path —
 /// today's behavior. `Queued` (Cloudflare): the completed row is pushed to a
 /// thread-local queue; the platform entry drains it after dispatch and
 /// attaches the write to `ctx.wait_until`, so responses stop paying one D1
@@ -416,7 +417,7 @@ pub async fn handle_request(
                 .unwrap_or(i64::MAX);
             write_request_log(
                 ctx,
-                RequestLogRow {
+                NewRequestLog {
                     method: &method,
                     path: &path,
                     status_label,
@@ -486,7 +487,7 @@ pub async fn handle_request(
         i64::try_from(crate::util::now_millis().saturating_sub(start_ms)).unwrap_or(i64::MAX);
     write_request_log(
         ctx,
-        RequestLogRow {
+        NewRequestLog {
             method: &method,
             path: &path,
             status_label,
@@ -502,20 +503,6 @@ pub async fn handle_request(
     reply
 }
 
-/// Fields of one `request_logs` audit row. Bundled into a struct so
-/// [`write_request_log`] stays a two-argument call (the row shape is shared by
-/// the buffered response tail and the streamed-download branch).
-struct RequestLogRow<'a> {
-    method: &'a str,
-    path: &'a str,
-    status_label: &'a str,
-    status_code: i64,
-    error_message: &'a str,
-    duration_ms: i64,
-    client_ip: &'a str,
-    user_id: &'a str,
-}
-
 /// Write one `request_logs` audit row (best-effort; never fails the request).
 /// Static-asset and health-check paths are skipped to keep the table
 /// signal-heavy — the prefix is the shared `routing::STATIC_PREFIX` const so it
@@ -524,37 +511,17 @@ struct RequestLogRow<'a> {
 /// Shared by the buffered response tail and the streamed-download branch so a
 /// download produces the same row on every platform, whether the adapter
 /// streams or buffers its body.
-async fn write_request_log(ctx: &dyn Context, row: RequestLogRow<'_>) {
+async fn write_request_log(ctx: &dyn Context, row: NewRequestLog<'_>) {
     if row.path.starts_with(routing::STATIC_PREFIX) || row.path == "/health" {
         return;
     }
-    let mut data = std::collections::HashMap::new();
-    data.insert("method".to_string(), serde_json::json!(row.method));
-    data.insert("path".to_string(), serde_json::json!(row.path));
-    data.insert("status".to_string(), serde_json::json!(row.status_label));
-    data.insert(
-        "status_code".to_string(),
-        serde_json::json!(row.status_code),
-    );
-    data.insert(
-        "duration_ms".to_string(),
-        serde_json::json!(row.duration_ms),
-    );
-    data.insert(
-        "error_message".to_string(),
-        serde_json::json!(row.error_message),
-    );
-    data.insert("client_ip".to_string(), serde_json::json!(row.client_ip));
-    data.insert("user_id".to_string(), serde_json::json!(row.user_id));
-    crate::util::stamp_created(&mut data);
-
     match request_log_mode() {
         RequestLogMode::Inline => {
             // Best-effort: don't fail the request if logging fails.
-            let _ = db::create(ctx, crate::blocks::admin::REQUEST_LOGS_TABLE, data).await;
+            let _ = request_logs::insert(ctx, &row).await;
         }
         RequestLogMode::Queued => {
-            enqueue_request_log(crate::blocks::admin::REQUEST_LOGS_TABLE, data);
+            enqueue_request_log(request_logs::TABLE, row.to_data());
         }
     }
 }
@@ -2359,9 +2326,10 @@ mod streaming_audit_tests {
     }
 
     async fn request_log_count(ctx: &TestContext) -> i64 {
-        db::count(ctx, crate::blocks::admin::REQUEST_LOGS_TABLE, &[])
+        request_logs::paginated(ctx, 1, 20, "")
             .await
             .expect("count request_logs")
+            .total_count
     }
 
     #[tokio::test]
@@ -2395,7 +2363,7 @@ mod request_log_mode_tests {
         drain_queued_request_logs, enqueue_request_log, request_log_mode, set_request_log_mode,
         RequestLogMode,
     };
-    use crate::blocks::admin;
+    use crate::platform_state::request_logs;
 
     #[test]
     fn default_mode_is_inline_and_drain_is_empty() {
@@ -2408,12 +2376,12 @@ mod request_log_mode_tests {
         set_request_log_mode(RequestLogMode::Queued);
         let mut data = std::collections::HashMap::new();
         data.insert("path".to_string(), serde_json::json!("/x"));
-        enqueue_request_log(admin::REQUEST_LOGS_TABLE, data.clone());
-        enqueue_request_log(admin::REQUEST_LOGS_TABLE, data);
+        enqueue_request_log(request_logs::TABLE, data.clone());
+        enqueue_request_log(request_logs::TABLE, data);
 
         let drained = drain_queued_request_logs();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].table, admin::REQUEST_LOGS_TABLE);
+        assert_eq!(drained[0].table, request_logs::TABLE);
         assert!(drain_queued_request_logs().is_empty(), "drain must clear");
 
         set_request_log_mode(RequestLogMode::Inline); // restore for other tests

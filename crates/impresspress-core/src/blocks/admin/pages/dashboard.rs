@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use maud::html;
 use wafer_block::{
-    db::{Filter, FilterOp, FilterTree, ListOptions, SortField},
+    db::{Filter, FilterOp, ListOptions, SortField},
     wire::database as wire,
 };
 use wafer_core::clients::database as db;
@@ -10,42 +10,15 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
 use crate::{
-    blocks::{admin::REQUEST_LOGS_TABLE as REQUEST_LOGS, auth::USERS_TABLE as USERS},
+    blocks::auth::USERS_TABLE as USERS,
+    platform_state::request_logs::{self, DailyCounts, TodayCounts},
     ui::{
         components, icons,
         shell::Topbar,
         templates::{dashboard_page, PageHeader, StatTile},
     },
-    util::RecordExt,
+    util::{daily_grouped, to_wire_filters, RecordExt},
 };
-
-/// Encode client-side [`Filter`]s as all-leaf wire [`FilterNode`](wire::FilterNode)s
-/// for a typed `db::aggregate` request. Mirrors `wafer-core`'s internal
-/// `to_wire_filters` conversion (not exported for block code to reuse).
-fn to_wire_filters(filters: &[Filter]) -> Vec<wire::FilterNode> {
-    filters
-        .iter()
-        .map(|f| {
-            let operator = match f.operator {
-                FilterOp::Equal => "eq",
-                FilterOp::NotEqual => "neq",
-                FilterOp::GreaterThan => "gt",
-                FilterOp::GreaterEqual => "gte",
-                FilterOp::LessThan => "lt",
-                FilterOp::LessEqual => "lte",
-                FilterOp::Like => "like",
-                FilterOp::In => "in",
-                FilterOp::IsNull => "is_null",
-                FilterOp::IsNotNull => "is_not_null",
-            };
-            wire::FilterNode::Leaf(wire::FilterDef {
-                field: f.field.clone(),
-                operator: operator.to_string(),
-                value: f.value.clone(),
-            })
-        })
-        .collect()
-}
 
 /// Trailing 30-day window as `(oldest_day, oldest_day_midnight_iso)`.
 /// `oldest_day` anchors the zero-fill; the ISO string is the `created_at >=`
@@ -56,43 +29,23 @@ fn window_30d() -> (chrono::NaiveDate, String) {
     (start, format!("{start}T00:00:00"))
 }
 
-/// Run ONE grouped-by-day aggregate over the trailing 30-day window and return
-/// the per-day rows (one [`wire::Record`] per day that has data). `aggregates`
-/// may carry several columns — e.g. a plain `Count` alongside a conditional
-/// `CaseWhenSum` — so a single statement can back multiple daily series over
-/// the same table. Callers project each alias out with [`series_from_rows`],
-/// which zero-fills the days with no rows.
-async fn daily_grouped_30d(
-    ctx: &dyn Context,
-    table: &str,
-    start_iso: &str,
-    extra_filters: Vec<Filter>,
-    aggregates: Vec<wire::AggregateColumnDef>,
-) -> Vec<wire::Record> {
-    let mut filters = vec![Filter {
-        field: "created_at".into(),
-        operator: FilterOp::GreaterEqual,
-        value: serde_json::json!(start_iso),
-    }];
-    filters.extend(extra_filters);
-
-    let req = wire::AggregateRequest {
-        collection: table.to_string(),
-        select_columns: vec![],
-        aggregates,
-        filters: to_wire_filters(&filters),
-        group_by: vec![wire::GroupByDef::DateBucket {
-            field: "created_at".into(),
-        }],
-        sort: vec![],
-        limit: 0,
-    };
-    db::aggregate(ctx, req).await.unwrap_or_default()
+/// Zero-fill `by_day` into a 30-entry series ordered oldest → newest
+/// (matching the chart's x-axis). A missing day reads as `0`.
+fn zero_filled_30d(by_day: &HashMap<String, i64>, start: chrono::NaiveDate) -> Vec<(String, i64)> {
+    (0..30)
+        .map(|i| {
+            let date = (start + chrono::Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string();
+            let count = by_day.get(&date).copied().unwrap_or(0);
+            (date, count)
+        })
+        .collect()
 }
 
-/// Project one aggregate `alias` out of grouped daily `rows` into a zero-filled
-/// 30-entry series ordered oldest → newest (matching the chart's x-axis).
-/// A missing day, or a group whose conditional sum was `NULL`, reads as `0`.
+/// Project one aggregate `alias` out of grouped daily `rows` (from
+/// [`daily_grouped`]) into a zero-filled 30-entry series. A group whose
+/// conditional sum was `NULL` reads as `0`.
 fn series_from_rows(
     rows: &[wire::Record],
     alias: &str,
@@ -106,16 +59,18 @@ fn series_from_rows(
             Some((day.to_string(), cnt))
         })
         .collect();
+    zero_filled_30d(&by_day, start)
+}
 
-    (0..30)
-        .map(|i| {
-            let date = (start + chrono::Duration::days(i))
-                .format("%Y-%m-%d")
-                .to_string();
-            let count = by_day.get(&date).copied().unwrap_or(0);
-            (date, count)
-        })
-        .collect()
+/// Project one metric out of the request log's daily counts into a
+/// zero-filled 30-entry series.
+fn series_from_daily(
+    days: &[DailyCounts],
+    pick: fn(&DailyCounts) -> i64,
+    start: chrono::NaiveDate,
+) -> Vec<(String, i64)> {
+    let by_day: HashMap<String, i64> = days.iter().map(|d| (d.day.clone(), pick(d))).collect();
+    zero_filled_30d(&by_day, start)
 }
 
 /// Header-tile USER counts in ONE statement: `(total_active, active_today)`.
@@ -162,62 +117,6 @@ async fn user_counts(ctx: &dyn Context, today_start: &str) -> (i64, i64) {
     (read("total"), read("today"))
 }
 
-/// Header-tile REQUEST_LOGS metrics for today in ONE statement:
-/// `(requests, errors, avg_ms)`.
-///
-/// All three share the `created_at >= today_start` predicate, so it becomes the
-/// `WHERE`; the error tally rides along as a conditional `CaseWhenSum` and the
-/// latency as an `Avg` — replacing two `db::count`s plus a separate average
-/// aggregate with a single round-trip.
-async fn request_counts(ctx: &dyn Context, today_start: &str) -> (i64, i64, f64) {
-    let today = [Filter {
-        field: "created_at".into(),
-        operator: FilterOp::GreaterEqual,
-        value: serde_json::json!(today_start),
-    }];
-    let is_error = [Filter {
-        field: "status".into(),
-        operator: FilterOp::Equal,
-        value: serde_json::json!("ERROR"),
-    }];
-    let req = wire::AggregateRequest {
-        collection: REQUEST_LOGS.to_string(),
-        select_columns: vec![],
-        aggregates: vec![
-            wire::AggregateColumnDef::Count {
-                alias: "requests".into(),
-            },
-            wire::AggregateColumnDef::CaseWhenSum {
-                when: to_wire_filters(&is_error),
-                alias: "errors".into(),
-            },
-            wire::AggregateColumnDef::Avg {
-                field: "duration_ms".into(),
-                alias: "avg_val".into(),
-            },
-        ],
-        filters: to_wire_filters(&today),
-        group_by: vec![],
-        sort: vec![],
-        limit: 0,
-    };
-    let rows = db::aggregate(ctx, req).await.unwrap_or_default();
-    let row = rows.first();
-    let requests = row
-        .and_then(|r| r.data.get("requests"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let errors = row
-        .and_then(|r| r.data.get("errors"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let avg_ms = row
-        .and_then(|r| r.data.get("avg_val"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    (requests, errors, avg_ms)
-}
-
 pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let today_start = format!("{today}T00:00:00");
@@ -233,9 +132,9 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (start_30d, start_iso) = window_30d();
 
     let user_counts_fut = user_counts(ctx, &today_start);
-    let request_counts_fut = request_counts(ctx, &today_start);
+    let request_counts_fut = request_logs::today_counts(ctx, &today_start);
 
-    let users_daily_fut = daily_grouped_30d(
+    let users_daily_fut = daily_grouped(
         ctx,
         USERS,
         &start_iso,
@@ -248,25 +147,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
             alias: "cnt".into(),
         }],
     );
-    let requests_daily_fut = daily_grouped_30d(
-        ctx,
-        REQUEST_LOGS,
-        &start_iso,
-        vec![],
-        vec![
-            wire::AggregateColumnDef::Count {
-                alias: "requests".into(),
-            },
-            wire::AggregateColumnDef::CaseWhenSum {
-                when: to_wire_filters(&[Filter {
-                    field: "status".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!("ERROR"),
-                }]),
-                alias: "errors".into(),
-            },
-        ],
-    );
+    let requests_daily_fut = request_logs::daily_counts(ctx, &start_iso);
 
     let recent_users_opts = ListOptions {
         columns: Some(vec!["id".into(), "email".into(), "created_at".into()]),
@@ -285,43 +166,15 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let recent_users_fut = db::list(ctx, USERS, &recent_users_opts);
 
-    let recent_errors_opts = ListOptions {
-        columns: Some(vec![
-            "status_code".into(),
-            "method".into(),
-            "path".into(),
-            "duration_ms".into(),
-            "created_at".into(),
-        ]),
-        filter_tree: Some(vec![FilterTree::Any(vec![
-            FilterTree::Leaf(Filter {
-                field: "status".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!("ERROR"),
-            }),
-            FilterTree::Leaf(Filter {
-                field: "status_code".into(),
-                operator: FilterOp::GreaterEqual,
-                value: serde_json::json!(400),
-            }),
-        ])]),
-        sort: vec![SortField {
-            field: "created_at".into(),
-            desc: true,
-        }],
-        limit: 5,
-        skip_count: true,
-        ..Default::default()
-    };
-    let recent_errors_fut = db::list(ctx, REQUEST_LOGS, &recent_errors_opts);
+    let recent_errors_fut = request_logs::list_recent_errors(ctx, 5);
 
     let (
         (user_count, new_users_today),
-        (requests_today, errors_today, avg_ms),
+        request_counts_r,
         recent_users_r,
         recent_errors_r,
-        users_daily_rows,
-        requests_daily_rows,
+        users_daily_r,
+        request_days_r,
     ) = futures::join!(
         user_counts_fut,
         request_counts_fut,
@@ -331,15 +184,22 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
         requests_daily_fut,
     );
 
+    let TodayCounts {
+        requests: requests_today,
+        errors: errors_today,
+        avg_ms,
+    } = request_counts_r.unwrap_or_default();
     let recent_users = recent_users_r.map(|rl| rl.records).unwrap_or_default();
-    let recent_errors = recent_errors_r.map(|rl| rl.records).unwrap_or_default();
+    let recent_errors = recent_errors_r.unwrap_or_default();
+    let users_daily_rows = users_daily_r.unwrap_or_default();
+    let request_days = request_days_r.unwrap_or_default();
 
     // Two grouped statements back all three charts: the USERS series comes from
-    // its own daily aggregate; the REQUEST_LOGS "requests" and "errors" series
-    // are two aliases projected out of the *same* per-day rows.
+    // its own daily aggregate; the request-log "requests" and "errors" series
+    // are two metrics projected out of the *same* per-day counts.
     let new_users_daily = series_from_rows(&users_daily_rows, "cnt", start_30d);
-    let requests_daily = series_from_rows(&requests_daily_rows, "requests", start_30d);
-    let errors_daily = series_from_rows(&requests_daily_rows, "errors", start_30d);
+    let requests_daily = series_from_daily(&request_days, |d| d.requests, start_30d);
+    let errors_daily = series_from_daily(&request_days, |d| d.errors, start_30d);
 
     let user_count_str = user_count.to_string();
     let new_users_str = new_users_today.to_string();
@@ -449,11 +309,11 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                 }
                             }
                             tbody {
-                                @for record in &recent_errors {
-                                    @let code = record.i64_field("status_code");
-                                    @let method = record.str_field("method");
-                                    @let path = record.str_field("path");
-                                    @let created = record.str_field("created_at");
+                                @for row in &recent_errors {
+                                    @let code = row.status_code;
+                                    @let method = row.method.as_str();
+                                    @let path = row.path.as_str();
+                                    @let created = row.created_at.as_str();
                                     tr {
                                         td {
                                             span .badge .(if code >= 500 { "badge-danger" } else { "badge-warning" }) { (code) }
@@ -509,11 +369,13 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 #[cfg(test)]
 mod tests {
-    //! Correctness: the consolidated aggregates return byte-for-byte the same
-    //! numbers the previous per-filter `db::count` / per-metric grouped queries
-    //! produced. Each consolidated helper is checked against the equivalent
+    //! Correctness: the consolidated user aggregates return byte-for-byte the
+    //! same numbers the previous per-filter `db::count` / per-metric grouped
+    //! queries produced. Each helper is checked against the equivalent
     //! separate `db::count` calls over the same seeded in-memory database, and
-    //! against hand-computed expectations for the fixed seed.
+    //! against hand-computed expectations for the fixed seed. The request-log
+    //! aggregates have the same check beside their owner,
+    //! `platform_state::request_logs`.
 
     use std::collections::HashMap;
 
@@ -521,11 +383,8 @@ mod tests {
     use wafer_block::db::{Filter, FilterOp};
     use wafer_core::clients::database as db;
 
-    use super::{
-        daily_grouped_30d, request_counts, series_from_rows, user_counts, window_30d, wire,
-        REQUEST_LOGS, USERS,
-    };
-    use crate::test_support::TestContext;
+    use super::{series_from_rows, user_counts, window_30d, wire, USERS};
+    use crate::{test_support::TestContext, util::daily_grouped};
 
     #[test]
     fn dashboard_renders_stats_before_charts() {
@@ -564,29 +423,6 @@ mod tests {
         db::create(ctx, USERS, data)
             .await
             .unwrap_or_else(|e| panic!("seed user {id}: {e}"));
-    }
-
-    async fn seed_req(
-        ctx: &TestContext,
-        id: &str,
-        status: &str,
-        duration_ms: i64,
-        created_at: &str,
-    ) {
-        let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-        data.insert("id".into(), json!(id));
-        data.insert("method".into(), json!("GET"));
-        data.insert("path".into(), json!("/x"));
-        data.insert("status".into(), json!(status));
-        data.insert(
-            "status_code".into(),
-            json!(if status == "ERROR" { 500 } else { 200 }),
-        );
-        data.insert("duration_ms".into(), json!(duration_ms));
-        data.insert("created_at".into(), json!(created_at));
-        db::create(ctx, REQUEST_LOGS, data)
-            .await
-            .unwrap_or_else(|e| panic!("seed request_log {id}: {e}"));
     }
 
     /// Value for `date` in a `(date, count)` series, or `-1` if the day is absent.
@@ -634,18 +470,6 @@ mod tests {
             seed_user(&ctx, &format!("u_del_{i}"), &at(0), Some(&at(0))).await;
         }
 
-        // Requests: today 4 (durations 100/200/300/400, one ERROR); 10d ago 2
-        // (ok, 50/50); 40d ago 5 (outside the window).
-        seed_req(&ctx, "r_t0", "OK", 100, &at(0)).await;
-        seed_req(&ctx, "r_t1", "OK", 200, &at(0)).await;
-        seed_req(&ctx, "r_t2", "OK", 300, &at(0)).await;
-        seed_req(&ctx, "r_t3", "ERROR", 400, &at(0)).await;
-        seed_req(&ctx, "r_10d_0", "OK", 50, &at(10)).await;
-        seed_req(&ctx, "r_10d_1", "OK", 50, &at(10)).await;
-        for i in 0..5 {
-            seed_req(&ctx, &format!("r_40d_{i}"), "OK", 999, &at(40)).await;
-        }
-
         // --- header tile counts: consolidated vs. separate per-filter counts ---
         let active = [Filter {
             field: "deleted_at".into(),
@@ -674,38 +498,10 @@ mod tests {
         );
         assert_eq!((total, new_today), (6, 3), "hand-computed user counts");
 
-        let req_today = [Filter {
-            field: "created_at".into(),
-            operator: FilterOp::GreaterEqual,
-            value: json!(&today_start),
-        }];
-        let err_today = [
-            Filter {
-                field: "status".into(),
-                operator: FilterOp::Equal,
-                value: json!("ERROR"),
-            },
-            Filter {
-                field: "created_at".into(),
-                operator: FilterOp::GreaterEqual,
-                value: json!(&today_start),
-            },
-        ];
-        let requests_expected = db::count(&ctx, REQUEST_LOGS, &req_today).await.unwrap();
-        let errors_expected = db::count(&ctx, REQUEST_LOGS, &err_today).await.unwrap();
-        let (requests, errors, avg_ms) = request_counts(&ctx, &today_start).await;
-        assert_eq!(requests, requests_expected, "requests count");
-        assert_eq!(errors, errors_expected, "errors count");
-        assert_eq!((requests, errors), (4, 1), "hand-computed request counts");
-        assert!(
-            (avg_ms - 250.0).abs() < 1e-9,
-            "avg of today's durations = 250, got {avg_ms}"
-        );
-
         // --- daily chart series ---
         let (start_30d, start_iso) = window_30d();
 
-        let users_rows = daily_grouped_30d(
+        let users_rows = daily_grouped(
             &ctx,
             USERS,
             &start_iso,
@@ -718,45 +514,12 @@ mod tests {
                 alias: "cnt".into(),
             }],
         )
-        .await;
+        .await
+        .expect("daily users aggregate");
         let new_users_daily = series_from_rows(&users_rows, "cnt", start_30d);
         assert_eq!(new_users_daily.len(), 30, "30-entry zero-filled series");
         assert_eq!(day_value(&new_users_daily, &day(0)), 3, "3 users today");
         assert_eq!(day_value(&new_users_daily, &day(5)), 2, "2 users 5d ago");
         assert_eq!(sum(&new_users_daily), 5, "40d-ago user + deleted excluded");
-
-        let req_rows = daily_grouped_30d(
-            &ctx,
-            REQUEST_LOGS,
-            &start_iso,
-            vec![],
-            vec![
-                wire::AggregateColumnDef::Count {
-                    alias: "requests".into(),
-                },
-                wire::AggregateColumnDef::CaseWhenSum {
-                    when: super::to_wire_filters(&[Filter {
-                        field: "status".into(),
-                        operator: FilterOp::Equal,
-                        value: json!("ERROR"),
-                    }]),
-                    alias: "errors".into(),
-                },
-            ],
-        )
-        .await;
-        // Both series come out of the SAME grouped rows — the whole point of the
-        // consolidation.
-        let requests_daily = series_from_rows(&req_rows, "requests", start_30d);
-        let errors_daily = series_from_rows(&req_rows, "errors", start_30d);
-        assert_eq!(day_value(&requests_daily, &day(0)), 4, "4 requests today");
-        assert_eq!(
-            day_value(&requests_daily, &day(10)),
-            2,
-            "2 requests 10d ago"
-        );
-        assert_eq!(sum(&requests_daily), 6, "40d-ago requests excluded");
-        assert_eq!(day_value(&errors_daily, &day(0)), 1, "1 error today");
-        assert_eq!(sum(&errors_daily), 1, "one error total in window");
     }
 }

@@ -8,12 +8,6 @@ use crate::http::{err_internal, ok_json};
 /// Audit log entries (admin-initiated mutations).
 pub(crate) const AUDIT_LOGS_TABLE: &str = "impresspress__admin__audit_logs";
 
-// `REQUEST_LOGS_TABLE` lives in the leaf `crate::admin_schema` module (read by
-// the request pipeline without depending on the admin block); re-exported here
-// so existing `logs::REQUEST_LOGS_TABLE` / `admin::REQUEST_LOGS_TABLE`
-// references keep resolving.
-pub(crate) use crate::admin_schema::REQUEST_LOGS_TABLE;
-
 /// Storage access log entries (one row per object read/write).
 pub(crate) const STORAGE_ACCESS_LOGS_TABLE: &str = "impresspress__admin__storage_access_logs";
 

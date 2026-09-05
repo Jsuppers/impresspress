@@ -526,6 +526,80 @@ pub fn parse_body_value(data: &[u8]) -> serde_json::Value {
     }
 }
 
+/// Encode client-side [`Filter`](wafer_block::db::Filter)s as all-leaf wire
+/// [`FilterNode`](wafer_block::wire::database::FilterNode)s for a typed
+/// `db::aggregate` request. Mirrors `wafer-core`'s internal
+/// `to_wire_filters` conversion (not exported for block code to reuse).
+pub(crate) fn to_wire_filters(
+    filters: &[wafer_block::db::Filter],
+) -> Vec<wafer_block::wire::database::FilterNode> {
+    use wafer_block::{db::FilterOp, wire::database as wire};
+    filters
+        .iter()
+        .map(|f| {
+            let operator = match f.operator {
+                FilterOp::Equal => "eq",
+                FilterOp::NotEqual => "neq",
+                FilterOp::GreaterThan => "gt",
+                FilterOp::GreaterEqual => "gte",
+                FilterOp::LessThan => "lt",
+                FilterOp::LessEqual => "lte",
+                FilterOp::Like => "like",
+                FilterOp::In => "in",
+                FilterOp::IsNull => "is_null",
+                FilterOp::IsNotNull => "is_not_null",
+            };
+            wire::FilterNode::Leaf(wire::FilterDef {
+                field: f.field.clone(),
+                operator: operator.to_string(),
+                value: f.value.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Run ONE grouped-by-day aggregate over `table` for rows whose `created_at`
+/// is at or after `since_iso`, and return the per-day rows (one
+/// [`Record`](wafer_block::wire::database::Record) per day that has data,
+/// its day under the `created_at` alias). `aggregates` may carry several
+/// columns — a plain `Count` alongside a conditional `CaseWhenSum` — so a
+/// single statement can back multiple daily series over the same table.
+///
+/// Shared by the table modules that render a daily chart
+/// (`platform_state::request_logs::daily_counts`, the admin dashboard's
+/// users series) so the date-bucket shape is built once.
+pub(crate) async fn daily_grouped(
+    ctx: &dyn wafer_run::context::Context,
+    table: &str,
+    since_iso: &str,
+    extra_filters: Vec<wafer_block::db::Filter>,
+    aggregates: Vec<wafer_block::wire::database::AggregateColumnDef>,
+) -> Result<Vec<wafer_block::wire::database::Record>, wafer_run::WaferError> {
+    use wafer_block::{
+        db::{Filter, FilterOp},
+        wire::database as wire,
+    };
+    let mut filters = vec![Filter {
+        field: "created_at".into(),
+        operator: FilterOp::GreaterEqual,
+        value: serde_json::json!(since_iso),
+    }];
+    filters.extend(extra_filters);
+
+    let req = wire::AggregateRequest {
+        collection: table.to_string(),
+        select_columns: vec![],
+        aggregates,
+        filters: to_wire_filters(&filters),
+        group_by: vec![wire::GroupByDef::DateBucket {
+            field: "created_at".into(),
+        }],
+        sort: vec![],
+        limit: 0,
+    };
+    wafer_core::clients::database::aggregate(ctx, req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
