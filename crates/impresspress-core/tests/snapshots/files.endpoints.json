@@ -1,0 +1,18 @@
+[
+  "DELETE /b/storage/api/buckets/{name}/objects/{key} authenticated",
+  "GET /b/cloudstorage/ authenticated",
+  "GET /b/storage/ authenticated",
+  "GET /b/storage/admin admin",
+  "GET /b/storage/admin/ admin",
+  "GET /b/storage/admin/buckets admin",
+  "GET /b/storage/admin/quotas admin",
+  "GET /b/storage/admin/shares admin",
+  "GET /b/storage/api/buckets authenticated",
+  "GET /b/storage/api/buckets/{name}/objects authenticated",
+  "GET /b/storage/api/buckets/{name}/objects/{key} authenticated",
+  "GET /b/storage/direct/{token} public",
+  "GET /b/storage/{bucket}/ authenticated",
+  "GET /b/storage/{bucket}/{prefix...}/ authenticated",
+  "POST /b/storage/api/buckets authenticated",
+  "POST /b/storage/api/buckets/{name}/objects authenticated"
+]

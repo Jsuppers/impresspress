@@ -1,0 +1,22 @@
+[
+  "DELETE /b/admin/api/iam/roles/{id} admin",
+  "GET /b/admin/ admin",
+  "GET /b/admin/api/iam/roles admin tool=list_roles",
+  "GET /b/admin/api/logs admin tool=list_audit_log",
+  "GET /b/admin/api/settings admin tool=get_site_settings",
+  "GET /b/admin/api/users admin tool=list_users",
+  "GET /b/admin/blocks admin",
+  "GET /b/admin/database admin",
+  "GET /b/admin/email admin",
+  "GET /b/admin/grants admin",
+  "GET /b/admin/logs admin",
+  "GET /b/admin/network admin",
+  "GET /b/admin/permissions admin",
+  "GET /b/admin/storage admin",
+  "GET /b/admin/users admin",
+  "GET /b/admin/variables admin",
+  "PATCH /b/admin/api/iam/roles/{id} admin",
+  "POST /b/admin/api/iam/roles admin",
+  "POST /b/admin/database/query admin",
+  "POST /b/admin/email admin"
+]

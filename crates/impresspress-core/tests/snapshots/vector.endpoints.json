@@ -1,0 +1,13 @@
+[
+  "DELETE /b/vector/api/indexes/{name} authenticated",
+  "DELETE /b/vector/api/{index}/{id} authenticated",
+  "GET /b/vector/ admin",
+  "GET /b/vector/api/indexes authenticated",
+  "GET /b/vector/api/stats authenticated",
+  "GET /b/vector/{name}/ admin",
+  "POST /b/vector/api/embed authenticated",
+  "POST /b/vector/api/indexes authenticated",
+  "POST /b/vector/api/ingest authenticated",
+  "POST /b/vector/api/query authenticated",
+  "POST /b/vector/api/upsert authenticated"
+]
