@@ -207,7 +207,9 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     EndpointRoute::public(HttpMethod::Post, "/b/auth/api/verify", Route::Verify)
         .summary("Verify email address"),
     // Public: issues a verification token to the address's owner and answers
-    // the same message whether or not the address is registered. IP
+    // one constant body whatever the account's state (unregistered, already
+    // verified, inside its 60 s cooldown), so nothing about an address can be
+    // learned from the response; `api::verify::resend_tests` pins that. IP
     // rate-limited (see `rate_limit_for`).
     EndpointRoute::public(
         HttpMethod::Post,
