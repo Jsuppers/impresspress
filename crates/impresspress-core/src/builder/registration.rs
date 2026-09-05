@@ -81,7 +81,7 @@ impl ImpresspressBuilder {
             .clone()
             .unwrap_or_else(|| Arc::new(wafer_run::StaticConfigSource::default()));
         let mut wafer = Wafer::new(config_source)?;
-        wafer.set_admin_block("impresspress/admin");
+        wafer.set_admin_block(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         // 4. Register service blocks
         wafer_core::service_blocks::database::register_with(&mut wafer, database)?;
@@ -91,7 +91,7 @@ impl ImpresspressBuilder {
 
         // `Arc::from(&'static str)` allocates the inline buffer once; no
         // `String::to_string` round-trip needed for a literal identifier.
-        let admin_block_id: Arc<str> = Arc::from("impresspress/admin");
+        let admin_block_id: Arc<str> = Arc::from(crate::blocks::admin::ADMIN_BLOCK_ID);
         let storage_block = crate::blocks::storage::create(storage, admin_block_id);
         wafer.register_block("wafer-run/storage", storage_block.clone())?;
         wafer
