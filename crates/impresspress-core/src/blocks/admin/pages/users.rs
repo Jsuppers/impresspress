@@ -514,8 +514,12 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                                     }
                                     td {
                                         @if revoked.is_empty() {
+                                            // Revocation is auth-ui's
+                                            // `PATCH /b/auth/api/api-keys/{id}`
+                                            // (`Route::RevokeApiKey`); an admin
+                                            // may revoke another user's key.
                                             button .btn .btn--sm .btn--secondary
-                                                hx-post={"/b/auth/api/api-keys/" (record.id) "/revoke"}
+                                                hx-patch={"/b/auth/api/api-keys/" (record.id)}
                                                 hx-target="#users-tab-content"
                                                 hx-confirm="Revoke this API key?"
                                             { "Revoke" }
@@ -545,5 +549,60 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                 }
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::auth::repo::{api_keys, users},
+        test_support::{admin_msg, output_html, TestContext},
+    };
+
+    /// The API-keys tab must revoke through the route auth-ui declares
+    /// (`PATCH /b/auth/api/api-keys/{id}`, `Route::RevokeApiKey`). The old
+    /// control posted to `.../{id}/revoke`, a path no block ever served, so
+    /// the button answered 404 in every deployment.
+    #[tokio::test]
+    async fn api_keys_tab_revokes_through_the_declared_patch_route() {
+        let ctx = TestContext::with_auth().await;
+        let owner = users::insert(
+            &ctx,
+            users::NewUser {
+                email: "owner@example.com".into(),
+                display_name: "Owner".into(),
+                avatar_url: None,
+                role: "user".into(),
+            },
+        )
+        .await
+        .expect("seed user");
+        let key = api_keys::insert(
+            &ctx,
+            api_keys::NewApiKey {
+                user_id: &owner.id,
+                name: "ci",
+                key_hash: "hash-1",
+                key_prefix: "ipk_abc",
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("seed api key");
+
+        let mut msg = admin_msg("retrieve", "/b/admin/users");
+        msg.set_meta("req.query.tab", "api-keys");
+        let html = output_html(users_page(&ctx, &msg).await).await;
+
+        let expected = format!("hx-patch=\"/b/auth/api/api-keys/{}\"", key.id);
+        assert!(
+            html.contains(&expected),
+            "the revoke control must PATCH the declared api-key route: {html}"
+        );
+        assert!(
+            !html.contains("/revoke"),
+            "no admin control may target the unserved `/revoke` path: {html}"
+        );
     }
 }

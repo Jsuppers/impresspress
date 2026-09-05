@@ -1552,3 +1552,291 @@ mod table_tests {
         }
     }
 }
+
+/// Every link an admin page emits must land on a declared endpoint. The
+/// API-key revoke button posted to `/b/auth/api/api-keys/{id}/revoke`, a path
+/// auth-ui never served, and nothing noticed: the pages spell their targets
+/// by hand and no test compared them with a route table. This module renders
+/// every page and fragment the block serves and resolves each `hx-*` URL (and
+/// the network rows' `data-detail-url`) against the table of the block that
+/// owns it, with the method the attribute implies.
+#[cfg(test)]
+mod page_link_tests {
+    use std::collections::BTreeSet;
+
+    use wafer_core::clients::database as db;
+    use wafer_run::{Block as _, BlockCategory, BlockInfo, InputStream};
+
+    use super::*;
+    use crate::{
+        blocks::{
+            auth::repo::{api_keys, users},
+            auth_ui::AuthUiBlock,
+        },
+        endpoint_match::endpoint_auth,
+        test_support::{admin_msg, anon_msg, output_html, TestContext},
+    };
+
+    /// `(attribute prefix, action the attribute implies)`. htmx maps
+    /// `hx-post` to POST (`create`), `hx-get` to GET (`retrieve`),
+    /// `hx-patch`/`hx-put` to PATCH/PUT (both `update`), `hx-delete` to
+    /// DELETE (`delete`). `data-detail-url` is fetched with GET by the
+    /// network page's script.
+    const LINK_ATTRS: &[(&str, &str)] = &[
+        ("hx-get=\"", "retrieve"),
+        ("hx-post=\"", "create"),
+        ("hx-patch=\"", "update"),
+        ("hx-put=\"", "update"),
+        ("hx-delete=\"", "delete"),
+        ("data-detail-url=\"", "retrieve"),
+    ];
+
+    /// `(action, path)` for every link attribute in `html`, query string
+    /// stripped and `&amp;` unescaped.
+    fn links_in(html: &str) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        for (attr, action) in LINK_ATTRS {
+            let mut rest = html;
+            while let Some(pos) = rest.find(attr) {
+                let after = &rest[pos + attr.len()..];
+                let end = after.find('"').expect("attribute value is terminated");
+                let url = after[..end].replace("&amp;", "&");
+                let path = url.split('?').next().unwrap_or("").to_string();
+                out.push((*action, path));
+                rest = &after[end..];
+            }
+        }
+        out
+    }
+
+    struct Seeds {
+        user_id: String,
+        role_id: String,
+        key_id: String,
+        grant_id: String,
+    }
+
+    const PROBE_BLOCK: &str = "impresspress/probe";
+    const PROBE_VARIABLE: &str = "PROBE_SETTING";
+
+    /// The two blocks an admin page may link to, by the router prefix each
+    /// owns (`routing.rs`); a link anywhere else is a new decision.
+    const ADMIN_PREFIX: &str = "/b/admin/";
+    const AUTH_UI_PREFIX: &str = "/b/auth/";
+
+    /// One row behind every per-record control the pages render: a user
+    /// (enable/disable/delete), a custom role (delete), an active API key
+    /// (revoke), a variable (edit), a WRAP grant (delete), a request-log
+    /// row (network detail) and a Feature block (detail, toggle).
+    async fn seeded_ctx() -> (TestContext, Seeds) {
+        let mut ctx = TestContext::with_auth().await;
+        let user = users::insert(
+            &ctx,
+            users::NewUser {
+                email: "member@example.com".into(),
+                display_name: "Member".into(),
+                avatar_url: None,
+                role: "user".into(),
+            },
+        )
+        .await
+        .expect("seed user");
+        let key = api_keys::insert(
+            &ctx,
+            api_keys::NewApiKey {
+                user_id: &user.id,
+                name: "ci",
+                key_hash: "hash-1",
+                key_prefix: "ipk_abc",
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("seed api key");
+        let role = db::create(
+            &ctx,
+            ROLES_TABLE,
+            crate::util::json_map(serde_json::json!({
+                "name": "editor",
+                "description": "",
+                "is_system": 0,
+                "permissions": "[]",
+                "created_at": crate::util::now_rfc3339(),
+                "updated_at": crate::util::now_rfc3339(),
+            })),
+        )
+        .await
+        .expect("seed role");
+        let mut variable = crate::util::json_map(serde_json::json!({
+            "key": PROBE_VARIABLE,
+            "name": PROBE_VARIABLE,
+            "value": "1",
+            "sensitive": 0,
+        }));
+        crate::util::stamp_created(&mut variable);
+        db::create(&ctx, VARIABLES_TABLE, variable)
+            .await
+            .expect("seed variable");
+        let mut grant = crate::util::json_map(serde_json::json!({
+            "grantee": "impresspress/probe",
+            "resource": "impresspress__probe__things",
+            "write": 0,
+            "resource_type": "",
+            "description": "",
+        }));
+        crate::util::stamp_created(&mut grant);
+        let grant = db::create(&ctx, WRAP_GRANTS_TABLE, grant)
+            .await
+            .expect("seed grant");
+        let mut request = crate::util::json_map(serde_json::json!({
+            "flow_id": "f-1",
+            "method": "GET",
+            "path": "/probe",
+            "status": "OK",
+            "status_code": 200,
+            "duration_ms": 5,
+            "error_message": "",
+            "client_ip": "203.0.113.7",
+            "user_id": "",
+        }));
+        crate::util::stamp_created(&mut request);
+        db::create(&ctx, REQUEST_LOGS_TABLE, request)
+            .await
+            .expect("seed request log");
+        // `can_disable` is what makes the detail fragment render the toggle.
+        ctx.register_block_info(
+            PROBE_BLOCK,
+            BlockInfo::new(PROBE_BLOCK, "0.0.1", "http-handler@v1", "probe")
+                .category(BlockCategory::Feature)
+                .can_disable(true),
+        );
+        (
+            ctx,
+            Seeds {
+                user_id: user.id,
+                role_id: role.id,
+                key_id: key.id,
+                grant_id: grant.id,
+            },
+        )
+    }
+
+    /// `(action, path, query parameters)` of one page render.
+    type Page = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+
+    /// Every page and fragment the block serves as HTML, with the query
+    /// parameters that select each tab.
+    const PAGES: &[Page] = &[
+        ("retrieve", "/b/admin/", &[]),
+        ("retrieve", "/b/admin/users", &[]),
+        ("retrieve", "/b/admin/users", &[("tab", "roles")]),
+        ("retrieve", "/b/admin/users", &[("tab", "api-keys")]),
+        ("retrieve", "/b/admin/storage", &[]),
+        ("retrieve", "/b/admin/blocks", &[]),
+        (
+            "retrieve",
+            "/b/admin/blocks/impresspress--probe/detail",
+            &[],
+        ),
+        ("retrieve", "/b/admin/database", &[]),
+        ("retrieve", "/b/admin/database", &[("tab", "sql")]),
+        ("retrieve", "/b/admin/logs", &[]),
+        ("retrieve", "/b/admin/logs", &[("tab", "audit")]),
+        ("retrieve", "/b/admin/settings/email", &[]),
+        ("retrieve", "/b/admin/settings/network", &[]),
+        (
+            "retrieve",
+            "/b/admin/network/detail/inbound",
+            &[("method", "GET"), ("path", "/probe")],
+        ),
+        ("retrieve", "/b/admin/settings/variables", &[]),
+        ("retrieve", "/b/admin/settings/variables", &[("tab", "all")]),
+        ("retrieve", "/b/admin/variables/PROBE_SETTING/edit", &[]),
+        ("retrieve", "/b/admin/settings/permissions", &[]),
+        (
+            "retrieve",
+            "/b/admin/settings/permissions",
+            &[("subtab", "database")],
+        ),
+        ("retrieve", "/b/admin/grants", &[]),
+    ];
+
+    #[tokio::test]
+    async fn every_link_an_admin_page_emits_resolves_to_a_declared_row() {
+        let (ctx, seeds) = seeded_ctx().await;
+        let auth_endpoints = AuthUiBlock::new().info().endpoints;
+        let block = AdminBlock::new();
+
+        let mut collected: BTreeSet<(String, String)> = BTreeSet::new();
+        for (action, path, query) in PAGES {
+            let mut msg = admin_msg(action, path);
+            for (name, value) in *query {
+                msg.set_meta(format!("req.query.{name}"), *value);
+            }
+            let html = output_html(block.handle(&ctx, msg, InputStream::empty()).await).await;
+            for (link_action, link_path) in links_in(&html) {
+                if link_path.starts_with(ADMIN_PREFIX) {
+                    assert!(
+                        endpoint_match::dispatch(&mut anon_msg(link_action, &link_path), ROUTES)
+                            .is_some(),
+                        "{path} emits {link_action} {link_path}, which no admin row serves"
+                    );
+                } else if link_path.starts_with(AUTH_UI_PREFIX) {
+                    assert!(
+                        endpoint_auth(&auth_endpoints, link_action, &link_path).is_some(),
+                        "{path} emits {link_action} {link_path}, which auth-ui does not declare"
+                    );
+                } else {
+                    panic!("{path} emits {link_action} {link_path}: not an admin or auth-ui path");
+                }
+                collected.insert((link_action.to_string(), link_path));
+            }
+        }
+
+        // The guard is only as good as what the pages rendered: each
+        // per-record control must actually have been emitted for its seed.
+        let expected = [
+            (
+                "create",
+                format!("/b/admin/users/{}/disable", seeds.user_id),
+            ),
+            ("delete", format!("/b/admin/users/{}", seeds.user_id)),
+            ("create", "/b/admin/iam/roles".to_string()),
+            ("delete", format!("/b/admin/iam/roles/{}", seeds.role_id)),
+            ("create", "/b/auth/api/api-keys".to_string()),
+            ("update", format!("/b/auth/api/api-keys/{}", seeds.key_id)),
+            ("retrieve", "/b/admin/storage".to_string()),
+            (
+                "retrieve",
+                "/b/admin/blocks/impresspress--probe/detail".to_string(),
+            ),
+            (
+                "create",
+                "/b/admin/blocks/impresspress--probe/toggle".to_string(),
+            ),
+            ("create", "/b/admin/database/query".to_string()),
+            ("retrieve", "/b/admin/network/detail/inbound".to_string()),
+            ("create", "/b/admin/variables".to_string()),
+            (
+                "retrieve",
+                format!("/b/admin/variables/{PROBE_VARIABLE}/edit"),
+            ),
+            ("update", format!("/b/admin/variables/{PROBE_VARIABLE}")),
+            ("create", "/b/admin/grants/rules".to_string()),
+            (
+                "delete",
+                format!("/b/admin/grants/rules/{}", seeds.grant_id),
+            ),
+        ];
+        for (action, path) in expected {
+            assert!(
+                collected.contains(&(action.to_string(), path.clone())),
+                "the pages must emit {action} {path}; collected: {collected:#?}"
+            );
+        }
+    }
+}
