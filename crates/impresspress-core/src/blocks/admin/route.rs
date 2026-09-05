@@ -31,15 +31,10 @@ pub(super) enum AdminRoute<'a> {
     SettingsApi,
     /// `/b/admin/api/extensions*`
     ExtensionsApi,
-    /// `/b/admin/api/storage*` — delegated to `impresspress/files`
-    StorageDelegate,
-    /// `/b/admin/api/cloudstorage<rest>` — delegated to `impresspress/files`.
-    /// Carries the suffix after `/cloudstorage` because the handler must
-    /// build `/admin/b/cloudstorage<rest>` for the delegated meta.
-    CloudStorageDelegate {
-        rest: &'a str,
-    },
-    /// API path under /b/admin/api/ that didn't match any of the above.
+    /// API path under /b/admin/api/ that didn't match any of the above. The
+    /// storage and cloud-storage JSON APIs land here too: the files block
+    /// declares them under its own prefixes (`/b/storage/admin/api/...`,
+    /// `/b/cloudstorage/admin/...`) and this block no longer forwards to it.
     ApiNotFound,
 
     // --- /b/admin/settings/... (consolidated settings tabs) ---
@@ -132,10 +127,6 @@ pub(super) fn route<'a>(path: &'a str, action: &str) -> AdminRoute<'a> {
             "logs" => AdminRoute::LogsApi,
             "settings" => AdminRoute::SettingsApi,
             "extensions" => AdminRoute::ExtensionsApi,
-            "storage" => AdminRoute::StorageDelegate,
-            "cloudstorage" => AdminRoute::CloudStorageDelegate {
-                rest: api_rest.strip_prefix("/cloudstorage").unwrap_or(""),
-            },
             _ => AdminRoute::ApiNotFound,
         };
     }
@@ -340,23 +331,27 @@ mod tests {
                 "retrieve",
                 AdminRoute::ApiNotFound,
             ),
+            // The storage and cloud-storage JSON APIs are declared by the
+            // files block under its own prefixes (`/b/storage/admin/api/...`,
+            // `/b/cloudstorage/admin/...`); the delegation that used to
+            // forward these is gone, so they are unknown API paths here.
             (
-                "storage delegate",
+                "storage delegation removed",
                 "/b/admin/api/storage/buckets",
                 "retrieve",
-                AdminRoute::StorageDelegate,
+                AdminRoute::ApiNotFound,
             ),
             (
-                "cloudstorage delegate",
-                "/b/admin/api/cloudstorage/foo",
+                "cloudstorage delegation removed",
+                "/b/admin/api/cloudstorage/shares",
                 "retrieve",
-                AdminRoute::CloudStorageDelegate { rest: "/foo" },
+                AdminRoute::ApiNotFound,
             ),
             (
-                "cloudstorage empty",
+                "cloudstorage root removed",
                 "/b/admin/api/cloudstorage",
                 "retrieve",
-                AdminRoute::CloudStorageDelegate { rest: "" },
+                AdminRoute::ApiNotFound,
             ),
             (
                 "api unknown",

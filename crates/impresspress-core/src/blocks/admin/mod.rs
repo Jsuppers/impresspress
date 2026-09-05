@@ -234,11 +234,8 @@ crate::impresspress_feature_block! {
 
         // The JSON sub-handlers (users::handle, database::handle, …) match on
         // the normalized `/admin/...` form of the path. That normalized path is
-        // computed here and passed to them as an EXPLICIT argument — no
-        // `req.resource` mutation. `req.resource` is reserved for the genuine
-        // cross-block `call_block` delegations below (StorageDelegate /
-        // CloudStorageDelegate), where the receiving files block reads it as a
-        // fresh request boundary.
+        // computed here and passed to them as an EXPLICIT argument; nothing in
+        // this block rewrites `req.resource`.
         let api_norm = path_owned
             .strip_prefix("/b/admin/api")
             .map(|rest| format!("/admin{rest}"))
@@ -266,19 +263,6 @@ crate::impresspress_feature_block! {
                     })
                     .collect();
                 ok_json(&blocks)
-            }
-            AdminRoute::StorageDelegate => {
-                // The original handler re-set req.resource INSIDE the if branch
-                // (to /admin/<api_rest>). The top-of-function normalization already
-                // did this, but the original re-applied; we mirror by deriving
-                // from path_owned (NOT msg.path() which is now normalized).
-                let api_rest = path_owned.strip_prefix("/b/admin/api").unwrap_or("");
-                msg.set_meta("req.resource", format!("/admin{api_rest}"));
-                ctx.call_block("impresspress/files", msg, input).await
-            }
-            AdminRoute::CloudStorageDelegate { rest } => {
-                msg.set_meta("req.resource", format!("/admin/b/cloudstorage{rest}"));
-                ctx.call_block("impresspress/files", msg, input).await
             }
             AdminRoute::ApiNotFound => err_not_found("not found"),
 
@@ -669,6 +653,65 @@ mod wrap_grant_mutation_tests {
             .expect("list wrap grants");
         assert!(rows.is_empty(), "the grant row must have been removed");
         assert_eq!(audit_count(&ctx, "wrap_grant.delete").await, 1);
+    }
+}
+
+/// The storage and cloud-storage JSON APIs used to be reached through this
+/// block: `/b/admin/api/storage/...` and `/b/admin/api/cloudstorage/...` had
+/// `req.resource` rewritten to a synthetic path and were forwarded to
+/// `impresspress/files` via `call_block`. The files block declares them itself
+/// now (`/b/storage/admin/api/...`, `/b/cloudstorage/admin/...`), so the old
+/// wire paths must answer 404 from this block rather than reach files.
+#[cfg(test)]
+mod delegation_tests {
+    use std::sync::Arc;
+
+    use wafer_run::{Block, InputStream};
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_is_error, TestContext};
+
+    // Registered as `impresspress/files` and answers 200 to anything, so a
+    // request this block still forwarded would come back a success and fail
+    // the assertion for the right reason. (`TestContext::call_block` answers
+    // `NotFound` for an unregistered block, and the real files block now 404s
+    // the synthetic paths itself, so neither would tell forwarding apart from
+    // refusing.)
+    crate::impresspress_feature_block! {
+        struct ProbeFilesBlock;
+        name: "impresspress/files",
+        info: |_this| BlockInfo::new("impresspress/files", "0.0.1", "http-handler@v1", "probe"),
+        handle: |_this, _ctx, _msg, _input| ok_json(&serde_json::json!({ "forwarded": true })),
+    }
+
+    async fn ctx_with_probe_files_block() -> TestContext {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.register_block(
+            ProbeFilesBlock::BLOCK_NAME,
+            Arc::new(ProbeFilesBlock::new()),
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn old_delegated_paths_are_not_found_here() {
+        let ctx = ctx_with_probe_files_block().await;
+        for (action, path) in [
+            ("retrieve", "/b/admin/api/cloudstorage/shares"),
+            ("retrieve", "/b/admin/api/cloudstorage/access-logs"),
+            ("retrieve", "/b/admin/api/cloudstorage/quotas"),
+            ("update", "/b/admin/api/cloudstorage/quotas/u-1"),
+            ("retrieve", "/b/admin/api/storage/buckets"),
+            ("retrieve", "/b/admin/api/storage/stats"),
+        ] {
+            let out = AdminBlock::new()
+                .handle(&ctx, admin_msg(action, path), InputStream::empty())
+                .await;
+            assert!(
+                output_is_error(out, "NotFound").await,
+                "{action} {path} must be NotFound from the admin block"
+            );
+        }
     }
 }
 
