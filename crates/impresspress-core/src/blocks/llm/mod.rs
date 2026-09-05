@@ -43,6 +43,7 @@ enum Route {
     ListModels,
     GetConfig,
     PostConfig,
+    DeleteConfig,
 }
 
 /// Method + path-template dispatch table, mirroring `info().endpoints`.
@@ -110,6 +111,11 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     // Config
     EndpointRoute::new(HttpMethod::Get, "/b/llm/api/config", Route::GetConfig),
     EndpointRoute::new(HttpMethod::Post, "/b/llm/api/config", Route::PostConfig),
+    EndpointRoute::new(
+        HttpMethod::Delete,
+        "/b/llm/api/config/{id}",
+        Route::DeleteConfig,
+    ),
 ];
 
 /// LLM feature block. Owns the provider admin UI + chat thread persistence.
@@ -283,6 +289,23 @@ impl LlmBlock {
         .ok()
     }
 
+    /// `DELETE /b/llm/api/config/{id}` — remove one per-thread override. The
+    /// settings page renders a delete control for every override row; this
+    /// is the route it targets.
+    async fn handle_delete_config(&self, ctx: &dyn Context, msg: &Message) -> OutputStream {
+        let id = crate::util::path_param(msg, "id", "/b/llm/api/config/").to_string();
+        if id.is_empty() {
+            return err_bad_request("Missing override ID");
+        }
+        match db::delete(ctx, SETTINGS_TABLE, &id).await {
+            Ok(()) => ok_json(&contracts::ConfigDeleteResponse { deleted: true }),
+            Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
+                err_not_found("Override not found")
+            }
+            Err(e) => err_internal("Database error", e),
+        }
+    }
+
     // --- Config ---
 
     /// Inter-block discovery: returns the default `(provider, model)` target
@@ -406,6 +429,21 @@ impl LlmBlock {
 /// `path_param(msg, "id", ..)` by name, so a struct declared only to feed
 /// `.path_params::<T>()` would have no runtime user (the `tickets` /
 /// `messages` precedent).
+/// Path parameters of `DELETE /b/llm/api/config/{id}`.
+fn override_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Override row id, as returned by `POST /b/llm/api/config`."
+            }
+        }
+    })
+}
+
 fn provider_id_path_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -540,6 +578,11 @@ impl Block for LlmBlock {
                 .auth(AuthLevel::Authenticated)
                 .input::<contracts::ConfigUpdateRequest>()
                 .output::<contracts::ConfigUpdateResponse>(),
+            BlockEndpoint::delete("/b/llm/api/config/{id}")
+                .summary("Remove a per-thread provider/model override")
+                .auth(AuthLevel::Authenticated)
+                .path_params_schema(override_id_path_schema())
+                .output::<contracts::ConfigDeleteResponse>(),
             // Chat UI is reached from the ADMIN sidebar (nav_groups::admin
             // "Communication" group); the pre-refactor `handle()` gated every
             // non-API page on `is_admin`, so the chat UI was admin-only in
@@ -628,6 +671,7 @@ impl Block for LlmBlock {
             Route::ListModels => routes::list_models(self, ctx, &msg).await,
             Route::GetConfig => self.handle_get_config(ctx).await,
             Route::PostConfig => self.handle_post_config(ctx, input).await,
+            Route::DeleteConfig => self.handle_delete_config(ctx, &msg).await,
         }
     }
 
@@ -669,10 +713,50 @@ mod config_tests {
     use wafer_run::{streams::output::TerminalNotResponse, ErrorCode, InputStream};
 
     use super::*;
-    use crate::test_support::{output_json, TestContext};
+    use crate::test_support::{admin_msg, output_json, TestContext};
 
     fn block() -> LlmBlock {
         LlmBlock::new(Arc::new(provider_admin::NoopProviderAdmin))
+    }
+
+    /// The settings page renders `hx-delete="/b/llm/api/config/{id}"` for
+    /// every per-thread override; that request must reach a route that
+    /// removes the row, not the block's 404 fallback.
+    #[tokio::test]
+    async fn delete_config_removes_the_thread_override() {
+        let ctx = TestContext::with_llm().await;
+        let created = output_json(
+            block()
+                .handle_post_config(
+                    &ctx,
+                    body(serde_json::json!({
+                        "thread_id": "t1",
+                        "provider_block": "openai-main",
+                        "model": "gpt-4o",
+                    })),
+                )
+                .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("row id").to_string();
+
+        let out = block()
+            .handle(
+                &ctx,
+                admin_msg("delete", &format!("/b/llm/api/config/{id}")),
+                InputStream::from_bytes(Vec::new()),
+            )
+            .await;
+
+        assert_eq!(
+            output_json(out).await["deleted"],
+            serde_json::json!(true),
+            "the settings page's delete button must reach a route"
+        );
+        let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+            .await
+            .expect("list overrides");
+        assert!(rows.is_empty(), "the override row must be gone");
     }
 
     fn body(value: serde_json::Value) -> InputStream {
