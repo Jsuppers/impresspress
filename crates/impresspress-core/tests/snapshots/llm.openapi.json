@@ -303,6 +303,50 @@
       "summary": "Update per-thread provider/model override"
     }
   },
+  "/b/llm/api/config/{id}": {
+    "delete": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Override row id, as returned by `POST /b/llm/api/config`.",
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "`DELETE /b/llm/api/config/{id}` response body.",
+                "properties": {
+                  "deleted": {
+                    "description": "Always `true`: a delete that did not happen is an error response.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "deleted"
+                ],
+                "title": "ConfigDeleteResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Remove a per-thread provider/model override"
+    }
+  },
   "/b/llm/api/models": {
     "get": {
       "responses": {
