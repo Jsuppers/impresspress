@@ -113,13 +113,18 @@ Rules for the row:
   slots `.input(f)`, `.output(f)`, `.path_params(f)`, `.query_params(f)`,
   each taking a `fn() -> serde_json::Value`.
 - Schema producers are plain functions. For a `schemars` type the block
-  writes `schema_of::<contracts::LoginRequest>`, a new generic
-  `pub fn schema_of<T: JsonSchema>() -> serde_json::Value` in
-  `endpoint_match.rs` that does exactly what `BlockEndpoint::input::<T>` does
-  today. For the hand-written path-param schemas that already exist as
-  functions (`provider_id_path_schema`, `id_path_schema`, ...) the block
-  passes the function name. Function pointers are `const`, so the table stays
-  a `const` and nothing is built at startup that was not built before.
+  writes `request_schema_of::<contracts::LoginRequest>` for a body, path or
+  query schema and `response_schema_of::<contracts::MeResponse>` for a
+  response schema, two new generic functions in `endpoint_match.rs`. The
+  upstream builders derive under different serde contracts (deserialize for
+  what a client sends, serialize for what the server emits) with settings
+  that are private to wafer-block, so each producer goes through the
+  matching upstream builder on a throwaway endpoint rather than copying those
+  settings, and a row serializes the same bytes the hand-written list did.
+  For the hand-written path-param schemas that already exist as functions
+  (`provider_id_path_schema`, `id_path_schema`, ...) the block passes the
+  function name. Function pointers are `const`, so the table stays a `const`
+  and nothing is built at startup that was not built before.
 
 `pub fn declare<H>(table: &[EndpointRoute<H>]) -> Vec<BlockEndpoint>` maps
 each row to a `BlockEndpoint` through the upstream builders, in table order,
@@ -291,7 +296,9 @@ Test-first, per PR:
   today.
 - **Core.** `endpoint_match` tests cover: `declare` maps every field
   (including a schema producer being called and `agent_tool` being set);
-  `schema_of::<T>` produces the same value as `BlockEndpoint::input::<T>`;
+  `request_schema_of::<T>` produces the same value as
+  `BlockEndpoint::input::<T>` and `response_schema_of::<T>` the same value
+  as `BlockEndpoint::output::<T>`, on a type where the two contracts differ;
   the three constructors set the auth they name and `new` sets `Admin`;
   `normalize_template` no longer exists.
 - **Router.** The existing routing tests that assert a carve-out
@@ -323,7 +330,7 @@ Seven PRs against `main`, each independently green and mergeable:
 
 1. **Core + llm + system.** Add the endpoint-surface snapshot test and
    commit the baseline for every block before any other change. Extend
-   `EndpointRoute`, add `declare` and `schema_of`. Migrate `llm` (already has
+   `EndpointRoute`, add `declare` and the two schema producers. Migrate `llm` (already has
    a table; it gains metadata and drops its `info()` list) and `system` (one
    `{filename}` row replaces the per-asset declarations, see section 2).
    Both snapshots byte-identical for every block except `system`'s surface

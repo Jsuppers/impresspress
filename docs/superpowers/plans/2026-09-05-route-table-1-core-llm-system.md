@@ -358,7 +358,18 @@ Files to add: `crates/impresspress-core/tests/endpoint_surface.rs` and `crates/i
 
 ---
 
-### Task 2: `EndpointRoute` carries the declaration; `declare` and `schema_of`
+### Task 2: `EndpointRoute` carries the declaration; `declare` and the schema producers
+
+> **As executed:** the single `schema_of<T>` below became two producers,
+> `request_schema_of<T>` (goes through `BlockEndpoint::input::<T>`, the
+> deserialize contract, also what `path_params`/`query_params` use) and
+> `response_schema_of<T>` (goes through `BlockEndpoint::output::<T>`, the
+> serialize contract). The upstream builders pin draft 2020-12, inline
+> subschemas and drop `$schema` in a private function, and the two contracts
+> publish different `required` lists for `#[serde(default)]` and
+> `skip_serializing_if` fields, so a bare `schema_for!` is not byte-identical.
+> The tests in `endpoint_match.rs` prove each producer against its builder on
+> a type where the contracts differ. Later tasks use the two names.
 
 **Files:**
 - Modify: `crates/impresspress-core/src/endpoint_match.rs:140-161` (the `EndpointRoute` struct and `impl`), plus new items and tests.
@@ -759,7 +770,7 @@ Claude-Session: https://claude.ai/code/session_01Vfp8g6U7PQTG1kgw2834Tp
 - Modify: `crates/impresspress-core/src/blocks/llm/routes/test_support.rs` (add `routed`)
 
 **Interfaces:**
-- Consumes: `EndpointRoute::{admin, authenticated}`, builders, `declare`, `schema_of` from Task 2.
+- Consumes: `EndpointRoute::{admin, authenticated}`, builders, `declare`, `request_schema_of`, `response_schema_of` from Task 2.
 - Produces: `pub(super) fn routed(msg: Message) -> Message` in `llm/routes/test_support.rs` (binds path vars through `blocks::llm::ROUTES`; panics if no row matches).
 
 - [ ] **Step 1: Write the failing table test in `llm/mod.rs`**
@@ -825,8 +836,8 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     // Chat API
     EndpointRoute::authenticated(HttpMethod::Post, "/b/llm/api/chat", Route::Chat)
         .summary("Send a chat message")
-        .input(schema_of::<contracts::ChatRequest>)
-        .output(schema_of::<contracts::ChatResponse>),
+        .input(request_schema_of::<contracts::ChatRequest>)
+        .output(response_schema_of::<contracts::ChatResponse>),
     // Same request as `/api/chat`; the response is `text/event-stream`, one
     // `data:` frame per `ChatChunk`, then `data: [DONE]` (or `event: error`).
     // No `.output(..)`: it would publish an `application/json` schema for a
@@ -834,7 +845,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     // `ChatChunk`, which carries no JsonSchema derive to mirror.
     EndpointRoute::authenticated(HttpMethod::Post, "/b/llm/api/chat/stream", Route::ChatStream)
         .summary("Send a chat message (SSE streaming)")
-        .input(schema_of::<contracts::ChatRequest>),
+        .input(request_schema_of::<contracts::ChatRequest>),
     // Provider CRUD (specific sub-resource first)
     EndpointRoute::admin(
         HttpMethod::Post,
@@ -843,23 +854,23 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Discover provider models via /v1/models")
     .path_params(provider_id_path_schema)
-    .output(schema_of::<contracts::DiscoveredModelsResponse>),
+    .output(response_schema_of::<contracts::DiscoveredModelsResponse>),
     EndpointRoute::admin(HttpMethod::Get, "/b/llm/api/providers", Route::ListProviders)
         .summary("List configured LLM providers")
-        .output(schema_of::<contracts::ProviderListResponse>),
+        .output(response_schema_of::<contracts::ProviderListResponse>),
     EndpointRoute::admin(HttpMethod::Post, "/b/llm/api/providers", Route::CreateProvider)
         .summary("Create LLM provider")
-        .input(schema_of::<contracts::CreateProviderRequest>)
-        .output(schema_of::<contracts::ProviderView>),
+        .input(request_schema_of::<contracts::CreateProviderRequest>)
+        .output(response_schema_of::<contracts::ProviderView>),
     EndpointRoute::admin(HttpMethod::Patch, "/b/llm/api/providers/{id}", Route::UpdateProvider)
         .summary("Update LLM provider")
         .path_params(provider_id_path_schema)
-        .input(schema_of::<contracts::UpdateProviderRequest>)
-        .output(schema_of::<contracts::ProviderView>),
+        .input(request_schema_of::<contracts::UpdateProviderRequest>)
+        .output(response_schema_of::<contracts::ProviderView>),
     EndpointRoute::admin(HttpMethod::Delete, "/b/llm/api/providers/{id}", Route::DeleteProvider)
         .summary("Delete LLM provider")
         .path_params(provider_id_path_schema)
-        .output(schema_of::<contracts::ProviderDeleteResponse>),
+        .output(response_schema_of::<contracts::ProviderDeleteResponse>),
     // Models (specific sub-resources first)
     EndpointRoute::authenticated(
         HttpMethod::Get,
@@ -868,7 +879,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Model status (ready / loading / unloaded)")
     .path_params(model_path_schema)
-    .output(schema_of::<contracts::ModelStatusResponse>),
+    .output(response_schema_of::<contracts::ModelStatusResponse>),
     // Takes no body; answers `text/event-stream`, one `data:` frame per
     // `LoadProgress`, then `data: [DONE]`. No `.output(..)` for the same
     // reason as `/api/chat/stream`.
@@ -886,22 +897,22 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Unload a model")
     .path_params(model_path_schema)
-    .output(schema_of::<contracts::ModelUnloadResponse>),
+    .output(response_schema_of::<contracts::ModelUnloadResponse>),
     EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/models", Route::ListModels)
         .summary("List available models (aggregated across backends)")
-        .output(schema_of::<contracts::ModelListResponse>),
+        .output(response_schema_of::<contracts::ModelListResponse>),
     // Config
     EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/config", Route::GetConfig)
         .summary("Get default provider/model config")
-        .output(schema_of::<contracts::LlmConfigResponse>),
+        .output(response_schema_of::<contracts::LlmConfigResponse>),
     EndpointRoute::authenticated(HttpMethod::Post, "/b/llm/api/config", Route::PostConfig)
         .summary("Update per-thread provider/model override")
-        .input(schema_of::<contracts::ConfigUpdateRequest>)
-        .output(schema_of::<contracts::ConfigUpdateResponse>),
+        .input(request_schema_of::<contracts::ConfigUpdateRequest>)
+        .output(response_schema_of::<contracts::ConfigUpdateResponse>),
 ];
 ```
 
-Change the import block to `use crate::{endpoint_match::{self, schema_of, EndpointRoute}, http::{err_bad_request, err_internal, err_not_found, ok_json}, util::json_map};` and drop `BlockEndpoint` from the `wafer_run` import (keep `HttpMethod`).
+Change the import block to `use crate::{endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute}, http::{err_bad_request, err_internal, err_not_found, ok_json}, util::json_map};` and drop `BlockEndpoint` from the `wafer_run` import (keep `HttpMethod`).
 
 **If PR #8 has merged**, `Route` also has `DeleteConfig` and `info()` has a `BlockEndpoint::delete("/b/llm/api/config/{id}")` entry with `.auth(AuthLevel::Authenticated)`, `.path_params_schema(override_id_path_schema())` and `.output::<contracts::ConfigDeleteResponse>()`. Carry it as the last row, copying #8's summary text verbatim:
 
@@ -909,7 +920,7 @@ Change the import block to `use crate::{endpoint_match::{self, schema_of, Endpoi
     EndpointRoute::authenticated(HttpMethod::Delete, "/b/llm/api/config/{id}", Route::DeleteConfig)
         .summary("<summary text from PR #8>")
         .path_params(override_id_path_schema)
-        .output(schema_of::<contracts::ConfigDeleteResponse>),
+        .output(response_schema_of::<contracts::ConfigDeleteResponse>),
 ```
 
 and in `handle_delete_config` replace `crate::util::path_param(msg, "id", "/b/llm/api/config/")` with `msg.var("id")`.
@@ -932,7 +943,7 @@ Run: `cargo test -p impresspress-core --lib blocks::llm::table_tests`
 Expected: PASS.
 
 Run: `cargo test -p impresspress-core --test openapi_snapshot --test endpoint_surface`
-Expected: PASS with no diff. If `llm.openapi.json` differs, do not regenerate. Diff the failure output: a schema difference means a `schema_of::<T>` names the wrong `T` or a `.path_params(..)`/`.input(..)`/`.output(..)` is missing from one row; compare the row against the deleted `info()` entry for the same path and fix the row.
+Expected: PASS with no diff. If `llm.openapi.json` differs, do not regenerate. Diff the failure output: a schema difference means a `request_schema_of::<T>` or `response_schema_of::<T>` names the wrong `T` or the wrong contract or a `.path_params(..)`/`.input(..)`/`.output(..)` is missing from one row; compare the row against the deleted `info()` entry for the same path and fix the row.
 
 - [ ] **Step 6: Write the failing test for `routed` in `llm/routes/test_support.rs`**
 
