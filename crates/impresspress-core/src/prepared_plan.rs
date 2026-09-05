@@ -20,8 +20,10 @@ use crate::features::BlockState;
 ///
 /// 2: `PreparedRoute` lost `router_final` (the router's per-path carve-out
 /// flag, deleted with the carve-outs) and `refine_undeclared` became
-/// required. A plan exported by a schema-1 build is refused here rather than
-/// read with a field missing.
+/// required. A plan exported by a schema-1 build is refused rather than read
+/// with a field missing: a real one spells `router_final`, which
+/// `deny_unknown_fields` rejects during deserialization, and one that does
+/// not is rejected by the version gate in `validate`.
 pub const PREPARED_RUNTIME_PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// Fail-closed sentinel used by the backwards-compatible structure-only

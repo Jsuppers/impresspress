@@ -336,7 +336,7 @@ Per the workspace rule, missing builders go upstream first, then consumers. In r
 
 Left for later phases from this work: the admin users page's revoke response is JSON that htmx swaps into the tab (phase 5); `tickets::ENDPOINT_REFERENCE` and legalpages' `:id` HTML text are hand-spelled second listings of paths (phase 5); auth-ui's `POST /b/auth/api/oauth/sync-user` reads an undeclared, ungranted `INTERNAL_SECRET` (B14, phase 2/3); products' hand-written JSON schemas should derive from `contracts.rs` (B11, its own PR); wafer-core's OpenAPI projection should render `{key...}` as `{key}` (section 6).
 
-**Phase 0 (2026-09-05, same day).** Nine Phase 0 fixes are open as independent PRs on the fork `Jsuppers/impresspress`, each branched from `main` with a test that fails before the change:
+**Phase 0 (2026-09-05, same day).** Eleven Phase 0 fixes shipped as independent PRs on the fork `Jsuppers/impresspress`, each branched from `main` with a test that fails before the change:
 
 | PR | Finding | Branch |
 |---|---|---|

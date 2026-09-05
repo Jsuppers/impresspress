@@ -6,10 +6,12 @@
 //! block's `info().endpoints`, and [`dispatch`] matches an incoming request
 //! (its [`RequestAction`]-style action plus resource path) against the same
 //! rows, extracts `{name}`, `{rest...}` and `{rest...}/` path variables into
-//! `req.param.*` meta, and yields the matched handler key. Nothing else in a
-//! block reads a path; the per-block `path.starts_with(...)` /
-//! `strip_prefix(...)` guard chains and the manual single-segment param
-//! parsing that used to live in every `handle()` are gone.
+//! `req.param.*` meta, and yields the matched handler key. The per-block
+//! `path.starts_with(...)` / `strip_prefix(...)` guard chains and the manual
+//! single-segment param parsing that used to live in every `handle()` are
+//! gone; the one deliberate path read left outside `dispatch` is llm's
+//! inter-block `/b/llm/api/internal/default-target` guard, which is not an
+//! HTTP endpoint and is documented at its site.
 //!
 //! ## Percent-encoding
 //!

@@ -49,10 +49,11 @@ enum Route {
 /// readers.
 ///
 /// The two published documents are `Public`. Every admin SSR sub-page,
-/// mutation and JSON endpoint is declared `Admin` in full so the central
-/// router enforces that tier from the declaration, not merely from the
-/// `/b/legalpages/admin` prefix's route-table ordering (the #1 regression
-/// hazard the original declaration package closed).
+/// mutation and JSON endpoint is declared `Admin`, and these declarations
+/// are the gate: the router carries one `Public` prefix entry for
+/// `/b/legalpages` and no `Admin` entry above it, and the handlers do not
+/// re-check `is_admin`. `tests/snapshots/legalpages.endpoints.json` pins
+/// every level.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // Published documents
     EndpointRoute::public(HttpMethod::Get, "/b/legalpages/terms", Route::PublicTerms)

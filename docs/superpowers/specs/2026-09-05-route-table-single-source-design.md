@@ -403,7 +403,8 @@ or refined the design above, one line each with the PR that made it:
   trailing slash (the path must end in `/`, the remainder must be
   non-empty), for files' nested folder pages (#15).
 - files declares thirteen rows, not eight: the six relocated admin rows,
-  the two `cloudstorage` user rows and the share delete, plus
+  the four `cloudstorage` user rows (share list, share create, share
+  delete, quota), plus
   `GET /b/storage/api/search`, `GET /b/storage/api/recent` and
   `DELETE /b/storage/api/buckets/{name}`, served but never declared, now
   `authenticated`; the two object rows use `{key...}` in place of `{key}`,
@@ -416,9 +417,11 @@ or refined the design above, one line each with the PR that made it:
   requests for the shapes only the prefix admitted (`GET
   /b/products/webhooks`, `GET /b/auth/api/verify/extra`, `GET /b/static/a/b`)
   are denied before dispatch instead of reaching the block's 404; an
-  undeclared path under the former `Admin` entries `/b/admin/settings`,
-  `/b/legalpages/admin` and `/b/legalpages/api` falls to `Authenticated`
-  and is answered 404 by the block's table dispatch. The prefix table stays
+  undeclared path under the former `Admin` entries `/b/legalpages/admin`
+  and `/b/legalpages/api` falls to `Authenticated` and is answered 404 by
+  the block's table dispatch (the deleted `/b/admin/settings` entry sat
+  under `/b/admin/`, which stays `Admin`, so nothing changed there). The
+  prefix table stays
   hand-written (fourteen entries: one prefix per block, `/health` and
   `/b/static/` for system, `/b/storage/` and `/b/cloudstorage/` for files,
   the inspector proxy), kept honest by a two-way test against

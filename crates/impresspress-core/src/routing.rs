@@ -469,7 +469,10 @@ pub fn effective_access(
     ep: &BlockEndpoint,
     extra_routes: &[ExtraRoute],
 ) -> AuthLevel {
-    let prefix_matches = |prefix: &str| ep.path == prefix || ep.path.starts_with(prefix);
+    // The same matcher `route_to_block` uses, bare form of a slash-suffixed
+    // prefix included, so the resolver can never disagree with the router
+    // about which entry serves a declared path.
+    let prefix_matches = |prefix: &str| route_prefix_matches(prefix, &ep.path);
 
     // Built-in `ROUTES` win on prefix collision and are searched first —
     // same order, same matching, as `route_to_block`.
@@ -1528,6 +1531,22 @@ mod tests {
     /// is declared `Admin`. The router must gate the bare form at the same
     /// level, not at the fail-closed `Authenticated` default it falls back to
     /// when no declaration matches.
+    /// `effective_access` must resolve a route the way `route_to_block` does,
+    /// including the bare form of a slash-suffixed prefix (`/b/vector` for
+    /// the `/b/vector/` entry): a row declared at that bare path is served by
+    /// the router, so the resolver must not fail closed to `Admin` and hide
+    /// the tool the router admits.
+    #[test]
+    fn effective_access_matches_the_bare_form_of_a_slash_suffixed_prefix() {
+        let info =
+            wafer_run::BlockInfo::new("impresspress/vector", "0.0.1", "http-handler@v1", "t")
+                .endpoints(vec![
+                    wafer_run::BlockEndpoint::get("/b/vector").auth(AuthLevel::Public)
+                ]);
+        let ep = &info.endpoints[0];
+        assert_eq!(effective_access(&info, ep, &[]), AuthLevel::Public);
+    }
+
     #[tokio::test]
     async fn bare_index_path_is_gated_at_the_declared_level() {
         use crate::test_support::{auth_msg, TestContext};
