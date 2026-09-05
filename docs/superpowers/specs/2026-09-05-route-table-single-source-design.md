@@ -158,6 +158,11 @@ does today. Two reasons:
   logo. The right answer would depend on table order, which is the hazard the
   exact lookup was introduced to remove.
 
+`{name...}` may also be followed by a trailing slash, meaning a folder-style
+listing; the path must end in `/` and the bound remainder must be non-empty.
+This is the shape files already declared for nested folder pages; the matcher
+did not support it.
+
 The system surface snapshot therefore changes in PR 1 from the per-asset lines
 to two lines, `GET /health public` and `GET /b/static/{filename} public`. The
 router's access decision for an asset request is unchanged: `endpoint_auth`
