@@ -5047,11 +5047,10 @@ async fn a_product_owned_but_not_created_by_the_seller_answers_the_same_everywhe
 // delete at least left nothing behind.
 //
 // Authorization is the whole risk here. `/b/products` is a PUBLIC route
-// prefix, so what a caller faces is the tier the endpoint DECLARES — and
-// `ProductsBlock::handle` reaches `handle_user` from two wire spellings, so a
-// tier proven on one says nothing about the other. Every test below therefore
-// drives `dispatch_routed` (the real `route_to_block` → `check_access` →
-// `ProductsBlock::handle`), never a handler directly.
+// prefix, so what a caller faces is the tier the endpoint DECLARES, and only
+// the router enforces it. Every test below therefore drives `dispatch_routed`
+// (the real `route_to_block` → `check_access` → `ProductsBlock::handle`),
+// never `harness::dispatch` or a handler directly, which skip `check_access`.
 
 /// Seed a live product owned by `owner`, the way seller-created products
 /// carry ownership: `owner_kind = "user"` with `owner_id` AND `created_by`

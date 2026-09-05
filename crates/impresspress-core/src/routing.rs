@@ -1862,9 +1862,9 @@ mod tests {
         assert!(crate::test_support::output_is_error(out, "PermissionDenied").await);
     }
 
-    /// Task 6 fix-round-1 finding: the products block's own `dispatch_admin`
-    /// tests (`handlers::handle_admin`) call the handler directly and never
-    /// go through `route_to_block`/`check_access`, so they prove the
+    /// Task 6 fix-round-1 finding: the products block's own `harness::dispatch`
+    /// tests enter `ProductsBlock::handle` directly and never go through
+    /// `route_to_block`/`check_access`, so they prove the
     /// restore handler's behaviour but not its authorization boundary —
     /// nothing previously exercised the fact that
     /// `POST /b/products/api/admin/products/{id}/restore` is
@@ -1925,8 +1925,8 @@ mod tests {
         );
 
         // 2. A non-admin authenticated caller is rejected — the exact
-        //    boundary `dispatch_user`-based tests cannot see, since they
-        //    call `handlers::handle_user` directly and skip
+        //    boundary `harness::dispatch`-based tests cannot see, since they
+        //    enter `ProductsBlock::handle` directly and skip
         //    `route_to_block`/`check_access` entirely.
         let denied = route_to_block(
             &ctx,

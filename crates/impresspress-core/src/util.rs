@@ -294,8 +294,8 @@ pub fn url_path_encode(s: &str) -> String {
 /// in the Service Worker), so an id encoded into an `href` arrives with its
 /// escapes intact. Route matching has to happen on that encoded form — a
 /// decoded `/` would split the route — so the decode belongs on the extracted
-/// value, which is what `endpoint_match::dispatch_path` and the products
-/// block's SSR page dispatch both do with it.
+/// value, which is what `endpoint_match::dispatch` does with every variable
+/// it binds.
 ///
 /// A sequence that does not decode to valid UTF-8 yields `s` unchanged.
 /// Non-text bytes are never a record id or an object key here, so the

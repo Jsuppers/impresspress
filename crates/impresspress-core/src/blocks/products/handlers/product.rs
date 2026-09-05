@@ -1,5 +1,5 @@
 //! Product CRUD: admin (`/b/products/api/admin/products`) and user-owned
-//! (`/b/products/products`, gated on `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS`).
+//! (`/b/products/api/products`, gated on `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS`).
 //!
 //! Every response is a `contracts::ProductView` (or a list of them) built
 //! from the row; every write body is a typed request whose fields are the
@@ -1086,15 +1086,14 @@ pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message)
 /// `pages::product_manager`. A second rule here is how those three disagreed
 /// with each other once already.
 ///
-/// Unlike the admin route it lives on `USER_ROUTES`, so it answers at BOTH
-/// `/b/products/api/products/{id}/restore` and the raw
-/// `/b/products/products/{id}/restore` — `ProductsBlock::handle` enters
-/// `handle_user` from both. That is safe here precisely because the tier is
-/// the fallback tier: the undeclared spelling resolves to `Authenticated`
-/// too, so neither spelling is weaker than the declaration, and ownership —
-/// not the URL — is what refuses seller B. An `Admin` route could not live
-/// here for exactly that reason, which is what
-/// `dispatch_tables_are_backed_by_declared_endpoints` enforces.
+/// `POST /b/products/api/products/{id}/restore`, declared `Authenticated`
+/// in `routes::ROUTES` and served at that one spelling: the raw
+/// `/b/products/products/{id}/restore` the block used to answer as well is
+/// not a route (`routes::table_tests` and
+/// `the_former_alias_spelling_of_a_seller_route_is_not_found` pin that).
+/// The tier admits every logged-in caller, so ownership — the
+/// `verify_deleted_product_owner` check above, not the URL — is what refuses
+/// seller B.
 pub(super) async fn handle_user_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id").to_string();
     if id.is_empty() {
