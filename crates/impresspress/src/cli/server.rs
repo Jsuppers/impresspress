@@ -184,10 +184,10 @@ pub async fn build_native_runtime(
         ));
     }
     // A read error here is always a genuine operational failure (backend
-    // outage/corruption) — `load_and_seed_block_settings` never fabricates
+    // outage/corruption) — `block_settings::load_and_seed` never fabricates
     // "every block enabled" out of one. Bail rather than boot with a
     // security-relevant setting silently defaulted open.
-    let features = impresspress_core::features::load_and_seed_block_settings(&database)
+    let features = impresspress_core::platform_state::block_settings::load_and_seed(&database)
         .await
         .map_err(|e| anyhow!("load block settings: {e}"))?;
 

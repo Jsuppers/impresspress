@@ -123,7 +123,7 @@ pub async fn seed_and_load_variables(
 }
 
 /// Load + hash-gate-seed block settings from the browser database. Delegates to
-/// the shared `impresspress_core::features::load_and_seed_block_settings` over
+/// the shared `impresspress_core::platform_state::block_settings::load_and_seed` over
 /// `BrowserDatabaseService`, so the browser runs the exact #222 hash-gate
 /// Cloudflare and native do.
 ///
@@ -134,7 +134,7 @@ pub async fn seed_and_load_variables(
 pub async fn load_block_settings(
     db: &Arc<dyn DatabaseService>,
 ) -> Result<impresspress_core::features::BlockSettings, String> {
-    impresspress_core::features::load_and_seed_block_settings(db)
+    impresspress_core::platform_state::block_settings::load_and_seed(db)
         .await
         .map_err(|e| format!("load block settings: {e}"))
 }

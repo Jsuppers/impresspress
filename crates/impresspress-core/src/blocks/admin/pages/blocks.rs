@@ -1,10 +1,9 @@
 use maud::html;
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
 use crate::{
-    blocks::admin::BLOCK_SETTINGS_TABLE as BLOCK_SETTINGS,
+    platform_state::block_settings,
     ui::{
         self,
         components::{empty_state, tab_navigation, Tab},
@@ -42,22 +41,11 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Load block enabled/disabled state from block_settings table. Collect
     // into a `BTreeMap` so the downstream iteration order is stable across
     // process restarts (a `HashMap` would randomize per-process).
-    let block_settings_rows = db::list_all(ctx, BLOCK_SETTINGS, vec![])
-        .await
-        .unwrap_or_default();
+    let block_settings_rows = block_settings::list_all(ctx).await.unwrap_or_default();
 
     let block_enabled: std::collections::BTreeMap<String, bool> = block_settings_rows
         .iter()
-        .map(|r| {
-            let name = r
-                .data
-                .get("block_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let enabled = r.data.get("enabled").and_then(|v| v.as_i64()).unwrap_or(1) != 0;
-            (name, enabled)
-        })
+        .map(|row| (row.block_name.clone(), row.enabled))
         .collect();
 
     // Append unloaded blocks (in block_settings but not in the runtime) as
@@ -248,11 +236,10 @@ pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputSt
     // An unreadable state is an error, not "enabled": the write below is
     // derived from it, so a guess here would flip the block off the back of
     // an outage.
-    let current_enabled =
-        match super::super::settings::block_settings::is_enabled(ctx, block_name).await {
-            Ok(enabled) => enabled,
-            Err(e) => return crate::http::err_internal("Failed to read block setting", e),
-        };
+    let current_enabled = match block_settings::is_enabled(ctx, block_name).await {
+        Ok(enabled) => enabled,
+        Err(e) => return crate::http::err_internal("Failed to read block setting", e),
+    };
     let new_enabled = !current_enabled;
 
     // Persist first. Only write the audit event — and only re-render the
@@ -261,9 +248,7 @@ pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputSt
     // failed toggle still logged "block.enable"/"block.disable" as if it
     // had happened and re-rendered the page showing the new (unpersisted)
     // state.
-    if let Err(e) =
-        super::super::settings::block_settings::set_enabled(ctx, block_name, new_enabled).await
-    {
+    if let Err(e) = block_settings::set_enabled(ctx, block_name, new_enabled).await {
         return crate::http::err_internal("Failed to persist block setting", e);
     }
 
@@ -291,8 +276,7 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
     let block_opt = blocks.iter().find(|b| b.name == block_name);
 
     // Check block enabled state via shared helper (audit finding #12).
-    let is_enabled = match super::super::settings::block_settings::is_enabled(ctx, block_name).await
-    {
+    let is_enabled = match block_settings::is_enabled(ctx, block_name).await {
         Ok(enabled) => enabled,
         Err(e) => return crate::http::err_internal("Failed to read block setting", e),
     };
@@ -567,7 +551,7 @@ mod toggle_feature_tests {
         let ctx = TestContext::with_admin().await;
 
         assert!(
-            super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
+            block_settings::is_enabled(&ctx, "impresspress/files")
                 .await
                 .expect("read block setting"),
             "no row yet ⇒ defaults enabled"
@@ -580,7 +564,7 @@ mod toggle_feature_tests {
             .expect("toggle against a healthy database must succeed");
 
         assert!(
-            !super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
+            !block_settings::is_enabled(&ctx, "impresspress/files")
                 .await
                 .expect("read block setting"),
             "toggle must have persisted the disabled state"
@@ -594,13 +578,8 @@ mod toggle_feature_tests {
     #[tokio::test]
     async fn toggle_refuses_when_current_state_cannot_be_read() {
         let ctx = TestContext::with_admin().await;
-        let failing = FailingDbOpContext::new(
-            ctx.clone(),
-            vec![(
-                "database.list",
-                super::super::super::settings::BLOCK_SETTINGS_TABLE,
-            )],
-        );
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.list", block_settings::TABLE)]);
         let out = handle_toggle_feature(&failing, &toggle_files_msg()).await;
 
         assert!(
@@ -608,7 +587,7 @@ mod toggle_feature_tests {
             "an unreadable block state must surface as an error"
         );
         assert!(
-            super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
+            block_settings::is_enabled(&ctx, "impresspress/files")
                 .await
                 .expect("read block setting"),
             "nothing may be written when the current state could not be read"

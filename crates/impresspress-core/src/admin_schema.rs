@@ -7,10 +7,10 @@
 //! migration runner (`migration_helper.rs`) — can reference them as a single
 //! source of truth.
 //!
-//! `blocks/admin` re-exports from here (`settings.rs`, `logs.rs`), so existing
-//! `blocks::admin::{BLOCK_SETTINGS_TABLE, REQUEST_LOGS_TABLE}` references
-//! continue to resolve. The variables table already moved to
-//! `crate::platform_state::variables`; the rest follows.
+//! `blocks/admin` re-exports from here (`logs.rs`), so existing
+//! `blocks::admin::REQUEST_LOGS_TABLE` references continue to resolve. The
+//! variables and block_settings tables already moved to
+//! `crate::platform_state`; the request log follows.
 //!
 //! Why a sibling of `blocks/`?
 //! - The constants describe the on-disk schema contract, not block logic, and
@@ -21,13 +21,6 @@
 //! - WRAP grants are still declared by `AdminBlock::info()` (the schema-owning
 //!   block); other modules read rows via runtime grants, not by re-declaring
 //!   ownership.
-
-/// Per-block enable/config settings (one row per block). Owned by the admin
-/// block.
-///
-/// `pub` (not `pub(crate)`) because consumers outside `impresspress-core`
-/// reference this table by name.
-pub const BLOCK_SETTINGS_TABLE: &str = "impresspress__admin__block_settings";
 
 /// HTTP request log entries (one row per inbound request). Owned by the admin
 /// block.

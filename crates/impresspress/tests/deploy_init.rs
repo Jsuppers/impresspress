@@ -105,7 +105,10 @@ async fn deploy_init_first_run_ok_and_second_run_idempotent() {
         ..Default::default()
     };
     let rows = db
-        .list(impresspress_core::admin_schema::BLOCK_SETTINGS_TABLE, &opts)
+        .list(
+            impresspress_core::platform_state::block_settings::TABLE,
+            &opts,
+        )
         .await
         .expect("list block_settings")
         .records;

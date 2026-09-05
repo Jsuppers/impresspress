@@ -102,7 +102,7 @@ mod tests {
             crate::platform_state::variables::TABLE
         ));
         assert!(!writes_invalidate_config_snapshot(
-            crate::blocks::admin::BLOCK_SETTINGS_TABLE
+            crate::platform_state::block_settings::TABLE
         ));
         assert!(!writes_invalidate_config_snapshot("unrelated_table"));
 

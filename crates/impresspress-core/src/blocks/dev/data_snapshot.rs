@@ -74,7 +74,7 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
-    platform_state::variables,
+    platform_state::{block_settings, variables},
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -210,7 +210,7 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     STRIPE_EVENTS_TABLE, // webhook idempotency ledger — this instance's own delivery history
     // --- admin: operational logs, and infrastructure state the runtime
     // re-derives at every boot rather than something anyone authored. ---
-    admin_schema::BLOCK_SETTINGS_TABLE, // per-block enable flag + migration-hash tracking
+    block_settings::TABLE, // per-block enable flag + migration-hash tracking
     admin_schema::REQUEST_LOGS_TABLE,
     AUDIT_LOGS_TABLE,
     STORAGE_ACCESS_LOGS_TABLE,

@@ -7,8 +7,8 @@
 //! excluded from `cargo test --workspace`.
 
 use crate::{
-    blocks::admin::{BLOCK_SETTINGS_TABLE, WRAP_GRANTS_TABLE},
-    platform_state::variables,
+    blocks::admin::WRAP_GRANTS_TABLE,
+    platform_state::{block_settings, variables},
 };
 
 /// Tables that this wrapper caches in KV.
@@ -24,7 +24,7 @@ pub enum CachedTable {
 pub fn classify_table(table: &str) -> Option<CachedTable> {
     match table {
         t if t == variables::TABLE => Some(CachedTable::Variables),
-        t if t == BLOCK_SETTINGS_TABLE => Some(CachedTable::BlockSettings),
+        t if t == block_settings::TABLE => Some(CachedTable::BlockSettings),
         _ => None,
     }
 }
@@ -41,7 +41,7 @@ pub const CONFIG_VERSION_KEY: &str = "cfg:v1:config_version";
 /// grants at build). Tables read fresh per request (roles, permissions,
 /// user_roles) do NOT bump.
 pub fn bumps_config_version(table: &str) -> bool {
-    table == variables::TABLE || table == BLOCK_SETTINGS_TABLE || table == WRAP_GRANTS_TABLE
+    table == variables::TABLE || table == block_settings::TABLE || table == WRAP_GRANTS_TABLE
 }
 
 use wafer_block::db::{Filter, FilterOp, ListOptions};
@@ -107,7 +107,7 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
 /// Two callers with deliberately different outcomes, both served by this one
 /// constructor so the shape cannot drift between them:
 ///
-/// - [`crate::features::load_block_settings`]'s full-table read — recognized
+/// - [`crate::platform_state::block_settings::load`]'s full-table read — recognized
 ///   by [`read_key`] and cached under the `__all__` sentinel;
 /// - `D1ConfigSource`'s single variables snapshot — deliberately NOT cached
 ///   (see `read_key`'s zero-filter arm, and the test that pins it). One
@@ -761,7 +761,7 @@ mod tests {
         for table in [CachedTable::Variables, CachedTable::BlockSettings] {
             let table_name = match table {
                 CachedTable::Variables => variables::TABLE,
-                CachedTable::BlockSettings => BLOCK_SETTINGS_TABLE,
+                CachedTable::BlockSettings => block_settings::TABLE,
             };
             assert_eq!(
                 classify_table(table_name),

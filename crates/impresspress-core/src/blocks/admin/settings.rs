@@ -9,100 +9,11 @@ use super::{
 };
 use crate::{
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    platform_state::variables::{self, NewVariable, VariablePatch},
-    util::json_map,
+    platform_state::{
+        block_settings::{self, BlockSettingsPatch},
+        variables::{self, NewVariable, VariablePatch},
+    },
 };
-
-/// Helpers for reading and writing the per-block `enabled` flag in
-/// [`BLOCK_SETTINGS_TABLE`]. Use these instead of inlining the select/upsert
-/// query in every callsite.
-pub mod block_settings {
-    use wafer_block::db::{Filter, FilterOp, ListOptions};
-    use wafer_core::clients::database as db;
-    use wafer_run::{context::Context, WaferError};
-
-    use super::BLOCK_SETTINGS_TABLE as TABLE;
-
-    /// Return whether `block_name` is enabled.
-    ///
-    /// Reads the `enabled` column from [`BLOCK_SETTINGS_TABLE`]. Defaults to
-    /// `true` when no row exists (all blocks are enabled by default). A
-    /// read failure is returned, never mapped to "enabled": the toggle
-    /// handler derives the state it writes from this answer, so guessing
-    /// here would flip a block on the strength of an outage.
-    pub async fn is_enabled(ctx: &dyn Context, block_name: &str) -> Result<bool, WaferError> {
-        let rows = db::list(
-            ctx,
-            TABLE,
-            &ListOptions {
-                columns: Some(vec!["enabled".into()]),
-                filters: vec![Filter {
-                    field: "block_name".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(block_name),
-                }],
-                skip_count: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-        Ok(rows
-            .records
-            .first()
-            .and_then(|r| r.data.get("enabled").and_then(|v| v.as_i64()))
-            .map(|v| v != 0)
-            .unwrap_or(true))
-    }
-
-    /// Persist the `enabled` flag for `block_name` in [`BLOCK_SETTINGS_TABLE`].
-    ///
-    /// Uses an upsert keyed on `block_name`, so it works whether or not a row
-    /// already exists.
-    ///
-    /// Routes through the structured [`db::upsert_by_field`] (get-by-field →
-    /// `update` | `create`) rather than a raw SQL upsert. The structured path
-    /// hits `DatabaseService::{create,update}`, which the Cloudflare
-    /// `KvCachedD1DatabaseService` invalidates — so toggling a block clears
-    /// the cached `block_settings` read (both the per-block key and the
-    /// full-table all-rows key). Block code has no raw-SQL path at all (no
-    /// `db::execute`/`db::query`), but the invalidation dependency on
-    /// `create`/`update` is the reason `set_enabled` stays structured instead
-    /// of being collapsed into a single atomic statement: an atomic upsert
-    /// would leave the eager `load_block_settings` cache stale until its TTL.
-    /// `created_at` is intentionally omitted: it is preserved on update and
-    /// synthesized by the backend on insert.
-    pub async fn set_enabled(
-        ctx: &dyn Context,
-        block_name: &str,
-        enabled: bool,
-    ) -> Result<(), String> {
-        let enabled_int: i64 = if enabled { 1 } else { 0 };
-        let mut data = super::json_map(serde_json::json!({
-            "block_name": block_name,
-            "enabled": enabled_int,
-            // Admin-UI write — mark this row as user-owned so the boot-time
-            // seed never overwrites it.
-            "seed_defaults_hash": crate::features::USER_EDITED_SENTINEL,
-        }));
-        crate::util::stamp_updated(&mut data);
-
-        db::upsert_by_field(
-            ctx,
-            TABLE,
-            "block_name",
-            serde_json::json!(block_name),
-            data,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("block_settings::set_enabled failed: {e}"))
-    }
-}
-
-// The block_settings table name still lives in the leaf `crate::admin_schema`
-// module; re-exported here so the nested `super::BLOCK_SETTINGS_TABLE`
-// references keep resolving until it moves to `platform_state`.
-pub use crate::admin_schema::BLOCK_SETTINGS_TABLE;
 
 /// `GET /b/admin/api/settings/all`.
 pub(super) async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
@@ -487,16 +398,12 @@ pub async fn seed_defaults(ctx: &dyn Context) {
     // we paid this run). Matches the "silent on error" stance of the
     // per-var upsert/create calls above; the `block_settings` row may not
     // exist yet (admin migrations create it on the same `Init` pass),
-    // which is why we use `upsert_block_settings_fields` rather than
-    // assuming a row.
-    let mut patch = std::collections::HashMap::new();
-    patch.insert(
-        "seed_defaults_hash".to_string(),
-        serde_json::Value::String(code_hash),
-    );
-    if let Err(e) =
-        crate::migration_helper::upsert_block_settings_fields(ctx, ADMIN_BLOCK_NAME, patch).await
-    {
+    // which is why we use `upsert_fields` rather than assuming a row.
+    let patch = BlockSettingsPatch {
+        seed_defaults_hash: Some(code_hash),
+        ..Default::default()
+    };
+    if let Err(e) = block_settings::upsert_fields(ctx, ADMIN_BLOCK_NAME, patch).await {
         tracing::warn!(
             err = %e,
             "seed_defaults: failed to stamp seed_defaults_hash; next cold start will re-run the bulk list_all"
@@ -506,13 +413,8 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
 #[cfg(test)]
 mod tests {
-    use wafer_block::db::{Filter, FilterOp};
-
     use super::*;
-    use crate::{
-        test_support::{FailingDbOpContext, TestContext},
-        util::RecordExt,
-    };
+    use crate::test_support::TestContext;
 
     /// Seed one `variables` row with an explicit `sensitive` flag.
     async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: bool) {
@@ -666,23 +568,18 @@ mod tests {
         );
 
         // 3. Read the stamped hash from the block_settings row directly.
-        let admin_rows = db::list_all(
-            &ctx,
-            crate::blocks::admin::settings::BLOCK_SETTINGS_TABLE,
-            vec![Filter {
-                field: "block_name".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(ADMIN_BLOCK_NAME.to_string()),
-            }],
-        )
-        .await
-        .expect("list block_settings");
+        let admin_rows: Vec<_> = block_settings::list_all(&ctx)
+            .await
+            .expect("list block_settings")
+            .into_iter()
+            .filter(|row| row.block_name == ADMIN_BLOCK_NAME)
+            .collect();
         assert_eq!(
             admin_rows.len(),
             1,
             "admin block_settings row should be present after first seed_defaults"
         );
-        let stamped_hash = admin_rows[0].str_field("seed_defaults_hash").to_string();
+        let stamped_hash = admin_rows[0].seed_defaults_hash.clone();
         let code_hash = seed_payload_hash(&crate::config_vars::shared_config_vars());
         assert_eq!(
             stamped_hash, code_hash,
@@ -745,109 +642,6 @@ mod tests {
         assert!(
             count > 0,
             "mismatched snapshot hash should still run the seed; got 0 rows"
-        );
-    }
-
-    /// `block_settings::is_enabled` defaults to `true` when no row exists.
-    #[tokio::test]
-    async fn block_settings_is_enabled_defaults_to_true_when_no_row() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-
-        let enabled = block_settings::is_enabled(&ctx, "impresspress/nonexistent")
-            .await
-            .expect("no row is not an error");
-        assert!(
-            enabled,
-            "is_enabled should return true when no block_settings row exists"
-        );
-    }
-
-    /// A read failure is not "enabled": the toggle handler writes the
-    /// opposite of whatever this returns, so an outage must be an error.
-    #[tokio::test]
-    async fn block_settings_is_enabled_surfaces_read_errors() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-        let failing = FailingDbOpContext::new(ctx, vec![("database.list", BLOCK_SETTINGS_TABLE)]);
-
-        assert!(
-            block_settings::is_enabled(&failing, "impresspress/files")
-                .await
-                .is_err(),
-            "an unreadable block_settings table must not read as enabled"
-        );
-    }
-
-    /// `block_settings::set_enabled` stamps `seed_defaults_hash` with the
-    /// [`USER_EDITED_SENTINEL`] so the boot-time seed will never clobber an
-    /// admin-UI toggle. See `plan_seed_decisions` in `features.rs`.
-    #[tokio::test]
-    async fn block_settings_set_enabled_marks_row_user_edited() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-
-        let name = "impresspress/some-block";
-        block_settings::set_enabled(&ctx, name, false)
-            .await
-            .expect("set_enabled false");
-
-        let rows = db::list_all(
-            &ctx,
-            BLOCK_SETTINGS_TABLE,
-            vec![Filter {
-                field: "block_name".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(name.to_string()),
-            }],
-        )
-        .await
-        .expect("list block_settings");
-        assert_eq!(rows.len(), 1, "exactly one block_settings row for {name}");
-        assert_eq!(
-            rows[0].str_field("seed_defaults_hash"),
-            crate::features::USER_EDITED_SENTINEL,
-            "set_enabled must stamp seed_defaults_hash with the user-edited sentinel",
-        );
-    }
-
-    /// `block_settings::set_enabled` / `is_enabled` round-trip: write false,
-    /// read back false; write true, read back true.
-    #[tokio::test]
-    async fn block_settings_set_enabled_round_trip() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-
-        let name = "impresspress/some-block";
-
-        // Disable then read back.
-        block_settings::set_enabled(&ctx, name, false)
-            .await
-            .expect("set_enabled false");
-        assert!(
-            !block_settings::is_enabled(&ctx, name)
-                .await
-                .expect("read block setting"),
-            "is_enabled should return false after set_enabled(false)"
-        );
-
-        // Re-enable then read back.
-        block_settings::set_enabled(&ctx, name, true)
-            .await
-            .expect("set_enabled true");
-        assert!(
-            block_settings::is_enabled(&ctx, name)
-                .await
-                .expect("read block setting"),
-            "is_enabled should return true after set_enabled(true)"
         );
     }
 

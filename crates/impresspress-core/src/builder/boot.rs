@@ -71,7 +71,7 @@ pub trait BootHooks {
     ///
     /// Implementations call [`crate::platform_state::variables::seed_auto_generated`] /
     /// [`crate::platform_state::variables::seed_and_load`] /
-    /// [`crate::features::load_and_seed_block_settings`] as appropriate and
+    /// [`crate::platform_state::block_settings::load_and_seed`] as appropriate and
     /// publish the results into the shared `ConfigService` / `BlockSettings`
     /// handle / crypto secret the runtime already holds.
     ///

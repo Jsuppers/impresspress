@@ -965,7 +965,7 @@ where
         .await?;
         let plan_draft = if prepare_plan && report.ok {
             let final_settings =
-                impresspress_core::features::load_block_settings(&built.db).await?;
+                impresspress_core::platform_state::block_settings::load(&built.db).await?;
             let final_grants = impresspress_core::boot::load_wrap_grants_from_db(&built.db).await;
             built.plan_exporter.publish_block_settings(final_settings)?;
             built.plan_exporter.publish_wrap_grants(&final_grants)?;
@@ -1160,7 +1160,7 @@ where
                 .collect(),
         )
     } else {
-        impresspress_core::features::load_block_settings(&db).await?
+        impresspress_core::platform_state::block_settings::load(&db).await?
     };
 
     // 3. Build the ConfigService map. After dropping the D1 env_vars
@@ -1840,9 +1840,10 @@ impl impresspress_core::builder::BootHooks for CfBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
         impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
 
-        let block_settings = impresspress_core::features::load_and_seed_block_settings(&self.db)
-            .await
-            .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
+        let block_settings =
+            impresspress_core::platform_state::block_settings::load_and_seed(&self.db)
+                .await
+                .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
         *self
             .block_settings_handle
             .write()

@@ -27,4 +27,5 @@
 //! declarations, because the `impresspress__admin__` prefix makes it the
 //! WRAP schema owner.
 
+pub mod block_settings;
 pub mod variables;
