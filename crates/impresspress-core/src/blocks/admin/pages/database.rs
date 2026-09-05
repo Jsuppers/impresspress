@@ -22,7 +22,6 @@ use crate::{
         html_response, icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
-        SiteConfig, UserInfo,
     },
     util::{now_millis, parse_form_body, url_path_encode as pct_encode},
 };
@@ -365,9 +364,6 @@ fn render_sql_error(msg: &str) -> Markup {
 }
 
 pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
-    let user = UserInfo::from_message(msg);
-
     let tables = introspect_table_summaries(ctx).await;
     let backend = crate::db_backend(ctx).await;
     let selected = msg.query("table");
@@ -390,10 +386,9 @@ pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     );
 
     admin_page(
+        ctx,
+        msg,
         "Database",
-        &config,
-        "/b/admin/database",
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Database"),
             primary_action: Some(backend_badge(backend, tables.len())),
@@ -401,8 +396,8 @@ pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             show_palette: true,
         },
         body,
-        msg,
     )
+    .await
 }
 
 pub async fn handle_database_query(

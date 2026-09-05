@@ -10,14 +10,10 @@ use crate::{
         components, icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
-        SiteConfig, UserInfo,
     },
 };
 
 pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
-    let user = UserInfo::from_message(msg);
-
     let refresh_action = html! {
         button .btn .btn--secondary .btn--sm
             hx-get="/b/admin/storage"
@@ -50,10 +46,9 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     );
 
     admin_page(
+        ctx,
+        msg,
         "Storage",
-        &config,
-        "/b/admin/storage",
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Storage"),
             primary_action: Some(refresh_action),
@@ -61,8 +56,8 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             show_palette: true,
         },
         body,
-        msg,
     )
+    .await
 }
 
 async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {

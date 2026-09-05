@@ -11,14 +11,11 @@ use crate::{
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
-        SiteConfig, UserInfo,
     },
     util::RecordExt,
 };
 
 pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
-    let user = UserInfo::from_message(msg);
     let tab = msg.query("tab");
     let active_tab = match tab {
         "audit" => "audit",
@@ -69,10 +66,9 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     );
 
     admin_page(
+        ctx,
+        msg,
         "Logs",
-        &config,
-        "/b/admin/logs",
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Logs"),
             primary_action: Some(refresh_action),
@@ -80,8 +76,8 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             show_palette: true,
         },
         body,
-        msg,
     )
+    .await
 }
 
 async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
