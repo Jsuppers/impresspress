@@ -1158,3 +1158,79 @@ async fn an_extra_route_to_a_block_that_declares_no_endpoints_keeps_its_tier() {
     assert_eq!(response_status(stream).await, 200);
     assert_eq!(ctx.calls(), vec!["gizza-ai/chat".to_string()]);
 }
+
+/// The six admin JSON rows the files block took over from the admin block's
+/// delegation. They used to sit behind the coarse `Admin` prefix `/b/admin/`;
+/// now they live under the `Public`-tier prefixes `/b/storage/` and
+/// `/b/cloudstorage/`, so each row's declared `AuthLevel` is the entire gate.
+/// `(req.action, path)`; the quota update is a PATCH, hence `update`.
+#[cfg(feature = "block-files")]
+const FILES_ADMIN_API_ROWS: &[(&str, &str)] = &[
+    ("retrieve", "/b/cloudstorage/admin/shares"),
+    ("retrieve", "/b/cloudstorage/admin/access-logs"),
+    ("retrieve", "/b/cloudstorage/admin/quotas"),
+    ("update", "/b/cloudstorage/admin/quotas/u-1"),
+    ("retrieve", "/b/storage/admin/api/buckets"),
+    ("retrieve", "/b/storage/admin/api/stats"),
+];
+
+#[cfg(feature = "block-files")]
+fn files_admin_api_msg(action: &str, path: &str, caller: Option<(&str, bool)>) -> Message {
+    let mut msg = match caller {
+        None => make_msg(path),
+        Some((user, false)) => make_msg_with_user(path, user),
+        Some((user, true)) => make_msg_with_admin(path, user),
+    };
+    msg.set_meta("req.action", action);
+    msg
+}
+
+/// Anonymous and logged-in non-admin callers are refused before dispatch on
+/// every relocated admin row, driving `route_to_block` with the block's real
+/// declaration. Failures are collected so one run reports every case.
+#[cfg(feature = "block-files")]
+#[tokio::test]
+async fn files_admin_api_rows_reject_anonymous_and_non_admin() {
+    let infos = vec![real_block_info("impresspress/files")];
+    let mut failures = Vec::new();
+    for (action, path) in FILES_ADMIN_API_ROWS {
+        for (label, caller) in [("anonymous", None), ("non-admin", Some(("user-1", false)))] {
+            let ctx = RecordingContext::new();
+            let msg = files_admin_api_msg(action, path, caller);
+            let s =
+                routing::route_to_block(&ctx, msg, InputStream::empty(), &AllEnabled, &infos, &[])
+                    .await;
+            let status = response_status(s).await;
+            if status != 403 || !ctx.calls().is_empty() {
+                failures.push(format!(
+                    "{label} {action} {path}: status {status}, dispatched to {:?}",
+                    ctx.calls()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An admin reaches dispatch on every relocated admin row, so the gate
+/// above is a gate and not a dead route.
+#[cfg(feature = "block-files")]
+#[tokio::test]
+async fn files_admin_api_rows_allow_admin() {
+    let infos = vec![real_block_info("impresspress/files")];
+    let mut failures = Vec::new();
+    for (action, path) in FILES_ADMIN_API_ROWS {
+        let ctx = RecordingContext::new();
+        let msg = files_admin_api_msg(action, path, Some(("admin-1", true)));
+        let s = routing::route_to_block(&ctx, msg, InputStream::empty(), &AllEnabled, &infos, &[])
+            .await;
+        let status = response_status(s).await;
+        if status != 200 || ctx.calls() != vec!["impresspress/files".to_string()] {
+            failures.push(format!(
+                "admin {action} {path}: status {status}, dispatched to {:?}",
+                ctx.calls()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

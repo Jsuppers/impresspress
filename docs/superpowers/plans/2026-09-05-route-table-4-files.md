@@ -4,7 +4,7 @@
 
 **Goal:** Migrate `files` so one `const ROUTES: &[EndpointRoute<Route>]` over wire paths in `blocks/files/mod.rs` is the block's only description of its HTTP surface: it dispatches every request and generates `info().endpoints` through `endpoint_match::declare`. Move the admin-side storage JSON API from the admin block's `call_block` delegation (wire paths `/b/admin/api/storage/...` and `/b/admin/api/cloudstorage/...`, rewritten to synthetic `/admin/storage/...` and `/admin/b/cloudstorage/...` before forwarding) under the prefixes the router already sends to files, as `admin` rows the router enforces from the declaration. Declare the user cloud-storage API and the three user storage-API paths the block served but never declared, at the level each handler already enforces. Delete the admin block's two delegation arms. Make a declared shape the matcher could not match (`{prefix...}/`) matchable.
 
-**Architecture:** PR 1 made `EndpointRoute<H>` carry the declaration and added `declare`, `request_schema_of`, `response_schema_of`. `files` today has four path matchers: a `starts_with` guard chain in `mod.rs:141-249`, a nine-row `EndpointRoute::new` sub-table in `storage/mod.rs` reached for `/b/storage/api/*`, a `match (action, path)` in `cloud.rs` over both real (`/b/cloudstorage/...`) and synthetic (`/admin/b/cloudstorage/...`) paths, and a `match (action, path)` in `storage/admin.rs` over synthetic `/admin/storage/...` paths, plus prefix-strip readers in `storage/params.rs`, `share.rs` and `cloud.rs`. All of that becomes one 30-row table and handlers that read `msg.var(..)`. The admin block loses `AdminRoute::{StorageDelegate, CloudStorageDelegate}` and the `req.resource` rewrite.
+**Architecture:** PR 1 made `EndpointRoute<H>` carry the declaration and added `declare`, `request_schema_of`, `response_schema_of`. `files` today has four path matchers: a `starts_with` guard chain in `mod.rs:141-249`, a nine-row `EndpointRoute::new` sub-table in `storage/mod.rs` reached for `/b/storage/api/*`, a `match (action, path)` in `cloud.rs` over both real (`/b/cloudstorage/...`) and synthetic (`/admin/b/cloudstorage/...`) paths, and a `match (action, path)` in `storage/admin.rs` over synthetic `/admin/storage/...` paths, plus prefix-strip readers in `storage/params.rs`, `share.rs` and `cloud.rs`. All of that becomes one 29-row table and handlers that read `msg.var(..)`. The admin block loses `AdminRoute::{StorageDelegate, CloudStorageDelegate}` and the `req.resource` rewrite.
 
 **Tech Stack:** Rust, `wafer-run` at rev `7d47e5e` (`BlockEndpoint`, `AuthLevel`, `HttpMethod`), `serde_json`, `tokio` tests, nightly `rustfmt`, `clippy -D warnings`.
 
@@ -40,7 +40,7 @@ The read-through found four places where the task as written could not be done; 
 |---|---|
 | `crates/impresspress-core/src/endpoint_match.rs` | `match_template` accepts `{name...}/`; module doc lists the shape; six new tests. |
 | `docs/superpowers/specs/2026-09-05-route-table-single-source-design.md` | Section 2 gains the `{name...}/` sentence. |
-| `crates/impresspress-core/src/blocks/files/mod.rs` | `Route` (28 variants), 30-row `ROUTES` over wire paths, three named schema producers, `user_preamble(Route)`, `info()` = `declare(ROUTES)`, `handle` = dispatch + preamble + one `match`; `test_support::routed`, `table_tests`, `handle_tests`. |
+| `crates/impresspress-core/src/blocks/files/mod.rs` | `Route` (28 variants), 29-row `ROUTES` over wire paths, three named schema producers, `user_preamble(Route)`, `info()` = `declare(ROUTES)`, `handle` = dispatch + preamble + one `match`; `test_support::routed`, `table_tests`, `handle_tests`. |
 | `crates/impresspress-core/src/blocks/files/storage/mod.rs` | No table, no `handle`, no `handle_admin`; re-exports the nine user handlers and `handle_stats` at `pub(in crate::blocks::files)`; keeps `test_helpers`. |
 | `crates/impresspress-core/src/blocks/files/storage/{buckets,objects,search}.rs` | Handlers become `pub(in crate::blocks::files)`; bodies unchanged. |
 | `crates/impresspress-core/src/blocks/files/storage/admin.rs` | Only `handle_stats` (its test sends the new wire path). |
@@ -135,7 +135,7 @@ Claude-Session: https://claude.ai/code/session_01Vfp8g6U7PQTG1kgw2834Tp
 ```
 refactor(files): declare the HTTP surface from one route table
 
-`ROUTES` (30 rows over wire paths) now carries the summaries, auth
+`ROUTES` (29 rows over wire paths) now carries the summaries, auth
 levels, schemas and tags `info()` listed by hand for 16 of them, and
 `info()` is `declare(ROUTES)`. The `starts_with` chain, the
 `/b/storage/api` sub-table, and the `match (action, path)` arms in

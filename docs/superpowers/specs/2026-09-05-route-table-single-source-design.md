@@ -228,13 +228,20 @@ already sends to files: `/b/cloudstorage/admin/shares`,
 `/b/cloudstorage/admin/quotas/{id}`, `/b/storage/admin/api/buckets` and
 `/b/storage/admin/api/stats`, each an `admin` row the router enforces from
 the declaration. The admin block's two delegation arms and the
-`req.resource` rewrite are deleted, and the admin storage page
-(`admin/pages/storage.rs`) points at the new paths. The two `cloud.rs` user
-paths (`/b/cloudstorage/shares`, `/b/cloudstorage/quota`) and the share
-delete become declared `authenticated` rows. The `starts_with` chain in
+`req.resource` rewrite are deleted; the admin storage page
+(`admin/pages/storage.rs`) never called the files block and is untouched.
+The two `cloud.rs` user paths (`/b/cloudstorage/shares`,
+`/b/cloudstorage/quota`) and the share delete become declared
+`authenticated` rows, as do the three `/b/storage/api` paths the sub-table
+served but never declared: `GET /b/storage/api/search`,
+`GET /b/storage/api/recent` and `DELETE /b/storage/api/buckets/{name}`. The
+two object rows declare `{key...}`, the template dispatch always matched, in
+place of the `{key}` no nested key could match; that re-templates two surface
+lines and one OpenAPI path key. The `starts_with` chain in
 `files/mod.rs:141–246` is replaced by the table. The files surface snapshot
-gains the eight rows listed here; the admin surface snapshot does not change,
-because the admin block never declared the delegated paths.
+gains the thirteen rows listed here (six `admin`, seven `authenticated`); the
+admin surface snapshot does not change, because the admin block never
+declared the delegated paths.
 
 This is the one place the spec departs from the design agreed in chat, which
 said the files block would declare `/b/admin/api/storage/...`. That path is

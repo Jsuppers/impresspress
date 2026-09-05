@@ -908,6 +908,24 @@ mod handle_tests {
         assert_eq!(quota.max_storage_bytes, 5);
     }
 
+    /// The share link is the block's one public row, and its handler reads
+    /// the `{token}` the row binds. A bogus token is read, fails signature
+    /// verification and answers `NotFound`; a handler reading any other
+    /// variable name would see an empty token and answer `InvalidArgument`
+    /// ("Missing share token") instead, which is what this distinguishes.
+    #[tokio::test]
+    async fn share_link_handler_reads_the_bound_token() {
+        let ctx = TestContext::with_files().await;
+        let out = FilesBlock::new()
+            .handle(
+                &ctx,
+                anon_msg("retrieve", "/b/storage/direct/bogus"),
+                InputStream::empty(),
+            )
+            .await;
+        assert!(output_is_error(out, "NotFound").await);
+    }
+
     /// The router gates the user rows `Authenticated` from the declaration;
     /// the block keeps refusing an anonymous caller itself as belt and braces.
     #[tokio::test]
