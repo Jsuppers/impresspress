@@ -111,19 +111,19 @@ fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> M
     }
 }
 
-/// DELETE `/b/userportal/sessions/{token_hash_hex}`. Scoped to caller's
-/// user_id — refusing to revoke another user's session looks indistinguishable
-/// from "no such session" (returns 200 with no body either way; htmx removes
-/// the row). Returns 401 if anonymous, 400 if hex is malformed.
-pub async fn handle_revoke(ctx: &dyn Context, msg: &Message, sub: &str) -> OutputStream {
+/// DELETE `/b/userportal/sessions/{hash}` (the token hash, hex). Scoped to
+/// caller's user_id — refusing to revoke another user's session looks
+/// indistinguishable from "no such session" (returns 200 with no body either
+/// way; htmx removes the row). Returns 401 if anonymous, 400 if the bound
+/// `{hash}` is missing or malformed.
+pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
         return ResponseBuilder::new()
             .status(401)
             .body(b"unauthenticated".to_vec(), "text/plain");
     }
-    let hex_part = sub.strip_prefix("/sessions/").unwrap_or("");
-    let hash = match decode_hex(hex_part) {
+    let hash = match decode_hex(msg.var("hash")) {
         Some(h) if !h.is_empty() => h,
         _ => {
             return ResponseBuilder::new()
@@ -144,9 +144,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        blocks::auth::{
-            repo::sessions::{insert, NewSession},
-            service::hash_token,
+        blocks::{
+            auth::{
+                repo::sessions::{insert, NewSession},
+                service::hash_token,
+            },
+            userportal::test_support::routed,
         },
         test_support::{anon_msg, auth_msg, output_html, output_status, TestContext},
     };
@@ -226,8 +229,8 @@ mod tests {
     #[tokio::test]
     async fn revoke_anonymous_returns_401() {
         let ctx = TestContext::with_auth().await;
-        let msg = anon_msg("delete", "/b/userportal/sessions/aabb");
-        let resp = handle_revoke(&ctx, &msg, "/sessions/aabb").await;
+        let msg = routed(anon_msg("delete", "/b/userportal/sessions/aabb"));
+        let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 401);
     }
 
@@ -235,8 +238,8 @@ mod tests {
     async fn revoke_malformed_hex_returns_400() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        let msg = auth_msg("delete", "/b/userportal/sessions/zzz", "user-a");
-        let resp = handle_revoke(&ctx, &msg, "/sessions/zzz").await;
+        let msg = routed(auth_msg("delete", "/b/userportal/sessions/zzz", "user-a"));
+        let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 400);
     }
 
@@ -251,13 +254,43 @@ mod tests {
         );
 
         let hex_hash: String = (0..32).map(|_| "01".to_string()).collect();
-        let msg = auth_msg(
+        let msg = routed(auth_msg(
             "delete",
             &format!("/b/userportal/sessions/{hex_hash}"),
             "user-a",
-        );
-        let resp = handle_revoke(&ctx, &msg, &format!("/sessions/{hex_hash}")).await;
+        ));
+        let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 200);
+        assert_eq!(
+            sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
+            0
+        );
+    }
+
+    /// `handle_revoke` reads `{hash}` only as the route table bound it: the
+    /// same message is refused unrouted and deletes the session once it has
+    /// been through `ROUTES`.
+    #[tokio::test]
+    async fn revoke_reads_only_the_bound_hash() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
+        let hex_hash: String = (0..32).map(|_| "01".to_string()).collect();
+        let path = format!("/b/userportal/sessions/{hex_hash}");
+
+        let unrouted = handle_revoke(&ctx, &auth_msg("delete", &path, "user-a")).await;
+        assert_eq!(
+            output_status(unrouted).await,
+            400,
+            "nothing bound means nothing to revoke"
+        );
+        assert_eq!(
+            sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
+            1
+        );
+
+        let through_table = handle_revoke(&ctx, &routed(auth_msg("delete", &path, "user-a"))).await;
+        assert_eq!(output_status(through_table).await, 200);
         assert_eq!(
             sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
             0
@@ -274,12 +307,12 @@ mod tests {
 
         // user-a tries to revoke user-b's session.
         let hex_hash: String = (0..32).map(|_| "02".to_string()).collect();
-        let msg = auth_msg(
+        let msg = routed(auth_msg(
             "delete",
             &format!("/b/userportal/sessions/{hex_hash}"),
             "user-a",
-        );
-        let resp = handle_revoke(&ctx, &msg, &format!("/sessions/{hex_hash}")).await;
+        ));
+        let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 200);
         // user-b's session is still there — no leak.
         assert_eq!(

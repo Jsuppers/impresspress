@@ -167,9 +167,10 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
     }
 }
 
+/// `PATCH /b/auth/api/api-keys/{id}`. `{id}` is read only as the route table
+/// bound it.
 pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let path = msg.path();
-    let id = path.rsplit_once('/').map(|(_, id)| id).unwrap_or("");
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing key ID");
     }
@@ -189,9 +190,10 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
+/// `DELETE /b/auth/api/api-keys/{id}`. `{id}` is read only as the route table
+/// bound it.
 pub async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let path = msg.path();
-    let id = path.rsplit_once('/').map(|(_, id)| id).unwrap_or("");
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing key ID");
     }
@@ -208,5 +210,90 @@ pub async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match api_keys::delete(ctx, id).await {
         Ok(_) => ok_json(&serde_json::json!({"deleted": true})),
         Err(e) => err_internal("Database error", e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::{auth::repo::users, auth_ui::test_support::routed},
+        test_support::{auth_msg, output_is_error, output_json, TestContext},
+    };
+
+    /// A user row plus one API key it owns; returns `(user_id, key_id)`.
+    async fn seed_user_with_key(ctx: &TestContext) -> (String, String) {
+        let user = users::insert(
+            ctx,
+            users::NewUser {
+                email: "owner@example.com".into(),
+                display_name: "Owner".into(),
+                avatar_url: None,
+                role: "user".into(),
+            },
+        )
+        .await
+        .expect("seed user");
+        let key = api_keys::insert(
+            ctx,
+            api_keys::NewApiKey {
+                user_id: &user.id,
+                name: "ci",
+                key_hash: "not-a-real-hash",
+                key_prefix: "sb_0000000",
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("seed api key");
+        (user.id, key.id)
+    }
+
+    /// `handle_revoke` reads `{id}` only as the route table bound it: the
+    /// same message is refused unrouted and revokes the key once it has been
+    /// through `ROUTES`.
+    #[tokio::test]
+    async fn revoke_reads_only_the_bound_id() {
+        let ctx = TestContext::with_auth().await;
+        let (owner, key_id) = seed_user_with_key(&ctx).await;
+        let path = format!("/b/auth/api/api-keys/{key_id}");
+
+        let unrouted = handle_revoke(&ctx, &auth_msg("update", &path, &owner)).await;
+        assert!(
+            output_is_error(unrouted, "InvalidArgument").await,
+            "nothing bound means nothing to revoke"
+        );
+        let key = api_keys::find_by_id(&ctx, &key_id).await.unwrap().unwrap();
+        assert!(key.revoked_at.is_none(), "an unrouted call must not revoke");
+
+        let through_table = handle_revoke(&ctx, &routed(auth_msg("update", &path, &owner))).await;
+        assert_eq!(
+            output_json(through_table).await["message"],
+            "API key revoked"
+        );
+        let key = api_keys::find_by_id(&ctx, &key_id).await.unwrap().unwrap();
+        assert!(key.revoked_at.is_some());
+    }
+
+    /// Same contract for `handle_delete`.
+    #[tokio::test]
+    async fn delete_reads_only_the_bound_id() {
+        let ctx = TestContext::with_auth().await;
+        let (owner, key_id) = seed_user_with_key(&ctx).await;
+        let path = format!("/b/auth/api/api-keys/{key_id}");
+
+        let unrouted = handle_delete(&ctx, &auth_msg("delete", &path, &owner)).await;
+        assert!(
+            output_is_error(unrouted, "InvalidArgument").await,
+            "nothing bound means nothing to delete"
+        );
+        assert!(
+            api_keys::find_by_id(&ctx, &key_id).await.unwrap().is_some(),
+            "an unrouted call must not delete"
+        );
+
+        let through_table = handle_delete(&ctx, &routed(auth_msg("delete", &path, &owner))).await;
+        assert_eq!(output_json(through_table).await["deleted"], true);
+        assert!(api_keys::find_by_id(&ctx, &key_id).await.unwrap().is_none());
     }
 }

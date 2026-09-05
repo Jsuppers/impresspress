@@ -487,7 +487,7 @@ fn endpoint_auth_exact(
         if action_for_method(ep.method) != action {
             continue;
         }
-        if match_template(&normalize_template(&ep.path), path).is_some() {
+        if match_template(&ep.path, path).is_some() {
             strictest = Some(match strictest {
                 Some(cur) if auth_rank(cur) >= auth_rank(ep.auth) => cur,
                 _ => ep.auth,
@@ -515,27 +515,6 @@ pub(crate) fn auth_rank(level: AuthLevel) -> u8 {
         AuthLevel::Authenticated => 1,
         AuthLevel::Admin => 2,
     }
-}
-
-/// Normalize a declared endpoint template to the matcher's `{rest...}` syntax.
-///
-/// Endpoint paths historically use a few spellings for a trailing
-/// rest-parameter (`{prefix...}`, `:hash`). The matcher's canonical form is
-/// `{name}` / `{name...}`; this converts the legacy `:name` colon style to
-/// `{name}` so declared endpoints and dispatch tables agree without forcing a
-/// rewrite of every `info()` block at once.
-fn normalize_template(template: &str) -> String {
-    template
-        .split('/')
-        .map(|seg| {
-            if let Some(name) = seg.strip_prefix(':') {
-                format!("{{{name}}}")
-            } else {
-                seg.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 #[cfg(test)]
@@ -864,14 +843,6 @@ mod tests {
         assert_eq!(
             endpoint_auth(&eps, "retrieve", "/b/storage/admin/"),
             Some(AuthLevel::Admin)
-        );
-    }
-
-    #[test]
-    fn normalize_colon_style() {
-        assert_eq!(
-            normalize_template("/b/userportal/sessions/:hash"),
-            "/b/userportal/sessions/{hash}"
         );
     }
 

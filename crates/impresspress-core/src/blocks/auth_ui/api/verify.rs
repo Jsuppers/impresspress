@@ -110,29 +110,30 @@ pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStrea
     };
 
     let email_lower = body.email.trim().to_lowercase();
+    // The endpoint is public. Every branch below answers this same body so
+    // an anonymous caller cannot tell a registered address from an
+    // unregistered one, an already-verified account from an unverified one,
+    // or an account inside its cooldown from one outside it.
     let safe_msg = "If that email is registered, a verification link has been sent.";
+    let constant = || ok_json(&serde_json::json!({"message": safe_msg}));
 
     let Ok(Some(user)) = users::find_by_email(ctx, &email_lower).await else {
-        return ok_json(&serde_json::json!({"message": safe_msg}));
+        return constant();
     };
 
     if user.email_verified {
-        return ok_json(&serde_json::json!({"message": "Email is already verified."}));
+        return constant();
     }
 
-    // Rate limit: 60 second cooldown
+    // 60 second cooldown: inside it, neither mint a token nor say so.
     let last_sent = users::last_verification_sent(ctx, &user.id)
         .await
         .unwrap_or_default();
     if !last_sent.is_empty() {
         if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last_sent) {
             let elapsed = chrono::Utc::now() - last.with_timezone(&chrono::Utc);
-            let remaining = 60 - elapsed.num_seconds();
-            if remaining > 0 {
-                return ok_json(&serde_json::json!({
-                    "message": format!("Please wait {} seconds before requesting another email.", remaining),
-                    "retry_after": remaining
-                }));
+            if elapsed.num_seconds() < 60 {
+                return constant();
             }
         }
     }
@@ -153,7 +154,7 @@ pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStrea
 
     super::send_template_email(ctx, "verification", &email_lower, &new_token).await;
 
-    ok_json(&serde_json::json!({"message": safe_msg}))
+    constant()
 }
 
 /// Return an HTML page response (for verify endpoints opened in browser).
@@ -206,4 +207,91 @@ fn html_respond(
         ),
     );
     ui::html_response(markup)
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use wafer_run::InputStream;
+
+    use super::*;
+    use crate::{
+        blocks::auth::repo::users::{self, NewUser},
+        test_support::{output_json, TestContext},
+    };
+
+    fn body(email: &str) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({ "email": email })).expect("serialize body"),
+        )
+    }
+
+    async fn seed(ctx: &TestContext, email: &str, verified: bool) -> String {
+        let user = users::insert(
+            ctx,
+            NewUser {
+                email: email.into(),
+                display_name: "U".into(),
+                avatar_url: None,
+                role: "user".into(),
+            },
+        )
+        .await
+        .expect("insert user");
+        users::set_email_verified(ctx, &user.id, verified)
+            .await
+            .expect("set email_verified");
+        user.id
+    }
+
+    /// The endpoint is public. An anonymous caller must not be able to tell
+    /// a registered address from an unregistered one by the response, so
+    /// every branch answers the same constant body: no "already verified",
+    /// no "please wait", no `retry_after`.
+    #[tokio::test]
+    async fn resend_answers_the_same_body_whatever_the_account_state() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        seed(&ctx, "verified@example.com", true).await;
+        let cooling = seed(&ctx, "cooling@example.com", false).await;
+        users::set_verification_token(&ctx, &cooling, "hash", &crate::util::now_rfc3339())
+            .await
+            .expect("set token");
+
+        let unregistered = output_json(handle_resend(&ctx, body("nobody@example.com")).await).await;
+        let already = output_json(handle_resend(&ctx, body("verified@example.com")).await).await;
+        let cooldown = output_json(handle_resend(&ctx, body("cooling@example.com")).await).await;
+
+        assert_eq!(
+            already, unregistered,
+            "a verified account must not be distinguishable from an unregistered one"
+        );
+        assert_eq!(
+            cooldown, unregistered,
+            "an account inside its cooldown must not be distinguishable from an unregistered one"
+        );
+        assert!(unregistered.get("retry_after").is_none());
+    }
+
+    /// Constant responses do not relax the cooldown: a request inside the
+    /// window neither mints a new token nor moves the cooldown clock.
+    #[tokio::test]
+    async fn resend_inside_the_cooldown_does_not_rotate_the_token() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let id = seed(&ctx, "cooling@example.com", false).await;
+        let sent_at = crate::util::now_rfc3339();
+        users::set_verification_token(&ctx, &id, "hash-before", &sent_at)
+            .await
+            .expect("set token");
+
+        let _ = handle_resend(&ctx, body("cooling@example.com"))
+            .await
+            .collect_buffered()
+            .await;
+
+        assert_eq!(
+            users::last_verification_sent(&ctx, &id)
+                .await
+                .expect("read cooldown"),
+            sent_at
+        );
+    }
 }
