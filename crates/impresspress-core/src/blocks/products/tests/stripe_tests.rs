@@ -3867,15 +3867,9 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
             ),
         ],
     );
-    let path = format!("/admin/b/products/products/{product_id}/offers/{offer_id}");
+    let path = format!("/b/products/api/admin/products/{product_id}/offers/{offer_id}");
     let (msg, input) = delete_msg(&path, "admin_1");
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::AlreadyExists
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::AlreadyExists).await);
     assert_eq!(
         repo::offers::get_managed(&ctx, &offer_id)
             .await
@@ -3926,13 +3920,13 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
         ],
     );
     let (msg, input) = delete_msg(&path, "admin_1");
-    let archived = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let archived = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(archived["status"], "archived");
     assert_eq!(retry_requests.lock().unwrap().len(), 2);
 
     let idempotent_requests = register_stripe_sequence(&mut ctx, vec![]);
     let (msg, input) = delete_msg(&path, "admin_1");
-    let archived_again = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let archived_again = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(archived_again["status"], "archived");
     assert!(idempotent_requests.lock().unwrap().is_empty());
 }
@@ -4034,9 +4028,9 @@ async fn seller_suspension_archives_the_catalog_of_soft_deleted_products_too() {
             ),
         ],
     );
-    let path = "/admin/b/products/sellers/deleted_suspend_account/suspend";
+    let path = "/b/products/api/admin/sellers/deleted_suspend_account/suspend";
     let (msg, input) = admin_create_msg(path, serde_json::json!({}));
-    let suspended = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let suspended = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(suspended["status"], "suspended");
 
     {
@@ -4140,15 +4134,9 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
             ),
         ],
     );
-    let path = "/admin/b/products/sellers/seller_suspend_account/suspend";
+    let path = "/b/products/api/admin/sellers/seller_suspend_account/suspend";
     let (msg, input) = admin_create_msg(path, serde_json::json!({}));
-    assert!(
-        output_is_error(
-            dispatch_admin(&ctx, msg, input).await,
-            ErrorCode::AlreadyExists,
-        )
-        .await
-    );
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::AlreadyExists,).await);
     assert_eq!(
         db::get(&ctx, repo::seller_accounts::TABLE, "seller_suspend_account")
             .await
@@ -4196,7 +4184,7 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
         ],
     );
     let (msg, input) = admin_create_msg(path, serde_json::json!({}));
-    let suspended = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let suspended = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(suspended["status"], "suspended");
     assert_eq!(
         db::get(&ctx, repo::products::TABLE, product_id)
@@ -4369,7 +4357,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
         }),
     );
     let offer_id = seed_active_offer(&ctx, "product_payment_link", "").await;
-    let base = format!("/admin/b/products/products/product_payment_link/offers/{offer_id}");
+    let base = format!("/b/products/api/admin/products/product_payment_link/offers/{offer_id}");
 
     let (msg, input) = admin_create_msg(
         &format!("{base}/presets"),
@@ -4379,7 +4367,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
             "inputs": {"pages": 4}
         }),
     );
-    let preset = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let preset = output_to_json(dispatch(&ctx, msg, input).await).await;
     let preset_id = preset["id"].as_str().expect("preset id").to_string();
     assert_eq!(preset["inputs"]["pages"], 4);
     assert_eq!(preset["active"], true);
@@ -4390,7 +4378,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
         "after_completion_url": "https://shop.example/payment-link/thanks?session_id={CHECKOUT_SESSION_ID}"
     });
     let (msg, input) = admin_create_msg(&format!("{base}/payment-links"), create_body.clone());
-    let link = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let link = output_to_json(dispatch(&ctx, msg, input).await).await;
     let link_id = link["id"]
         .as_str()
         .expect("local Payment Link id")
@@ -4401,7 +4389,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
 
     // Same immutable configuration reuses the existing provider resource.
     let (msg, input) = admin_create_msg(&format!("{base}/payment-links"), create_body);
-    let reused = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let reused = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(reused["id"], link_id);
     assert_eq!(requests.lock().unwrap().len(), 1);
 
@@ -4420,7 +4408,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
     }
 
     let (msg, input) = get_msg("/b/products/storefront/product_payment_link", "");
-    let storefront = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let storefront = output_to_json(dispatch(&ctx, msg, input).await).await;
     let public_link = &storefront["offers"][0]["payment_links"][0];
     assert_eq!(public_link["id"], link_id);
     assert_eq!(public_link["preset_id"], preset_id);
@@ -4429,7 +4417,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
     assert!(public_link.get("sync_status").is_none());
 
     let (msg, input) = delete_msg(&format!("{base}/payment-links/{link_id}"), "admin_1");
-    let deactivated = output_to_json(dispatch_admin(&ctx, msg, input).await).await;
+    let deactivated = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(deactivated["active"], false);
     {
         let requests_guard = requests.lock().unwrap();
@@ -4445,7 +4433,7 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
     }
 
     let (msg, input) = get_msg("/b/products/storefront/product_payment_link", "");
-    let storefront = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let storefront = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(
         storefront["offers"][0]["payment_links"],
         serde_json::json!([])

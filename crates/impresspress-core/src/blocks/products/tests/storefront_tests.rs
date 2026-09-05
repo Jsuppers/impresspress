@@ -53,7 +53,7 @@ async fn storefront_config_exposes_only_a_valid_matching_publishable_key() {
     ])
     .await;
     let (msg, input) = get_msg("/b/products/storefront/config", "");
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["embedded_checkout_available"], true);
     assert_eq!(body["stripe_publishable_key"], "pk_test_browser_safe");
     assert_eq!(body["stripe_mode"], "test");
@@ -74,7 +74,7 @@ async fn storefront_config_exposes_only_a_valid_matching_publishable_key() {
     ])
     .await;
     let (msg, input) = get_msg("/b/products/storefront/config", "");
-    let body = output_to_json(dispatch_user(&mismatch, msg, input).await).await;
+    let body = output_to_json(dispatch(&mismatch, msg, input).await).await;
     assert_eq!(body["embedded_checkout_available"], false);
 
     let invalid = ctx_with(&[(
@@ -83,7 +83,7 @@ async fn storefront_config_exposes_only_a_valid_matching_publishable_key() {
     )])
     .await;
     let (msg, input) = get_msg("/b/products/storefront/config", "");
-    let body = output_to_json(dispatch_user(&invalid, msg, input).await).await;
+    let body = output_to_json(dispatch(&invalid, msg, input).await).await;
     assert_eq!(body["embedded_checkout_available"], false);
     assert!(body.get("stripe_publishable_key").is_none());
     assert!(body.get("stripe_mode").is_none());
@@ -109,7 +109,7 @@ async fn browser_runtime_hides_secret_settings_and_rejects_stripe_secret_operati
     .await;
 
     let (msg, input) = get_msg("/b/products/storefront/config", "");
-    let config = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let config = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(config["embedded_checkout_available"], false);
 
     let (msg, input) = create_msg(
@@ -148,7 +148,7 @@ async fn browser_runtime_hides_secret_settings_and_rejects_stripe_secret_operati
 async fn storefront_widget_is_javascript_and_uses_all_three_stripe_presentations() {
     let ctx = ctx().await;
     let (msg, input) = get_msg("/b/products/storefront.js", "");
-    let response = dispatch_user(&ctx, msg, input)
+    let response = dispatch(&ctx, msg, input)
         .await
         .collect_buffered()
         .await
@@ -224,7 +224,7 @@ async fn guest_order_status_requires_an_unexpired_receipt_and_returns_a_minimal_
 
     let (mut msg, input) = get_msg("/b/products/orders/order_guest_receipt/status", "");
     msg.set_meta("req.query.receipt_token", token);
-    let body = output_to_json(dispatch_user(&ctx, msg, input).await).await;
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["order_id"], "order_guest_receipt");
     assert_eq!(body["status"], "completed");
     assert_eq!(body["amounts"]["currency"], "JPY");
@@ -244,7 +244,7 @@ async fn guest_order_status_requires_an_unexpired_receipt_and_returns_a_minimal_
     let (mut msg, input) = get_msg("/b/products/orders/order_guest_receipt/status", "");
     msg.set_meta("req.query.receipt_token", "wrong-token");
     assert!(
-        output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await,
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::NotFound).await,
         "a wrong capability must not reveal whether the order exists"
     );
 
@@ -261,7 +261,7 @@ async fn guest_order_status_requires_an_unexpired_receipt_and_returns_a_minimal_
     .expect("expire receipt");
     let (mut msg, input) = get_msg("/b/products/orders/order_guest_receipt/status", "");
     msg.set_meta("req.query.receipt_token", token);
-    assert!(output_is_error(dispatch_user(&ctx, msg, input).await, ErrorCode::NotFound).await);
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::NotFound).await);
 }
 
 #[tokio::test]

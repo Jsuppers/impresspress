@@ -4,12 +4,11 @@
 //! operations for admin and user-facing routes.
 //!
 //! Split by domain responsibility:
-//! - [`dispatch`] — the `AdminRoute`/`UserRoute` tables and the
-//!   `handle_admin`/`handle_user` entry points that match a normalized
-//!   sub-path and fan out to the domain modules below or the order and Stripe
-//!   modules.
-//! - [`product`] — product CRUD, both admin (`/admin/b/products/products`)
-//!   and user-owned (`/b/products/products`, gated on
+//! - [`dispatch`] — `run`, the one fan-out from a matched
+//!   `routes::Route` to the domain modules below, the order and Stripe
+//!   modules, and the SSR pages.
+//! - [`product`] — product CRUD, both admin (`/b/products/api/admin/products`)
+//!   and user-owned (`/b/products/api/products`, gated on
 //!   `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS`).
 //! - [`group`] — group CRUD (admin + user-owned), the "products in a
 //!   group" listing, and the read-only group-templates listing.
@@ -36,10 +35,7 @@ mod stats;
 mod subscription;
 mod types;
 
-pub(in crate::blocks::products) use dispatch::user_products_enabled;
-pub use dispatch::{handle_admin, handle_user};
-#[cfg(test)]
-pub(in crate::blocks::products) use dispatch::{ADMIN_ROUTES, USER_ROUTES};
+pub(in crate::blocks::products) use dispatch::{run, user_products_enabled};
 pub(in crate::blocks::products) use product::{is_owned_by, name_like_filter, write_error};
 use wafer_core::clients::database as db;
 use wafer_run::context::Context;

@@ -1776,6 +1776,65 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
+    /// The webhook is reachable anonymously from the products block's own
+    /// declaration, with no router carve-out involved: `endpoint_auth` and
+    /// `declared_access` resolve `POST /b/products/webhooks` to `Public` from
+    /// `ProductsBlock::new().info()` alone, and `route_to_block` dispatches
+    /// an anonymous POST with that info. Today the
+    /// `router_declared_public("/b/products/webhooks", ..)` entry still
+    /// short-circuits the access decision, so the dispatch half passes for
+    /// two reasons; the resolution half is the one that lets PR 7 delete the
+    /// carve-out and keep this test green.
+    #[tokio::test]
+    async fn stripe_webhook_is_public_from_the_products_declaration_alone() {
+        use wafer_run::{AuthLevel, Block};
+
+        use crate::{
+            blocks::products::ProductsBlock,
+            test_support::{anon_msg, TestContext},
+        };
+
+        let block_infos = vec![ProductsBlock::new().info()];
+        assert_eq!(
+            endpoint_match::endpoint_auth(
+                &block_infos[0].endpoints,
+                "create",
+                "/b/products/webhooks"
+            ),
+            Some(AuthLevel::Public),
+            "the products block declares the webhook public"
+        );
+        assert_eq!(
+            declared_access(
+                &block_infos,
+                "impresspress/products",
+                &anon_msg("create", "/b/products/webhooks"),
+            ),
+            RouteAccess::Public,
+            "the router resolves the webhook public from the declaration"
+        );
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/products",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let out = route_to_block(
+            &ctx,
+            anon_msg("create", "/b/products/webhooks"),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        let buf = out
+            .collect_buffered()
+            .await
+            .expect("an anonymous Stripe webhook POST must dispatch");
+        assert_eq!(buf.body, b"DISPATCHED");
+    }
+
     #[tokio::test]
     async fn undeclared_products_path_other_than_the_webhook_carveout_requires_auth() {
         use crate::test_support::{anon_msg, TestContext};
@@ -1803,9 +1862,9 @@ mod tests {
         assert!(crate::test_support::output_is_error(out, "PermissionDenied").await);
     }
 
-    /// Task 6 fix-round-1 finding: the products block's own `dispatch_admin`
-    /// tests (`handlers::handle_admin`) call the handler directly and never
-    /// go through `route_to_block`/`check_access`, so they prove the
+    /// Task 6 fix-round-1 finding: the products block's own `harness::dispatch`
+    /// tests enter `ProductsBlock::handle` directly and never go through
+    /// `route_to_block`/`check_access`, so they prove the
     /// restore handler's behaviour but not its authorization boundary —
     /// nothing previously exercised the fact that
     /// `POST /b/products/api/admin/products/{id}/restore` is
@@ -1817,16 +1876,15 @@ mod tests {
     /// `discovery_tests::real_block_infos()` favors the real declaration
     /// over a hand-rolled one for exactly this reason.
     ///
-    /// This covers the DECLARED spelling only, which is not the whole
-    /// boundary: `ProductsBlock::handle` reaches its dispatch tables from
-    /// more than one wire path, and a tier proven on one spelling says
-    /// nothing about the others (that gap is how restore shipped reachable
-    /// at `Authenticated` through `/b/products/products/{id}/restore`).
-    /// The companion
+    /// The products block now serves each handler at exactly one wire
+    /// spelling, the declared one (`blocks::products::routes::ROUTES`; its
+    /// `table_tests` pin that the former second spellings 404), so the tier
+    /// proven here is the whole boundary. The companion
     /// `blocks::products::tests::handler_tests
     /// ::restore_is_unreachable_for_a_non_admin_on_every_path_that_reaches_it`
-    /// drives the same router against the REAL block for every spelling; it
-    /// lives there because it needs the products database harness.
+    /// drives the same router against the REAL block for both restore
+    /// routes; it lives there because it needs the products database
+    /// harness.
     #[tokio::test]
     async fn restore_product_endpoint_is_admin_only_end_to_end() {
         use wafer_run::Block;
@@ -1836,10 +1894,8 @@ mod tests {
             test_support::{admin_msg, auth_msg, TestContext},
         };
 
-        // The real wire path — `/api/admin/` intact, exactly what
-        // `route_to_block` sees before `ProductsBlock::handle`'s own
-        // `/b/products/api/admin` -> `/admin/b/products` normalization
-        // (which happens after this gate, not before it).
+        // The real wire path, exactly what `route_to_block` sees and what
+        // `ProductsBlock::handle` dispatches on.
         let restore_path = "/b/products/api/admin/products/prod_1/restore";
         let block_infos = vec![ProductsBlock::new().info()];
 
@@ -1869,8 +1925,8 @@ mod tests {
         );
 
         // 2. A non-admin authenticated caller is rejected — the exact
-        //    boundary `dispatch_user`-based tests cannot see, since they
-        //    call `handlers::handle_user` directly and skip
+        //    boundary `harness::dispatch`-based tests cannot see, since they
+        //    enter `ProductsBlock::handle` directly and skip
         //    `route_to_block`/`check_access` entirely.
         let denied = route_to_block(
             &ctx,

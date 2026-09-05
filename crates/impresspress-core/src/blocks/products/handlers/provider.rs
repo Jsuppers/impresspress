@@ -13,7 +13,7 @@ use crate::{
     http::{
         err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
     },
-    util::{path_param, RecordExt},
+    util::RecordExt,
 };
 
 fn optional_string(record: &wafer_core::clients::database::Record, field: &str) -> Option<String> {
@@ -86,7 +86,7 @@ pub(super) async fn webhook_events(ctx: &dyn Context, msg: &Message) -> OutputSt
 }
 
 pub(super) async fn replay_webhook_event(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let event_id = path_param(msg, "id", "/admin/b/products/webhook-events/").trim();
+    let event_id = msg.var("id").trim();
     if event_id.is_empty() {
         return err_bad_request("webhook event id is required");
     }

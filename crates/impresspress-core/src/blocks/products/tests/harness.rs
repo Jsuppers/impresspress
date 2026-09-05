@@ -105,38 +105,47 @@ pub fn admin_create_msg(path: &str, body: serde_json::Value) -> (Message, InputS
     (msg, input)
 }
 
-/// Dispatch an admin request the way `ProductsBlock::handle` does, but for
-/// tests that build the message with the normalized `/admin/b/products/...`
-/// path already in `req.resource`: the normalized sub-path is now an explicit
-/// argument (no `req.resource` rewrite), so here it equals `msg.path()`.
-pub async fn dispatch_admin(
+/// Dispatch a request the way the runtime does once the router has admitted
+/// it: through `ProductsBlock::handle`, so the route table, the route's
+/// rate-limit bucket and the `ALLOW_USER_PRODUCTS` / seller-suspension gates
+/// all run. `req.resource` is the wire path. A fresh `ProductsBlock` per
+/// call means a fresh limiter, so no test spends another's quota.
+pub async fn dispatch(
     ctx: &dyn wafer_run::context::Context,
-    mut msg: Message,
+    msg: Message,
     input: InputStream,
 ) -> OutputStream {
-    let norm = msg.path().to_string();
-    super::super::handlers::handle_admin(ctx, &mut msg, &norm, input).await
+    use wafer_run::Block;
+
+    super::super::ProductsBlock::new()
+        .handle(ctx, msg, input)
+        .await
 }
 
-/// Dispatch a user request the same way (normalized `/b/products/...` path is
-/// already in `req.resource` for these tests).
-pub async fn dispatch_user(
-    ctx: &dyn wafer_run::context::Context,
-    mut msg: Message,
-    input: InputStream,
-) -> OutputStream {
-    let norm = msg.path().to_string();
-    super::super::handlers::handle_user(ctx, &mut msg, &norm, input).await
+/// Run `msg` through the block's route table so `{id}` (and the other path
+/// variables) are bound the way they are on the wire, then hand the message
+/// to a handler directly. Panics when no row matches: a test that sends an
+/// unroutable path would otherwise exercise the handler's "missing id"
+/// branch by accident.
+pub fn routed(mut msg: Message) -> Message {
+    let route = crate::endpoint_match::dispatch(&mut msg, super::super::routes::ROUTES);
+    assert!(
+        route.is_some(),
+        "no products route matches {} {}",
+        msg.action(),
+        msg.path()
+    );
+    msg
 }
 
 /// Dispatch a request through the central router — `route_to_block` →
-/// `check_access` → `ProductsBlock::handle` — rather than straight into a
-/// dispatch table.
+/// `check_access` → `ProductsBlock::handle` — rather than straight into the
+/// block.
 ///
-/// `dispatch_admin`/`dispatch_user` above enter the block *below* the layer
-/// that enforces a declared endpoint's `AuthLevel`, so they can prove a
-/// handler's behaviour but never its authorization tier, nor which wire
-/// paths reach it. A test about who may invoke an endpoint must use this.
+/// `dispatch` above enters the block *below* the layer that enforces a
+/// declared endpoint's `AuthLevel`, so it can prove a handler's behaviour but
+/// never its authorization tier. A test about who may invoke an endpoint
+/// must use this.
 pub async fn dispatch_routed(ctx: &TestContext, msg: Message, input: InputStream) -> OutputStream {
     use wafer_run::Block;
 

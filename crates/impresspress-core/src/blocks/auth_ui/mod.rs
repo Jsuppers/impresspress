@@ -30,9 +30,7 @@ use wafer_run::{
     OutputStream,
 };
 
-use super::rate_limit::{
-    check_rate_limit, ip_identity, LimitKey, RateLimit, RateLimitOutcome, UserRateLimiter,
-};
+use super::rate_limit::{apply_route_limit, LimitKey, RateLimit, UserRateLimiter};
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::err_not_found,
@@ -297,13 +295,8 @@ const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLim
 }
 
 /// Spend `route`'s rate-limit bucket for this request. `Some(response)` is
-/// the 429 to return; `None` means proceed: no bucket for this route, the
-/// bucket is disabled by config, a user-keyed bucket with no user, or under
-/// the limit.
-///
-/// `RateLimitOutcome::Allowed(headers)` is discarded: injecting X-RateLimit-*
-/// response headers needs a streaming-middleware shape we don't have yet.
-/// Tracked as a single follow-up, not a per-route TODO.
+/// the 429 to return; `None` means proceed: no bucket for this route, or
+/// `apply_route_limit` let the request through.
 async fn apply_rate_limit(
     limiter: &UserRateLimiter,
     ctx: &dyn Context,
@@ -311,20 +304,7 @@ async fn apply_rate_limit(
     route: Route,
 ) -> Option<OutputStream> {
     let (key, category, limit) = rate_limit_for(route)?;
-    let identity = match key {
-        LimitKey::Ip => ip_identity(msg),
-        LimitKey::User => {
-            let user_id = msg.user_id();
-            if user_id.is_empty() {
-                return None;
-            }
-            user_id.to_string()
-        }
-    };
-    match check_rate_limit(limiter, ctx, &identity, category, limit).await {
-        RateLimitOutcome::Limited(response) => Some(response),
-        RateLimitOutcome::Allowed(_) | RateLimitOutcome::Disabled => None,
-    }
+    apply_route_limit(limiter, ctx, msg, key, category, limit).await
 }
 
 /// The auth-ui block's own declared config vars (OAuth provider creds). Single

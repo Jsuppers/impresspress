@@ -406,26 +406,13 @@ pub async fn check_rate_limit(
     }
 }
 
-/// Convenience wrapper: check per-user rate limit using the request's user_id.
+/// Check the per-user read/write rate limit using the request's user_id.
 ///
-/// Automatically determines read vs write category from the message action.
-/// Returns `RateLimitOutcome::Disabled` for unauthenticated requests (empty user_id).
-///
-/// `upload_action` lets callers (e.g. the files block) map their "create"
-/// action onto the `upload` category instead of `api_write` — pass `None` for
-/// the default read/write split.
-pub async fn check_user_rate_limit(
-    limiter: &UserRateLimiter,
-    ctx: &dyn wafer_run::context::Context,
-    msg: &wafer_run::Message,
-) -> RateLimitOutcome {
-    check_user_rate_limit_with(limiter, ctx, msg, None).await
-}
-
-/// As [`check_user_rate_limit`], but with an optional category override for the
-/// `create` action. `upload_action = Some((RateLimit::UPLOAD, "upload"))` makes
-/// `create` requests count against the upload bucket; `None` uses the default
-/// read (`retrieve`) vs write (everything else) split.
+/// Determines the category from the message action: `retrieve` spends
+/// `api_read`, everything else `api_write`, unless `create_override` names
+/// another bucket for the `create` action (`Some((RateLimit::UPLOAD,
+/// "upload"))` makes uploads count against their own bucket). Returns
+/// `RateLimitOutcome::Disabled` for unauthenticated requests (empty user_id).
 pub async fn check_user_rate_limit_with(
     limiter: &UserRateLimiter,
     ctx: &dyn wafer_run::context::Context,
@@ -458,7 +445,7 @@ pub fn ip_identity(msg: &wafer_run::Message) -> String {
     }
 }
 
-/// Whether a route-limit rule keys its bucket by client IP or by user id.
+/// Whether a route's rate-limit bucket is keyed by client IP or by user id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitKey {
     /// Key the bucket by [`ip_identity`] — for unauthenticated endpoints.
@@ -468,46 +455,37 @@ pub enum LimitKey {
     User,
 }
 
-/// One declarative rate-limit rule: a `(action, path)` predicate plus the
-/// bucket key, category name, and default limit to apply when it matches.
-pub struct RouteLimit {
-    /// Predicate over `(action, normalized_path)`. The first rule whose
-    /// predicate returns `true` wins.
-    pub matches: fn(&str, &str) -> bool,
-    /// Whether to key the bucket by IP or user id.
-    pub key: LimitKey,
-    /// Rate-limit category name (drives the `RATE_LIMIT_{CATEGORY}` override).
-    pub category: &'static str,
-    /// Default limit when no config override is present.
-    pub limit: RateLimit,
-}
-
-/// Walk a declarative table of [`RouteLimit`] rules and apply the first one
-/// that matches `(action, path)`. Returns `Some(outcome)` when a rule matched
-/// (the caller returns the `Limited` stream or attaches the `Allowed` headers);
-/// `None` when no rule matched (the request is not rate-limited at this layer).
+/// Spend the `(key, category, limit)` bucket a block's route table assigned
+/// to this request. `Some(response)` is the 429 to return; `None` means
+/// proceed: the bucket is disabled by config, a user-keyed bucket has no user
+/// to charge, or the request is under the limit.
 ///
-/// `User`-keyed rules are skipped for requests with an empty user_id.
-pub async fn check_route_limits(
+/// `RateLimitOutcome::Allowed(headers)` is discarded for every caller:
+/// injecting `X-RateLimit-*` response headers needs a streaming-middleware
+/// shape we don't have yet. Tracked as a single follow-up, not a per-route
+/// TODO.
+pub async fn apply_route_limit(
     limiter: &UserRateLimiter,
     ctx: &dyn wafer_run::context::Context,
     msg: &wafer_run::Message,
-    action: &str,
-    path: &str,
-    rules: &[RouteLimit],
-) -> Option<RateLimitOutcome> {
-    let rule = rules.iter().find(|r| (r.matches)(action, path))?;
-    let identity = match rule.key {
+    key: LimitKey,
+    category: &str,
+    limit: RateLimit,
+) -> Option<OutputStream> {
+    let identity = match key {
         LimitKey::Ip => ip_identity(msg),
         LimitKey::User => {
-            let uid = msg.user_id();
-            if uid.is_empty() {
+            let user_id = msg.user_id();
+            if user_id.is_empty() {
                 return None;
             }
-            uid.to_string()
+            user_id.to_string()
         }
     };
-    Some(check_rate_limit(limiter, ctx, &identity, rule.category, rule.limit).await)
+    match check_rate_limit(limiter, ctx, &identity, category, limit).await {
+        RateLimitOutcome::Limited(response) => Some(response),
+        RateLimitOutcome::Allowed(_) | RateLimitOutcome::Disabled => None,
+    }
 }
 
 #[cfg(test)]
@@ -667,84 +645,74 @@ mod tests {
         assert_eq!(ip_identity(&msg_with("create", "", "")), "unknown");
     }
 
-    const TEST_ROUTES: &[RouteLimit] = &[
-        RouteLimit {
-            matches: |a, p| a == "create" && p == "/auth/api/login",
-            key: LimitKey::Ip,
-            category: "auth",
-            limit: RateLimit {
-                max_requests: 2,
-                window: Duration::from_secs(60),
-            },
-        },
-        RouteLimit {
-            matches: |a, _| a == "update",
-            key: LimitKey::User,
-            category: "auth_write",
-            limit: RateLimit {
-                max_requests: 2,
-                window: Duration::from_secs(60),
-            },
-        },
-    ];
+    const TWO_PER_MINUTE: RateLimit = RateLimit {
+        max_requests: 2,
+        window: Duration::from_secs(60),
+    };
 
     #[tokio::test]
-    async fn check_route_limits_matches_ip_rule_and_limits() {
+    async fn apply_route_limit_limits_an_ip_bucket() {
         let ctx = TestCtx;
         let limiter = UserRateLimiter::new();
         let msg = msg_with("create", "", "9.9.9.9");
-        // First two allowed, third limited.
+        // First two proceed, the third is the 429.
         for _ in 0..2 {
-            assert!(matches!(
-                check_route_limits(
-                    &limiter,
-                    &ctx,
-                    &msg,
-                    "create",
-                    "/auth/api/login",
-                    TEST_ROUTES
-                )
-                .await,
-                Some(RateLimitOutcome::Allowed(_))
-            ));
+            assert!(
+                apply_route_limit(&limiter, &ctx, &msg, LimitKey::Ip, "auth", TWO_PER_MINUTE)
+                    .await
+                    .is_none()
+            );
         }
-        assert!(matches!(
-            check_route_limits(
-                &limiter,
-                &ctx,
-                &msg,
-                "create",
-                "/auth/api/login",
-                TEST_ROUTES
-            )
-            .await,
-            Some(RateLimitOutcome::Limited(_))
-        ));
+        assert!(
+            apply_route_limit(&limiter, &ctx, &msg, LimitKey::Ip, "auth", TWO_PER_MINUTE)
+                .await
+                .is_some()
+        );
     }
 
+    /// A user-keyed bucket has nothing to charge for an anonymous caller, so
+    /// the request proceeds and spends nothing; a caller with a user is
+    /// charged.
     #[tokio::test]
-    async fn check_route_limits_skips_user_rule_when_anonymous_and_no_match() {
+    async fn apply_route_limit_skips_a_user_bucket_for_an_anonymous_caller() {
         let ctx = TestCtx;
         let limiter = UserRateLimiter::new();
-        // User-keyed rule but empty user_id → None (skipped).
         let anon = msg_with("update", "", "");
-        assert!(
-            check_route_limits(&limiter, &ctx, &anon, "update", "/auth/api/me", TEST_ROUTES)
-                .await
-                .is_none()
-        );
-        // No rule matches this (action, path) → None.
-        let other = msg_with("retrieve", "u1", "");
-        assert!(check_route_limits(
+        for _ in 0..3 {
+            assert!(apply_route_limit(
+                &limiter,
+                &ctx,
+                &anon,
+                LimitKey::User,
+                "auth_write",
+                TWO_PER_MINUTE
+            )
+            .await
+            .is_none());
+        }
+        let user = msg_with("update", "u1", "");
+        for _ in 0..2 {
+            assert!(apply_route_limit(
+                &limiter,
+                &ctx,
+                &user,
+                LimitKey::User,
+                "auth_write",
+                TWO_PER_MINUTE
+            )
+            .await
+            .is_none());
+        }
+        assert!(apply_route_limit(
             &limiter,
             &ctx,
-            &other,
-            "retrieve",
-            "/auth/whatever",
-            TEST_ROUTES
+            &user,
+            LimitKey::User,
+            "auth_write",
+            TWO_PER_MINUTE
         )
         .await
-        .is_none());
+        .is_some());
     }
 
     // -- decide_rate_limit (wasm32 D1-backend decision logic) --------------

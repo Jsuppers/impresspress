@@ -1,4 +1,4 @@
-//! Admin dashboard stats: `/admin/b/products/stats`.
+//! Admin dashboard stats: `/b/products/api/admin/stats`.
 
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;

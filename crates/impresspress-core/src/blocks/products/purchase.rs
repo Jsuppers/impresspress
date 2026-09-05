@@ -224,21 +224,7 @@ async fn purchase_response(
 }
 
 pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    // Prefer the router-populated `{id}` path var (set by the endpoint
-    // matcher), falling back to stripping the known prefixes for hand-built
-    // test messages.
-    let id = {
-        let var = msg.var("id");
-        if !var.is_empty() {
-            var
-        } else {
-            msg.path()
-                .strip_prefix("/admin/b/products/purchases/")
-                .or_else(|| msg.path().strip_prefix("/b/products/purchases/"))
-                .unwrap_or("")
-                .trim_matches('/')
-        }
-    };
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing purchase ID");
     }
@@ -271,18 +257,7 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// output types: routing already gates this one at `AuthLevel::Admin`, so
 /// there is no ownership check to make here.
 pub async fn handle_get_admin(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = {
-        let var = msg.var("id");
-        if !var.is_empty() {
-            var
-        } else {
-            msg.path()
-                .strip_prefix("/admin/b/products/api/admin/purchases/")
-                .or_else(|| msg.path().strip_prefix("/b/products/api/admin/purchases/"))
-                .unwrap_or("")
-                .trim_matches('/')
-        }
-    };
+    let id = msg.var("id");
     if id.is_empty() {
         return err_bad_request("Missing purchase ID");
     }
@@ -365,25 +340,8 @@ fn valid_refund_operation_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn admin_refund_id(msg: &Message) -> String {
-    // `/admin/b/products/purchases/{id}/refund` — prefer the matcher-bound
-    // `{id}`, falling back to prefix/suffix stripping for hand-built tests.
-    {
-        let var = msg.var("id");
-        if !var.is_empty() {
-            var.to_string()
-        } else {
-            msg.path()
-                .strip_prefix("/admin/b/products/purchases/")
-                .and_then(|s| s.strip_suffix("/refund"))
-                .unwrap_or("")
-                .to_string()
-        }
-    }
-}
-
 pub async fn handle_refund(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let id = admin_refund_id(msg);
+    let id = msg.var("id").to_string();
     if id.is_empty() {
         return err_bad_request("Missing purchase ID");
     }

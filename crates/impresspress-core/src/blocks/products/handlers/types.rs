@@ -1,4 +1,4 @@
-//! Product-type taxonomy CRUD (admin `/admin/b/products/types`; read-only
+//! Product-type taxonomy CRUD (admin `/b/products/api/admin/types`; read-only
 //! list also served to regular users at `/b/products/types`).
 //!
 //! Every response is a `contracts::ProductTypeView` (or a list of them)
@@ -16,8 +16,6 @@ use crate::{
     },
     http::ok_json,
 };
-
-const ADMIN_TYPE_PREFIX: &str = "/admin/b/products/types/";
 
 pub(super) async fn handle_list_types(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let query = PageQuery::from_message(msg);
@@ -52,5 +50,12 @@ pub(super) async fn handle_create_type(
 }
 
 pub(super) async fn handle_delete_type(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    crud::crud_delete(ctx, msg, TYPES_TABLE, ADMIN_TYPE_PREFIX, "Type").await
+    let id = match crud::path_id(msg, "Type") {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match crud::delete_record(ctx, TYPES_TABLE, id, "Type").await {
+        Ok(deleted) => ok_json(&deleted),
+        Err(response) => response,
+    }
 }
