@@ -456,20 +456,31 @@ async fn public_declared_endpoint_passes_without_auth() {
 }
 
 #[tokio::test]
-async fn undeclared_path_falls_back_to_prefix_tier() {
-    let ctx = RecordingContext::new();
+async fn undeclared_path_falls_back_to_authenticated_not_the_prefix_tier() {
     let features = AllEnabled;
     let infos = legalpages_infos();
 
     // `/b/legalpages/api/documents` (no `{id}`) is NOT in the declared
-    // endpoint list above. The coarse prefix route for `/b/legalpages/api` is
-    // Admin (the backstop), so a non-admin is still rejected — an undeclared
-    // path can never be LESS protected than its prefix tier.
-    let msg = make_msg_with_user("/b/legalpages/api/documents", "user-1");
+    // endpoint list above, and the block's only prefix entry is the
+    // Public-tier `/b/legalpages`. An undeclared path falls to
+    // `Authenticated`, never to the prefix's own tier: an anonymous caller is
+    // denied, a logged-in caller reaches the block, and the block's table
+    // dispatch answers 404 for a path it does not declare. (The real block
+    // declares this path `admin`; see `routing::tests::
+    // legalpages_admin_and_api_paths_are_denied_without_the_admin_role`.)
+    let ctx = RecordingContext::new();
+    let msg = make_msg("/b/legalpages/api/documents");
     let stream =
         routing::route_to_block(&ctx, msg, InputStream::empty(), &features, &infos, &[]).await;
     assert_eq!(response_status(stream).await, 403);
     assert!(ctx.calls().is_empty());
+
+    let ctx = RecordingContext::new();
+    let msg = make_msg_with_user("/b/legalpages/api/documents", "user-1");
+    let stream =
+        routing::route_to_block(&ctx, msg, InputStream::empty(), &features, &infos, &[]).await;
+    assert_eq!(response_status(stream).await, 200);
+    assert_eq!(ctx.calls(), vec!["impresspress/legalpages".to_string()]);
 }
 
 /// `block_infos` mirroring the llm block's mixed-tier declarations: chat is

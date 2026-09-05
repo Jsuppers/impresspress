@@ -125,7 +125,7 @@ enum Route {
 ///
 /// Every row is `admin`. That restates, rather than decides, the level the
 /// central router already enforces: `routing.rs` gates the whole `/b/admin/`
-/// prefix (and `/b/admin/settings`) at `RouteAccess::Admin`, and
+/// prefix at `RouteAccess::Admin`, and
 /// `route_to_block` applies the stricter of the prefix tier and the declared
 /// level, so no path under this prefix has ever been reachable without the
 /// `admin` role. No handler re-checks `is_admin`; the block relies on the

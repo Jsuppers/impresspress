@@ -18,7 +18,7 @@ use crate::{endpoint_match, features::FeatureConfig};
 /// filter once made every asset request write a `request_logs` row).
 pub const STATIC_PREFIX: &str = "/b/static/";
 
-/// A single route entry.
+/// A single route entry: the coarse access floor for one block's prefix.
 ///
 /// `block` is the impresspress block name (`{org}/{block}`) used for feature-gating
 /// and the inspector's [`routes_config`] view. `dispatch_to` is the Wafer block
@@ -26,26 +26,20 @@ pub const STATIC_PREFIX: &str = "/b/static/";
 /// inspector, which is feature-gated/displayed as `impresspress/inspector` but
 /// dispatches to the `wafer-run/inspector` runtime block.
 ///
-/// `router_final` controls whether [`route_to_block`] may *refine* `access`
-/// with the target block's declared per-endpoint [`AuthLevel`] (see
-/// [`declared_access`]): `false` (the default, via [`Route::new`] /
-/// [`Route::proxy`]) lets a declared endpoint strengthen `access` — the
-/// normal case, and also how an *undeclared* path under the route falls back
-/// to [`declared_access`]'s fail-closed default (`Authenticated`) rather than
-/// this route's own (possibly looser) `access`. `true` (via
-/// [`Route::router_declared_public`]) makes `access` final: the router's own
-/// declaration IS the complete authorization decision for that exact path,
-/// and the [`declared_access`] fallback is never consulted. This is the
-/// escape hatch for a narrow, single-purpose path that legitimately has no
-/// session (a signed webhook, an OAuth provider callback, a password-reset
-/// link) but the owning block hasn't declared it as a `BlockEndpoint` — see
-/// [`Route::router_declared_public`] for why that matters.
+/// `access` is a floor, never the whole decision: [`route_to_block`] enforces
+/// `access.max(declared_access(..))`, so the block's declared per-endpoint
+/// [`AuthLevel`] can only strengthen it, and an *undeclared* path under the
+/// route falls back to [`declared_access`]'s fail-closed default
+/// (`Authenticated`) rather than to this route's own (possibly looser)
+/// `access`. A path that must be reachable with no session (a signed
+/// webhook, an OAuth provider callback, a password-reset link, a
+/// content-hashed asset) is public because its block declares it
+/// `AuthLevel::Public`; the router carries no per-path override.
 pub struct Route {
     pub prefix: &'static str,
     pub access: RouteAccess,
     pub block: &'static str,
     pub dispatch_to: &'static str,
-    router_final: bool,
 }
 
 impl Route {
@@ -56,7 +50,6 @@ impl Route {
             access,
             block,
             dispatch_to: block,
-            router_final: false,
         }
     }
 
@@ -74,49 +67,7 @@ impl Route {
             access,
             block,
             dispatch_to,
-            router_final: false,
         }
-    }
-
-    /// A narrow, exact-path route the ROUTER declares `Public` outright,
-    /// bypassing the [`declared_access`] refinement step entirely.
-    ///
-    /// [`declared_access`]'s fallback for an undeclared path is
-    /// `Authenticated` (fail-closed — see its doc comment), which is
-    /// *stricter* than `Public`. Combined via [`RouteAccess::max`], a
-    /// stricter fallback can only ever win over a looser prefix `access` —
-    /// that's the whole point of the fail-closed default. Which means a
-    /// path that must stay genuinely public (no session at all: Stripe
-    /// webhooks verified by HMAC, an OAuth provider's browser-redirect
-    /// callback, a password-reset link) but is NOT declared as a
-    /// `BlockEndpoint` cannot be kept public by adding a normal
-    /// [`Route::new`] entry — the fallback would still win. This
-    /// constructor is the router-level escape hatch for exactly that case:
-    /// it must be listed BEFORE the block's general prefix route
-    /// (most-specific-first, like every other carve-out in [`ROUTES`]), and
-    /// its `access` is final — no declared endpoint (there isn't one) or
-    /// fallback can strengthen or weaken it.
-    ///
-    /// The real fix for each such path is still to declare it as a
-    /// `BlockEndpoint` (with the correct `AuthLevel`) in the owning block's
-    /// `info()`; this constructor exists because routing.rs cannot add that
-    /// declaration to another block's file on its own.
-    const fn router_declared_public(prefix: &'static str, block: &'static str) -> Route {
-        Route {
-            prefix,
-            access: RouteAccess::Public,
-            block,
-            dispatch_to: block,
-            router_final: true,
-        }
-    }
-
-    /// Whether the prefix declaration is the complete authorization decision.
-    ///
-    /// Exposed within the crate so deployment-plan export can preserve the
-    /// exact route policy without making this implementation detail public.
-    pub(crate) const fn is_router_final(&self) -> bool {
-        self.router_final
     }
 }
 
@@ -217,7 +168,7 @@ pub struct ExtraRoute {
     ///
     /// Private so the choice is made through [`Self::new`] or
     /// [`Self::refined`], whose names say which semantics the registrar
-    /// wanted — the same reason [`Route::router_final`] is private.
+    /// wanted.
     refine_undeclared: bool,
 }
 
@@ -263,33 +214,39 @@ impl ExtraRoute {
     /// [`RouteAccess::Authenticated`].
     ///
     /// Exposed within the crate so deployment-plan export can round-trip the
-    /// exact route policy, as it already does for [`Route::is_router_final`].
+    /// exact route policy.
     pub(crate) const fn refines_undeclared(&self) -> bool {
         self.refine_undeclared
     }
 }
 
-/// The shared routing table. Order matters — more specific prefixes before general ones.
+/// The shared routing table: one coarse prefix per block, plus the inspector
+/// proxy.
+///
+/// Hand-written on purpose — the inspector proxy, `/health` outside `/b/`,
+/// files' two prefixes and the slash-suffixed spellings are decisions a
+/// derivation would have to encode anyway — and kept honest by two tests:
+/// every declared endpoint of every block in `blocks::all_block_infos()` sits
+/// under an entry naming its block and every entry's block declares under
+/// it; and no entry's prefix is served by another's, so order does not
+/// matter.
+///
+/// Each entry's `access` is the floor for its prefix; the per-path level is
+/// the block's own `BlockEndpoint` declaration (see [`declared_access`]).
+/// There is no per-path entry: a path a block wants public, admin-only or
+/// session-less is declared so in the block's table.
 ///
 /// All block routes live under `/b/{block_name}/...`. SSR pages and JSON API
 /// share the same prefix — blocks distinguish by HTTP method and path.
-/// System endpoints (`/health`, `/nav`, `/static/`, `/debug/`) are the only
-/// routes outside `/b/`.
+/// `/health` is the only route outside `/b/`.
 pub const ROUTES: &[Route] = &[
-    // System & static assets
+    // System: the health probe, and the content-hashed, immutable,
+    // session-less static assets (CSS/JS/fonts/logo for the logged-out
+    // login/signup pages). `SystemBlock::info()` declares
+    // `GET /b/static/{filename}` public; that row is what admits an
+    // anonymous asset request.
     Route::new("/health", RouteAccess::Public, "impresspress/system"),
-    // Static assets are content-hashed, immutable, and session-less by
-    // design (CSS/JS/fonts/logo for the logged-out login/signup pages).
-    // `SystemBlock::info().endpoints` now declares them as one whole-segment
-    // row, `GET /b/static/{filename}` (public), which `declared_access`
-    // resolves on its own — the earlier mid-segment `app-{hash}.css`
-    // declarations could never match a request, and this carve-out was the
-    // fix for the resulting fail-closed 403 on every anonymous asset (code
-    // review 2026-07-16, C1). It is kept only until `router_final` itself is
-    // removed in phase 1's final PR (see
-    // `docs/superpowers/specs/2026-09-05-route-table-single-source-design.md`,
-    // section 4); the declared row is what makes that removal safe.
-    Route::router_declared_public(STATIC_PREFIX, "impresspress/system"),
+    Route::new(STATIC_PREFIX, RouteAccess::Public, "impresspress/system"),
     // Inspector — runtime debugging UI (admin only). Feature-gated as
     // `impresspress/inspector` but dispatches to the `wafer-run/inspector` block.
     Route::proxy(
@@ -298,33 +255,14 @@ pub const ROUTES: &[Route] = &[
         "impresspress/inspector",
         "wafer-run/inspector",
     ),
-    // Auth — genuinely-public, session-less endpoints that `impresspress/auth-ui`
-    // has NOT (yet) declared as `BlockEndpoint`s (routing.rs cannot add that
-    // declaration to the block's own file). Each is gated by its own
-    // token/secret/signature inside the handler, not by `msg.user_id()` — see
-    // `Route::router_declared_public`'s doc comment for why a plain
-    // `Route::new(_, Public, _)` entry would NOT be enough once undeclared
-    // paths default to `Authenticated`. Must precede the general `/b/auth/`
-    // entry below (most-specific-first).
-    Route::router_declared_public("/b/auth/oauth/callback", "impresspress/auth-ui"), // OAuth provider browser redirect — single-use PKCE state, no prior session by design.
-    Route::router_declared_public("/b/auth/api/oauth/sync-user", "impresspress/auth-ui"), // Internal caller gated by INTERNAL_SECRET header, not a user session.
-    Route::router_declared_public("/b/auth/api/oauth/providers", "impresspress/auth-ui"), // Non-sensitive (which providers are configured); needed pre-login.
-    Route::router_declared_public("/b/auth/reset-password", "impresspress/auth-ui"), // Password-reset SSR page — logged-out by definition.
-    Route::router_declared_public("/b/auth/api/reset-password", "impresspress/auth-ui"), // Consumes a single-use reset token.
-    Route::router_declared_public("/b/auth/api/forgot-password", "impresspress/auth-ui"), // Requests a reset token by email — no session yet.
-    Route::router_declared_public("/b/auth/api/verify", "impresspress/auth-ui"), // Consumes a single-use email-verification token.
-    Route::router_declared_public("/b/auth/api/resend-verification", "impresspress/auth-ui"), // Re-sends the verification token — no session yet.
-    // Auth — SSR pages + API under /b/auth/
+    // Auth — SSR pages + API under /b/auth/. The session-less paths (OAuth
+    // callback, password reset, verification, provider list, internal
+    // sync-user) are declared public by the auth-ui block; each handler
+    // gates itself by a token, signature or shared secret.
     Route::new("/b/auth/", RouteAccess::Public, "impresspress/auth-ui"),
-    // Admin settings — more specific prefix must come before the /b/admin/ catch-all
-    Route::new(
-        "/b/admin/settings",
-        RouteAccess::Admin,
-        "impresspress/admin",
-    ),
-    // Admin — SSR pages + API under /b/admin/. The bare `/b/admin` form used
-    // to need its own duplicate entry here; `route_prefix_matches` now covers
-    // it (and every other slash-suffixed prefix) generically.
+    // Admin — SSR pages + API under /b/admin/, every row declared `admin` on
+    // top of this tier. The bare `/b/admin` form is covered by
+    // `route_prefix_matches` (like every other slash-suffixed prefix).
     Route::new("/b/admin/", RouteAccess::Admin, "impresspress/admin"),
     // Feature blocks — SSR + API under /b/{block}/
     Route::new("/b/storage/", RouteAccess::Public, "impresspress/files"),
@@ -333,30 +271,15 @@ pub const ROUTES: &[Route] = &[
         RouteAccess::Public,
         "impresspress/files",
     ),
-    // Stripe webhook — verified by HMAC signature (`stripe.rs::handle_webhook`),
-    // not by `msg.user_id()`. It is also declared Public in the products
-    // block for discovery, while this router-final carve-out keeps delivery
-    // reachable during boot or tests where BlockInfo metadata is unavailable.
-    // Must precede the general `/b/products` entry below.
-    Route::router_declared_public("/b/products/webhooks", "impresspress/products"),
+    // Products — storefront, seller and admin surfaces, and the Stripe
+    // webhook, which the block declares public (verified by HMAC signature
+    // in `stripe.rs::handle_webhook`, not by `msg.user_id()`).
     Route::new("/b/products", RouteAccess::Public, "impresspress/products"),
-    // Tickets — three declared public intake routes plus centrally gated admin UI/API.
+    // Tickets — three declared public intake routes plus declared admin UI/API.
     Route::new("/b/tickets", RouteAccess::Public, "impresspress/tickets"),
-    // Legalpages — public reads + admin writes/UI.
-    // Admin and API prefixes must come BEFORE the bare `/b/legalpages` entry
-    // because `route_to_block` matches on first-prefix-hit. Admin handlers
-    // inside the block do not re-check `is_admin`, so this gate is the only
-    // thing keeping random callers off `/admin/publish` and friends.
-    Route::new(
-        "/b/legalpages/admin",
-        RouteAccess::Admin,
-        "impresspress/legalpages",
-    ),
-    Route::new(
-        "/b/legalpages/api",
-        RouteAccess::Admin,
-        "impresspress/legalpages",
-    ),
+    // Legalpages — public reads (`/terms`, `/privacy`); every row under
+    // `/admin` and `/api` is declared `admin`. The handlers do not re-check
+    // `is_admin`, so those declarations are the gate.
     Route::new(
         "/b/legalpages",
         RouteAccess::Public,
@@ -429,23 +352,6 @@ pub fn routes_config(block_infos: &[BlockInfo]) -> serde_json::Value {
     serde_json::json!({ "routes": routes })
 }
 
-/// Resolve the declared per-endpoint access tier for `(msg.action,
-/// msg.path)` from the target block's `BlockInfo::endpoints`, mapped into the
-/// router's [`RouteAccess`] ladder.
-///
-/// Returns [`RouteAccess::Authenticated`] when no declared endpoint matches
-/// (including when the block has no `BlockInfo` at all) — the caller
-/// combines this with the coarse prefix tier via [`RouteAccess::max`], so an
-/// UNDECLARED path under even a `Public`-tier prefix requires a logged-in
-/// caller by default, and a declared path is governed by the stricter of
-/// prefix and endpoint. This is the fail-closed fix for "route declarations
-/// fail open" (undeclared endpoint metadata used to silently resolve to
-/// `Public`): a block must now explicitly declare a `BlockEndpoint` — with
-/// `AuthLevel::Public` — for any path that is genuinely meant to have no
-/// session, or use [`Route::router_declared_public`] at the router level when
-/// it can't (yet) declare that endpoint itself. `Authenticated`, not a hard
-/// deny, so a forgotten declaration degrades to "please log in" rather than
-/// 404ing a route that already works for logged-in callers.
 /// The access tier an [`ExtraRoute`] actually enforces for `msg`.
 ///
 /// Extra routes used to enforce `route.access` alone, which made
@@ -485,24 +391,36 @@ fn declared_endpoint_access(
         .map(RouteAccess::from_auth_level)
 }
 
+/// Resolve the declared per-endpoint access tier for `(msg.action,
+/// msg.path)` from the target block's `BlockInfo::endpoints`, mapped into the
+/// router's [`RouteAccess`] ladder.
+///
+/// Returns [`RouteAccess::Authenticated`] when no declared endpoint matches
+/// (including when the block has no `BlockInfo` at all) — the caller
+/// combines this with the coarse prefix tier via [`RouteAccess::max`], so an
+/// UNDECLARED path under even a `Public`-tier prefix requires a logged-in
+/// caller by default, and a declared path is governed by the stricter of
+/// prefix and endpoint. This is the fail-closed fix for "route declarations
+/// fail open" (undeclared endpoint metadata used to silently resolve to
+/// `Public`): a block must explicitly declare a `BlockEndpoint` with
+/// `AuthLevel::Public` for any path that is genuinely meant to have no
+/// session; the router has no per-path override. `Authenticated`, not a
+/// hard deny, so a forgotten declaration degrades to "please log in" rather
+/// than 404ing a route that already works for logged-in callers.
 fn declared_access(block_infos: &[BlockInfo], block_name: &str, msg: &Message) -> RouteAccess {
     declared_endpoint_access(block_infos, block_name, msg).unwrap_or(RouteAccess::Authenticated)
 }
 
 /// Resolve the [`AuthLevel`] a caller must actually have to invoke `ep`,
 /// mirroring exactly what [`route_to_block`] enforces for it:
-/// `route.access.max(declared_access(...))`, with the `router_final` escape
-/// hatch making a built-in route's own declaration final, and an extra route
-/// refined only when its target block declares endpoints (see
-/// [`extra_route_access`]).
+/// `route.access.max(declared)` for a built-in route, and the same max for
+/// an extra route (see [`extra_route_access`]; its undeclared branch never
+/// applies to a block's own endpoint).
 ///
-/// Lives here (not in `pipeline.rs`, where the WebMCP manifest calls it)
-/// because `Route::router_final` is a private field — deliberately not
-/// exposed, so nothing outside this module can special-case it. This
-/// resolver is the one thing that legitimately needs to read it to answer
-/// "what would the router actually do here", so it is implemented beside
-/// [`ROUTES`], [`declared_access`], and [`check_access`] rather than poking
-/// a hole in the type for an outside caller.
+/// Lives here (not in `pipeline.rs`, where the WebMCP manifest calls it) so
+/// it sits beside [`ROUTES`], [`declared_access`] and [`check_access`], the
+/// three things it has to agree with: a resolver that drifted from the
+/// router would advertise tools the router rejects or hide tools it admits.
 ///
 /// Unlike [`declared_access`] — called by `route_to_block` with a live
 /// `Message` whose concrete path can match more than one declared endpoint
@@ -551,7 +469,10 @@ pub fn effective_access(
     ep: &BlockEndpoint,
     extra_routes: &[ExtraRoute],
 ) -> AuthLevel {
-    let prefix_matches = |prefix: &str| ep.path == prefix || ep.path.starts_with(prefix);
+    // The same matcher `route_to_block` uses, bare form of a slash-suffixed
+    // prefix included, so the resolver can never disagree with the router
+    // about which entry serves a declared path.
+    let prefix_matches = |prefix: &str| route_prefix_matches(prefix, &ep.path);
 
     // Built-in `ROUTES` win on prefix collision and are searched first —
     // same order, same matching, as `route_to_block`.
@@ -561,10 +482,6 @@ pub fn effective_access(
             // endpoint is dead. Fail closed.
             RouteAccess::Admin
         }
-        // The router's own declaration is the complete answer — the
-        // endpoint's declared level, looser or stricter, is never
-        // consulted. See `Route::router_declared_public`'s doc comment.
-        Some(r) if r.router_final => r.access,
         Some(r) => r.access.max(RouteAccess::from_auth_level(ep.auth)),
         // No built-in route claims this path — fall through to the
         // downstream-registered ones, exactly as `route_to_block` does.
@@ -637,11 +554,6 @@ fn check_access(access: RouteAccess, msg: &Message) -> Option<OutputStream> {
     }
 }
 
-/// Route a message to the appropriate impresspress block based on request path.
-///
-/// Checks feature flags and admin role. Dispatches via `ctx.call_block` — all
-/// impresspress blocks are registered in the Wafer registry at boot (zero-arg
-/// blocks via `register_static_block!`, LlmBlock via `register_llm()`).
 /// Whether `path` belongs to the route registered under `prefix`.
 ///
 /// Exact match, or prefix match, or -- the third arm -- the bare form of a
@@ -659,6 +571,12 @@ fn route_prefix_matches(prefix: &str, path: &str) -> bool {
     path == prefix || path.starts_with(prefix) || prefix.strip_suffix('/') == Some(path)
 }
 
+/// Route a message to the appropriate impresspress block based on request path.
+///
+/// Checks the feature gate and the access tier, then dispatches via
+/// `ctx.call_block` — every impresspress block is registered in the Wafer
+/// registry at boot (`blocks::register_feature_blocks`, `register_llm`,
+/// `register_auth`).
 pub async fn route_to_block(
     ctx: &dyn Context,
     msg: Message,
@@ -696,23 +614,16 @@ pub async fn route_to_block(
             return crate::http::err_not_found("endpoint not found");
         }
 
-        // Access gate. The coarse prefix tier is a backstop; if the target
+        // Access gate. The coarse prefix tier is a floor; if the target
         // block declares an endpoint matching this exact (action, path) we
         // also enforce that endpoint's declared `AuthLevel` — taking the
         // stricter of the two. This is what makes `BlockEndpoint::auth`
         // load-bearing instead of documentation-only, and lets blocks drop
         // their per-handler `is_admin`/`user_id` preambles. An UNDECLARED
-        // path falls back to `Authenticated` (fail-closed), UNLESS this
-        // route is `router_final` (see `Route::router_declared_public`), in
-        // which case the router's own `access` is the complete decision and
-        // `declared_access`'s fallback is never consulted.
-        let access = if route.router_final {
-            route.access
-        } else {
-            route
-                .access
-                .max(declared_access(block_infos, route.block, &msg))
-        };
+        // path falls back to `Authenticated` (fail-closed).
+        let access = route
+            .access
+            .max(declared_access(block_infos, route.block, &msg));
         if let Some(denied) = check_access(access, &msg) {
             return denied;
         }
@@ -786,11 +697,14 @@ mod tests {
             ("/b/admin/", "impresspress/admin"),
             ("/b/admin/users", "impresspress/admin"),
             ("/b/admin", "impresspress/admin"),
+            ("/b/admin/settings/email", "impresspress/admin"),
             ("/b/storage/buckets", "impresspress/files"),
             ("/b/cloudstorage/shares", "impresspress/files"),
             ("/b/products", "impresspress/products"),
+            ("/b/products/webhooks", "impresspress/products"),
             ("/b/tickets/submit", "impresspress/tickets"),
             ("/b/legalpages", "impresspress/legalpages"),
+            ("/b/legalpages/admin/terms", "impresspress/legalpages"),
             ("/b/userportal", "impresspress/userportal"),
         ];
 
@@ -884,17 +798,17 @@ mod tests {
 
     #[test]
     fn non_admin_routes_dont_require_admin() {
-        // Note: `/b/legalpages` is intentionally omitted here because it has
-        // sub-routes (`/b/legalpages/admin`, `/b/legalpages/api`) that DO
-        // require admin. Those sub-routes are verified by
-        // `legalpages_admin_routes_require_admin`.
+        // The admin-only paths under these prefixes (legalpages' `/admin`
+        // and `/api` rows, the tickets admin UI, ...) are gated by the
+        // blocks' own `admin` declarations, not by the prefix tier.
         let non_admin_prefixes = [
             "/health",
-            "/static/",
+            STATIC_PREFIX,
             "/b/auth/",
             "/b/storage/",
             "/b/products",
             "/b/tickets",
+            "/b/legalpages",
             "/b/userportal",
             "/b/cloudstorage/",
         ];
@@ -1057,53 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn legalpages_admin_routes_require_admin() {
-        let admin_route = ROUTES
-            .iter()
-            .find(|r| r.prefix == "/b/legalpages/admin")
-            .expect("legalpages admin route not declared");
-        assert_eq!(
-            admin_route.access,
-            RouteAccess::Admin,
-            "/b/legalpages/admin must require admin"
-        );
-        assert_eq!(admin_route.block, "impresspress/legalpages");
-
-        let api_route = ROUTES
-            .iter()
-            .find(|r| r.prefix == "/b/legalpages/api")
-            .expect("legalpages api route not declared");
-        assert_eq!(
-            api_route.access,
-            RouteAccess::Admin,
-            "/b/legalpages/api must require admin"
-        );
-
-        let public_route = ROUTES
-            .iter()
-            .find(|r| r.prefix == "/b/legalpages")
-            .expect("public legalpages route not declared");
-        assert_ne!(
-            public_route.access,
-            RouteAccess::Admin,
-            "/b/legalpages must remain public"
-        );
-
-        // Most-specific-first ordering matters for the `starts_with` matcher.
-        let positions: Vec<_> = ROUTES
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.block == "impresspress/legalpages")
-            .map(|(i, r)| (i, r.prefix))
-            .collect();
-        assert_eq!(
-            positions.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
-            vec!["/b/legalpages/admin", "/b/legalpages/api", "/b/legalpages"],
-            "legalpages routes must be ordered most-specific-first",
-        );
-    }
-
-    #[test]
     fn all_block_routes_are_under_b_prefix() {
         for route in ROUTES {
             let is_system = route.block == "impresspress/system";
@@ -1224,11 +1091,11 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // `effective_access` — the WebMCP manifest's resolver (pipeline.rs) must
-    // agree with what `route_to_block` actually admits (routing.rs:435-440),
-    // for each shape `Route::router_final` can produce. Each test asserts
-    // the resolver's verdict AND drives a real anonymous request through
-    // `route_to_block` to confirm the router itself behaves the same way —
-    // if the two disagree, the manifest is wrong by definition.
+    // agree with what `route_to_block` actually admits, for each shape the
+    // table and a declaration can combine into. Each test asserts the
+    // resolver's verdict AND drives a real request through `route_to_block`
+    // to confirm the router itself behaves the same way — if the two
+    // disagree, the manifest is wrong by definition.
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1307,25 +1174,32 @@ mod tests {
         );
     }
 
+    /// Both directions on the static prefix, which used to be the one place
+    /// a router entry overrode the declaration: the system block's real
+    /// `GET /b/static/{filename}` public row under the Public prefix resolves
+    /// `Public` and the router admits an anonymous caller; a stricter row
+    /// declared under the same prefix resolves to that level and the router
+    /// enforces it, because the max wins.
     #[tokio::test]
-    async fn effective_access_agrees_with_the_router_for_a_router_final_route() {
-        use crate::test_support::{anon_msg, TestContext};
+    async fn effective_access_agrees_with_the_router_for_a_declared_public_row_under_a_public_prefix(
+    ) {
+        use wafer_run::Block as _;
 
-        // `router_final` makes the route's own declaration complete in BOTH
-        // directions: here the endpoint declares itself Admin, but the
-        // static-asset prefix route is `router_declared_public`. The router
-        // must still admit an anonymous caller, and `effective_access` must
-        // say Public, not Admin — taking the max here would hide a tool
-        // that is genuinely publicly reachable.
-        let ep_path = "/b/static/secret-admin-only-thing";
-        let info = BlockInfo::new("impresspress/system", "0.0.1", "http-handler@v1", "t")
-            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Admin)]);
-        let ep = info.endpoints[0].clone();
+        use crate::{
+            blocks::system::SystemBlock,
+            test_support::{anon_msg, output_is_error, TestContext},
+        };
 
+        let info = SystemBlock::new().info();
+        let asset_row = info
+            .endpoints
+            .iter()
+            .find(|ep| ep.path == "/b/static/{filename}")
+            .expect("the system block declares the asset row");
         assert_eq!(
-            effective_access(&info, &ep, &[]),
+            effective_access(&info, asset_row, &[]),
             AuthLevel::Public,
-            "router_final routes make the router's own declaration final — the endpoint's stricter Admin declaration must not leak through"
+            "a Public row under the Public static prefix is Public"
         );
 
         let mut ctx = TestContext::new().await;
@@ -1335,7 +1209,7 @@ mod tests {
         );
         let out = route_to_block(
             &ctx,
-            anon_msg("retrieve", ep_path),
+            anon_msg("retrieve", "/b/static/app-abc123.css"),
             InputStream::empty(),
             &AllEnabled,
             std::slice::from_ref(&info),
@@ -1343,9 +1217,32 @@ mod tests {
         )
         .await;
         let buf = out.collect_buffered().await.expect(
-            "router_final Public route must admit an anonymous caller regardless of the endpoint's declared level",
+            "the router must admit an anonymous asset request, matching the resolver's Public verdict",
         );
         assert_eq!(buf.body, b"DISPATCHED");
+
+        let ep_path = "/b/static/secret-admin-only-thing";
+        let strict = BlockInfo::new("impresspress/system", "0.0.1", "http-handler@v1", "t")
+            .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Admin)]);
+        let ep = strict.endpoints[0].clone();
+        assert_eq!(
+            effective_access(&strict, &ep, &[]),
+            AuthLevel::Admin,
+            "a stricter declaration under a Public prefix is enforced, not overridden"
+        );
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", ep_path),
+            InputStream::empty(),
+            &AllEnabled,
+            std::slice::from_ref(&strict),
+            &[],
+        )
+        .await;
+        assert!(
+            output_is_error(out, "PermissionDenied").await,
+            "the router must reject the anonymous caller, matching the resolver's Admin verdict"
+        );
     }
 
     #[tokio::test]
@@ -1634,6 +1531,22 @@ mod tests {
     /// is declared `Admin`. The router must gate the bare form at the same
     /// level, not at the fail-closed `Authenticated` default it falls back to
     /// when no declaration matches.
+    /// `effective_access` must resolve a route the way `route_to_block` does,
+    /// including the bare form of a slash-suffixed prefix (`/b/vector` for
+    /// the `/b/vector/` entry): a row declared at that bare path is served by
+    /// the router, so the resolver must not fail closed to `Admin` and hide
+    /// the tool the router admits.
+    #[test]
+    fn effective_access_matches_the_bare_form_of_a_slash_suffixed_prefix() {
+        let info =
+            wafer_run::BlockInfo::new("impresspress/vector", "0.0.1", "http-handler@v1", "t")
+                .endpoints(vec![
+                    wafer_run::BlockEndpoint::get("/b/vector").auth(AuthLevel::Public)
+                ]);
+        let ep = &info.endpoints[0];
+        assert_eq!(effective_access(&info, ep, &[]), AuthLevel::Public);
+    }
+
     #[tokio::test]
     async fn bare_index_path_is_gated_at_the_declared_level() {
         use crate::test_support::{auth_msg, TestContext};
@@ -1663,27 +1576,33 @@ mod tests {
         );
     }
 
+    /// An anonymous asset request reaches dispatch from the system block's
+    /// own declaration: `SystemBlock::info()` declares
+    /// `GET /b/static/{filename}` public, and `declared_access` resolves the
+    /// bound filename to that row. Driven with the real `info()`, so a
+    /// router entry that merely restates it is redundant.
     #[tokio::test]
     async fn anonymous_static_asset_request_is_not_denied() {
-        use crate::test_support::{anon_msg, TestContext};
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::system::SystemBlock,
+            test_support::{anon_msg, TestContext},
+        };
 
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/system",
             std::sync::Arc::new(DispatchProbeBlock),
         );
+        let block_infos = vec![SystemBlock::new().info()];
 
-        // No `BlockInfo` passed at all — proves the carve-out does not depend
-        // on `declared_access` matching. `SystemBlock::info().endpoints` now
-        // declares `GET /b/static/{filename}` (public), which would resolve
-        // this path on its own; the carve-out stays until `router_final` is
-        // removed in phase 1's final PR, and this test goes with it.
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", "/b/static/app-abc123.css"),
             InputStream::empty(),
             &AllEnabled,
-            &[],
+            &block_infos,
             &[],
         )
         .await;
@@ -1696,14 +1615,20 @@ mod tests {
 
     #[tokio::test]
     async fn webmcp_script_asset_is_publicly_reachable() {
-        use crate::test_support::{anon_msg, TestContext};
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::system::SystemBlock,
+            test_support::{anon_msg, TestContext},
+        };
 
         // The WebMCP registration script (`crates/impresspress-core/src/ui/
         // assets/webmcp.js`, served under `/b/static/`) must load for
         // anonymous visitors, or tools silently never register on the
         // public storefront. Drive a real anonymous request through
         // `route_to_block` against the actual URL the page embeds
-        // (`assets::webmcp_js_url()`), the same way
+        // (`assets::webmcp_js_url()`) and the system block's real
+        // declaration, the same way
         // `anonymous_static_asset_request_is_not_denied` proves this for the
         // static prefix generally.
         let mut ctx = TestContext::new().await;
@@ -1711,13 +1636,14 @@ mod tests {
             "impresspress/system",
             std::sync::Arc::new(DispatchProbeBlock),
         );
+        let block_infos = vec![SystemBlock::new().info()];
 
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", &crate::ui::assets::webmcp_js_url()),
             InputStream::empty(),
             &AllEnabled,
-            &[],
+            &block_infos,
             &[],
         )
         .await;
@@ -1730,42 +1656,33 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
-    #[test]
-    fn static_prefix_route_is_router_declared_public() {
-        // Direct check on the ROUTES entry itself (companion to the dispatch
-        // test above): while `router_final` exists the static prefix uses it.
-        // Since the system block declares `GET /b/static/{filename}` this is
-        // belt and braces, not the thing keeping assets public; phase 1's
-        // final PR deletes `router_final` and this test with it.
-        let static_route = ROUTES
-            .iter()
-            .find(|r| r.prefix == STATIC_PREFIX)
-            .expect("static prefix route not declared");
-        assert_eq!(static_route.access, RouteAccess::Public);
-        assert!(
-            static_route.router_final,
-            "/b/static/ must be router_final so the Authenticated default can't override it"
-        );
-    }
-
+    /// The Stripe webhook is verified by HMAC signature inside its handler,
+    /// not by a session. The products block declares
+    /// `POST /b/products/webhooks` public and the router reads that
+    /// declaration; driven with the block's real `info()`, an anonymous
+    /// POST reaches dispatch.
     #[tokio::test]
-    async fn stripe_webhook_carveout_stays_reachable_with_no_session() {
-        use crate::test_support::{anon_msg, TestContext};
+    async fn stripe_webhook_stays_reachable_with_no_session() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::products::ProductsBlock,
+            test_support::{anon_msg, TestContext},
+        };
 
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/products",
             std::sync::Arc::new(DispatchProbeBlock),
         );
+        let block_infos = vec![ProductsBlock::new().info()];
 
-        // No BlockInfo passed at all — `router_declared_public` routes never
-        // consult `declared_access`, so this must dispatch regardless.
         let out = route_to_block(
             &ctx,
             anon_msg("create", "/b/products/webhooks"),
             InputStream::empty(),
             &AllEnabled,
-            &[],
+            &block_infos,
             &[],
         )
         .await;
@@ -1776,23 +1693,15 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
-    /// The webhook is reachable anonymously from the products block's own
-    /// declaration, with no router carve-out involved: `endpoint_auth` and
-    /// `declared_access` resolve `POST /b/products/webhooks` to `Public` from
-    /// `ProductsBlock::new().info()` alone, and `route_to_block` dispatches
-    /// an anonymous POST with that info. Today the
-    /// `router_declared_public("/b/products/webhooks", ..)` entry still
-    /// short-circuits the access decision, so the dispatch half passes for
-    /// two reasons; the resolution half is the one that lets PR 7 delete the
-    /// carve-out and keep this test green.
-    #[tokio::test]
-    async fn stripe_webhook_is_public_from_the_products_declaration_alone() {
-        use wafer_run::{AuthLevel, Block};
+    /// The resolution behind `stripe_webhook_stays_reachable_with_no_session`:
+    /// `endpoint_auth` and `declared_access` resolve
+    /// `POST /b/products/webhooks` to `Public` from
+    /// `ProductsBlock::new().info()` alone, with no router entry involved.
+    #[test]
+    fn stripe_webhook_is_public_from_the_products_declaration_alone() {
+        use wafer_run::{AuthLevel, Block as _};
 
-        use crate::{
-            blocks::products::ProductsBlock,
-            test_support::{anon_msg, TestContext},
-        };
+        use crate::{blocks::products::ProductsBlock, test_support::anon_msg};
 
         let block_infos = vec![ProductsBlock::new().info()];
         assert_eq!(
@@ -1813,30 +1722,10 @@ mod tests {
             RouteAccess::Public,
             "the router resolves the webhook public from the declaration"
         );
-
-        let mut ctx = TestContext::new().await;
-        ctx.register_block(
-            "impresspress/products",
-            std::sync::Arc::new(DispatchProbeBlock),
-        );
-        let out = route_to_block(
-            &ctx,
-            anon_msg("create", "/b/products/webhooks"),
-            InputStream::empty(),
-            &AllEnabled,
-            &block_infos,
-            &[],
-        )
-        .await;
-        let buf = out
-            .collect_buffered()
-            .await
-            .expect("an anonymous Stripe webhook POST must dispatch");
-        assert_eq!(buf.body, b"DISPATCHED");
     }
 
     #[tokio::test]
-    async fn undeclared_products_path_other_than_the_webhook_carveout_requires_auth() {
+    async fn undeclared_products_path_requires_auth() {
         use crate::test_support::{anon_msg, TestContext};
 
         let ctx = TestContext::new().await;
@@ -1847,9 +1736,9 @@ mod tests {
             "t",
         )];
 
-        // Same general `/b/products` prefix as the webhook carve-out, but NOT
-        // one of the router-declared-public paths — must still require auth.
-        // Proves the carve-out is narrow, not a reopening of the whole prefix.
+        // Same Public-tier `/b/products` prefix as the declared public
+        // webhook, but not a declared path — must still require auth. A
+        // public declaration is narrow, not a reopening of the whole prefix.
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", "/b/products/some-made-up-undeclared-path"),
@@ -1959,77 +1848,18 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
+    /// The nine session-less `/b/auth/...` paths resolve to `Public` from the
+    /// auth-ui block's own declaration, and the two api-key rows resolve to
+    /// `Authenticated`. These eleven were the block's undeclared surface
+    /// before PR #14; the router carve-outs that kept nine of them reachable
+    /// are gone because these declarations carry the level.
     #[test]
-    fn router_declared_public_routes_precede_their_general_prefix() {
-        // Most-specific-first ordering matters for the `starts_with` matcher
-        // (same discipline as the legalpages admin/api-before-bare routes).
-        let router_declared_public_prefixes = [
-            "/b/auth/oauth/callback",
-            "/b/auth/api/oauth/sync-user",
-            "/b/auth/api/oauth/providers",
-            "/b/auth/reset-password",
-            "/b/auth/api/reset-password",
-            "/b/auth/api/forgot-password",
-            "/b/auth/api/verify",
-            "/b/auth/api/resend-verification",
-            "/b/products/webhooks",
-        ];
-        for prefix in router_declared_public_prefixes {
-            let carveout_pos = ROUTES
-                .iter()
-                .position(|r| r.prefix == prefix)
-                .unwrap_or_else(|| panic!("router_declared_public route {prefix} not found"));
-            let general_prefix = if prefix.starts_with("/b/auth/") {
-                "/b/auth/"
-            } else {
-                "/b/products"
-            };
-            let general_pos = ROUTES
-                .iter()
-                .position(|r| r.prefix == general_prefix)
-                .unwrap_or_else(|| panic!("general route {general_prefix} not found"));
-            assert!(
-                carveout_pos < general_pos,
-                "{prefix} (at {carveout_pos}) must precede {general_prefix} (at {general_pos})"
-            );
-            assert_eq!(
-                ROUTES[carveout_pos].access,
-                RouteAccess::Public,
-                "{prefix} must be Public"
-            );
-            assert!(
-                ROUTES[carveout_pos].router_final,
-                "{prefix} must be router_final so the Authenticated default can't override it"
-            );
-        }
-    }
-
-    /// Every `/b/auth/...` path the router still admits through a
-    /// `router_declared_public` carve-out resolves to `Public` from the
-    /// auth-ui block's own declaration, and the two api-key rows (never
-    /// carved out; gated so far only by `declared_access`'s fail-closed
-    /// default) resolve to `Authenticated`. This is what lets phase 1's final
-    /// PR delete the carve-outs without changing who reaches what. The
-    /// carve-out prefixes and the paths asserted public are compared as
-    /// sets, so an auth-ui carve-out this test does not cover cannot exist.
-    #[test]
-    fn auth_ui_declares_every_path_the_router_carves_out() {
+    fn auth_ui_declares_its_nine_session_less_and_two_api_key_paths() {
         use wafer_run::Block as _;
 
         let info = crate::blocks::auth_ui::AuthUiBlock::new().info();
 
-        let public = [
-            ("retrieve", "/b/auth/reset-password"),
-            ("retrieve", "/b/auth/oauth/callback"),
-            ("retrieve", "/b/auth/api/verify"),
-            ("create", "/b/auth/api/verify"),
-            ("create", "/b/auth/api/resend-verification"),
-            ("create", "/b/auth/api/forgot-password"),
-            ("create", "/b/auth/api/reset-password"),
-            ("retrieve", "/b/auth/api/oauth/providers"),
-            ("create", "/b/auth/api/oauth/sync-user"),
-        ];
-        for (action, path) in public {
+        for (action, path) in AUTH_UI_SESSION_LESS_PATHS {
             assert_eq!(
                 endpoint_match::endpoint_auth(&info.endpoints, action, path),
                 Some(AuthLevel::Public),
@@ -2043,19 +1873,434 @@ mod tests {
                 "{action} /b/auth/api/api-keys/{{id}} must be declared authenticated"
             );
         }
+    }
 
-        let mut carved_out: Vec<&str> = ROUTES
-            .iter()
-            .filter(|r| r.router_final && r.block == "impresspress/auth-ui")
-            .map(|r| r.prefix)
-            .collect();
-        carved_out.sort_unstable();
-        let mut covered: Vec<&str> = public.iter().map(|(_, path)| *path).collect();
-        covered.sort_unstable();
-        covered.dedup();
+    /// The nine auth-ui `(action, path)` pairs that legitimately have no
+    /// session: each handler gates itself by a token, signature or shared
+    /// secret, and the block declares each `public`.
+    const AUTH_UI_SESSION_LESS_PATHS: &[(&str, &str)] = &[
+        ("retrieve", "/b/auth/reset-password"),
+        ("retrieve", "/b/auth/oauth/callback"),
+        ("retrieve", "/b/auth/api/verify"),
+        ("create", "/b/auth/api/verify"),
+        ("create", "/b/auth/api/resend-verification"),
+        ("create", "/b/auth/api/forgot-password"),
+        ("create", "/b/auth/api/reset-password"),
+        ("retrieve", "/b/auth/api/oauth/providers"),
+        ("create", "/b/auth/api/oauth/sync-user"),
+    ];
+
+    /// Each session-less auth-ui path reaches dispatch anonymously from the
+    /// auth-ui declaration alone, driven through `route_to_block` with the
+    /// block's real `info()`. This is the router-level proof behind
+    /// `auth_ui_declares_its_nine_session_less_and_two_api_key_paths`: a
+    /// router entry that merely restates one of these rows is redundant.
+    #[tokio::test]
+    async fn auth_ui_session_less_paths_dispatch_anonymously_from_the_declaration() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::auth_ui::AuthUiBlock,
+            test_support::{anon_msg, TestContext},
+        };
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/auth-ui",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = vec![AuthUiBlock::new().info()];
+
+        for (action, path) in AUTH_UI_SESSION_LESS_PATHS {
+            let out = route_to_block(
+                &ctx,
+                anon_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = out.collect_buffered().await.unwrap_or_else(|terminal| {
+                panic!("anonymous {action} {path} must dispatch from the declaration, got {terminal:?}")
+            });
+            assert_eq!(buf.body, b"DISPATCHED", "{action} {path}");
+        }
+    }
+
+    /// The two api-key rows were never carved out: they were reachable only
+    /// because `declared_access`'s fail-closed default happens to be the
+    /// level the handler wants. Now the block declares them `authenticated`
+    /// and the router enforces exactly that from the declaration.
+    #[tokio::test]
+    async fn auth_ui_api_key_rows_need_a_session_from_the_declaration() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::auth_ui::AuthUiBlock,
+            test_support::{anon_msg, auth_msg, output_is_error, TestContext},
+        };
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/auth-ui",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = vec![AuthUiBlock::new().info()];
+        let path = "/b/auth/api/api-keys/k-1";
+
+        for action in ["update", "delete"] {
+            let denied = route_to_block(
+                &ctx,
+                anon_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            assert!(
+                output_is_error(denied, "PermissionDenied").await,
+                "anonymous {action} {path} must be denied"
+            );
+
+            let admitted = route_to_block(
+                &ctx,
+                auth_msg(action, path, "user_1"),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = admitted
+                .collect_buffered()
+                .await
+                .unwrap_or_else(|terminal| {
+                    panic!("{action} {path} must dispatch, got {terminal:?}")
+                });
+            assert_eq!(buf.body, b"DISPATCHED", "{action} {path}");
+        }
+    }
+
+    /// `/b/admin/settings` carried its own `Admin` prefix entry. Every path
+    /// under it is gated `Admin` regardless: by the `/b/admin/` entry, and by
+    /// the admin block's own rows, which are all `admin`. Driven with the
+    /// real `all_block_infos()`, for a declared tab, the redirecting index
+    /// and an undeclared path, so the dedicated entry is redundant.
+    #[tokio::test]
+    async fn admin_settings_paths_are_denied_without_the_admin_role() {
+        use crate::test_support::{admin_msg, anon_msg, auth_msg, output_is_error, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/admin",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = crate::blocks::all_block_infos();
+
+        let declared = ["/b/admin/settings/", "/b/admin/settings/email"];
+        let undeclared = "/b/admin/settings/not-a-tab";
+        for path in declared.iter().copied().chain(std::iter::once(undeclared)) {
+            for (label, msg) in [
+                ("anonymous", anon_msg("retrieve", path)),
+                ("non-admin", auth_msg("retrieve", path, "user_1")),
+            ] {
+                let out = route_to_block(
+                    &ctx,
+                    msg,
+                    InputStream::empty(),
+                    &AllEnabled,
+                    &block_infos,
+                    &[],
+                )
+                .await;
+                assert!(
+                    output_is_error(out, "PermissionDenied").await,
+                    "{label} GET {path} must be denied"
+                );
+            }
+        }
+        for path in declared {
+            let out = route_to_block(
+                &ctx,
+                admin_msg("retrieve", path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = out.collect_buffered().await.unwrap_or_else(|terminal| {
+                panic!("admin GET {path} must dispatch, got {terminal:?}")
+            });
+            assert_eq!(buf.body, b"DISPATCHED", "admin GET {path}");
+        }
+    }
+
+    /// `/b/legalpages/admin` and `/b/legalpages/api` carried `Admin` prefix
+    /// entries because the block's handlers do not re-check `is_admin`.
+    /// Every row the block declares under those prefixes is `admin`, so the
+    /// declaration gates each path at the same level. Driven with the real
+    /// `all_block_infos()` for a representative row of every shape (pages,
+    /// page writes, the JSON collection, an `{id}` row), plus the public
+    /// terms page to show the public rows are not over-gated.
+    #[tokio::test]
+    async fn legalpages_admin_and_api_paths_are_denied_without_the_admin_role() {
+        use crate::test_support::{admin_msg, anon_msg, auth_msg, output_is_error, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/legalpages",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = crate::blocks::all_block_infos();
+
+        const ADMIN_ROWS: &[(&str, &str)] = &[
+            ("retrieve", "/b/legalpages/admin"),
+            ("retrieve", "/b/legalpages/admin/terms"),
+            ("create", "/b/legalpages/admin/save"),
+            ("retrieve", "/b/legalpages/api/documents"),
+            ("create", "/b/legalpages/api/documents"),
+            ("update", "/b/legalpages/api/documents/d-1"),
+            ("delete", "/b/legalpages/api/documents/d-1"),
+        ];
+        for (action, path) in ADMIN_ROWS {
+            for (label, msg) in [
+                ("anonymous", anon_msg(action, path)),
+                ("non-admin", auth_msg(action, path, "user_1")),
+            ] {
+                let out = route_to_block(
+                    &ctx,
+                    msg,
+                    InputStream::empty(),
+                    &AllEnabled,
+                    &block_infos,
+                    &[],
+                )
+                .await;
+                assert!(
+                    output_is_error(out, "PermissionDenied").await,
+                    "{label} {action} {path} must be denied"
+                );
+            }
+            let out = route_to_block(
+                &ctx,
+                admin_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            let buf = out.collect_buffered().await.unwrap_or_else(|terminal| {
+                panic!("admin {action} {path} must dispatch, got {terminal:?}")
+            });
+            assert_eq!(buf.body, b"DISPATCHED", "admin {action} {path}");
+        }
+
+        let out = route_to_block(
+            &ctx,
+            anon_msg("retrieve", "/b/legalpages/terms"),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        let buf = out
+            .collect_buffered()
+            .await
+            .expect("the public terms page must dispatch anonymously");
+        assert_eq!(buf.body, b"DISPATCHED");
+    }
+
+    /// A router carve-out was a prefix entry: it admitted every method and
+    /// every path under it, and the block answered the shapes it did not
+    /// serve with a 404. A declaration admits exactly its `(method,
+    /// template)` row, so those shapes are undeclared, fall to the
+    /// `Authenticated` default, and are denied before dispatch. Driven with
+    /// the real declarations of the three blocks that used to be carved out.
+    #[tokio::test]
+    async fn a_declaration_admits_its_template_where_a_carve_out_admitted_a_prefix() {
+        use wafer_run::Block as _;
+
+        use crate::{
+            blocks::{auth_ui::AuthUiBlock, products::ProductsBlock, system::SystemBlock},
+            test_support::{anon_msg, output_is_error, TestContext},
+        };
+
+        let mut ctx = TestContext::new().await;
+        for name in [
+            "impresspress/system",
+            "impresspress/auth-ui",
+            "impresspress/products",
+        ] {
+            ctx.register_block(name, std::sync::Arc::new(DispatchProbeBlock));
+        }
+        let block_infos = vec![
+            SystemBlock::new().info(),
+            AuthUiBlock::new().info(),
+            ProductsBlock::new().info(),
+        ];
+
+        for (action, path) in [
+            ("retrieve", "/b/products/webhooks"),
+            ("create", "/b/products/webhooks/extra"),
+            ("retrieve", "/b/auth/api/verify/extra"),
+            ("retrieve", "/b/static/a/b"),
+        ] {
+            let out = route_to_block(
+                &ctx,
+                anon_msg(action, path),
+                InputStream::empty(),
+                &AllEnabled,
+                &block_infos,
+                &[],
+            )
+            .await;
+            assert!(
+                output_is_error(out, "PermissionDenied").await,
+                "anonymous {action} {path} is undeclared and must be denied before dispatch"
+            );
+        }
+    }
+
+    /// An undeclared path under a prefix that used to carry its own `Admin`
+    /// entry falls to the fail-closed `Authenticated` default: an anonymous
+    /// caller is denied, and a logged-in caller reaches the block, whose
+    /// table dispatch answers 404 for a path it does not declare
+    /// (`blocks::legalpages` reads nothing from the path before
+    /// `endpoint_match::dispatch`). Every path the block does serve under
+    /// `/b/legalpages/admin` and `/b/legalpages/api` is declared `admin` and
+    /// gated by that declaration, see
+    /// `legalpages_admin_and_api_paths_are_denied_without_the_admin_role`.
+    #[tokio::test]
+    async fn an_undeclared_path_under_a_former_admin_prefix_entry_falls_to_authenticated() {
+        use crate::test_support::{anon_msg, auth_msg, output_is_error, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "impresspress/legalpages",
+            std::sync::Arc::new(DispatchProbeBlock),
+        );
+        let block_infos = crate::blocks::all_block_infos();
+        let path = "/b/legalpages/admin/does-not-exist";
+
+        let denied = route_to_block(
+            &ctx,
+            anon_msg("retrieve", path),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        assert!(
+            output_is_error(denied, "PermissionDenied").await,
+            "an anonymous caller must be denied an undeclared path"
+        );
+
+        let admitted = route_to_block(
+            &ctx,
+            auth_msg("retrieve", path, "user_1"),
+            InputStream::empty(),
+            &AllEnabled,
+            &block_infos,
+            &[],
+        )
+        .await;
+        let buf = admitted.collect_buffered().await.expect(
+            "a logged-in caller reaches the block, whose table dispatch answers 404 for an \
+             undeclared path",
+        );
+        assert_eq!(buf.body, b"DISPATCHED");
+    }
+
+    /// No entry's prefix is served by another entry's, so the table is
+    /// order-independent: the first match is the only match. A new entry
+    /// nested under an existing one (the shape the deleted carve-outs and
+    /// the `/b/admin/settings` entry had) needs this test changed and the
+    /// reason for the nesting written down.
+    #[test]
+    fn prefix_entries_are_pairwise_disjoint() {
+        for (i, a) in ROUTES.iter().enumerate() {
+            for (j, b) in ROUTES.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !route_prefix_matches(a.prefix, b.prefix),
+                    "the {} entry serves the {} entry's prefix",
+                    a.prefix,
+                    b.prefix
+                );
+            }
+        }
+    }
+
+    /// The table is hand-written; this is what keeps it honest against the
+    /// blocks' own declarations. Every declared endpoint of every registered
+    /// block is served by an entry naming that block (as `block` or
+    /// `dispatch_to`), and every entry's block declares at least one endpoint
+    /// under it. The one exemption is the inspector proxy: its `BlockInfo`
+    /// (`wafer_block_inspector::InspectorBlock`) is the runtime's own,
+    /// declares no `BlockEndpoint`s and is not in `all_block_infos()`; its
+    /// per-request gating is its own `AccessPolicy` on top of the `Admin`
+    /// prefix tier.
+    #[test]
+    fn every_declared_endpoint_sits_under_its_blocks_prefix_and_every_prefix_is_declared_against() {
+        let infos = crate::blocks::all_block_infos();
+
+        for info in &infos {
+            for ep in &info.endpoints {
+                let entry = ROUTES
+                    .iter()
+                    .find(|r| route_prefix_matches(r.prefix, &ep.path))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} declares {} {} but no ROUTES entry serves it",
+                            info.name, ep.method, ep.path
+                        )
+                    });
+                assert!(
+                    entry.block == info.name || entry.dispatch_to == info.name,
+                    "{} declares {} {} but the {} entry serves it from {}",
+                    info.name,
+                    ep.method,
+                    ep.path,
+                    entry.prefix,
+                    entry.block
+                );
+            }
+        }
+
+        let mut without_info = Vec::new();
+        for route in ROUTES {
+            match infos
+                .iter()
+                .find(|i| i.name == route.block || i.name == route.dispatch_to)
+            {
+                Some(info) => assert!(
+                    info.endpoints
+                        .iter()
+                        .any(|ep| route_prefix_matches(route.prefix, &ep.path)),
+                    "the {} entry names {} but the block declares nothing under it",
+                    route.prefix,
+                    route.block
+                ),
+                None => without_info.push(route),
+            }
+        }
+        let exempt: Vec<&str> = without_info.iter().map(|r| r.prefix).collect();
         assert_eq!(
-            carved_out, covered,
-            "the auth-ui carve-outs in ROUTES and the paths this test asserts public must be the same set"
+            exempt,
+            vec!["/b/inspector"],
+            "only the inspector proxy may name a block absent from all_block_infos()"
+        );
+        assert_ne!(
+            without_info[0].block, without_info[0].dispatch_to,
+            "the exemption is the one proxy, which dispatches to the runtime's own block"
         );
     }
 

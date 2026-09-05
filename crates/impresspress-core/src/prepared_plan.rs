@@ -17,7 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::features::BlockState;
 
 /// Current deployment-plan schema. Import rejects every other version.
-pub const PREPARED_RUNTIME_PLAN_SCHEMA_VERSION: u32 = 1;
+///
+/// 2: `PreparedRoute` lost `router_final` (the router's per-path carve-out
+/// flag, deleted with the carve-outs) and `refine_undeclared` became
+/// required. A plan exported by a schema-1 build is refused rather than read
+/// with a field missing: a real one spells `router_final`, which
+/// `deny_unknown_fields` rejects during deserialization, and one that does
+/// not is rejected by the version gate in `validate`.
+pub const PREPARED_RUNTIME_PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// Fail-closed sentinel used by the backwards-compatible structure-only
 /// constructor. Deploy tooling must use `new_with_config_generation` with the
@@ -320,15 +327,11 @@ pub struct PreparedRoute {
     pub access: PreparedRouteAccess,
     pub block: String,
     pub dispatch_to: String,
-    pub router_final: bool,
     /// Consumer routes only: whether a path the block has not declared an
     /// endpoint for falls back to `Authenticated` rather than standing at
-    /// `access` (`routing::ExtraRoute::refined` vs `::new`).
-    ///
-    /// `default` so a plan exported before this field existed still imports —
-    /// and imports as `false`, which is `ExtraRoute::new`, which is what every
-    /// route in such a plan was.
-    #[serde(default)]
+    /// `access` (`routing::ExtraRoute::refined` vs `::new`). Always `false`
+    /// for a built-in route, whose undeclared policy is `declared_access`'s
+    /// own fail-closed default.
     pub refine_undeclared: bool,
 }
 
@@ -882,7 +885,6 @@ mod tests {
                 access: PreparedRouteAccess::Public,
                 block: "impresspress/system".into(),
                 dispatch_to: "impresspress/system".into(),
-                router_final: false,
                 refine_undeclared: false,
             }],
             built_in_route_count: 1,
@@ -1098,5 +1100,77 @@ mod tests {
                 &PreparedReleaseAssets::absent(),
             )
             .is_err());
+    }
+
+    fn exported_plan() -> serde_json::Value {
+        let plan = PreparedRuntimePlan::new(
+            "example",
+            hash('b'),
+            WaferLockIdentity::absent(),
+            PreparedReleaseAssets::absent(),
+            structure(),
+        )
+        .unwrap();
+        serde_json::to_value(plan).unwrap()
+    }
+
+    /// A plan exported by a build on schema 1 is refused by the version gate
+    /// before any content or hash check, so the error names the version
+    /// rather than a mismatch the operator cannot act on.
+    #[test]
+    fn a_version_1_plan_is_rejected_at_import() {
+        let mut exported = exported_plan();
+        exported["schema_version"] = serde_json::json!(1);
+        let error =
+            PreparedRuntimePlan::from_json(&serde_json::to_vec(&exported).unwrap()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                PreparedPlanError::UnsupportedSchema {
+                    actual: 1,
+                    expected: 2
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// Schema 1 carried `PreparedRoute.router_final`, the router's per-path
+    /// carve-out flag. A plan that still spells it is refused as a whole,
+    /// and the refusal names the field.
+    #[test]
+    fn a_plan_exported_with_router_final_is_rejected_at_import() {
+        let mut exported = exported_plan();
+        exported["schema_version"] = serde_json::json!(1);
+        for route in exported["structure"]["routes"].as_array_mut().unwrap() {
+            route["router_final"] = serde_json::json!(false);
+        }
+        let error =
+            PreparedRuntimePlan::from_json(&serde_json::to_vec(&exported).unwrap()).unwrap_err();
+        assert!(matches!(error, PreparedPlanError::Json(_)), "{error}");
+        assert!(error.to_string().contains("router_final"), "{error}");
+    }
+
+    #[test]
+    fn a_version_2_plan_round_trips_and_carries_no_router_final() {
+        assert_eq!(PREPARED_RUNTIME_PLAN_SCHEMA_VERSION, 2);
+        let plan = PreparedRuntimePlan::new(
+            "example",
+            hash('b'),
+            WaferLockIdentity::absent(),
+            PreparedReleaseAssets::absent(),
+            structure(),
+        )
+        .unwrap();
+        assert_eq!(plan.schema_version, 2);
+
+        let exported = serde_json::to_value(&plan).unwrap();
+        for route in exported["structure"]["routes"].as_array().unwrap() {
+            assert!(route.get("router_final").is_none(), "{route}");
+            assert!(route.get("refine_undeclared").is_some(), "{route}");
+        }
+
+        let bytes = plan.to_json_pretty().unwrap();
+        assert_eq!(PreparedRuntimePlan::from_json(&bytes).unwrap(), plan);
     }
 }

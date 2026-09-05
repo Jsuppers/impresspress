@@ -185,10 +185,9 @@ impl ImpresspressBuilder {
                 access: route.access.into(),
                 block: route.block.to_string(),
                 dispatch_to: route.dispatch_to.to_string(),
-                router_final: route.is_router_final(),
                 // Built-in routes are never consumer routes; the undeclared
                 // policy for them is `declared_access`'s own fail-closed
-                // default, gated by `router_final` above.
+                // default.
                 refine_undeclared: false,
             })
             .chain(self.extra_routes.iter().map(|route| PreparedRoute {
@@ -196,7 +195,6 @@ impl ImpresspressBuilder {
                 access: route.access.into(),
                 block: route.block_name.clone(),
                 dispatch_to: route.block_name.clone(),
-                router_final: false,
                 refine_undeclared: route.refines_undeclared(),
             }))
             .collect();

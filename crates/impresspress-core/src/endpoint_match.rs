@@ -1,12 +1,17 @@
-//! Shared request-to-endpoint matcher for impresspress blocks.
+//! Shared route table and request-to-endpoint matcher for impresspress blocks.
 //!
-//! Blocks declare their HTTP surface once as [`wafer_run::BlockEndpoint`]s in
-//! `info().endpoints`. This module matches an incoming request (its
-//! [`RequestAction`]-style action plus resource path) against a slice of
-//! path templates, extracts `{name}` / `{rest...}` path variables into
-//! `req.param.*` meta, and yields the matched handler key. It replaces the
-//! per-block `path.starts_with(...)` / `strip_prefix(...)` guard chains and the
-//! manual single-segment param parsing that used to live in every `handle()`.
+//! A block declares its HTTP surface once, as a `const` table of
+//! [`EndpointRoute`] rows: method, wire-path template, handler key, auth level
+//! and the OpenAPI/WebMCP metadata. [`declare`] turns that table into the
+//! block's `info().endpoints`, and [`dispatch`] matches an incoming request
+//! (its [`RequestAction`]-style action plus resource path) against the same
+//! rows, extracts `{name}`, `{rest...}` and `{rest...}/` path variables into
+//! `req.param.*` meta, and yields the matched handler key. The per-block
+//! `path.starts_with(...)` / `strip_prefix(...)` guard chains and the manual
+//! single-segment param parsing that used to live in every `handle()` are
+//! gone; the one deliberate path read left outside `dispatch` is llm's
+//! inter-block `/b/llm/api/internal/default-target` guard, which is not an
+//! HTTP endpoint and is documented at its site.
 //!
 //! ## Percent-encoding
 //!
@@ -17,11 +22,11 @@
 //! to the matcher, whereas a decoded `/` would split the route.
 //!
 //! Matching therefore happens on the encoded path (templates are literal ASCII
-//! and need no decoding), and [`dispatch_path`] decodes each bound variable
-//! before it lands in `req.param.*`, so a handler reads the value the caller
-//! encoded rather than the escape sequence. Without that decode the encoding a
-//! page must apply when it builds a URL has no inverse, and the round trip
-//! silently misses the record it names.
+//! and need no decoding), and [`dispatch`] decodes each bound variable before
+//! it lands in `req.param.*`, so a handler reads the value the caller encoded
+//! rather than the escape sequence. Without that decode the encoding a page
+//! must apply when it builds a URL has no inverse, and the round trip silently
+//! misses the record it names.
 //!
 //! ## Template syntax
 //!
@@ -76,8 +81,8 @@ pub fn action_for_method(method: HttpMethod) -> &'static str {
 ///
 /// Values are returned **as they appear in `path`**, so still percent-encoded
 /// — matching must happen on the encoded form (see the module docs). Callers
-/// that hand a variable to a handler percent-decode it first;
-/// [`dispatch_path`] does that for every route it binds.
+/// that hand a variable to a handler percent-decode it first; [`dispatch`]
+/// does that for every route it binds.
 pub fn match_template<'p>(template: &str, path: &'p str) -> Option<Vec<(String, &'p str)>> {
     let t_segs: Vec<&str> = template.split('/').collect();
     let p_segs: Vec<&str> = path.split('/').collect();
@@ -270,15 +275,6 @@ impl<H: Copy> EndpointRoute<H> {
         Self::with_auth(method, template, handler, AuthLevel::Admin)
     }
 
-    /// Dispatch-only row for a table that still declares its endpoints by
-    /// hand in `info()` rather than through [`declare`]. Declares `Admin`, so
-    /// that if such a table does reach `declare` by mistake it over-protects
-    /// and shows up in the endpoint-surface snapshot instead of publishing a
-    /// public row. Removed once the last such table is migrated.
-    pub const fn new(method: HttpMethod, template: &'static str, handler: H) -> Self {
-        Self::with_auth(method, template, handler, AuthLevel::Admin)
-    }
-
     /// Set the short summary text.
     pub const fn summary(mut self, summary: &'static str) -> Self {
         self.summary = summary;
@@ -375,79 +371,46 @@ pub fn declare<H: Copy>(table: &[EndpointRoute<H>]) -> Vec<BlockEndpoint> {
 }
 
 /// Find the first route in `table` whose method+template matches the request,
-/// writing any extracted `{name}` path variables into `msg`'s `req.param.*`
-/// meta and returning the matched handler key.
+/// writing any extracted path variables (percent-decoded) into `msg`'s
+/// `req.param.*` meta and returning the matched handler key.
 ///
 /// Routes are tried in declaration order, so blocks list more-specific
 /// templates before generic ones (the same ordering discipline the old
 /// `starts_with` chains relied on). Returns `None` when nothing matches, so the
 /// caller emits its own 404.
+///
+/// The path is matched exactly first. Only when that fails, and the path has
+/// no trailing slash, is it retried with one appended: index routes are
+/// declared with a trailing slash (`/b/messages/`), and [`match_template`]
+/// compares segment counts, so `/b/messages` -- three segments against the
+/// template's four -- could not match it and 404'd while `/b/messages/`
+/// served fine. The sidebar always links the slashed form, so this only bit
+/// someone typing or bookmarking the bare path, but it bit inconsistently
+/// while some blocks tolerated it through hand-written prefix matchers.
+/// Handling it here rather than with a second row in every table keeps each
+/// table a faithful mirror of `info().endpoints`. Because the retry runs only
+/// after an exact match has failed, no request that resolves exactly can be
+/// re-routed by it; [`endpoint_auth`] mirrors the retry so the router gates
+/// the bare form at the row's declared level.
 pub fn dispatch<H: Copy>(msg: &mut Message, table: &[EndpointRoute<H>]) -> Option<H> {
     let action = msg.action().to_string();
     let path = msg.path().to_string();
-    dispatch_path(msg, &action, &path, table)
-}
+    let with_slash = (!path.ends_with('/')).then(|| format!("{path}/"));
 
-/// Like [`dispatch`], but matches against an explicitly supplied `action` +
-/// `path` rather than reading them from the message.
-///
-/// Used by blocks that mount their sub-handlers under a normalized sub-path
-/// (e.g. the products admin/user split): the caller passes the normalized path
-/// as an explicit argument instead of mutating `req.resource` in place, and
-/// extracted `{name}` vars still land in `req.param.*` so the sub-handlers'
-/// id readers work unchanged.
-pub fn dispatch_path<H: Copy>(
-    msg: &mut Message,
-    action: &str,
-    path: &str,
-    table: &[EndpointRoute<H>],
-) -> Option<H> {
-    if let Some(h) = dispatch_exact(msg, action, path, table) {
-        return Some(h);
-    }
-    // Index routes are declared with a trailing slash (`/b/messages/`), and
-    // `match_template` compares segment counts, so `/b/messages` -- three
-    // segments against the template's four -- could not match it and 404'd
-    // while `/b/messages/` served fine. The sidebar always links the slashed
-    // form, so this only bit someone typing or bookmarking the bare path, but
-    // it bit inconsistently: `admin`, `userportal` and `products` route
-    // through their own hand-written prefix matchers and tolerate it, while
-    // every block on this shared table (`messages`, `vector`) did not. Fixing
-    // it here rather than by adding a second row to two route tables keeps
-    // the tables a faithful mirror of `info().endpoints` and covers blocks
-    // added later.
-    //
-    // Only retried after an exact match has already failed, so no request
-    // that resolves today can be re-routed by this.
-    if !path.ends_with('/') {
-        return dispatch_exact(msg, action, &format!("{path}/"), table);
-    }
-    None
-}
-
-/// The strict, single-pass matcher behind [`dispatch_path`].
-fn dispatch_exact<H: Copy>(
-    msg: &mut Message,
-    action: &str,
-    path: &str,
-    table: &[EndpointRoute<H>],
-) -> Option<H> {
-    for route in table {
-        if action_for_method(route.method) != action {
-            continue;
-        }
-        if let Some(params) = match_template(route.template, path) {
-            let owned: Vec<(String, String)> = params
-                .into_iter()
-                .map(|(k, v)| (k, crate::util::url_path_decode(v)))
-                .collect();
-            for (name, value) in owned {
-                msg.set_meta(
-                    format!("{}{}", wafer_run::META_REQ_PARAM_PREFIX, name),
-                    value,
-                );
+    for candidate in std::iter::once(path).chain(with_slash) {
+        for route in table {
+            if action_for_method(route.method) != action {
+                continue;
             }
-            return Some(route.handler);
+            if let Some(params) = match_template(route.template, &candidate) {
+                for (name, value) in params {
+                    msg.set_meta(
+                        format!("{}{}", wafer_run::META_REQ_PARAM_PREFIX, name),
+                        crate::util::url_path_decode(value),
+                    );
+                }
+                return Some(route.handler);
+            }
         }
     }
     None
@@ -481,7 +444,7 @@ pub fn endpoint_auth(
     if let Some(level) = endpoint_auth_exact(endpoints, action, path) {
         return Some(level);
     }
-    // Mirror `dispatch_path`'s trailing-slash retry, and only after an exact
+    // Mirror `dispatch`'s trailing-slash retry, and only after an exact
     // match has failed. A block's `dispatch` serves `GET /b/llm` from its
     // `/b/llm/` row, so the router must gate the bare form at that row's
     // declared level; without this it fell back to the `Authenticated`
@@ -640,7 +603,7 @@ mod tests {
         let mut msg = Message::new("test");
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/messages/api/contexts/ctx-7");
-        let table = [EndpointRoute::new(
+        let table = [EndpointRoute::admin(
             HttpMethod::Get,
             "/b/messages/api/contexts/{id}",
             1u8,
@@ -667,7 +630,7 @@ mod tests {
         let mut msg = Message::new("test");
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", &path);
-        let table = [EndpointRoute::new(
+        let table = [EndpointRoute::admin(
             HttpMethod::Get,
             "/b/messages/api/contexts/{id}",
             1u8,
@@ -686,7 +649,7 @@ mod tests {
             "req.resource",
             "/b/storage/api/buckets/photos/objects/holiday%20snaps/a%2Bb.txt",
         );
-        let table = [EndpointRoute::new(
+        let table = [EndpointRoute::admin(
             HttpMethod::Get,
             "/b/storage/api/buckets/{name}/objects/{key...}",
             1u8,
@@ -703,7 +666,7 @@ mod tests {
         let mut msg = Message::new("test");
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/messages/api/contexts/%FF%FE");
-        let table = [EndpointRoute::new(
+        let table = [EndpointRoute::admin(
             HttpMethod::Get,
             "/b/messages/api/contexts/{id}",
             1u8,
@@ -718,8 +681,8 @@ mod tests {
         msg.set_meta("req.action", "create");
         msg.set_meta("req.resource", "/b/messages/api/contexts");
         let table = [
-            EndpointRoute::new(HttpMethod::Get, "/b/messages/api/contexts", 1u8),
-            EndpointRoute::new(HttpMethod::Post, "/b/messages/api/contexts", 2u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/messages/api/contexts", 1u8),
+            EndpointRoute::admin(HttpMethod::Post, "/b/messages/api/contexts", 2u8),
         ];
         assert_eq!(dispatch(&mut msg, &table), Some(2u8));
     }
@@ -734,7 +697,7 @@ mod tests {
         let mut msg = Message::new("test");
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/messages");
-        let table = [EndpointRoute::new(HttpMethod::Get, "/b/messages/", 1u8)];
+        let table = [EndpointRoute::admin(HttpMethod::Get, "/b/messages/", 1u8)];
         assert_eq!(dispatch(&mut msg, &table), Some(1u8));
     }
 
@@ -746,8 +709,8 @@ mod tests {
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/messages/api");
         let table = [
-            EndpointRoute::new(HttpMethod::Get, "/b/messages/", 1u8),
-            EndpointRoute::new(HttpMethod::Get, "/b/messages/api/contexts", 2u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/messages/", 1u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/messages/api/contexts", 2u8),
         ];
         assert_eq!(dispatch(&mut msg, &table), None);
     }
@@ -760,8 +723,8 @@ mod tests {
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/x/thing");
         let table = [
-            EndpointRoute::new(HttpMethod::Get, "/b/x/thing", 1u8),
-            EndpointRoute::new(HttpMethod::Get, "/b/x/thing/", 2u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/x/thing", 1u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/x/thing/", 2u8),
         ];
         assert_eq!(dispatch(&mut msg, &table), Some(1u8));
     }
@@ -773,7 +736,7 @@ mod tests {
         let mut msg = Message::new("test");
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/vector/api/indexes");
-        let table = [EndpointRoute::new(
+        let table = [EndpointRoute::admin(
             HttpMethod::Get,
             "/b/vector/api/indexes/{name}",
             1u8,
@@ -788,8 +751,8 @@ mod tests {
         msg.set_meta("req.action", "delete");
         msg.set_meta("req.resource", "/b/vector/api/indexes/my-index");
         let table = [
-            EndpointRoute::new(HttpMethod::Delete, "/b/vector/api/indexes/{name}", 1u8),
-            EndpointRoute::new(HttpMethod::Delete, "/b/vector/api/{index}/{id}", 2u8),
+            EndpointRoute::admin(HttpMethod::Delete, "/b/vector/api/indexes/{name}", 1u8),
+            EndpointRoute::admin(HttpMethod::Delete, "/b/vector/api/{index}/{id}", 2u8),
         ];
         assert_eq!(dispatch(&mut msg, &table), Some(1u8));
         assert_eq!(msg.var("name"), "my-index");
@@ -878,17 +841,6 @@ mod tests {
         );
         assert_eq!(
             EndpointRoute::admin(HttpMethod::Get, "/b/x/", 1u8).auth,
-            AuthLevel::Admin
-        );
-    }
-
-    /// `new` is the dispatch-only constructor the not-yet-migrated tables
-    /// still use. If one of those tables ever reaches `declare` by mistake it
-    /// must over-protect, never publish a public row by omission.
-    #[test]
-    fn new_declares_admin() {
-        assert_eq!(
-            EndpointRoute::new(HttpMethod::Get, "/b/x/", 1u8).auth,
             AuthLevel::Admin
         );
     }
@@ -1030,7 +982,7 @@ mod tests {
     }
 
     /// The router and the block must agree on which row serves a request.
-    /// `dispatch_path` retries a bare index path with a trailing slash, so
+    /// `dispatch` retries a bare index path with a trailing slash, so
     /// `GET /b/llm` reaches the `Admin` chat page; `endpoint_auth` has to
     /// resolve the same row, or the router gates the request at the
     /// fail-closed `Authenticated` default and a logged-in non-admin gets an
@@ -1089,7 +1041,7 @@ mod tests {
     }
 
     /// The slash form is exact: a path without the trailing slash does not
-    /// match it. (`dispatch_path`'s slash retry then finds it, see below.)
+    /// match it. (`dispatch`'s slash retry then finds it, see below.)
     #[test]
     fn rest_param_with_trailing_slash_requires_the_slash() {
         assert!(match_template(
@@ -1129,8 +1081,8 @@ mod tests {
         msg.set_meta("req.action", "retrieve");
         msg.set_meta("req.resource", "/b/storage/photos/2024/x");
         let table = [
-            EndpointRoute::new(HttpMethod::Get, "/b/storage/{bucket}/", 1u8),
-            EndpointRoute::new(HttpMethod::Get, "/b/storage/{bucket}/{prefix...}/", 2u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/storage/{bucket}/", 1u8),
+            EndpointRoute::admin(HttpMethod::Get, "/b/storage/{bucket}/{prefix...}/", 2u8),
         ];
         assert_eq!(dispatch(&mut msg, &table), Some(2u8));
         assert_eq!(msg.var("bucket"), "photos");

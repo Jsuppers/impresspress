@@ -249,17 +249,14 @@ mod tests {
 
     /// `declared_access` (`routing.rs`) fails closed to `AuthLevel::
     /// Authenticated` for any path a block does not declare as a
-    /// `BlockEndpoint` — the one asset row in `ROUTES` is that declaration.
-    /// Checked via `effective_access`, not `declared_access` directly: `/b/static/`
-    /// is mounted as `Route::router_declared_public` (`router_final`), so
-    /// the router's own `Public` declaration is what actually admits an
-    /// anonymous request regardless of this endpoint entry (proved
-    /// end-to-end by `routing::tests::webmcp_script_asset_is_publicly_reachable`,
-    /// which registers no `BlockInfo` at all and still dispatches) —
-    /// `effective_access` is the resolver that mirrors exactly what the
-    /// router enforces (it's the same one `pipeline.rs` plugs into the
-    /// WebMCP manifest generator), so it's the correct thing to assert
-    /// against here.
+    /// `BlockEndpoint` — the one asset row in `ROUTES` is that declaration,
+    /// and it is what admits an anonymous asset request: the router carries
+    /// no per-path entry for `/b/static/` (proved end-to-end by
+    /// `routing::tests::webmcp_script_asset_is_publicly_reachable`, which
+    /// drives the real request through `route_to_block` with this block's
+    /// `info()`). Checked here via `effective_access`, the resolver that
+    /// mirrors exactly what the router enforces (the same one `pipeline.rs`
+    /// plugs into the WebMCP manifest generator).
     #[test]
     fn webmcp_script_asset_is_publicly_reachable() {
         let info = SystemBlock::new().info();

@@ -1,7 +1,7 @@
 # One route table per block
 
 **Date:** 2026-09-05
-**Status:** Design, pending review
+**Status:** Implemented (PRs #12–#17 and this one, PR 7: router cleanup)
 **Repo:** `impresspress` only (no wafer-run change)
 **Origin:** Phase 1 of `docs/CODE_REVIEW_2026-09-05.md` (section 7)
 
@@ -383,3 +383,47 @@ requires all of them.
 - Changing what any path returns, or which caller may reach it, beyond
   turning an implicit "the handler checks a token" into an explicit
   `public` row that the snapshot shows.
+
+## As built
+
+The seven PRs landed as sequenced. Where the implementation departed from
+or refined the design above, one line each with the PR that made it:
+
+- `system` declares one `GET /b/static/{filename}` row and looks the bound
+  filename up in the build-time asset manifest; the per-asset
+  `app-{hash}.css` declarations are gone (#12).
+- `request_schema_of::<T>` and `response_schema_of::<T>` go through the
+  upstream `BlockEndpoint::input` / `::output` builders on a throwaway
+  endpoint rather than copying wafer-block's private derive settings, so a
+  row serializes the bytes the hand-written list did (#12).
+- `endpoint_auth` mirrors `dispatch`'s trailing-slash retry, so the router
+  gates a bare index path (`GET /b/llm`) at the `/b/llm/` row's declared
+  level instead of the `Authenticated` default (#12, review fix).
+- `match_template` accepts `{name...}/`, a rest parameter followed by a
+  trailing slash (the path must end in `/`, the remainder must be
+  non-empty), for files' nested folder pages (#15).
+- files declares thirteen rows, not eight: the six relocated admin rows,
+  the four `cloudstorage` user rows (share list, share create, share
+  delete, quota), plus
+  `GET /b/storage/api/search`, `GET /b/storage/api/recent` and
+  `DELETE /b/storage/api/buckets/{name}`, served but never declared, now
+  `authenticated`; the two object rows use `{key...}` in place of `{key}`,
+  which changes two surface lines and one OpenAPI path key (#15).
+- products serves each handler at exactly its declared spelling: the 51
+  aliases the old `strip_prefix("/b/products/api")` rewrite produced, and
+  the webhook's non-POST and suffixed shapes, answer 404 (#17).
+- Router cleanup (PR 7): a carve-out was a prefix entry admitting every
+  method under it, a declaration admits its exact template, so anonymous
+  requests for the shapes only the prefix admitted (`GET
+  /b/products/webhooks`, `GET /b/auth/api/verify/extra`, `GET /b/static/a/b`)
+  are denied before dispatch instead of reaching the block's 404; an
+  undeclared path under the former `Admin` entries `/b/legalpages/admin`
+  and `/b/legalpages/api` falls to `Authenticated` and is answered 404 by
+  the block's table dispatch (the deleted `/b/admin/settings` entry sat
+  under `/b/admin/`, which stays `Admin`, so nothing changed there). The
+  prefix table stays
+  hand-written (fourteen entries: one prefix per block, `/health` and
+  `/b/static/` for system, `/b/storage/` and `/b/cloudstorage/` for files,
+  the inspector proxy), kept honest by a two-way test against
+  `blocks::all_block_infos()` and a pairwise-disjointness test.
+  `PREPARED_RUNTIME_PLAN_SCHEMA_VERSION` is 2.
