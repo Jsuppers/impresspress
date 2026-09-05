@@ -70,6 +70,7 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
+    // audit-allow: names the platform tables for the export allowlist/exclusion bookkeeping below — the two it reads (`variables`, `user_roles`) are granted by `dev::wrap_grants()`, which maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)` and which the runtime honours from its flat grant list, and the audit attributes grants to the declaring file's block and cannot see it
     platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
 

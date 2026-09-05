@@ -6,7 +6,10 @@
 # in `crates/impresspress-core/src/blocks/`, derives the calling block from the
 # file path and the table-owning block from the table's `{org}__{block}__`
 # prefix, and verifies the owning block declares a `ResourceGrant` covering
-# the call.
+# the call. A reference to `crate::platform_state::<module>` from a block is
+# walked the same way: that module's functions run under the calling block's
+# WRAP identity, so the reference is a database access on the module's
+# `TABLE` (Phase 3.7).
 #
 # Background: WRAP enforces cross-block table access at runtime, but only
 # when the calling site routes through the typed `db::*` client AND the
@@ -131,6 +134,23 @@ while IFS= read -r line; do
 # `pub(crate)`, `pub(super)`, etc.
 done < <(grep -rEn "${GREP_EXCLUDE[@]}" "^(pub(\([^)]+\))?[[:space:]]+)?const [A-Z_]+: &str = \"[^\"]+\"" "$BLOCKS_DIR" 2>/dev/null || true)
 
+# ---------- Phase 1.7: platform_state tables ----------
+# `crates/impresspress-core/src/platform_state/<module>.rs` owns one platform
+# table each, declared as `pub const TABLE`. Indexed by module name so Phase
+# 3.7 can resolve `platform_state::<module>` to the table it reaches.
+PLATFORM_STATE_DIR="crates/impresspress-core/src/platform_state"
+declare -A PLATFORM_TABLE       # module -> table name
+re_platform_table='const[[:space:]]+TABLE[[:space:]]*:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]+)"'
+while IFS= read -r line; do
+  file="${line%%:*}"
+  rest="${line#*:}"
+  rest="${rest#*:}"
+  if [[ "$rest" =~ $re_platform_table ]]; then
+    module="$(basename "$file" .rs)"
+    PLATFORM_TABLE["$module"]="${BASH_REMATCH[1]}"
+  fi
+done < <(grep -rEn "^pub const TABLE: &str = \"[^\"]+\"" "$PLATFORM_STATE_DIR" 2>/dev/null || true)
+
 # Parse `use ... as` aliases. Both crate-rooted and super-relative paths
 # matter — many files import `use crate::blocks::auth::USERS_COLLECTION as USERS`.
 # We don't model module scope precisely; we just record alias → source-bare-name
@@ -240,13 +260,18 @@ done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' 
 # (multi-line aware) and resolving paths to their target files.
 
 # Print every `use ...;` statement in $file as a single line, with internal
-# whitespace collapsed. Handles multi-line brace forms.
+# whitespace collapsed. Handles multi-line brace forms. Line comments inside
+# a brace group (an `// audit-allow:` pragma on the platform_state entry of
+# a `use crate::{..}` group, say) are stripped before the `;` test, so a
+# `;` in comment text cannot end the statement early.
 read_use_statements() {
   awk '
     /^[[:space:]]*(pub(\([^)]+\))?[[:space:]]+)?use[[:space:]]/ {
       buf = $0
+      sub(/\/\/.*$/, "", buf)
       while (buf !~ /;/) {
         if ((getline next_line) <= 0) break
+        sub(/\/\/.*$/, "", next_line)
         buf = buf " " next_line
       }
       gsub(/[[:space:]]+/, " ", buf)
@@ -425,6 +450,18 @@ while IFS= read -r file; do
       module_part="${src_path%::*}"
       [ "$module_part" = "$src_path" ] && module_part=""
 
+      # `use crate::platform_state::<module>::TABLE [as ALIAS]` binds the
+      # platform table directly; the module lives outside `src/blocks/`, so
+      # the file walk below cannot reach it.
+      if [ "$src_const" = "TABLE" ] && [[ "$module_part" =~ ^crate::platform_state::([a-z_]+)$ ]]; then
+        pmodule="${BASH_REMATCH[1]}"
+        if [ -n "${PLATFORM_TABLE[$pmodule]:-}" ]; then
+          FILE_USE_VALUE["${file}::${alias}"]="${PLATFORM_TABLE[$pmodule]}"
+          FILE_USE_ALIAS["${file}::${alias}"]="TABLE"
+          continue
+        fi
+      fi
+
       # Resolve the source path to a target file.
       target_file=""
       if [ -n "$module_part" ]; then
@@ -501,6 +538,36 @@ for _ in 1 2 3; do
   [ "$changed" -eq 0 ] && break
 done
 
+# ---------- Phase 1.8: per-file platform_state references ----------
+# Which `platform_state` modules each block file reaches: every `use
+# crate::platform_state::<module>…` leaf (a whole-module import, an item
+# import, `self`, or an alias) plus every inline `platform_state::<module>::`
+# path. Read once here; the resolver consults it for `<module>::TABLE`
+# tokens and Phase 3.7 walks it.
+declare -A FILE_PLATFORM_MODULES   # file -> space-separated module names
+while IFS= read -r file; do
+  modules=""
+  while IFS= read -r stmt; do
+    [ -z "$stmt" ] && continue
+    body="${stmt#*use }"
+    body="${body%;*}"
+    while IFS= read -r entry; do
+      [ -z "$entry" ] && continue
+      src_path="${entry%%|*}"
+      if [[ "$src_path" =~ ^crate::platform_state::([a-z_]+)(::|$) ]]; then
+        modules="$modules ${BASH_REMATCH[1]}"
+      fi
+    done < <(explode_use_body "$body")
+  done < <(read_use_statements "$file")
+  while IFS= read -r match; do
+    [ -z "$match" ] && continue
+    match="${match#platform_state::}"
+    modules="$modules ${match%::}"
+  done < <(grep -oE "platform_state::[a-z_]+::" "$file" 2>/dev/null || true)
+  [ -z "${modules// /}" ] && continue
+  FILE_PLATFORM_MODULES["$file"]="$(echo "$modules" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
+
 # ---------- Phase 2: collect grants per-owning-block ----------
 # Pattern:  ResourceGrant::{read,read_write}(GRANTEE, RESOURCE)[.typed(TYPE)]
 # Grants live in a block's `BlockInfo::grants(vec![...])` — we attribute the
@@ -532,6 +599,21 @@ resolve_token() {
   fi
   # Stripped bare identifier (drop `module::path::` prefix).
   local bare="${tok##*::}"
+  # 0. `<module>::TABLE` naming a `platform_state` module the file imports
+  #    (`use crate::platform_state::{variables, ..}` then `variables::TABLE`),
+  #    or the fully qualified `crate::platform_state::<module>::TABLE`. The
+  #    modules live outside `src/blocks/`, so the file walk in 0c cannot
+  #    reach them; a block's own `repo::variables::TABLE` (products) does
+  #    not import `platform_state` and falls through to 0c.
+  if [[ "$tok" =~ (^|::)([a-z_]+)::TABLE$ ]]; then
+    local pmodule="${BASH_REMATCH[2]}"
+    if [ -n "${PLATFORM_TABLE[$pmodule]:-}" ]; then
+      if [[ "$tok" == *platform_state::* ]] || [[ " ${FILE_PLATFORM_MODULES[$file]:-} " == *" $pmodule "* ]]; then
+        echo "${PLATFORM_TABLE[$pmodule]}"
+        return
+      fi
+    fi
+  fi
   # 0a. `crate::blocks::BLOCK::NAME` — full path. Disambiguates colliding
   #     bare names across blocks (e.g. `VARIABLES_COLLECTION` exists in
   #     both admin and products). NAME may be a direct const in BLOCK or a
@@ -733,6 +815,7 @@ storage_path_to_owner() {
 while IFS= read -r line; do
   file="${line%%:*}"
   rest="${line#*:}"
+  lineno="${rest%%:*}"
   rest="${rest#*:}"
   # Match: ResourceGrant::read("a", "b")  or  ResourceGrant::read_write(IDENT, IDENT)
   # The args may be string literals or constant identifiers (with optional `super::module::` qualifier).
@@ -744,11 +827,22 @@ while IFS= read -r line; do
     resource_raw="${BASH_REMATCH[3]// /}"
     grantee="$(resolve_token "$grantee_raw" "$file")"
     resource="$(resolve_token "$resource_raw" "$file")"
-    # Grant type: default Database; if the same line has .typed(...), pick that
+    # Grant type: default Database; `.typed(...)` on the same line picks
+    # another. rustfmt puts a long `.typed(...)` on its own continuation
+    # line, so that line is read too — without it admin's
+    # `read("*", "*").typed(Network)` and `read_write("*", "*").typed(Crypto)`
+    # index as Database wildcards that cover every admin-owned table for
+    # every caller, and no missing grant on an admin table can ever be
+    # reported.
     type="Database"
     re_typed='\.typed\(([^)]*ResourceType::)?([A-Za-z]+)\)'
     if [[ "$rest" =~ $re_typed ]]; then
       type="${BASH_REMATCH[2]}"
+    else
+      next_line="$(sed -n "$((lineno + 1))p" "$file" 2>/dev/null)"
+      if [[ "$next_line" =~ ^[[:space:]]*\.typed ]] && [[ "$next_line" =~ $re_typed ]]; then
+        type="${BASH_REMATCH[2]}"
+      fi
     fi
     # Owning block = the block this file lives in
     owner="$(file_to_block_id "$file")"
@@ -922,6 +1016,59 @@ while IFS= read -r line; do
   fi
 done < <(grep -rEn "${GREP_EXCLUDE[@]}" "db::(list|create|update|delete|count|get|find_one)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
+# ---------- Phase 3.7: walk platform_state references ----------
+# A block reaches a platform table through
+# `crates/impresspress-core/src/platform_state/<module>.rs`, whose functions
+# run under the CALLING block's WRAP identity — the module is a codec plus
+# query helpers, not a service that acts as admin. Every `use
+# crate::platform_state::<module>…` leaf and every inline
+# `platform_state::<module>::` path in a block file is therefore a database
+# access on that module's table, checked exactly like a `db::*` callsite that
+# names it (same pragmas, same report). Without this, moving those calls out
+# of `src/blocks/` would silently un-audit every cross-block read of the
+# platform tables. The reported line is the file's first mention of
+# `platform_state`; an `// audit-allow:` pragma goes on the line above it.
+declare -i ps_total=0
+while IFS= read -r file; do
+  modules="${FILE_PLATFORM_MODULES[$file]:-}"
+  [ -z "${modules// /}" ] && continue
+  lineno="$(grep -n "platform_state" "$file" | head -1 | cut -d: -f1)"
+  [ -z "$lineno" ] && lineno=1
+  caller="$(file_to_block_id "$file")"
+  for module in $modules; do
+    [ -z "$module" ] && continue
+    table="${PLATFORM_TABLE[$module]:-<unresolved:platform_state::${module}>}"
+    pair_key="${caller}|${table}"
+    [ -n "${SEEN_PAIRS[$pair_key]:-}" ] && continue
+    SEEN_PAIRS["$pair_key"]=1
+    ps_total=$((ps_total + 1))
+    total=$((total + 1))
+    if file_allows_audit_skip "$file" || has_allow_pragma "$file" "$lineno"; then
+      allowed=$((allowed + 1))
+      ALLOWED_LINES+=("${file}:${lineno}: ${caller} → ${table} (via platform_state::${module})")
+      continue
+    fi
+    if [[ "$table" == "<unresolved:"* ]]; then
+      unresolved=$((unresolved + 1))
+      UNRESOLVED_LINES+=("${file}:${lineno}: ${caller} → ${table}")
+      continue
+    fi
+    result="$(check_coverage "$caller" "$table")"
+    case "$result" in
+      OK|OWN) ;;
+      MISSING)
+        missing=$((missing + 1))
+        owner="$(table_to_owner "$table")"
+        MISSING_LINES+=("${file}:${lineno}: ${caller} → ${table} (owned by ${owner}, via platform_state::${module})")
+        ;;
+      NON_CONVENTIONAL)
+        nonconv=$((nonconv + 1))
+        NONCONV_LINES+=("${file}:${lineno}: ${caller} → ${table} (via platform_state::${module})")
+        ;;
+    esac
+  done
+done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
+
 # ---------- Phase 3.5: walk storage callsites and check coverage ----------
 # Mirrors Phase 3 but for typed Storage grants.
 
@@ -980,13 +1127,19 @@ echo
 echo "WRAP grant audit — $(date)"
 echo
 echo "Indexed: ${#CONST_VALUE[@]} constants, ${#GRANTS[@]} grant decls."
-echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed."
+echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed (${ps_total} reached through platform_state)."
 echo "Storage:  ${storage_total} unique (caller, resource) pairs; ${storage_allowed} pragma-allowed."
 echo
 
 if [ "${#MISSING_LINES[@]}" -gt 0 ]; then
   echo "MISSING grants (${missing}):"
   printf '  %s\n' "${MISSING_LINES[@]}"
+  echo
+fi
+
+if [ "${#ALLOWED_LINES[@]}" -gt 0 ]; then
+  echo "ALLOWED by pragma (${allowed}) — each carries its reason at the site:"
+  printf '  %s\n' "${ALLOWED_LINES[@]}"
   echo
 fi
 

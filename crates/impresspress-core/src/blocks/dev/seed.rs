@@ -83,6 +83,7 @@ use super::{
     validation,
     workspace::{self, Workspace},
 };
+// audit-allow: the dev block grants itself this table — `dev::wrap_grants()` maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)`, which the runtime honours from its flat grant list; the audit attributes grants to the declaring file's block and so cannot see it
 use crate::platform_state::variables::{self, VariablePatch};
 
 /// Seed-manifest schema version this build reads.
