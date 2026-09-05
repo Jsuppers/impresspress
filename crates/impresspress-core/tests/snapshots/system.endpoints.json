@@ -1,15 +1,4 @@
 [
-  "GET /b/static/app-{hash}.css public",
-  "GET /b/static/favicon-{hash}.ico public",
-  "GET /b/static/files-browser-{hash}.js public",
-  "GET /b/static/htmx-{hash}.min.js public",
-  "GET /b/static/impresspress-logo-2x-{hash}.png public",
-  "GET /b/static/impresspress-logo-{hash}.png public",
-  "GET /b/static/itim-latin-ext-{hash}.woff2 public",
-  "GET /b/static/itim-latin-{hash}.woff2 public",
-  "GET /b/static/llm-chat-{hash}.js public",
-  "GET /b/static/marked-{hash}.min.js public",
-  "GET /b/static/purify-{hash}.js public",
-  "GET /b/static/webmcp-{hash}.js public",
+  "GET /b/static/{filename} public",
   "GET /health public"
 ]
