@@ -855,7 +855,8 @@ mod tests {
                 .expect("create provider row");
         }
 
-        let svc = crate::blocks::llm::providers::ProviderLlmService::new();
+        let svc = crate::blocks::llm::providers::ProviderLlmService::try_new()
+            .expect("build provider service");
         reload_provider_service(&ctx, &svc)
             .await
             .expect("reload succeeds");

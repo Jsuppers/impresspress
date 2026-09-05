@@ -143,10 +143,11 @@ fn ssrf_revalidating_redirect_policy() -> reqwest::redirect::Policy {
 // endpoint (there is no attacker-controlled per-request URL here), and one a
 // reqwest client cannot close without a resolve-before-connect hook.
 impl ProviderLlmService {
-    /// Construct a service with a default `reqwest` client. Returns
-    /// `LlmError::BackendError` if the underlying TLS stack fails to
-    /// initialize — rare in practice but propagating it lets the host fall
-    /// back to a degraded mode rather than aborting the whole process.
+    /// Construct a service with a `reqwest` client carrying the
+    /// SSRF-revalidating redirect policy. Returns `LlmError::BackendError`
+    /// if the underlying TLS stack fails to initialize — rare in practice,
+    /// and the host treats it as a build failure: there is deliberately no
+    /// constructor that falls back to a client without the policy.
     pub fn try_new() -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .redirect(ssrf_revalidating_redirect_policy())
@@ -161,23 +162,6 @@ impl ProviderLlmService {
         })
     }
 
-    /// Infallible legacy constructor — kept so existing `info()` probes and
-    /// throwaway-instance call sites still compile. On the rare TLS-init
-    /// failure we degrade to a client with no extra options (which itself
-    /// cannot fail to build); the next chat call surfaces the underlying
-    /// reqwest error as `LlmError::Network`. The per-request
-    /// [`crate::util::validate_url_value`] gate at each call site applies
-    /// regardless of which client backs the service.
-    pub fn new() -> Self {
-        Self::try_new().unwrap_or_else(|_| Self {
-            inner: Arc::new(RwLock::new(Inner {
-                providers: HashMap::new(),
-                cached_models: HashMap::new(),
-            })),
-            http: reqwest::Client::new(),
-        })
-    }
-
     /// Clone of a single provider's config, keyed by backend_id. The
     /// `api_key` it carries was resolved from `key_var` by the feature
     /// block's reload (see `routes::reload_provider_service`) before
@@ -185,12 +169,6 @@ impl ProviderLlmService {
     fn provider_config(&self, backend_id: &str) -> Option<ProviderConfig> {
         let inner = recover_lock!(self.inner.read(), "provider svc read");
         inner.providers.get(backend_id).cloned()
-    }
-}
-
-impl Default for ProviderLlmService {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -519,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_populates_cached_models() {
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         svc.configure(vec![openai_cfg(), local_cfg()]);
 
         let models = svc.list_models().await.unwrap();
@@ -532,7 +510,7 @@ mod tests {
     async fn disabled_providers_excluded_from_list_models() {
         let mut cfg = openai_cfg();
         cfg.enabled = false;
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         svc.configure(vec![cfg, local_cfg()]);
 
         let models = svc.list_models().await.unwrap();
@@ -542,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn claims_backend_matches_configured_names() {
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         svc.configure(vec![openai_cfg()]);
         assert!(svc.claims_backend("openai-main"));
         assert!(!svc.claims_backend("local"));
@@ -550,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_ready_for_enabled_provider() {
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         svc.configure(vec![openai_cfg()]);
         let s = svc.status("openai-main", "gpt-4o").await.unwrap();
         assert_eq!(s.state, ModelState::Ready);
@@ -560,7 +538,7 @@ mod tests {
     async fn status_error_for_disabled_provider() {
         let mut cfg = openai_cfg();
         cfg.enabled = false;
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         svc.configure(vec![cfg]);
         let s = svc.status("openai-main", "gpt-4o").await.unwrap();
         assert!(matches!(s.state, ModelState::Error { .. }));
@@ -568,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_invalid_request_for_unknown_backend() {
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         assert!(matches!(
             svc.status("nope", "m").await,
             Err(LlmError::InvalidRequest(_))
@@ -578,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_on_unknown_backend_yields_invalid_request() {
         use wafer_core::interfaces::llm::service::ChatMessage;
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         let req = ChatRequest::new("nope", "m", vec![ChatMessage::user("hi")]);
         let stream = svc.chat_stream(req, CancellationToken::new()).await;
         let items: Vec<_> = stream.collect().await;
@@ -590,7 +568,7 @@ mod tests {
     async fn chat_stream_missing_api_key_is_unauthorized() {
         use wafer_core::interfaces::llm::service::ChatMessage;
         // OpenAI without api_key should surface Unauthorized at encode time.
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         let cfg = ProviderConfig::new(
             "openai-main",
             ProviderProtocol::OpenAi,
@@ -606,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconfigure_replaces_previous_providers() {
-        let svc = ProviderLlmService::new();
+        let svc = ProviderLlmService::try_new().expect("build provider service");
         svc.configure(vec![openai_cfg()]);
         assert!(svc.claims_backend("openai-main"));
 
