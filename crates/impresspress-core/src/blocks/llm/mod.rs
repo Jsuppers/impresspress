@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use wafer_core::clients::{config, database as db};
 use wafer_run::{
-    context::Context, Block, BlockEndpoint, BlockInfo, ConfigVar, HttpMethod, InputStream,
-    InstanceMode, LifecycleEvent, LifecycleType, Message, OutputStream, WaferError,
+    context::Context, Block, BlockInfo, ConfigVar, HttpMethod, InputStream, InstanceMode,
+    LifecycleEvent, LifecycleType, Message, OutputStream, WaferError,
 };
 
 use self::provider_admin::ProviderAdmin;
 use crate::{
-    endpoint_match::{self, EndpointRoute},
+    endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
     util::json_map,
 };
@@ -46,76 +46,131 @@ enum Route {
     DeleteConfig,
 }
 
-/// Method + path-template dispatch table, mirroring `info().endpoints`.
-/// Sub-resource templates (`.../discover-models`, `.../load`, `.../status`)
-/// precede the generic `.../{id}` / `.../models` templates so the specific
-/// route wins (the old `ends_with` ordering). `{id}`/`{backend_id}`/
-/// `{model_id}` are bound into `req.param.*`.
+/// The block's HTTP surface: what `handle()` dispatches on and what
+/// `info().endpoints` is generated from. Sub-resource templates
+/// (`.../discover-models`, `.../load`, `.../status`) precede the generic
+/// `.../{id}` / `.../models` templates so the specific route wins.
+/// `{id}`/`{backend_id}`/`{model_id}` are bound into `req.param.*`.
+///
+/// The chat UI is reached from the ADMIN sidebar (nav_groups::admin
+/// "Communication" group); the pre-refactor `handle()` gated every non-API
+/// page on `is_admin`, so the pages are declared `Admin` to keep that exact
+/// outcome as the single, centrally enforced policy.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // UI pages
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/", Route::ChatPage),
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/threads/{id}", Route::ThreadPage),
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/settings", Route::SettingsPage),
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/providers", Route::ProvidersPage),
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/models", Route::ModelsPage),
+    EndpointRoute::admin(HttpMethod::Get, "/b/llm/", Route::ChatPage).summary("Chat UI"),
+    EndpointRoute::admin(HttpMethod::Get, "/b/llm/threads/{id}", Route::ThreadPage)
+        .summary("Chat UI (thread permalink)"),
+    EndpointRoute::admin(HttpMethod::Get, "/b/llm/settings", Route::SettingsPage)
+        .summary("LLM settings page"),
+    EndpointRoute::admin(HttpMethod::Get, "/b/llm/providers", Route::ProvidersPage)
+        .summary("Providers admin"),
+    EndpointRoute::admin(HttpMethod::Get, "/b/llm/models", Route::ModelsPage)
+        .summary("Models admin"),
     // Chat API
-    EndpointRoute::new(HttpMethod::Post, "/b/llm/api/chat", Route::Chat),
-    EndpointRoute::new(
+    EndpointRoute::authenticated(HttpMethod::Post, "/b/llm/api/chat", Route::Chat)
+        .summary("Send a chat message")
+        .input(request_schema_of::<contracts::ChatRequest>)
+        .output(response_schema_of::<contracts::ChatResponse>),
+    // Same request as `/api/chat`; the response is `text/event-stream`, one
+    // `data:` frame per `ChatChunk`, then `data: [DONE]` (or `event: error`).
+    // No `.output(..)`: it would publish an `application/json` schema for a
+    // body this endpoint never sends, and the frame type is wafer-run's
+    // `ChatChunk`, which carries no JsonSchema derive to mirror.
+    EndpointRoute::authenticated(
         HttpMethod::Post,
         "/b/llm/api/chat/stream",
         Route::ChatStream,
-    ),
+    )
+    .summary("Send a chat message (SSE streaming)")
+    .input(request_schema_of::<contracts::ChatRequest>),
     // Provider CRUD (specific sub-resource first)
-    EndpointRoute::new(
+    EndpointRoute::admin(
         HttpMethod::Post,
         "/b/llm/api/providers/{id}/discover-models",
         Route::DiscoverModels,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Discover provider models via /v1/models")
+    .path_params(provider_id_path_schema)
+    .output(response_schema_of::<contracts::DiscoveredModelsResponse>),
+    EndpointRoute::admin(
         HttpMethod::Get,
         "/b/llm/api/providers",
         Route::ListProviders,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("List configured LLM providers")
+    .output(response_schema_of::<contracts::ProviderListResponse>),
+    EndpointRoute::admin(
         HttpMethod::Post,
         "/b/llm/api/providers",
         Route::CreateProvider,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Create LLM provider")
+    .input(request_schema_of::<contracts::CreateProviderRequest>)
+    .output(response_schema_of::<contracts::ProviderView>),
+    EndpointRoute::admin(
         HttpMethod::Patch,
         "/b/llm/api/providers/{id}",
         Route::UpdateProvider,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Update LLM provider")
+    .path_params(provider_id_path_schema)
+    .input(request_schema_of::<contracts::UpdateProviderRequest>)
+    .output(response_schema_of::<contracts::ProviderView>),
+    EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/llm/api/providers/{id}",
         Route::DeleteProvider,
-    ),
-    // Models endpoints (specific sub-resources first)
-    EndpointRoute::new(
+    )
+    .summary("Delete LLM provider")
+    .path_params(provider_id_path_schema)
+    .output(response_schema_of::<contracts::ProviderDeleteResponse>),
+    // Models (specific sub-resources first)
+    EndpointRoute::authenticated(
         HttpMethod::Get,
         "/b/llm/api/models/{backend_id}/{model_id}/status",
         Route::ModelStatus,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Model status (ready / loading / unloaded)")
+    .path_params(model_path_schema)
+    .output(response_schema_of::<contracts::ModelStatusResponse>),
+    // Takes no body; answers `text/event-stream`, one `data:` frame per
+    // `LoadProgress`, then `data: [DONE]`. No `.output(..)` for the same
+    // reason as `/api/chat/stream`.
+    EndpointRoute::admin(
         HttpMethod::Post,
         "/b/llm/api/models/{backend_id}/{model_id}/load",
         Route::LoadModel,
-    ),
-    EndpointRoute::new(
+    )
+    .summary("Load a model (SSE progress)")
+    .path_params(model_path_schema),
+    EndpointRoute::admin(
         HttpMethod::Post,
         "/b/llm/api/models/{backend_id}/{model_id}/unload",
         Route::UnloadModel,
-    ),
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/api/models", Route::ListModels),
+    )
+    .summary("Unload a model")
+    .path_params(model_path_schema)
+    .output(response_schema_of::<contracts::ModelUnloadResponse>),
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/models", Route::ListModels)
+        .summary("List available models (aggregated across backends)")
+        .output(response_schema_of::<contracts::ModelListResponse>),
     // Config
-    EndpointRoute::new(HttpMethod::Get, "/b/llm/api/config", Route::GetConfig),
-    EndpointRoute::new(HttpMethod::Post, "/b/llm/api/config", Route::PostConfig),
-    EndpointRoute::new(
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/config", Route::GetConfig)
+        .summary("Get default provider/model config")
+        .output(response_schema_of::<contracts::LlmConfigResponse>),
+    EndpointRoute::authenticated(HttpMethod::Post, "/b/llm/api/config", Route::PostConfig)
+        .summary("Update per-thread provider/model override")
+        .input(request_schema_of::<contracts::ConfigUpdateRequest>)
+        .output(response_schema_of::<contracts::ConfigUpdateResponse>),
+    EndpointRoute::authenticated(
         HttpMethod::Delete,
         "/b/llm/api/config/{id}",
         Route::DeleteConfig,
-    ),
+    )
+    .summary("Remove a per-thread provider/model override")
+    .path_params(override_id_path_schema)
+    .output(response_schema_of::<contracts::ConfigDeleteResponse>),
 ];
 
 /// LLM feature block. Owns the provider admin UI + chat thread persistence.
@@ -293,7 +348,7 @@ impl LlmBlock {
     /// settings page renders a delete control for every override row; this
     /// is the route it targets.
     async fn handle_delete_config(&self, ctx: &dyn Context, msg: &Message) -> OutputStream {
-        let id = crate::util::path_param(msg, "id", "/b/llm/api/config/").to_string();
+        let id = msg.var("id").to_string();
         if id.is_empty() {
             return err_bad_request("Missing override ID");
         }
@@ -423,12 +478,6 @@ impl LlmBlock {
 // Block trait implementation
 // ---------------------------------------------------------------------------
 
-/// Path-parameter schema for the `/b/llm/api/providers/{id}…` routes.
-///
-/// Hand-written rather than derived: every handler reads the id with
-/// `path_param(msg, "id", ..)` by name, so a struct declared only to feed
-/// `.path_params::<T>()` would have no runtime user (the `tickets` /
-/// `messages` precedent).
 /// Path parameters of `DELETE /b/llm/api/config/{id}`.
 fn override_id_path_schema() -> serde_json::Value {
     serde_json::json!({
@@ -444,6 +493,12 @@ fn override_id_path_schema() -> serde_json::Value {
     })
 }
 
+/// Path-parameter schema for the `/b/llm/api/providers/{id}…` routes.
+///
+/// Hand-written rather than derived: every handler reads the id with
+/// `msg.var("id")` by name, so a struct declared only to feed a derived
+/// path-params schema would have no runtime user (the `tickets` /
+/// `messages` precedent).
 fn provider_id_path_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -482,8 +537,6 @@ fn model_path_schema() -> serde_json::Value {
 #[wafer_block::wafer_async_trait]
 impl Block for LlmBlock {
     fn info(&self) -> BlockInfo {
-        use wafer_run::AuthLevel;
-
         BlockInfo::new(
             "impresspress/llm",
             "0.0.1",
@@ -507,105 +560,7 @@ impl Block for LlmBlock {
             "LLM orchestrator. Routes chat requests to provider-llm or local-llm backends, \
              manages thread history via the messages block, and provides the main chat UI.",
         )
-        .endpoints(vec![
-            BlockEndpoint::post("/b/llm/api/chat")
-                .summary("Send a chat message")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::ChatRequest>()
-                .output::<contracts::ChatResponse>(),
-            // Same request as `/api/chat`; the response is
-            // `text/event-stream` — one `data:` frame per `ChatChunk`, then
-            // `data: [DONE]` (or `event: error`). No `.output::<T>()`: it
-            // would publish an `application/json` schema for a body this
-            // endpoint never sends, and the frame type is wafer-run's
-            // `ChatChunk`, which carries no JsonSchema derive to mirror.
-            BlockEndpoint::post("/b/llm/api/chat/stream")
-                .summary("Send a chat message (SSE streaming)")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::ChatRequest>(),
-            BlockEndpoint::get("/b/llm/api/providers")
-                .summary("List configured LLM providers")
-                .auth(AuthLevel::Admin)
-                .output::<contracts::ProviderListResponse>(),
-            BlockEndpoint::post("/b/llm/api/providers")
-                .summary("Create LLM provider")
-                .auth(AuthLevel::Admin)
-                .input::<contracts::CreateProviderRequest>()
-                .output::<contracts::ProviderView>(),
-            BlockEndpoint::patch("/b/llm/api/providers/{id}")
-                .summary("Update LLM provider")
-                .auth(AuthLevel::Admin)
-                .path_params_schema(provider_id_path_schema())
-                .input::<contracts::UpdateProviderRequest>()
-                .output::<contracts::ProviderView>(),
-            BlockEndpoint::delete("/b/llm/api/providers/{id}")
-                .summary("Delete LLM provider")
-                .auth(AuthLevel::Admin)
-                .path_params_schema(provider_id_path_schema())
-                .output::<contracts::ProviderDeleteResponse>(),
-            BlockEndpoint::post("/b/llm/api/providers/{id}/discover-models")
-                .summary("Discover provider models via /v1/models")
-                .auth(AuthLevel::Admin)
-                .path_params_schema(provider_id_path_schema())
-                .output::<contracts::DiscoveredModelsResponse>(),
-            BlockEndpoint::get("/b/llm/api/models")
-                .summary("List available models (aggregated across backends)")
-                .auth(AuthLevel::Authenticated)
-                .output::<contracts::ModelListResponse>(),
-            BlockEndpoint::get("/b/llm/api/models/{backend_id}/{model_id}/status")
-                .summary("Model status (ready / loading / unloaded)")
-                .auth(AuthLevel::Authenticated)
-                .path_params_schema(model_path_schema())
-                .output::<contracts::ModelStatusResponse>(),
-            // Takes no body; answers `text/event-stream`, one `data:` frame
-            // per `LoadProgress`, then `data: [DONE]`. No `.output::<T>()`
-            // for the same reason as `/api/chat/stream`.
-            BlockEndpoint::post("/b/llm/api/models/{backend_id}/{model_id}/load")
-                .summary("Load a model (SSE progress)")
-                .auth(AuthLevel::Admin)
-                .path_params_schema(model_path_schema()),
-            BlockEndpoint::post("/b/llm/api/models/{backend_id}/{model_id}/unload")
-                .summary("Unload a model")
-                .auth(AuthLevel::Admin)
-                .path_params_schema(model_path_schema())
-                .output::<contracts::ModelUnloadResponse>(),
-            BlockEndpoint::get("/b/llm/api/config")
-                .summary("Get default provider/model config")
-                .auth(AuthLevel::Authenticated)
-                .output::<contracts::LlmConfigResponse>(),
-            BlockEndpoint::post("/b/llm/api/config")
-                .summary("Update per-thread provider/model override")
-                .auth(AuthLevel::Authenticated)
-                .input::<contracts::ConfigUpdateRequest>()
-                .output::<contracts::ConfigUpdateResponse>(),
-            BlockEndpoint::delete("/b/llm/api/config/{id}")
-                .summary("Remove a per-thread provider/model override")
-                .auth(AuthLevel::Authenticated)
-                .path_params_schema(override_id_path_schema())
-                .output::<contracts::ConfigDeleteResponse>(),
-            // Chat UI is reached from the ADMIN sidebar (nav_groups::admin
-            // "Communication" group); the pre-refactor `handle()` gated every
-            // non-API page on `is_admin`, so the chat UI was admin-only in
-            // practice. Declaring it `Admin` (and the thread permalink too)
-            // makes that the single declared, centrally-enforced policy —
-            // preserving the exact prior auth outcome (the declared
-            // `Authenticated` was drift the old blanket gate overrode).
-            BlockEndpoint::get("/b/llm/")
-                .summary("Chat UI")
-                .auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/llm/threads/{id}")
-                .summary("Chat UI (thread permalink)")
-                .auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/llm/settings")
-                .summary("LLM settings page")
-                .auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/llm/providers")
-                .summary("Providers admin")
-                .auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/llm/models")
-                .summary("Models admin")
-                .auth(AuthLevel::Admin),
-        ])
+        .endpoints(endpoint_match::declare(ROUTES))
         .config_keys(vec![
             ConfigVar::new(
                 DEFAULT_PROVIDER_VAR,
@@ -635,8 +590,9 @@ impl Block for LlmBlock {
         // `(provider, model)` target. Only accessible from another block (the
         // caller_id is set by `ctx.call_block`); never reachable from external
         // HTTP because the shared pipeline strips the caller id. It is NOT a
-        // declared HTTP endpoint, so it stays a handler-owned guard ahead of
-        // the matcher.
+        // declared HTTP endpoint (declaring it would publish it), so it stays
+        // a handler-owned guard ahead of the matcher; this is the one path
+        // read in this block outside `endpoint_match::dispatch`.
         if msg.action() == "retrieve" && msg.path() == "/b/llm/api/internal/default-target" {
             if ctx.caller_id().is_none() {
                 return crate::http::err_not_found("not found");
@@ -649,7 +605,7 @@ impl Block for LlmBlock {
         // pages, provider CRUD, model load/unload → Admin). The block holds
         // no `user_id`/`is_admin` preamble and the provider/model handlers no
         // longer re-check `is_admin`. `{id}`/`{backend_id}`/`{model_id}` are
-        // bound into `req.param.*` for the handlers' `path_param` readers.
+        // bound into `req.param.*` for the handlers' `msg.var` readers.
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
             return err_not_found("not found");
         };
@@ -703,6 +659,27 @@ impl Block for LlmBlock {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// `info().endpoints` is generated from `ROUTES`; nothing else declares
+    /// an endpoint for this block.
+    #[test]
+    fn info_endpoints_come_from_the_table() {
+        let block = LlmBlock::new(Arc::new(provider_admin::NoopProviderAdmin));
+        let declared = block.info().endpoints;
+        assert_eq!(declared.len(), ROUTES.len());
+        for (ep, row) in declared.iter().zip(ROUTES) {
+            assert_eq!(ep.method, row.method, "{}", row.template);
+            assert_eq!(ep.path, row.template);
+            assert_eq!(ep.auth, row.auth, "{}", row.template);
+        }
     }
 }
 

@@ -46,7 +46,7 @@
 //! needs to be shared with another wafer-run consumer it should be proposed as
 //! a fresh `wafer_block` module rather than resurrecting the old `Router`.
 
-use wafer_run::{AuthLevel, HttpMethod, Message};
+use wafer_run::{AuthLevel, BlockEndpoint, HttpMethod, Message};
 
 /// Map an [`HttpMethod`] to the canonical wire action string impresspress routes on
 /// (`req.action`). Mirrors `wafer_block::http_codec::action_for_http_method`
@@ -137,27 +137,225 @@ fn byte_offset_of_segment(path: &str, n: usize) -> usize {
     path.len()
 }
 
-/// One row of a block's dispatch table: the HTTP method, the path template
-/// (typically copied from the block's declared endpoint path), and an opaque
-/// handler key `H` the block matches on.
+/// A function that produces a JSON Schema on demand.
+///
+/// Rows hold one of these instead of a `serde_json::Value` so a block's table
+/// can stay a `const`; [`declare`] calls it once per `info()`. For a
+/// `schemars` type pass [`request_schema_of::<T>`] or
+/// [`response_schema_of::<T>`] uncalled; for a hand-written schema pass the
+/// function that builds it.
+pub type SchemaFn = fn() -> serde_json::Value;
+
+/// JSON Schema for a request body, path params or query params of type `T`,
+/// exactly as `BlockEndpoint::input::<T>()` / `::path_params::<T>()` /
+/// `::query_params::<T>()` derive it: draft 2020-12, subschemas inlined, no
+/// `$schema`, under the **deserialize** contract (what a client sends).
+///
+/// Those settings live in wafer-block and are not public, so this goes
+/// through the upstream builder on a throwaway endpoint rather than copying
+/// them; a row that names `request_schema_of::<T>` therefore serializes the
+/// same bytes the hand-written `info()` list did.
+pub fn request_schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
+    BlockEndpoint::get("")
+        .input::<T>()
+        .input_schema
+        .expect("BlockEndpoint::input always sets the schema")
+}
+
+/// JSON Schema for a response body of type `T`, exactly as
+/// `BlockEndpoint::output::<T>()` derives it: same settings as
+/// [`request_schema_of`] but under the **serialize** contract (what the server
+/// guarantees to emit). The two contracts differ for `#[serde(default)]`,
+/// `skip_serializing_if` and `skip_deserializing` fields, which is why a row
+/// names one or the other rather than one shared producer.
+pub fn response_schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
+    BlockEndpoint::get("")
+        .output::<T>()
+        .output_schema
+        .expect("BlockEndpoint::output always sets the schema")
+}
+
+/// One row of a block's route table: what `handle()` dispatches on **and**
+/// what `info().endpoints` is generated from (see [`declare`]).
+///
+/// `method`, `template` and `handler` drive matching; everything else is the
+/// declaration the router and the OpenAPI/WebMCP projections read. A row
+/// always names its [`AuthLevel`] through [`Self::public`],
+/// [`Self::authenticated`] or [`Self::admin`]; there is no constructor that
+/// defaults to `Public`, because the upstream `BlockEndpoint` default of
+/// `Public` is how an unmarked endpoint used to become world-readable by
+/// omission.
 pub struct EndpointRoute<H> {
     /// HTTP method this route answers (mapped to a wire action internally).
     pub method: HttpMethod,
-    /// Path template (`/b/x/{id}`, `/b/x/{rest...}`, …).
+    /// Path template (`/b/x/{id}`, `/b/x/{rest...}`, …) as it appears on the wire.
     pub template: &'static str,
     /// Block-defined handler discriminator returned to `handle()`.
     pub handler: H,
+    /// Level the router enforces before dispatching to this row.
+    pub auth: AuthLevel,
+    /// Short summary shown in the admin/OpenAPI UI.
+    pub summary: &'static str,
+    /// Longer description for OpenAPI / docs.
+    pub description: &'static str,
+    /// Request-body schema producer, if the endpoint takes a body.
+    pub input: Option<SchemaFn>,
+    /// Response-body schema producer, if the endpoint answers JSON.
+    pub output: Option<SchemaFn>,
+    /// URL path-parameter schema producer.
+    pub path_params: Option<SchemaFn>,
+    /// Query-parameter schema producer.
+    pub query_params: Option<SchemaFn>,
+    /// OpenAPI tags.
+    pub tags: &'static [&'static str],
+    /// Whether the endpoint is published as deprecated.
+    pub deprecated: bool,
+    /// `(name, description)` when the endpoint is exposed as a WebMCP tool.
+    pub agent_tool: Option<(&'static str, &'static str)>,
 }
 
 impl<H: Copy> EndpointRoute<H> {
-    /// Convenience constructor.
-    pub const fn new(method: HttpMethod, template: &'static str, handler: H) -> Self {
+    const fn with_auth(
+        method: HttpMethod,
+        template: &'static str,
+        handler: H,
+        auth: AuthLevel,
+    ) -> Self {
         Self {
             method,
             template,
             handler,
+            auth,
+            summary: "",
+            description: "",
+            input: None,
+            output: None,
+            path_params: None,
+            query_params: None,
+            tags: &[],
+            deprecated: false,
+            agent_tool: None,
         }
     }
+
+    /// A row anyone may call. Every public row is a decision: the handler
+    /// must gate itself by token, signature or shared secret, or need no gate.
+    pub const fn public(method: HttpMethod, template: &'static str, handler: H) -> Self {
+        Self::with_auth(method, template, handler, AuthLevel::Public)
+    }
+
+    /// A row any logged-in caller may call.
+    pub const fn authenticated(method: HttpMethod, template: &'static str, handler: H) -> Self {
+        Self::with_auth(method, template, handler, AuthLevel::Authenticated)
+    }
+
+    /// A row only an admin may call.
+    pub const fn admin(method: HttpMethod, template: &'static str, handler: H) -> Self {
+        Self::with_auth(method, template, handler, AuthLevel::Admin)
+    }
+
+    /// Dispatch-only row for a table that still declares its endpoints by
+    /// hand in `info()` rather than through [`declare`]. Declares `Admin`, so
+    /// that if such a table does reach `declare` by mistake it over-protects
+    /// and shows up in the endpoint-surface snapshot instead of publishing a
+    /// public row. Removed once the last such table is migrated.
+    pub const fn new(method: HttpMethod, template: &'static str, handler: H) -> Self {
+        Self::with_auth(method, template, handler, AuthLevel::Admin)
+    }
+
+    /// Set the short summary text.
+    pub const fn summary(mut self, summary: &'static str) -> Self {
+        self.summary = summary;
+        self
+    }
+
+    /// Set the longer description text.
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    /// Declare the request-body schema.
+    pub const fn input(mut self, schema: SchemaFn) -> Self {
+        self.input = Some(schema);
+        self
+    }
+
+    /// Declare the response-body schema.
+    pub const fn output(mut self, schema: SchemaFn) -> Self {
+        self.output = Some(schema);
+        self
+    }
+
+    /// Declare the path-parameter schema.
+    pub const fn path_params(mut self, schema: SchemaFn) -> Self {
+        self.path_params = Some(schema);
+        self
+    }
+
+    /// Declare the query-parameter schema.
+    pub const fn query_params(mut self, schema: SchemaFn) -> Self {
+        self.query_params = Some(schema);
+        self
+    }
+
+    /// Set the OpenAPI tag list.
+    pub const fn tags(mut self, tags: &'static [&'static str]) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Publish the endpoint as deprecated.
+    pub const fn deprecated(mut self) -> Self {
+        self.deprecated = true;
+        self
+    }
+
+    /// Expose the endpoint as a WebMCP tool with this name and description.
+    pub const fn agent_tool(mut self, name: &'static str, description: &'static str) -> Self {
+        self.agent_tool = Some((name, description));
+        self
+    }
+}
+
+/// The `BlockEndpoint`s a table declares, in table order, built through the
+/// upstream builders so the result is what a hand-written `info()` list
+/// produced. Each schema producer is called once.
+pub fn declare<H: Copy>(table: &[EndpointRoute<H>]) -> Vec<BlockEndpoint> {
+    table
+        .iter()
+        .map(|row| {
+            let mut ep = match row.method {
+                HttpMethod::Get => BlockEndpoint::get(row.template),
+                HttpMethod::Post => BlockEndpoint::post(row.template),
+                HttpMethod::Patch => BlockEndpoint::patch(row.template),
+                HttpMethod::Delete => BlockEndpoint::delete(row.template),
+            }
+            .summary(row.summary)
+            .description(row.description)
+            .auth(row.auth)
+            .tags(row.tags);
+            if let Some(schema) = row.input {
+                ep = ep.input_schema(schema());
+            }
+            if let Some(schema) = row.output {
+                ep = ep.output_schema(schema());
+            }
+            if let Some(schema) = row.path_params {
+                ep = ep.path_params_schema(schema());
+            }
+            if let Some(schema) = row.query_params {
+                ep = ep.query_params_schema(schema());
+            }
+            if row.deprecated {
+                ep = ep.deprecated();
+            }
+            if let Some((name, description)) = row.agent_tool {
+                ep = ep.agent_tool(name, description);
+            }
+            ep
+        })
+        .collect()
 }
 
 /// Find the first route in `table` whose method+template matches the request,
@@ -260,6 +458,26 @@ fn dispatch_exact<H: Copy>(
 /// mirrors the `RouteAccess::max` discipline the router already applies between
 /// the prefix tier and the declared level.
 pub fn endpoint_auth(
+    endpoints: &[wafer_run::BlockEndpoint],
+    action: &str,
+    path: &str,
+) -> Option<AuthLevel> {
+    if let Some(level) = endpoint_auth_exact(endpoints, action, path) {
+        return Some(level);
+    }
+    // Mirror `dispatch_path`'s trailing-slash retry, and only after an exact
+    // match has failed. A block's `dispatch` serves `GET /b/llm` from its
+    // `/b/llm/` row, so the router must gate the bare form at that row's
+    // declared level; without this it fell back to the `Authenticated`
+    // default and a logged-in non-admin reached an `Admin` page.
+    if !path.ends_with('/') {
+        return endpoint_auth_exact(endpoints, action, &format!("{path}/"));
+    }
+    None
+}
+
+/// The strict, single-pass resolver behind [`endpoint_auth`].
+fn endpoint_auth_exact(
     endpoints: &[wafer_run::BlockEndpoint],
     action: &str,
     path: &str,
@@ -654,6 +872,212 @@ mod tests {
         assert_eq!(
             normalize_template("/b/userportal/sessions/:hash"),
             "/b/userportal/sessions/{hash}"
+        );
+    }
+
+    fn probe_schema() -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": { "id": { "type": "string" } } })
+    }
+
+    #[test]
+    fn constructors_set_the_auth_they_name() {
+        assert_eq!(
+            EndpointRoute::public(HttpMethod::Get, "/b/x/", 1u8).auth,
+            AuthLevel::Public
+        );
+        assert_eq!(
+            EndpointRoute::authenticated(HttpMethod::Get, "/b/x/", 1u8).auth,
+            AuthLevel::Authenticated
+        );
+        assert_eq!(
+            EndpointRoute::admin(HttpMethod::Get, "/b/x/", 1u8).auth,
+            AuthLevel::Admin
+        );
+    }
+
+    /// `new` is the dispatch-only constructor the not-yet-migrated tables
+    /// still use. If one of those tables ever reaches `declare` by mistake it
+    /// must over-protect, never publish a public row by omission.
+    #[test]
+    fn new_declares_admin() {
+        assert_eq!(
+            EndpointRoute::new(HttpMethod::Get, "/b/x/", 1u8).auth,
+            AuthLevel::Admin
+        );
+    }
+
+    #[test]
+    fn declare_maps_every_row_field() {
+        use wafer_run::BlockEndpoint;
+        const TABLE: &[EndpointRoute<u8>] =
+            &[
+                EndpointRoute::admin(HttpMethod::Post, "/b/x/api/things/{id}", 1u8)
+                    .summary("Make a thing")
+                    .description("Longer text")
+                    .input(probe_schema)
+                    .output(probe_schema)
+                    .path_params(probe_schema)
+                    .query_params(probe_schema)
+                    .tags(&["x", "things"])
+                    .deprecated()
+                    .agent_tool("make_thing", "Makes a thing"),
+            ];
+
+        let eps: Vec<BlockEndpoint> = declare(TABLE);
+        assert_eq!(eps.len(), 1);
+        let ep = &eps[0];
+        assert_eq!(ep.method, HttpMethod::Post);
+        assert_eq!(ep.path, "/b/x/api/things/{id}");
+        assert_eq!(ep.auth, AuthLevel::Admin);
+        assert_eq!(ep.summary, "Make a thing");
+        assert_eq!(ep.description, "Longer text");
+        assert_eq!(ep.input_schema, Some(probe_schema()));
+        assert_eq!(ep.output_schema, Some(probe_schema()));
+        assert_eq!(ep.path_params, Some(probe_schema()));
+        assert_eq!(ep.query_params, Some(probe_schema()));
+        assert_eq!(ep.tags, vec!["x".to_string(), "things".to_string()]);
+        assert!(ep.deprecated);
+        let tool = ep.agent_tool.as_ref().expect("agent tool declared");
+        assert_eq!(tool.name, "make_thing");
+        assert_eq!(tool.description, "Makes a thing");
+    }
+
+    /// A row with no metadata must produce exactly what the upstream builders
+    /// produce from `BlockEndpoint::get(path)` alone, so a block that only
+    /// ever set method, path and auth serializes the same bytes as before.
+    #[test]
+    fn declare_leaves_unset_metadata_at_the_upstream_defaults() {
+        use wafer_run::BlockEndpoint;
+        let eps = declare(&[EndpointRoute::public(HttpMethod::Get, "/b/x/", 1u8)]);
+        let ep = &eps[0];
+        let bare = BlockEndpoint::get("/b/x/");
+        assert_eq!(ep.auth, AuthLevel::Public);
+        assert_eq!(ep.summary, bare.summary);
+        assert_eq!(ep.description, bare.description);
+        assert_eq!(ep.input_schema, bare.input_schema);
+        assert_eq!(ep.output_schema, bare.output_schema);
+        assert_eq!(ep.path_params, bare.path_params);
+        assert_eq!(ep.query_params, bare.query_params);
+        assert_eq!(ep.tags, bare.tags);
+        assert_eq!(ep.deprecated, bare.deprecated);
+        assert!(ep.agent_tool.is_none());
+    }
+
+    #[test]
+    fn declare_preserves_table_order() {
+        let eps = declare(&[
+            EndpointRoute::public(HttpMethod::Get, "/b/x/api/things", 1u8),
+            EndpointRoute::public(HttpMethod::Post, "/b/x/api/things", 2u8),
+        ]);
+        assert_eq!(eps[0].method, HttpMethod::Get);
+        assert_eq!(eps[1].method, HttpMethod::Post);
+    }
+
+    /// A field with `#[serde(default)]` is optional for a client to send but
+    /// always present in what the server emits, so the two contracts publish
+    /// different `required` lists. The probe carries one so these tests
+    /// cannot pass by both producers happening to agree.
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct ContractProbe {
+        id: String,
+        #[serde(default)]
+        count: u32,
+    }
+
+    #[test]
+    fn request_schema_of_matches_the_upstream_request_builders() {
+        use wafer_run::BlockEndpoint;
+        let expected = BlockEndpoint::get("/b/x")
+            .input::<ContractProbe>()
+            .input_schema
+            .expect("upstream derive sets the schema");
+        assert_eq!(request_schema_of::<ContractProbe>(), expected);
+        assert_eq!(
+            BlockEndpoint::get("/b/x")
+                .path_params::<ContractProbe>()
+                .path_params,
+            Some(request_schema_of::<ContractProbe>()),
+            "path params derive under the same (deserialize) contract as a body"
+        );
+        assert_eq!(
+            expected["required"],
+            serde_json::json!(["id"]),
+            "a client may omit a defaulted field"
+        );
+    }
+
+    #[test]
+    fn response_schema_of_matches_the_upstream_response_builder() {
+        use wafer_run::BlockEndpoint;
+        let expected = BlockEndpoint::get("/b/x")
+            .output::<ContractProbe>()
+            .output_schema
+            .expect("upstream derive sets the schema");
+        assert_eq!(response_schema_of::<ContractProbe>(), expected);
+        assert_eq!(
+            expected["required"],
+            serde_json::json!(["id", "count"]),
+            "the server always emits a defaulted field"
+        );
+        assert_ne!(
+            request_schema_of::<ContractProbe>(),
+            response_schema_of::<ContractProbe>()
+        );
+    }
+
+    /// Metadata is declaration only; the matcher reads method, template and
+    /// handler and nothing else.
+    #[test]
+    fn dispatch_ignores_row_metadata() {
+        let mut msg = Message::new("test");
+        msg.set_meta("req.action", "retrieve");
+        msg.set_meta("req.resource", "/b/x/api/things/t-1");
+        let table = [
+            EndpointRoute::admin(HttpMethod::Get, "/b/x/api/things/{id}", 7u8)
+                .summary("s")
+                .tags(&["x"]),
+        ];
+        assert_eq!(dispatch(&mut msg, &table), Some(7u8));
+        assert_eq!(msg.var("id"), "t-1");
+    }
+
+    /// The router and the block must agree on which row serves a request.
+    /// `dispatch_path` retries a bare index path with a trailing slash, so
+    /// `GET /b/llm` reaches the `Admin` chat page; `endpoint_auth` has to
+    /// resolve the same row, or the router gates the request at the
+    /// fail-closed `Authenticated` default and a logged-in non-admin gets an
+    /// admin page.
+    #[test]
+    fn endpoint_auth_matches_an_index_route_without_its_trailing_slash() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![BlockEndpoint::get("/b/llm/").auth(AuthLevel::Admin)];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/llm"),
+            Some(AuthLevel::Admin)
+        );
+    }
+
+    #[test]
+    fn endpoint_auth_slash_retry_never_shadows_an_exact_match() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![
+            BlockEndpoint::get("/b/x/thing").auth(AuthLevel::Public),
+            BlockEndpoint::get("/b/x/thing/").auth(AuthLevel::Admin),
+        ];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/x/thing"),
+            Some(AuthLevel::Public)
+        );
+    }
+
+    #[test]
+    fn endpoint_auth_slash_retry_does_not_bind_an_empty_path_param() {
+        use wafer_run::BlockEndpoint;
+        let eps = vec![BlockEndpoint::get("/b/vector/api/indexes/{name}").auth(AuthLevel::Admin)];
+        assert_eq!(
+            endpoint_auth(&eps, "retrieve", "/b/vector/api/indexes"),
+            None
         );
     }
 }
