@@ -12,7 +12,7 @@ use super::service::{self, ListContextsParams, ListEntriesParams};
 use crate::{
     http::err_internal,
     ui::{self, shell::Crumb},
-    util::{path_param, RecordExt},
+    util::RecordExt,
 };
 
 pub fn entry_card(record: &db::Record) -> Markup {
@@ -152,7 +152,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
 }
 
 pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let context_id = path_param(msg, "id", "/b/messages/contexts/");
+    let context_id = msg.var("id");
 
     if context_id.is_empty() {
         return ui::not_found_response(msg);
