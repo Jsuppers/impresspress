@@ -3,7 +3,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::contracts::{AdminAuditLogListQuery, AdminAuditLogListResponse};
-use crate::http::{err_internal, err_not_found, ok_json};
+use crate::http::{err_internal, ok_json};
 
 /// Audit log entries (admin-initiated mutations).
 pub(crate) const AUDIT_LOGS_TABLE: &str = "impresspress__admin__audit_logs";
@@ -17,19 +17,8 @@ pub(crate) use crate::admin_schema::REQUEST_LOGS_TABLE;
 /// Storage access log entries (one row per object read/write).
 pub(crate) const STORAGE_ACCESS_LOGS_TABLE: &str = "impresspress__admin__storage_access_logs";
 
-/// `path` is the normalized `/admin/logs` sub-path, passed explicitly (no
-/// `req.resource` rewrite).
-pub async fn handle(ctx: &dyn Context, msg: &Message, path: &str) -> OutputStream {
-    let action = msg.action();
-
-    match (action, path) {
-        ("retrieve", "/admin/logs") => handle_list(ctx, msg).await,
-        ("retrieve", "/admin/system-logs") => handle_system_logs(ctx, msg).await,
-        _ => err_not_found("not found"),
-    }
-}
-
-async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
+/// `GET /b/admin/api/logs`.
+pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let query = AdminAuditLogListQuery::from_message(msg);
 
     let mut filters = Vec::new();
@@ -71,47 +60,6 @@ async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
     {
         Ok(result) => ok_json(&AdminAuditLogListResponse::from_record_list(&result)),
-        Err(e) => err_internal("Database error", e),
-    }
-}
-
-async fn handle_system_logs(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let (page, page_size, _) = msg.pagination_params(50);
-
-    let mut filters = Vec::new();
-    let status = msg.query("status").to_string();
-    if !status.is_empty() {
-        filters.push(Filter {
-            field: "status".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(status),
-        });
-    }
-    let path_filter = msg.query("path").to_string();
-    if !path_filter.is_empty() {
-        filters.push(Filter {
-            field: "path".to_string(),
-            operator: FilterOp::Like,
-            value: serde_json::Value::String(format!("%{path_filter}%")),
-        });
-    }
-
-    let sort = vec![SortField {
-        field: "created_at".to_string(),
-        desc: true,
-    }];
-
-    match db::paginated_list(
-        ctx,
-        REQUEST_LOGS_TABLE,
-        page as i64,
-        page_size as i64,
-        filters,
-        sort,
-    )
-    .await
-    {
-        Ok(result) => ok_json(&result),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -158,7 +106,7 @@ mod tests {
         audit_log(&ctx, "admin-1", "user.delete", "users/u-9", "203.0.113.7").await;
 
         let body =
-            output_json(handle_list(&ctx, &admin_msg("retrieve", "/admin/logs")).await).await;
+            output_json(handle_list(&ctx, &admin_msg("retrieve", "/b/admin/api/logs")).await).await;
 
         let row = body["records"][0]
             .as_object()
@@ -205,7 +153,7 @@ mod tests {
         )
         .await;
 
-        let mut msg = admin_msg("retrieve", "/admin/logs");
+        let mut msg = admin_msg("retrieve", "/b/admin/api/logs");
         msg.set_meta("req.query.action", "role.create".to_string());
 
         let body = output_json(handle_list(&ctx, &msg).await).await;

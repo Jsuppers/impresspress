@@ -106,34 +106,8 @@ pub mod block_settings {
 // `super::BLOCK_SETTINGS_TABLE` references keep resolving.
 pub use crate::admin_schema::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE};
 
-/// `path` is the normalized `/admin/settings[...]` sub-path, passed explicitly
-/// (no `req.resource` rewrite). Id-bearing leaves take the key from it.
-pub async fn handle(
-    ctx: &dyn Context,
-    msg: &Message,
-    path: &str,
-    input: InputStream,
-) -> OutputStream {
-    let action = msg.action();
-
-    match (action, path) {
-        ("retrieve", "/admin/settings/all") => handle_list_full(ctx).await,
-        ("retrieve", "/admin/settings") | ("retrieve", "/settings") => handle_list(ctx).await,
-        ("retrieve", _)
-            if path.starts_with("/admin/settings/") || path.starts_with("/settings/") =>
-        {
-            handle_get(ctx, path).await
-        }
-        ("update", _) if path.starts_with("/admin/settings/") => {
-            handle_set(ctx, msg, path, input).await
-        }
-        ("create", "/admin/settings") => handle_create(ctx, msg, input).await,
-        ("delete", _) if path.starts_with("/admin/settings/") => handle_delete(ctx, path).await,
-        _ => err_not_found("not found"),
-    }
-}
-
-async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
+/// `GET /b/admin/api/settings/all`.
+pub(super) async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
     match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
         Ok(records) => {
             let vars: Vec<_> = records
@@ -166,7 +140,8 @@ async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
     }
 }
 
-async fn handle_list(ctx: &dyn Context) -> OutputStream {
+/// `GET /b/admin/api/settings`.
+pub(super) async fn handle_list(ctx: &dyn Context) -> OutputStream {
     match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
         Ok(records) => {
             // Collected into a `BTreeMap` first, then flattened: the
@@ -204,11 +179,10 @@ async fn handle_list(ctx: &dyn Context) -> OutputStream {
     }
 }
 
-async fn handle_get(ctx: &dyn Context, path: &str) -> OutputStream {
-    let key = path
-        .strip_prefix("/admin/settings/")
-        .or_else(|| path.strip_prefix("/settings/"))
-        .unwrap_or("");
+/// `GET /b/admin/api/settings/{key}`. `{key}` is read only as the route
+/// table bound it.
+pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let key = msg.var("key");
     if key.is_empty() {
         return err_bad_request("Missing setting key");
     }
@@ -239,13 +213,14 @@ async fn handle_get(ctx: &dyn Context, path: &str) -> OutputStream {
     }
 }
 
-async fn handle_set(
+/// `PATCH /b/admin/api/settings/{key}`. `{key}` is read only as the route
+/// table bound it.
+pub(super) async fn handle_set(
     ctx: &dyn Context,
     msg: &Message,
-    path: &str,
     input: InputStream,
 ) -> OutputStream {
-    let key = path.strip_prefix("/admin/settings/").unwrap_or("");
+    let key = msg.var("key");
     if key.is_empty() {
         return err_bad_request("Missing setting key");
     }
@@ -286,7 +261,12 @@ async fn handle_set(
     }
 }
 
-async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
+/// `POST /b/admin/api/settings`.
+pub(super) async fn handle_create(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct Req {
         key: String,
@@ -322,8 +302,10 @@ async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
     }
 }
 
-async fn handle_delete(ctx: &dyn Context, path: &str) -> OutputStream {
-    let key = path.strip_prefix("/admin/settings/").unwrap_or("");
+/// `DELETE /b/admin/api/settings/{key}`. `{key}` is read only as the route
+/// table bound it.
+pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let key = msg.var("key");
     if key.is_empty() {
         return err_bad_request("Missing setting key");
     }
@@ -906,10 +888,11 @@ mod tests {
             .await
             .expect("seed secret var");
 
-        let msg = admin_msg("retrieve", "/admin/settings/STRIPE_SECRET");
-        let path = msg.path().to_string();
-        let out = handle(&ctx, &msg, &path, InputStream::empty()).await;
-        let body = output_json(out).await;
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            "/b/admin/api/settings/STRIPE_SECRET",
+        ));
+        let body = output_json(handle_get(&ctx, &msg).await).await;
         // `Record` serializes as `{ id, data: { value, ... } }`.
         assert_eq!(
             body.get("data")
@@ -1162,7 +1145,7 @@ mod create_tests {
     async fn create(ctx: &dyn Context, body: serde_json::Value) {
         let out = handle_create(
             ctx,
-            &admin_msg("create", "/admin/settings"),
+            &admin_msg("create", "/b/admin/api/settings"),
             InputStream::from_bytes(serde_json::to_vec(&body).unwrap()),
         )
         .await;

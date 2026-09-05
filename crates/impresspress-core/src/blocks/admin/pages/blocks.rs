@@ -15,10 +15,16 @@ use crate::{
 };
 
 /// Encode a block name (`org/block`) for use as a URL path segment. The
-/// public admin URLs use `--` as the separator so the path stays parseable
-/// after a `/`-stripped route match.
+/// public admin URLs use `--` as the separator so the name occupies one
+/// segment and the route table's `{name}` binds it whole.
 fn encode_block_name(name: &str) -> String {
     name.replace('/', "--")
+}
+
+/// Inverse of [`encode_block_name`]: the `{name}` segment the route table
+/// bound, back to the registered `org/block` form.
+fn decode_block_name(encoded: &str) -> String {
+    encoded.replace("--", "/")
 }
 
 pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -232,12 +238,12 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-/// POST /b/admin/blocks/{name}/toggle -- toggle a block's enabled state
-pub async fn handle_toggle_feature(
-    ctx: &dyn Context,
-    msg: &Message,
-    block_name: &str,
-) -> OutputStream {
+/// `POST /b/admin/blocks/{name}/toggle` -- toggle a block's enabled state.
+/// `{name}` is the `--`-encoded block name, read only as the route table
+/// bound it.
+pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let block_name = decode_block_name(msg.var("name"));
+    let block_name = block_name.as_str();
     // Read current state and toggle via shared helper (audit finding #12).
     // An unreadable state is an error, not "enabled": the write below is
     // derived from it, so a guess here would flip the block off the back of
@@ -275,12 +281,12 @@ pub async fn handle_toggle_feature(
     blocks_page(ctx, msg).await
 }
 
-/// GET /b/admin/blocks/{name}/detail -- block detail modal content
-pub async fn handle_block_detail(
-    ctx: &dyn Context,
-    _msg: &Message,
-    block_name: &str,
-) -> OutputStream {
+/// `GET /b/admin/blocks/{name}/detail` -- block detail modal content.
+/// `{name}` is the `--`-encoded block name, read only as the route table
+/// bound it.
+pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let block_name = decode_block_name(msg.var("name"));
+    let block_name = block_name.as_str();
     let blocks = ctx.registered_blocks();
     let block_opt = blocks.iter().find(|b| b.name == block_name);
 
@@ -527,7 +533,19 @@ mod toggle_feature_tests {
     use wafer_core::clients::database as db;
 
     use super::*;
-    use crate::test_support::{admin_msg, output_is_error, FailingDbOpContext, TestContext};
+    use crate::{
+        blocks::admin::test_support::routed,
+        test_support::{admin_msg, output_is_error, FailingDbOpContext, TestContext},
+    };
+
+    /// `POST /b/admin/blocks/impresspress--files/toggle`, with `{name}` bound
+    /// by the table the way it is on the wire.
+    fn toggle_files_msg() -> Message {
+        routed(admin_msg(
+            "create",
+            "/b/admin/blocks/impresspress--files/toggle",
+        ))
+    }
 
     async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
         db::list_all(
@@ -547,7 +565,6 @@ mod toggle_feature_tests {
     #[tokio::test]
     async fn toggle_success_persists_and_audits() {
         let ctx = TestContext::with_admin().await;
-        let msg = admin_msg("create", "/admin/blocks/impresspress--files/toggle");
 
         assert!(
             super::super::super::settings::block_settings::is_enabled(&ctx, "impresspress/files")
@@ -556,7 +573,7 @@ mod toggle_feature_tests {
             "no row yet ⇒ defaults enabled"
         );
 
-        let _ = handle_toggle_feature(&ctx, &msg, "impresspress/files")
+        let _ = handle_toggle_feature(&ctx, &toggle_files_msg())
             .await
             .collect_buffered()
             .await
@@ -584,9 +601,7 @@ mod toggle_feature_tests {
                 super::super::super::settings::BLOCK_SETTINGS_TABLE,
             )],
         );
-        let msg = admin_msg("create", "/admin/blocks/impresspress--files/toggle");
-
-        let out = handle_toggle_feature(&failing, &msg, "impresspress/files").await;
+        let out = handle_toggle_feature(&failing, &toggle_files_msg()).await;
 
         assert!(
             output_is_error(out, "Internal").await,
@@ -611,9 +626,8 @@ mod toggle_feature_tests {
     #[tokio::test]
     async fn toggle_persist_failure_returns_error_without_audit() {
         let ctx = TestContext::with_admin().await.break_writes();
-        let msg = admin_msg("create", "/admin/blocks/impresspress--files/toggle");
 
-        let out = handle_toggle_feature(&ctx, &msg, "impresspress/files").await;
+        let out = handle_toggle_feature(&ctx, &toggle_files_msg()).await;
         assert!(
             crate::test_support::output_is_error(out, "Internal").await,
             "a genuine persistence failure must surface as an error, not a fabricated success"

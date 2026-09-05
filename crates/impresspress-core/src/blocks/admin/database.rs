@@ -2,10 +2,10 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use wafer_sql_utils::{introspect, Backend};
 
-use crate::http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json};
+use crate::http::{err_bad_request, err_forbidden, err_internal, ok_json};
 
 /// Lightweight per-table summary: name + row count. Shared by the JSON
-/// `GET /admin/database/tables` handler and the SSR database page's
+/// `GET /b/admin/api/database/tables` handler and the SSR database page's
 /// left-pane list so both run the same introspection routine.
 pub(in crate::blocks::admin) struct TableSummary {
     pub name: String,
@@ -13,7 +13,7 @@ pub(in crate::blocks::admin) struct TableSummary {
 }
 
 /// A single column's introspected metadata. Shared by the JSON
-/// `GET /admin/database/tables/{name}/columns` handler and the SSR
+/// `GET /b/admin/api/database/tables/{name}/columns` handler and the SSR
 /// schema panel.
 pub(in crate::blocks::admin) struct ColumnInfo {
     pub name: String,
@@ -115,30 +115,8 @@ pub(in crate::blocks::admin) async fn introspect_columns(
     (cols, row_count)
 }
 
-/// `path` is the normalized `/admin/database/...` sub-path, passed explicitly
-/// (no `req.resource` rewrite). `handle_columns` extracts the table name from it.
-pub async fn handle(
-    ctx: &dyn Context,
-    msg: &Message,
-    path: &str,
-    input: InputStream,
-) -> OutputStream {
-    let action = msg.action();
-
-    match (action, path) {
-        ("retrieve", "/admin/database/info") => handle_info(ctx).await,
-        ("retrieve", "/admin/database/tables") => handle_tables(ctx).await,
-        ("retrieve", _)
-            if path.starts_with("/admin/database/tables/") && path.ends_with("/columns") =>
-        {
-            handle_columns(ctx, path).await
-        }
-        ("create", "/admin/database/query") => handle_query(ctx, input).await,
-        _ => err_not_found("not found"),
-    }
-}
-
-async fn handle_info(ctx: &dyn Context) -> OutputStream {
+/// `GET /b/admin/api/database/info`.
+pub(super) async fn handle_info(ctx: &dyn Context) -> OutputStream {
     let backend = crate::db_backend(ctx).await;
     let sql = introspect::build_list_tables(backend);
     let tables = match db::query_raw(ctx, &sql, &[]).await {
@@ -167,7 +145,8 @@ fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-async fn handle_tables(ctx: &dyn Context) -> OutputStream {
+/// `GET /b/admin/api/database/tables`.
+pub(super) async fn handle_tables(ctx: &dyn Context) -> OutputStream {
     let table_info: Vec<serde_json::Value> = introspect_table_summaries(ctx)
         .await
         .into_iter()
@@ -181,13 +160,10 @@ async fn handle_tables(ctx: &dyn Context) -> OutputStream {
     ok_json(&serde_json::json!(table_info))
 }
 
-async fn handle_columns(ctx: &dyn Context, path: &str) -> OutputStream {
-    // Extract table name from /admin/database/tables/{name}/columns
-    let table_name = path
-        .strip_prefix("/admin/database/tables/")
-        .and_then(|s| s.strip_suffix("/columns"))
-        .unwrap_or("");
-
+/// `GET /b/admin/api/database/tables/{name}/columns`. `{name}` is read only
+/// as the route table bound it.
+pub(super) async fn handle_columns(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let table_name = msg.var("name");
     if table_name.is_empty() {
         return err_bad_request("Missing table name");
     }
@@ -242,7 +218,7 @@ impl QueryValidationError {
 /// Rejects: multi-statement (`;`), any write keyword (whole-word match),
 /// and unsafe PRAGMAs.
 ///
-/// Used by both the JSON API (`POST /admin/database/query`) and the
+/// Used by both the JSON API (`POST /b/admin/api/database/query`) and the
 /// admin SSR page handler (`POST /b/admin/database/query`). Single
 /// source of truth — do not duplicate this logic.
 pub(in crate::blocks::admin) fn validate_readonly_query(
@@ -354,7 +330,8 @@ pub(in crate::blocks::admin) fn validate_readonly_query(
     }
 }
 
-async fn handle_query(ctx: &dyn Context, input: InputStream) -> OutputStream {
+/// `POST /b/admin/api/database/query`.
+pub(super) async fn handle_query(ctx: &dyn Context, input: InputStream) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct QueryReq {
         query: String,

@@ -291,8 +291,10 @@ async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
     single_user_row(&record, &roles, "")
 }
 
-/// POST /b/admin/users/{id}/disable
-pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message, user_id: &str) -> OutputStream {
+/// `POST /b/admin/users/{id}/disable`. `{id}` is read only as the route
+/// table bound it.
+pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.var("id");
     // Self-disable guard, update, and audit-log write live in the shared ops
     // layer (single source of truth shared with the JSON surface).
     if let Err(out) = ops::set_user_disabled(ctx, msg, user_id, true).await {
@@ -302,8 +304,10 @@ pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message, user_id: &str
     ui::html_response_with_toast(row, "User disabled", "success")
 }
 
-/// POST /b/admin/users/{id}/enable
-pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message, user_id: &str) -> OutputStream {
+/// `POST /b/admin/users/{id}/enable`. `{id}` is read only as the route
+/// table bound it.
+pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.var("id");
     if let Err(out) = ops::set_user_disabled(ctx, msg, user_id, false).await {
         return out;
     }
@@ -311,8 +315,10 @@ pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message, user_id: &str)
     ui::html_response_with_toast(row, "User enabled", "success")
 }
 
-/// DELETE /b/admin/users/{id}
-pub async fn handle_user_delete(ctx: &dyn Context, msg: &Message, user_id: &str) -> OutputStream {
+/// `DELETE /b/admin/users/{id}`. `{id}` is read only as the route table
+/// bound it.
+pub async fn handle_user_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.var("id");
     // Self-delete guard, soft-delete, and audit-log write live in the shared
     // ops layer.
     if let Err(out) = ops::delete_user(ctx, msg, user_id).await {
@@ -350,7 +356,10 @@ pub async fn handle_create_role(
         )
 }
 
-pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message, role_id: &str) -> OutputStream {
+/// `DELETE /b/admin/iam/roles/{id}` (from the roles tab). `{id}` is read only
+/// as the route table bound it.
+pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let role_id = msg.var("id");
     // System-role guard, delete, and audit-log write live in the shared ops
     // layer.
     if let Err(out) = ops::delete_role(ctx, msg, role_id).await {
