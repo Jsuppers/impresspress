@@ -1523,9 +1523,11 @@ mod table_tests {
         }
     }
 
-    /// Paths the classifier answered 404 stay unmatched: removed APIs, the
-    /// storage delegation, unknown tabs, and the empty-id shapes the old
-    /// `strip_prefix` guards refused.
+    /// Paths that stay unmatched. Most the classifier already answered 404:
+    /// removed APIs, the storage delegation, unknown tabs, and the empty-id
+    /// shapes the old `strip_prefix` guards refused. Two are deliberate
+    /// narrowings, marked below: the classifier matched them by path alone,
+    /// with no action gate, and the rows are method-specific.
     #[test]
     fn paths_the_classifier_refused_stay_unmatched() {
         for (action, path) in [
@@ -1537,7 +1539,13 @@ mod table_tests {
             ("retrieve", "/b/admin/api/cloudstorage"),
             ("retrieve", "/b/admin/api/system-logs"),
             ("retrieve", "/b/admin/api/whatever"),
+            // Narrowed: the classifier served the block list for ANY method
+            // on `/b/admin/api/extensions`; the row is GET-only.
             ("create", "/b/admin/api/extensions"),
+            // Narrowed: the settings tier was action-agnostic (a POST rendered
+            // the tab); the four tab rows and the redirect row are GET-only.
+            ("create", "/b/admin/settings/email"),
+            ("create", "/b/admin/settings"),
             ("retrieve", "/b/admin/settings/foobar"),
             ("create", "/b/admin/custom-blocks/install"),
             ("delete", "/b/admin/custom-blocks/impresspress--foo"),
@@ -1577,11 +1585,15 @@ mod page_link_tests {
         test_support::{admin_msg, anon_msg, output_html, TestContext},
     };
 
-    /// `(attribute prefix, action the attribute implies)`. htmx maps
+    /// `(URL prefix in the rendered HTML, action it implies)`. htmx maps
     /// `hx-post` to POST (`create`), `hx-get` to GET (`retrieve`),
     /// `hx-patch`/`hx-put` to PATCH/PUT (both `update`), `hx-delete` to
     /// DELETE (`delete`). `data-detail-url` is fetched with GET by the
-    /// network page's script.
+    /// network page's script. `fetch("` is the inline script the settings
+    /// form emits for its save target (`ui/settings_form.rs`), always a POST;
+    /// the URL is JSON-encoded there, so the double-quote form is exact, and
+    /// the served `.js` assets never appear in rendered HTML, so this cannot
+    /// over-trigger. A non-POST inline `fetch` needs its own entry.
     const LINK_ATTRS: &[(&str, &str)] = &[
         ("hx-get=\"", "retrieve"),
         ("hx-post=\"", "create"),
@@ -1589,6 +1601,7 @@ mod page_link_tests {
         ("hx-put=\"", "update"),
         ("hx-delete=\"", "delete"),
         ("data-detail-url=\"", "retrieve"),
+        ("fetch(\"", "create"),
     ];
 
     /// `(action, path)` for every link attribute in `html`, query string
