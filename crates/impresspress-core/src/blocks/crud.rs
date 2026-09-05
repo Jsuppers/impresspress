@@ -11,9 +11,14 @@
 //! * The `crud_*` functions are the untyped one-liners built on top of them:
 //!   the request body is whatever JSON object arrived, written as a column
 //!   map, and the response is the database layer's own `Record` envelope or
-//!   [`Deleted`]. Only the five with callers remain: `crud_get` and
-//!   `crud_update` (legalpages), `crud_get_owned` (messages) and the two
-//!   deletes. A block whose JSON API is typed uses the primitives directly.
+//!   [`Deleted`]. They read the record id from the request path with a
+//!   prefix fallback (`path_id`), which only `products` still relies on:
+//!   `crud_delete` and `crud_delete_owned` are its callers. `legalpages` and
+//!   `messages` read `{id}` as their route tables bound it and compose the
+//!   primitives directly, so `crud_get`, `crud_update` and `crud_get_owned`
+//!   have no caller left; they go, with the prefix fallback, once `products`
+//!   dispatches on wire paths too. A block whose JSON API is typed uses the
+//!   primitives directly.
 //!
 // audit-allow-file: pure pass-through helpers — every db::* call here takes
 // the table name as a `collection: &str` parameter from the caller. WRAP
