@@ -9,8 +9,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The impresspress crate's build.rs `include_bytes!`s the impresspress-web
+  # wasm (`crates/impresspress-web/pkg/impresspress_web_bg.wasm`) and exits
+  # non-zero when it is missing, so no release binary can be built until that
+  # wasm exists. Same job as ci.yml's `build-wasm`: build it once, publish
+  # `pkg/` as an artifact, and have every matrix target download it.
+  build-wasm:
+    name: Build impresspress-web wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout wafer-run
+        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wasm
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          # Pinned for the same reason as ci.yml: an unpinned lookup can fall
+          # back to the action's ancient default, which cannot parse
+          # workspace-inherited manifest fields.
+          version: 'v0.15.0'
+
+      - name: Build WASM
+        run: cd crates/impresspress-web && wasm-pack build --target web --release --out-dir pkg
+
+      - name: Upload pkg/ artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: impresspress-web-pkg
+          path: crates/impresspress-web/pkg/
+          retention-days: 1
+
   build:
     name: Build (${{ matrix.name }})
+    needs: build-wasm
     strategy:
       fail-fast: false
       matrix:
@@ -69,8 +112,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
+      # build.rs `include_bytes!`s the impresspress-web wasm; download the
+      # prebuilt pkg/ so it finds it (the same step every CI job takes).
+      - name: Download impresspress-web pkg/
+        uses: actions/download-artifact@v4
+        with:
+          name: impresspress-web-pkg
+          path: crates/impresspress-web/pkg
+
+      # `--locked`: a release must resolve exactly the dependency set CI
+      # tested, never a fresh resolution of the git pins.
       - name: Build
-        run: cargo build -p impresspress --release --target ${{ matrix.target }}
+        run: cargo build --locked -p impresspress --release --target ${{ matrix.target }}
 
       - name: Package (tar.gz)
         if: matrix.ext == 'tar.gz'

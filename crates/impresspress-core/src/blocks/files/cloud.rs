@@ -145,16 +145,21 @@ async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return err_bad_request("Missing share ID");
     }
 
-    // Verify ownership
-    if let Ok(share) = repo::shares::find_by_id(ctx, id).await {
-        let owner = share
-            .data
-            .get("created_by")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if owner != msg.user_id() && !crate::util::is_admin(msg) {
-            return err_forbidden("Cannot delete another user's share");
+    // Verify ownership. This lookup is the only authorization on the path,
+    // so a failed read stops the request instead of skipping the check.
+    match repo::shares::find_by_id(ctx, id).await {
+        Ok(share) => {
+            let owner = share
+                .data
+                .get("created_by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if owner != msg.user_id() && !crate::util::is_admin(msg) {
+                return err_forbidden("Cannot delete another user's share");
+            }
         }
+        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Share not found"),
+        Err(e) => return err_internal("Database error", e),
     }
 
     match repo::shares::delete(ctx, id).await {
@@ -165,8 +170,14 @@ async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let quota = super::quota::get_user_quota(ctx, msg.user_id()).await;
-    let usage = super::quota::get_user_usage(ctx, msg.user_id()).await;
+    let quota = match super::quota::get_user_quota(ctx, msg.user_id()).await {
+        Ok(quota) => quota,
+        Err(e) => return err_internal("Quota lookup failed", e),
+    };
+    let usage = match super::quota::get_user_usage(ctx, msg.user_id()).await {
+        Ok(usage) => usage,
+        Err(e) => return err_internal("Quota usage lookup failed", e),
+    };
     ok_json(&serde_json::json!({
         "quota": quota,
         "usage": usage
@@ -246,7 +257,32 @@ mod tests {
     use wafer_run::InputStream;
 
     use super::*;
-    use crate::test_support::{auth_msg, output_is_error, output_json, TestContext};
+    use crate::test_support::{
+        auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
+    };
+
+    fn empty_input() -> InputStream {
+        InputStream::from_bytes(Vec::new())
+    }
+
+    /// Seed one share row owned by `owner` and return its id.
+    async fn seed_share(ctx: &TestContext, owner: &str) -> String {
+        repo::shares::insert(
+            ctx,
+            repo::shares::NewShare {
+                token: "share-token-1",
+                bucket: "photos",
+                key: "a.png",
+                created_by: owner,
+                created_at: "2026-09-05T00:00:00Z",
+                expires_at: None,
+                max_access_count: None,
+            },
+        )
+        .await
+        .expect("seed share")
+        .id
+    }
 
     fn share_body(bucket: &str, key: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({ "bucket": bucket, "key": key })).unwrap()
@@ -413,6 +449,62 @@ mod tests {
         assert!(
             output_is_error(out, "InvalidArgument").await,
             "invalid bucket name must be rejected"
+        );
+    }
+
+    /// The ownership check is the only authorization on share deletion. An
+    /// outage on that lookup must stop the request, not skip the check.
+    #[tokio::test]
+    async fn delete_share_lookup_outage_does_not_delete() {
+        let ctx = TestContext::with_files().await;
+        let id = seed_share(&ctx, "u1").await;
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.get", repo::shares::TABLE)]);
+
+        let msg = auth_msg("delete", &format!("/b/cloudstorage/shares/{id}"), "u2");
+        let out = handle(&failing, msg, empty_input()).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "an ownership lookup outage must not fall through to the delete"
+        );
+        assert!(
+            repo::shares::find_by_id(&ctx, &id).await.is_ok(),
+            "the share must survive a failed ownership check"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_share_by_non_owner_is_forbidden() {
+        let ctx = TestContext::with_files().await;
+        let id = seed_share(&ctx, "u1").await;
+
+        let msg = auth_msg("delete", &format!("/b/cloudstorage/shares/{id}"), "u2");
+        let out = handle(&ctx, msg, empty_input()).await;
+
+        assert!(output_is_error(out, "PermissionDenied").await);
+        assert!(repo::shares::find_by_id(&ctx, &id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_missing_share_is_not_found() {
+        let ctx = TestContext::with_files().await;
+        let msg = auth_msg("delete", "/b/cloudstorage/shares/no-such-share", "u1");
+        assert!(output_is_error(handle(&ctx, msg, empty_input()).await, "NotFound").await);
+    }
+
+    /// `/b/cloudstorage/quota` must not report zero usage during an outage.
+    #[tokio::test]
+    async fn quota_endpoint_surfaces_usage_outage() {
+        let ctx = TestContext::with_files().await;
+        let failing = FailingDbOpContext::new(ctx, vec![("database.sum", repo::objects::TABLE)]);
+
+        let msg = auth_msg("retrieve", "/b/cloudstorage/quota", "u1");
+        let out = handle(&failing, msg, empty_input()).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a usage outage must surface as an error, not as zero usage"
         );
     }
 

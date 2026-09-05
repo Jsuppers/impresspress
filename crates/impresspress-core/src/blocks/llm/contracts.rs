@@ -417,6 +417,13 @@ pub struct ConfigAcknowledgement {
     pub updated: bool,
 }
 
+/// `DELETE /b/llm/api/config/{id}` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ConfigDeleteResponse {
+    /// Always `true`: a delete that did not happen is an error response.
+    pub deleted: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

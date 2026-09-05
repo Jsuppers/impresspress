@@ -1,4 +1,5 @@
 [
+  "DELETE /b/llm/api/config/{id} authenticated",
   "DELETE /b/llm/api/providers/{id} admin",
   "GET /b/llm/ admin",
   "GET /b/llm/api/config authenticated",

@@ -16,13 +16,14 @@ use crate::{
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
-        SiteConfig, UserInfo,
+        UserInfo,
     },
     util::{parse_form_body, RecordExt},
 };
 
 pub async fn users_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
+    // Still needed by the page body (the current admin's own row is
+    // rendered differently); the shell loads its own copy.
     let user = UserInfo::from_message(msg);
     let tab = msg.query("tab");
     let active_tab = match tab {
@@ -81,10 +82,9 @@ pub async fn users_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     );
 
     admin_page(
+        ctx,
+        msg,
         "Users",
-        &config,
-        "/b/admin/users",
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Users"),
             primary_action: None,
@@ -92,8 +92,8 @@ pub async fn users_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             show_palette: true,
         },
         body,
-        msg,
     )
+    .await
 }
 
 /// Users tab content (table + search + pagination).

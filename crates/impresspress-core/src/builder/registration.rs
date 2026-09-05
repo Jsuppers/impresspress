@@ -129,7 +129,14 @@ impl ImpresspressBuilder {
 
         #[cfg(feature = "llm")]
         let provider_llm_svc = {
-            let svc = Arc::new(crate::blocks::llm::providers::ProviderLlmService::new());
+            // A client that cannot be built with its SSRF-revalidating
+            // redirect policy is a build failure, not a degraded service:
+            // the policy is what stops a compromised provider endpoint from
+            // redirecting the request onto internal addresses.
+            let svc = Arc::new(
+                crate::blocks::llm::providers::ProviderLlmService::try_new()
+                    .map_err(|e| RuntimeError::Config(format!("provider LLM service: {e}")))?,
+            );
             llm_router.register("provider", svc.clone());
             svc
         };

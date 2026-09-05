@@ -418,6 +418,41 @@ impl DatabaseService for KvCachedD1DatabaseService {
             .await
     }
 
+    // `delete_where_count` and `take_where` MUST be overridden as well. Their
+    // trait defaults compose the primitives above (`count` + `delete_where`;
+    // `list` + `delete` per row), which on a cached table would take the row
+    // set from KV — possibly stale — and delete behind the cache's back, and
+    // on every table would skip the inner adapter's single atomic
+    // `DELETE … RETURNING`. Same policy as the other bulk writes: refuse on a
+    // cached table, forward otherwise.
+    async fn delete_where_count(
+        &self,
+        collection: &str,
+        filters: &[Filter],
+    ) -> Result<i64, DatabaseError> {
+        if cache_key::classify_table(collection).is_some() {
+            return Err(DatabaseError::Internal(format!(
+                "bulk delete_where_count not supported on cached table `{collection}` \
+                 (would require KV mass-invalidation)"
+            )));
+        }
+        self.inner.delete_where_count(collection, filters).await
+    }
+
+    async fn take_where(
+        &self,
+        collection: &str,
+        filters: &[Filter],
+    ) -> Result<Vec<Record>, DatabaseError> {
+        if cache_key::classify_table(collection).is_some() {
+            return Err(DatabaseError::Internal(format!(
+                "take_where not supported on cached table `{collection}` \
+                 (would require KV mass-invalidation)"
+            )));
+        }
+        self.inner.take_where(collection, filters).await
+    }
+
     async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
         if cache_key::classify_table(collection).is_some() {
             return Err(DatabaseError::Internal(format!(
@@ -800,6 +835,30 @@ mod tests {
             unreachable!()
         }
 
+        /// Marker implementation: a caller that reaches the inner adapter's
+        /// own `take_where` gets a row tagged with the collection, whereas the
+        /// trait default would go through `list` + `delete` above.
+        async fn take_where(
+            &self,
+            collection: &str,
+            _filters: &[Filter],
+        ) -> Result<Vec<Record>, DatabaseError> {
+            Ok(vec![Record {
+                id: format!("took:{collection}"),
+                data: HashMap::new(),
+            }])
+        }
+
+        /// Marker implementation, see `take_where`; the trait default would
+        /// go through `count` + `delete_where`.
+        async fn delete_where_count(
+            &self,
+            _collection: &str,
+            _filters: &[Filter],
+        ) -> Result<i64, DatabaseError> {
+            Ok(7)
+        }
+
         async fn count(
             &self,
             _collection: &str,
@@ -916,6 +975,51 @@ mod tests {
             kv.writes.get(),
             1,
             "a genuine miss must repopulate the cache with one PUT"
+        );
+    }
+
+    /// Bulk ops on a cached table are refused like the other bulk writes,
+    /// never served by the trait defaults: those would `list` (from KV, so
+    /// possibly stale) and then `delete` row by row behind the cache's back.
+    #[wasm_bindgen_test]
+    async fn take_where_on_cached_table_is_refused() {
+        let (svc, kv) = cached_service(KvGet::Missing);
+        assert!(svc.take_where(VARIABLES_TABLE, &[]).await.is_err());
+        assert_eq!(
+            kv.writes.get(),
+            0,
+            "a refused bulk op must not touch the cache"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn delete_where_count_on_cached_table_is_refused() {
+        let (svc, kv) = cached_service(KvGet::Missing);
+        assert!(svc.delete_where_count(VARIABLES_TABLE, &[]).await.is_err());
+        assert_eq!(kv.writes.get(), 0);
+    }
+
+    /// On an uncached table both forward to the inner adapter's own (atomic)
+    /// implementation rather than the list-then-delete default.
+    #[wasm_bindgen_test]
+    async fn take_where_forwards_to_inner_for_uncached_table() {
+        let (svc, _kv) = cached_service(KvGet::Missing);
+        let rows = svc
+            .take_where("conf_x", &[])
+            .await
+            .expect("forwarded to inner");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "took:conf_x");
+    }
+
+    #[wasm_bindgen_test]
+    async fn delete_where_count_forwards_to_inner_for_uncached_table() {
+        let (svc, _kv) = cached_service(KvGet::Missing);
+        assert_eq!(
+            svc.delete_where_count("conf_x", &[])
+                .await
+                .expect("forwarded to inner"),
+            7
         );
     }
 }

@@ -22,6 +22,12 @@ IMPRESSPRESS_LISTEN=127.0.0.1:8090 \
 
 Open <http://127.0.0.1:8090/b/auth/login> and sign in with `admin@example.com` and `admin123`. Local data is stored under `data/` by default.
 
+If you commit from this checkout, point git at the repository's hooks once so formatting and clippy run the same way CI does (this needs the nightly toolchain's rustfmt: `rustup toolchain install nightly --component rustfmt`):
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Try it without installing anything
 
 `dev.impresspress.org` is a browser-local sandbox where a WebMCP-capable AI agent builds a site, writes backend blocks and stocks a shop entirely in your browser tab — nothing is installed, and nothing is deployed behind it. See [`docs/dev-sandbox.md`](docs/dev-sandbox.md).

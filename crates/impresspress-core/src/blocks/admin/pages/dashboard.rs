@@ -15,7 +15,6 @@ use crate::{
         components, icons,
         shell::Topbar,
         templates::{dashboard_page, PageHeader, StatTile},
-        SiteConfig, UserInfo,
     },
     util::RecordExt,
 };
@@ -220,9 +219,6 @@ async fn request_counts(ctx: &dyn Context, today_start: &str) -> (i64, i64, f64)
 }
 
 pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = SiteConfig::load(ctx).await;
-    let user = UserInfo::from_message(msg);
-
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let today_start = format!("{today}T00:00:00");
 
@@ -497,10 +493,9 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     );
 
     admin_page(
+        ctx,
+        msg,
         "Dashboard",
-        &config,
-        "/b/admin/",
-        user.as_ref(),
         Topbar {
             crumbs: crumb("Dashboard"),
             primary_action: None,
@@ -508,8 +503,8 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
             show_palette: true,
         },
         body,
-        msg,
     )
+    .await
 }
 
 #[cfg(test)]
