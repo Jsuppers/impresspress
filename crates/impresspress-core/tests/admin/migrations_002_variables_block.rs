@@ -7,8 +7,7 @@
 use std::collections::HashMap;
 
 use impresspress_core::{
-    blocks::admin::{migrations, VARIABLES_TABLE},
-    test_support::TestContext,
+    blocks::admin::migrations, platform_state::variables, test_support::TestContext,
 };
 use serde_json::json;
 use wafer_block::db::ListOptions;
@@ -28,7 +27,7 @@ async fn insert_var(ctx: &TestContext, key: &str, value: &str) {
     data.insert("updated_by".to_string(), json!(""));
     data.insert("created_at".to_string(), json!("2026-05-16T00:00:00Z"));
     data.insert("updated_at".to_string(), json!("2026-05-16T00:00:00Z"));
-    db::create(ctx, VARIABLES_TABLE, data)
+    db::create(ctx, variables::TABLE, data)
         .await
         .unwrap_or_else(|e| panic!("create row {key}: {e}"));
 }
@@ -38,7 +37,7 @@ async fn read_block_column(ctx: &TestContext, key: &str) -> Option<String> {
         limit: 100,
         ..Default::default()
     };
-    let rows = db::list(ctx, VARIABLES_TABLE, &opts)
+    let rows = db::list(ctx, variables::TABLE, &opts)
         .await
         .expect("list variables");
     let row = rows

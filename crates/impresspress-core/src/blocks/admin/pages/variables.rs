@@ -1,12 +1,12 @@
 use maud::{html, Markup};
-use wafer_core::clients::database::{self as db};
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::admin::{ops, VARIABLES_TABLE as VARIABLES},
-    http::err_not_found,
+    blocks::admin::ops,
+    http::{err_internal, err_not_found},
+    platform_state::variables,
     ui::{self, components, icons},
-    util::{parse_form_body, RecordExt},
+    util::parse_form_body,
 };
 
 /// Render JUST the variables settings body. The parent `settings_page`
@@ -251,11 +251,11 @@ fn var_table(header: Markup, show_default: bool, body: Markup) -> Markup {
 
 /// "All Variables" tab -- flat table of all config variables from the DB.
 async fn config_all_tab(ctx: &dyn Context) -> Markup {
-    let settings = db::list_all(ctx, VARIABLES, vec![]).await;
+    let settings = variables::list_all(ctx).await;
 
     html! {
         @match &settings {
-            Ok(records) => {
+            Ok(rows) => {
                 div .table-container {
                     table .table {
                         thead {
@@ -267,14 +267,14 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                             }
                         }
                         tbody {
-                            @for record in records {
-                                @let key = record.str_field("key");
-                                @let value = record.str_field("value");
-                                @let description = record.str_field("description");
-                                @let warning = record.str_field("warning");
+                            @for row in rows {
+                                @let key = row.key.as_str();
+                                @let value = row.value.as_str();
+                                @let description = row.description.as_str();
+                                @let warning = row.warning.as_str();
                                 // SEC-060: mask via the shared rule, not the
                                 // `sensitive` flag alone.
-                                @let masked = ops::is_sensitive_key(key, record.i64_field("sensitive"));
+                                @let masked = ops::is_sensitive_key(key, i64::from(row.sensitive));
                                 tr #{"var-row-" (key)} {
                                     td .font-medium { (key) }
                                     td .text-sm {
@@ -322,20 +322,18 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
     let shared_vars = crate::config_vars::shared_config_vars();
 
     // Load all variables from DB
-    let all_vars = db::list_all(ctx, VARIABLES, vec![])
-        .await
-        .unwrap_or_default();
+    let all_vars = variables::list_all(ctx).await.unwrap_or_default();
 
     // Build a map of key -> (value, sensitive-flag). The flag is kept as the
-    // raw `i64` so the SEC-060 suffix rule can be applied via
-    // `ops::is_sensitive_key` at render time.
+    // `i64` `ops::is_sensitive_key` takes so the SEC-060 suffix rule can be
+    // applied at render time.
     let var_map: std::collections::HashMap<String, (String, i64)> = all_vars
         .iter()
-        .map(|r| {
-            let key = r.str_field("key").to_string();
-            let value = r.str_field("value").to_string();
-            let sensitive = r.i64_field("sensitive");
-            (key, (value, sensitive))
+        .map(|row| {
+            (
+                row.key.clone(),
+                (row.value.clone(), i64::from(row.sensitive)),
+            )
         })
         .collect();
 
@@ -439,7 +437,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
 
         // Unowned variables section -- keys in DB not declared by any block or shared
         @let unowned_vars: Vec<_> = all_vars.iter()
-            .filter(|r| !known_keys.contains(r.str_field("key")))
+            .filter(|row| !known_keys.contains(row.key.as_str()))
             .collect();
         @if !unowned_vars.is_empty() {
             (var_table(
@@ -456,8 +454,8 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                 },
                 false,
                 html! {
-                    @for record in &unowned_vars {
-                        @let key = record.str_field("key");
+                    @for row in &unowned_vars {
+                        @let key = row.key.as_str();
                         // SEC-060: mask via the shared rule. `track_unset` is
                         // false here so an empty value renders as an empty
                         // `code` cell, matching the prior flat layout.
@@ -466,13 +464,13 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                             name: None,
                             value: ValueState::resolve(
                                 key,
-                                record.str_field("value"),
-                                record.i64_field("sensitive"),
+                                &row.value,
+                                i64::from(row.sensitive),
                                 false,
                             ),
                             default: None,
                             auto_generate: false,
-                            description: record.str_field("description"),
+                            description: &row.description,
                             warning: "",
                             show_default: false,
                         }))
@@ -515,22 +513,17 @@ pub async fn handle_create_variable(
 /// `{key}` is read only as the route table bound it.
 pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let var_key = msg.var("key");
-    let Ok(record) = db::get_by_field(
-        ctx,
-        VARIABLES,
-        "key",
-        serde_json::Value::String(var_key.to_string()),
-    )
-    .await
-    else {
-        return err_not_found("Variable not found");
+    let row = match variables::get_by_key(ctx, var_key).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return err_not_found("Variable not found"),
+        Err(e) => return err_internal("Database error", e),
     };
 
-    let key = record.str_field("key").to_string();
-    let sensitive = record.i64_field("sensitive") != 0;
-    let value = record.str_field("value").to_string();
-    let description = record.str_field("description").to_string();
-    let warning = record.str_field("warning").to_string();
+    let key = row.key;
+    let sensitive = row.sensitive;
+    let value = row.value;
+    let description = row.description;
+    let warning = row.warning;
 
     let markup = html! {
         div .modal-header {
@@ -640,15 +633,10 @@ mod tests {
 
 #[cfg(test)]
 mod create_form_tests {
-    use wafer_block::db::{Filter, FilterOp};
-    use wafer_core::clients::database as db;
     use wafer_run::InputStream;
 
     use super::*;
-    use crate::{
-        blocks::admin::VARIABLES_TABLE,
-        test_support::{admin_msg, collect_or_panic, TestContext},
-    };
+    use crate::test_support::{admin_msg, collect_or_panic, TestContext};
 
     async fn admin_ctx() -> TestContext {
         let ctx = TestContext::new().await;
@@ -658,21 +646,12 @@ mod create_form_tests {
         ctx
     }
 
-    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> i64 {
-        let rows = db::list_all(
-            ctx,
-            VARIABLES_TABLE,
-            vec![Filter {
-                field: "key".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(key),
-            }],
-        )
-        .await
-        .expect("list variables");
-        rows.first()
+    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> bool {
+        variables::get_by_key(ctx, key)
+            .await
+            .expect("get variable")
             .unwrap_or_else(|| panic!("{key} was not created"))
-            .i64_field("sensitive")
+            .sensitive
     }
 
     async fn post_form(ctx: &dyn Context, body: &str) {
@@ -691,14 +670,14 @@ mod create_form_tests {
     async fn form_post_without_the_flag_defaults_to_sensitive() {
         let ctx = admin_ctx().await;
         post_form(&ctx, "key=SITE_MOTTO&value=move+fast").await;
-        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+        assert!(sensitive_flag(&ctx, "SITE_MOTTO").await);
     }
 
     #[tokio::test]
     async fn form_post_with_an_explicit_zero_is_not_sensitive() {
         let ctx = admin_ctx().await;
         post_form(&ctx, "key=SITE_MOTTO&value=move+fast&sensitive=0").await;
-        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 0);
+        assert!(!sensitive_flag(&ctx, "SITE_MOTTO").await);
     }
 
     /// The modal posts a hidden `sensitive=0` followed by the checkbox's
@@ -713,7 +692,7 @@ mod create_form_tests {
             "key=SITE_MOTTO&value=move+fast&sensitive=0&sensitive=1",
         )
         .await;
-        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+        assert!(sensitive_flag(&ctx, "SITE_MOTTO").await);
     }
 
     /// The create modal is checked by default and always posts an explicit

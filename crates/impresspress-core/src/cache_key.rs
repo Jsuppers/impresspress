@@ -6,7 +6,10 @@
 //! logic lives here so it's host-testable; `impresspress-cloudflare` is
 //! excluded from `cargo test --workspace`.
 
-use crate::blocks::admin::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE, WRAP_GRANTS_TABLE};
+use crate::{
+    blocks::admin::{BLOCK_SETTINGS_TABLE, WRAP_GRANTS_TABLE},
+    platform_state::variables,
+};
 
 /// Tables that this wrapper caches in KV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +23,7 @@ pub enum CachedTable {
 /// Returns Some when `table` is one of the cached tables.
 pub fn classify_table(table: &str) -> Option<CachedTable> {
     match table {
-        t if t == VARIABLES_TABLE => Some(CachedTable::Variables),
+        t if t == variables::TABLE => Some(CachedTable::Variables),
         t if t == BLOCK_SETTINGS_TABLE => Some(CachedTable::BlockSettings),
         _ => None,
     }
@@ -38,7 +41,7 @@ pub const CONFIG_VERSION_KEY: &str = "cfg:v1:config_version";
 /// grants at build). Tables read fresh per request (roles, permissions,
 /// user_roles) do NOT bump.
 pub fn bumps_config_version(table: &str) -> bool {
-    table == VARIABLES_TABLE || table == BLOCK_SETTINGS_TABLE || table == WRAP_GRANTS_TABLE
+    table == variables::TABLE || table == BLOCK_SETTINGS_TABLE || table == WRAP_GRANTS_TABLE
 }
 
 use wafer_block::db::{Filter, FilterOp, ListOptions};
@@ -757,7 +760,7 @@ mod tests {
     fn every_classified_table_bumps_config_version() {
         for table in [CachedTable::Variables, CachedTable::BlockSettings] {
             let table_name = match table {
-                CachedTable::Variables => VARIABLES_TABLE,
+                CachedTable::Variables => variables::TABLE,
                 CachedTable::BlockSettings => BLOCK_SETTINGS_TABLE,
             };
             assert_eq!(

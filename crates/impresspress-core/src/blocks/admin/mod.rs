@@ -10,7 +10,7 @@ mod users;
 
 pub(crate) use iam::{PERMISSIONS_TABLE, ROLES_TABLE, USER_ROLES_TABLE};
 pub(crate) use logs::{AUDIT_LOGS_TABLE, REQUEST_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
-pub use settings::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE};
+pub use settings::BLOCK_SETTINGS_TABLE;
 
 /// Registered name of the admin block.
 ///
@@ -31,6 +31,7 @@ use wafer_run::{
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
+    platform_state::variables,
 };
 
 /// Path-parameter schema for the `/iam/roles/{id}` routes.
@@ -513,7 +514,7 @@ crate::impresspress_feature_block! {
                 CollectionSchema::new(ROLES_TABLE),
                 CollectionSchema::new(PERMISSIONS_TABLE),
                 CollectionSchema::new(USER_ROLES_TABLE),
-                CollectionSchema::new(VARIABLES_TABLE),
+                CollectionSchema::new(variables::TABLE),
                 CollectionSchema::new(AUDIT_LOGS_TABLE),
                 CollectionSchema::new(REQUEST_LOGS_TABLE),
                 CollectionSchema::new(STORAGE_ACCESS_LOGS_TABLE),
@@ -534,7 +535,7 @@ crate::impresspress_feature_block! {
                     super::auth_ui::AUTH_UI_BLOCK_ID,
                     USER_ROLES_TABLE,
                 ),
-                wafer_run::ResourceGrant::read(super::auth::AUTH_BLOCK_ID, VARIABLES_TABLE),
+                wafer_run::ResourceGrant::read(super::auth::AUTH_BLOCK_ID, variables::TABLE),
                 wafer_run::ResourceGrant::read("impresspress/userportal", BLOCK_SETTINGS_TABLE),
                 // Every block may upsert its own migration state into block_settings.
                 wafer_run::ResourceGrant::read_write("*", BLOCK_SETTINGS_TABLE),
@@ -1680,16 +1681,21 @@ mod page_link_tests {
         )
         .await
         .expect("seed role");
-        let mut variable = crate::util::json_map(serde_json::json!({
-            "key": PROBE_VARIABLE,
-            "name": PROBE_VARIABLE,
-            "value": "1",
-            "sensitive": 0,
-        }));
-        crate::util::stamp_created(&mut variable);
-        db::create(&ctx, VARIABLES_TABLE, variable)
-            .await
-            .expect("seed variable");
+        variables::insert(
+            &ctx,
+            variables::NewVariable {
+                key: PROBE_VARIABLE.to_string(),
+                value: "1".to_string(),
+                name: PROBE_VARIABLE.to_string(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: String::new(),
+                block: variables::block_for_key(PROBE_VARIABLE),
+            },
+        )
+        .await
+        .expect("seed variable");
         let mut grant = crate::util::json_map(serde_json::json!({
             "grantee": "impresspress/probe",
             "resource": "impresspress__probe__things",

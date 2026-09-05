@@ -74,6 +74,7 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
+    platform_state::variables,
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -168,7 +169,7 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     (PRODUCTS_VARIABLES_TABLE, Mode::Upsert(BY_ID)),
     (OFFER_COMPONENTS_TABLE, Mode::Upsert(BY_ID)),
     (CHECKOUT_PRESETS_TABLE, Mode::Upsert(BY_ID)),
-    // --- admin: IAM catalog plus config. `VARIABLES_TABLE` is filtered row
+    // --- admin: IAM catalog plus config. `variables::TABLE` is filtered row
     // by row at export time (`variable_is_exportable`) rather than excluded
     // wholesale — most admin variables are ordinary site config (`APP_NAME`,
     // feature flags), exactly what a re-hosted copy needs to keep working.
@@ -180,7 +181,7 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     // `APP_NAME` variable and dies on that index. See [`Mode::Upsert`].
     (ROLES_TABLE, Mode::Upsert(&["name"])),
     (PERMISSIONS_TABLE, Mode::Upsert(&["name"])),
-    (admin_schema::VARIABLES_TABLE, Mode::Upsert(&["key"])),
+    (variables::TABLE, Mode::Upsert(&["key"])),
     // --- identity: the owner's own account, `Replace`d as a set so a fresh
     // instance's bootstrap admin is gone once someone else's is imported —
     // every `owner_id`/`created_by` an imported product carries still
@@ -441,7 +442,7 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
             // The one table with a per-row export decision — see
             // `variable_is_exportable`'s docs for why the check lives there
             // and not as a second `Mode`.
-            .filter(|row| table != admin_schema::VARIABLES_TABLE || variable_is_exportable(row))
+            .filter(|row| table != variables::TABLE || variable_is_exportable(row))
             .filter(|row| owner_was_exported(table, row, &exported))
             .collect();
         if OWNED_TABLES.iter().any(|(_, _, owner)| *owner == table) {

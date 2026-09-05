@@ -159,7 +159,7 @@ pub async fn build_native_runtime(
 
     // Seed env/auto-gen/JWT variables + run the #222 block-settings hash-gate,
     // all through the shared `impresspress_core` seeders over the service.
-    let vars = impresspress_core::boot::seed_and_load_variables(&database, env_vars)
+    let vars = impresspress_core::platform_state::variables::seed_and_load(&database, env_vars)
         .await
         .map_err(|e| anyhow!("seed and load variables: {e}"))?;
     tracing::info!(vars = vars.len(), "variables loaded from database");

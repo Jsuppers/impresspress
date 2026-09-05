@@ -8,9 +8,9 @@
 //! source of truth.
 //!
 //! `blocks/admin` re-exports from here (`settings.rs`, `logs.rs`), so existing
-//! `blocks::admin::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE, REQUEST_LOGS_TABLE}`
-//! and `settings::VARIABLES_TABLE` references continue to resolve. New
-//! consumers should import directly from this module.
+//! `blocks::admin::{BLOCK_SETTINGS_TABLE, REQUEST_LOGS_TABLE}` references
+//! continue to resolve. The variables table already moved to
+//! `crate::platform_state::variables`; the rest follows.
 //!
 //! Why a sibling of `blocks/`?
 //! - The constants describe the on-disk schema contract, not block logic, and
@@ -28,13 +28,6 @@
 /// `pub` (not `pub(crate)`) because consumers outside `impresspress-core`
 /// reference this table by name.
 pub const BLOCK_SETTINGS_TABLE: &str = "impresspress__admin__block_settings";
-
-/// Admin-managed configuration variables (key/value/scope/sensitive). Owned by
-/// the admin block.
-///
-/// `pub` (not `pub(crate)`) because consumers outside `impresspress-core`
-/// reference this table by name.
-pub const VARIABLES_TABLE: &str = "impresspress__admin__variables";
 
 /// HTTP request log entries (one row per inbound request). Owned by the admin
 /// block.

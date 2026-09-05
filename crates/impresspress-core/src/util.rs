@@ -97,9 +97,15 @@ pub trait RecordExt {
     fn string_list_field(&self, key: &str) -> Vec<String>;
 }
 
-impl RecordExt for Record {
+/// The one implementation: every `Record` shape the runtime hands out —
+/// `wafer_core::clients::database::Record` under WRAP and
+/// `wafer_core::interfaces::database::service::Record` at boot — carries a
+/// `data: HashMap<String, Value>` column map, and the platform-state codecs
+/// decode that map for both. Implemented on the map so the two flavours
+/// share one accessor set; the `Record` impl below forwards to it.
+impl RecordExt for HashMap<String, serde_json::Value> {
     fn str_field(&self, key: &str) -> &str {
-        self.data.get(key).and_then(|v| v.as_str()).unwrap_or("")
+        self.get(key).and_then(|v| v.as_str()).unwrap_or("")
     }
 
     fn i64_field(&self, key: &str) -> i64 {
@@ -107,15 +113,15 @@ impl RecordExt for Record {
     }
 
     fn opt_i64_field(&self, key: &str) -> Option<i64> {
-        self.data.get(key).and_then(json_as_i64)
+        self.get(key).and_then(json_as_i64)
     }
 
     fn u64_field(&self, key: &str) -> u64 {
-        self.data.get(key).and_then(json_as_u64).unwrap_or(0)
+        self.get(key).and_then(json_as_u64).unwrap_or(0)
     }
 
     fn bool_field(&self, key: &str) -> bool {
-        match self.data.get(key) {
+        match self.get(key) {
             Some(serde_json::Value::Bool(b)) => *b,
             Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
             Some(serde_json::Value::String(s)) => s == "true" || s == "1",
@@ -124,14 +130,14 @@ impl RecordExt for Record {
     }
 
     fn opt_str_field(&self, key: &str) -> Option<String> {
-        match self.data.get(key) {
+        match self.get(key) {
             Some(serde_json::Value::String(value)) => Some(value.clone()),
             _ => None,
         }
     }
 
     fn json_value_field(&self, key: &str) -> serde_json::Value {
-        match self.data.get(key) {
+        match self.get(key) {
             Some(serde_json::Value::String(raw)) => {
                 serde_json::from_str(raw).unwrap_or(serde_json::Value::Null)
             }
@@ -162,6 +168,48 @@ impl RecordExt for Record {
                 _ => None,
             })
             .collect()
+    }
+}
+
+impl RecordExt for Record {
+    fn str_field(&self, key: &str) -> &str {
+        self.data.str_field(key)
+    }
+
+    fn i64_field(&self, key: &str) -> i64 {
+        self.data.i64_field(key)
+    }
+
+    fn opt_i64_field(&self, key: &str) -> Option<i64> {
+        self.data.opt_i64_field(key)
+    }
+
+    fn u64_field(&self, key: &str) -> u64 {
+        self.data.u64_field(key)
+    }
+
+    fn bool_field(&self, key: &str) -> bool {
+        self.data.bool_field(key)
+    }
+
+    fn opt_str_field(&self, key: &str) -> Option<String> {
+        self.data.opt_str_field(key)
+    }
+
+    fn json_value_field(&self, key: &str) -> serde_json::Value {
+        self.data.json_value_field(key)
+    }
+
+    fn json_object_field(&self, key: &str) -> serde_json::Map<String, serde_json::Value> {
+        self.data.json_object_field(key)
+    }
+
+    fn json_array_field(&self, key: &str) -> Vec<serde_json::Value> {
+        self.data.json_array_field(key)
+    }
+
+    fn string_list_field(&self, key: &str) -> Vec<String> {
+        self.data.string_list_field(key)
     }
 }
 

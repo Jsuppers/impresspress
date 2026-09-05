@@ -15,7 +15,7 @@
 use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use async_trait::async_trait;
-use impresspress_core::{blocks::admin::VARIABLES_TABLE, cache_key};
+use impresspress_core::{cache_key, platform_state::variables};
 use wafer_block::ConfigVar;
 use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::{ConfigError, ConfigSource, EnvBlockConfig};
@@ -156,7 +156,7 @@ impl D1ConfigSource {
         let generation = impresspress_core::config_generation::config_write_generation();
         let rows = self
             .db
-            .list(VARIABLES_TABLE, &cache_key::full_table_list_opts())
+            .list(variables::TABLE, &cache_key::full_table_list_opts())
             .await
             .map_err(Box::new)?;
 

@@ -26,7 +26,7 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
-use super::{logs::audit_log, settings::VARIABLES_TABLE, ROLES_TABLE, USER_ROLES_TABLE};
+use super::{logs::audit_log, ROLES_TABLE, USER_ROLES_TABLE};
 /// SSRF URL validator for `InputType::Url` writes. The single implementation
 /// lives in [`crate::util::validate_url_value`]; re-exported here so the admin
 /// variable create/update paths and the generic settings form
@@ -45,6 +45,7 @@ pub(super) use crate::util::{is_sensitive_key, MASKED_VALUE};
 use crate::{
     blocks::auth::{bump_auth_version, USERS_TABLE},
     http::{err_bad_request, err_forbidden, err_internal, err_not_found},
+    platform_state::variables::{self, NewVariable, VariablePatch, VariableRow},
     util::RecordExt,
 };
 
@@ -367,7 +368,7 @@ pub(super) async fn create_variable(
     name: Option<&str>,
     description: Option<&str>,
     sensitive: bool,
-) -> Result<db::Record, OutputStream> {
+) -> Result<VariableRow, OutputStream> {
     if key.is_empty() {
         return Err(err_bad_request("Key is required"));
     }
@@ -380,18 +381,18 @@ pub(super) async fn create_variable(
         }
     }
 
-    let mut data = crate::util::json_map(serde_json::json!({
-        "key": key,
-        "value": value,
-        "name": name.filter(|n| !n.is_empty()).unwrap_or(key),
-        "description": description.unwrap_or_default(),
-        "sensitive": if sensitive { 1 } else { 0 },
-        "updated_by": msg.user_id(),
-    }));
-    crate::util::stamp_created(&mut data);
-
-    let record = match db::create(ctx, VARIABLES_TABLE, data).await {
-        Ok(record) => record,
+    let new = NewVariable {
+        key: key.to_string(),
+        value: value.to_string(),
+        name: name.filter(|n| !n.is_empty()).unwrap_or(key).to_string(),
+        description: description.unwrap_or_default().to_string(),
+        warning: String::new(),
+        sensitive,
+        updated_by: msg.user_id().to_string(),
+        block: variables::block_for_key(key),
+    };
+    let record = match variables::insert(ctx, new).await {
+        Ok(row) => row,
         Err(e) => return Err(err_internal("Database error", e)),
     };
 
@@ -421,13 +422,13 @@ pub(super) struct VariableUpdate<'a> {
 /// Password-typed declared vars like `BOOTSTRAP_ADMIN_PASSWORD`) and the
 /// `_URL` SSRF validation on both surfaces.
 ///
-/// Returns the upserted record.
+/// Returns the upserted row.
 pub(super) async fn update_variable(
     ctx: &dyn Context,
     msg: &Message,
     key: &str,
     update: VariableUpdate<'_>,
-) -> Result<db::Record, OutputStream> {
+) -> Result<VariableRow, OutputStream> {
     if key.is_empty() {
         return Err(err_bad_request("Missing setting key"));
     }
@@ -443,16 +444,9 @@ pub(super) async fn update_variable(
         // the empty-value path; a missing row (upsert-create branch) has no
         // stored secret to wipe, so only the suffix rule applies there.
         if value.is_empty() {
-            let stored_flag = match db::get_by_field(
-                ctx,
-                VARIABLES_TABLE,
-                "key",
-                serde_json::Value::String(key.to_string()),
-            )
-            .await
-            {
-                Ok(record) => record.i64_field("sensitive"),
-                Err(e) if e.code == ErrorCode::NotFound => 0,
+            let stored_flag = match variables::get_by_key(ctx, key).await {
+                Ok(Some(row)) => i64::from(row.sensitive),
+                Ok(None) => 0,
                 Err(e) => return Err(err_internal("Database error", e)),
             };
             if is_sensitive_key(key, stored_flag) {
@@ -469,31 +463,16 @@ pub(super) async fn update_variable(
         }
     }
 
-    let mut data = HashMap::new();
-    // `key` is `NOT NULL` and supplies the row's identity on the upsert-create
-    // branch (PUT to a not-yet-present key). On the update branch it resolves
-    // to a no-op (sets `key` to its current value), so it's safe to always
-    // include — and required for the create branch to satisfy the constraint.
-    data.insert("key".to_string(), serde_json::json!(key));
-    if let Some(value) = update.value {
-        data.insert("value".to_string(), serde_json::json!(value));
-    }
-    if let Some(description) = update.description {
-        data.insert("description".to_string(), serde_json::json!(description));
-    }
-    data.insert("updated_by".to_string(), serde_json::json!(msg.user_id()));
-    crate::util::stamp_updated(&mut data);
-
-    let record = match db::upsert_by_field(
-        ctx,
-        VARIABLES_TABLE,
-        "key",
-        serde_json::Value::String(key.to_string()),
-        data,
-    )
-    .await
-    {
-        Ok(record) => record,
+    // A PUT to a not-yet-present key takes `upsert_by_key`'s create branch,
+    // which derives the row's `block` and synthesises its id and timestamps.
+    let patch = VariablePatch {
+        value: update.value.map(str::to_string),
+        description: update.description.map(str::to_string),
+        updated_by: Some(msg.user_id().to_string()),
+        ..Default::default()
+    };
+    let record = match variables::upsert_by_key(ctx, key, patch).await {
+        Ok(row) => row,
         Err(e) => return Err(err_internal("Database error", e)),
     };
 
@@ -601,24 +580,16 @@ mod tests {
             .await,
         );
         assert_eq!(
-            record.data.get("key").and_then(|v| v.as_str()),
-            Some("NEW_SITE_TAGLINE"),
+            record.key, "NEW_SITE_TAGLINE",
             "the created row must persist its key column"
         );
 
         // The row is now findable by `key` (proves the NOT NULL row landed).
-        let found = db::get_by_field(
-            &ctx,
-            VARIABLES_TABLE,
-            "key",
-            serde_json::Value::String("NEW_SITE_TAGLINE".to_string()),
-        )
-        .await
-        .expect("the upserted variable is findable by key");
-        assert_eq!(
-            found.data.get("value").and_then(|v| v.as_str()),
-            Some("Hello")
-        );
+        let found = variables::get_by_key(&ctx, "NEW_SITE_TAGLINE")
+            .await
+            .expect("get variable")
+            .expect("the upserted variable is findable by key");
+        assert_eq!(found.value, "Hello");
 
         // A second update on the same key takes the update branch (no
         // duplicate row, key unchanged).
@@ -634,22 +605,14 @@ mod tests {
             )
             .await,
         );
-        let rows = db::list_all(
-            &ctx,
-            VARIABLES_TABLE,
-            vec![Filter {
-                field: "key".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String("NEW_SITE_TAGLINE".to_string()),
-            }],
-        )
-        .await
-        .expect("list variables by key");
+        let rows: Vec<_> = variables::list_all(&ctx)
+            .await
+            .expect("list variables")
+            .into_iter()
+            .filter(|row| row.key == "NEW_SITE_TAGLINE")
+            .collect();
         assert_eq!(rows.len(), 1, "update must not create a second row");
-        assert_eq!(
-            rows[0].data.get("value").and_then(|v| v.as_str()),
-            Some("Goodbye")
-        );
+        assert_eq!(rows[0].value, "Goodbye");
     }
 
     /// SEC drift: the SSR variable path ran no URL/SSRF validation. Both
@@ -755,17 +718,12 @@ mod tests {
         .is_err());
 
         // ...leaving the stored value untouched.
-        let row = db::get_by_field(
-            &ctx,
-            VARIABLES_TABLE,
-            "key",
-            serde_json::Value::String("BOOTSTRAP_ADMIN_PASSWORD".to_string()),
-        )
-        .await
-        .expect("seeded row still present");
+        let row = variables::get_by_key(&ctx, "BOOTSTRAP_ADMIN_PASSWORD")
+            .await
+            .expect("get variable")
+            .expect("seeded row still present");
         assert_eq!(
-            row.data.get("value").and_then(|v| v.as_str()),
-            Some("hunter2"),
+            row.value, "hunter2",
             "rejected clear must not overwrite the stored secret"
         );
 

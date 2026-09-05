@@ -1838,7 +1838,7 @@ struct CfBootHooks {
 #[wafer_block::wafer_async_trait]
 impl impresspress_core::builder::BootHooks for CfBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
-        impresspress_core::boot::seed_auto_generated(&self.db).await;
+        impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
 
         let block_settings = impresspress_core::features::load_and_seed_block_settings(&self.db)
             .await
