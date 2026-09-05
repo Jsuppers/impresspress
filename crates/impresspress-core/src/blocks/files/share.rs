@@ -36,10 +36,9 @@ pub async fn handle_direct_access(
     msg: &Message,
     limiter: &UserRateLimiter,
 ) -> OutputStream {
-    // The real on-the-wire path (no `req.resource` rewrite in the parent
-    // dispatcher anymore).
-    let path = msg.path();
-    let token = path.strip_prefix("/b/storage/direct/").unwrap_or("");
+    // `{token}` in `GET /b/storage/direct/{token}`, as the block's route
+    // table bound it.
+    let token = msg.var("token");
     if token.is_empty() {
         return err_bad_request("Missing share token");
     }

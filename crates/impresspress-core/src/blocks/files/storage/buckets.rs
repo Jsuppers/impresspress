@@ -12,7 +12,10 @@ use crate::{
     http::{err_bad_request, err_forbidden, err_internal, ok_json},
 };
 
-pub(super) async fn handle_list_buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_list_buckets(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     // [`repo::buckets::TABLE`] is the single source of truth for bucket
     // existence / ownership / visibility. Both the admin and user branches
     // read it (the admin sees every bucket, the user only their own) —
@@ -35,7 +38,7 @@ pub(super) async fn handle_list_buckets(ctx: &dyn Context, msg: &Message) -> Out
     }
 }
 
-pub(super) async fn handle_create_bucket(
+pub(in crate::blocks::files) async fn handle_create_bucket(
     ctx: &dyn Context,
     msg: &Message,
     input: InputStream,
@@ -82,7 +85,10 @@ pub(super) async fn handle_create_bucket(
     ok_json(&serde_json::json!({"name": body.name, "created": true}))
 }
 
-pub(super) async fn handle_delete_bucket(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub(in crate::blocks::files) async fn handle_delete_bucket(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
     let bucket = extract_bucket_name(msg);
     let bucket = bucket.as_str();
     if bucket.is_empty() {

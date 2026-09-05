@@ -746,7 +746,7 @@ mod discovery_tests {
             "list-objects response schema must match ObjectList {{objects, total_count}}: {list}"
         );
 
-        let get_obj = &paths["/b/storage/api/buckets/{name}/objects/{key}"]["get"];
+        let get_obj = &paths["/b/storage/api/buckets/{name}/objects/{key...}"]["get"];
         assert!(
             !get_obj.is_null(),
             "get-object must appear in /openapi.json: {body}"
