@@ -1948,6 +1948,61 @@ mod tests {
         }
     }
 
+    /// Every `/b/auth/...` path the router still admits through a
+    /// `router_declared_public` carve-out resolves to `Public` from the
+    /// auth-ui block's own declaration, and the two api-key rows (never
+    /// carved out; gated so far only by `declared_access`'s fail-closed
+    /// default) resolve to `Authenticated`. This is what lets phase 1's final
+    /// PR delete the carve-outs without changing who reaches what. The
+    /// carve-out prefixes and the paths asserted public are compared as
+    /// sets, so an auth-ui carve-out this test does not cover cannot exist.
+    #[test]
+    fn auth_ui_declares_every_path_the_router_carves_out() {
+        use wafer_run::Block as _;
+
+        let info = crate::blocks::auth_ui::AuthUiBlock::new().info();
+
+        let public = [
+            ("retrieve", "/b/auth/reset-password"),
+            ("retrieve", "/b/auth/oauth/callback"),
+            ("retrieve", "/b/auth/api/verify"),
+            ("create", "/b/auth/api/verify"),
+            ("create", "/b/auth/api/resend-verification"),
+            ("create", "/b/auth/api/forgot-password"),
+            ("create", "/b/auth/api/reset-password"),
+            ("retrieve", "/b/auth/api/oauth/providers"),
+            ("create", "/b/auth/api/oauth/sync-user"),
+        ];
+        for (action, path) in public {
+            assert_eq!(
+                endpoint_match::endpoint_auth(&info.endpoints, action, path),
+                Some(AuthLevel::Public),
+                "{action} {path} must be declared public by the auth-ui block itself"
+            );
+        }
+        for action in ["update", "delete"] {
+            assert_eq!(
+                endpoint_match::endpoint_auth(&info.endpoints, action, "/b/auth/api/api-keys/k-1"),
+                Some(AuthLevel::Authenticated),
+                "{action} /b/auth/api/api-keys/{{id}} must be declared authenticated"
+            );
+        }
+
+        let mut carved_out: Vec<&str> = ROUTES
+            .iter()
+            .filter(|r| r.router_final && r.block == "impresspress/auth-ui")
+            .map(|r| r.prefix)
+            .collect();
+        carved_out.sort_unstable();
+        let mut covered: Vec<&str> = public.iter().map(|(_, path)| *path).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            carved_out, covered,
+            "the auth-ui carve-outs in ROUTES and the paths this test asserts public must be the same set"
+        );
+    }
+
     /// Shared dummy block for the tests above: always dispatches successfully
     /// with a recognizable body, so a test can prove "reached dispatch"
     /// rather than merely "wasn't denied".
