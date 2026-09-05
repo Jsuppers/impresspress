@@ -2,14 +2,15 @@ use maud::html;
 use wafer_block::db::{ListOptions, SortField};
 use wafer_core::clients::{config, database as db};
 use wafer_run::{
-    context::Context, BlockEndpoint, BlockInfo, CollectionSchema, InputStream, InstanceMode,
-    Message, OutputStream,
+    context::Context, BlockInfo, CollectionSchema, HttpMethod, InputStream, InstanceMode, Message,
+    OutputStream,
 };
 
 use crate::{
+    endpoint_match::{self, EndpointRoute},
     http::{err_forbidden, err_internal, err_not_found, ok_json},
     ui::{self, components, icons, settings_form},
-    util::{parse_form_body, stamp_updated, RecordExt},
+    util::{parse_form_body, stamp_updated},
 };
 
 pub(crate) mod migrations;
@@ -20,13 +21,102 @@ pub(crate) mod pages;
 
 const TABLE: &str = "impresspress__userportal__buttons";
 
+/// Handler for one row of [`ROUTES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Dashboard,
+    Profile,
+    UpdateProfile,
+    Sessions,
+    RevokeSession,
+    Security,
+    Config,
+    AdminSettingsPage,
+    AdminSaveSettings,
+    AdminButtonsPage,
+    AdminCreateButton,
+    AdminEditButtonForm,
+    AdminUpdateButton,
+    AdminDeleteButton,
+}
+
+/// The block's HTTP surface: what `handle()` dispatches on and what
+/// `info().endpoints` is generated from. Wire paths; `{hash}` / `{id}` are
+/// bound into `req.param.*` for the handlers' `msg.var` readers. The
+/// `/admin/*` rows are declared `Admin` so the central router enforces the
+/// tier; the block hand-checks nothing.
+const ROUTES: &[EndpointRoute<Route>] = &[
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/userportal/", Route::Dashboard)
+        .summary("Portal home (apps + orgs)"),
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/userportal/profile", Route::Profile)
+        .summary("Profile page"),
+    EndpointRoute::authenticated(
+        HttpMethod::Post,
+        "/b/userportal/update-profile",
+        Route::UpdateProfile,
+    )
+    .summary("Update profile"),
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/userportal/sessions", Route::Sessions)
+        .summary("Active sessions"),
+    EndpointRoute::authenticated(
+        HttpMethod::Delete,
+        "/b/userportal/sessions/{hash}",
+        Route::RevokeSession,
+    )
+    .summary("Revoke session"),
+    EndpointRoute::authenticated(HttpMethod::Get, "/b/userportal/security", Route::Security)
+        .summary("Account security"),
+    EndpointRoute::public(HttpMethod::Get, "/b/userportal/config", Route::Config)
+        .summary("Portal configuration"),
+    EndpointRoute::admin(
+        HttpMethod::Get,
+        "/b/userportal/admin/settings",
+        Route::AdminSettingsPage,
+    )
+    .summary("Branding settings"),
+    EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/userportal/admin/settings",
+        Route::AdminSaveSettings,
+    )
+    .summary("Save branding settings"),
+    EndpointRoute::admin(
+        HttpMethod::Get,
+        "/b/userportal/admin/buttons",
+        Route::AdminButtonsPage,
+    )
+    .summary("Manage portal buttons"),
+    EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/userportal/admin/buttons",
+        Route::AdminCreateButton,
+    )
+    .summary("Create button"),
+    EndpointRoute::admin(
+        HttpMethod::Get,
+        "/b/userportal/admin/buttons/{id}/edit",
+        Route::AdminEditButtonForm,
+    )
+    .summary("Edit button form"),
+    EndpointRoute::admin(
+        HttpMethod::Patch,
+        "/b/userportal/admin/buttons/{id}",
+        Route::AdminUpdateButton,
+    )
+    .summary("Update button"),
+    EndpointRoute::admin(
+        HttpMethod::Delete,
+        "/b/userportal/admin/buttons/{id}",
+        Route::AdminDeleteButton,
+    )
+    .summary("Delete button"),
+];
+
 crate::impresspress_feature_block! {
     /// User-facing portal dashboard + admin button config (`impresspress/userportal`).
     pub struct UserPortalBlock;
     name: "impresspress/userportal",
     info: |_this| {
-        use wafer_run::AuthLevel;
-
         BlockInfo::new(
             "impresspress/userportal",
             "0.0.1",
@@ -43,63 +133,41 @@ crate::impresspress_feature_block! {
         .collections(vec![CollectionSchema::new(TABLE)])
         .category(wafer_run::BlockCategory::Feature)
         .description("User-facing profile page with editable display name, admin-configurable navigation buttons, and portal configuration endpoint.")
-        .endpoints(vec![
-            BlockEndpoint::get("/b/userportal/").summary("Portal home (apps + orgs)").auth(AuthLevel::Authenticated),
-            BlockEndpoint::get("/b/userportal/profile").summary("Profile page").auth(AuthLevel::Authenticated),
-            BlockEndpoint::post("/b/userportal/update-profile").summary("Update profile").auth(AuthLevel::Authenticated),
-            BlockEndpoint::get("/b/userportal/sessions").summary("Active sessions").auth(AuthLevel::Authenticated),
-            BlockEndpoint::delete("/b/userportal/sessions/:hash").summary("Revoke session").auth(AuthLevel::Authenticated),
-            BlockEndpoint::get("/b/userportal/security").summary("Account security").auth(AuthLevel::Authenticated),
-            BlockEndpoint::get("/b/userportal/config").summary("Portal configuration"),
-            // Admin surface — declared in full so the central router enforces
-            // the `Admin` tier (the block no longer hand-checks `is_admin` for
-            // the `/admin/` subtree).
-            BlockEndpoint::get("/b/userportal/admin/settings").summary("Branding settings").auth(AuthLevel::Admin),
-            BlockEndpoint::post("/b/userportal/admin/settings").summary("Save branding settings").auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/userportal/admin/buttons").summary("Manage portal buttons").auth(AuthLevel::Admin),
-            BlockEndpoint::post("/b/userportal/admin/buttons").summary("Create button").auth(AuthLevel::Admin),
-            BlockEndpoint::get("/b/userportal/admin/buttons/{id}/edit").summary("Edit button form").auth(AuthLevel::Admin),
-            BlockEndpoint::patch("/b/userportal/admin/buttons/{id}").summary("Update button").auth(AuthLevel::Admin),
-            BlockEndpoint::delete("/b/userportal/admin/buttons/{id}").summary("Delete button").auth(AuthLevel::Admin),
-        ])
+        .endpoints(endpoint_match::declare(ROUTES))
         .config_keys(vec![])
         .admin_url("/b/userportal/admin/settings")
         .can_disable(true)
         .default_enabled(false)
     },
     handle: |this, ctx, msg, input| {
-        let path = msg.path().to_string();
-        let action = msg.action().to_string();
-
-        if !path.starts_with("/b/userportal") {
-            return this.handle_config(ctx).await;
-        }
-
-        let sub = path
-            .strip_prefix("/b/userportal")
-            .unwrap_or("/")
-            .to_string();
-
-        // Admin routes. The `Admin` tier is enforced centrally from the
-        // declared `/b/userportal/admin/*` endpoints, so no inline `is_admin`
-        // check is needed; the normalized `sub` path is still passed
-        // explicitly to the admin sub-dispatcher (no `req.resource` rewrite).
-        if sub.starts_with("/admin/") {
-            return this.handle_admin(ctx, msg, input, &action, &sub).await;
-        }
-
-        match (action.as_str(), sub.as_str()) {
-            ("retrieve", "" | "/") => pages::dashboard::dashboard_page(ctx, &msg).await,
-            ("retrieve", "/profile") => pages::profile::profile_page(ctx, &msg).await,
-            ("create", "/update-profile") => handle_update_profile(ctx, &msg, input).await,
-            ("retrieve", "/sessions") => pages::sessions::sessions_page(ctx, &msg).await,
-            ("retrieve", "/security") => pages::security::security_page(ctx, &msg).await,
-            ("delete", s) if s.starts_with("/sessions/") => {
-                pages::sessions::handle_revoke(ctx, &msg, s).await
+        // Auth is enforced centrally by `route_to_block` from each row's
+        // declared `AuthLevel`; the block holds no `user_id` / `is_admin`
+        // preamble. `{hash}` / `{id}` are bound into `req.param.*` for the
+        // handlers' `msg.var` readers.
+        let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
+            return err_not_found("not found");
+        };
+        match route {
+            Route::Dashboard => pages::dashboard::dashboard_page(ctx, &msg).await,
+            Route::Profile => pages::profile::profile_page(ctx, &msg).await,
+            Route::UpdateProfile => handle_update_profile(ctx, &msg, input).await,
+            Route::Sessions => pages::sessions::sessions_page(ctx, &msg).await,
+            Route::RevokeSession => pages::sessions::handle_revoke(ctx, &msg).await,
+            Route::Security => pages::security::security_page(ctx, &msg).await,
+            Route::Config => this.handle_config(ctx).await,
+            Route::AdminSettingsPage => admin_settings_page(ctx, &msg).await,
+            Route::AdminSaveSettings => handle_save_settings(ctx, input).await,
+            Route::AdminButtonsPage => pages::admin_buttons::admin_buttons_page(ctx, &msg).await,
+            Route::AdminCreateButton => pages::admin_buttons::handle_create_button(ctx, input).await,
+            Route::AdminEditButtonForm => {
+                pages::admin_buttons::handle_edit_button_form(ctx, msg.var("id")).await
             }
-            ("retrieve", "/config") => this.handle_config(ctx).await,
-            ("retrieve", "/internal/list-buttons") => this.handle_list_buttons(ctx).await,
-            _ => err_not_found("not found"),
+            Route::AdminUpdateButton => {
+                pages::admin_buttons::handle_update_button(ctx, input, msg.var("id")).await
+            }
+            Route::AdminDeleteButton => {
+                pages::admin_buttons::handle_delete_button(ctx, msg.var("id")).await
+            }
         }
     },
     lifecycle: |_this, ctx, event| {
@@ -115,25 +183,6 @@ crate::impresspress_feature_block! {
 }
 
 impl UserPortalBlock {
-    /// Internal cross-block action — returns the configured portal buttons as
-    /// a JSON array. Not user-routable. Consumed by the auth block's dashboard
-    /// page via `ctx.call_block` to avoid raw cross-block SQL.
-    async fn handle_list_buttons(&self, ctx: &dyn Context) -> OutputStream {
-        let records = load_buttons(ctx).await;
-        let arr: Vec<serde_json::Value> = records
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "label": r.str_field("label"),
-                    "icon": r.str_field("icon"),
-                    "path": r.str_field("path"),
-                    "sort_order": r.data.get("sort_order").cloned().unwrap_or(serde_json::Value::Null),
-                })
-            })
-            .collect();
-        ok_json(&serde_json::Value::Array(arr))
-    }
-
     async fn handle_config(&self, ctx: &dyn Context) -> OutputStream {
         let settings = ctx
             .config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
@@ -164,51 +213,6 @@ impl UserPortalBlock {
             }
         });
         ok_json(&config_val)
-    }
-
-    async fn handle_admin(
-        &self,
-        ctx: &dyn Context,
-        msg: Message,
-        input: InputStream,
-        action: &str,
-        sub: &str,
-    ) -> OutputStream {
-        match (action, sub) {
-            ("retrieve", "/admin/settings") => admin_settings_page(ctx, &msg).await,
-            ("create", "/admin/settings") => handle_save_settings(ctx, input).await,
-            ("retrieve", "/admin/buttons") => {
-                pages::admin_buttons::admin_buttons_page(ctx, &msg).await
-            }
-            ("create", "/admin/buttons") => {
-                pages::admin_buttons::handle_create_button(ctx, input).await
-            }
-            ("retrieve", s) if s.starts_with("/admin/buttons/") && s.ends_with("/edit") => {
-                let id = s
-                    .strip_prefix("/admin/buttons/")
-                    .and_then(|s| s.strip_suffix("/edit"))
-                    .unwrap_or("");
-                if id.is_empty() {
-                    return err_not_found("not found");
-                }
-                pages::admin_buttons::handle_edit_button_form(ctx, id).await
-            }
-            ("update", s) if s.starts_with("/admin/buttons/") => {
-                let id = s.strip_prefix("/admin/buttons/").unwrap_or("");
-                if id.is_empty() {
-                    return err_not_found("not found");
-                }
-                pages::admin_buttons::handle_update_button(ctx, input, id).await
-            }
-            ("delete", s) if s.starts_with("/admin/buttons/") => {
-                let id = s.strip_prefix("/admin/buttons/").unwrap_or("");
-                if id.is_empty() {
-                    return err_not_found("not found");
-                }
-                pages::admin_buttons::handle_delete_button(ctx, id).await
-            }
-            _ => err_not_found("not found"),
-        }
     }
 }
 
@@ -286,7 +290,10 @@ async fn handle_update_profile(
 #[cfg(test)]
 mod update_profile_csrf_tests {
     use super::*;
-    use crate::test_support::{auth_msg, output_status, TestContext};
+    use crate::{
+        test_support::{auth_msg, output_status, TestContext},
+        util::RecordExt,
+    };
 
     async fn seed_user(ctx: &TestContext, user_id: &str) {
         let mut data = std::collections::HashMap::new();
@@ -421,75 +428,42 @@ async fn handle_save_settings(ctx: &dyn Context, input: InputStream) -> OutputSt
 }
 
 #[cfg(test)]
-mod cross_block_tests {
-    use std::collections::HashMap;
+mod test_support {
+    use wafer_run::Message;
 
-    use serde_json::json;
-    use wafer_core::clients::database as db;
-    use wafer_run::Block;
+    /// Run `msg` through the block's own route table so `{hash}` / `{id}` is
+    /// bound the way it is on the wire, then hand the message to a handler
+    /// directly. Panics when no row matches: a test that sends an unroutable
+    /// path would otherwise exercise the handler's "nothing bound" branch by
+    /// accident.
+    pub(super) fn routed(mut msg: Message) -> Message {
+        let route = crate::endpoint_match::dispatch(&mut msg, super::ROUTES);
+        assert!(
+            route.is_some(),
+            "no userportal route matches {} {}",
+            msg.action(),
+            msg.path()
+        );
+        msg
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use wafer_run::Block as _;
 
     use super::*;
-    use crate::test_support::{anon_msg, output_json, TestContext};
 
-    fn button_data(
-        label: &str,
-        icon: &str,
-        path: &str,
-        sort_order: i64,
-    ) -> HashMap<String, serde_json::Value> {
-        let mut m = HashMap::new();
-        m.insert("label".to_string(), json!(label));
-        m.insert("icon".to_string(), json!(icon));
-        m.insert("path".to_string(), json!(path));
-        m.insert("sort_order".to_string(), json!(sort_order));
-        m
-    }
-
-    #[tokio::test]
-    async fn list_buttons_action_returns_json_array_in_sort_order() {
-        let ctx = TestContext::with_userportal().await;
-
-        // Seed two buttons through the userportal-owned `buttons` table.
-        db::create(
-            &ctx,
-            TABLE,
-            button_data("Impresspress", "shield", "/b/admin/", 0),
-        )
-        .await
-        .expect("seed first button");
-        db::create(
-            &ctx,
-            TABLE,
-            button_data("Inspector", "search", "/b/inspector/ui", 1),
-        )
-        .await
-        .expect("seed second button");
-
-        let block = UserPortalBlock::new();
-        let msg = anon_msg("retrieve", "/b/userportal/internal/list-buttons");
-        let resp = block
-            .handle(&ctx, msg, wafer_run::InputStream::empty())
-            .await;
-        let parsed = output_json(resp).await;
-
-        let arr = parsed.as_array().expect("response is JSON array");
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["label"], "Impresspress");
-        assert_eq!(arr[0]["icon"], "shield");
-        assert_eq!(arr[0]["path"], "/b/admin/");
-        assert_eq!(arr[1]["label"], "Inspector");
-        assert_eq!(arr[1]["icon"], "search");
-    }
-
-    #[tokio::test]
-    async fn list_buttons_action_returns_empty_array_when_none_configured() {
-        let ctx = TestContext::new().await;
-        let block = UserPortalBlock::new();
-        let msg = anon_msg("retrieve", "/b/userportal/internal/list-buttons");
-        let resp = block
-            .handle(&ctx, msg, wafer_run::InputStream::empty())
-            .await;
-        let parsed = output_json(resp).await;
-        assert_eq!(parsed.as_array().unwrap().len(), 0);
+    /// `info().endpoints` is generated from `ROUTES`; nothing else declares
+    /// an endpoint for this block.
+    #[test]
+    fn info_endpoints_come_from_the_table() {
+        let declared = UserPortalBlock::new().info().endpoints;
+        assert_eq!(declared.len(), ROUTES.len());
+        for (ep, row) in declared.iter().zip(ROUTES) {
+            assert_eq!(ep.method, row.method, "{}", row.template);
+            assert_eq!(ep.path, row.template);
+            assert_eq!(ep.auth, row.auth, "{}", row.template);
+        }
     }
 }

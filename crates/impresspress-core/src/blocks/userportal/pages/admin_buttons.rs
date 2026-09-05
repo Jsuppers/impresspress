@@ -377,9 +377,9 @@ mod tests {
             .await
             .unwrap();
 
-        // The handler takes `id` directly (the real route,
-        // `GET /b/userportal/admin/buttons/{id}/edit`, is parsed and
-        // dispatched by `userportal/mod.rs` before reaching this function).
+        // The handler takes `id` directly: `userportal/mod.rs` dispatches
+        // `GET /b/userportal/admin/buttons/{id}/edit` through its route table
+        // and passes the bound `{id}` in.
         let resp = handle_edit_button_form(&ctx, &record.id).await;
         let html = output_html(resp).await;
 
