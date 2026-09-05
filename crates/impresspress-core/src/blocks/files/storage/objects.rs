@@ -181,7 +181,12 @@ pub(super) async fn handle_upload_object(
     // since that's the smaller of the two. For multipart bodies the cap
     // applies to the envelope — a slight over-estimate (the extracted file
     // is always smaller than its envelope), never an under-estimate.
-    let quota = crate::blocks::files::quota::get_user_quota(ctx, msg.user_id()).await;
+    let quota = match crate::blocks::files::quota::get_user_quota(ctx, msg.user_id()).await {
+        Ok(quota) => quota,
+        // Fail closed: reading the body against the default cap during an
+        // outage would admit a file an admin-lowered override forbids.
+        Err(e) => return err_internal("Quota lookup failed", e),
+    };
     let Ok(body_bytes) = collect_with_cap(input, quota.max_file_size_bytes).await else {
         return err_bad_request(&format!(
             "File exceeds maximum size of {} bytes",

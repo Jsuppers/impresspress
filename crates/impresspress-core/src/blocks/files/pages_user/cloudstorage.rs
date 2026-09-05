@@ -147,11 +147,19 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     let shares = list_shares_for_user(ctx, &user_id).await;
     // Same quota source as upload enforcement (`quota::check_quota`), so
     // the card can never disagree with what the API enforces.
-    let quota = QuotaInfo {
-        used_bytes: crate::blocks::files::quota::get_used_bytes(ctx, &user_id).await,
-        limit_bytes: crate::blocks::files::quota::get_user_quota(ctx, &user_id)
-            .await
-            .max_storage_bytes,
+    let used_bytes = crate::blocks::files::quota::get_used_bytes(ctx, &user_id).await;
+    let limit = crate::blocks::files::quota::get_user_quota(ctx, &user_id).await;
+    let quota = match (used_bytes, limit) {
+        (Ok(used_bytes), Ok(limit)) => QuotaInfo {
+            used_bytes,
+            limit_bytes: limit.max_storage_bytes,
+        },
+        (Err(e), _) | (_, Err(e)) => {
+            // A quota card showing "0 B used" during an outage misleads;
+            // the page fails like the API does.
+            tracing::error!(error = %e, user_id = %user_id, "cloud storage page: quota lookup failed");
+            return crate::ui::server_error_response(msg);
+        }
     };
 
     let shares_with_js = html! {
