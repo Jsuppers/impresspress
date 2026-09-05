@@ -2542,7 +2542,6 @@ dependencies = [
  "impresspress-core",
  "impresspress-native",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
