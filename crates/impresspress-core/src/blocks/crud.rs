@@ -23,9 +23,60 @@ use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use crate::{
-    http::{err_bad_request, err_internal, err_not_found, err_unauthorized},
+    http::{err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized},
     util::{field_as_string, stamp_created, stamp_updated},
 };
+
+/// The response a failed database call turns into — the one place that
+/// decides it.
+///
+/// Every arm exists because collapsing it into the 500 loses something the
+/// caller needs:
+///
+/// - [`ErrorCode::NotFound`] is the row the caller asked for, so it is a 404
+///   labelled `not_found` (the full message, not a noun: a route knows what
+///   it was looking for and this helper does not).
+/// - [`ErrorCode::PermissionDenied`] is a WRAP refusal — either a row guard
+///   the caller is not the owner of, or a [`wafer_run::ResourceGrant`] the
+///   block never declared. It is a **403**. Before this helper existed, all
+///   62 hand-written mappings in the tree fell through to `err_internal`, so
+///   a block deployed without a grant answered `500 Internal server error
+///   (ref: …)` and an operator had nothing to distinguish it from a corrupt
+///   row. The refusal's own message names the missing grant and the target
+///   table, which is deployment topology, so it is logged here and the
+///   client is told only that access was denied.
+/// - [`ErrorCode::ResourceExhausted`] is a quota, which
+///   `wafer_block::http_codec` already renders as 429. Its message is a
+///   classified, client-actionable refusal from the service — the same class
+///   this repo already echoes for `InvalidArgument` — so it is passed
+///   through rather than sanitized.
+/// - Everything else is an internal failure: `context` is the fixed log
+///   label, the cause is logged, and the client gets the sanitized
+///   `"Internal server error (ref: <id>)"`.
+///
+/// Domain classifications a *repo* raises (`InvalidArgument`,
+/// `FailedPrecondition`, `Aborted`) are deliberately NOT here: they mean
+/// different things per block, and the three block-private helpers that map
+/// them (`products/handlers/{sellers,offers,product}.rs`) keep their own arms
+/// and delegate only this tail.
+pub fn db_error(error: wafer_run::WaferError, not_found: &str, context: &str) -> OutputStream {
+    match error.code {
+        ErrorCode::NotFound => err_not_found(not_found),
+        ErrorCode::PermissionDenied => {
+            tracing::warn!(
+                context = %context,
+                error = %error,
+                "database access denied — a WRAP grant or a row guard refused this call",
+            );
+            err_forbidden("Access denied")
+        }
+        ErrorCode::ResourceExhausted => OutputStream::error(wafer_run::WaferError::new(
+            ErrorCode::ResourceExhausted,
+            error.message,
+        )),
+        _ => err_internal(context, error),
+    }
+}
 
 /// Response body of every CRUD delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -105,7 +156,7 @@ pub async fn list_page(
     });
     db::paginated_list(ctx, collection, page, page_size, filters, sort)
         .await
-        .map_err(|e| err_internal("Database error", e))
+        .map_err(|e| db_error(e, "Collection not found", "Database error"))
 }
 
 /// Fetch `id` from `collection`, mapping a missing row to a 404 labelled
@@ -116,13 +167,9 @@ pub async fn get_record(
     id: &str,
     not_found_label: &str,
 ) -> Result<Record, OutputStream> {
-    db::get(ctx, collection, id).await.map_err(|e| {
-        if e.code == ErrorCode::NotFound {
-            err_not_found(&format!("{not_found_label} not found"))
-        } else {
-            err_internal("Database error", e)
-        }
-    })
+    db::get(ctx, collection, id)
+        .await
+        .map_err(|e| db_error(e, &format!("{not_found_label} not found"), "Database error"))
 }
 
 /// Insert `data` into `collection`, stamping `created_at` / `updated_at`
@@ -142,10 +189,10 @@ pub async fn create_record(
     stamp_created(&mut data);
     let created = db::create(ctx, collection, data)
         .await
-        .map_err(|e| err_internal("Database error", e))?;
+        .map_err(|e| db_error(e, "Collection not found", "Database error"))?;
     db::get(ctx, collection, &created.id)
         .await
-        .map_err(|e| err_internal("Database error", e))
+        .map_err(|e| db_error(e, "Record not found", "Database error"))
 }
 
 /// Apply `data` to `id` in `collection`, stamping `updated_at`; a missing
@@ -158,13 +205,9 @@ pub async fn update_record(
     not_found_label: &str,
 ) -> Result<Record, OutputStream> {
     stamp_updated(&mut data);
-    db::update(ctx, collection, id, data).await.map_err(|e| {
-        if e.code == ErrorCode::NotFound {
-            err_not_found(&format!("{not_found_label} not found"))
-        } else {
-            err_internal("Database error", e)
-        }
-    })
+    db::update(ctx, collection, id, data)
+        .await
+        .map_err(|e| db_error(e, &format!("{not_found_label} not found"), "Database error"))
 }
 
 /// Delete `id` from `collection`; a missing row is a 404 labelled
@@ -178,13 +221,7 @@ pub async fn delete_record(
     db::delete(ctx, collection, id)
         .await
         .map(|()| Deleted::done())
-        .map_err(|e| {
-            if e.code == ErrorCode::NotFound {
-                err_not_found(&format!("{not_found_label} not found"))
-            } else {
-                err_internal("Database error", e)
-            }
-        })
+        .map_err(|e| db_error(e, &format!("{not_found_label} not found"), "Database error"))
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +247,8 @@ pub struct OwnedResource<'a> {
 /// Returns the record on success. On failure returns a ready-to-send error
 /// response: 401 for unauthenticated callers, 404 for both "row missing" and
 /// "row owned by someone else" (existence must not leak to non-owners), and
-/// 500 for database errors.
+/// whatever [`db_error`] makes of the database failure (403 for a WRAP
+/// refusal, 500 for the rest).
 pub async fn verify_owner(
     ctx: &dyn Context,
     collection: &str,
@@ -229,10 +267,11 @@ pub async fn verify_owner(
             }
             Ok(record)
         }
-        Err(e) if e.code == ErrorCode::NotFound => {
-            Err(err_not_found(&format!("{not_found_label} not found")))
-        }
-        Err(e) => Err(err_internal("Database error", e)),
+        Err(e) => Err(db_error(
+            e,
+            &format!("{not_found_label} not found"),
+            "Database error",
+        )),
     }
 }
 
@@ -293,4 +332,187 @@ pub async fn delete_owned(
     )
     .await?;
     delete_record(ctx, res.collection, &id, res.label).await
+}
+
+#[cfg(test)]
+mod db_error_tests {
+    use wafer_core::clients::database as db;
+    use wafer_run::WaferError;
+
+    use super::*;
+    use crate::test_support::{output_http_status, TestContext};
+
+    fn wafer_err(code: ErrorCode, message: &str) -> WaferError {
+        WaferError::new(code, message)
+    }
+
+    #[tokio::test]
+    async fn db_error_maps_not_found_to_404() {
+        let out = db_error(
+            wafer_err(ErrorCode::NotFound, "row 7 is not there"),
+            "Product not found",
+            "Database error",
+        );
+        assert_eq!(output_http_status(out).await, 404);
+    }
+
+    /// The behaviour fix. A WRAP row-guard denial is a `PermissionDenied`
+    /// from the database client; every hand-written mapping in the tree
+    /// falls through to `err_internal`, so a missing grant reaches the
+    /// client as `500 Internal server error (ref: …)`.
+    #[tokio::test]
+    async fn db_error_maps_permission_denied_to_403() {
+        let out = db_error(
+            wafer_err(
+                ErrorCode::PermissionDenied,
+                "WRAP: block 'impresspress/products' has no grant for 'wafer_run__auth__users'",
+            ),
+            "Product not found",
+            "Database error",
+        );
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    /// …and the denial's own message names the missing grant and the table,
+    /// which is deployment topology. It is logged, not published.
+    #[tokio::test]
+    async fn the_403_does_not_republish_the_wrap_error_text() {
+        let out = db_error(
+            wafer_err(
+                ErrorCode::PermissionDenied,
+                "WRAP: no grant for secret_table",
+            ),
+            "Product not found",
+            "Database error",
+        );
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                assert!(
+                    !e.message.contains("secret_table") && !e.message.contains("WRAP"),
+                    "403 body must not carry the denial detail, got {:?}",
+                    e.message
+                );
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn db_error_keeps_resource_exhausted_at_429() {
+        let out = db_error(
+            wafer_err(ErrorCode::ResourceExhausted, "storage quota exceeded"),
+            "Object not found",
+            "Database error",
+        );
+        assert_eq!(output_http_status(out).await, 429);
+    }
+
+    #[tokio::test]
+    async fn db_error_sanitizes_everything_else_into_a_500() {
+        let out = db_error(
+            wafer_err(ErrorCode::Internal, "connection reset by peer"),
+            "Product not found",
+            "Database error",
+        );
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                assert_eq!(wafer_block::http_codec::resolve_error_status(&e), 500);
+                assert!(
+                    e.message.starts_with("Internal server error (ref: "),
+                    "500 body must be the sanitized form, got {:?}",
+                    e.message
+                );
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // End to end: the same denial arriving through the CRUD primitives.
+    // ---------------------------------------------------------------------
+
+    const FOREIGN_TABLE: &str = "wafer_run__auth__users";
+
+    /// A context acting as a block with NO grants, so every typed database
+    /// call it makes against a table it does not own is refused by the same
+    /// `wrap::check_access` the runtime applies.
+    async fn denied_ctx() -> TestContext {
+        TestContext::with_auth()
+            .await
+            .with_wrap("test/ungranted", Vec::new(), "impresspress/admin")
+    }
+
+    #[tokio::test]
+    async fn a_denied_read_through_get_record_is_403_not_500() {
+        let ctx = denied_ctx().await;
+        let out = get_record(&ctx, FOREIGN_TABLE, "any-id", "User")
+            .await
+            .expect_err("WRAP denies the read");
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_list_through_list_page_is_403_not_500() {
+        let ctx = denied_ctx().await;
+        let out = list_page(&ctx, FOREIGN_TABLE, 1, 10, Vec::new(), None)
+            .await
+            .expect_err("WRAP denies the list");
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_write_through_create_record_is_403_not_500() {
+        let ctx = denied_ctx().await;
+        let out = create_record(&ctx, FOREIGN_TABLE, HashMap::new())
+            .await
+            .expect_err("WRAP denies the write");
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_write_through_update_record_is_403_not_500() {
+        let ctx = denied_ctx().await;
+        let out = update_record(&ctx, FOREIGN_TABLE, "any-id", HashMap::new(), "User")
+            .await
+            .expect_err("WRAP denies the write");
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_delete_through_delete_record_is_403_not_500() {
+        let ctx = denied_ctx().await;
+        let out = delete_record(&ctx, FOREIGN_TABLE, "any-id", "User")
+            .await
+            .expect_err("WRAP denies the delete");
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_read_through_verify_owner_is_403_not_500() {
+        let ctx = denied_ctx().await;
+        let out = verify_owner(
+            &ctx,
+            FOREIGN_TABLE,
+            "any-id",
+            "created_by",
+            "user-1",
+            "User",
+        )
+        .await
+        .expect_err("WRAP denies the read");
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    /// The grant path still answers as it did: a caller that may read the
+    /// table gets the 404 a missing row deserves, so the 403 above is the
+    /// denial and not a blanket refusal.
+    #[tokio::test]
+    async fn a_granted_read_of_a_missing_row_is_still_404() {
+        let ctx = TestContext::with_auth().await;
+        let _ = db::create(&ctx, FOREIGN_TABLE, HashMap::new()).await;
+        let out = get_record(&ctx, FOREIGN_TABLE, "no-such-id", "User")
+            .await
+            .expect_err("the row does not exist");
+        assert_eq!(output_http_status(out).await, 404);
+    }
 }
