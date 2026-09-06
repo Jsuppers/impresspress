@@ -742,9 +742,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ),
     (
         "auth_maintenance",
-        // `("database.get", maintenance::TABLE)` — the throttle's
-        // "an unreadable stamp skips rather than sweeps" test
-        &["blocks/auth/maintenance.rs"],
+        &[
+            // The export decision: the sweep's throttle stamp is scoped to
+            // the instance that wrote it, so `TABLE_EXCLUDED` names it. The
+            // list is closed, so every table has to be named somewhere in it.
+            "blocks/dev/data_snapshot.rs",
+            // `("database.get", maintenance::TABLE)` — the throttle's
+            // "an unreadable stamp skips rather than sweeps" test
+            "blocks/auth/maintenance.rs",
+        ],
     ),
     // The files block's two categories, both of which the admin doors above
     // are already exempted under:

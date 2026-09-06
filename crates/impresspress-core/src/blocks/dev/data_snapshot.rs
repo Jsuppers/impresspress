@@ -57,8 +57,8 @@ use crate::{
     blocks::{
         admin::{AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE},
         auth::repo::{
-            api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, oauth_pkce, orgs, pats,
-            provider_links, rate_limits, sessions, tokens, users,
+            api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, maintenance, oauth_pkce,
+            orgs, pats, provider_links, rate_limits, sessions, tokens, users,
         },
         products::{
             list_live_products, upsert_product_from_snapshot, CHECKOUT_PRESETS_TABLE,
@@ -226,6 +226,10 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     provider_links::TABLE,
     rate_limits::TABLE,
     orgs::TABLE,
+    // The sweeper's throttle singleton: one row holding when the expired-row
+    // sweep last ran on THIS instance. Exporting it would carry a foreign
+    // clock into the destination and suppress its first sweep.
+    maintenance::TABLE,
 ];
 
 /// Whether one row of `impresspress__admin__variables` may leave in an
