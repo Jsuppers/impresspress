@@ -110,7 +110,6 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 #[cfg(test)]
 mod tests {
-    use wafer_core::clients::database as db;
 
     use super::*;
     use crate::{
@@ -123,23 +122,7 @@ mod tests {
     }
 
     async fn seed_user_with_verified(ctx: &TestContext, user_id: &str, verified: bool) {
-        db::exec_raw(
-            ctx,
-            "INSERT INTO wafer_run__auth__users \
-             (id, email, display_name, role, email_verified, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            &[
-                serde_json::json!(user_id),
-                serde_json::json!(format!("{user_id}@example.com")),
-                serde_json::json!(user_id),
-                serde_json::json!("user"),
-                serde_json::json!(if verified { 1 } else { 0 }),
-                serde_json::json!("2026-01-01T00:00:00Z"),
-                serde_json::json!("2026-01-01T00:00:00Z"),
-            ],
-        )
-        .await
-        .unwrap();
+        ctx.seed_auth_user_verified(user_id, verified).await;
     }
 
     #[tokio::test]
