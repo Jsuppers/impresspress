@@ -60,7 +60,15 @@ export interface FileMetadataRecord {
   key: string;
   size: number;
   content_type: string;
-  status: string;
+  /**
+   * `pending` while the upload is in flight, `complete` once the blob is in
+   * storage. The two values the server's `ObjectStatus` enum defines — it is
+   * the type of the column now, so a row can hold nothing else.
+   *
+   * Search and recent listings only ever return `complete` rows; `pending`
+   * reaches a client only through a listing that does not filter on status.
+   */
+  status: 'pending' | 'complete';
   uploaded_by: string;
   uploaded_at: string;
 }
