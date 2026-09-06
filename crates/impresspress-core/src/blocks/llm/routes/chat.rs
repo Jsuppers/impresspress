@@ -136,9 +136,16 @@ async fn dispatch_chat(
     let messages = history_to_messages(&history);
 
     // 3. Resolve the provider block / model via the block's existing logic.
-    let (provider_block, resolved_model) = block
+    //    An unreadable per-thread override is an error, not a silent fall
+    //    back to the global default: the caller pinned a backend and would
+    //    otherwise be billed to another one without ever learning.
+    let (provider_block, resolved_model) = match block
         .resolve_provider(ctx, &thread_id, provider.as_deref(), model.as_deref())
-        .await;
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => return Err(err_internal("resolve_provider failed", e)),
+    };
 
     // 4. Map the legacy `impresspress/provider-llm` default into a concrete
     //    backend_id (first enabled provider). Non-legacy values pass through.

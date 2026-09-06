@@ -41,13 +41,12 @@
 //! `null`. Response types only — never apply it to an input.
 
 use serde::{Deserialize, Serialize};
-use wafer_core::clients::{
-    database::Record,
-    llm::{ModelCapabilities, ModelInfo, ModelState, ModelStatus},
-};
+use wafer_core::clients::llm::{ModelCapabilities, ModelInfo, ModelState, ModelStatus};
 
-use super::providers::config::{ProviderConfig, ProviderProtocol};
-use crate::util::RecordExt;
+use super::{
+    providers::config::{ProviderConfig, ProviderProtocol},
+    repo::settings::ThreadSettingRow,
+};
 
 // ---------------------------------------------------------------------------
 // POST /b/llm/api/chat, POST /b/llm/api/chat/stream
@@ -384,16 +383,18 @@ pub struct ThreadOverrideView {
     pub updated_at: String,
 }
 
-impl ThreadOverrideView {
-    /// Project an `impresspress__llm__settings` row.
-    pub fn from_record(record: &Record) -> Self {
+impl From<&ThreadSettingRow> for ThreadOverrideView {
+    /// Publish a stored override. The row type is the only thing that reads
+    /// the table's columns, so the view is a field-for-field projection with
+    /// nothing to decode.
+    fn from(row: &ThreadSettingRow) -> Self {
         Self {
-            id: record.id.clone(),
-            thread_id: record.str_field("thread_id").to_string(),
-            provider_block: record.str_field("provider_block").to_string(),
-            model: record.str_field("model").to_string(),
-            created_at: record.str_field("created_at").to_string(),
-            updated_at: record.str_field("updated_at").to_string(),
+            id: row.id.clone(),
+            thread_id: row.thread_id.clone(),
+            provider_block: row.provider_block.clone(),
+            model: row.model.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
         }
     }
 }
@@ -501,20 +502,18 @@ mod tests {
 
     #[test]
     fn config_update_response_is_the_override_or_the_acknowledgement() {
-        let record = Record {
+        let row = ThreadSettingRow {
             id: "row-1".into(),
-            data: crate::util::json_map(serde_json::json!({
-                "thread_id": "t1",
-                "provider_block": "openai-main",
-                "model": "gpt-4o",
-                "created_at": "2026-08-28T00:00:00Z",
-                "updated_at": "2026-08-28T00:00:00Z",
-            })),
+            thread_id: "t1".into(),
+            provider_block: "openai-main".into(),
+            model: "gpt-4o".into(),
+            created_at: "2026-08-28T00:00:00Z".into(),
+            updated_at: "2026-08-28T00:00:00Z".into(),
         };
         assert_eq!(
-            serde_json::to_value(ConfigUpdateResponse::Override(
-                ThreadOverrideView::from_record(&record)
-            ))
+            serde_json::to_value(ConfigUpdateResponse::Override(ThreadOverrideView::from(
+                &row
+            )))
             .expect("json"),
             serde_json::json!({
                 "id": "row-1",

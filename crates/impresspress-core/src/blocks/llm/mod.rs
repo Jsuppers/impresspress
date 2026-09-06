@@ -3,13 +3,14 @@ pub mod migrations;
 pub mod pages;
 pub mod provider_admin;
 pub mod providers;
+pub(crate) mod repo;
 pub mod routes;
 pub mod schema;
 pub mod ui;
 
 use std::sync::Arc;
 
-use wafer_core::clients::{config, database as db};
+use wafer_core::clients::config;
 use wafer_run::{
     context::Context, Block, BlockInfo, ConfigVar, HttpMethod, InputStream, InstanceMode,
     LifecycleEvent, LifecycleType, Message, OutputStream, WaferError,
@@ -19,7 +20,6 @@ use self::provider_admin::ProviderAdmin;
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    util::json_map,
 };
 
 /// In-block dispatch targets, one per declared HTTP endpoint.
@@ -198,8 +198,6 @@ impl LlmBlock {
     }
 }
 
-pub(crate) const SETTINGS_TABLE: &str = "impresspress__llm__settings";
-
 pub(super) const DEFAULT_PROVIDER_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_PROVIDER";
 pub(super) const DEFAULT_MODEL_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MODEL";
 pub(super) const DEFAULT_PROVIDER: &str = "impresspress/provider-llm";
@@ -281,22 +279,27 @@ pub(super) async fn messages_list(
 
 impl LlmBlock {
     /// Resolve which provider block and model to use for a request.
+    ///
+    /// Returns `Err` when the per-thread override cannot be read. Falling
+    /// back to the global default on a database outage would route a
+    /// thread's traffic to a backend its owner had pinned away from, and the
+    /// caller would never learn.
     pub(super) async fn resolve_provider(
         &self,
         ctx: &dyn Context,
         thread_id: &str,
         req_provider: Option<&str>,
         req_model: Option<&str>,
-    ) -> (String, String) {
+    ) -> Result<(String, String), WaferError> {
         // Check per-thread override first
-        let thread_setting = self.get_thread_setting(ctx, thread_id).await;
+        let thread_setting = repo::settings::find_for_thread(ctx, thread_id).await?;
 
         let provider_block = thread_setting
             .as_ref()
-            .and_then(|s| s.data.get("provider_block").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| req_provider.map(|s| s.to_string()))
+            .map(|setting| setting.provider_block.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| req_provider.map(str::to_string))
             .unwrap_or_else(|| {
                 // Will be filled below from config
                 String::new()
@@ -304,10 +307,10 @@ impl LlmBlock {
 
         let model = thread_setting
             .as_ref()
-            .and_then(|s| s.data.get("model").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| req_model.map(|s| s.to_string()))
+            .map(|setting| setting.model.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| req_model.map(str::to_string))
             .unwrap_or_default();
 
         let default_provider =
@@ -326,22 +329,7 @@ impl LlmBlock {
             model
         };
 
-        (final_provider, final_model)
-    }
-
-    /// Get the per-thread settings record from the DB, if any.
-    ///
-    /// Returns the whole [`db::Record`] (not just its `data`) so callers that
-    /// need the record id for a follow-up update don't have to re-query.
-    async fn get_thread_setting(&self, ctx: &dyn Context, thread_id: &str) -> Option<db::Record> {
-        db::get_by_field(
-            ctx,
-            SETTINGS_TABLE,
-            "thread_id",
-            serde_json::Value::String(thread_id.to_string()),
-        )
-        .await
-        .ok()
+        Ok((final_provider, final_model))
     }
 
     /// `DELETE /b/llm/api/config/{id}` — remove one per-thread override. The
@@ -352,7 +340,7 @@ impl LlmBlock {
         if id.is_empty() {
             return err_bad_request("Missing override ID");
         }
-        match db::delete(ctx, SETTINGS_TABLE, &id).await {
+        match repo::settings::delete(ctx, &id).await {
             Ok(()) => ok_json(&contracts::ConfigDeleteResponse { deleted: true }),
             Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
                 err_not_found("Override not found")
@@ -422,46 +410,43 @@ impl LlmBlock {
             );
         }
 
-        // Per-thread override update
+        // Per-thread override update. The lookup's error is NOT "no
+        // override": treating it as one used to write a second row for a
+        // thread that already had one.
         if let Some(thread_id) = body.thread_id {
-            let existing = self.get_thread_setting(ctx, &thread_id).await;
+            let existing = match repo::settings::find_for_thread(ctx, &thread_id).await {
+                Ok(existing) => existing,
+                Err(e) => return err_internal("Database error", e),
+            };
 
-            if let Some(record) = existing {
-                // Update the existing record in place — the single fetch above
-                // already gave us both the id and the current data.
-                let mut data = record.data;
-                if let Some(pb) = body.provider_block {
-                    data.insert("provider_block".to_string(), serde_json::json!(pb));
+            let written = match existing {
+                // Update the existing row in place — the single fetch above
+                // already gave us both the id and the current values.
+                Some(row) => {
+                    repo::settings::update(
+                        ctx,
+                        &row,
+                        body.provider_block.as_deref(),
+                        body.model.as_deref(),
+                    )
+                    .await
                 }
-                if let Some(m) = body.model {
-                    data.insert("model".to_string(), serde_json::json!(m));
+                None => {
+                    repo::settings::insert(
+                        ctx,
+                        &thread_id,
+                        body.provider_block.as_deref().unwrap_or_default(),
+                        body.model.as_deref().unwrap_or_default(),
+                    )
+                    .await
                 }
-                crate::util::stamp_updated(&mut data);
-                match db::update(ctx, SETTINGS_TABLE, &record.id, data).await {
-                    Ok(r) => {
-                        return ok_json(&ConfigUpdateResponse::Override(
-                            ThreadOverrideView::from_record(&r),
-                        ))
-                    }
-                    Err(e) => return err_internal("Database error", e),
-                }
-            } else {
-                // Create new per-thread setting
-                let mut data = json_map(serde_json::json!({
-                    "thread_id": thread_id,
-                    "provider_block": body.provider_block.unwrap_or_default(),
-                    "model": body.model.unwrap_or_default(),
-                }));
-                crate::util::stamp_created(&mut data);
-                match db::create(ctx, SETTINGS_TABLE, data).await {
-                    Ok(r) => {
-                        return ok_json(&ConfigUpdateResponse::Override(
-                            ThreadOverrideView::from_record(&r),
-                        ))
-                    }
-                    Err(e) => return err_internal("Database error", e),
-                }
-            }
+            };
+            return match written {
+                Ok(row) => ok_json(&ConfigUpdateResponse::Override(ThreadOverrideView::from(
+                    &row,
+                ))),
+                Err(e) => err_internal("Database error", e),
+            };
         }
 
         ok_json(&ConfigUpdateResponse::Acknowledged(ConfigAcknowledgement {
@@ -730,7 +715,7 @@ mod config_tests {
             serde_json::json!(true),
             "the settings page's delete button must reach a route"
         );
-        let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+        let rows = repo::settings::list_all(&ctx)
             .await
             .expect("list overrides");
         assert!(rows.is_empty(), "the override row must be gone");
@@ -858,7 +843,7 @@ mod config_tests {
         .await;
 
         assert_eq!(out, serde_json::json!({ "updated": true }));
-        let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+        let rows = repo::settings::list_all(&ctx)
             .await
             .expect("list overrides");
         assert!(
@@ -914,7 +899,7 @@ mod config_tests {
                 }
                 other => panic!("{value}: expected InvalidArgument, got {other:?}"),
             }
-            let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+            let rows = repo::settings::list_all(&ctx)
                 .await
                 .expect("list overrides");
             assert!(
@@ -922,6 +907,69 @@ mod config_tests {
                 "{value}: a refused request must not have written an override"
             );
         }
+    }
+
+    /// A settings-table read that FAILS is not "no override".
+    ///
+    /// `get_thread_setting` ended in `.ok()`, so a database outage looked
+    /// exactly like an absent row: `handle_post_config` took its "create"
+    /// branch and wrote a SECOND override for a thread that already had one,
+    /// leaving two rows the `thread_id` lookup then picks between
+    /// arbitrarily; and `resolve_provider` silently fell back to the global
+    /// default provider and model, billing a thread's traffic to a backend
+    /// its owner had pinned away from.
+    #[tokio::test]
+    async fn a_failing_settings_read_is_an_error_not_an_absent_override() {
+        let ctx = TestContext::with_llm().await;
+        output_json(
+            block()
+                .handle_post_config(
+                    &ctx,
+                    body(serde_json::json!({
+                        "thread_id": "t1",
+                        "provider_block": "openai-main",
+                        "model": "gpt-4o",
+                    })),
+                )
+                .await,
+        )
+        .await;
+
+        let failing = crate::test_support::FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.list", repo::settings::TABLE)],
+        );
+
+        match block()
+            .handle_post_config(
+                &failing,
+                body(serde_json::json!({ "thread_id": "t1", "model": "gpt-4o-mini" })),
+            )
+            .await
+            .collect_buffered()
+            .await
+        {
+            Err(TerminalNotResponse::Error(e)) => assert_eq!(e.code, ErrorCode::Internal),
+            other => panic!("a failed lookup must not be treated as an absent row: {other:?}"),
+        }
+        let rows = repo::settings::list_all(&ctx)
+            .await
+            .expect("list overrides");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the failed lookup must not have created a second override for t1"
+        );
+
+        assert_eq!(
+            block()
+                .resolve_provider(&failing, "t1", None, None)
+                .await
+                .expect_err("the outage surfaces")
+                .code,
+            ErrorCode::Internal,
+            "a failed settings read must not fall back to the default provider/model"
+        );
     }
 
     #[tokio::test]

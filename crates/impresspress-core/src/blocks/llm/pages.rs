@@ -10,7 +10,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::{config, database as db, llm::ModelInfo};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{DEFAULT_MODEL_VAR, DEFAULT_PROVIDER, DEFAULT_PROVIDER_VAR, SETTINGS_TABLE};
+use super::{repo, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER, DEFAULT_PROVIDER_VAR};
 use crate::{
     messages_schema::{CONTEXTS_TABLE, ENTRIES_TABLE},
     ui::{self, components, icons, shell::Crumb},
@@ -383,10 +383,10 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let default_provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
     let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
 
-    // Load per-thread overrides
-    let overrides: Vec<db::Record> = db::list_all(ctx, SETTINGS_TABLE, vec![])
-        .await
-        .unwrap_or_default();
+    // Load per-thread overrides. An unreadable settings table renders as an
+    // empty override list here, unchanged from before the repo move — the
+    // error discipline for the SSR page renderers is Phase 3 (T4).
+    let overrides = repo::settings::list_all(ctx).await.unwrap_or_default();
 
     let content = html! {
         (components::page_header(
@@ -455,10 +455,10 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         }
                         tbody {
                             @for ov in &overrides {
-                                @let tid = ov.str_field("thread_id");
-                                @let pb = ov.str_field("provider_block");
-                                @let model = ov.str_field("model");
-                                @let updated = ov.str_field("updated_at");
+                                @let tid = ov.thread_id.as_str();
+                                @let pb = ov.provider_block.as_str();
+                                @let model = ov.model.as_str();
+                                @let updated = ov.updated_at.as_str();
                                 @let date = updated.get(..10).unwrap_or(updated);
                                 tr {
                                     td {
