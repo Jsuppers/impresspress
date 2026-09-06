@@ -1,8 +1,13 @@
 use wafer_run::{BlockInfo, HttpMethod, InstanceMode, OutputStream};
 
+// `ResponseBuilder` serves an asset's bytes, which only exist when the
+// assets are compiled in; without the feature the block still declares and
+// routes `/b/static/{filename}` and answers 404.
+#[cfg(feature = "embed-assets")]
+use crate::http::ResponseBuilder;
 use crate::{
     endpoint_match::{self, EndpointRoute},
-    http::{err_not_found, ok_json, ResponseBuilder},
+    http::{err_not_found, ok_json},
 };
 
 /// Resolve a hashed filename (the part after `/b/static/`) to its bytes and

@@ -186,22 +186,20 @@ impl D1ConfigSource {
         let returned_rows = rows.records.len();
         let mut grouped: BlockVariables = HashMap::new();
         for record in rows.records {
-            let Some(block) = record.data.get("block").and_then(|b| b.as_str()) else {
+            // Decoded through the row type that owns these column names, so
+            // this adapter cannot drift from `platform_state::variables`.
+            // A row the codec rejects (no `key`) is dropped rather than
+            // failing the snapshot, as it was before: one malformed row must
+            // not leave every block on its defaults.
+            let Ok(row) = variables::VariableRow::from_record(&record.id, &record.data) else {
                 continue;
             };
-            if block.is_empty() {
-                continue;
-            }
-            let (Some(key), Some(value)) = (
-                record.data.get("key").and_then(|k| k.as_str()),
-                record.data.get("value").and_then(|v| v.as_str()),
-            ) else {
+            // Shared (`WAFER_RUN_SHARED__*`) and ad hoc keys have no block
+            // and belong to no block's snapshot.
+            let Some(block) = row.block else {
                 continue;
             };
-            grouped
-                .entry(block.to_string())
-                .or_default()
-                .insert(key.to_string(), value.to_string());
+            grouped.entry(block).or_default().insert(row.key, row.value);
         }
 
         let snapshot = Rc::new(grouped);

@@ -49,7 +49,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions};
 const FULL_LIMIT_THRESHOLD: i64 = 10_000;
 
 /// Reserved cache-key value for the full-table `block_settings` read —
-/// `runner::load_block_settings`'s eager filterless list. Real block names
+/// `platform_state::block_settings::load`'s eager filterless list. Real block names
 /// are always `{org}/{block}` (slash-delimited), so this slash-free
 /// sentinel can never collide with a per-block key.
 const ALL_ROWS_SENTINEL: &str = "__all__";
@@ -124,7 +124,7 @@ pub fn full_table_list_opts() -> ListOptions {
 /// Returns Some(kv_key) iff `opts` matches a cacheable read shape:
 /// either the canonical "load all rows for one block" single-filter shape,
 /// or — for `block_settings` only — the eager filterless full-table read
-/// (`runner::load_block_settings`).
+/// (`platform_state::block_settings::load`).
 pub fn read_key(table: CachedTable, opts: &ListOptions) -> Option<String> {
     // Shape gate shared by both read kinds: an unsorted, unpaginated,
     // count-skipping "give me every matching row" list.
