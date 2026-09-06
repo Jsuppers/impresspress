@@ -10,7 +10,7 @@ use super::{
     contracts::{
         AmountRule, ApprovalStatus, CommerceAnalytics, ManagedOffer, OfferStatus, OfferSyncStatus,
         ProductStatus, SellerAccount, SellerFailureSummary, SellerStatus, StripeConnectionState,
-        StripeConnectionStatus, VariableDefinition, VariableKind,
+        StripeConnectionStatus, StripeEventType, VariableDefinition, VariableKind,
     },
     money, repo, stripe_provider,
 };
@@ -116,7 +116,7 @@ fn seller_failures_section(failures: &[SellerFailureSummary]) -> Markup {
 use crate::{
     config_vars,
     ui::{self, components, icons, settings_form, settings_form::SettingsSection},
-    util::RecordExt,
+    util::{self, RecordExt},
 };
 
 fn admin_tabs(active: &str) -> Markup {
@@ -2750,20 +2750,16 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     code .products-code-block { "/b/products/webhooks" }
                     details .products-plain-details {
                         summary { "Show required Stripe event types" }
-                    ul .text-sm {
-                        li { code { "account.updated" } }
-                        li { code { "checkout.session.completed" } }
-                        li { code { "checkout.session.async_payment_succeeded" } }
-                        li { code { "checkout.session.async_payment_failed" } }
-                        li { code { "payment_intent.succeeded" } ", " code { "payment_intent.payment_failed" } ", " code { "payment_intent.processing" } ", " code { "payment_intent.requires_action" } ", " code { "payment_intent.canceled" } }
-                        li { code { "customer.subscription.updated" } }
-                        li { code { "customer.subscription.deleted" } }
-                        li { code { "invoice.paid" } ", " code { "invoice.payment_succeeded" } }
-                        li { code { "invoice.payment_failed" } }
-                        li { code { "charge.dispute.created" } ", " code { "charge.dispute.updated" } ", " code { "charge.dispute.closed" } }
-                        li { code { "refund.created" } ", " code { "refund.updated" } ", " code { "refund.failed" } }
-                        li { code { "charge.refunded" } }
-                    }
+                        // The set `handle_webhook` dispatches on, not a
+                        // second copy of it: a type the block starts
+                        // handling is advertised here without anyone
+                        // remembering to add it, and one it stops handling
+                        // stops being advertised.
+                        ul .text-sm {
+                            @for event_type in StripeEventType::ALL {
+                                li { code { (util::wire_str(event_type)) } }
+                            }
+                        }
                     }
                     p .text-muted .text-sm {
                         "Use the signing secret Stripe assigns to this destination in Products Settings. Keep test and live destinations separate."

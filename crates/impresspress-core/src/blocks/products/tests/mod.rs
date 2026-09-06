@@ -12,4 +12,5 @@ mod repo_tests;
 mod seller_governance_tests;
 mod status_enum_tests;
 mod storefront_tests;
+mod stripe_event_type_tests;
 mod stripe_tests;

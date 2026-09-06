@@ -3014,8 +3014,20 @@ async fn dispute_webhooks_are_ordered_tenant_safe_and_immutable() {
 // Webhook — unhandled event types
 // ============================================================
 
+/// A type this block does not handle is ordinary traffic, and this is what
+/// "ordinary" means: acknowledged as received, recorded under the type
+/// Stripe actually sent, and sealed `processed` so a redelivery of the same
+/// id is deduped rather than re-run.
+///
+/// A Stripe destination can be subscribed to more event types than any one
+/// integration handles — the dashboard's "select all events" is one click —
+/// so this is the common case, not an edge one. Answering anything but 2xx
+/// would make Stripe retry the delivery on its backoff schedule and
+/// eventually mark the destination unhealthy, for an event no handler wants.
+/// The dispatcher's ignore arm was `_ =>` before this PR and is `None =>`
+/// after it; this test is the same assertion across both.
 #[tokio::test]
-async fn webhook_unhandled_event_returns_ok() {
+async fn webhook_unhandled_event_is_acknowledged_and_sealed() {
     let ctx = ctx_with(&[(
         "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
         WEBHOOK_SECRET,
@@ -3023,14 +3035,40 @@ async fn webhook_unhandled_event_returns_ok() {
     .await;
 
     let event = serde_json::json!({
+        "id": "evt_unhandled_type",
         "type": "payment_intent.created",
         "data": { "object": {} }
     });
     let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
 
-    let out = stripe::handle_webhook(&ctx, &msg, input).await;
-    let body = output_to_json(out).await;
-    assert_eq!(body["received"], true);
+    let body = output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await;
+    // `duplicate` and `dead_letter` are skipped when false, so the whole
+    // body is the assertion: neither flag is set.
+    assert_eq!(body, serde_json::json!({ "received": true }));
+
+    // Recorded before the dispatch, so the row holds the raw type — the
+    // event_type column is Stripe's whole vocabulary, not the handled
+    // subset, which is why `WebhookEventSummary.event_type` stays a string.
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_unhandled_type",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["event_type"], "payment_intent.created");
+    assert_eq!(
+        event_row.data["status"], "processed",
+        "an unhandled type is done, not queued for retry",
+    );
+
+    // And a redelivery of the same id is deduped rather than re-processed.
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let body = output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await;
+    assert_eq!(
+        body,
+        serde_json::json!({ "received": true, "duplicate": true })
+    );
 }
 
 // ============================================================
