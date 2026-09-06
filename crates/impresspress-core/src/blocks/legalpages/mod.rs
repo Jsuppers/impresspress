@@ -675,7 +675,13 @@ crate::impresspress_feature_block! {
             .config_keys(config_vars())
             .admin_url("/b/legalpages/admin")
             .can_disable(true)
-            .default_enabled(false)
+            // Ships enabled. This is the value the boot seed has written since
+            // it was introduced; the declaration used to say `false` and only
+            // the seed table was read, so nothing observed the disagreement.
+            // Whether legal pages *should* default off is a product decision
+            // (spec 5.6), and changing this line now re-seeds every row that
+            // an admin has not toggled.
+            .default_enabled(true)
     },
     handle: |this, ctx, msg, input| {
         // Auth is enforced centrally by `route_to_block` from the declared
