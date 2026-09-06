@@ -54,12 +54,8 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 // `TABLE_IDENT_ALLOWED` with the same justification given there.
 use crate::blocks::products::TABLE as PRODUCTS_COLLECTION;
 use crate::{
-    admin_schema,
     blocks::{
-        admin::{
-            AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE,
-            USER_ROLES_TABLE, WRAP_GRANTS_TABLE,
-        },
+        admin::{AUDIT_LOGS_TABLE, PERMISSIONS_TABLE, ROLES_TABLE, STORAGE_ACCESS_LOGS_TABLE},
         auth::repo::{
             api_keys, bootstrap_tokens, jwt_blocklist, local_credentials, oauth_pkce, orgs, pats,
             provider_links, rate_limits, sessions, tokens, users,
@@ -74,6 +70,8 @@ use crate::{
             VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
+    // audit-allow: names the platform tables for the export allowlist/exclusion bookkeeping below — the two it reads (`variables`, `user_roles`) are granted by `dev::wrap_grants()`, which maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)` and which the runtime honours from its flat grant list, and the audit attributes grants to the declaring file's block and cannot see it
+    platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -168,7 +166,7 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     (PRODUCTS_VARIABLES_TABLE, Mode::Upsert(BY_ID)),
     (OFFER_COMPONENTS_TABLE, Mode::Upsert(BY_ID)),
     (CHECKOUT_PRESETS_TABLE, Mode::Upsert(BY_ID)),
-    // --- admin: IAM catalog plus config. `VARIABLES_TABLE` is filtered row
+    // --- admin: IAM catalog plus config. `variables::TABLE` is filtered row
     // by row at export time (`variable_is_exportable`) rather than excluded
     // wholesale — most admin variables are ordinary site config (`APP_NAME`,
     // feature flags), exactly what a re-hosted copy needs to keep working.
@@ -180,7 +178,7 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     // `APP_NAME` variable and dies on that index. See [`Mode::Upsert`].
     (ROLES_TABLE, Mode::Upsert(&["name"])),
     (PERMISSIONS_TABLE, Mode::Upsert(&["name"])),
-    (admin_schema::VARIABLES_TABLE, Mode::Upsert(&["key"])),
+    (variables::TABLE, Mode::Upsert(&["key"])),
     // --- identity: the owner's own account, `Replace`d as a set so a fresh
     // instance's bootstrap admin is gone once someone else's is imported —
     // every `owner_id`/`created_by` an imported product carries still
@@ -188,7 +186,7 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     // module docs for why `local_credentials` travels with `users`. ---
     (users::TABLE, Mode::Replace),
     (local_credentials::TABLE, Mode::Replace),
-    (USER_ROLES_TABLE, Mode::Replace),
+    (user_roles::TABLE, Mode::Replace),
 ];
 
 /// Every table the products, admin and auth blocks declare that
@@ -209,11 +207,11 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     STRIPE_EVENTS_TABLE, // webhook idempotency ledger — this instance's own delivery history
     // --- admin: operational logs, and infrastructure state the runtime
     // re-derives at every boot rather than something anyone authored. ---
-    admin_schema::BLOCK_SETTINGS_TABLE, // per-block enable flag + migration-hash tracking
-    admin_schema::REQUEST_LOGS_TABLE,
+    block_settings::TABLE, // per-block enable flag + migration-hash tracking
+    request_logs::TABLE,
     AUDIT_LOGS_TABLE,
     STORAGE_ACCESS_LOGS_TABLE,
-    WRAP_GRANTS_TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot
+    wrap_grants::TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot
     // --- auth: session/credential plumbing scoped to this running
     // instance (bearer material this instance issued, not the owner's own
     // login — see `local_credentials` above), plus multi-tenant org
@@ -441,7 +439,7 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
             // The one table with a per-row export decision — see
             // `variable_is_exportable`'s docs for why the check lives there
             // and not as a second `Mode`.
-            .filter(|row| table != admin_schema::VARIABLES_TABLE || variable_is_exportable(row))
+            .filter(|row| table != variables::TABLE || variable_is_exportable(row))
             .filter(|row| owner_was_exported(table, row, &exported))
             .collect();
         if OWNED_TABLES.iter().any(|(_, _, owner)| *owner == table) {
@@ -619,7 +617,7 @@ pub struct ImportReport {
 /// A fixed list rather than the snapshot's own (incidental, alphabetical)
 /// `BTreeMap` order — `"impresspress__admin__user_roles"` sorts before
 /// `"wafer_run__auth__users"`, which is exactly backwards.
-const REPLACE_ORDER: &[&str] = &[users::TABLE, local_credentials::TABLE, USER_ROLES_TABLE];
+const REPLACE_ORDER: &[&str] = &[users::TABLE, local_credentials::TABLE, user_roles::TABLE];
 
 #[cfg(test)]
 mod replace_order_tests {

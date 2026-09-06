@@ -5,7 +5,7 @@
 //! not exist in a default-feature build, so these tests must not compile
 //! there.
 //!
-//! `PRODUCTS_TABLE`/`OFFERS_TABLE`/`PURCHASES_TABLE`/`ADMIN_USER_ROLES_TABLE`
+//! `PRODUCTS_TABLE`/`OFFERS_TABLE`/`PURCHASES_TABLE`
 //! below restate table names `impresspress-core` keeps `pub(crate)` (the
 //! products ones are further gated by that block's own door tests —
 //! `blocks/products/tests/repo_door_test.rs` — which refuse a re-export
@@ -18,7 +18,6 @@
 use std::collections::BTreeSet;
 
 use impresspress_core::{
-    admin_schema,
     blocks::{
         admin::AdminBlock,
         auth::repo::users,
@@ -29,6 +28,7 @@ use impresspress_core::{
         },
         products::ProductsBlock,
     },
+    platform_state::{user_roles, variables},
     test_support::TestContext,
     util::json_map,
 };
@@ -47,7 +47,6 @@ const PRODUCT_VERSIONS_TABLE: &str = "impresspress__products__product_versions";
 const CHECKOUT_PRESETS_TABLE: &str = "impresspress__products__checkout_presets";
 const PRODUCTS_VARIABLES_TABLE: &str = "impresspress__products__variables";
 const PURCHASES_TABLE: &str = "impresspress__products__purchases";
-const ADMIN_USER_ROLES_TABLE: &str = "impresspress__admin__user_roles";
 
 // ---------------------------------------------------------------------------
 // Coverage: every declared table has a decision.
@@ -229,7 +228,7 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
 
     seed_row(
         ctx,
-        ADMIN_USER_ROLES_TABLE,
+        user_roles::TABLE,
         "role_owner_admin",
         json!({ "user_id": user_id, "role": "admin" }),
     )
@@ -238,7 +237,7 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
     // Never exported: the `sensitive` flag is set.
     seed_row(
         ctx,
-        admin_schema::VARIABLES_TABLE,
+        variables::TABLE,
         "var_secret",
         json!({
             "key": "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD",
@@ -250,7 +249,7 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
     // Exported: ordinary site config.
     seed_row(
         ctx,
-        admin_schema::VARIABLES_TABLE,
+        variables::TABLE,
         "var_public",
         json!({
             "key": "WAFER_RUN_SHARED__APP_NAME",
@@ -263,7 +262,7 @@ async fn seed_product_and_order(ctx: &TestContext) -> String {
     // CLAUDE.md reserves that prefix for infrastructure config.
     seed_row(
         ctx,
-        admin_schema::VARIABLES_TABLE,
+        variables::TABLE,
         "var_infra",
         json!({
             "key": "IMPRESSPRESS_INTERNAL_FLAG",
@@ -290,7 +289,7 @@ async fn export_carries_products_but_never_secrets_or_orders() {
     assert_eq!(snap.tables[PRODUCTS_TABLE].len(), 1);
     assert!(!snap.tables.contains_key(PURCHASES_TABLE));
 
-    let vars = &snap.tables[admin_schema::VARIABLES_TABLE];
+    let vars = &snap.tables[variables::TABLE];
     assert_eq!(
         vars.len(),
         1,
@@ -493,7 +492,7 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
     .await;
     seed_row(
         &dst,
-        ADMIN_USER_ROLES_TABLE,
+        user_roles::TABLE,
         "role_fresh_bootstrap",
         json!({ "user_id": "user_fresh_bootstrap", "role": "admin" }),
     )
@@ -501,7 +500,7 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
 
     let report = data_snapshot::import(&dst, &snap).await.unwrap();
     assert_eq!(report.tables[users::TABLE], 1);
-    assert_eq!(report.tables[ADMIN_USER_ROLES_TABLE], 1);
+    assert_eq!(report.tables[user_roles::TABLE], 1);
 
     let users_rows = db::list_all(&dst, users::TABLE, Vec::new()).await.unwrap();
     assert_eq!(
@@ -511,7 +510,7 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
     );
     assert_eq!(users_rows[0].id, admin_id);
 
-    let role_rows = db::list_all(&dst, ADMIN_USER_ROLES_TABLE, Vec::new())
+    let role_rows = db::list_all(&dst, user_roles::TABLE, Vec::new())
         .await
         .unwrap();
     assert_eq!(
@@ -605,7 +604,7 @@ fn mixed_snapshot() -> DataSnapshot {
         .collect()],
     );
     tables.insert(
-        admin_schema::VARIABLES_TABLE.to_string(),
+        variables::TABLE.to_string(),
         vec![json_map(json!({
             "id": "var_seeded",
             "key": "WAFER_RUN_SHARED__APP_NAME",
@@ -679,7 +678,7 @@ async fn seed_import_applies_data_json_when_present() {
     assert_eq!(products.len(), 1);
     assert_eq!(products[0].id, "prod_seeded");
 
-    let vars = db::list_all(&ctx, admin_schema::VARIABLES_TABLE, Vec::new())
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
         .await
         .unwrap();
     assert_eq!(vars.len(), 1);
@@ -776,7 +775,7 @@ async fn an_import_lands_on_rows_the_destination_seeded_with_its_own_ids() {
     .await;
     seed_row(
         &ctx,
-        admin_schema::VARIABLES_TABLE,
+        variables::TABLE,
         "var_minted_here",
         json!({
             "key": "WAFER_RUN_SHARED__APP_NAME",
@@ -813,7 +812,7 @@ async fn an_import_lands_on_rows_the_destination_seeded_with_its_own_ids() {
         ],
     );
     tables.insert(
-        admin_schema::VARIABLES_TABLE.to_string(),
+        variables::TABLE.to_string(),
         vec![
             json_map(json!({
                 "id": "var_minted_over_there",
@@ -867,7 +866,7 @@ async fn an_import_lands_on_rows_the_destination_seeded_with_its_own_ids() {
     // the id the snapshot gave it.
     assert!(roles.iter().any(|r| r.id == "role_editor"), "{roles:?}");
 
-    let vars = db::list_all(&ctx, admin_schema::VARIABLES_TABLE, Vec::new())
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
         .await
         .unwrap();
     let app_name: Vec<_> = vars

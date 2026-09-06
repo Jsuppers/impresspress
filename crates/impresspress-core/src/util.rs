@@ -97,9 +97,15 @@ pub trait RecordExt {
     fn string_list_field(&self, key: &str) -> Vec<String>;
 }
 
-impl RecordExt for Record {
+/// The one implementation: every `Record` shape the runtime hands out —
+/// `wafer_core::clients::database::Record` under WRAP and
+/// `wafer_core::interfaces::database::service::Record` at boot — carries a
+/// `data: HashMap<String, Value>` column map, and the platform-state codecs
+/// decode that map for both. Implemented on the map so the two flavours
+/// share one accessor set; the `Record` impl below forwards to it.
+impl RecordExt for HashMap<String, serde_json::Value> {
     fn str_field(&self, key: &str) -> &str {
-        self.data.get(key).and_then(|v| v.as_str()).unwrap_or("")
+        self.get(key).and_then(|v| v.as_str()).unwrap_or("")
     }
 
     fn i64_field(&self, key: &str) -> i64 {
@@ -107,15 +113,15 @@ impl RecordExt for Record {
     }
 
     fn opt_i64_field(&self, key: &str) -> Option<i64> {
-        self.data.get(key).and_then(json_as_i64)
+        self.get(key).and_then(json_as_i64)
     }
 
     fn u64_field(&self, key: &str) -> u64 {
-        self.data.get(key).and_then(json_as_u64).unwrap_or(0)
+        self.get(key).and_then(json_as_u64).unwrap_or(0)
     }
 
     fn bool_field(&self, key: &str) -> bool {
-        match self.data.get(key) {
+        match self.get(key) {
             Some(serde_json::Value::Bool(b)) => *b,
             Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
             Some(serde_json::Value::String(s)) => s == "true" || s == "1",
@@ -124,14 +130,14 @@ impl RecordExt for Record {
     }
 
     fn opt_str_field(&self, key: &str) -> Option<String> {
-        match self.data.get(key) {
+        match self.get(key) {
             Some(serde_json::Value::String(value)) => Some(value.clone()),
             _ => None,
         }
     }
 
     fn json_value_field(&self, key: &str) -> serde_json::Value {
-        match self.data.get(key) {
+        match self.get(key) {
             Some(serde_json::Value::String(raw)) => {
                 serde_json::from_str(raw).unwrap_or(serde_json::Value::Null)
             }
@@ -162,6 +168,48 @@ impl RecordExt for Record {
                 _ => None,
             })
             .collect()
+    }
+}
+
+impl RecordExt for Record {
+    fn str_field(&self, key: &str) -> &str {
+        self.data.str_field(key)
+    }
+
+    fn i64_field(&self, key: &str) -> i64 {
+        self.data.i64_field(key)
+    }
+
+    fn opt_i64_field(&self, key: &str) -> Option<i64> {
+        self.data.opt_i64_field(key)
+    }
+
+    fn u64_field(&self, key: &str) -> u64 {
+        self.data.u64_field(key)
+    }
+
+    fn bool_field(&self, key: &str) -> bool {
+        self.data.bool_field(key)
+    }
+
+    fn opt_str_field(&self, key: &str) -> Option<String> {
+        self.data.opt_str_field(key)
+    }
+
+    fn json_value_field(&self, key: &str) -> serde_json::Value {
+        self.data.json_value_field(key)
+    }
+
+    fn json_object_field(&self, key: &str) -> serde_json::Map<String, serde_json::Value> {
+        self.data.json_object_field(key)
+    }
+
+    fn json_array_field(&self, key: &str) -> Vec<serde_json::Value> {
+        self.data.json_array_field(key)
+    }
+
+    fn string_list_field(&self, key: &str) -> Vec<String> {
+        self.data.string_list_field(key)
     }
 }
 
@@ -476,6 +524,80 @@ pub fn parse_body_value(data: &[u8]) -> serde_json::Value {
         }
         serde_json::Value::Object(obj)
     }
+}
+
+/// Encode client-side [`Filter`](wafer_block::db::Filter)s as all-leaf wire
+/// [`FilterNode`](wafer_block::wire::database::FilterNode)s for a typed
+/// `db::aggregate` request. Mirrors `wafer-core`'s internal
+/// `to_wire_filters` conversion (not exported for block code to reuse).
+pub(crate) fn to_wire_filters(
+    filters: &[wafer_block::db::Filter],
+) -> Vec<wafer_block::wire::database::FilterNode> {
+    use wafer_block::{db::FilterOp, wire::database as wire};
+    filters
+        .iter()
+        .map(|f| {
+            let operator = match f.operator {
+                FilterOp::Equal => "eq",
+                FilterOp::NotEqual => "neq",
+                FilterOp::GreaterThan => "gt",
+                FilterOp::GreaterEqual => "gte",
+                FilterOp::LessThan => "lt",
+                FilterOp::LessEqual => "lte",
+                FilterOp::Like => "like",
+                FilterOp::In => "in",
+                FilterOp::IsNull => "is_null",
+                FilterOp::IsNotNull => "is_not_null",
+            };
+            wire::FilterNode::Leaf(wire::FilterDef {
+                field: f.field.clone(),
+                operator: operator.to_string(),
+                value: f.value.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Run ONE grouped-by-day aggregate over `table` for rows whose `created_at`
+/// is at or after `since_iso`, and return the per-day rows (one
+/// [`Record`](wafer_block::wire::database::Record) per day that has data,
+/// its day under the `created_at` alias). `aggregates` may carry several
+/// columns — a plain `Count` alongside a conditional `CaseWhenSum` — so a
+/// single statement can back multiple daily series over the same table.
+///
+/// Shared by the table modules that render a daily chart
+/// (`platform_state::request_logs::daily_counts`, the admin dashboard's
+/// users series) so the date-bucket shape is built once.
+pub(crate) async fn daily_grouped(
+    ctx: &dyn wafer_run::context::Context,
+    table: &str,
+    since_iso: &str,
+    extra_filters: Vec<wafer_block::db::Filter>,
+    aggregates: Vec<wafer_block::wire::database::AggregateColumnDef>,
+) -> Result<Vec<wafer_block::wire::database::Record>, wafer_run::WaferError> {
+    use wafer_block::{
+        db::{Filter, FilterOp},
+        wire::database as wire,
+    };
+    let mut filters = vec![Filter {
+        field: "created_at".into(),
+        operator: FilterOp::GreaterEqual,
+        value: serde_json::json!(since_iso),
+    }];
+    filters.extend(extra_filters);
+
+    let req = wire::AggregateRequest {
+        collection: table.to_string(),
+        select_columns: vec![],
+        aggregates,
+        filters: to_wire_filters(&filters),
+        group_by: vec![wire::GroupByDef::DateBucket {
+            field: "created_at".into(),
+        }],
+        sort: vec![],
+        limit: 0,
+    };
+    wafer_core::clients::database::aggregate(ctx, req).await
 }
 
 #[cfg(test)]

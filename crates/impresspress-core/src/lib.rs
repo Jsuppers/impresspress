@@ -5,9 +5,7 @@
 //! `wafer_block_crypto::primitives`) used by both the Cloudflare Worker and
 //! native standalone binary.
 
-pub mod admin_schema;
 pub mod blocks;
-pub mod boot;
 pub mod builder;
 pub mod cache;
 pub mod cache_key;
@@ -29,6 +27,7 @@ pub mod metrics;
 pub mod migration_helper;
 pub mod multipart;
 pub mod pipeline;
+pub mod platform_state;
 pub mod prepared_plan;
 pub mod release_inventory;
 pub mod routing;

@@ -283,7 +283,7 @@ pub fn collect_all_config_vars(block_infos: &[wafer_run::BlockInfo]) -> Vec<Conf
 /// `impresspress__admin__variables.block` column from a `{org}/{block}` name.
 ///
 /// This is the single source of truth for the `block` column value: the
-/// boot-time auto-generated-secret seeder ([`crate::boot::seed_auto_generated`])
+/// boot-time auto-generated-secret seeder ([`crate::platform_state::variables::seed_auto_generated`])
 /// writes it, the `D1ConfigSource` queries by it, and admin migration 002
 /// backfills the same shape from the `key` column's first two `__`-delimited
 /// segments. All three must agree, so they all funnel through here.
@@ -320,7 +320,7 @@ pub fn screaming_block(name: &str) -> String {
 /// exactly as the backfill would.
 ///
 /// This MUST stay byte-for-byte equivalent to migration 002's `CASE` so a
-/// row seeded by [`crate::boot`] and a row backfilled by the migration land on
+/// row seeded by [`crate::platform_state::variables`] and a row backfilled by the migration land on
 /// the same `block` value (and therefore the same `D1ConfigSource` per-block
 /// cache key).
 pub fn key_block_prefix(key: &str) -> String {

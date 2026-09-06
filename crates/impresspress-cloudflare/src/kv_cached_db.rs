@@ -732,7 +732,7 @@ impl DatabaseService for KvCachedD1DatabaseService {
 mod tests {
     use std::cell::Cell;
 
-    use impresspress_core::blocks::admin::VARIABLES_TABLE;
+    use impresspress_core::platform_state::variables;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
@@ -950,7 +950,7 @@ mod tests {
     async fn row_cache_get_error_falls_through_without_put() {
         let (svc, kv) = cached_service(KvGet::Fail);
         let result = svc
-            .list(VARIABLES_TABLE, &variables_list_opts())
+            .list(variables::TABLE, &variables_list_opts())
             .await
             .expect("a KV failure must not fail the query; D1 answers it");
         assert_eq!(result.records.len(), 1, "D1 rows must still be served");
@@ -967,7 +967,7 @@ mod tests {
     async fn row_cache_missing_key_repopulates() {
         let (svc, kv) = cached_service(KvGet::Missing);
         let result = svc
-            .list(VARIABLES_TABLE, &variables_list_opts())
+            .list(variables::TABLE, &variables_list_opts())
             .await
             .expect("a cache miss must fall through to D1");
         assert_eq!(result.records.len(), 1);
@@ -984,7 +984,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn take_where_on_cached_table_is_refused() {
         let (svc, kv) = cached_service(KvGet::Missing);
-        assert!(svc.take_where(VARIABLES_TABLE, &[]).await.is_err());
+        assert!(svc.take_where(variables::TABLE, &[]).await.is_err());
         assert_eq!(
             kv.writes.get(),
             0,
@@ -995,7 +995,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn delete_where_count_on_cached_table_is_refused() {
         let (svc, kv) = cached_service(KvGet::Missing);
-        assert!(svc.delete_where_count(VARIABLES_TABLE, &[]).await.is_err());
+        assert!(svc.delete_where_count(variables::TABLE, &[]).await.is_err());
         assert_eq!(kv.writes.get(), 0);
     }
 

@@ -1,15 +1,9 @@
 use maud::{html, Markup};
-use wafer_block::{
-    db::{Filter, FilterOp, ListOptions, SortField},
-    wire::database as wire,
-};
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::admin::REQUEST_LOGS_TABLE as REQUEST_LOGS,
+    platform_state::request_logs,
     ui::{components, icons},
-    util::RecordExt,
 };
 
 /// Render JUST the network monitoring body. The parent `settings_page`
@@ -40,52 +34,9 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
 async fn network_inbound_tab(ctx: &dyn Context, msg: &Message) -> Markup {
     let search = msg.query("search").to_string();
 
-    let filters = if search.is_empty() {
-        vec![]
-    } else {
-        vec![wire::FilterNode::Leaf(wire::FilterDef {
-            field: "path".into(),
-            operator: "like".into(),
-            value: serde_json::json!(format!("%{search}%")),
-        })]
-    };
-
-    let req = wire::AggregateRequest {
-        collection: REQUEST_LOGS.to_string(),
-        select_columns: vec!["method".into(), "path".into()],
-        aggregates: vec![
-            wire::AggregateColumnDef::Count {
-                alias: "cnt".into(),
-            },
-            wire::AggregateColumnDef::Avg {
-                field: "duration_ms".into(),
-                alias: "avg_ms".into(),
-            },
-            wire::AggregateColumnDef::CaseWhenSum {
-                when: vec![wire::FilterNode::Leaf(wire::FilterDef {
-                    field: "status_code".into(),
-                    operator: "gte".into(),
-                    value: serde_json::json!(400),
-                })],
-                alias: "errors".into(),
-            },
-            wire::AggregateColumnDef::Max {
-                field: "created_at".into(),
-                alias: "last_seen".into(),
-            },
-        ],
-        filters,
-        group_by: vec![
-            wire::GroupByDef::Column("method".into()),
-            wire::GroupByDef::Column("path".into()),
-        ],
-        sort: vec![wire::SortFieldDef {
-            field: "cnt".into(),
-            desc: true,
-        }],
-        limit: 50,
-    };
-    let summary = db::aggregate(ctx, req).await.unwrap_or_default();
+    let summary = request_logs::summarise_by_path(ctx, &search, 50)
+        .await
+        .unwrap_or_default();
 
     html! {
         div .filter-bar {
@@ -140,20 +91,7 @@ async fn network_inbound_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                         }
                     }
                     @for row in &summary {
-                        @let method = row.data.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                        @let path = row.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        @let cnt = row.data.get("cnt").and_then(|v| v.as_i64()).unwrap_or(0);
-                        // `db::aggregate`'s Avg has no result-cast (unlike the old
-                        // `cast_as: Some("INTEGER")` builder path), so AVG(duration_ms)
-                        // comes back as a JSON float; `as_i64()` is always `None` for the
-                        // `Number::Float` variant, so read it as f64 and truncate. The old
-                        // `CAST(AVG(duration_ms) AS INTEGER)` truncated toward zero;
-                        // `duration_ms` is always >= 0, so `as i64` (which also truncates
-                        // toward zero) is exact parity — no `.round()`.
-                        @let avg_ms = row.data.get("avg_ms").and_then(|v| v.as_f64()).map(|v| v as i64).unwrap_or(0);
-                        @let errors = row.data.get("errors").and_then(|v| v.as_i64()).unwrap_or(0);
-                        @let last_seen = row.data.get("last_seen").and_then(|v| v.as_str()).unwrap_or("");
-                        (inbound_row(method, path, cnt, avg_ms, errors, last_seen))
+                        (inbound_row(&row.method, &row.path, row.count, row.avg_ms, row.errors, &row.last_seen))
                     }
                 }
             }
@@ -211,42 +149,10 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
     let offset: i64 = msg.query("offset").parse().unwrap_or(0);
     let limit: i64 = 20;
 
-    let rows = db::list(
-        ctx,
-        REQUEST_LOGS,
-        &ListOptions {
-            columns: Some(vec![
-                "status_code".into(),
-                "duration_ms".into(),
-                "client_ip".into(),
-                "user_id".into(),
-                "created_at".into(),
-            ]),
-            filters: vec![
-                Filter {
-                    field: "method".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(&method),
-                },
-                Filter {
-                    field: "path".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(&path),
-                },
-            ],
-            sort: vec![SortField {
-                field: "created_at".into(),
-                desc: true,
-            }],
-            limit: limit + 1, // fetch one extra to detect "has more"
-            offset,
-            skip_count: true,
-            ..Default::default()
-        },
-    )
-    .await
-    .map(|r| r.records)
-    .unwrap_or_default();
+    // One more than the page shows, to learn whether a next page exists.
+    let rows = request_logs::list_for_path(ctx, &method, &path, offset, limit + 1)
+        .await
+        .unwrap_or_default();
 
     let has_more = rows.len() as i64 > limit;
     let display_rows = if has_more {
@@ -267,12 +173,12 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
                 }
             }
             tbody {
-                @for record in display_rows {
-                    @let status_code = record.i64_field("status_code");
-                    @let duration = record.i64_field("duration_ms");
-                    @let client_ip = record.data.get("client_ip").and_then(|v| v.as_str()).unwrap_or("");
-                    @let user_id = record.data.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-                    @let created = record.data.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                @for row in display_rows {
+                    @let status_code = row.status_code;
+                    @let duration = row.duration_ms;
+                    @let client_ip = row.client_ip.as_str();
+                    @let user_id = row.user_id.as_str();
+                    @let created = row.created_at.as_str();
                     tr {
                         td {
                             span .badge .(if status_code >= 500 { "badge-danger" } else if status_code >= 400 { "badge-warning" } else { "badge-success" }) {

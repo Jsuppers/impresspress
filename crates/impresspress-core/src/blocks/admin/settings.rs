@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use wafer_core::clients::database as db;
-use wafer_run::{
-    context::Context, ConfigVar, ErrorCode, InputStream, InputType, Message, OutputStream,
-};
+use wafer_run::{context::Context, ConfigVar, InputStream, InputType, Message, OutputStream};
 
 use super::{
     contracts::{AdminSettingView, AdminSettingsResponse},
@@ -11,126 +9,36 @@ use super::{
 };
 use crate::{
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    util::{json_map, RecordExt},
+    platform_state::{
+        block_settings::{self, BlockSettingsPatch},
+        variables::{self, NewVariable, VariablePatch},
+    },
 };
-
-/// Helpers for reading and writing the per-block `enabled` flag in
-/// [`BLOCK_SETTINGS_TABLE`]. Use these instead of inlining the select/upsert
-/// query in every callsite.
-pub mod block_settings {
-    use wafer_block::db::{Filter, FilterOp, ListOptions};
-    use wafer_core::clients::database as db;
-    use wafer_run::{context::Context, WaferError};
-
-    use super::BLOCK_SETTINGS_TABLE as TABLE;
-
-    /// Return whether `block_name` is enabled.
-    ///
-    /// Reads the `enabled` column from [`BLOCK_SETTINGS_TABLE`]. Defaults to
-    /// `true` when no row exists (all blocks are enabled by default). A
-    /// read failure is returned, never mapped to "enabled": the toggle
-    /// handler derives the state it writes from this answer, so guessing
-    /// here would flip a block on the strength of an outage.
-    pub async fn is_enabled(ctx: &dyn Context, block_name: &str) -> Result<bool, WaferError> {
-        let rows = db::list(
-            ctx,
-            TABLE,
-            &ListOptions {
-                columns: Some(vec!["enabled".into()]),
-                filters: vec![Filter {
-                    field: "block_name".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(block_name),
-                }],
-                skip_count: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-        Ok(rows
-            .records
-            .first()
-            .and_then(|r| r.data.get("enabled").and_then(|v| v.as_i64()))
-            .map(|v| v != 0)
-            .unwrap_or(true))
-    }
-
-    /// Persist the `enabled` flag for `block_name` in [`BLOCK_SETTINGS_TABLE`].
-    ///
-    /// Uses an upsert keyed on `block_name`, so it works whether or not a row
-    /// already exists.
-    ///
-    /// Routes through the structured [`db::upsert_by_field`] (get-by-field →
-    /// `update` | `create`) rather than a raw SQL upsert. The structured path
-    /// hits `DatabaseService::{create,update}`, which the Cloudflare
-    /// `KvCachedD1DatabaseService` invalidates — so toggling a block clears
-    /// the cached `block_settings` read (both the per-block key and the
-    /// full-table all-rows key). Block code has no raw-SQL path at all (no
-    /// `db::execute`/`db::query`), but the invalidation dependency on
-    /// `create`/`update` is the reason `set_enabled` stays structured instead
-    /// of being collapsed into a single atomic statement: an atomic upsert
-    /// would leave the eager `load_block_settings` cache stale until its TTL.
-    /// `created_at` is intentionally omitted: it is preserved on update and
-    /// synthesized by the backend on insert.
-    pub async fn set_enabled(
-        ctx: &dyn Context,
-        block_name: &str,
-        enabled: bool,
-    ) -> Result<(), String> {
-        let enabled_int: i64 = if enabled { 1 } else { 0 };
-        let mut data = super::json_map(serde_json::json!({
-            "block_name": block_name,
-            "enabled": enabled_int,
-            // Admin-UI write — mark this row as user-owned so the boot-time
-            // seed never overwrites it.
-            "seed_defaults_hash": crate::features::USER_EDITED_SENTINEL,
-        }));
-        crate::util::stamp_updated(&mut data);
-
-        db::upsert_by_field(
-            ctx,
-            TABLE,
-            "block_name",
-            serde_json::json!(block_name),
-            data,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("block_settings::set_enabled failed: {e}"))
-    }
-}
-
-// Table-name constants live in the leaf `crate::admin_schema` module (the
-// single source of truth, mirroring `messages_schema`); re-exported here so
-// existing `settings::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE}` and the nested
-// `super::BLOCK_SETTINGS_TABLE` references keep resolving.
-pub use crate::admin_schema::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE};
 
 /// `GET /b/admin/api/settings/all`.
 pub(super) async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
-    match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
-        Ok(records) => {
-            let vars: Vec<_> = records
+    match variables::list_all(ctx).await {
+        Ok(rows) => {
+            let vars: Vec<_> = rows
                 .iter()
-                .map(|record| {
-                    let key = record.str_field("key").to_string();
-                    let is_sensitive = ops::is_sensitive_key(&key, record.i64_field("sensitive"));
-                    let is_system = key.starts_with("WAFER_RUN_SHARED__");
+                .map(|row| {
+                    let is_sensitive = ops::is_sensitive_key(&row.key, i64::from(row.sensitive));
+                    let is_system = row.key.starts_with("WAFER_RUN_SHARED__");
                     // Mask sensitive values even in the "full" listing
                     let value = if is_sensitive {
                         MASKED_VALUE.to_string()
                     } else {
-                        record.str_field("value").to_string()
+                        row.value.clone()
                     };
                     serde_json::json!({
-                        "key": key,
-                        "name": record.str_field("name"),
-                        "description": record.str_field("description"),
+                        "key": row.key,
+                        "name": row.name,
+                        "description": row.description,
                         "value": value,
-                        "warning": record.str_field("warning"),
+                        "warning": row.warning,
                         "sensitive": is_sensitive,
                         "system": is_system,
-                        "updated_at": record.str_field("updated_at"),
+                        "updated_at": row.updated_at,
                     })
                 })
                 .collect();
@@ -142,34 +50,27 @@ pub(super) async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
 
 /// `GET /b/admin/api/settings`.
 pub(super) async fn handle_list(ctx: &dyn Context) -> OutputStream {
-    match db::list_all(ctx, VARIABLES_TABLE, vec![]).await {
-        Ok(records) => {
+    match variables::list_all(ctx).await {
+        Ok(rows) => {
             // Collected into a `BTreeMap` first, then flattened: the
             // response is a public contract, and a randomized key order made
             // two identical reads differ byte for byte.
             let mut by_key = BTreeMap::new();
-            for record in &records {
-                let key = record.str_field("key");
-                let sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
+            for row in &rows {
+                let sensitive = ops::is_sensitive_key(&row.key, i64::from(row.sensitive));
                 let value = if sensitive {
-                    serde_json::Value::String(MASKED_VALUE.to_string())
+                    MASKED_VALUE.to_string()
                 } else {
-                    record
-                        .data
-                        .get("value")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null)
+                    row.value.clone()
                 };
-                if !key.is_empty() {
-                    by_key.insert(
-                        key.to_string(),
-                        AdminSettingView {
-                            key: key.to_string(),
-                            value,
-                            sensitive,
-                        },
-                    );
-                }
+                by_key.insert(
+                    row.key.clone(),
+                    AdminSettingView {
+                        key: row.key.clone(),
+                        value: serde_json::Value::String(value),
+                        sensitive,
+                    },
+                );
             }
             ok_json(&AdminSettingsResponse {
                 settings: by_key.into_values().collect(),
@@ -187,28 +88,23 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
         return err_bad_request("Missing setting key");
     }
 
-    match db::get_by_field(
-        ctx,
-        VARIABLES_TABLE,
-        "key",
-        serde_json::Value::String(key.to_string()),
-    )
-    .await
-    {
-        Ok(mut record) => {
+    match variables::get_by_key(ctx, key).await {
+        Ok(Some(mut row)) => {
             // SEC-060: mask on the row flag OR the `_SECRET` / `_KEY` suffix —
             // the single-key getter previously masked on the flag alone, so a
             // `*_SECRET` key with the flag unset leaked its value here.
-            let is_sensitive = ops::is_sensitive_key(key, record.i64_field("sensitive"));
-            if is_sensitive {
-                record.data.insert(
-                    "value".to_string(),
-                    serde_json::Value::String(MASKED_VALUE.to_string()),
-                );
+            if ops::is_sensitive_key(key, i64::from(row.sensitive)) {
+                row.value = MASKED_VALUE.to_string();
             }
-            ok_json(&record)
+            // The row is echoed in the `{id, data}` record envelope this
+            // endpoint has always published; it is declared without a schema
+            // until it is typed.
+            ok_json(&db::Record {
+                id: row.id.clone(),
+                data: row.to_data(),
+            })
         }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Setting not found"),
+        Ok(None) => err_not_found("Setting not found"),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -256,7 +152,12 @@ pub(super) async fn handle_set(
     )
     .await
     {
-        Ok(record) => ok_json(&record),
+        // Echoed in the `{id, data}` record envelope this endpoint has
+        // always published; declared without a schema until it is typed.
+        Ok(row) => ok_json(&db::Record {
+            id: row.id.clone(),
+            data: row.to_data(),
+        }),
         Err(out) => out,
     }
 }
@@ -297,7 +198,12 @@ pub(super) async fn handle_create(
     )
     .await
     {
-        Ok(record) => ok_json(&record),
+        // Echoed in the `{id, data}` record envelope this endpoint has
+        // always published; declared without a schema until it is typed.
+        Ok(row) => ok_json(&db::Record {
+            id: row.id.clone(),
+            data: row.to_data(),
+        }),
         Err(out) => out,
     }
 }
@@ -314,19 +220,13 @@ pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStr
         return err_bad_request(&format!("Cannot delete shared system variable: {key}"));
     }
 
-    match db::get_by_field(
-        ctx,
-        VARIABLES_TABLE,
-        "key",
-        serde_json::Value::String(key.to_string()),
-    )
-    .await
-    {
-        Ok(record) => match db::delete(ctx, VARIABLES_TABLE, &record.id).await {
-            Ok(_) => ok_json(&serde_json::json!({"deleted": key})),
+    match variables::get_by_key(ctx, key).await {
+        Ok(Some(row)) => match variables::delete(ctx, &row.id).await {
+            Ok(()) => ok_json(&serde_json::json!({"deleted": key})),
             Err(e) => err_internal("Database error", e),
         },
-        Err(_) => err_not_found("Setting not found"),
+        Ok(None) => err_not_found("Setting not found"),
+        Err(e) => err_internal("Database error", e),
     }
 }
 
@@ -394,19 +294,15 @@ pub async fn seed_defaults(ctx: &dyn Context) {
     // bulk failure we treat every key as missing, which falls into the
     // create-with-INSERT-OR-IGNORE-equivalent path; consistent with the
     // prior code's silent-on-error stance.
-    let existing: HashMap<String, _> = db::list_all(ctx, VARIABLES_TABLE, vec![])
+    let existing: HashMap<String, _> = variables::list_all(ctx)
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|record| (record.str_field("key").to_string(), record))
+        .map(|row| (row.key.clone(), row))
         .collect();
 
     for var in &vars {
-        let sensitive: i32 = if var.input_type == InputType::Password {
-            1
-        } else {
-            0
-        };
+        let sensitive = var.input_type == InputType::Password;
         let name = if var.name.is_empty() {
             &var.key
         } else {
@@ -414,7 +310,7 @@ pub async fn seed_defaults(ctx: &dyn Context) {
         };
 
         match existing.get(&var.key) {
-            Some(record) => {
+            Some(row) => {
                 // A stored value pointing at our own `/b/static/` route for a
                 // file this build does not serve is a stale pointer *this
                 // function wrote*: built-in asset URLs carry a content hash
@@ -434,45 +330,37 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 // it no longer matches. Scoped to the built-in route by
                 // `is_stale_builtin_asset_url`, so a white-labelled URL is
                 // never touched.
-                let stale_builtin_asset =
-                    crate::ui::assets::is_stale_builtin_asset_url(record.str_field("value"));
+                let stale_builtin_asset = crate::ui::assets::is_stale_builtin_asset_url(&row.value);
 
                 // Only refresh metadata when at least one declared field
                 // actually differs. Without this guard every isolate cold-start
                 // re-writes every shared config var (~80 vars × cold-starts/day
                 // ≈ ~900 useless UPDATEs/day in prod).
-                let same_name = record.str_field("name") == name.as_str();
-                let same_desc = record.str_field("description") == var.description;
-                let same_warn = record.str_field("warning") == var.warning;
-                let same_sens = record.i64_field("sensitive") == sensitive as i64;
+                let same_name = row.name == *name;
+                let same_desc = row.description == var.description;
+                let same_warn = row.warning == var.warning;
+                let same_sens = row.sensitive == sensitive;
                 if same_name && same_desc && same_warn && same_sens && !stale_builtin_asset {
                     continue;
                 }
-                let mut fields = serde_json::json!({
-                    "name": name,
-                    "description": var.description,
-                    "warning": var.warning,
-                    "sensitive": sensitive,
-                });
+                let mut patch = VariablePatch {
+                    name: Some(name.clone()),
+                    description: Some(var.description.clone()),
+                    warning: Some(var.warning.clone()),
+                    sensitive: Some(sensitive),
+                    ..Default::default()
+                };
                 if stale_builtin_asset {
                     tracing::warn!(
                         key = %var.key,
-                        stale = %record.str_field("value"),
+                        stale = %row.value,
                         repaired_to = %var.default,
                         "repaired a persisted URL for a built-in asset this build \
                          no longer serves; reset to the declared default"
                     );
-                    fields["value"] = serde_json::Value::String(var.default.clone());
+                    patch.value = Some(var.default.clone());
                 }
-                let data = json_map(fields);
-                let _ = db::upsert_by_field(
-                    ctx,
-                    VARIABLES_TABLE,
-                    "key",
-                    serde_json::Value::String(var.key.clone()),
-                    data,
-                )
-                .await;
+                let _ = variables::upsert_by_key(ctx, &var.key, patch).await;
             }
             None => {
                 // Seed from process env when set (lets `.env` bootstrap a
@@ -484,16 +372,20 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| var.default.clone());
                 if !seed_value.is_empty() {
-                    let data = json_map(serde_json::json!({
-                        "key": var.key,
-                        "name": name,
-                        "description": var.description,
-                        "value": seed_value,
-                        "warning": var.warning,
-                        "sensitive": sensitive,
-                        "created_at": crate::util::now_rfc3339()
-                    }));
-                    let _ = db::create(ctx, VARIABLES_TABLE, data).await;
+                    let _ = variables::insert(
+                        ctx,
+                        NewVariable {
+                            key: var.key.clone(),
+                            value: seed_value,
+                            name: name.clone(),
+                            description: var.description.clone(),
+                            warning: var.warning.clone(),
+                            sensitive,
+                            updated_by: String::new(),
+                            block: variables::block_for_key(&var.key),
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -506,16 +398,12 @@ pub async fn seed_defaults(ctx: &dyn Context) {
     // we paid this run). Matches the "silent on error" stance of the
     // per-var upsert/create calls above; the `block_settings` row may not
     // exist yet (admin migrations create it on the same `Init` pass),
-    // which is why we use `upsert_block_settings_fields` rather than
-    // assuming a row.
-    let mut patch = std::collections::HashMap::new();
-    patch.insert(
-        "seed_defaults_hash".to_string(),
-        serde_json::Value::String(code_hash),
-    );
-    if let Err(e) =
-        crate::migration_helper::upsert_block_settings_fields(ctx, ADMIN_BLOCK_NAME, patch).await
-    {
+    // which is why we use `upsert_fields` rather than assuming a row.
+    let patch = BlockSettingsPatch {
+        seed_defaults_hash: Some(code_hash),
+        ..Default::default()
+    };
+    if let Err(e) = block_settings::upsert_fields(ctx, ADMIN_BLOCK_NAME, patch).await {
         tracing::warn!(
             err = %e,
             "seed_defaults: failed to stamp seed_defaults_hash; next cold start will re-run the bulk list_all"
@@ -525,25 +413,26 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
 #[cfg(test)]
 mod tests {
-    use wafer_block::db::{Filter, FilterOp};
-
     use super::*;
-    use crate::test_support::{FailingDbOpContext, TestContext};
+    use crate::test_support::TestContext;
 
     /// Seed one `variables` row with an explicit `sensitive` flag.
-    async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
-        let mut data = json_map(serde_json::json!({
-            "key": key,
-            "name": key,
-            "description": "",
-            "value": value,
-            "warning": "",
-            "sensitive": sensitive,
-        }));
-        crate::util::stamp_created(&mut data);
-        db::create(ctx, VARIABLES_TABLE, data)
-            .await
-            .expect("seed variable");
+    async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: bool) {
+        variables::insert(
+            ctx,
+            NewVariable {
+                key: key.to_string(),
+                value: value.to_string(),
+                name: key.to_string(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive,
+                updated_by: String::new(),
+                block: variables::block_for_key(key),
+            },
+        )
+        .await
+        .expect("seed variable");
     }
 
     /// `GET /b/admin/api/settings` never publishes a secret value.
@@ -561,13 +450,13 @@ mod tests {
             .expect("apply admin migrations");
 
         // Not sensitive: no flag, no suffix.
-        seed_var(&ctx, "SITE_NAME", "Acme", 0).await;
+        seed_var(&ctx, "SITE_NAME", "Acme", false).await;
         // Sensitive by suffix alone (SEC-060): the flag is clear.
-        seed_var(&ctx, "STRIPE_SECRET", "sk_live_realsecret", 0).await;
-        seed_var(&ctx, "MAILGUN_API_KEY", "key-realsecret", 0).await;
+        seed_var(&ctx, "STRIPE_SECRET", "sk_live_realsecret", false).await;
+        seed_var(&ctx, "MAILGUN_API_KEY", "key-realsecret", false).await;
         // Sensitive by flag alone: `InputType::Password` vars carry neither
         // suffix, and `seed_defaults` is what sets their flag.
-        seed_var(&ctx, "BOOTSTRAP_ADMIN_PASSWORD", "hunter2", 1).await;
+        seed_var(&ctx, "BOOTSTRAP_ADMIN_PASSWORD", "hunter2", true).await;
 
         let body = crate::test_support::output_json(handle_list(&ctx).await).await;
         let by_key: std::collections::HashMap<&str, &serde_json::Value> = body["settings"]
@@ -669,7 +558,7 @@ mod tests {
 
         // 2. First seed run — populates variables + stamps the hash row.
         seed_defaults(&ctx).await;
-        let var_count_after_first = db::list_all(&ctx, VARIABLES_TABLE, vec![])
+        let var_count_after_first = variables::list_all(&ctx)
             .await
             .expect("list variables")
             .len();
@@ -679,23 +568,18 @@ mod tests {
         );
 
         // 3. Read the stamped hash from the block_settings row directly.
-        let admin_rows = db::list_all(
-            &ctx,
-            crate::blocks::admin::settings::BLOCK_SETTINGS_TABLE,
-            vec![Filter {
-                field: "block_name".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(ADMIN_BLOCK_NAME.to_string()),
-            }],
-        )
-        .await
-        .expect("list block_settings");
+        let admin_rows: Vec<_> = block_settings::list_all(&ctx)
+            .await
+            .expect("list block_settings")
+            .into_iter()
+            .filter(|row| row.block_name == ADMIN_BLOCK_NAME)
+            .collect();
         assert_eq!(
             admin_rows.len(),
             1,
             "admin block_settings row should be present after first seed_defaults"
         );
-        let stamped_hash = admin_rows[0].str_field("seed_defaults_hash").to_string();
+        let stamped_hash = admin_rows[0].seed_defaults_hash.clone();
         let code_hash = seed_payload_hash(&crate::config_vars::shared_config_vars());
         assert_eq!(
             stamped_hash, code_hash,
@@ -719,7 +603,7 @@ mod tests {
         // 5. seed_defaults should short-circuit before any list_all on
         //    variables — leaving the (empty) variables table untouched.
         seed_defaults(&next_ctx).await;
-        let var_count_after_second = db::list_all(&next_ctx, VARIABLES_TABLE, vec![])
+        let var_count_after_second = variables::list_all(&next_ctx)
             .await
             .expect("list variables on next ctx")
             .len();
@@ -751,116 +635,13 @@ mod tests {
         ctx.set_config(crate::features::BLOCK_SETTINGS_CONFIG_KEY, &snapshot);
 
         seed_defaults(&ctx).await;
-        let count = db::list_all(&ctx, VARIABLES_TABLE, vec![])
+        let count = variables::list_all(&ctx)
             .await
             .expect("list variables")
             .len();
         assert!(
             count > 0,
             "mismatched snapshot hash should still run the seed; got 0 rows"
-        );
-    }
-
-    /// `block_settings::is_enabled` defaults to `true` when no row exists.
-    #[tokio::test]
-    async fn block_settings_is_enabled_defaults_to_true_when_no_row() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-
-        let enabled = block_settings::is_enabled(&ctx, "impresspress/nonexistent")
-            .await
-            .expect("no row is not an error");
-        assert!(
-            enabled,
-            "is_enabled should return true when no block_settings row exists"
-        );
-    }
-
-    /// A read failure is not "enabled": the toggle handler writes the
-    /// opposite of whatever this returns, so an outage must be an error.
-    #[tokio::test]
-    async fn block_settings_is_enabled_surfaces_read_errors() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-        let failing = FailingDbOpContext::new(ctx, vec![("database.list", BLOCK_SETTINGS_TABLE)]);
-
-        assert!(
-            block_settings::is_enabled(&failing, "impresspress/files")
-                .await
-                .is_err(),
-            "an unreadable block_settings table must not read as enabled"
-        );
-    }
-
-    /// `block_settings::set_enabled` stamps `seed_defaults_hash` with the
-    /// [`USER_EDITED_SENTINEL`] so the boot-time seed will never clobber an
-    /// admin-UI toggle. See `plan_seed_decisions` in `features.rs`.
-    #[tokio::test]
-    async fn block_settings_set_enabled_marks_row_user_edited() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-
-        let name = "impresspress/some-block";
-        block_settings::set_enabled(&ctx, name, false)
-            .await
-            .expect("set_enabled false");
-
-        let rows = db::list_all(
-            &ctx,
-            BLOCK_SETTINGS_TABLE,
-            vec![Filter {
-                field: "block_name".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(name.to_string()),
-            }],
-        )
-        .await
-        .expect("list block_settings");
-        assert_eq!(rows.len(), 1, "exactly one block_settings row for {name}");
-        assert_eq!(
-            rows[0].str_field("seed_defaults_hash"),
-            crate::features::USER_EDITED_SENTINEL,
-            "set_enabled must stamp seed_defaults_hash with the user-edited sentinel",
-        );
-    }
-
-    /// `block_settings::set_enabled` / `is_enabled` round-trip: write false,
-    /// read back false; write true, read back true.
-    #[tokio::test]
-    async fn block_settings_set_enabled_round_trip() {
-        let ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-
-        let name = "impresspress/some-block";
-
-        // Disable then read back.
-        block_settings::set_enabled(&ctx, name, false)
-            .await
-            .expect("set_enabled false");
-        assert!(
-            !block_settings::is_enabled(&ctx, name)
-                .await
-                .expect("read block setting"),
-            "is_enabled should return false after set_enabled(false)"
-        );
-
-        // Re-enable then read back.
-        block_settings::set_enabled(&ctx, name, true)
-            .await
-            .expect("set_enabled true");
-        assert!(
-            block_settings::is_enabled(&ctx, name)
-                .await
-                .expect("read block setting"),
-            "is_enabled should return true after set_enabled(true)"
         );
     }
 
@@ -877,16 +658,7 @@ mod tests {
             .expect("apply admin migrations");
 
         // Insert a *_SECRET row with the sensitive flag explicitly unset.
-        let mut data = json_map(serde_json::json!({
-            "key": "STRIPE_SECRET",
-            "value": "sk_live_supersecret",
-            "name": "Stripe secret",
-            "sensitive": 0,
-        }));
-        crate::util::stamp_created(&mut data);
-        db::create(&ctx, VARIABLES_TABLE, data)
-            .await
-            .expect("seed secret var");
+        seed_var(&ctx, "STRIPE_SECRET", "sk_live_supersecret", false).await;
 
         let msg = crate::blocks::admin::test_support::routed(admin_msg(
             "retrieve",
@@ -905,19 +677,10 @@ mod tests {
 
     /// Read one variable row's `value` column.
     async fn stored_value(ctx: &dyn Context, key: &str) -> Option<String> {
-        db::list_all(
-            ctx,
-            VARIABLES_TABLE,
-            vec![Filter {
-                field: "key".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(key.to_string()),
-            }],
-        )
-        .await
-        .expect("list variables")
-        .first()
-        .map(|r| r.str_field("value").to_string())
+        variables::get_by_key(ctx, key)
+            .await
+            .expect("get variable")
+            .map(|row| row.value)
     }
 
     /// Releases before the pixel-art mark seeded `LOGO_URL` with the built-in
@@ -938,7 +701,7 @@ mod tests {
             &ctx,
             crate::config_vars::LOGO_URL_KEY,
             "/b/static/impresspress-logo-long-1f4c8ab2.png",
-            0,
+            false,
         )
         .await;
 
@@ -993,7 +756,7 @@ mod tests {
             &ctx,
             crate::config_vars::LOGO_URL_KEY,
             "/b/static/impresspress-logo-long-1f4c8ab2.png",
-            0,
+            false,
         )
         .await;
 
@@ -1021,7 +784,7 @@ mod tests {
             &ctx,
             crate::config_vars::LOGO_URL_KEY,
             "https://acme.example/wordmark.png",
-            0,
+            false,
         )
         .await;
 
@@ -1056,14 +819,14 @@ mod tests {
             &ctx,
             "WAFER_RUN_SHARED__LOGO_ICON_URL",
             "/b/static/impresspress-logo-5e884a3a.png",
-            0,
+            false,
         )
         .await;
         seed_var(
             &ctx,
             "WAFER_RUN_SHARED__FAVICON_URL",
             "/b/static/favicon-2845a6ac.ico",
-            0,
+            false,
         )
         .await;
 
@@ -1095,7 +858,7 @@ mod tests {
             .expect("apply admin migrations");
 
         let current = crate::ui::assets::logo_icon_url();
-        seed_var(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL", &current, 0).await;
+        seed_var(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL", &current, false).await;
 
         seed_defaults(&ctx).await;
 
@@ -1110,8 +873,6 @@ mod tests {
 
 #[cfg(test)]
 mod create_tests {
-    use wafer_block::db::{Filter, FilterOp};
-    use wafer_core::clients::database as db;
     use wafer_run::InputStream;
 
     use super::*;
@@ -1125,21 +886,12 @@ mod create_tests {
         ctx
     }
 
-    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> i64 {
-        let rows = db::list_all(
-            ctx,
-            VARIABLES_TABLE,
-            vec![Filter {
-                field: "key".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(key),
-            }],
-        )
-        .await
-        .expect("list variables");
-        rows.first()
+    async fn sensitive_flag(ctx: &dyn Context, key: &str) -> bool {
+        variables::get_by_key(ctx, key)
+            .await
+            .expect("get variable")
             .unwrap_or_else(|| panic!("{key} was not created"))
-            .i64_field("sensitive")
+            .sensitive
     }
 
     async fn create(ctx: &dyn Context, body: serde_json::Value) {
@@ -1165,7 +917,7 @@ mod create_tests {
             serde_json::json!({"key": "SITE_MOTTO", "value": "move fast"}),
         )
         .await;
-        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 1);
+        assert!(sensitive_flag(&ctx, "SITE_MOTTO").await);
     }
 
     #[tokio::test]
@@ -1176,6 +928,6 @@ mod create_tests {
             serde_json::json!({"key": "SITE_MOTTO", "value": "move fast", "sensitive": false}),
         )
         .await;
-        assert_eq!(sensitive_flag(&ctx, "SITE_MOTTO").await, 0);
+        assert!(!sensitive_flag(&ctx, "SITE_MOTTO").await);
     }
 }

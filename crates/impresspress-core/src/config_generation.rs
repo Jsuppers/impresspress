@@ -4,7 +4,7 @@
 //! order, within one pass. `builder::boot` and `strict_init_all_blocks`
 //! initialize the admin block first; admin's `Init` runs its migrations and
 //! then `settings::seed_defaults`, and the Cloudflare boot hook follows with
-//! `boot::seed_auto_generated`. Every one of those inserts rows into the
+//! `platform_state::variables::seed_auto_generated`. Every one of those inserts rows into the
 //! variables table AFTER some other block has already resolved its config —
 //! the database service block, for one, is lazily initialized by admin's own
 //! seeding query and declares a config key of its own.
@@ -62,7 +62,7 @@ pub fn config_write_generation() -> u64 {
 /// per-block read amplification this whole mechanism exists to remove,
 /// reintroduced in the pass that can least afford it.
 pub fn writes_invalidate_config_snapshot(table: &str) -> bool {
-    table == crate::blocks::admin::VARIABLES_TABLE
+    table == crate::platform_state::variables::TABLE
 }
 
 #[cfg(test)]
@@ -99,10 +99,10 @@ mod tests {
     #[test]
     fn only_variables_writes_invalidate_the_snapshot() {
         assert!(writes_invalidate_config_snapshot(
-            crate::blocks::admin::VARIABLES_TABLE
+            crate::platform_state::variables::TABLE
         ));
         assert!(!writes_invalidate_config_snapshot(
-            crate::blocks::admin::BLOCK_SETTINGS_TABLE
+            crate::platform_state::block_settings::TABLE
         ));
         assert!(!writes_invalidate_config_snapshot("unrelated_table"));
 
@@ -110,7 +110,7 @@ mod tests {
         // stamp, or a runtime could rebuild from config no isolate is told
         // to re-read.
         assert!(crate::cache_key::bumps_config_version(
-            crate::blocks::admin::VARIABLES_TABLE
+            crate::platform_state::variables::TABLE
         ));
     }
 }

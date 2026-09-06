@@ -965,8 +965,9 @@ where
         .await?;
         let plan_draft = if prepare_plan && report.ok {
             let final_settings =
-                impresspress_core::features::load_block_settings(&built.db).await?;
-            let final_grants = impresspress_core::boot::load_wrap_grants_from_db(&built.db).await;
+                impresspress_core::platform_state::block_settings::load(&built.db).await?;
+            let final_grants =
+                impresspress_core::platform_state::wrap_grants::load(&built.db).await;
             built.plan_exporter.publish_block_settings(final_settings)?;
             built.plan_exporter.publish_wrap_grants(&final_grants)?;
             let identity = prepared_runtime_identity(&env)?;
@@ -1081,7 +1082,7 @@ struct BuiltRuntime {
 /// ignored. Shared by the request-path per-isolate cache
 /// (`runtime_cache::get_or_build`) and the `/_deploy/init` boot funnel.
 pub(crate) async fn apply_db_wrap_grants(built: &mut BuiltRuntime) {
-    let db_grants = impresspress_core::boot::load_wrap_grants_from_db(&built.db).await;
+    let db_grants = impresspress_core::platform_state::wrap_grants::load(&built.db).await;
     if !db_grants.is_empty() {
         built.wafer.add_wrap_grants(db_grants);
     }
@@ -1160,7 +1161,7 @@ where
                 .collect(),
         )
     } else {
-        impresspress_core::features::load_block_settings(&db).await?
+        impresspress_core::platform_state::block_settings::load(&db).await?
     };
 
     // 3. Build the ConfigService map. After dropping the D1 env_vars
@@ -1838,11 +1839,12 @@ struct CfBootHooks {
 #[wafer_block::wafer_async_trait]
 impl impresspress_core::builder::BootHooks for CfBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
-        impresspress_core::boot::seed_auto_generated(&self.db).await;
+        impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
 
-        let block_settings = impresspress_core::features::load_and_seed_block_settings(&self.db)
-            .await
-            .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
+        let block_settings =
+            impresspress_core::platform_state::block_settings::load_and_seed(&self.db)
+                .await
+                .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
         *self
             .block_settings_handle
             .write()

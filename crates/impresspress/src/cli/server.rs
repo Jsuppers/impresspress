@@ -159,7 +159,7 @@ pub async fn build_native_runtime(
 
     // Seed env/auto-gen/JWT variables + run the #222 block-settings hash-gate,
     // all through the shared `impresspress_core` seeders over the service.
-    let vars = impresspress_core::boot::seed_and_load_variables(&database, env_vars)
+    let vars = impresspress_core::platform_state::variables::seed_and_load(&database, env_vars)
         .await
         .map_err(|e| anyhow!("seed and load variables: {e}"))?;
     tracing::info!(vars = vars.len(), "variables loaded from database");
@@ -184,10 +184,10 @@ pub async fn build_native_runtime(
         ));
     }
     // A read error here is always a genuine operational failure (backend
-    // outage/corruption) — `load_and_seed_block_settings` never fabricates
+    // outage/corruption) — `block_settings::load_and_seed` never fabricates
     // "every block enabled" out of one. Bail rather than boot with a
     // security-relevant setting silently defaulted open.
-    let features = impresspress_core::features::load_and_seed_block_settings(&database)
+    let features = impresspress_core::platform_state::block_settings::load_and_seed(&database)
         .await
         .map_err(|e| anyhow!("load block settings: {e}"))?;
 
@@ -268,7 +268,7 @@ pub async fn build_native_runtime(
     //     backend is covered. (Reading `infra.db_path` as a SQLite file
     //     found nothing on Postgres, where that path is just the unused
     //     default.) The builder installs them before the runtime is sealed.
-    let db_grants = impresspress_core::boot::load_wrap_grants_from_db(&database).await;
+    let db_grants = impresspress_core::platform_state::wrap_grants::load(&database).await;
     if !db_grants.is_empty() {
         tracing::info!(
             count = db_grants.len(),

@@ -69,9 +69,9 @@ pub trait BootHooks {
     /// can't lose the `HashMap::keys()` race and permanent-fail on a missing
     /// secret — the impresspress #209 regression class).
     ///
-    /// Implementations call [`crate::boot::seed_auto_generated`] /
-    /// [`crate::boot::seed_and_load_variables`] /
-    /// [`crate::features::load_and_seed_block_settings`] as appropriate and
+    /// Implementations call [`crate::platform_state::variables::seed_auto_generated`] /
+    /// [`crate::platform_state::variables::seed_and_load`] /
+    /// [`crate::platform_state::block_settings::load_and_seed`] as appropriate and
     /// publish the results into the shared `ConfigService` / `BlockSettings`
     /// handle / crypto secret the runtime already holds.
     ///

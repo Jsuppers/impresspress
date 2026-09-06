@@ -1,9 +1,8 @@
 use maud::{html, Markup};
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::admin::WRAP_GRANTS_TABLE as WRAP_GRANTS,
+    platform_state::wrap_grants,
     ui::{components, icons},
 };
 
@@ -124,9 +123,7 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
 }
 
 pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
-    let grants = db::list_all(ctx, WRAP_GRANTS, vec![])
-        .await
-        .unwrap_or_default();
+    let grants = wrap_grants::list(ctx).await.unwrap_or_default();
 
     // Collect registered block names for the grantee dropdown
     let blocks = ctx.registered_blocks();
@@ -163,11 +160,11 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                         tbody {
                             @for grant in &grants {
                                 @let id = &grant.id;
-                                @let grantee = grant.data.get("grantee").and_then(|v| v.as_str()).unwrap_or("");
-                                @let resource = grant.data.get("resource").and_then(|v| v.as_str()).unwrap_or("");
-                                @let write = grant.data.get("write").map(|v| v.as_i64().unwrap_or(0) != 0 || v.as_str() == Some("1")).unwrap_or(false);
-                                @let rt = grant.data.get("resource_type").and_then(|v| v.as_str()).unwrap_or("");
-                                @let description = grant.data.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                @let grantee = grant.grantee.as_str();
+                                @let resource = grant.resource.as_str();
+                                @let write = grant.write;
+                                @let rt = grant.resource_type.as_str();
+                                @let description = grant.description.as_str();
                                 tr {
                                     td {
                                         @if grantee == "*" {
@@ -439,30 +436,12 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
     }
 
     // 2. Custom DB grants
-    let custom_grants = db::list_all(ctx, WRAP_GRANTS, vec![])
-        .await
-        .unwrap_or_default();
+    let custom_grants = wrap_grants::list(ctx).await.unwrap_or_default();
     for grant in &custom_grants {
-        let grantee = grant
-            .data
-            .get("grantee")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let resource = grant
-            .data
-            .get("resource")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let write = grant
-            .data
-            .get("write")
-            .map(|v| v.as_i64().unwrap_or(0) != 0 || v.as_str() == Some("1"))
-            .unwrap_or(false);
-        let rt = grant
-            .data
-            .get("resource_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let grantee = grant.grantee.as_str();
+        let resource = grant.resource.as_str();
+        let write = grant.write;
+        let rt = grant.resource_type.as_str();
         let type_label = if rt.is_empty() {
             "DB/Config"
         } else {

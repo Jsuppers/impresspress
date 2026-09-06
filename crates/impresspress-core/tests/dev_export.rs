@@ -25,7 +25,6 @@
 use std::{collections::HashMap, io::Read as _};
 
 use impresspress_core::{
-    admin_schema,
     blocks::dev::{
         activation::{self, ActivationIntent},
         blobs,
@@ -35,6 +34,7 @@ use impresspress_core::{
         seed::{self, SeedManifest},
         test_support::{FakeControl, FakeShell},
     },
+    platform_state::variables,
     test_support::{
         admin_msg, anon_msg, output_body, output_http_header, output_http_status, output_json,
         TestContext,
@@ -855,7 +855,7 @@ async fn the_manifest_describes_the_archive_entry_for_entry() {
     assert_eq!(manifest.tables[PRODUCTS_TABLE], 1);
     // Every allowlisted table is reported, empty ones included — "no
     // products" and "no products table in this build" must not read the same.
-    assert!(manifest.tables.contains_key(admin_schema::VARIABLES_TABLE));
+    assert!(manifest.tables.contains_key(variables::TABLE));
 }
 
 /// Nothing published, nothing to export — and the refusal says what to do

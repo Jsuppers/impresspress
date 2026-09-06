@@ -70,7 +70,6 @@
 //! activation.
 
 use serde::{Deserialize, Serialize};
-use wafer_core::clients::database as db;
 use wafer_run::context::Context;
 
 use super::{
@@ -84,6 +83,8 @@ use super::{
     validation,
     workspace::{self, Workspace},
 };
+// audit-allow: the dev block grants itself this table — `dev::wrap_grants()` maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)`, which the runtime honours from its flat grant list; the audit attributes grants to the declaring file's block and so cannot see it
+use crate::platform_state::variables::{self, VariablePatch};
 
 /// Seed-manifest schema version this build reads.
 ///
@@ -722,43 +723,23 @@ const SEED_ERROR_DESCRIPTION: &str =
 /// site that no later boot retries (the failed generation is in the ledger, so
 /// `is_fresh` is false from then on).
 pub async fn record_failure(ctx: &dyn Context, message: &str) {
-    let now = crate::util::now_rfc3339();
-    let row: Vec<(String, serde_json::Value)> = vec![
-        // `db::upsert` writes `data` verbatim — unlike `db::create` it
-        // synthesizes no `id` — and `id` is this table's `TEXT PRIMARY KEY`,
-        // so the row has to carry one or the INSERT writes a NULL key (or is
-        // refused outright on Postgres). Discarded on the conflict path: `id`
-        // is not in the update set, so a second refusal keeps the first row's.
-        ("id".to_string(), uuid::Uuid::new_v4().to_string().into()),
-        ("key".to_string(), SEED_ERROR_KEY.into()),
-        ("value".to_string(), message.into()),
-        ("name".to_string(), SEED_ERROR_NAME.into()),
-        ("description".to_string(), SEED_ERROR_DESCRIPTION.into()),
-        (
-            "block".to_string(),
-            crate::config_vars::key_block_prefix(SEED_ERROR_KEY).into(),
-        ),
-        // Not a secret: it is a diagnostic about this instance's own boot, and
-        // masking it would hide the one thing it exists to say.
-        ("sensitive".to_string(), 0.into()),
-        ("created_at".to_string(), now.clone().into()),
-        ("updated_at".to_string(), now.into()),
-    ];
-    // `key` is the table's `UNIQUE` column, so this is the atomic upsert and
-    // not the get-then-create race: a boot that fails twice updates one row.
-    // `created_at` is deliberately not in the update set — the row's age is
-    // when the first refusal happened.
-    let written = db::upsert(
+    // `key` is the table's `UNIQUE` column and `upsert_by_key` is the one
+    // write path every platform shares (the Cloudflare row cache refuses the
+    // atomic upsert on this table); a boot that fails twice updates one row.
+    // `created_at` is not in the patch — the row's age is when the first
+    // refusal happened.
+    let written = variables::upsert_by_key(
         ctx,
-        crate::admin_schema::VARIABLES_TABLE,
-        row,
-        vec!["key".to_string()],
-        wafer_block::wire::database::OnConflict::SetColumns(vec![
-            "value".to_string(),
-            "name".to_string(),
-            "description".to_string(),
-            "updated_at".to_string(),
-        ]),
+        SEED_ERROR_KEY,
+        VariablePatch {
+            value: Some(message.to_string()),
+            name: Some(SEED_ERROR_NAME.to_string()),
+            description: Some(SEED_ERROR_DESCRIPTION.to_string()),
+            // Not a secret: it is a diagnostic about this instance's own
+            // boot, and masking it would hide the one thing it exists to say.
+            sensitive: Some(false),
+            ..Default::default()
+        },
     )
     .await;
     if let Err(e) = written {
@@ -776,16 +757,7 @@ pub async fn record_failure(ctx: &dyn Context, message: &str) {
 /// carry an empty explanation of a failure that is over. Deleting a key with
 /// no row affects nothing, which is what makes this callable unconditionally.
 async fn clear_failure(ctx: &dyn Context) {
-    let cleared = db::delete_by_filters(
-        ctx,
-        crate::admin_schema::VARIABLES_TABLE,
-        vec![wafer_block::db::Filter {
-            field: "key".to_string(),
-            operator: wafer_block::db::FilterOp::Equal,
-            value: serde_json::Value::String(SEED_ERROR_KEY.to_string()),
-        }],
-    )
-    .await;
+    let cleared = variables::delete_by_key(ctx, SEED_ERROR_KEY).await;
     if let Err(e) = cleared {
         tracing::error!(
             error = %e.message,
@@ -802,23 +774,10 @@ async fn clear_failure(ctx: &dyn Context) {
 /// writes this runs, so a config read would answer with the previous boot's
 /// answer to a question about this one.
 pub async fn last_failure(ctx: &dyn Context) -> Result<Option<String>, wafer_run::WaferError> {
-    match db::get_by_field(
-        ctx,
-        crate::admin_schema::VARIABLES_TABLE,
-        "key",
-        serde_json::Value::String(SEED_ERROR_KEY.to_string()),
-    )
-    .await
-    {
-        Ok(record) => Ok(record
-            .data
-            .get("value")
-            .and_then(|value| value.as_str())
-            .filter(|message| !message.is_empty())
-            .map(str::to_string)),
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    Ok(variables::get_by_key(ctx, SEED_ERROR_KEY)
+        .await?
+        .map(|row| row.value)
+        .filter(|message| !message.is_empty()))
 }
 
 /// Store one verified file's bytes and record it in the workspace under

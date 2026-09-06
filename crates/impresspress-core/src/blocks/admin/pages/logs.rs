@@ -5,7 +5,8 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
 use crate::{
-    blocks::admin::{AUDIT_LOGS_TABLE as AUDIT_LOGS, REQUEST_LOGS_TABLE as REQUEST_LOGS},
+    blocks::admin::AUDIT_LOGS_TABLE as AUDIT_LOGS,
+    platform_state::request_logs,
     ui::{
         components::{self, pagination},
         icons,
@@ -84,28 +85,7 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
     let (page, page_size, _) = msg.pagination_params(50);
     let search = msg.query("search").to_string();
 
-    let mut filters = Vec::new();
-    if !search.is_empty() {
-        filters.push(Filter {
-            field: "path".into(),
-            operator: FilterOp::Like,
-            value: serde_json::Value::String(format!("%{search}%")),
-        });
-    }
-
-    let sort = vec![SortField {
-        field: "created_at".into(),
-        desc: true,
-    }];
-    let result = db::paginated_list(
-        ctx,
-        REQUEST_LOGS,
-        page as i64,
-        page_size as i64,
-        filters,
-        sort,
-    )
-    .await;
+    let result = request_logs::paginated(ctx, page as i64, page_size as i64, &search).await;
 
     html! {
         div .filter-bar {
@@ -127,19 +107,19 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                             }
                         }
                         tbody {
-                            @if list.records.is_empty() {
+                            @if list.rows.is_empty() {
                                 tr {
                                     td colspan="6" .text-center .text-muted .p-8 { "No request logs yet" }
                                 }
                             }
-                            @for record in &list.records {
-                                @let status = record.str_field("status");
-                                @let method = record.str_field("method");
-                                @let path = record.str_field("path");
-                                @let duration = record.i64_field("duration_ms");
-                                @let user_id = record.str_field("user_id");
-                                @let created = record.str_field("created_at");
-                                @let status_code = record.i64_field("status_code");
+                            @for row in &list.rows {
+                                @let status = row.status.as_str();
+                                @let method = row.method.as_str();
+                                @let path = row.path.as_str();
+                                @let duration = row.duration_ms;
+                                @let user_id = row.user_id.as_str();
+                                @let created = row.created_at.as_str();
+                                @let status_code = row.status_code;
                                 tr {
                                     td {
                                         span .badge .(if status == "ERROR" { "badge-danger" } else if status_code >= 400 { "badge-warning" } else { "badge-success" }) {

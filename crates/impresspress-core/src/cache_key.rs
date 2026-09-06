@@ -6,7 +6,7 @@
 //! logic lives here so it's host-testable; `impresspress-cloudflare` is
 //! excluded from `cargo test --workspace`.
 
-use crate::blocks::admin::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE, WRAP_GRANTS_TABLE};
+use crate::platform_state::{block_settings, variables, wrap_grants};
 
 /// Tables that this wrapper caches in KV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,8 +20,8 @@ pub enum CachedTable {
 /// Returns Some when `table` is one of the cached tables.
 pub fn classify_table(table: &str) -> Option<CachedTable> {
     match table {
-        t if t == VARIABLES_TABLE => Some(CachedTable::Variables),
-        t if t == BLOCK_SETTINGS_TABLE => Some(CachedTable::BlockSettings),
+        t if t == variables::TABLE => Some(CachedTable::Variables),
+        t if t == block_settings::TABLE => Some(CachedTable::BlockSettings),
         _ => None,
     }
 }
@@ -38,7 +38,7 @@ pub const CONFIG_VERSION_KEY: &str = "cfg:v1:config_version";
 /// grants at build). Tables read fresh per request (roles, permissions,
 /// user_roles) do NOT bump.
 pub fn bumps_config_version(table: &str) -> bool {
-    table == VARIABLES_TABLE || table == BLOCK_SETTINGS_TABLE || table == WRAP_GRANTS_TABLE
+    table == variables::TABLE || table == block_settings::TABLE || table == wrap_grants::TABLE
 }
 
 use wafer_block::db::{Filter, FilterOp, ListOptions};
@@ -49,7 +49,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions};
 const FULL_LIMIT_THRESHOLD: i64 = 10_000;
 
 /// Reserved cache-key value for the full-table `block_settings` read —
-/// `runner::load_block_settings`'s eager filterless list. Real block names
+/// `platform_state::block_settings::load`'s eager filterless list. Real block names
 /// are always `{org}/{block}` (slash-delimited), so this slash-free
 /// sentinel can never collide with a per-block key.
 const ALL_ROWS_SENTINEL: &str = "__all__";
@@ -104,7 +104,7 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
 /// Two callers with deliberately different outcomes, both served by this one
 /// constructor so the shape cannot drift between them:
 ///
-/// - [`crate::features::load_block_settings`]'s full-table read — recognized
+/// - [`crate::platform_state::block_settings::load`]'s full-table read — recognized
 ///   by [`read_key`] and cached under the `__all__` sentinel;
 /// - `D1ConfigSource`'s single variables snapshot — deliberately NOT cached
 ///   (see `read_key`'s zero-filter arm, and the test that pins it). One
@@ -124,7 +124,7 @@ pub fn full_table_list_opts() -> ListOptions {
 /// Returns Some(kv_key) iff `opts` matches a cacheable read shape:
 /// either the canonical "load all rows for one block" single-filter shape,
 /// or — for `block_settings` only — the eager filterless full-table read
-/// (`runner::load_block_settings`).
+/// (`platform_state::block_settings::load`).
 pub fn read_key(table: CachedTable, opts: &ListOptions) -> Option<String> {
     // Shape gate shared by both read kinds: an unsorted, unpaginated,
     // count-skipping "give me every matching row" list.
@@ -757,8 +757,8 @@ mod tests {
     fn every_classified_table_bumps_config_version() {
         for table in [CachedTable::Variables, CachedTable::BlockSettings] {
             let table_name = match table {
-                CachedTable::Variables => VARIABLES_TABLE,
-                CachedTable::BlockSettings => BLOCK_SETTINGS_TABLE,
+                CachedTable::Variables => variables::TABLE,
+                CachedTable::BlockSettings => block_settings::TABLE,
             };
             assert_eq!(
                 classify_table(table_name),

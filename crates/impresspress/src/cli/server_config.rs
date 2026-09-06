@@ -20,8 +20,8 @@ pub fn filter_to_declared_keys(env_vars: HashMap<String, String>) -> Vec<(String
 }
 
 // Block-settings loading + the #222 hash-gate seed are handled by the shared
-// `impresspress_core::features::load_and_seed_block_settings`, and admin-created
-// WRAP grants by `impresspress_core::boot::load_wrap_grants_from_db`, both over
+// `impresspress_core::platform_state::block_settings::load_and_seed`, and admin-created
+// WRAP grants by `impresspress_core::platform_state::wrap_grants::load`, both over
 // the platform `DatabaseService` (see `server.rs::build_native_runtime`). The
 // previous native-only readers opened `IMPRESSPRESS_DB_PATH` as a SQLite file
 // directly, which no other target does and which finds nothing on Postgres.

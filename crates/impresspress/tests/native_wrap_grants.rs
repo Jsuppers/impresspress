@@ -60,7 +60,7 @@ async fn wrap_grants_are_read_through_the_database_service() {
     grant.insert("write".into(), serde_json::json!(1));
     grant.insert("resource_type".into(), serde_json::json!("db"));
     database
-        .create(impresspress_core::blocks::admin::WRAP_GRANTS_TABLE, grant)
+        .create(impresspress_core::platform_state::wrap_grants::TABLE, grant)
         .await
         .expect("seed grant");
 

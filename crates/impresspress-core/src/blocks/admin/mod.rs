@@ -8,9 +8,8 @@ mod pages;
 mod settings;
 mod users;
 
-pub(crate) use iam::{PERMISSIONS_TABLE, ROLES_TABLE, USER_ROLES_TABLE};
-pub(crate) use logs::{AUDIT_LOGS_TABLE, REQUEST_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
-pub use settings::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE};
+pub(crate) use iam::{PERMISSIONS_TABLE, ROLES_TABLE};
+pub(crate) use logs::{AUDIT_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
 
 /// Registered name of the admin block.
 ///
@@ -20,9 +19,6 @@ pub use settings::{BLOCK_SETTINGS_TABLE, VARIABLES_TABLE};
 /// have run before the runner seeds `auto_generate` secrets).
 pub const ADMIN_BLOCK_ID: &str = "impresspress/admin";
 
-/// WRAP grant rows (block-to-resource access tokens).
-pub const WRAP_GRANTS_TABLE: &str = "impresspress__admin__wrap_grants";
-
 use wafer_run::{
     context::Context, BlockInfo, ErrorCode, HttpMethod, InputStream, InstanceMode, Message,
     OutputStream,
@@ -31,6 +27,7 @@ use wafer_run::{
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
+    platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
 
 /// Path-parameter schema for the `/iam/roles/{id}` routes.
@@ -512,16 +509,16 @@ crate::impresspress_feature_block! {
             .collections(vec![
                 CollectionSchema::new(ROLES_TABLE),
                 CollectionSchema::new(PERMISSIONS_TABLE),
-                CollectionSchema::new(USER_ROLES_TABLE),
-                CollectionSchema::new(VARIABLES_TABLE),
+                CollectionSchema::new(user_roles::TABLE),
+                CollectionSchema::new(variables::TABLE),
                 CollectionSchema::new(AUDIT_LOGS_TABLE),
-                CollectionSchema::new(REQUEST_LOGS_TABLE),
+                CollectionSchema::new(request_logs::TABLE),
                 CollectionSchema::new(STORAGE_ACCESS_LOGS_TABLE),
-                CollectionSchema::new(BLOCK_SETTINGS_TABLE),
-                CollectionSchema::new(WRAP_GRANTS_TABLE),
+                CollectionSchema::new(block_settings::TABLE),
+                CollectionSchema::new(wrap_grants::TABLE),
             ])
             .grants(vec![
-                wafer_run::ResourceGrant::read_write(super::auth::AUTH_BLOCK_ID, USER_ROLES_TABLE),
+                wafer_run::ResourceGrant::read_write(super::auth::AUTH_BLOCK_ID, user_roles::TABLE),
                 // auth-ui's login/refresh/OAuth-callback handlers call the
                 // shared `ensure_admin_role`/`get_user_roles` helpers
                 // directly (not via the framework `wafer-run/auth`
@@ -532,15 +529,13 @@ crate::impresspress_feature_block! {
                 // previously silently swallowed into an empty roles list).
                 wafer_run::ResourceGrant::read_write(
                     super::auth_ui::AUTH_UI_BLOCK_ID,
-                    USER_ROLES_TABLE,
+                    user_roles::TABLE,
                 ),
-                wafer_run::ResourceGrant::read(super::auth::AUTH_BLOCK_ID, VARIABLES_TABLE),
-                wafer_run::ResourceGrant::read("impresspress/userportal", BLOCK_SETTINGS_TABLE),
                 // Every block may upsert its own migration state into block_settings.
-                wafer_run::ResourceGrant::read_write("*", BLOCK_SETTINGS_TABLE),
+                wafer_run::ResourceGrant::read_write("*", block_settings::TABLE),
                 // Infrastructure logging: storage wrapper + pipeline write logs
                 wafer_run::ResourceGrant::read_write("*", STORAGE_ACCESS_LOGS_TABLE),
-                wafer_run::ResourceGrant::read_write("*", REQUEST_LOGS_TABLE),
+                wafer_run::ResourceGrant::read_write("*", request_logs::TABLE),
                 // Default: allow all blocks to make outbound network requests.
                 // Remove this grant via the admin UI to restrict network access.
                 wafer_run::ResourceGrant::read("*", "*")
@@ -709,8 +704,6 @@ fn redirect_308(target: &str) -> OutputStream {
 // WRAP grant handlers
 // ---------------------------------------------------------------------------
 
-use wafer_core::clients::database as db;
-
 use crate::util::parse_form_body;
 
 async fn handle_create_wrap_grant(
@@ -733,18 +726,22 @@ async fn handle_create_wrap_grant(
         return err_bad_request("Grantee and resource are required");
     }
 
-    let mut data = std::collections::HashMap::new();
-    data.insert("grantee".into(), serde_json::json!(grantee));
-    data.insert("resource".into(), serde_json::json!(resource));
-    data.insert("write".into(), serde_json::json!(if write { 1 } else { 0 }));
-    data.insert("resource_type".into(), serde_json::json!(resource_type));
-    data.insert("description".into(), serde_json::json!(description));
-
     // Persist first; only render the (now-updated) page and write the audit
     // event after a confirmed successful write. Previously `let _ =
     // db::create(..)` discarded the result, so a failed insert still
     // re-rendered the permissions page as if the grant had been added.
-    let record = match db::create(ctx, WRAP_GRANTS_TABLE, data).await {
+    let record = match wrap_grants::create(
+        ctx,
+        wrap_grants::NewWrapGrant {
+            grantee,
+            resource,
+            write,
+            resource_type,
+            description,
+        },
+    )
+    .await
+    {
         Ok(record) => record,
         Err(e) => return err_internal("Database error", e),
     };
@@ -775,7 +772,7 @@ async fn handle_delete_wrap_grant(ctx: &dyn Context, mut msg: Message) -> Output
     // confirmed successful delete. Previously `let _ = db::delete(..)`
     // discarded the result, so deleting an already-gone (or unwritable)
     // grant still re-rendered the page as a success.
-    match db::delete(ctx, WRAP_GRANTS_TABLE, grant_id).await {
+    match wrap_grants::delete(ctx, grant_id).await {
         Ok(()) => {}
         Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Grant not found"),
         Err(e) => return err_internal("Database error", e),
@@ -921,14 +918,9 @@ mod wrap_grant_mutation_tests {
             .await
             .expect("a valid grant create must succeed, not error");
 
-        let rows = db::list_all(&ctx, WRAP_GRANTS_TABLE, vec![])
-            .await
-            .expect("list wrap grants");
+        let rows = wrap_grants::list(&ctx).await.expect("list wrap grants");
         assert_eq!(rows.len(), 1, "the grant must have been persisted");
-        assert_eq!(
-            rows[0].data.get("grantee").and_then(|v| v.as_str()),
-            Some("impresspress/files")
-        );
+        assert_eq!(rows[0].grantee, "impresspress/files");
         assert_eq!(audit_count(&ctx, "wrap_grant.create").await, 1);
     }
 
@@ -948,9 +940,7 @@ mod wrap_grant_mutation_tests {
             "empty grantee/resource must be rejected as a bad request"
         );
 
-        let rows = db::list_all(&ctx, WRAP_GRANTS_TABLE, vec![])
-            .await
-            .expect("list wrap grants");
+        let rows = wrap_grants::list(&ctx).await.expect("list wrap grants");
         assert!(rows.is_empty(), "no grant row must be persisted");
         assert_eq!(audit_count(&ctx, "wrap_grant.create").await, 0);
     }
@@ -977,15 +967,18 @@ mod wrap_grant_mutation_tests {
     async fn delete_wrap_grant_success_removes_row_and_audits() {
         let ctx = TestContext::with_admin().await;
 
-        let mut data = std::collections::HashMap::new();
-        data.insert("grantee".into(), serde_json::json!("impresspress/files"));
-        data.insert("resource".into(), serde_json::json!("some_table"));
-        data.insert("write".into(), serde_json::json!(0));
-        data.insert("resource_type".into(), serde_json::json!(""));
-        data.insert("description".into(), serde_json::json!(""));
-        let record = db::create(&ctx, WRAP_GRANTS_TABLE, data)
-            .await
-            .expect("seed grant row");
+        let record = wrap_grants::create(
+            &ctx,
+            wrap_grants::NewWrapGrant {
+                grantee: "impresspress/files".to_string(),
+                resource: "some_table".to_string(),
+                write: false,
+                resource_type: String::new(),
+                description: String::new(),
+            },
+        )
+        .await
+        .expect("seed grant row");
 
         let msg = routed(admin_msg(
             "delete",
@@ -997,9 +990,7 @@ mod wrap_grant_mutation_tests {
             .await
             .expect("delete of an existing grant must succeed");
 
-        let rows = db::list_all(&ctx, WRAP_GRANTS_TABLE, vec![])
-            .await
-            .expect("list wrap grants");
+        let rows = wrap_grants::list(&ctx).await.expect("list wrap grants");
         assert!(rows.is_empty(), "the grant row must have been removed");
         assert_eq!(audit_count(&ctx, "wrap_grant.delete").await, 1);
     }
@@ -1093,6 +1084,37 @@ mod grant_tests {
         );
     }
 
+    /// Two grants nothing reads through. The framework auth block reads its
+    /// configuration through the config client
+    /// (`config_client::get_default`), never the variables table; userportal
+    /// reads the enablement map from the config snapshot
+    /// (`features::BLOCK_SETTINGS_CONFIG_KEY`), never the block_settings
+    /// table. The WRAP audit (`scripts/audit-wrap-grants.sh`), which also
+    /// walks `platform_state` references, finds no such access from either
+    /// block. A grant with no reader is standing permission for one to
+    /// appear without review, so neither row is declared.
+    #[test]
+    fn admin_declares_no_grant_nothing_reads_through() {
+        use crate::{
+            blocks::auth::AUTH_BLOCK_ID,
+            platform_state::{block_settings, variables},
+        };
+
+        let grants = AdminBlock::new().info().grants;
+        let stale: Vec<_> = grants
+            .iter()
+            .filter(|g| {
+                (g.grantee == AUTH_BLOCK_ID && g.resource == variables::TABLE)
+                    || (g.grantee == "impresspress/userportal"
+                        && g.resource == block_settings::TABLE)
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "admin must not grant a table nothing reads through: {stale:?}"
+        );
+    }
+
     #[test]
     fn admin_block_grants_auth_ui_read_write_on_user_roles() {
         // auth-ui's login/refresh/OAuth-callback handlers call the shared
@@ -1105,19 +1127,21 @@ mod grant_tests {
         // surface as a real error (500 on login), exposing this
         // pre-existing missing grant. Pin the grant's presence so it can't
         // silently regress again.
-        use super::{super::auth_ui::AUTH_UI_BLOCK_ID, USER_ROLES_TABLE};
+        use super::super::auth_ui::AUTH_UI_BLOCK_ID;
+        use crate::platform_state::user_roles;
 
         let admin = AdminBlock::new();
         let grants = admin.info().grants;
+        let table = user_roles::TABLE;
 
         let auth_ui_user_roles_grant = grants
             .iter()
-            .find(|g| g.grantee == AUTH_UI_BLOCK_ID && g.resource == USER_ROLES_TABLE);
+            .find(|g| g.grantee == AUTH_UI_BLOCK_ID && g.resource == table);
 
         assert!(
             auth_ui_user_roles_grant.is_some_and(|g| g.write),
             "admin block must declare a read_write grant for {AUTH_UI_BLOCK_ID} on \
-             {USER_ROLES_TABLE} (login path) — found: {auth_ui_user_roles_grant:?}"
+             {table} (login path) — found: {auth_ui_user_roles_grant:?}"
         );
     }
 }
@@ -1680,42 +1704,48 @@ mod page_link_tests {
         )
         .await
         .expect("seed role");
-        let mut variable = crate::util::json_map(serde_json::json!({
-            "key": PROBE_VARIABLE,
-            "name": PROBE_VARIABLE,
-            "value": "1",
-            "sensitive": 0,
-        }));
-        crate::util::stamp_created(&mut variable);
-        db::create(&ctx, VARIABLES_TABLE, variable)
-            .await
-            .expect("seed variable");
-        let mut grant = crate::util::json_map(serde_json::json!({
-            "grantee": "impresspress/probe",
-            "resource": "impresspress__probe__things",
-            "write": 0,
-            "resource_type": "",
-            "description": "",
-        }));
-        crate::util::stamp_created(&mut grant);
-        let grant = db::create(&ctx, WRAP_GRANTS_TABLE, grant)
-            .await
-            .expect("seed grant");
-        let mut request = crate::util::json_map(serde_json::json!({
-            "flow_id": "f-1",
-            "method": "GET",
-            "path": "/probe",
-            "status": "OK",
-            "status_code": 200,
-            "duration_ms": 5,
-            "error_message": "",
-            "client_ip": "203.0.113.7",
-            "user_id": "",
-        }));
-        crate::util::stamp_created(&mut request);
-        db::create(&ctx, REQUEST_LOGS_TABLE, request)
-            .await
-            .expect("seed request log");
+        variables::insert(
+            &ctx,
+            variables::NewVariable {
+                key: PROBE_VARIABLE.to_string(),
+                value: "1".to_string(),
+                name: PROBE_VARIABLE.to_string(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: String::new(),
+                block: variables::block_for_key(PROBE_VARIABLE),
+            },
+        )
+        .await
+        .expect("seed variable");
+        let grant = wrap_grants::create(
+            &ctx,
+            wrap_grants::NewWrapGrant {
+                grantee: "impresspress/probe".to_string(),
+                resource: "impresspress__probe__things".to_string(),
+                write: false,
+                resource_type: String::new(),
+                description: String::new(),
+            },
+        )
+        .await
+        .expect("seed grant");
+        request_logs::insert(
+            &ctx,
+            &request_logs::NewRequestLog {
+                method: "GET",
+                path: "/probe",
+                status_label: "OK",
+                status_code: 200,
+                error_message: "",
+                duration_ms: 5,
+                client_ip: "203.0.113.7",
+                user_id: "",
+            },
+        )
+        .await
+        .expect("seed request log");
         // `can_disable` is what makes the detail fragment render the toggle.
         ctx.register_block_info(
             PROBE_BLOCK,
