@@ -73,7 +73,6 @@ fn render_table(rows: &[sessions::SessionRow], current_family: Option<&str>) -> 
             thead {
                 tr {
                     th { "Started" }
-                    th { "Method" }
                     th { "Last used" }
                     th { "Expires" }
                     th { "" }
@@ -94,7 +93,6 @@ fn render_table(rows: &[sessions::SessionRow], current_family: Option<&str>) -> 
                                 (badge(BadgeVariant::Success, "Current session"))
                             }
                         }
-                        td data-label="Method" { (r.auth_method) }
                         td data-label="Last used" { time datetime=(r.last_used_at) { (r.last_used_at) } }
                         td data-label="Expires" { time datetime=(r.expires_at) { (r.expires_at) } }
                         td data-label="" {
