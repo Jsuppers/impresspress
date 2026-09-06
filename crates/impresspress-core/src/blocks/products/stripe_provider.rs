@@ -12,6 +12,7 @@ use wafer_core::clients::config;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use super::{
+    config::{platform_country, seller_fee_bps},
     contracts::{
         BillingPortalRequest, ProviderReconcileResult, ProviderRedirect, RefundStatus,
         SellerAccount, SellerApproval, SellerCapabilities, SellerOnboardingRequest,
@@ -258,24 +259,6 @@ async fn validate_redirect(ctx: &dyn Context, url: &str) -> Result<(), WaferErro
     Ok(())
 }
 
-async fn configured_fee(ctx: &dyn Context) -> Result<u16, WaferError> {
-    config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-        "0",
-    )
-    .await
-    .parse::<u16>()
-    .ok()
-    .filter(|value| *value <= 10_000)
-    .ok_or_else(|| {
-        WaferError::new(
-            ErrorCode::FailedPrecondition,
-            "seller application fee must be between 0 and 10000 basis points",
-        )
-    })
-}
-
 fn not_started_account(user_id: &str, fee_basis_points: u16) -> SellerAccount {
     SellerAccount {
         id: String::new(),
@@ -304,7 +287,7 @@ pub(crate) async fn seller_status(
     ctx: &dyn Context,
     user_id: &str,
 ) -> Result<SellerAccount, WaferError> {
-    let fee = configured_fee(ctx).await?;
+    let fee = seller_fee_bps(ctx).await?;
     let Some(local) = repo::seller_accounts::get_for_user(ctx, user_id).await? else {
         return Ok(not_started_account(user_id, fee));
     };
@@ -346,7 +329,7 @@ pub(crate) async fn start_seller_onboarding(
 ) -> Result<SellerOnboardingResponse, WaferError> {
     validate_redirect(ctx, &request.return_url).await?;
     validate_redirect(ctx, &request.refresh_url).await?;
-    let fee = configured_fee(ctx).await?;
+    let fee = seller_fee_bps(ctx).await?;
     let client = StripeClient::load(ctx).await?;
     let mut local = repo::seller_accounts::ensure_for_user(ctx, user_id, fee).await?;
     if repo::seller_accounts::is_suspended_record(&local)? {
@@ -357,18 +340,7 @@ pub(crate) async fn start_seller_onboarding(
     }
     let account_id = local.str_field("stripe_account_id").to_string();
     if account_id.is_empty() {
-        let country = config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY", "")
-            .await
-            .trim()
-            .to_ascii_uppercase();
-        if !country.is_empty()
-            && (country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()))
-        {
-            return Err(WaferError::new(
-                ErrorCode::FailedPrecondition,
-                "platform country must be a two-letter country code",
-            ));
-        }
+        let country = platform_country(ctx).await?;
         let mut form = vec![
             ("type".to_string(), "express".to_string()),
             (
@@ -384,8 +356,11 @@ pub(crate) async fn start_seller_onboarding(
                 user_id.to_string(),
             ),
         ];
-        if !country.is_empty() {
-            form.push(("country".to_string(), country));
+        // Omitted when the platform has no configured country: Stripe then
+        // infers the connected account's country from onboarding, which is
+        // what this path has always done for a blank value.
+        if let Some(country) = country {
+            form.push(("country".to_string(), country.as_str().to_string()));
         }
         let remote = client
             .request_json(

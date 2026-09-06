@@ -1,3 +1,4 @@
+pub(crate) mod config;
 pub mod contracts;
 mod handlers;
 pub(crate) mod migrations;
@@ -60,7 +61,6 @@ pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
     variables::TABLE as VARIABLES_TABLE,
 };
-use wafer_core::clients::config;
 use wafer_run::{BlockInfo, ConfigVar, InputType, InstanceMode};
 
 use super::rate_limit::{apply_route_limit, UserRateLimiter};
@@ -82,7 +82,8 @@ pub const RUNTIME_KIND_CONFIG_KEY: &str = "__IMPRESSPRESS_RUNTIME_KIND__";
 pub(crate) async fn stripe_secret_operations_allowed(
     ctx: &dyn wafer_run::context::Context,
 ) -> bool {
-    config::get_default(ctx, RUNTIME_KIND_CONFIG_KEY, "server").await != "browser"
+    wafer_core::clients::config::get_default(ctx, RUNTIME_KIND_CONFIG_KEY, "server").await
+        != "browser"
 }
 
 /// The products block's own declared config vars. Single source of truth for
@@ -218,7 +219,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Select)
         .options(CURRENCY_OPTIONS),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
+            config::PLATFORM_COUNTRY,
             "Country of the platform Stripe account; also the seller onboarding default",
             "",
         )
@@ -242,7 +243,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Text)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
+            config::SELLER_APPLICATION_FEE_BPS,
             "Default platform application fee for connected-account sales, in basis points (0-10000)",
             "0",
         )

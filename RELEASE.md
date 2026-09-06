@@ -17,6 +17,42 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
+
+**What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one
+default, and it is the empty one its setting has always declared. Checkout and
+Payment Links used to default it to `US`, and to fall back to `US` for a value
+they could not read, while seller onboarding defaulted it to empty and refused
+an unreadable value. There is now one reader, and blank means "not configured"
+everywhere.
+
+**Who is affected.** Only a deployment that (a) has never set
+`IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY`, and (b) sells an offer whose
+"collect shipping address" is on and whose "allowed shipping countries" list is
+empty. Until now that combination silently produced a Checkout that would
+accept a United States address and nothing else — including for a platform
+that is not in the United States. It now refuses the checkout with
+`this offer collects a shipping address but names no allowed countries`, and
+the refusal is recorded against the order so it shows up in the seller
+dashboard's recent failures.
+
+Offers that list their own allowed shipping countries are unaffected; that
+list always won and still does. Offers that do not collect a shipping address
+are unaffected. Seller onboarding is unaffected: it already treated blank as
+"no country" and let Stripe infer it.
+
+**What to set.** In Admin → Settings → Products, set **Platform Country** to
+your platform's two-letter country code (for example `NZ`), or list the
+countries you ship to on each offer. A value that is not two ASCII letters is
+now an error rather than a silent `US`, so fix any typo there at the same time.
+
+Related, and not behaviour-changing for a valid configuration:
+`IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS` is now refused rather than
+read as `0` when it is not a whole number of basis points between 0 and 10000.
+A deployment whose fee is currently unreadable has been taking **no** platform
+fee on connected-account sales; after this release those sales refuse until the
+value is corrected.
+
 ### Products: `deleted_at` normalization (migration 020) — upgrade with `--run-migrations`
 
 Product deletion is a soft delete, and `deleted_at` now carries a strict

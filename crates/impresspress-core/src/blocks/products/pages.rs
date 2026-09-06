@@ -978,21 +978,14 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
         default_currency = seller_currencies[0].clone();
     }
     let automatic_tax = super::stripe::automatic_tax_enabled(ctx).await;
-    let configured_country = wafer_core::clients::config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
-        "US",
-    )
-    .await;
-    let configured_country = configured_country.trim();
-    let platform_country = if configured_country.len() == 2
-        && configured_country
-            .bytes()
-            .all(|byte| byte.is_ascii_alphabetic())
-    {
-        configured_country.to_ascii_uppercase()
-    } else {
-        "US".to_string()
+    // Blank when no platform country is configured: the field's placeholder
+    // then asks for the list, which is the honest prompt. It used to prefill
+    // `US` on a deployment that had never said it was in the US.
+    let platform_country = match super::config::platform_country(ctx).await {
+        Ok(country) => country
+            .map(|code| code.as_str().to_string())
+            .unwrap_or_default(),
+        Err(error) => return crate::http::err_internal("Platform country is misconfigured", error),
     };
     let back_href = if admin {
         "/b/products/admin/manage"
@@ -2995,16 +2988,18 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Ok(None) => None,
             Err(error) => return crate::http::err_internal("Database error", error),
         };
-        let fee = wafer_core::clients::config::get_default(
-            ctx,
-            "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-            "0",
-        )
-        .await
-        .parse::<u32>()
-        .ok()
-        .filter(|fee| *fee <= 10_000)
-        .unwrap_or(0);
+        // Rendered, so it must not be invented: a fee the platform cannot
+        // read used to print as "0.00%" on the page an operator opens to
+        // check exactly that number.
+        let fee = match super::config::seller_fee_bps(ctx).await {
+            Ok(fee) => u32::from(fee),
+            Err(error) => {
+                return crate::http::err_internal(
+                    "Platform application fee is misconfigured",
+                    error,
+                )
+            }
+        };
         (count, account, fee)
     } else {
         (0, None, 0)
@@ -3101,16 +3096,12 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
         },
         None => Vec::new(),
     };
-    let fee_basis_points = wafer_core::clients::config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-        "0",
-    )
-    .await
-    .parse::<u32>()
-    .ok()
-    .filter(|fee| *fee <= 10_000)
-    .unwrap_or(0);
+    let fee_basis_points = match super::config::seller_fee_bps(ctx).await {
+        Ok(fee) => u32::from(fee),
+        Err(error) => {
+            return crate::http::err_internal("Platform application fee is misconfigured", error)
+        }
+    };
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
     let content = html! {
         (portal_tabs("selling", seller_enabled))

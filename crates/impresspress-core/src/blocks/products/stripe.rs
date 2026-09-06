@@ -14,6 +14,7 @@ use wafer_core::clients::{
 use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
+    config::{platform_country, seller_fee_bps, CountryCode},
     contracts::{
         self, AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, EventStatus,
         ManagedOffer, ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus,
@@ -630,16 +631,33 @@ fn synced_component_price<'a>(
     })
 }
 
-fn shipping_countries(offer: &Offer, fallback_country: &str) -> Vec<String> {
-    if offer.checkout.allowed_shipping_countries.is_empty() {
-        vec![fallback_country.to_ascii_uppercase()]
-    } else {
-        offer
+/// The country list Stripe collects a shipping address for: the offer's own
+/// list, or the platform's country when the offer names none.
+///
+/// [B23] There is no third answer. `allowed_countries` is a required member
+/// of Stripe's `shipping_address_collection`, so a caller that cannot name a
+/// country cannot silently omit the key — that would leave `collect_shipping
+/// _address` on an offer that then collects no address at all. It used to
+/// substitute `"US"`, which shipped a New Zealand storefront to the United
+/// States and said nothing.
+fn shipping_countries(
+    offer: &Offer,
+    platform_country: Option<&CountryCode>,
+) -> Result<Vec<String>, String> {
+    if !offer.checkout.allowed_shipping_countries.is_empty() {
+        return Ok(offer
             .checkout
             .allowed_shipping_countries
             .iter()
             .map(|country| country.trim().to_ascii_uppercase())
-            .collect()
+            .collect());
+    }
+    match platform_country {
+        Some(country) => Ok(vec![country.as_str().to_string()]),
+        None => Err(
+            "this offer collects a shipping address but names no allowed countries; list them on the offer or set IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY"
+                .to_string(),
+        ),
     }
 }
 
@@ -665,12 +683,12 @@ fn shipping_amount_is_allowed(offer: &Offer, amount_minor: i64) -> bool {
 fn push_shipping_address_collection(
     pairs: &mut Vec<(String, String)>,
     offer: &Offer,
-    fallback_country: &str,
-) {
+    platform_country: Option<&CountryCode>,
+) -> Result<(), String> {
     if !offer.checkout.collect_shipping_address {
-        return;
+        return Ok(());
     }
-    for (index, country) in shipping_countries(offer, fallback_country)
+    for (index, country) in shipping_countries(offer, platform_country)?
         .into_iter()
         .enumerate()
     {
@@ -680,6 +698,7 @@ fn push_shipping_address_collection(
             country,
         );
     }
+    Ok(())
 }
 
 fn push_checkout_shipping_options(
@@ -758,17 +777,6 @@ fn payment_link_shipping_supported(offer: &Offer) -> Result<(), String> {
     Ok(())
 }
 
-async fn platform_country(ctx: &dyn Context) -> String {
-    let configured =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY", "US").await;
-    let country = configured.trim();
-    if country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        country.to_ascii_uppercase()
-    } else {
-        "US".to_string()
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_offer_checkout_form(
     offer: &Offer,
@@ -779,7 +787,7 @@ fn build_offer_checkout_form(
     success_url: &str,
     cancel_url: &str,
     automatic_tax: bool,
-    country: &str,
+    platform_country: Option<&CountryCode>,
     fee_minor: i64,
     fee_basis_points: u16,
 ) -> Result<String, String> {
@@ -843,7 +851,7 @@ fn build_offer_checkout_form(
     if offer.checkout.collect_billing_address {
         push_form(&mut pairs, "billing_address_collection", "required");
     }
-    push_shipping_address_collection(&mut pairs, offer, country);
+    push_shipping_address_collection(&mut pairs, offer, platform_country)?;
     push_checkout_shipping_options(
         &mut pairs,
         offer,
@@ -1001,16 +1009,10 @@ async fn handle_offer_checkout(
         let Ok(seller) = repo::seller_accounts::ready_for_user(ctx, owner_id).await else {
             return err_bad_request("This seller's Stripe account is not ready to accept charges");
         };
-        let configured_fee = config::get_default(
-            ctx,
-            "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-            "0",
-        )
-        .await
-        .parse::<u16>()
-        .ok()
-        .filter(|value| *value <= 10_000)
-        .unwrap_or(0);
+        let configured_fee = match seller_fee_bps(ctx).await {
+            Ok(fee) => fee,
+            Err(error) => return err_internal("Platform application fee is misconfigured", error),
+        };
         let fee = if seller.fee_basis_points == 0 {
             configured_fee
         } else {
@@ -1169,7 +1171,13 @@ async fn handle_offer_checkout(
     }
 
     let automatic_tax = offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await;
-    let country = platform_country(ctx).await;
+    let country = match platform_country(ctx).await {
+        Ok(country) => country,
+        Err(error) => {
+            let _ = repo::purchases::mark_checkout_failed(ctx, &order.id, &error.message).await;
+            return err_internal("Platform country is misconfigured", error);
+        }
+    };
     let stripe_body = match build_offer_checkout_form(
         &offer,
         &preview,
@@ -1179,7 +1187,7 @@ async fn handle_offer_checkout(
         &success_url,
         &cancel_url,
         automatic_tax,
-        &country.to_ascii_uppercase(),
+        country.as_ref(),
         fee_minor,
         fee_basis_points,
     ) {
@@ -1326,16 +1334,7 @@ async fn payment_link_seller_context(
         ));
     }
     let seller = repo::seller_accounts::ready_for_user(ctx, product.str_field("owner_id")).await?;
-    let configured_fee = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-        "0",
-    )
-    .await
-    .parse::<u16>()
-    .ok()
-    .filter(|value| *value <= 10_000)
-    .unwrap_or(0);
+    let configured_fee = seller_fee_bps(ctx).await?;
     let fee = if seller.fee_basis_points == 0 {
         configured_fee
     } else {
@@ -2078,7 +2077,7 @@ fn payment_link_form(
     preset_id: &str,
     after_completion_url: Option<&str>,
     automatic_tax: bool,
-    country: &str,
+    platform_country: Option<&CountryCode>,
     fee_minor: i64,
     fee_basis_points: u16,
 ) -> Result<String, String> {
@@ -2117,7 +2116,7 @@ fn payment_link_form(
     if offer.checkout.collect_billing_address {
         push_form(&mut pairs, "billing_address_collection", "required");
     }
-    push_shipping_address_collection(&mut pairs, offer, country);
+    push_shipping_address_collection(&mut pairs, offer, platform_country)?;
     payment_link_shipping_supported(offer)?;
     for (index, option) in offer.checkout.shipping_options.iter().enumerate() {
         push_form(
@@ -2344,7 +2343,7 @@ pub(crate) async fn create_payment_link(
         fee_basis_points,
     )
     .await?;
-    let country = platform_country(ctx).await;
+    let country = platform_country(ctx).await?;
     let body = payment_link_form(
         &offer,
         &preview,
@@ -2353,7 +2352,7 @@ pub(crate) async fn create_payment_link(
         &preset_id,
         after_completion_url,
         offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await,
-        &country.to_ascii_uppercase(),
+        country.as_ref(),
         fee_minor,
         fee_basis_points,
     )
@@ -4652,7 +4651,7 @@ mod tests {
             "https://shop.example/success",
             "https://shop.example/cancel",
             false,
-            "NZ",
+            CountryCode::parse("NZ").as_ref(),
             110,
             275,
         )
@@ -4736,7 +4735,7 @@ mod tests {
             "https://shop.example/success",
             "https://shop.example/cancel",
             false,
-            "US",
+            CountryCode::parse("US").as_ref(),
             0,
             0,
         )
@@ -4767,7 +4766,7 @@ mod tests {
             "",
             None,
             false,
-            "US",
+            CountryCode::parse("US").as_ref(),
             0,
             0,
         )
@@ -4783,7 +4782,7 @@ mod tests {
             "",
             None,
             false,
-            "US",
+            CountryCode::parse("US").as_ref(),
             0,
             0,
         )
