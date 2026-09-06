@@ -1841,10 +1841,12 @@ impl impresspress_core::builder::BootHooks for CfBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
         impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
 
-        let block_settings =
-            impresspress_core::platform_state::block_settings::load_and_seed(&self.db)
-                .await
-                .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
+        let block_settings = impresspress_core::platform_state::block_settings::load_and_seed(
+            &self.db,
+            &impresspress_core::blocks::block_enabled_defaults(),
+        )
+        .await
+        .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
         *self
             .block_settings_handle
             .write()

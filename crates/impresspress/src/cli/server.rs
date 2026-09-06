@@ -187,9 +187,12 @@ pub async fn build_native_runtime(
     // outage/corruption) — `block_settings::load_and_seed` never fabricates
     // "every block enabled" out of one. Bail rather than boot with a
     // security-relevant setting silently defaulted open.
-    let features = impresspress_core::platform_state::block_settings::load_and_seed(&database)
-        .await
-        .map_err(|e| anyhow!("load block settings: {e}"))?;
+    let features = impresspress_core::platform_state::block_settings::load_and_seed(
+        &database,
+        &impresspress_core::blocks::block_enabled_defaults(),
+    )
+    .await
+    .map_err(|e| anyhow!("load block settings: {e}"))?;
 
     // STRICT_SCHEMA (`WAFER_RUN__DATABASE__STRICT_SCHEMA`): a deploy-time
     // operational flag, read straight from the process env — exactly like the

@@ -10,7 +10,7 @@
 //! over [`Context`]: every block's `Init` stamps its migration state through
 //! [`upsert_fields`], admin's pages toggle and list through [`set_enabled`],
 //! [`is_enabled`] and [`list_all`]. The settings types themselves
-//! (`BlockState`, `BlockSettings`, `ENABLED_DEFAULTS`, the planner) stay in
+//! (`BlockState`, `BlockSettings`, the planner) stay in
 //! [`crate::features`]; only the table access lives here.
 
 use std::{collections::HashMap, sync::Arc};
@@ -226,11 +226,16 @@ pub async fn load(db: &Arc<dyn DatabaseService>) -> Result<BlockSettings, Databa
 /// planner, apply the resulting inserts/updates, and return the post-seed
 /// [`BlockSettings`].
 ///
+/// `defaults` is the `(block_name, default_enabled)` set to seed towards,
+/// which every production caller builds with
+/// [`crate::blocks::block_enabled_defaults`]; a block absent from it keeps
+/// whatever row it has and is never given one.
+///
 /// This is the single implementation behind every target's block-settings
 /// load: the Cloudflare runner, the browser config loader, AND the native
 /// CLI, which previously read the table without ever running the #222
-/// hash-gate, so `ENABLED_DEFAULTS` changes silently never propagated on
-/// native boots. Routing native through here closes that gap.
+/// hash-gate, so a changed default silently never propagated on native
+/// boots. Routing native through here closes that gap.
 ///
 /// Steady state: the planner returns an empty `Vec`, so zero writes are
 /// issued and the only cost is the initial list (+ no re-read).
@@ -253,7 +258,10 @@ pub async fn load(db: &Arc<dyn DatabaseService>) -> Result<BlockSettings, Databa
 /// propagates the error so the caller can decide the right failure policy —
 /// every current caller treats it as fatal to the boot/build (fail closed:
 /// no runtime gets built/served with a fabricated all-enabled snapshot).
-pub async fn load_and_seed(db: &Arc<dyn DatabaseService>) -> Result<BlockSettings, DatabaseError> {
+pub async fn load_and_seed(
+    db: &Arc<dyn DatabaseService>,
+    defaults: &[(String, bool)],
+) -> Result<BlockSettings, DatabaseError> {
     let rows = read_rows(db).await?;
 
     // Existing-row map for the hash-gate planner.
@@ -272,14 +280,14 @@ pub async fn load_and_seed(db: &Arc<dyn DatabaseService>) -> Result<BlockSetting
 
     // `block_name` → row `id`, so a `SeedOp::Update` can do a single-row
     // `db.update` (which the KV wrapper invalidates) instead of `update_where`
-    // (which hard-errors on cached tables, so a changed `ENABLED_DEFAULTS` hash
-    // would never propagate to existing rows).
+    // (which hard-errors on cached tables, so a changed seed hash would never
+    // propagate to existing rows).
     let id_by_block: HashMap<String, String> = rows
         .iter()
         .map(|row| (row.block_name.clone(), row.id.clone()))
         .collect();
 
-    let decisions = plan_seed_decisions(&existing);
+    let decisions = plan_seed_decisions(&existing, defaults);
     let any_writes = !decisions.is_empty();
     for d in &decisions {
         apply_seed_decision(db, d, &id_by_block).await?;
@@ -312,11 +320,11 @@ async fn apply_seed_decision(
     };
     match d.op {
         SeedOp::Insert => {
-            db.create(TABLE, patch.into_row(d.block_name).to_data())
+            db.create(TABLE, patch.into_row(&d.block_name).to_data())
                 .await?;
         }
         SeedOp::Update => {
-            let Some(id) = id_by_block.get(d.block_name) else {
+            let Some(id) = id_by_block.get(&d.block_name) else {
                 return Err(DatabaseError::Internal(format!(
                     "block_settings seed update for {} has no row id",
                     d.block_name
@@ -610,14 +618,31 @@ mod tests {
 ///
 /// Before the loader was unified, native (`server_config::load_block_settings`)
 /// read the `block_settings` table with a plain `SELECT` and never invoked
-/// the #222 hash-gate. An `ENABLED_DEFAULTS` change therefore propagated on
-/// Cloudflare and browser boots but silently NOT on native boots. These
+/// the #222 hash-gate. A changed default therefore propagated on Cloudflare
+/// and browser boots but silently NOT on native boots. These
 /// tests pin that the unified loader runs the gate, so a native boot now
 /// re-seeds stale rows.
 #[cfg(test)]
 mod load_and_seed_tests {
     use super::*;
-    use crate::features::{seed_hash_for, FeatureConfig, ENABLED_DEFAULTS, USER_EDITED_SENTINEL};
+    use crate::features::{seed_hash_for, FeatureConfig, USER_EDITED_SENTINEL};
+
+    /// The defaults these tests seed towards. A fixture, not the production
+    /// block set: the loader's contract is "apply the planner's decisions over
+    /// whatever defaults you were handed", and pinning it to the real registry
+    /// would make every one of these tests re-assert the registry instead of
+    /// the loader. The `block_settings` table has no foreign key to the block
+    /// registry, so invented names round-trip exactly as real ones do.
+    fn fixture() -> Vec<(String, bool)> {
+        [
+            ("org/alpha", true),
+            ("org/bravo", false),
+            ("org/charlie", true),
+        ]
+        .into_iter()
+        .map(|(name, enabled)| (name.to_string(), enabled))
+        .collect()
+    }
 
     /// A `DatabaseService` with the admin schema applied through the
     /// pre-wafer DDL runner (the migration-file-runner exception to the
@@ -657,13 +682,14 @@ mod load_and_seed_tests {
         db.create(TABLE, row.to_data()).await.expect("insert row");
     }
 
-    /// Fresh table → every `ENABLED_DEFAULTS` block is inserted at its current
+    /// Fresh table → every block in the defaults is inserted at its current
     /// seed hash (the native-fresh-boot case).
     #[tokio::test]
     async fn seeds_all_defaults_on_empty_table() {
         let db = migrated_db().await;
-        let settings = load_and_seed(&db).await.expect("load_and_seed");
-        for (name, default) in ENABLED_DEFAULTS {
+        let defaults = fixture();
+        let settings = load_and_seed(&db, &defaults).await.expect("load_and_seed");
+        for (name, default) in &defaults {
             assert_eq!(
                 settings.is_block_enabled(name),
                 *default,
@@ -686,31 +712,32 @@ mod load_and_seed_tests {
     #[tokio::test]
     async fn re_seeds_stale_hash_row_the_native_path_used_to_skip() {
         let db = migrated_db().await;
-        let (block_name, current_default) = ENABLED_DEFAULTS[0];
+        let defaults = fixture();
+        let (block_name, current_default) = defaults[0].clone();
         let stale_default = !current_default;
         seed_row(
             &db,
-            block_name,
+            &block_name,
             stale_default,
             &seed_hash_for(stale_default),
         )
         .await;
 
         // Pre-condition: the row is at the stale value.
-        let (before_enabled, before_hash) = read_row(&db, block_name).await.unwrap();
+        let (before_enabled, before_hash) = read_row(&db, &block_name).await.unwrap();
         assert_eq!(before_enabled, stale_default);
         assert_eq!(before_hash, seed_hash_for(stale_default));
 
-        let settings = load_and_seed(&db).await.expect("load_and_seed");
+        let settings = load_and_seed(&db, &defaults).await.expect("load_and_seed");
 
         // Post-condition: the gate fired — row updated to the current default.
-        let (after_enabled, after_hash) = read_row(&db, block_name).await.unwrap();
+        let (after_enabled, after_hash) = read_row(&db, &block_name).await.unwrap();
         assert_eq!(
             after_enabled, current_default,
             "stale row should have been re-seeded to the current default",
         );
         assert_eq!(after_hash, seed_hash_for(current_default));
-        assert_eq!(settings.is_block_enabled(block_name), current_default);
+        assert_eq!(settings.is_block_enabled(&block_name), current_default);
     }
 
     /// The Cloudflare request path is read-only: it returns the stored value
@@ -719,22 +746,22 @@ mod load_and_seed_tests {
     #[tokio::test]
     async fn read_only_loader_never_applies_seed_plan() {
         let db = migrated_db().await;
-        let (block_name, current_default) = ENABLED_DEFAULTS[0];
+        let (block_name, current_default) = fixture()[0].clone();
         let stale_default = !current_default;
         let stale_hash = seed_hash_for(stale_default);
-        seed_row(&db, block_name, stale_default, &stale_hash).await;
+        seed_row(&db, &block_name, stale_default, &stale_hash).await;
 
         let settings = load(&db).await.expect("read-only load");
 
-        assert_eq!(settings.is_block_enabled(block_name), stale_default);
+        assert_eq!(settings.is_block_enabled(&block_name), stale_default);
         assert_eq!(
-            read_row(&db, block_name).await,
+            read_row(&db, &block_name).await,
             Some((stale_default, stale_hash))
         );
         assert_eq!(
             read_rows(&db).await.expect("read rows").len(),
             1,
-            "read-only load must not insert the rest of ENABLED_DEFAULTS"
+            "read-only load must not insert the rest of the defaults"
         );
     }
 
@@ -743,16 +770,17 @@ mod load_and_seed_tests {
     #[tokio::test]
     async fn preserves_user_edited_row() {
         let db = migrated_db().await;
-        let (block_name, default) = ENABLED_DEFAULTS[0];
+        let defaults = fixture();
+        let (block_name, default) = defaults[0].clone();
         let user_choice = !default;
-        seed_row(&db, block_name, user_choice, USER_EDITED_SENTINEL).await;
+        seed_row(&db, &block_name, user_choice, USER_EDITED_SENTINEL).await;
 
-        let settings = load_and_seed(&db).await.expect("load_and_seed");
+        let settings = load_and_seed(&db, &defaults).await.expect("load_and_seed");
 
-        let (after_enabled, after_hash) = read_row(&db, block_name).await.unwrap();
+        let (after_enabled, after_hash) = read_row(&db, &block_name).await.unwrap();
         assert_eq!(after_enabled, user_choice, "user choice must be preserved");
         assert_eq!(after_hash, USER_EDITED_SENTINEL);
-        assert_eq!(settings.is_block_enabled(block_name), user_choice);
+        assert_eq!(settings.is_block_enabled(&block_name), user_choice);
     }
 
     /// Steady state: a table already at every current hash issues zero writes
@@ -760,12 +788,13 @@ mod load_and_seed_tests {
     #[tokio::test]
     async fn no_writes_at_steady_state() {
         let db = migrated_db().await;
+        let defaults = fixture();
         // First pass seeds everything.
-        load_and_seed(&db).await.expect("load_and_seed");
+        load_and_seed(&db, &defaults).await.expect("load_and_seed");
         // Capture every row to detect any spurious write on the second pass.
         let before = read_rows(&db).await.expect("snapshot before");
         // Second pass should be a no-op (empty plan).
-        load_and_seed(&db).await.expect("load_and_seed");
+        load_and_seed(&db, &defaults).await.expect("load_and_seed");
         let after = read_rows(&db).await.expect("snapshot after");
         assert_eq!(before, after, "steady-state pass must not write");
     }
@@ -904,7 +933,8 @@ mod operational_error_tests {
     #[tokio::test]
     async fn genuine_read_error_propagates_instead_of_fabricating_all_enabled() {
         let db: Arc<dyn DatabaseService> = Arc::new(AlwaysErrorsOnList);
-        let result = load_and_seed(&db).await;
+        let defaults = vec![("org/alpha".to_string(), true)];
+        let result = load_and_seed(&db, &defaults).await;
 
         assert!(
             result.is_err(),

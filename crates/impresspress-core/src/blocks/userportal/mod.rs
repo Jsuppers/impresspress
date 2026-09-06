@@ -137,7 +137,10 @@ crate::impresspress_feature_block! {
         .config_keys(vec![])
         .admin_url("/b/userportal/admin/settings")
         .can_disable(true)
-        .default_enabled(false)
+        // Ships enabled — see the note on `legalpages`. Same divergence, same
+        // resolution: the declaration is corrected to the value production has
+        // been running, not the other way round.
+        .default_enabled(true)
     },
     handle: |this, ctx, msg, input| {
         // Auth is enforced centrally by `route_to_block` from each row's

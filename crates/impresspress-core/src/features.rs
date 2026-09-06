@@ -198,39 +198,6 @@ impl FeatureConfig for std::sync::RwLock<BlockSettings> {
     }
 }
 
-/// Canonical defaults for `impresspress__admin__block_settings.enabled`.
-/// Consumed by [`plan_seed_decisions`] on every cold start.
-///
-/// Adding a block here: bump the list, ship — every existing row gets the
-/// INSERT path (no row yet → write the new default at the current hash).
-///
-/// Changing an existing default: just edit the bool — the hash gate detects
-/// the change and re-seeds rows still at the old default. Admin-UI edits
-/// (marked [`USER_EDITED_SENTINEL`]) are preserved.
-///
-/// Excluded for now: `impresspress/llm` and `impresspress/vector`. The LLM
-/// block module is gated on `feature = "llm"` (wasm32-incompatible) so
-/// the router would dispatch into a void on wasm32 if either was enabled
-/// here. Restored when the LlmService trait refactor lands.
-///
-/// Also excluded: `impresspress/admin`. The admin row's `seed_defaults_hash`
-/// column is owned by [`crate::blocks::admin::settings::seed_defaults`]
-/// for the shared-vars-list payload hash (raw hex, no prefix). Two
-/// writers on the same column with different formats would cause an
-/// infinite re-seed loop on every cold start. The admin block is always
-/// enabled by design (FeatureConfig falls back to `true` when the row is
-/// absent), so omitting it from the seed has no behavioural effect.
-pub const ENABLED_DEFAULTS: &[(&str, bool)] = &[
-    ("wafer-run/auth", true),
-    ("impresspress/files", true),
-    ("impresspress/legalpages", true),
-    ("impresspress/tickets", false),
-    ("impresspress/messages", true),
-    ("impresspress/products", true),
-    ("impresspress/system", true),
-    ("impresspress/userportal", true),
-];
-
 /// Stored in `seed_defaults_hash` to mark a row that was last written by
 /// the admin UI's toggle. Such rows are never overwritten by the seed.
 pub const USER_EDITED_SENTINEL: &str = "user-edited";
@@ -258,8 +225,8 @@ pub struct ExistingRow {
 /// What the planner decided about a given block name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedDecision {
-    /// Static block name from [`ENABLED_DEFAULTS`].
-    pub block_name: &'static str,
+    /// Block name, copied from the caller's defaults slice.
+    pub block_name: String,
     /// Value to write.
     pub enabled: bool,
     /// `seed_defaults_hash` value to write (always `"seed:<hex>"`).
@@ -277,12 +244,20 @@ pub enum SeedOp {
 }
 
 /// Compute the set of writes needed to bring `block_settings.enabled`
-/// rows in sync with [`ENABLED_DEFAULTS`].
+/// rows in sync with `defaults`.
 ///
-/// Pure function — no DB access. The caller supplies the already-loaded
-/// `existing` map (keyed by block_name → `ExistingRow`) and applies the
-/// returned decisions in whatever shape its persistence layer prefers
-/// (one upsert per decision, batched, etc.).
+/// Pure function — no DB access and no knowledge of the block registry. The
+/// caller supplies both sides: the already-loaded `existing` map (keyed by
+/// block_name → `ExistingRow`) and the `(block_name, default_enabled)` pairs
+/// to seed towards, which production derives from the blocks' own `BlockInfo`
+/// via [`crate::blocks::block_enabled_defaults`]. It then applies the returned
+/// decisions in whatever shape its persistence layer prefers (one upsert per
+/// decision, batched, etc.).
+///
+/// A row whose block is absent from `defaults` is left alone — no decision is
+/// emitted for it. That is how a block that is not `can_disable`, or is not
+/// compiled into this build, keeps whatever row it has (and, having none,
+/// falls back to enabled).
 ///
 /// Steady-state cost: empty `Vec` returned → caller issues zero writes.
 ///
@@ -294,14 +269,17 @@ pub enum SeedOp {
 ///   (already at the current seeded default).
 /// - Row present with any other `"seed:..."` hash → `SeedOp::Update`
 ///   (stale seed hash; default changed since the row was last seeded).
-pub fn plan_seed_decisions(existing: &HashMap<String, ExistingRow>) -> Vec<SeedDecision> {
+pub fn plan_seed_decisions(
+    existing: &HashMap<String, ExistingRow>,
+    defaults: &[(String, bool)],
+) -> Vec<SeedDecision> {
     let mut out = Vec::new();
-    for &(name, default) in ENABLED_DEFAULTS {
-        let want_hash = seed_hash_for(default);
+    for (name, default) in defaults {
+        let want_hash = seed_hash_for(*default);
         match existing.get(name) {
             None => out.push(SeedDecision {
-                block_name: name,
-                enabled: default,
+                block_name: name.clone(),
+                enabled: *default,
                 hash: want_hash,
                 op: SeedOp::Insert,
             }),
@@ -313,8 +291,8 @@ pub fn plan_seed_decisions(existing: &HashMap<String, ExistingRow>) -> Vec<SeedD
                     continue;
                 }
                 out.push(SeedDecision {
-                    block_name: name,
-                    enabled: default,
+                    block_name: name.clone(),
+                    enabled: *default,
                     hash: want_hash,
                     op: SeedOp::Update,
                 });
@@ -339,40 +317,75 @@ mod seed_plan_tests {
 
     use super::*;
 
-    fn defaults_count() -> usize {
-        ENABLED_DEFAULTS.len()
+    /// The planner's inputs are a fixture, never the production block set.
+    /// Driving these lanes from the real registry is what let the
+    /// `legalpages`/`userportal` divergence sit unnoticed for as long as it
+    /// did: the tests asserted the planner agreed with whatever the registry
+    /// said, which is a tautology. Six entries, deliberately mixed
+    /// `true`/`false`, so the mixed-state test below has its five lanes with
+    /// one left over.
+    fn fixture() -> Vec<(String, bool)> {
+        [
+            ("org/alpha", true),
+            ("org/bravo", false),
+            ("org/charlie", true),
+            ("org/delta", false),
+            ("org/echo", true),
+            ("org/foxtrot", true),
+        ]
+        .into_iter()
+        .map(|(name, enabled)| (name.to_string(), enabled))
+        .collect()
+    }
+
+    /// Stage every fixture entry in `existing`, deriving the stored `enabled`
+    /// and `seed_defaults_hash` from that entry's default.
+    fn staged(
+        defaults: &[(String, bool)],
+        value: impl Fn(bool) -> bool,
+        hash: impl Fn(bool) -> String,
+    ) -> HashMap<String, ExistingRow> {
+        defaults
+            .iter()
+            .map(|(name, default)| {
+                (
+                    name.clone(),
+                    ExistingRow {
+                        enabled: value(*default),
+                        hash: hash(*default),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn expected_default(defaults: &[(String, bool)], block_name: &str) -> bool {
+        defaults
+            .iter()
+            .find(|(name, _)| name == block_name)
+            .map(|(_, v)| *v)
+            .expect("decision block name must be in the defaults slice")
     }
 
     #[test]
     fn plan_seed_decisions_inserts_when_row_absent() {
+        let defaults = fixture();
         let existing: HashMap<String, ExistingRow> = HashMap::new();
-        let decisions = plan_seed_decisions(&existing);
-        assert_eq!(decisions.len(), defaults_count());
+        let decisions = plan_seed_decisions(&existing, &defaults);
+        assert_eq!(decisions.len(), defaults.len());
         for d in &decisions {
             assert_eq!(d.op, SeedOp::Insert);
-            let expected_default = ENABLED_DEFAULTS
-                .iter()
-                .find(|(name, _)| *name == d.block_name)
-                .map(|(_, v)| *v)
-                .expect("decision block name must be in ENABLED_DEFAULTS");
-            assert_eq!(d.enabled, expected_default);
-            assert_eq!(d.hash, seed_hash_for(expected_default));
+            let expected = expected_default(&defaults, &d.block_name);
+            assert_eq!(d.enabled, expected);
+            assert_eq!(d.hash, seed_hash_for(expected));
         }
     }
 
     #[test]
     fn plan_seed_decisions_skips_when_hash_matches_current() {
-        let mut existing = HashMap::new();
-        for (name, default) in ENABLED_DEFAULTS {
-            existing.insert(
-                (*name).to_string(),
-                ExistingRow {
-                    enabled: *default,
-                    hash: seed_hash_for(*default),
-                },
-            );
-        }
-        let decisions = plan_seed_decisions(&existing);
+        let defaults = fixture();
+        let existing = staged(&defaults, |d| d, seed_hash_for);
+        let decisions = plan_seed_decisions(&existing, &defaults);
         assert!(
             decisions.is_empty(),
             "no decisions expected at steady state, got: {decisions:?}",
@@ -381,44 +394,23 @@ mod seed_plan_tests {
 
     #[test]
     fn plan_seed_decisions_updates_when_hash_stale() {
-        let mut existing = HashMap::new();
-        for (name, default) in ENABLED_DEFAULTS {
-            let opposite = !*default;
-            existing.insert(
-                (*name).to_string(),
-                ExistingRow {
-                    enabled: opposite,
-                    hash: seed_hash_for(opposite),
-                },
-            );
-        }
-        let decisions = plan_seed_decisions(&existing);
-        assert_eq!(decisions.len(), defaults_count());
+        let defaults = fixture();
+        let existing = staged(&defaults, |d| !d, |d| seed_hash_for(!d));
+        let decisions = plan_seed_decisions(&existing, &defaults);
+        assert_eq!(decisions.len(), defaults.len());
         for d in &decisions {
             assert_eq!(d.op, SeedOp::Update);
-            let expected_default = ENABLED_DEFAULTS
-                .iter()
-                .find(|(name, _)| *name == d.block_name)
-                .map(|(_, v)| *v)
-                .expect("decision block name must be in ENABLED_DEFAULTS");
-            assert_eq!(d.enabled, expected_default);
-            assert_eq!(d.hash, seed_hash_for(expected_default));
+            let expected = expected_default(&defaults, &d.block_name);
+            assert_eq!(d.enabled, expected);
+            assert_eq!(d.hash, seed_hash_for(expected));
         }
     }
 
     #[test]
     fn plan_seed_decisions_skips_user_edited() {
-        let mut existing = HashMap::new();
-        for (name, default) in ENABLED_DEFAULTS {
-            existing.insert(
-                (*name).to_string(),
-                ExistingRow {
-                    enabled: !*default,
-                    hash: USER_EDITED_SENTINEL.to_string(),
-                },
-            );
-        }
-        let decisions = plan_seed_decisions(&existing);
+        let defaults = fixture();
+        let existing = staged(&defaults, |d| !d, |_| USER_EDITED_SENTINEL.to_string());
+        let decisions = plan_seed_decisions(&existing, &defaults);
         assert!(
             decisions.is_empty(),
             "user-edited rows must be preserved even when value drifts: {decisions:?}",
@@ -427,20 +419,35 @@ mod seed_plan_tests {
 
     #[test]
     fn plan_seed_decisions_skips_empty_hash_legacy() {
-        let mut existing = HashMap::new();
-        for (name, default) in ENABLED_DEFAULTS {
-            existing.insert(
-                (*name).to_string(),
-                ExistingRow {
-                    enabled: !*default,
-                    hash: String::new(),
-                },
-            );
-        }
-        let decisions = plan_seed_decisions(&existing);
+        let defaults = fixture();
+        let existing = staged(&defaults, |d| !d, |_| String::new());
+        let decisions = plan_seed_decisions(&existing, &defaults);
         assert!(
             decisions.is_empty(),
             "legacy empty-hash rows must be preserved: {decisions:?}",
+        );
+    }
+
+    /// A row for a block the caller did not list is not the planner's
+    /// business: no decision is emitted and the row is left alone. This is the
+    /// lane `impresspress/system` and `wafer-run/auth` fall into once the
+    /// defaults come from `can_disable` (spec 2.1.4) — an existing row of
+    /// theirs is preserved as-is, and having none they fall back to enabled.
+    #[test]
+    fn plan_seed_decisions_ignores_rows_outside_the_defaults() {
+        let defaults = fixture();
+        let mut existing = staged(&defaults, |d| d, seed_hash_for);
+        existing.insert(
+            "org/not-listed".to_string(),
+            ExistingRow {
+                enabled: false,
+                hash: seed_hash_for(true),
+            },
+        );
+        let decisions = plan_seed_decisions(&existing, &defaults);
+        assert!(
+            decisions.is_empty(),
+            "a row with no matching default must not be touched: {decisions:?}",
         );
     }
 
@@ -461,20 +468,13 @@ mod seed_plan_tests {
         // user-edited (preserve), some legacy empty hash (preserve). The
         // planner must produce exactly the right decisions, no extras and
         // no skips.
+        let defaults = fixture();
         let mut existing = HashMap::new();
 
-        // Pick five blocks from ENABLED_DEFAULTS to stage in different states.
-        // ENABLED_DEFAULTS has 7 entries; assign one to each lane and let the
-        // remaining 2 fall into the "absent → Insert" lane.
-        assert!(
-            ENABLED_DEFAULTS.len() >= 5,
-            "test assumes at least 5 entries in ENABLED_DEFAULTS"
-        );
-
         // Lane A: at-current → skip.
-        let (lane_a_name, lane_a_default) = ENABLED_DEFAULTS[0];
+        let (lane_a_name, lane_a_default) = defaults[0].clone();
         existing.insert(
-            lane_a_name.to_string(),
+            lane_a_name.clone(),
             ExistingRow {
                 enabled: lane_a_default,
                 hash: seed_hash_for(lane_a_default),
@@ -482,10 +482,10 @@ mod seed_plan_tests {
         );
 
         // Lane B: stale seed hash → Update.
-        let (lane_b_name, lane_b_default) = ENABLED_DEFAULTS[1];
+        let (lane_b_name, lane_b_default) = defaults[1].clone();
         let lane_b_old = !lane_b_default;
         existing.insert(
-            lane_b_name.to_string(),
+            lane_b_name.clone(),
             ExistingRow {
                 enabled: lane_b_old,
                 hash: seed_hash_for(lane_b_old),
@@ -493,9 +493,9 @@ mod seed_plan_tests {
         );
 
         // Lane C: user-edited → skip even if value drifts.
-        let (lane_c_name, lane_c_default) = ENABLED_DEFAULTS[2];
+        let (lane_c_name, lane_c_default) = defaults[2].clone();
         existing.insert(
-            lane_c_name.to_string(),
+            lane_c_name.clone(),
             ExistingRow {
                 enabled: !lane_c_default,
                 hash: USER_EDITED_SENTINEL.to_string(),
@@ -503,22 +503,22 @@ mod seed_plan_tests {
         );
 
         // Lane D: legacy empty hash → skip (preserve).
-        let (lane_d_name, lane_d_default) = ENABLED_DEFAULTS[3];
+        let (lane_d_name, lane_d_default) = defaults[3].clone();
         existing.insert(
-            lane_d_name.to_string(),
+            lane_d_name.clone(),
             ExistingRow {
                 enabled: !lane_d_default,
                 hash: String::new(),
             },
         );
 
-        // Lanes E and beyond: absent → Insert. ENABLED_DEFAULTS[4..] are all absent.
+        // Lanes E and beyond: absent → Insert.
 
-        let decisions = plan_seed_decisions(&existing);
+        let decisions = plan_seed_decisions(&existing, &defaults);
 
-        // Expected: 1 Update (lane B) + (ENABLED_DEFAULTS.len() - 4) Inserts
-        // (lanes E onward). Lanes A, C, D produce no decisions.
-        let expected_inserts = ENABLED_DEFAULTS.len() - 4;
+        // Expected: 1 Update (lane B) + (defaults.len() - 4) Inserts (lanes E
+        // onward). Lanes A, C, D produce no decisions.
+        let expected_inserts = defaults.len() - 4;
         let inserts: Vec<&SeedDecision> = decisions
             .iter()
             .filter(|d| d.op == SeedOp::Insert)
@@ -542,9 +542,9 @@ mod seed_plan_tests {
         assert_eq!(updates[0].hash, seed_hash_for(lane_b_default));
 
         // Confirm none of the skipped lanes (A, C, D) appear in any decision.
-        for skipped in &[lane_a_name, lane_c_name, lane_d_name] {
+        for skipped in [lane_a_name, lane_c_name, lane_d_name] {
             assert!(
-                decisions.iter().all(|d| d.block_name != *skipped),
+                decisions.iter().all(|d| d.block_name != skipped),
                 "{skipped} should not be in decisions: {decisions:?}",
             );
         }

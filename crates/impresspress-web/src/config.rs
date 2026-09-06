@@ -134,7 +134,10 @@ pub async fn seed_and_load_variables(
 pub async fn load_block_settings(
     db: &Arc<dyn DatabaseService>,
 ) -> Result<impresspress_core::features::BlockSettings, String> {
-    impresspress_core::platform_state::block_settings::load_and_seed(db)
-        .await
-        .map_err(|e| format!("load block settings: {e}"))
+    impresspress_core::platform_state::block_settings::load_and_seed(
+        db,
+        &impresspress_core::blocks::block_enabled_defaults(),
+    )
+    .await
+    .map_err(|e| format!("load block settings: {e}"))
 }
