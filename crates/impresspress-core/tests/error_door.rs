@@ -66,10 +66,18 @@
 /// `llm/mod.rs` and `llm/routes/providers.rs`. Four of those are STORAGE
 /// calls rather than database ones (`files/share.rs` and both
 /// `files/storage/*`); the codes are the same set and the mapping is the
-/// same sentence, so they go through the same door. Only the nine products
-/// entries below are left, all for PR 4.
+/// same sentence, so they go through the same door. Only the eight products
+/// entries below are left.
+///
+/// PR 4 took **none** of them, deliberately. The entries were written on the
+/// assumption that the enum work would open these files anyway, and it did —
+/// but it opened them to move two published snapshots, the SDK's order and
+/// seller types and every products status column at once. Folding a second,
+/// unrelated behaviour change (a WRAP denial stops answering 500) into that
+/// review would have hidden it. The eight go as their own PR, which is a
+/// mechanical diff with a behavioural test and no snapshot movement at all.
 const STILL_HAND_MAPPED: &[(&str, &str)] = &[
-    // ---- PR 4: products enums (the same files move for the enum work) ----
+    // ---- owed as a follow-up to PR 4; see the note above ----
     ("products/pages.rs", "PR 4 (three SSR reads)"),
     ("products/purchase.rs", "PR 4 (five purchase lookups)"),
     ("products/stripe.rs", "PR 4 (three catalog reads)"),

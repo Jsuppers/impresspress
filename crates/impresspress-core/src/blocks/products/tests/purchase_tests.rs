@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use wafer_run::ErrorCode;
 
 use super::harness::*;
-use crate::blocks::products::purchase;
+use crate::blocks::products::{contracts::RefundStatus, purchase};
 
 // ============================================================
 // Order history and refunds
@@ -341,7 +341,8 @@ async fn order_endpoints_publish_typed_views_and_withhold_the_receipt_digest() {
     );
     assert_eq!(detail.refunds[0].amount_minor, 1000);
     assert_eq!(
-        detail.refunds[0].status, "succeeded",
+        detail.refunds[0].status,
+        RefundStatus::Succeeded,
         "the buyer sees whether their refund landed"
     );
     assert_eq!(detail.disputes[0].provider_dispute_id, "dp_provider_typed");

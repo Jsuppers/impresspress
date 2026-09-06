@@ -13,9 +13,9 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use super::{
     contracts::{
-        ApprovalStatus, BillingPortalRequest, ProviderReconcileResult, ProviderRedirect,
-        SellerAccount, SellerCapabilities, SellerOnboardingRequest, SellerOnboardingResponse,
-        StripeConnectionState, StripeConnectionStatus,
+        BillingPortalRequest, ProviderReconcileResult, ProviderRedirect, RefundStatus,
+        SellerAccount, SellerApproval, SellerCapabilities, SellerOnboardingRequest,
+        SellerOnboardingResponse, SellerStatus, StripeConnectionState, StripeConnectionStatus,
     },
     repo,
     stripe_client::{publishable_livemode, secret_livemode, StripeClient, DEFAULT_API_VERSION},
@@ -280,8 +280,8 @@ fn not_started_account(user_id: &str, fee_basis_points: u16) -> SellerAccount {
     SellerAccount {
         id: String::new(),
         user_id: user_id.to_string(),
-        status: "not_started".to_string(),
-        approval_status: ApprovalStatus::Approved,
+        status: SellerStatus::NotStarted,
+        approval_status: SellerApproval::Approved,
         stripe_account_id: String::new(),
         capabilities: SellerCapabilities {
             details_submitted: false,
@@ -309,7 +309,7 @@ pub(crate) async fn seller_status(
         return Ok(not_started_account(user_id, fee));
     };
     let account_id = local.str_field("stripe_account_id").to_string();
-    if account_id.is_empty() || local.str_field("status") == "suspended" {
+    if account_id.is_empty() || repo::seller_accounts::is_suspended_record(&local)? {
         return repo::seller_accounts::to_contract(&local);
     }
     let Ok(client) = StripeClient::load(ctx).await else {
@@ -349,7 +349,7 @@ pub(crate) async fn start_seller_onboarding(
     let fee = configured_fee(ctx).await?;
     let client = StripeClient::load(ctx).await?;
     let mut local = repo::seller_accounts::ensure_for_user(ctx, user_id, fee).await?;
-    if local.str_field("status") == "suspended" {
+    if repo::seller_accounts::is_suspended_record(&local)? {
         return Err(WaferError::new(
             ErrorCode::PermissionDenied,
             "seller account is suspended",
@@ -701,7 +701,7 @@ async fn reconcile_refund_operation(
         operation.str_field("aggregate_id"),
     )
     .await?;
-    if refund.str_field("status") == "succeeded" {
+    if repo::refunds::status_of(&refund)? == RefundStatus::Succeeded {
         return Ok(RefundReconcileOutcome::Succeeded(
             refund.str_field("response_json").to_string(),
         ));

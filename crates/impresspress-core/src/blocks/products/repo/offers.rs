@@ -13,15 +13,16 @@ use super::{offer_components, products, variables};
 use crate::{
     blocks::products::{
         contracts::{
-            AmountRule, BillingScheme, CheckoutPolicy, Condition, ManagedOffer, Offer,
-            OfferComponent, OfferComponentDraft, OfferDefinitionRequest, OfferMode, OfferStatus,
-            PricingModel, QuantityRule, RecurringInterval, TaxBehavior, UsageType,
-            VariableDefinition, VariableKind, VariableVisibility,
+            AmountRule, ApprovalStatus, BillingScheme, CheckoutPolicy, Condition, ManagedOffer,
+            Offer, OfferComponent, OfferComponentDraft, OfferDefinitionRequest, OfferMode,
+            OfferStatus, OfferSyncStatus, PricingModel, ProductStatus, QuantityRule,
+            RecurringInterval, TaxBehavior, UsageType, VariableDefinition, VariableKind,
+            VariableVisibility,
         },
         money::normalize_currency,
         offer_pricing,
     },
-    util::{stamp_created, stamp_updated, RecordExt},
+    util::{enum_column_or, stamp_created, stamp_updated, wire_str, RecordExt},
 };
 
 fn decode_error(entity: &str, id: &str, message: impl std::fmt::Display) -> WaferError {
@@ -31,15 +32,13 @@ fn decode_error(entity: &str, id: &str, message: impl std::fmt::Display) -> Wafe
     )
 }
 
-fn wire_enum<T: DeserializeOwned>(
-    record: &Record,
-    field: &str,
-    fallback: &str,
-) -> Result<T, WaferError> {
-    let value = record.str_field(field);
-    let value = if value.is_empty() { fallback } else { value };
-    serde_json::from_value(Value::String(value.to_string()))
-        .map_err(|error| decode_error("offer", &record.id, error))
+/// The `status` column of an offer row, as the enum that defines it.
+///
+/// Empty reads as [`OfferStatus::Draft`], which is the column's own
+/// `DEFAULT` (`005_commerce_v2.sqlite.sql:80`) and what the fallback string
+/// this replaces named.
+fn status_of(record: &Record) -> Result<OfferStatus, WaferError> {
+    enum_column_or(record, "status", OfferStatus::Draft)
 }
 
 fn json_text<T: DeserializeOwned + Default>(
@@ -106,7 +105,7 @@ fn variable_from_record(record: &Record) -> Result<VariableDefinition, WaferErro
         optional_text(record, "label").unwrap_or_else(|| record.str_field("name").to_string());
     Ok(VariableDefinition {
         key: record.str_field("name").to_string(),
-        kind: wire_enum::<VariableKind>(record, "var_type", "number")?,
+        kind: enum_column_or(record, "var_type", VariableKind::Number)?,
         label,
         help_text: record.str_field("help_text").to_string(),
         required: record.bool_field("required"),
@@ -122,7 +121,7 @@ fn variable_from_record(record: &Record) -> Result<VariableDefinition, WaferErro
             .map(usize::try_from)
             .transpose()
             .map_err(|error| decode_error("variable", &record.id, error))?,
-        visibility: wire_enum::<VariableVisibility>(record, "visibility", "public")?,
+        visibility: enum_column_or(record, "visibility", VariableVisibility::Public)?,
         sort_order: i32::try_from(record.i64_field("sort_order"))
             .map_err(|error| decode_error("variable", &record.id, error))?,
     })
@@ -194,14 +193,14 @@ async fn hydrate(ctx: &dyn Context, record: Record) -> Result<Offer, WaferError>
         product_id: record.str_field("product_id").to_string(),
         version,
         name: record.str_field("name").to_string(),
-        mode: wire_enum::<OfferMode>(&record, "mode", "payment")?,
+        mode: enum_column_or(&record, "mode", OfferMode::Payment)?,
         currency: record.str_field("currency").to_string(),
-        pricing_model: wire_enum::<PricingModel>(&record, "pricing_model", "fixed")?,
+        pricing_model: enum_column_or(&record, "pricing_model", PricingModel::Fixed)?,
         recurring_interval,
         interval_count,
-        usage_type: wire_enum::<UsageType>(&record, "usage_type", "licensed")?,
-        billing_scheme: wire_enum::<BillingScheme>(&record, "billing_scheme", "per_unit")?,
-        tax_behavior: wire_enum::<TaxBehavior>(&record, "tax_behavior", "unspecified")?,
+        usage_type: enum_column_or(&record, "usage_type", UsageType::Licensed)?,
+        billing_scheme: enum_column_or(&record, "billing_scheme", BillingScheme::PerUnit)?,
+        tax_behavior: enum_column_or(&record, "tax_behavior", TaxBehavior::Unspecified)?,
         variables,
         components,
         checkout: json_text::<CheckoutPolicy>(&record, "config_json", "offer")?,
@@ -378,15 +377,15 @@ fn definition_data(offer: &Offer) -> Result<HashMap<String, Value>, WaferError> 
         ("stripe_price_id".to_string(), Value::String(String::new())),
         (
             "sync_status".to_string(),
-            Value::String("not_synced".to_string()),
+            serde_json::json!(OfferSyncStatus::NotSynced),
         ),
         ("sync_error".to_string(), Value::String(String::new())),
     ]))
 }
 
 async fn hydrate_managed(ctx: &dyn Context, record: Record) -> Result<ManagedOffer, WaferError> {
-    let status = wire_enum::<OfferStatus>(&record, "status", "draft")?;
-    let sync_status = record.str_field("sync_status").to_string();
+    let status = enum_column_or(&record, "status", OfferStatus::Draft)?;
+    let sync_status = enum_column_or(&record, "sync_status", OfferSyncStatus::NotSynced)?;
     let sync_error = record.str_field("sync_error").to_string();
     Ok(ManagedOffer {
         status,
@@ -407,7 +406,7 @@ pub(crate) async fn mark_syncing(ctx: &dyn Context, offer_id: &str) -> Result<()
     let mut data = HashMap::from([
         (
             "sync_status".to_string(),
-            Value::String("syncing".to_string()),
+            serde_json::json!(OfferSyncStatus::Syncing),
         ),
         ("sync_error".to_string(), Value::String(String::new())),
     ]);
@@ -424,7 +423,7 @@ pub(crate) async fn mark_synced(
     let mut data = HashMap::from([
         (
             "sync_status".to_string(),
-            Value::String("synced".to_string()),
+            serde_json::json!(OfferSyncStatus::Synced),
         ),
         ("sync_error".to_string(), Value::String(String::new())),
         (
@@ -449,7 +448,7 @@ pub(crate) async fn mark_sync_error(
     let mut data = HashMap::from([
         (
             "sync_status".to_string(),
-            Value::String("failed".to_string()),
+            serde_json::json!(OfferSyncStatus::Failed),
         ),
         (
             "sync_error".to_string(),
@@ -523,7 +522,7 @@ pub(crate) async fn create(
         "product_id".to_string(),
         Value::String(product_id.to_string()),
     );
-    data.insert("status".to_string(), Value::String("draft".to_string()));
+    data.insert("status".to_string(), serde_json::json!(OfferStatus::Draft));
     data.insert(
         "created_by".to_string(),
         Value::String(created_by.to_string()),
@@ -552,7 +551,7 @@ pub(crate) async fn create(
     }
     let mut settle = HashMap::from([("draft_updating".to_string(), Value::Bool(false))]);
     stamp_updated(&mut settle);
-    if !update_if_current(ctx, &offer_id, "draft", Some(0), settle).await? {
+    if !update_if_current(ctx, &offer_id, OfferStatus::Draft, Some(0), settle).await? {
         return Err(concurrent_transition());
     }
     get_managed(ctx, &offer_id).await
@@ -566,7 +565,7 @@ pub(crate) async fn create(
 pub(crate) async fn update_if_status(
     ctx: &dyn Context,
     offer_id: &str,
-    expected_status: &str,
+    expected_status: OfferStatus,
     data: HashMap<String, Value>,
 ) -> Result<bool, WaferError> {
     update_if_current(ctx, offer_id, expected_status, None, data).await
@@ -581,7 +580,7 @@ pub(crate) async fn update_if_status(
 pub(crate) async fn update_if_current(
     ctx: &dyn Context,
     offer_id: &str,
-    expected_status: &str,
+    expected_status: OfferStatus,
     expected_draft_revision: Option<i64>,
     data: HashMap<String, Value>,
 ) -> Result<bool, WaferError> {
@@ -625,7 +624,7 @@ pub(crate) async fn update_draft(
     if record.str_field("product_id") != product_id {
         return Err(WaferError::new(ErrorCode::NotFound, "offer not found"));
     }
-    if record.str_field("status") != "draft" {
+    if status_of(&record)? != OfferStatus::Draft {
         return Err(WaferError::new(
             ErrorCode::FailedPrecondition,
             "active or archived offers are immutable; duplicate the offer to edit it",
@@ -652,9 +651,17 @@ pub(crate) async fn update_draft(
     data.insert("draft_revision".to_string(), Value::from(next_revision));
     data.insert("draft_updating".to_string(), Value::Bool(true));
     stamp_updated(&mut data);
-    if !update_if_current(ctx, offer_id, "draft", Some(draft_revision), data).await? {
+    if !update_if_current(
+        ctx,
+        offer_id,
+        OfferStatus::Draft,
+        Some(draft_revision),
+        data,
+    )
+    .await?
+    {
         let current = db::get(ctx, TABLE, offer_id).await?;
-        if current.str_field("status") != "draft" {
+        if status_of(&current)? != OfferStatus::Draft {
             return Err(WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "active or archived offers are immutable; duplicate the offer to edit it",
@@ -670,7 +677,15 @@ pub(crate) async fn update_draft(
     // raised: publish keeps failing cleanly until a retried update completes.
     let mut settle = HashMap::from([("draft_updating".to_string(), Value::Bool(false))]);
     stamp_updated(&mut settle);
-    if !update_if_current(ctx, offer_id, "draft", Some(next_revision), settle).await? {
+    if !update_if_current(
+        ctx,
+        offer_id,
+        OfferStatus::Draft,
+        Some(next_revision),
+        settle,
+    )
+    .await?
+    {
         return Err(concurrent_transition());
     }
     get_managed(ctx, offer_id).await
@@ -705,13 +720,21 @@ pub(crate) async fn publish(
         return Err(concurrent_transition());
     }
     offer_pricing::validate_offer(&managed.offer).map_err(|error| invalid(error.to_string()))?;
-    let mut data = HashMap::from([("status".to_string(), Value::String("active".to_string()))]);
+    let mut data = HashMap::from([("status".to_string(), serde_json::json!(OfferStatus::Active))]);
     stamp_updated(&mut data);
     // CAS draft->active fenced on the exact draft revision that was read and
     // validated: any draft update that started since (which always advances
     // the revision before touching child rows) makes this write miss, so a
     // publish can only ever pin the consistent child set it validated.
-    if !update_if_current(ctx, offer_id, "draft", Some(draft_revision), data).await? {
+    if !update_if_current(
+        ctx,
+        offer_id,
+        OfferStatus::Draft,
+        Some(draft_revision),
+        data,
+    )
+    .await?
+    {
         // A concurrent transition won the race. Re-read: a concurrent
         // publish converges to the same outcome; anything else is an error.
         let managed = get_managed(ctx, offer_id).await?;
@@ -732,14 +755,15 @@ pub(crate) async fn archive(
     if managed.status == OfferStatus::Archived {
         return Ok(managed);
     }
-    let mut data = HashMap::from([("status".to_string(), Value::String("archived".to_string()))]);
+    let mut data = HashMap::from([(
+        "status".to_string(),
+        serde_json::json!(OfferStatus::Archived),
+    )]);
     stamp_updated(&mut data);
-    let expected = match managed.status {
-        OfferStatus::Draft => "draft",
-        OfferStatus::Active => "active",
-        OfferStatus::Archived => unreachable!("archived returns above"),
-    };
-    if !update_if_status(ctx, offer_id, expected, data).await? {
+    // The offer is archived from whichever state it is in; `managed.status`
+    // is the CAS expectation directly, which is what the re-spelled
+    // `match` this replaces was reconstructing.
+    if !update_if_status(ctx, offer_id, managed.status, data).await? {
         // A concurrent transition won the race. A concurrent archive
         // converges to the same outcome; anything else is an error.
         let managed = get_managed(ctx, offer_id).await?;
@@ -846,7 +870,7 @@ pub(crate) async fn list_public_for_product(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: Value::String("active".to_string()),
+                value: serde_json::json!(OfferStatus::Active),
             },
         ],
     )
@@ -867,14 +891,19 @@ pub(crate) async fn list_public_for_product(
 /// suspended, archived, or soft-deleted seller configurations.
 pub(crate) async fn get_public(ctx: &dyn Context, offer_id: &str) -> Result<Offer, WaferError> {
     let record = db::get(ctx, TABLE, offer_id).await?;
-    if record.str_field("status") != "active" {
+    if status_of(&record)? != OfferStatus::Active {
         return Err(WaferError::new(ErrorCode::NotFound, "offer not found"));
     }
     let product_id = record.str_field("product_id");
     let product = products::get(ctx, product_id).await?;
     // `products::get` already answers `NotFound` for a soft-deleted row; only
     // `status`/`approval_status` are this function's own rules to enforce.
-    if product.str_field("status") != "active" || product.str_field("approval_status") != "approved"
+    //
+    // The stored spelling against the variants' own, not a decode: this is the
+    // public visibility gate, and a row outside either contract has to stay
+    // invisible (404) rather than announce itself with a 500.
+    if product.str_field("status") != wire_str(&ProductStatus::Active)
+        || product.str_field("approval_status") != wire_str(&ApprovalStatus::Approved)
     {
         return Err(WaferError::new(ErrorCode::NotFound, "offer not found"));
     }

@@ -9,8 +9,9 @@ use wafer_run::{context::Context, WaferError};
 use crate::{
     blocks::products::{
         contracts::{
-            AnalyticsProduct, CheckoutPresentation, CommerceAnalytics, MoneyBreakdown, OfferMode,
-            OrderStatus, ReconciliationStatus, SellerFailureSummary,
+            AnalyticsProduct, CheckoutPresentation, CommerceAnalytics, DisputeStatus,
+            MoneyBreakdown, OfferMode, OrderStatus, ProviderPaymentStatus, ReconciliationStatus,
+            SellerFailureSummary, SubscriptionStatus,
         },
         money,
     },
@@ -67,7 +68,11 @@ pub(crate) async fn recent_seller_failures(
                 Filter {
                     field: "provider_payment_status".to_string(),
                     operator: FilterOp::In,
-                    value: serde_json::json!(["payment_failed", "requires_action", "canceled"]),
+                    value: serde_json::json!([
+                        ProviderPaymentStatus::PaymentFailed,
+                        ProviderPaymentStatus::RequiresAction,
+                        ProviderPaymentStatus::Canceled,
+                    ]),
                 },
             ],
             sort: vec![SortField {
@@ -178,7 +183,10 @@ pub(crate) struct PaymentIntentSnapshot {
     pub payment_intent_id: String,
     pub stripe_account_id: String,
     pub livemode: bool,
-    pub status: String,
+    /// The provider's state for the PaymentIntent. Never
+    /// [`ProviderPaymentStatus::Unset`]: a snapshot is built from a
+    /// delivered event, and `sync_payment_intent` refuses one that is not.
+    pub status: ProviderPaymentStatus,
     pub amount_minor: i64,
     pub currency: String,
     pub error_code: String,
@@ -629,7 +637,7 @@ pub(crate) async fn complete_checkout_atomic(
     if !payment_intent.is_empty() {
         data.insert(
             "provider_payment_status".into(),
-            serde_json::json!("succeeded"),
+            serde_json::json!(ProviderPaymentStatus::Succeeded),
         );
         data.insert("provider_payment_error_code".into(), serde_json::json!(""));
         data.insert(
@@ -646,7 +654,10 @@ pub(crate) async fn complete_checkout_atomic(
         serde_json::json!(stripe_subscription_id),
     );
     if !stripe_subscription_id.is_empty() {
-        data.insert("subscription_status".into(), serde_json::json!("active"));
+        data.insert(
+            "subscription_status".into(),
+            serde_json::json!(SubscriptionStatus::Active),
+        );
         data.insert(
             "subscription_last_synced_at".into(),
             serde_json::json!(&now),
@@ -855,7 +866,7 @@ pub(crate) async fn reconcile_checkout_session(
     if !completion.payment_intent_id.is_empty() {
         data.insert(
             "provider_payment_status".to_string(),
-            serde_json::json!("succeeded"),
+            serde_json::json!(ProviderPaymentStatus::Succeeded),
         );
         data.insert(
             "provider_payment_error_code".to_string(),
@@ -869,7 +880,7 @@ pub(crate) async fn reconcile_checkout_session(
     if !completion.subscription_id.is_empty() {
         data.insert(
             "subscription_status".to_string(),
-            serde_json::json!("active"),
+            serde_json::json!(SubscriptionStatus::Active),
         );
         data.insert(
             "subscription_last_synced_at".to_string(),
@@ -1021,10 +1032,7 @@ pub(crate) async fn sync_payment_intent(
     if snapshot.payment_intent_id.is_empty()
         || snapshot.event_created < 0
         || snapshot.amount_minor < 0
-        || !matches!(
-            snapshot.status.as_str(),
-            "succeeded" | "payment_failed" | "processing" | "requires_action" | "canceled"
-        )
+        || snapshot.status == ProviderPaymentStatus::Unset
     {
         return Err(invalid(
             "id, supported status, non-negative amount, and event timestamp are required",
@@ -1094,7 +1102,7 @@ pub(crate) async fn sync_payment_intent(
     let order_status = OrderStatus::from_record(&purchase)?;
     let paid = order_status.is_paid();
     if paid {
-        if snapshot.status != "succeeded" {
+        if snapshot.status != ProviderPaymentStatus::Succeeded {
             // Checkout is the fulfillment authority. A late, non-success
             // PaymentIntent delivery cannot regress an already reconciled
             // paid order even when an old integration did not persist its PI
@@ -1104,7 +1112,9 @@ pub(crate) async fn sync_payment_intent(
         if purchase.i64_field("total_cents") != snapshot.amount_minor {
             return Err(invalid("amount does not match the completed order"));
         }
-    } else if order_status == OrderStatus::Failed && snapshot.status == "succeeded" {
+    } else if order_status == OrderStatus::Failed
+        && snapshot.status == ProviderPaymentStatus::Succeeded
+    {
         return Err(invalid(
             "a succeeded PaymentIntent conflicts with a terminal failed order",
         ));
@@ -1122,7 +1132,7 @@ pub(crate) async fn sync_payment_intent(
         ),
         (
             "provider_payment_status".to_string(),
-            serde_json::json!(&snapshot.status),
+            serde_json::json!(snapshot.status),
         ),
         (
             "provider_payment_error_code".to_string(),
@@ -1139,13 +1149,20 @@ pub(crate) async fn sync_payment_intent(
         ("updated_at".to_string(), serde_json::json!(&now)),
     ]);
     if !paid {
-        let reconciliation_status = match snapshot.status.as_str() {
-            "succeeded" => ReconciliationStatus::PaymentSucceededAwaitingCheckout,
-            "payment_failed" => ReconciliationStatus::PaymentFailed,
-            "processing" => ReconciliationStatus::PaymentProcessing,
-            "requires_action" => ReconciliationStatus::PaymentRequiresAction,
-            "canceled" => ReconciliationStatus::PaymentCanceled,
-            _ => unreachable!("validated PaymentIntent status"),
+        let reconciliation_status = match snapshot.status {
+            ProviderPaymentStatus::Succeeded => {
+                ReconciliationStatus::PaymentSucceededAwaitingCheckout
+            }
+            ProviderPaymentStatus::PaymentFailed => ReconciliationStatus::PaymentFailed,
+            ProviderPaymentStatus::Processing => ReconciliationStatus::PaymentProcessing,
+            ProviderPaymentStatus::RequiresAction => ReconciliationStatus::PaymentRequiresAction,
+            ProviderPaymentStatus::Canceled => ReconciliationStatus::PaymentCanceled,
+            // Refused by the guard at the top of this function: a snapshot
+            // is built from a delivered PaymentIntent event, which always
+            // carries a state.
+            ProviderPaymentStatus::Unset => {
+                return Err(invalid("PaymentIntent event carried no status"))
+            }
         };
         data.insert(
             "reconciliation_status".to_string(),
@@ -1208,14 +1225,15 @@ pub(crate) async fn sync_commerce_subscription(
     stripe_subscription_id: &str,
     stripe_account_id: &str,
     livemode: bool,
-    status: &str,
+    status: SubscriptionStatus,
     current_period_end: Option<&str>,
     cancel_at_period_end: Option<bool>,
     canceled_at: Option<&str>,
-    expected_current_status: Option<&str>,
+    expected_current_status: Option<SubscriptionStatus>,
     event_created: i64,
 ) -> Result<Option<Record>, WaferError> {
-    if stripe_subscription_id.is_empty() || status.is_empty() || event_created < 0 {
+    if stripe_subscription_id.is_empty() || status == SubscriptionStatus::Unset || event_created < 0
+    {
         return Err(WaferError::new(
             wafer_run::ErrorCode::InvalidArgument,
             "subscription id, status, and a valid event timestamp are required",
@@ -1248,9 +1266,9 @@ pub(crate) async fn sync_commerce_subscription(
     let purchase_id = purchase.id.clone();
     for _ in 0..3 {
         let current_created = purchase.i64_field("subscription_event_created");
-        let current_status = purchase.str_field("subscription_status").to_string();
+        let current_status = SubscriptionStatus::from_record(&purchase)?;
         if !super::subscription_transition_allowed(
-            &current_status,
+            current_status,
             current_created,
             status,
             event_created,
@@ -1310,7 +1328,7 @@ pub(crate) async fn sync_commerce_subscription(
                 Filter {
                     field: "subscription_status".to_string(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!(&current_status),
+                    value: serde_json::json!(current_status),
                 },
             ],
             data,
@@ -1647,12 +1665,19 @@ pub(crate) async fn commerce_analytics(
         }
 
         if !order.str_field("stripe_subscription_id").is_empty() {
-            match order.str_field("subscription_status") {
-                "active" => aggregate.active_subscription_count += 1,
-                "trialing" => aggregate.trialing_subscription_count += 1,
-                "past_due" | "unpaid" | "paused" => aggregate.past_due_subscription_count += 1,
-                "canceled" | "incomplete_expired" => aggregate.canceled_subscription_count += 1,
-                _ => {}
+            match SubscriptionStatus::from_record(&order)? {
+                SubscriptionStatus::Active => aggregate.active_subscription_count += 1,
+                SubscriptionStatus::Trialing => aggregate.trialing_subscription_count += 1,
+                SubscriptionStatus::PastDue
+                | SubscriptionStatus::Unpaid
+                | SubscriptionStatus::Paused => aggregate.past_due_subscription_count += 1,
+                SubscriptionStatus::Canceled | SubscriptionStatus::IncompleteExpired => {
+                    aggregate.canceled_subscription_count += 1
+                }
+                // An order with a Stripe subscription id whose state has
+                // not arrived yet, or one Stripe is still setting up. It
+                // belongs to no bucket the analytics page shows.
+                SubscriptionStatus::Unset | SubscriptionStatus::Incomplete => {}
             }
         }
     }
@@ -1681,19 +1706,22 @@ pub(crate) async fn commerce_analytics(
                 ),
             )
         })?;
-        match dispute.str_field("status") {
-            "warning_needs_response"
-            | "warning_under_review"
-            | "needs_response"
-            | "under_review" => {
+        match super::disputes::status_of(&dispute)? {
+            DisputeStatus::WarningNeedsResponse
+            | DisputeStatus::WarningUnderReview
+            | DisputeStatus::NeedsResponse
+            | DisputeStatus::UnderReview => {
                 aggregate.open_dispute_count += 1;
                 aggregate.open_disputed_volume_minor += i128::from(amount);
             }
-            "lost" => {
+            DisputeStatus::Lost => {
                 aggregate.lost_dispute_count += 1;
                 aggregate.lost_disputed_volume_minor += i128::from(amount);
             }
-            _ => {}
+            // Closed in the merchant's favour, prevented before it became a
+            // dispute, or a warning that closed: none of them is open and
+            // none of them was lost, so they count in neither total.
+            DisputeStatus::WarningClosed | DisputeStatus::Won | DisputeStatus::Prevented => {}
         }
     }
 
@@ -1839,7 +1867,7 @@ pub(crate) async fn completed_purchase_ids(
                 Filter {
                     field: "status".into(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!("completed"),
+                    value: serde_json::json!(OrderStatus::Completed),
                 },
             ],
             skip_count: true,

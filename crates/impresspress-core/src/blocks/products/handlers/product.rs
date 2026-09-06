@@ -17,7 +17,7 @@ use crate::{
         crud,
         products::{
             contracts::{
-                CreateProductRequest, ProductDuplicateResponse, ProductListQuery,
+                ApprovalStatus, CreateProductRequest, ProductDuplicateResponse, ProductListQuery,
                 ProductListResponse, ProductStatus, ProductView, UpdateProductRequest,
             },
             repo::{self, offers as offer_repo},
@@ -27,7 +27,7 @@ use crate::{
         err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
         err_unauthorized, ok_json,
     },
-    util::{field_as_string, now_rfc3339, stamp_created, stamp_updated, RecordExt},
+    util::{enum_column, field_as_string, now_rfc3339, stamp_created, stamp_updated, RecordExt},
 };
 
 // Columns the products table owns internally: the row's identity, ownership,
@@ -163,6 +163,21 @@ pub(in crate::blocks::products) fn write_error(
         ErrorCode::NotFound => err_not_found("Product not found"),
         ErrorCode::InvalidArgument => err_bad_request(&error.message),
         _ => err_internal(context, error),
+    }
+}
+
+/// One product row as the view every product endpoint publishes, or the 500
+/// a row outside the contract earns.
+///
+/// The single-row counterpart of [`ProductListResponse::from_record_list`]'s
+/// row-not-page degradation, and the opposite trade for the opposite reason:
+/// a page that drops one unreadable row still answers what the caller asked,
+/// but here the row IS the response, so a `status` or `approval_status` the
+/// contract does not define has to be said out loud.
+pub(in crate::blocks::products) fn product_json(record: &db::Record) -> OutputStream {
+    match ProductView::from_record(record) {
+        Ok(view) => ok_json(&view),
+        Err(error) => err_internal("Product row is outside the contract", error),
     }
 }
 
@@ -379,7 +394,7 @@ pub(super) async fn handle_get_product(ctx: &dyn Context, msg: &Message) -> Outp
         Err(response) => return response,
     };
     match repo::products::get(ctx, id).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),
     }
@@ -400,16 +415,19 @@ pub(super) async fn handle_create_product(
     // `CreateProductRequest`, and `read_write_body` has already refused a
     // body that named one anyway.
     for (key, value) in [
-        ("status", serde_json::json!("draft")),
+        ("status", serde_json::json!(ProductStatus::Draft)),
         ("created_by", serde_json::json!(msg.user_id())),
         ("owner_kind", serde_json::json!("platform")),
         ("owner_id", serde_json::json!("")),
-        ("approval_status", serde_json::json!("approved")),
+        (
+            "approval_status",
+            serde_json::json!(ApprovalStatus::Approved),
+        ),
     ] {
         data.entry(key.to_string()).or_insert(value);
     }
     match create_product_row(ctx, data).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -438,7 +456,7 @@ pub(super) async fn handle_update_product(
     // exists to prevent. `NotFound` matches the response every other admin
     // product endpoint gives for a soft-deleted row.
     match repo::products::update_live(ctx, id, data).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         Err(e) => write_error(e, "Database error"),
     }
 }
@@ -513,7 +531,7 @@ async fn restore_product(ctx: &dyn Context, id: &str) -> OutputStream {
     // What the probe reads afterwards CAN still move — see the
     // `SlugProbe::Clear` arm below for what is done about that.
     match repo::products::restore(ctx, id).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         // The filtered write matched zero rows: no such product, or one that
         // was never deleted. Never a slug collision, so it does not go near
         // the probe.
@@ -555,7 +573,7 @@ async fn restore_product(ctx: &dyn Context, id: &str) -> OutputStream {
             // today, and sniffing driver message text would be both magic and
             // backend-specific, so that fix belongs in wafer-run.)
             SlugProbe::Clear(slug) => match repo::products::restore(ctx, id).await {
-                Ok(record) => ok_json(&ProductView::from_record(&record)),
+                Ok(record) => product_json(&record),
                 // The row stopped being a deleted product in the meantime —
                 // a concurrent restore landed first, or it was purged. That
                 // is not this caller's slug conflict, and the 404 every other
@@ -765,14 +783,11 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
         );
         data.insert(
             "approval_status".to_string(),
-            serde_json::Value::String(
-                if moderation_required {
-                    "draft"
-                } else {
-                    "approved"
-                }
-                .to_string(),
-            ),
+            serde_json::json!(if moderation_required {
+                ApprovalStatus::Draft
+            } else {
+                ApprovalStatus::Approved
+            }),
         );
         if let Some(account_id) = source.data.get("seller_account_id") {
             data.insert("seller_account_id".to_string(), account_id.clone());
@@ -788,7 +803,7 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
         );
         data.insert(
             "approval_status".to_string(),
-            serde_json::Value::String("approved".to_string()),
+            serde_json::json!(ApprovalStatus::Approved),
         );
     }
     stamp_created(&mut data);
@@ -821,8 +836,12 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
             return err_internal("Could not duplicate product pricing", error);
         }
     };
+    let product = match ProductView::from_record(&created) {
+        Ok(product) => product,
+        Err(error) => return err_internal("Product row is outside the contract", error),
+    };
     ok_json(&ProductDuplicateResponse {
-        product: ProductView::from_record(&created),
+        product,
         offers: duplicated_offers,
     })
 }
@@ -865,7 +884,7 @@ pub(super) async fn handle_user_get_product(ctx: &dyn Context, msg: &Message) ->
         Err(response) => return response,
     };
     match verify_product_owner(ctx, id, msg.user_id()).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         Err(response) => response,
     }
 }
@@ -909,18 +928,15 @@ pub(super) async fn handle_user_create_product(
     let moderation_required = seller_moderation_required(ctx).await;
     data.insert(
         "status".to_string(),
-        serde_json::Value::String("draft".to_string()),
+        serde_json::json!(ProductStatus::Draft),
     );
     data.insert(
         "approval_status".to_string(),
-        serde_json::Value::String(
-            if moderation_required {
-                "draft"
-            } else {
-                "approved"
-            }
-            .to_string(),
-        ),
+        serde_json::json!(if moderation_required {
+            ApprovalStatus::Draft
+        } else {
+            ApprovalStatus::Approved
+        }),
     );
     data.insert(
         "owner_kind".to_string(),
@@ -963,7 +979,7 @@ pub(super) async fn handle_user_create_product(
     }
 
     match create_product_row(ctx, data).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -1008,18 +1024,28 @@ pub(super) async fn handle_user_update_product(
             {
                 return response;
             }
-            let approval = field_as_string(&current, "approval_status");
-            if approval == "suspended" {
+            let approval = match enum_column::<ApprovalStatus>(&current, "approval_status") {
+                Ok(approval) => approval,
+                Err(error) => {
+                    return err_internal("Product row is outside the contract", error);
+                }
+            };
+            if approval == ApprovalStatus::Suspended {
                 return err_forbidden("Suspended products cannot be published");
             }
-            if seller_moderation_required(ctx).await && approval != "approved" {
+            if seller_moderation_required(ctx).await && approval != ApprovalStatus::Approved {
+                // The two columns a seller submission moves, to two different
+                // values: `status` is the publication state a buyer sees and
+                // `approval_status` is the moderation state an administrator
+                // acts on. Review bug B11 read the pair as one vocabulary
+                // spelled twice; `tests::status_enum_tests` pins that it is not.
                 data.insert(
                     "status".to_string(),
-                    serde_json::Value::String("pending_review".to_string()),
+                    serde_json::json!(ProductStatus::PendingReview),
                 );
                 data.insert(
                     "approval_status".to_string(),
-                    serde_json::Value::String("pending".to_string()),
+                    serde_json::json!(ApprovalStatus::Pending),
                 );
                 data.insert(
                     "submitted_at".to_string(),
@@ -1028,11 +1054,11 @@ pub(super) async fn handle_user_update_product(
             } else {
                 data.insert(
                     "status".to_string(),
-                    serde_json::Value::String("active".to_string()),
+                    serde_json::json!(ProductStatus::Active),
                 );
                 data.insert(
                     "approval_status".to_string(),
-                    serde_json::Value::String("approved".to_string()),
+                    serde_json::json!(ApprovalStatus::Approved),
                 );
                 data.insert(
                     "published_at".to_string(),
@@ -1048,7 +1074,7 @@ pub(super) async fn handle_user_update_product(
     // and this write only widens the window a concurrent delete can land in.
     // The write itself has to be the thing that tests liveness.
     match repo::products::update_live(ctx, &id, data).await {
-        Ok(record) => ok_json(&ProductView::from_record(&record)),
+        Ok(record) => product_json(&record),
         Err(error) => write_error(error, "Database error"),
     }
 }

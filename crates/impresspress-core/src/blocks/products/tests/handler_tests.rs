@@ -4,6 +4,7 @@ use base64ct::{Base64, Encoding};
 use wafer_run::ErrorCode;
 
 use super::harness::*;
+use crate::blocks::products::contracts::{ApprovalStatus, DisputeStatus, ProductStatus};
 
 // ============================================================
 // Admin Product CRUD
@@ -477,8 +478,14 @@ async fn admin_stats_never_combine_currencies() {
         .await;
     }
     for (purchase_id, dispute_id, status, currency, amount) in [
-        ("order_nzd", "dp_admin_nzd", "needs_response", "NZD", 700),
-        ("order_usd", "dp_admin_usd", "lost", "USD", 900),
+        (
+            "order_nzd",
+            "dp_admin_nzd",
+            DisputeStatus::NeedsResponse,
+            "NZD",
+            700,
+        ),
+        ("order_usd", "dp_admin_usd", DisputeStatus::Lost, "USD", 900),
     ] {
         crate::blocks::products::repo::disputes::reconcile(
             &ctx,
@@ -489,7 +496,7 @@ async fn admin_stats_never_combine_currencies() {
                 provider_dispute_id: dispute_id.to_string(),
                 provider_charge_id: format!("ch_{dispute_id}"),
                 payment_intent_id: format!("pi_{dispute_id}"),
-                status: status.to_string(),
+                status,
                 amount_minor: amount,
                 currency: currency.to_string(),
                 reason: "fraudulent".to_string(),
@@ -564,14 +571,14 @@ async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
             "seller_order_1",
             "seller_stats_1",
             "dp_seller_stats_1",
-            "under_review",
+            DisputeStatus::UnderReview,
             700,
         ),
         (
             "seller_order_2",
             "seller_stats_2",
             "dp_seller_stats_2",
-            "lost",
+            DisputeStatus::Lost,
             900,
         ),
     ] {
@@ -584,7 +591,7 @@ async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
                 provider_dispute_id: dispute_id.to_string(),
                 provider_charge_id: format!("ch_{dispute_id}"),
                 payment_intent_id: format!("pi_{dispute_id}"),
-                status: status.to_string(),
+                status,
                 amount_minor: amount,
                 currency: "NZD".to_string(),
                 reason: "fraudulent".to_string(),
@@ -4010,9 +4017,9 @@ async fn product_endpoints_publish_the_flat_product_view() {
     assert_eq!(view.tags, vec!["a", "b"]);
     assert_eq!(view.metadata.get("k"), Some(&serde_json::json!(1)));
     assert_eq!(view.stock, 3);
-    assert_eq!(view.status, "draft");
+    assert_eq!(view.status, ProductStatus::Draft);
     assert_eq!(view.owner_kind, "platform");
-    assert_eq!(view.approval_status, "approved");
+    assert_eq!(view.approval_status, ApprovalStatus::Approved);
     assert_eq!(view.created_by, "admin_1");
     assert_eq!(view.fulfillment_kind, "download");
     assert_eq!(view.current_version, 1);

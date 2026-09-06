@@ -77,7 +77,7 @@
               "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
               "properties": {
                 "approval_status": {
-                  "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+                  "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`. A different column and a different\nvocabulary from `status` — a listing awaiting review is\n`status = pending_review` and `approval_status = pending` at once.",
                   "enum": [
                     "draft",
                     "pending",
@@ -440,7 +440,7 @@
         "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
         "properties": {
           "approval_status": {
-            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`. A different column and a different\nvocabulary from `status` — a listing awaiting review is\n`status = pending_review` and `approval_status = pending` at once.",
             "enum": [
               "draft",
               "pending",
@@ -794,7 +794,7 @@
         "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
         "properties": {
           "approval_status": {
-            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`. A different column and a different\nvocabulary from `status` — a listing awaiting review is\n`status = pending_review` and `approval_status = pending` at once.",
             "enum": [
               "draft",
               "pending",
@@ -1049,7 +1049,7 @@
         "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
         "properties": {
           "approval_status": {
-            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`.",
+            "description": "Moderation state: `draft`, `pending` (submitted for review), `approved`,\n`rejected` or `suspended`. A different column and a different\nvocabulary from `status` — a listing awaiting review is\n`status = pending_review` and `approval_status = pending` at once.",
             "enum": [
               "draft",
               "pending",

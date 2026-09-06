@@ -13,12 +13,12 @@ use crate::{
     blocks::{
         crud,
         products::{
-            contracts::{CatalogProductListResponse, CatalogProductView, PageQuery},
+            contracts::{CatalogProductListResponse, CatalogProductView, PageQuery, ProductStatus},
             repo,
         },
     },
     http::{err_internal, err_not_found, ok_json},
-    util::RecordExt,
+    util::{wire_str, RecordExt},
 };
 
 pub(super) async fn handle_catalog(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -58,11 +58,16 @@ pub(super) async fn handle_get_product_public(ctx: &dyn Context, msg: &Message) 
 
     match repo::products::get(ctx, id).await {
         Ok(record) => {
-            let status = record.str_field("status");
-            if status != "active" {
+            // The stored spelling against the variant's own, not a decode: a
+            // row whose `status` is outside the contract has to stay invisible
+            // to the public catalog, and a 500 here would say it exists.
+            if record.str_field("status") != wire_str(&ProductStatus::Active) {
                 return err_not_found("Product not found");
             }
-            ok_json(&CatalogProductView::from_record(&record))
+            match CatalogProductView::from_record(&record) {
+                Ok(view) => ok_json(&view),
+                Err(error) => err_internal("Product row is outside the contract", error),
+            }
         }
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
         Err(e) => err_internal("Database error", e),

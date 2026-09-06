@@ -10,9 +10,10 @@ use crate::{
         crud,
         products::{
             contracts::{
-                FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus,
-                PricingPreviewRequest, ReconciliationStatus, StorefrontConfig, StorefrontOffer,
-                StorefrontProduct, StripeMode, VariableVisibility, COMMERCE_SCHEMA_VERSION,
+                ApprovalStatus, FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus,
+                PricingPreviewRequest, ProductStatus, ReconciliationStatus, StorefrontConfig,
+                StorefrontOffer, StorefrontProduct, StripeMode, VariableVisibility,
+                COMMERCE_SCHEMA_VERSION,
             },
             offer_pricing,
             repo::{offers, payment_links, products, purchases},
@@ -20,7 +21,7 @@ use crate::{
         },
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
-    util::{sha256_hex, RecordExt},
+    util::{sha256_hex, wire_str, RecordExt},
 };
 
 const STOREFRONT_WIDGET_JS: &str = include_str!("../assets/storefront.js");
@@ -197,7 +198,12 @@ pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) 
     };
     // `products::get` already answers `NotFound` for a soft-deleted row; only
     // `status`/`approval_status` are this handler's own rules to enforce.
-    if product.str_field("status") != "active" || product.str_field("approval_status") != "approved"
+    //
+    // The stored spelling against the variants' own, not a decode: this is a
+    // public storefront gate, and a row outside either contract has to stay
+    // invisible (404) rather than announce itself with a 500.
+    if product.str_field("status") != wire_str(&ProductStatus::Active)
+        || product.str_field("approval_status") != wire_str(&ApprovalStatus::Approved)
     {
         return err_not_found("Product not found");
     }

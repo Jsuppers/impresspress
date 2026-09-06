@@ -6,8 +6,8 @@ use super::{
         AdminPurchaseListQuery, BuyerOrderDetailResponse, BuyerOrderListResponse, BuyerOrderView,
         BuyerRefundView, DisputeView, LineItemView, OrderStatus, PageQuery, PurchaseDetailResponse,
         PurchaseListResponse, PurchaseView, RefundRequest, RefundResult, RefundResultStatus,
-        RefundView, SellerOrderDetailResponse, SellerOrderListQuery, SellerOrderListResponse,
-        SellerOrderView,
+        RefundStatus, RefundView, SellerOrderDetailResponse, SellerOrderListQuery,
+        SellerOrderListResponse, SellerOrderView,
     },
     repo, stripe_provider,
 };
@@ -124,6 +124,22 @@ async fn order_relations(
     })
 }
 
+/// The child rows of one order, projected, or the 500 a row outside its
+/// contract earns.
+///
+/// A *detail* response fails loudly where [`PurchaseListResponse::from_record_list`]
+/// degrades: a page of orders that drops one unreadable row still answers the
+/// question the caller asked, but an order detail that silently omits a refund
+/// or a dispute answers it wrongly. The row is the response here.
+fn child_rows<T>(
+    rows: impl IntoIterator<Item = Result<T, wafer_run::WaferError>>,
+    entity: &str,
+) -> Result<Vec<T>, OutputStream> {
+    rows.into_iter()
+        .collect::<Result<Vec<T>, _>>()
+        .map_err(|error| err_internal(&format!("{entity} row is outside the contract"), error))
+}
+
 /// The caller's own order. Disputes are not included: a dispute is a matter
 /// between the seller, the platform and the provider.
 async fn buyer_order_response(
@@ -138,6 +154,20 @@ async fn buyer_order_response(
         Ok(view) => view,
         Err(error) => return err_internal("Order row is outside the contract", error),
     };
+    let refunds = match child_rows(
+        relations.refunds.iter().map(BuyerRefundView::from_record),
+        "Refund",
+    ) {
+        Ok(refunds) => refunds,
+        Err(out) => return out,
+    };
+    let disputes = match child_rows(
+        relations.disputes.iter().map(DisputeView::from_record),
+        "Dispute",
+    ) {
+        Ok(disputes) => disputes,
+        Err(out) => return out,
+    };
     ok_json(&BuyerOrderDetailResponse {
         purchase: view,
         line_items: relations
@@ -145,16 +175,8 @@ async fn buyer_order_response(
             .iter()
             .map(LineItemView::from_record)
             .collect(),
-        refunds: relations
-            .refunds
-            .iter()
-            .map(BuyerRefundView::from_record)
-            .collect(),
-        disputes: relations
-            .disputes
-            .iter()
-            .map(DisputeView::from_record)
-            .collect(),
+        refunds,
+        disputes,
     })
 }
 
@@ -171,6 +193,20 @@ async fn seller_order_response(
         Ok(view) => view,
         Err(error) => return err_internal("Order row is outside the contract", error),
     };
+    let refunds = match child_rows(
+        relations.refunds.iter().map(RefundView::from_record),
+        "Refund",
+    ) {
+        Ok(refunds) => refunds,
+        Err(out) => return out,
+    };
+    let disputes = match child_rows(
+        relations.disputes.iter().map(DisputeView::from_record),
+        "Dispute",
+    ) {
+        Ok(disputes) => disputes,
+        Err(out) => return out,
+    };
     ok_json(&SellerOrderDetailResponse {
         purchase: view,
         line_items: relations
@@ -178,16 +214,8 @@ async fn seller_order_response(
             .iter()
             .map(LineItemView::from_record)
             .collect(),
-        refunds: relations
-            .refunds
-            .iter()
-            .map(RefundView::from_record)
-            .collect(),
-        disputes: relations
-            .disputes
-            .iter()
-            .map(DisputeView::from_record)
-            .collect(),
+        refunds,
+        disputes,
     })
 }
 
@@ -204,6 +232,20 @@ async fn purchase_response(
         Ok(view) => view,
         Err(error) => return err_internal("Order row is outside the contract", error),
     };
+    let refunds = match child_rows(
+        relations.refunds.iter().map(RefundView::from_record),
+        "Refund",
+    ) {
+        Ok(refunds) => refunds,
+        Err(out) => return out,
+    };
+    let disputes = match child_rows(
+        relations.disputes.iter().map(DisputeView::from_record),
+        "Dispute",
+    ) {
+        Ok(disputes) => disputes,
+        Err(out) => return out,
+    };
     ok_json(&PurchaseDetailResponse {
         purchase: view,
         line_items: relations
@@ -211,16 +253,8 @@ async fn purchase_response(
             .iter()
             .map(LineItemView::from_record)
             .collect(),
-        refunds: relations
-            .refunds
-            .iter()
-            .map(RefundView::from_record)
-            .collect(),
-        disputes: relations
-            .disputes
-            .iter()
-            .map(DisputeView::from_record)
-            .collect(),
+        refunds,
+        disputes,
     })
 }
 
@@ -293,18 +327,49 @@ pub async fn handle_get_seller(ctx: &dyn Context, msg: &Message) -> OutputStream
     seller_order_response(ctx, purchase).await
 }
 
+/// The refund ledger state of a row, or the response a value outside the
+/// contract earns.
+///
+/// The ledger's own column, not the provider's: `provider_status` beside it
+/// carries Stripe's vocabulary and stays a string.
+fn refund_status(
+    record: &wafer_core::clients::database::Record,
+) -> Result<RefundStatus, OutputStream> {
+    repo::refunds::status_of(record)
+        .map_err(|error| err_internal("Refund row is outside the contract", error))
+}
+
+/// One refund's outcome as the client is told it, or the 500 an undecodable
+/// ledger row earns.
+fn refund_json(
+    purchase: &wafer_core::clients::database::Record,
+    refund: &wafer_core::clients::database::Record,
+) -> OutputStream {
+    match refund_result(purchase, refund) {
+        Ok(result) => ok_json(&result),
+        Err(out) => out,
+    }
+}
+
 fn refund_result(
     purchase: &wafer_core::clients::database::Record,
     refund: &wafer_core::clients::database::Record,
-) -> RefundResult {
-    RefundResult {
+) -> Result<RefundResult, OutputStream> {
+    // Three ledger states collapse into two answers: the API's
+    // `RefundResultStatus` says only whether the money is back, and
+    // `provider_succeeded` — the provider has paid but the order's refunded
+    // total has not been settled — is not yet "back". It has always been
+    // reported as `pending`, and this match is where that stops being an
+    // accident of a `_` arm. The `_` arm also matched `canceled`, which is a
+    // value of the row's `provider_status` and never of its `status`.
+    Ok(RefundResult {
         purchase_id: purchase.id.clone(),
         refund_id: refund.id.clone(),
         provider_refund_id: refund.str_field("provider_refund_id").to_string(),
-        status: match refund.str_field("status") {
-            "succeeded" => RefundResultStatus::Succeeded,
-            "failed" | "canceled" => RefundResultStatus::Failed,
-            _ => RefundResultStatus::Pending,
+        status: match refund_status(refund)? {
+            RefundStatus::Succeeded => RefundResultStatus::Succeeded,
+            RefundStatus::Failed => RefundResultStatus::Failed,
+            RefundStatus::Pending | RefundStatus::ProviderSucceeded => RefundResultStatus::Pending,
         },
         provider_status: refund.str_field("provider_status").to_string(),
         amount_minor: refund.i64_field("amount_minor"),
@@ -312,7 +377,7 @@ fn refund_result(
         order_total_minor: purchase.i64_field("total_cents"),
         currency: purchase.str_field("currency").to_ascii_uppercase(),
         livemode: refund.bool_field("livemode"),
-    }
+    })
 }
 
 fn manual_refund_result(
@@ -483,7 +548,11 @@ async fn refund_purchase(
                     "Refund idempotency key was already used for a different request",
                 );
             }
-            if existing.str_field("status") == "succeeded" {
+            let existing_status = match refund_status(&existing) {
+                Ok(status) => status,
+                Err(out) => return out,
+            };
+            if existing_status == RefundStatus::Succeeded {
                 let current = match repo::purchases::get(ctx, &id).await {
                     Ok(current) => current,
                     Err(error) => return err_internal("Could not load refunded purchase", error),
@@ -659,7 +728,11 @@ async fn refund_purchase(
         Err(error) => return err_internal("Could not enqueue refund reconciliation", error),
     };
 
-    if refund.str_field("status") == "succeeded" {
+    let claimed_status = match refund_status(&refund) {
+        Ok(status) => status,
+        Err(out) => return out,
+    };
+    if claimed_status == RefundStatus::Succeeded {
         if let Err(error) = repo::provider_operations::resolve_unleased(
             ctx,
             &provider_operation.id,
@@ -675,9 +748,9 @@ async fn refund_purchase(
             Ok(current) => current,
             Err(error) => return err_internal("Could not load refunded purchase", error),
         };
-        return ok_json(&refund_result(&current, &refund));
+        return refund_json(&current, &refund);
     }
-    if refund.str_field("status") == "provider_succeeded" {
+    if claimed_status == RefundStatus::ProviderSucceeded {
         let current = match repo::purchases::reconcile_refund_total(
             ctx,
             &id,
@@ -705,11 +778,11 @@ async fn refund_purchase(
         {
             return err_internal("Could not complete refund reconciliation operation", error);
         }
-        return ok_json(&refund_result(&current, &refund));
+        return refund_json(&current, &refund);
     }
-    if refund.str_field("status") == "pending" && !refund.str_field("provider_refund_id").is_empty()
+    if claimed_status == RefundStatus::Pending && !refund.str_field("provider_refund_id").is_empty()
     {
-        return ok_json(&refund_result(&purchase, &refund));
+        return refund_json(&purchase, &refund);
     }
 
     let params = stripe_provider::StripeRefundParams {
@@ -799,7 +872,7 @@ async fn refund_purchase(
                 return err_internal("Could not resolve failed refund operation", error);
             }
         }
-        return ok_json(&refund_result(&purchase, &refund));
+        return refund_json(&purchase, &refund);
     }
     let updated = match repo::purchases::reconcile_refund_total(
         ctx,
@@ -828,5 +901,5 @@ async fn refund_purchase(
     {
         return err_internal("Could not complete refund reconciliation operation", error);
     }
-    ok_json(&refund_result(&updated, &refund))
+    refund_json(&updated, &refund)
 }

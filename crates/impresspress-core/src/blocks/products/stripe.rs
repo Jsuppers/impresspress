@@ -15,9 +15,10 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError
 
 use super::{
     contracts::{
-        AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, ManagedOffer,
-        ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus, PaymentLinkCreateRequest,
-        PricingPreviewRequest, ReconciliationStatus, WebhookAck, WebhookEventList,
+        self, AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, EventStatus,
+        ManagedOffer, ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus,
+        PaymentLinkCreateRequest, PricingPreviewRequest, ProviderPaymentStatus,
+        ReconciliationStatus, SubscriptionStatus, WebhookAck, WebhookEventList,
         WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
@@ -40,12 +41,6 @@ use crate::{
 /// alias since every call site below already spells `STRIPE_EVENTS_TABLE`.
 const STRIPE_EVENTS_TABLE: &str = repo::stripe_events::TABLE;
 
-/// `status` column values on [`STRIPE_EVENTS_TABLE`].
-const EVENT_STATUS_PENDING: &str = "pending";
-const EVENT_STATUS_PROCESSING: &str = "processing";
-const EVENT_STATUS_FAILED: &str = "failed";
-const EVENT_STATUS_PROCESSED: &str = "processed";
-const EVENT_STATUS_DEAD_LETTER: &str = "dead_letter";
 const EVENT_LEASE_SECONDS: i64 = 300;
 const EVENT_MAX_ATTEMPTS: u64 = 8;
 
@@ -106,7 +101,7 @@ async fn record_event(
             ("event_type".to_string(), serde_json::json!(event_type)),
             (
                 "status".to_string(),
-                serde_json::json!(EVENT_STATUS_PROCESSING),
+                serde_json::json!(EventStatus::Processing),
             ),
             (
                 "stripe_account_id".to_string(),
@@ -142,11 +137,11 @@ async fn record_event(
             "Stripe event id was reused with a different signed payload",
         ));
     }
-    let status = existing.str_field("status");
+    let status = event_status(&existing)?;
     match status {
-        EVENT_STATUS_PROCESSED => return Ok(EventRecordState::AlreadyProcessed),
-        EVENT_STATUS_DEAD_LETTER => return Ok(EventRecordState::DeadLetter),
-        EVENT_STATUS_PROCESSING => {
+        EventStatus::Processed => return Ok(EventRecordState::AlreadyProcessed),
+        EventStatus::DeadLetter => return Ok(EventRecordState::DeadLetter),
+        EventStatus::Processing => {
             let lease_is_live =
                 event_timestamp(&existing, "processing_started_at").is_some_and(|started| {
                     now_value.signed_duration_since(started).num_seconds() < EVENT_LEASE_SECONDS
@@ -155,13 +150,12 @@ async fn record_event(
                 return Ok(EventRecordState::InFlight);
             }
         }
-        EVENT_STATUS_FAILED => {
+        EventStatus::Failed => {
             if event_timestamp(&existing, "next_retry_at").is_some_and(|next| next > now_value) {
                 return Ok(EventRecordState::RetryScheduled);
             }
         }
-        EVENT_STATUS_PENDING => {}
-        _ => {}
+        EventStatus::Pending => {}
     }
 
     let attempts = existing.u64_field("attempts").saturating_add(1);
@@ -171,7 +165,7 @@ async fn record_event(
     let mut data = HashMap::new();
     data.insert(
         "status".to_string(),
-        serde_json::json!(EVENT_STATUS_PROCESSING),
+        serde_json::json!(EventStatus::Processing),
     );
     data.insert("attempts".to_string(), serde_json::json!(attempts));
     data.insert("processing_owner".to_string(), serde_json::json!(&owner));
@@ -229,7 +223,7 @@ async fn mark_event_processed(
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
     data.insert(
         "status".to_string(),
-        serde_json::json!(EVENT_STATUS_PROCESSED),
+        serde_json::json!(EventStatus::Processed),
     );
     data.insert("processing_owner".to_string(), serde_json::json!(""));
     data.insert("processing_started_at".to_string(), serde_json::Value::Null);
@@ -249,7 +243,7 @@ async fn mark_event_processed(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!(EVENT_STATUS_PROCESSING),
+                value: serde_json::json!(EventStatus::Processing),
             },
             Filter {
                 field: "processing_owner".to_string(),
@@ -283,9 +277,9 @@ async fn mark_event_failed(
     data.insert(
         "status".to_string(),
         serde_json::json!(if dead_letter {
-            EVENT_STATUS_DEAD_LETTER
+            EventStatus::DeadLetter
         } else {
-            EVENT_STATUS_FAILED
+            EventStatus::Failed
         }),
     );
     data.insert("processing_owner".to_string(), serde_json::json!(""));
@@ -320,7 +314,7 @@ async fn mark_event_failed(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!(EVENT_STATUS_PROCESSING),
+                value: serde_json::json!(EventStatus::Processing),
             },
             Filter {
                 field: "processing_owner".to_string(),
@@ -350,11 +344,19 @@ fn optional_record_string(record: &Record, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn webhook_event_summary(record: Record) -> WebhookEventSummary {
-    WebhookEventSummary {
+/// The `status` column of a stripe-events row, as the enum that defines
+/// it. The five `const &str` this replaces were used both as written
+/// values and as match patterns against the raw column, so a stored value
+/// outside the set fell through every arm silently.
+fn event_status(record: &Record) -> Result<EventStatus, WaferError> {
+    crate::util::enum_column(record, "status")
+}
+
+fn webhook_event_summary(record: Record) -> Result<WebhookEventSummary, WaferError> {
+    Ok(WebhookEventSummary {
         id: record.id.clone(),
         event_type: record.str_field("event_type").to_string(),
-        status: record.str_field("status").to_string(),
+        status: event_status(&record)?,
         stripe_account_id: record.str_field("stripe_account_id").to_string(),
         livemode: record.bool_field("livemode"),
         attempts: record.u64_field("attempts"),
@@ -365,12 +367,12 @@ fn webhook_event_summary(record: Record) -> WebhookEventSummary {
         terminal_at: optional_record_string(&record, "terminal_at"),
         created_at: record.str_field("created_at").to_string(),
         updated_at: record.str_field("updated_at").to_string(),
-    }
+    })
 }
 
 pub(crate) async fn list_webhook_events(
     ctx: &dyn Context,
-    status: Option<&str>,
+    status: Option<EventStatus>,
     page: i64,
     page_size: i64,
 ) -> Result<WebhookEventList, WaferError> {
@@ -395,12 +397,16 @@ pub(crate) async fn list_webhook_events(
         }],
     )
     .await?;
+    // Loudly, not row-by-row: this is the operator's webhook queue, and a row
+    // whose `status` is outside the set is exactly the row an operator opened
+    // the page to find. Omitting it would hide the fault from the one view
+    // that exists to show it.
     Ok(WebhookEventList {
         records: result
             .records
             .into_iter()
             .map(webhook_event_summary)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
         total_count: result.total_count,
         page: result.page,
         page_size: result.page_size,
@@ -430,9 +436,10 @@ pub(crate) async fn replay_webhook_event(
         ));
     }
     let event = db::get(ctx, STRIPE_EVENTS_TABLE, event_id).await?;
+    let previous_status = event_status(&event)?;
     if !matches!(
-        event.str_field("status"),
-        EVENT_STATUS_FAILED | EVENT_STATUS_DEAD_LETTER
+        previous_status,
+        EventStatus::Failed | EventStatus::DeadLetter
     ) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
@@ -467,7 +474,6 @@ pub(crate) async fn replay_webhook_event(
         ));
     }
 
-    let previous_status = event.str_field("status").to_string();
     let reset = db::update_by_filters_count(
         ctx,
         STRIPE_EVENTS_TABLE,
@@ -480,13 +486,13 @@ pub(crate) async fn replay_webhook_event(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!(&previous_status),
+                value: serde_json::json!(previous_status),
             },
         ],
         HashMap::from([
             (
                 "status".to_string(),
-                serde_json::json!(EVENT_STATUS_PENDING),
+                serde_json::json!(EventStatus::Pending),
             ),
             ("attempts".to_string(), serde_json::json!(0)),
             ("processing_owner".to_string(), serde_json::json!("")),
@@ -3378,13 +3384,19 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             let status = match event_type {
-                "payment_intent.succeeded" if object_status == "succeeded" => "succeeded",
-                "payment_intent.payment_failed" => "payment_failed",
-                "payment_intent.processing" if object_status == "processing" => "processing",
-                "payment_intent.requires_action" if object_status == "requires_action" => {
-                    "requires_action"
+                "payment_intent.succeeded" if object_status == "succeeded" => {
+                    ProviderPaymentStatus::Succeeded
                 }
-                "payment_intent.canceled" if object_status == "canceled" => "canceled",
+                "payment_intent.payment_failed" => ProviderPaymentStatus::PaymentFailed,
+                "payment_intent.processing" if object_status == "processing" => {
+                    ProviderPaymentStatus::Processing
+                }
+                "payment_intent.requires_action" if object_status == "requires_action" => {
+                    ProviderPaymentStatus::RequiresAction
+                }
+                "payment_intent.canceled" if object_status == "canceled" => {
+                    ProviderPaymentStatus::Canceled
+                }
                 _ => fail_webhook!(
                     err_internal_no_cause(
                         "PaymentIntent event type does not match its object status",
@@ -3433,7 +3445,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 payment_intent_id,
                 stripe_account_id: event_account.to_string(),
                 livemode: event_livemode,
-                status: status.to_string(),
+                status,
                 amount_minor: data_object
                     .get("amount")
                     .and_then(serde_json::Value::as_i64)
@@ -3471,7 +3483,22 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 .or_else(|| data_object.pointer("/items/data/0/price/metadata/plan"))
                 .and_then(|v| v.as_str());
             let mut commerce_matched = false;
-            if !stripe_sub_id.is_empty() && !status.is_empty() {
+            // Refused here rather than mapped to a default, for the same
+            // reason the dispute branch below refuses an unknown network
+            // state: a delivery whose `status` this build does not know is a
+            // fact about the subscription that would otherwise be dropped on
+            // the floor. A 500 makes Stripe redeliver, so nothing is lost and
+            // the gap is visible. An absent or empty `status` keeps its old
+            // meaning — nothing to apply — because that is not a value.
+            let Ok(status) = serde_json::from_value::<SubscriptionStatus>(
+                serde_json::Value::String(status.to_string()),
+            ) else {
+                fail_webhook!(
+                    err_internal_no_cause("Subscription status is outside the supported set"),
+                    "subscription status was unsupported"
+                );
+            };
+            if !stripe_sub_id.is_empty() && status != SubscriptionStatus::Unset {
                 let current_period_end = subscription_period_end(&data_object);
                 let canceled_at = stripe_timestamp(data_object.get("canceled_at"));
                 match repo::purchases::sync_commerce_subscription(
@@ -3556,11 +3583,11 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     &stripe_sub_id,
                     event_account,
                     event_livemode,
-                    "active",
+                    SubscriptionStatus::Active,
                     None,
                     None,
                     None,
-                    Some("past_due"),
+                    Some(SubscriptionStatus::PastDue),
                     event_created,
                 )
                 .await
@@ -3612,7 +3639,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     &stripe_sub_id,
                     event_account,
                     event_livemode,
-                    "past_due",
+                    SubscriptionStatus::PastDue,
                     None,
                     None,
                     None,
@@ -3670,7 +3697,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     stripe_sub_id,
                     event_account,
                     event_livemode,
-                    "canceled",
+                    SubscriptionStatus::Canceled,
                     None,
                     Some(false),
                     canceled_at.as_deref(),
@@ -3814,11 +3841,20 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     "dispute currency mismatch"
                 );
             }
-            let status = data_object
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            // The network state, as the enum that defines the set. The
+            // repo used to hold a `supported_status` list and refuse an
+            // unrecognised value from inside `reconcile`; the refusal
+            // happens here now, one step earlier and with the same
+            // outcome — a 500 that makes Stripe redeliver, so a dispute
+            // state this build does not know is never stored.
+            let Ok(status) = serde_json::from_value::<contracts::DisputeStatus>(
+                data_object.get("status").cloned().unwrap_or_default(),
+            ) else {
+                fail_webhook!(
+                    err_internal_no_cause("Dispute status is outside the supported set"),
+                    "dispute status was unsupported"
+                );
+            };
             let snapshot = repo::disputes::DisputeSnapshot {
                 purchase_id: purchase.id.clone(),
                 seller_account_id: purchase.str_field("seller_account_id").to_string(),
@@ -4871,7 +4907,7 @@ mod tests {
     async fn seed_stripe_event_row(
         ctx: &crate::test_support::TestContext,
         event_id: &str,
-        status: &str,
+        status: EventStatus,
     ) {
         let mut row = HashMap::new();
         row.insert("id".to_string(), serde_json::json!(event_id));
@@ -4901,7 +4937,7 @@ mod tests {
         let secret = "whsec_test_pending_retry";
         ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
 
-        seed_stripe_event_row(&ctx, "evt_pending_retry", EVENT_STATUS_PENDING).await;
+        seed_stripe_event_row(&ctx, "evt_pending_retry", EventStatus::Pending).await;
 
         let body = serde_json::json!({
             "id": "evt_pending_retry",
@@ -4924,7 +4960,7 @@ mod tests {
             .expect("row exists after processing");
         assert_eq!(
             row.data.get("status").and_then(|v| v.as_str()),
-            Some(EVENT_STATUS_PROCESSED),
+            Some(crate::util::wire_str(&EventStatus::Processed).as_str()),
             "row must be sealed processed once side effects succeed"
         );
 
@@ -4946,7 +4982,7 @@ mod tests {
         let secret = "whsec_test_already_processed";
         ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
 
-        seed_stripe_event_row(&ctx, "evt_already_processed", EVENT_STATUS_PROCESSED).await;
+        seed_stripe_event_row(&ctx, "evt_already_processed", EventStatus::Processed).await;
 
         let body = serde_json::json!({
             "id": "evt_already_processed",
@@ -5029,7 +5065,7 @@ mod tests {
         );
         row.insert(
             "status".to_string(),
-            serde_json::json!(EVENT_STATUS_PROCESSING),
+            serde_json::json!(EventStatus::Processing),
         );
         row.insert("attempts".to_string(), serde_json::json!(2));
         row.insert(
@@ -5105,7 +5141,10 @@ mod tests {
         let row = db::get(&ctx, STRIPE_EVENTS_TABLE, "evt_failure")
             .await
             .expect("failed event row");
-        assert_eq!(row.str_field("status"), EVENT_STATUS_FAILED);
+        assert_eq!(
+            row.str_field("status"),
+            crate::util::wire_str(&EventStatus::Failed)
+        );
         assert_eq!(row.str_field("last_error"), "transient database error");
         assert!(!row.str_field("next_retry_at").is_empty());
         assert_eq!(
@@ -5156,7 +5195,10 @@ mod tests {
         let row = db::get(&ctx, STRIPE_EVENTS_TABLE, "evt_failure")
             .await
             .expect("dead-letter row");
-        assert_eq!(row.str_field("status"), EVENT_STATUS_DEAD_LETTER);
+        assert_eq!(
+            row.str_field("status"),
+            crate::util::wire_str(&EventStatus::DeadLetter)
+        );
         assert!(!row.str_field("terminal_at").is_empty());
     }
 
@@ -5211,7 +5253,7 @@ mod tests {
                 ),
                 (
                     "status".to_string(),
-                    serde_json::json!(EVENT_STATUS_DEAD_LETTER),
+                    serde_json::json!(EventStatus::DeadLetter),
                 ),
                 ("attempts".to_string(), serde_json::json!(8)),
                 (
@@ -5239,7 +5281,7 @@ mod tests {
         .await
         .expect("seed dead-letter event");
 
-        let list = list_webhook_events(&ctx, Some(EVENT_STATUS_DEAD_LETTER), 1, 20)
+        let list = list_webhook_events(&ctx, Some(EventStatus::DeadLetter), 1, 20)
             .await
             .expect("list dead-letter events");
         assert_eq!(list.total_count, 1);
@@ -5272,7 +5314,7 @@ mod tests {
                 ),
                 (
                     "status".to_string(),
-                    serde_json::json!(EVENT_STATUS_DEAD_LETTER),
+                    serde_json::json!(EventStatus::DeadLetter),
                 ),
                 ("attempts".to_string(), serde_json::json!(8)),
                 (
@@ -5311,7 +5353,10 @@ mod tests {
         let replayed = db::get(&ctx, STRIPE_EVENTS_TABLE, "evt_manual_replay")
             .await
             .expect("replayed event row");
-        assert_eq!(replayed.str_field("status"), EVENT_STATUS_PROCESSED);
+        assert_eq!(
+            replayed.str_field("status"),
+            crate::util::wire_str(&EventStatus::Processed)
+        );
         assert_eq!(replayed.u64_field("attempts"), 1);
         assert!(!replayed.str_field("processed_at").is_empty());
 
@@ -5325,7 +5370,7 @@ mod tests {
                     "event_type".to_string(),
                     serde_json::json!("charge.refunded"),
                 ),
-                ("status".to_string(), serde_json::json!(EVENT_STATUS_FAILED)),
+                ("status".to_string(), serde_json::json!(EventStatus::Failed)),
                 (
                     "payload_base64".to_string(),
                     serde_json::json!(Base64::encode_string(tampered_payload.as_bytes())),

@@ -10,5 +10,6 @@ mod purchase_tests;
 mod repo_door_test;
 mod repo_tests;
 mod seller_governance_tests;
+mod status_enum_tests;
 mod storefront_tests;
 mod stripe_tests;

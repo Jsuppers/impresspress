@@ -14,7 +14,10 @@ use wafer_run::{Block, ErrorCode, InputStream, Message};
 use super::harness::*;
 use crate::{
     blocks::products::{
-        contracts::{OfferDefinitionRequest, PaymentLinkCreateRequest, PricingPreviewRequest},
+        contracts::{
+            OfferDefinitionRequest, OfferSyncStatus, PaymentLinkCreateRequest,
+            PricingPreviewRequest,
+        },
         offer_pricing, repo, stripe,
     },
     util::{hex_encode, sha256_hex, RecordExt},
@@ -1141,6 +1144,94 @@ async fn checkout_redelivery_backfills_missing_subscription_item_snapshot() {
     .await
     .unwrap();
     assert_eq!(event_row.data["status"], "processed");
+}
+
+/// A subscription delivery carrying a lifecycle state this build does not
+/// define is refused, not silently dropped.
+///
+/// `sync_commerce_subscription` takes a typed status now, so the wire value
+/// has to be parsed at the webhook boundary. Mapping an unparseable one to
+/// "no subscription" would have skipped the whole commerce branch and
+/// answered `200 received`, which tells Stripe the event was handled and
+/// leaves the projection silently stale. The 500 makes Stripe redeliver and
+/// puts the event row in the operator's failed queue.
+#[tokio::test]
+async fn a_subscription_status_outside_the_contract_fails_the_webhook() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed(
+        &ctx,
+        repo::purchases::PURCHASES_TABLE,
+        "purchase_unknown_sub_status",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("buyer_unknown")),
+            (
+                "buyer_user_id".to_string(),
+                serde_json::json!("buyer_unknown"),
+            ),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(2500)),
+            ("currency".to_string(), serde_json::json!("NZD")),
+            (
+                "stripe_subscription_id".to_string(),
+                serde_json::json!("sub_unknown_status"),
+            ),
+            (
+                "subscription_status".to_string(),
+                serde_json::json!("active"),
+            ),
+        ]),
+    )
+    .await;
+
+    let event = serde_json::json!({
+        "id": "evt_unknown_sub_status",
+        "type": "customer.subscription.updated",
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_unknown_status",
+            "status": "hibernating",
+            "cancel_at_period_end": false,
+            "canceled_at": null
+        }}
+    });
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert_eq!(
+        crate::test_support::output_http_status(stripe::handle_webhook(&ctx, &msg, input).await)
+            .await,
+        500,
+        "an unknown lifecycle state must make Stripe redeliver, not report success",
+    );
+
+    // The stored projection is untouched: nothing was applied, and nothing
+    // was quietly cleared either.
+    let purchase = repo::purchases::get(&ctx, "purchase_unknown_sub_status")
+        .await
+        .unwrap();
+    assert_eq!(purchase.data["subscription_status"], "active");
+
+    // And the event row is in the failed queue naming THIS reason. The
+    // assertion is on the reason, not just on the 500: without the refusal
+    // the delivery still fails, but three steps later and for the wrong
+    // reason — the commerce branch is skipped as "no subscription", the
+    // platform-billing lookup then finds no row of its own, and the operator
+    // is told the subscription is unowned rather than that its state is
+    // unrecognised.
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_unknown_sub_status",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["status"], "failed");
+    assert_eq!(
+        event_row.data["last_error"], "subscription status was unsupported",
+        "the failure has to name the unrecognised state, not a downstream symptom",
+    );
 }
 
 #[tokio::test]
@@ -3218,7 +3309,7 @@ async fn catalog_sync_persists_fixed_prices_and_reuses_them_in_checkout_and_paym
     let synced = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
         .await
         .expect("synchronize immutable fixed rows");
-    assert_eq!(synced.sync_status, "synced");
+    assert_eq!(synced.sync_status, OfferSyncStatus::Synced);
     assert!(synced.sync_error.is_empty());
     assert_eq!(synced.offer.stripe_product_id, "prod_catalog");
     assert!(
@@ -3351,7 +3442,7 @@ async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product(
     assert_eq!(error.code, ErrorCode::Internal);
     assert!(error.message.contains("immutable offer row"));
     let failed = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
-    assert_eq!(failed.sync_status, "failed");
+    assert_eq!(failed.sync_status, OfferSyncStatus::Failed);
     assert!(failed.sync_error.contains("immutable offer row"));
     assert!(failed
         .offer
@@ -3402,7 +3493,7 @@ async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product(
     let retried = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
         .await
         .expect("retry catalog sync");
-    assert_eq!(retried.sync_status, "synced");
+    assert_eq!(retried.sync_status, OfferSyncStatus::Synced);
     assert!(retried.sync_error.is_empty());
     assert_eq!(
         retried
@@ -3512,7 +3603,7 @@ async fn catalog_reconciliation_refreshes_product_metadata_and_reactivates_fixed
     let reconciled = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
         .await
         .expect("repair inactive catalog objects");
-    assert_eq!(reconciled.sync_status, "synced");
+    assert_eq!(reconciled.sync_status, OfferSyncStatus::Synced);
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 4);
@@ -3681,7 +3772,7 @@ async fn seller_catalog_sync_creates_resources_in_the_owned_connected_account() 
     let synced = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
         .await
         .expect("sync seller catalog");
-    assert_eq!(synced.sync_status, "synced");
+    assert_eq!(synced.sync_status, OfferSyncStatus::Synced);
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests

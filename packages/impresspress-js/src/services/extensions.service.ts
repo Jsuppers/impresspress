@@ -688,6 +688,33 @@ export interface ProviderReconcileResult {
   dead_letter: number;
 }
 
+/**
+ * Stripe's subscription lifecycle, as the order views publish it. `""` is the
+ * state of every non-subscription order, which is why it is the first value of
+ * the published list rather than the field being optional.
+ */
+export type SubscriptionStatus =
+  | ""
+  | "incomplete"
+  | "incomplete_expired"
+  | "trialing"
+  | "active"
+  | "past_due"
+  | "unpaid"
+  | "paused"
+  | "canceled";
+
+/** The refund ledger's own state, distinct from the provider's `provider_status`. */
+export type RefundStatus = "pending" | "provider_succeeded" | "succeeded" | "failed";
+
+/** How far a seller account has got with Stripe Connect. */
+export type SellerStatus =
+  | "not_started"
+  | "onboarding"
+  | "restricted"
+  | "active"
+  | "suspended";
+
 export type DisputeStatus =
   | "warning_needs_response"
   | "warning_under_review"
@@ -760,7 +787,7 @@ export interface Purchase {
   payment_intent_event_created: number;
   reconciliation_status: string;
   reconciliation_error: string;
-  subscription_status: string;
+  subscription_status: SubscriptionStatus;
   subscription_current_period_end: string | null;
   subscription_cancel_at_period_end: boolean;
   subscription_canceled_at: string | null;
@@ -798,7 +825,7 @@ export interface BuyerOrder {
   metadata: Record<string, unknown>;
   provider_payment_status: "" | "succeeded" | "payment_failed" | "processing" | "requires_action" | "canceled";
   reconciliation_status: string;
-  subscription_status: string;
+  subscription_status: SubscriptionStatus;
   subscription_current_period_end: string | null;
   subscription_cancel_at_period_end: boolean;
   subscription_canceled_at: string | null;
@@ -866,7 +893,7 @@ export interface SellerOrder {
   provider_payment_error_message: string;
   reconciliation_status: string;
   reconciliation_error: string;
-  subscription_status: string;
+  subscription_status: SubscriptionStatus;
   subscription_current_period_end: string | null;
   subscription_cancel_at_period_end: boolean;
   payment_at: string | null;
@@ -936,7 +963,7 @@ export interface Refund {
   amount_minor: number;
   target_refunded_total_minor: number;
   currency: string;
-  status: string;
+  status: RefundStatus;
   provider_status: string;
   provider_reason: string;
   note: string;
@@ -959,8 +986,14 @@ export interface PurchaseDetail {
 export interface SellerAccount {
   id: string;
   user_id: string;
-  status: string;
-  approval_status: string;
+  status: SellerStatus;
+  /**
+   * Whether an administrator has suspended the account, derived from `status`.
+   * Two values, not the five of a product's `approval_status`: this field has
+   * only ever carried `approved` or `suspended`, and the published schema now
+   * says so.
+   */
+  approval_status: "approved" | "suspended";
   stripe_account_id?: string;
   capabilities: {
     details_submitted: boolean;

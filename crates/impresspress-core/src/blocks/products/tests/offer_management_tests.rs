@@ -359,9 +359,9 @@ async fn publish_fails_cleanly_when_the_draft_revision_moved_after_its_read() {
     let landed = repo::offers::update_if_current(
         &test_ctx,
         &offer_id,
-        "draft",
+        OfferStatus::Draft,
         Some(0),
-        HashMap::from([("status".to_string(), json!("active"))]),
+        HashMap::from([("status".to_string(), json!(OfferStatus::Active))]),
     )
     .await
     .unwrap();
