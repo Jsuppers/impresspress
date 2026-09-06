@@ -618,8 +618,8 @@ mod tests {
 ///
 /// Before the loader was unified, native (`server_config::load_block_settings`)
 /// read the `block_settings` table with a plain `SELECT` and never invoked
-/// the #222 hash-gate. An `ENABLED_DEFAULTS` change therefore propagated on
-/// Cloudflare and browser boots but silently NOT on native boots. These
+/// the #222 hash-gate. A changed default therefore propagated on Cloudflare
+/// and browser boots but silently NOT on native boots. These
 /// tests pin that the unified loader runs the gate, so a native boot now
 /// re-seeds stale rows.
 #[cfg(test)]

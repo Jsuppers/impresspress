@@ -198,39 +198,6 @@ impl FeatureConfig for std::sync::RwLock<BlockSettings> {
     }
 }
 
-/// Canonical defaults for `impresspress__admin__block_settings.enabled`.
-/// Consumed by [`plan_seed_decisions`] on every cold start.
-///
-/// Adding a block here: bump the list, ship — every existing row gets the
-/// INSERT path (no row yet → write the new default at the current hash).
-///
-/// Changing an existing default: just edit the bool — the hash gate detects
-/// the change and re-seeds rows still at the old default. Admin-UI edits
-/// (marked [`USER_EDITED_SENTINEL`]) are preserved.
-///
-/// Excluded for now: `impresspress/llm` and `impresspress/vector`. The LLM
-/// block module is gated on `feature = "llm"` (wasm32-incompatible) so
-/// the router would dispatch into a void on wasm32 if either was enabled
-/// here. Restored when the LlmService trait refactor lands.
-///
-/// Also excluded: `impresspress/admin`. The admin row's `seed_defaults_hash`
-/// column is owned by [`crate::blocks::admin::settings::seed_defaults`]
-/// for the shared-vars-list payload hash (raw hex, no prefix). Two
-/// writers on the same column with different formats would cause an
-/// infinite re-seed loop on every cold start. The admin block is always
-/// enabled by design (FeatureConfig falls back to `true` when the row is
-/// absent), so omitting it from the seed has no behavioural effect.
-pub const ENABLED_DEFAULTS: &[(&str, bool)] = &[
-    ("wafer-run/auth", true),
-    ("impresspress/files", true),
-    ("impresspress/legalpages", true),
-    ("impresspress/tickets", false),
-    ("impresspress/messages", true),
-    ("impresspress/products", true),
-    ("impresspress/system", true),
-    ("impresspress/userportal", true),
-];
-
 /// Stored in `seed_defaults_hash` to mark a row that was last written by
 /// the admin UI's toggle. Such rows are never overwritten by the seed.
 pub const USER_EDITED_SENTINEL: &str = "user-edited";
