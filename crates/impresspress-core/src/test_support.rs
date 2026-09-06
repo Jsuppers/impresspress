@@ -1675,12 +1675,15 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
 /// The JWT secret every `handle_request` test call passes.
 pub const TEST_JWT_SECRET: &str = "test-jwt-secret";
 
-/// A `Bearer` access token carrying `roles`, signed the way `auth_ui` signs
-/// one (block-derived key from [`TEST_JWT_SECRET`], the default issuer), so
-/// `pipeline::handle_request`'s step 2 resolves it to a real identity with
-/// those roles. This is how a test asks for a document *as* an authenticated
-/// or admin caller.
-pub fn bearer_for_roles(roles: &[&str]) -> String {
+/// An access token for `sub` carrying `roles`, signed the way `auth_ui` signs
+/// one: the block-derived key from [`TEST_JWT_SECRET`] and `expected_issuer`'s
+/// default issuer. Both `crate::crypto::verify_access_token` (and so
+/// `pipeline::handle_request`'s step 2 and `AuthServiceImpl`) accept it.
+///
+/// A `TestContext` that must *verify* one of these needs
+/// `set_config(blocks::auth::JWT_SECRET_KEY, TEST_JWT_SECRET)` — the secret is
+/// read from the config snapshot, not passed in.
+pub fn access_token_for(sub: &str, roles: &[&str]) -> String {
     use std::{collections::HashMap, time::Duration};
 
     use wafer_block_crypto::primitives;
@@ -1690,7 +1693,7 @@ pub fn bearer_for_roles(roles: &[&str]) -> String {
         crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
     );
     let mut claims = HashMap::new();
-    claims.insert("sub".to_string(), serde_json::json!("user-test-1"));
+    claims.insert("sub".to_string(), serde_json::json!(sub));
     claims.insert("type".to_string(), serde_json::json!("access"));
     // Must match `expected_issuer`'s default
     // (`crate::blocks::auth::helpers::expected_issuer`): a `TestContext` has
@@ -1700,9 +1703,16 @@ pub fn bearer_for_roles(roles: &[&str]) -> String {
         serde_json::json!("http://localhost:5173"),
     );
     claims.insert("roles".to_string(), serde_json::json!(roles));
-    let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
-        .expect("test jwt_sign");
-    format!("Bearer {token}")
+    primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+        .expect("test jwt_sign")
+}
+
+/// A `Bearer` access token carrying `roles`, so
+/// `pipeline::handle_request`'s step 2 resolves it to a real identity with
+/// those roles. This is how a test asks for a document *as* an authenticated
+/// or admin caller.
+pub fn bearer_for_roles(roles: &[&str]) -> String {
+    format!("Bearer {}", access_token_for("user-test-1", roles))
 }
 
 /// Fetch a discovery document (`/openapi.json` or `/.well-known/agent.json`)

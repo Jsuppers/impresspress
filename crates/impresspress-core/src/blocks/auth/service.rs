@@ -1,9 +1,18 @@
 //! AuthServiceImpl — implements the wafer-core `AuthService` trait.
 //!
-//! Extracts credentials from incoming [`Message`]s (Bearer header or
-//! `wafer_session` cookie), looks them up in the `wafer_run__auth__sessions`
-//! or `wafer_run__auth__personal_access_tokens` tables, and bumps
-//! `last_used_at`.
+//! Authenticates the credential impresspress actually issues. Every signed-in
+//! request carries an `auth_token` cookie holding an access JWT, which
+//! `blocks::router` re-presents as `Authorization: Bearer <jwt>`; a Bearer
+//! that [`crate::crypto::verify_access_token`] accepts resolves to its `sub`.
+//! Any other Bearer is looked up as a personal access token in
+//! `wafer_run__auth__personal_access_tokens` (whose `last_used_at` is bumped),
+//! and a request with no Bearer is unauthenticated.
+//!
+//! `require_role(Admin)` additionally honours an unexpired bootstrap token
+//! presented as a Bearer, which is how the first admin is created.
+//!
+//! The session table is not a credential store: a row there is a login family
+//! for the userportal device list (B12), never something a request presents.
 //!
 //! See `docs/superpowers/specs/2026-04-21-auth-block-design.md` §4 for the
 //! cross-block contract and §6 for the bootstrap-token fallback.
@@ -15,7 +24,7 @@ use wafer_core::interfaces::auth::service::{
 };
 use wafer_run::{context::Context, Message};
 
-use super::repo::{pats, sessions, users};
+use super::repo::{pats, users};
 
 /// Per-block state. Holds a lazy [`Context`] handle so service methods can
 /// dispatch messages to `wafer-run/database` etc.
@@ -106,16 +115,6 @@ fn bearer_from(msg: &Message) -> Option<String> {
     v.strip_prefix("Bearer ").map(str::to_owned)
 }
 
-/// Extract the `wafer_session` cookie value, if any.
-fn session_cookie_from(msg: &Message) -> Option<String> {
-    let v = msg.cookie("wafer_session");
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.to_owned())
-    }
-}
-
 /// Returns `true` iff `expires_at` parses as an RFC3339 timestamp earlier
 /// than now. Parsing the timestamp avoids the mixed-format trap of string
 /// comparison (`+00:00` vs `Z`) — the auth tables intermix both because
@@ -132,18 +131,43 @@ fn is_expired(expires_at: &str) -> bool {
 
 /// Internal credential classification used by all three require_* methods.
 enum Creds {
-    Session(Vec<u8>),
+    /// A verified access JWT; the payload is its `sub`, already checked
+    /// against the signature, `type`, issuer, blocklist and `auth_version`
+    /// rules by [`crate::crypto::verify_access_token`].
+    Jwt(String),
+    /// A Bearer that is not an access JWT, as the sha256 of the raw token —
+    /// the lookup key in `wafer_run__auth__personal_access_tokens`.
     Pat(Vec<u8>),
 }
 
-fn extract_creds(msg: &Message) -> Result<Creds, AuthError> {
-    if let Some(bearer) = bearer_from(msg) {
-        return Ok(Creds::Pat(hash_token(&bearer)));
+/// Classify the credential on `msg`.
+///
+/// A Bearer that verifies as an access JWT is that; any other Bearer is a
+/// candidate PAT; no Bearer at all is unauthenticated. There is no cookie
+/// branch: `blocks::router` has already turned the `auth_token` cookie into a
+/// Bearer header by the time any handler or service sees the message, and the
+/// `wafer_session` cookie this used to accept was issued by nothing.
+///
+/// The secret comes from the config snapshot (`ctx.config_get`, the pattern
+/// `csrf.rs` uses) and the issuer from `helpers::expected_issuer`, so this
+/// service applies exactly the deployment's own token policy — the same two
+/// values `pipeline.rs` passes to `extract_auth_meta`.
+async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthError> {
+    let Some(bearer) = bearer_from(msg) else {
+        return Err(AuthError::Unauthorized);
+    };
+    let secret = ctx
+        .config_get(super::JWT_SECRET_KEY)
+        .unwrap_or("")
+        .to_string();
+    let expected_iss = super::helpers::expected_issuer(ctx).await;
+    if let Some(claims) = crate::crypto::verify_access_token(ctx, &bearer, &secret, &expected_iss)
+        .await
+        .filter(|c| c.sub.as_deref().is_some_and(|s| !s.is_empty()))
+    {
+        return Ok(Creds::Jwt(claims.sub.unwrap_or_default()));
     }
-    if let Some(cookie) = session_cookie_from(msg) {
-        return Ok(Creds::Session(hash_token(&cookie)));
-    }
-    Err(AuthError::Unauthorized)
+    Ok(Creds::Pat(hash_token(&bearer)))
 }
 
 /// Static WRAP grants for the framework `wafer-run/auth` block. Returned by
@@ -317,20 +341,13 @@ impl AuthService for AuthServiceImpl {
 
     async fn require_user(&self, msg: &Message) -> Result<UserId, AuthError> {
         let ctx = self.ctx()?;
-        match extract_creds(msg)? {
-            Creds::Session(h) => {
-                let row = sessions::find_by_token_hash(ctx, &h)
-                    .await
-                    .map_err(|e| AuthError::Internal(e.to_string()))?
-                    .ok_or(AuthError::Unauthorized)?;
-                if is_expired(&row.expires_at) {
-                    return Err(AuthError::Unauthorized);
-                }
-                sessions::touch_last_used(ctx, &h)
-                    .await
-                    .map_err(|e| AuthError::Internal(e.to_string()))?;
-                ensure_active(ctx, &row.user_id).await?;
-                Ok(UserId(row.user_id))
+        match extract_creds(ctx, msg).await? {
+            // The token's own expiry, issuer, blocklist status and
+            // `auth_version` were checked by `verify_access_token`; what is
+            // left is the account lifecycle, which no token can carry.
+            Creds::Jwt(sub) => {
+                ensure_active(ctx, &sub).await?;
+                Ok(UserId(sub))
             }
             Creds::Pat(h) => {
                 let row = pats::find_by_token_hash(ctx, &h)
@@ -353,13 +370,13 @@ impl AuthService for AuthServiceImpl {
 
     async fn require_token(&self, msg: &Message, scope: TokenScope) -> Result<UserId, AuthError> {
         let ctx = self.ctx()?;
-        let creds = extract_creds(msg)?;
-        // Scopes live exclusively on PATs. A session cookie presented here is
-        // a category error — treat it as Forbidden so the caller knows the
+        let creds = extract_creds(ctx, msg).await?;
+        // Scopes live exclusively on PATs. A session access JWT presented here
+        // is a category error — treat it as Forbidden so the caller knows the
         // credentials are valid but wrong type, not just missing.
         let h = match creds {
             Creds::Pat(h) => h,
-            Creds::Session(_) => return Err(AuthError::Forbidden),
+            Creds::Jwt(_) => return Err(AuthError::Forbidden),
         };
         let row = pats::find_by_token_hash(ctx, &h)
             .await
@@ -456,7 +473,24 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::test_support::{access_token_for, TestContext, TEST_JWT_SECRET};
+
+    /// A `Message` presenting `token` the way the router presents the
+    /// `auth_token` cookie: as an `Authorization: Bearer` header.
+    fn bearer_msg(token: &str) -> Message {
+        let mut msg = Message::new("auth.require_role");
+        msg.set_meta("http.header.authorization", format!("Bearer {token}"));
+        msg
+    }
+
+    /// `TestContext::with_admin` plus the JWT master secret in the config
+    /// snapshot: `extract_creds` reads it synchronously to verify the access
+    /// token the request carries.
+    async fn with_admin_and_jwt_secret() -> TestContext {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(super::super::JWT_SECRET_KEY, TEST_JWT_SECRET);
+        ctx
+    }
 
     #[tokio::test]
     async fn init_applies_migrations_and_runs_bootstrap_on_fresh_ctx() {
@@ -596,7 +630,7 @@ mod tests {
     async fn inline_admin_role_alone_satisfies_require_role() {
         use crate::platform_state::user_roles;
 
-        let ctx = Arc::new(TestContext::with_admin().await);
+        let ctx = Arc::new(with_admin_and_jwt_secret().await);
         let service = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
         service
             .init(&*ctx)
@@ -636,22 +670,10 @@ mod tests {
             "the inline role is the first thing the merged resolver reads"
         );
 
-        let raw_token = "inline-admin-raw";
-        sessions::insert(
-            &*ctx,
-            sessions::NewSession {
-                token_hash: hash_token(raw_token),
-                user_id: user.id.clone(),
-                expires_at: "9999-01-01T00:00:00Z".into(),
-            },
-        )
-        .await
-        .expect("seed session");
-
-        let mut msg = Message::new("auth.require_role");
-        msg.set_meta("http.header.cookie", format!("wafer_session={raw_token}"));
+        // The token claims no roles at all; the inline column is what has to
+        // carry the grant.
         let got = service
-            .require_role(&msg, Role::Admin)
+            .require_role(&bearer_msg(&access_token_for(&user.id, &[])), Role::Admin)
             .await
             .expect("an inline-role admin must satisfy Role::Admin with no user_roles row");
         assert_eq!(got.0, user.id);
@@ -659,13 +681,13 @@ mod tests {
 
     #[tokio::test]
     async fn require_role_admin_grants_via_roles_table_only() {
-        // End-to-end version of the resolver test above: a real
-        // `wafer_session`-cookied Message for a user whose inline
-        // `users.role` is "user" but who has an admin row in
-        // user_roles::TABLE must satisfy `require_role(Role::Admin)`.
+        // End-to-end version of the resolver test above: a real access-JWT
+        // Message for a user whose inline `users.role` is "user" but who has
+        // an admin row in user_roles::TABLE must satisfy
+        // `require_role(Role::Admin)`.
         use crate::platform_state::user_roles;
 
-        let ctx = Arc::new(TestContext::with_admin().await);
+        let ctx = Arc::new(with_admin_and_jwt_secret().await);
         let service = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
         service
             .init(&*ctx)
@@ -690,23 +712,8 @@ mod tests {
             .await
             .expect("assign admin via roles table");
 
-        let raw_token = "e2e-session-raw";
-        sessions::insert(
-            &*ctx,
-            sessions::NewSession {
-                token_hash: hash_token(raw_token),
-                user_id: user.id.clone(),
-                expires_at: "9999-01-01T00:00:00Z".into(),
-            },
-        )
-        .await
-        .expect("seed session");
-
-        let mut msg = Message::new("auth.require_role");
-        msg.set_meta("http.header.cookie", format!("wafer_session={raw_token}"));
-
         let got = service
-            .require_role(&msg, Role::Admin)
+            .require_role(&bearer_msg(&access_token_for(&user.id, &[])), Role::Admin)
             .await
             .expect("roles-table-only admin must satisfy Role::Admin");
         assert_eq!(got.0, user.id);
