@@ -2,9 +2,6 @@
 
 use std::collections::HashMap;
 
-use serde_json::Value;
-use wafer_block::db::{Filter, FilterOp};
-use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use crate::{
@@ -25,52 +22,11 @@ fn admin_error(error: WaferError, not_found: &str) -> OutputStream {
     }
 }
 
-fn equal(field: &str, value: impl Into<Value>) -> Filter {
-    Filter {
-        field: field.to_string(),
-        operator: FilterOp::Equal,
-        value: value.into(),
-    }
-}
-
-fn owned_by(user_id: &str) -> Vec<Filter> {
-    vec![equal("owner_id", Value::String(user_id.to_string()))]
-}
-
-/// The seller's LIVE products — what the admin seller detail page lists.
-/// A deleted listing is not part of a seller's catalog and does not belong in
-/// a catalog view.
-async fn seller_live_products(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
-    repo::products::list_all(ctx, owned_by(user_id)).await
-}
-
-/// EVERY product the seller owns, soft-deleted ones included — what
-/// suspension and reactivation act on.
-///
-/// Deliberately a different read from [`seller_live_products`] rather than a
-/// shared one: the two callers want genuinely different sets, and a single
-/// read would have to be wrong for one of them. Suspension is a lifecycle and
-/// fraud control, so its set is "everything this seller owns": soft delete
-/// changes nothing in Stripe, so a deleted product's Prices and Payment Links
-/// keep taking money in the connected account until suspension archives them.
-async fn seller_every_product(ctx: &dyn Context, user_id: &str) -> Result<Vec<Record>, WaferError> {
-    repo::products::list_all_including_deleted(ctx, owned_by(user_id)).await
-}
-
 pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
-    let records = match db::list_all(ctx, repo::seller_accounts::TABLE, vec![]).await {
-        Ok(records) => records,
-        Err(error) => return err_internal("Could not list sellers", error),
-    };
-    let sellers = match records
-        .iter()
-        .map(repo::seller_accounts::to_contract)
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(sellers) => sellers,
-        Err(error) => return admin_error(error, "Seller not found"),
-    };
-    ok_json(&SellerAccountList { sellers })
+    match repo::seller_accounts::list_contracts(ctx).await {
+        Ok(sellers) => ok_json(&SellerAccountList { sellers }),
+        Err(error) => admin_error(error, "Seller not found"),
+    }
 }
 
 pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -78,15 +34,12 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if id.is_empty() {
         return err_bad_request("Missing seller ID");
     }
-    let record = match db::get(ctx, repo::seller_accounts::TABLE, id).await {
-        Ok(record) => record,
+    let seller = match repo::seller_accounts::get_contract(ctx, id).await {
+        Ok(Some(seller)) => seller,
+        Ok(None) => return err_not_found("Seller not found"),
         Err(error) => return admin_error(error, "Seller not found"),
     };
-    let seller = match repo::seller_accounts::to_contract(&record) {
-        Ok(seller) => seller,
-        Err(error) => return admin_error(error, "Seller not found"),
-    };
-    let products = match seller_live_products(ctx, &seller.user_id).await {
+    let products = match repo::products::list_owned_by(ctx, &seller.user_id).await {
         Ok(products) => products,
         Err(error) => return err_internal("Could not list seller products", error),
     };
@@ -174,8 +127,13 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
     if id.is_empty() {
         return err_bad_request("Missing seller ID");
     }
-    let account = match db::get(ctx, repo::seller_accounts::TABLE, id).await {
-        Ok(account) => account,
+    // The stored row, not `get_contract`'s decoded contract: suspension is a
+    // fraud control, and a row whose `fee_basis_points` no longer decodes is
+    // exactly the account an operator most needs to be able to suspend. The
+    // decode happens where the answer is built, at the end.
+    let account = match repo::seller_accounts::get(ctx, id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return err_not_found("Seller not found"),
         Err(error) => return admin_error(error, "Seller not found"),
     };
     if (account.str_field("status") == "suspended") == suspended {
@@ -184,7 +142,14 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             Err(error) => admin_error(error, "Seller not found"),
         };
     }
-    let products = match seller_every_product(ctx, account.str_field("user_id")).await {
+    // EVERY product the seller owns, soft-deleted ones included. Deliberately
+    // a different read from the catalog listing in `get` above: suspension is
+    // a lifecycle and fraud control, so its set is "everything this seller
+    // owns" — soft delete changes nothing in Stripe, so a deleted product's
+    // Prices and Payment Links keep taking money in the connected account
+    // until suspension archives them.
+    let user_id = account.str_field("user_id").to_string();
+    let products = match repo::products::list_owned_by_including_deleted(ctx, &user_id).await {
         Ok(products) => products,
         Err(error) => return err_internal("Could not load seller products", error),
     };
@@ -223,10 +188,10 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             continue;
         };
         stamp_updated(&mut data);
-        // Deliberately the unfiltered write. `seller_every_product` above
-        // spans the deleted rows on purpose (suspension is a fraud control
-        // and has to cover everything the seller owns), so filtering the
-        // write on liveness here would silently exempt exactly those rows.
+        // Deliberately the unfiltered write. The read above spans the
+        // deleted rows on purpose (suspension is a fraud control and has to
+        // cover everything the seller owns), so filtering the write on
+        // liveness here would silently exempt exactly those rows.
         if let Err(error) = repo::products::update_including_deleted(ctx, &product.id, data).await {
             return err_internal("Could not update seller product state", error);
         }

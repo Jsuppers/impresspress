@@ -98,6 +98,50 @@ pub(crate) fn to_contract(record: &db::Record) -> Result<SellerAccount, WaferErr
     })
 }
 
+/// Every seller account, as the published [`SellerAccount`] contract.
+///
+/// The admin seller list (`GET /b/products/api/admin/sellers`) and the admin
+/// sellers page rendered this from two verbatim copies of the same
+/// `db::list_all` + `to_contract` pair; a decode failure on any row is an
+/// error for the whole read, because a seller list missing the row that could
+/// not be decoded is a governance surface that silently hides an account.
+pub(crate) async fn list_contracts(ctx: &dyn Context) -> Result<Vec<SellerAccount>, WaferError> {
+    db::list_all(ctx, TABLE, vec![])
+        .await?
+        .iter()
+        .map(to_contract)
+        .collect()
+}
+
+/// One seller account by its local id, as the stored row. `Ok(None)` when
+/// there is no such row.
+///
+/// Kept alongside [`get_contract`] for the one caller — suspension — that
+/// must be able to act on a row whose contract projection would fail: an
+/// account with a corrupt `fee_basis_points` is exactly the one an operator
+/// most needs to be able to suspend.
+pub(crate) async fn get(ctx: &dyn Context, id: &str) -> Result<Option<db::Record>, WaferError> {
+    match db::get(ctx, TABLE, id).await {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if error.code == ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// One seller account by its local id, as the published [`SellerAccount`]
+/// contract. `Ok(None)` when there is no such row, so a caller can answer 404
+/// without matching on an error code.
+pub(crate) async fn get_contract(
+    ctx: &dyn Context,
+    id: &str,
+) -> Result<Option<SellerAccount>, WaferError> {
+    match db::get(ctx, TABLE, id).await {
+        Ok(record) => to_contract(&record).map(Some),
+        Err(error) if error.code == ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn get_for_user(
     ctx: &dyn Context,
     user_id: &str,

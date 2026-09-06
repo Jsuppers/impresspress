@@ -3,8 +3,7 @@
 use std::collections::HashMap;
 
 use maud::{html, Markup};
-use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
-use wafer_core::clients::database as db;
+use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
@@ -13,7 +12,7 @@ use super::{
         SellerFailureSummary, StripeConnectionState, StripeConnectionStatus, VariableDefinition,
         VariableKind,
     },
-    money, repo, stripe_provider, GROUPS_TABLE, PURCHASES_TABLE,
+    money, repo, stripe_provider,
 };
 
 fn display_money(amount_minor: i64, currency: &str) -> String {
@@ -213,7 +212,7 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(n) => n,
         Err(e) => return crate::http::err_internal("Database error", e),
     };
-    let groups_count = match db::count(ctx, GROUPS_TABLE, &[]).await {
+    let groups_count = match repo::groups::count(ctx, &[]).await {
         Ok(n) => n,
         Err(e) => return crate::http::err_internal("Database error", e),
     };
@@ -221,7 +220,7 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(n) => n,
         Err(e) => return crate::http::err_internal("Database error", e),
     };
-    let offers_count = match db::count(ctx, repo::offers::TABLE, &[]).await {
+    let offers_count = match repo::offers::count(ctx, &[]).await {
         Ok(n) => n,
         Err(e) => return crate::http::err_internal("Database error", e),
     };
@@ -709,17 +708,9 @@ fn offer_status_label(status: OfferStatus) -> &'static str {
 // ---------------------------------------------------------------------------
 
 pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let seller_records = match db::list_all(ctx, repo::seller_accounts::TABLE, vec![]).await {
-        Ok(records) => records,
-        Err(error) => return crate::http::err_internal("Could not list sellers", error),
-    };
-    let sellers = match seller_records
-        .iter()
-        .map(repo::seller_accounts::to_contract)
-        .collect::<Result<Vec<_>, _>>()
-    {
+    let sellers = match repo::seller_accounts::list_contracts(ctx).await {
         Ok(sellers) => sellers,
-        Err(error) => return crate::http::err_internal("Could not read seller status", error),
+        Err(error) => return crate::http::err_internal("Could not list sellers", error),
     };
     let seller_products = match repo::products::list_all(
         ctx,
@@ -828,27 +819,12 @@ pub async fn admin_seller_detail(
     msg: &Message,
     seller_id: &str,
 ) -> OutputStream {
-    let record = match db::get(ctx, repo::seller_accounts::TABLE, seller_id).await {
-        Ok(record) => record,
-        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-            return crate::http::err_not_found("Seller not found");
-        }
+    let seller = match repo::seller_accounts::get_contract(ctx, seller_id).await {
+        Ok(Some(seller)) => seller,
+        Ok(None) => return crate::http::err_not_found("Seller not found"),
         Err(error) => return crate::http::err_internal("Could not load seller", error),
     };
-    let seller = match repo::seller_accounts::to_contract(&record) {
-        Ok(seller) => seller,
-        Err(error) => return crate::http::err_internal("Could not read seller status", error),
-    };
-    let products = match repo::products::list_all(
-        ctx,
-        vec![Filter {
-            field: "owner_id".into(),
-            operator: FilterOp::Equal,
-            value: serde_json::json!(&seller.user_id),
-        }],
-    )
-    .await
-    {
+    let products = match repo::products::list_owned_by(ctx, &seller.user_id).await {
         Ok(products) => products,
         Err(error) => return crate::http::err_internal("Could not list seller products", error),
     };
@@ -2335,15 +2311,7 @@ async function productCatalogDelete(button){if(!window.confirm('Delete group '+(
 // ---------------------------------------------------------------------------
 
 pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let opts = ListOptions {
-        sort: vec![SortField {
-            field: "name".into(),
-            desc: false,
-        }],
-        limit: 100,
-        ..Default::default()
-    };
-    let result = db::list(ctx, GROUPS_TABLE, &opts).await;
+    let result = repo::groups::list_by_name(ctx, vec![], 100).await;
 
     let content = html! {
         (admin_tabs("groups"))
@@ -3008,17 +2976,7 @@ async function manageBuyerBilling(){
 pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
-    let purchases_count = match db::count(
-        ctx,
-        PURCHASES_TABLE,
-        &[Filter {
-            field: "user_id".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::json!(&user_id),
-        }],
-    )
-    .await
-    {
+    let purchases_count = match repo::purchases::count_for_user(ctx, &user_id).await {
         Ok(count) => count,
         Err(error) => return crate::http::err_internal("Database error", error),
     };

@@ -6,12 +6,17 @@
 
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
-use super::TYPES_TABLE;
+// `repo::types::TABLE` is handed to the generic CRUD helpers below, each of
+// which takes its table from the caller — which is why this file names the
+// constant at all. See the `types` entry in `tests/repo_door.rs`.
 use crate::{
     blocks::{
         crud,
-        products::contracts::{
-            CreateProductTypeRequest, PageQuery, ProductTypeListResponse, ProductTypeView,
+        products::{
+            contracts::{
+                CreateProductTypeRequest, PageQuery, ProductTypeListResponse, ProductTypeView,
+            },
+            repo::types::TABLE as TYPES_TABLE,
         },
     },
     http::ok_json,

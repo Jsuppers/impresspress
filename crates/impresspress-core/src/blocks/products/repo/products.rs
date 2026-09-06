@@ -154,6 +154,40 @@ pub(crate) async fn list_all(
     db::list_all(ctx, TABLE, filters).await
 }
 
+/// Every LIVE product `user_id` owns — a seller's catalog.
+///
+/// The `owner_id` filter was written out three times (the admin seller
+/// detail endpoint, the admin seller detail page, and `sellers.rs`'s private
+/// `owned_by`); it is one query with one name now. A deleted listing is not
+/// part of a seller's catalog and does not belong in a catalog view, which is
+/// why this goes through [`list_all`] rather than
+/// [`list_all_including_deleted`] — suspension, which does want every row the
+/// seller owns, keeps its own read.
+pub(crate) async fn list_owned_by(
+    ctx: &dyn Context,
+    user_id: &str,
+) -> Result<Vec<Record>, WaferError> {
+    list_all(ctx, vec![owner_filter(user_id)]).await
+}
+
+/// Every product `user_id` owns, soft-deleted ones included — what
+/// suspension and reactivation act on. See [`list_all_including_deleted`] for
+/// why that set is deliberately different from [`list_owned_by`]'s.
+pub(crate) async fn list_owned_by_including_deleted(
+    ctx: &dyn Context,
+    user_id: &str,
+) -> Result<Vec<Record>, WaferError> {
+    list_all_including_deleted(ctx, vec![owner_filter(user_id)]).await
+}
+
+fn owner_filter(user_id: &str) -> Filter {
+    Filter {
+        field: "owner_id".to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(user_id.to_string()),
+    }
+}
+
 /// List every product matching `filters` *regardless of soft-delete state*,
 /// unpaged.
 ///

@@ -11,7 +11,7 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::{config, database as db};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::{default_template_id, seller_policy, GROUPS_TABLE, PRODUCT_TEMPLATES_TABLE};
+use super::seller_policy;
 use crate::{
     blocks::{
         crud,
@@ -895,7 +895,7 @@ pub(super) async fn handle_user_create_product(
 
     // Verify user owns the group (if provided)
     if let Some(group_id) = request.group_id.as_deref().filter(|id| !id.is_empty()) {
-        match db::get(ctx, GROUPS_TABLE, group_id).await {
+        match repo::groups::get(ctx, group_id).await {
             Ok(group) => {
                 if field_as_string(&group, "user_id") != user_id {
                     return err_bad_request("You don't own this group");
@@ -951,7 +951,7 @@ pub(super) async fn handle_user_create_product(
         .get("product_template_id")
         .is_none_or(|value| value.as_str().is_some_and(str::is_empty))
     {
-        if let Some(default_id) = default_template_id(ctx, PRODUCT_TEMPLATES_TABLE).await {
+        if let Some(default_id) = repo::product_templates::default_id(ctx).await {
             data.insert(
                 "product_template_id".to_string(),
                 serde_json::Value::String(default_id),

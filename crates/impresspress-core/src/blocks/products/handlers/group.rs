@@ -7,11 +7,14 @@
 //! built from the row; every write body is a typed request whose fields are
 //! the only columns a client can reach.
 
-use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
-use wafer_core::clients::database as db;
+use wafer_block::db::{Filter, FilterOp};
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
-use super::{default_template_id, GROUPS_TABLE, GROUP_TEMPLATES_TABLE};
+// `repo::groups::TABLE` is handed to the generic CRUD helpers below, each of
+// which takes its table from the caller — which is why this file names the
+// constant at all. Every query this file builds itself goes through
+// `repo::groups` / `repo::group_templates`. See the `groups` entry in
+// `tests/repo_door.rs`.
 use crate::{
     blocks::{
         crud,
@@ -21,7 +24,7 @@ use crate::{
                 GroupTemplateListResponse, GroupView, PageQuery, ProductListResponse,
                 UpdateGroupRequest, UpdateOwnGroupRequest,
             },
-            repo,
+            repo::{self, groups::TABLE as GROUPS_TABLE},
         },
     },
     http::{err_bad_request, err_internal, err_unauthorized, ok_json},
@@ -115,20 +118,12 @@ pub(super) async fn handle_user_list_groups(ctx: &dyn Context, msg: &Message) ->
         return err_unauthorized("Not authenticated");
     }
 
-    let opts = ListOptions {
-        filters: vec![Filter {
-            field: "user_id".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String(user_id),
-        }],
-        sort: vec![SortField {
-            field: "name".to_string(),
-            desc: false,
-        }],
-        limit: 1000,
-        ..Default::default()
-    };
-    match db::list(ctx, GROUPS_TABLE, &opts).await {
+    let owned = vec![Filter {
+        field: "user_id".to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(user_id),
+    }];
+    match repo::groups::list_by_name(ctx, owned, 1000).await {
         Ok(result) => ok_json(&GroupListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
@@ -168,7 +163,7 @@ pub(super) async fn handle_user_create_group(
         .get("group_template_id")
         .is_none_or(|v| v.as_str().is_some_and(str::is_empty))
     {
-        if let Some(default_id) = default_template_id(ctx, GROUP_TEMPLATES_TABLE).await {
+        if let Some(default_id) = repo::group_templates::default_id(ctx).await {
             body.insert(
                 "group_template_id".to_string(),
                 serde_json::Value::String(default_id),
@@ -257,15 +252,7 @@ pub(super) async fn handle_user_list_group_templates(
     ctx: &dyn Context,
     _msg: &Message,
 ) -> OutputStream {
-    let opts = ListOptions {
-        sort: vec![SortField {
-            field: "name".to_string(),
-            desc: false,
-        }],
-        limit: 1000,
-        ..Default::default()
-    };
-    match db::list(ctx, GROUP_TEMPLATES_TABLE, &opts).await {
+    match repo::group_templates::list_by_name(ctx, 1000).await {
         Ok(result) => ok_json(&GroupTemplateListResponse::from_record_list(&result)),
         Err(e) => err_internal("Database error", e),
     }
