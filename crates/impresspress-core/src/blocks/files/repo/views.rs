@@ -25,6 +25,8 @@ pub struct ViewRow {
     pub user_id: String,
     /// RFC 3339 instant of the view.
     pub viewed_at: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl ViewRow {
@@ -36,6 +38,8 @@ impl ViewRow {
             key: rec.str_field("key").to_string(),
             user_id: rec.str_field("user_id").to_string(),
             viewed_at: rec.str_field("viewed_at").to_string(),
+            created_at: rec.str_field("created_at").to_string(),
+            updated_at: rec.str_field("updated_at").to_string(),
         }
     }
 }
@@ -99,6 +103,8 @@ mod tests {
                 ("key".to_string(), json!("a.png")),
                 ("user_id".to_string(), json!("alice")),
                 ("viewed_at".to_string(), json!("2026-05-06T10:00:00Z")),
+                ("created_at".to_string(), json!("2026-05-06T10:00:00Z")),
+                ("updated_at".to_string(), json!("2026-05-06T10:00:01Z")),
             ]
             .into_iter()
             .collect(),
@@ -111,6 +117,8 @@ mod tests {
                 key: "a.png".to_string(),
                 user_id: "alice".to_string(),
                 viewed_at: "2026-05-06T10:00:00Z".to_string(),
+                created_at: "2026-05-06T10:00:00Z".to_string(),
+                updated_at: "2026-05-06T10:00:01Z".to_string(),
             }
         );
     }

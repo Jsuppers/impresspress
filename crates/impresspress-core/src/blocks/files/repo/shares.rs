@@ -44,6 +44,7 @@ pub struct ShareRow {
     /// documents and the meaning
     /// [`increment_access_count_capped`] enforces.
     pub max_access_count: Option<i64>,
+    pub updated_at: String,
 }
 
 impl ShareRow {
@@ -59,6 +60,7 @@ impl ShareRow {
             expires_at: rec.opt_str_field("expires_at").filter(|s| !s.is_empty()),
             access_count: rec.i64_field("access_count"),
             max_access_count: rec.opt_i64_field("max_access_count").filter(|n| *n > 0),
+            updated_at: rec.str_field("updated_at").to_string(),
         }
     }
 }
@@ -74,6 +76,8 @@ pub struct AccessLogRow {
     pub accessed_at: String,
     pub ip_address: String,
     pub user_agent: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl AccessLogRow {
@@ -85,6 +89,8 @@ impl AccessLogRow {
             accessed_at: rec.str_field("accessed_at").to_string(),
             ip_address: rec.str_field("ip_address").to_string(),
             user_agent: rec.str_field("user_agent").to_string(),
+            created_at: rec.str_field("created_at").to_string(),
+            updated_at: rec.str_field("updated_at").to_string(),
         }
     }
 }
@@ -353,6 +359,7 @@ mod tests {
             ("expires_at", json!("2026-06-06T10:00:00Z")),
             ("access_count", json!(4)),
             ("max_access_count", json!(10)),
+            ("updated_at", json!("2026-05-06T10:00:01Z")),
         ]));
         assert_eq!(
             row,
@@ -366,6 +373,7 @@ mod tests {
                 expires_at: Some("2026-06-06T10:00:00Z".to_string()),
                 access_count: 4,
                 max_access_count: Some(10),
+                updated_at: "2026-05-06T10:00:01Z".to_string(),
             }
         );
     }
@@ -423,6 +431,8 @@ mod tests {
                 ("accessed_at".to_string(), json!("2026-05-06T10:00:00Z")),
                 ("ip_address".to_string(), json!("203.0.113.7")),
                 ("user_agent".to_string(), json!("curl/8")),
+                ("created_at".to_string(), json!("2026-05-06T10:00:00Z")),
+                ("updated_at".to_string(), json!("2026-05-06T10:00:01Z")),
             ]
             .into_iter()
             .collect(),
@@ -435,6 +445,8 @@ mod tests {
                 accessed_at: "2026-05-06T10:00:00Z".to_string(),
                 ip_address: "203.0.113.7".to_string(),
                 user_agent: "curl/8".to_string(),
+                created_at: "2026-05-06T10:00:00Z".to_string(),
+                updated_at: "2026-05-06T10:00:01Z".to_string(),
             }
         );
     }

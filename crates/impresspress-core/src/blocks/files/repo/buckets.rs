@@ -40,6 +40,7 @@ pub struct BucketRow {
     pub created_by: String,
     /// RFC 3339 creation instant.
     pub created_at: String,
+    pub updated_at: String,
 }
 
 impl BucketRow {
@@ -51,6 +52,7 @@ impl BucketRow {
             public: rec.bool_field("public"),
             created_by: rec.str_field("created_by").to_string(),
             created_at: rec.str_field("created_at").to_string(),
+            updated_at: rec.str_field("updated_at").to_string(),
         }
     }
 }
@@ -203,6 +205,7 @@ mod tests {
                 ("public".to_string(), value),
                 ("created_by".to_string(), json!("alice")),
                 ("created_at".to_string(), json!("2026-05-06T10:00:00Z")),
+                ("updated_at".to_string(), json!("2026-05-06T10:00:01Z")),
             ]
             .into_iter()
             .collect(),
@@ -245,6 +248,7 @@ mod tests {
                 public: true,
                 created_by: "alice".to_string(),
                 created_at: "2026-05-06T10:00:00Z".to_string(),
+                updated_at: "2026-05-06T10:00:01Z".to_string(),
             }
         );
     }

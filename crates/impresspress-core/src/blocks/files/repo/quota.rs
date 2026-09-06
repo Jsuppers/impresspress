@@ -27,7 +27,14 @@ pub struct QuotaRow {
     pub user_id: String,
     /// The effective caps: each column that is present overrides the block
     /// default, field by field.
+    ///
+    /// Flattened on the wire, because the four caps are four columns of this
+    /// table — `QuotaConfig` groups them for the enforcement path, it does
+    /// not nest them in the row.
+    #[serde(flatten)]
     pub config: QuotaConfig,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl QuotaRow {
@@ -58,6 +65,8 @@ impl QuotaRow {
                     .opt_i64_field("reset_period_days")
                     .unwrap_or(defaults.reset_period_days),
             },
+            created_at: rec.str_field("created_at").to_string(),
+            updated_at: rec.str_field("updated_at").to_string(),
         }
     }
 }

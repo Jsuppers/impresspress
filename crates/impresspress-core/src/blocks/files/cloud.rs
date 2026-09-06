@@ -9,12 +9,15 @@ use std::collections::HashMap;
 
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
-use super::repo;
+use super::{
+    contracts::{RecordListView, RecordView},
+    repo,
+};
 use crate::http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json};
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match repo::shares::list_for_user(ctx, msg.user_id(), 100).await {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -170,7 +173,7 @@ pub(super) async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -
     let (page, page_size, _) = msg.pagination_params(20);
     let offset = ((page - 1) * page_size) as i64;
     match repo::shares::list_recent(ctx, page_size as i64, offset).await {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -182,14 +185,14 @@ pub(super) async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> Outp
     let offset = ((page - 1) * page_size) as i64;
 
     match repo::shares::list_access_logs(ctx, share_id, page_size as i64, offset).await {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Database error", e),
     }
 }
 
 pub(super) async fn handle_admin_quotas(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     match repo::quota::list(ctx, 1000).await {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -229,7 +232,7 @@ pub(super) async fn handle_update_quota(
     }
 
     match repo::quota::upsert_for_user(ctx, user_id, body).await {
-        Ok(row) => ok_json(&row),
+        Ok(row) => ok_json(&RecordView::from_row(&row)),
         Err(e) => err_internal("Database error", e),
     }
 }

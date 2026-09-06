@@ -3,7 +3,7 @@
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::files::repo,
+    blocks::files::{contracts::RecordListView, repo},
     http::{err_bad_request, err_internal, ok_json},
 };
 
@@ -26,7 +26,7 @@ pub(in crate::blocks::files) async fn handle_search(
     )
     .await
     {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Search failed", e),
     }
 }
@@ -36,7 +36,7 @@ pub(in crate::blocks::files) async fn handle_recent(
     msg: &Message,
 ) -> OutputStream {
     match repo::views::list_recent_for_user(ctx, msg.user_id(), 20).await {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -64,15 +64,17 @@ mod integration_tests {
         repo::objects::seed(ctx, data).await.expect("seed object");
     }
 
-    /// The keys in a `repo::Page<ObjectRow>` response body: `rows` are the
-    /// decoded rows themselves, so `key` is a field of the row rather than
-    /// of a nested `data` map.
     fn search_result_keys(v: &serde_json::Value) -> Vec<String> {
-        v.get("rows")
+        v.get("records")
             .and_then(|r| r.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|row| row.get("key").and_then(|k| k.as_str()).map(str::to_string))
+                    .filter_map(|rec| {
+                        rec.get("data")
+                            .and_then(|d| d.get("key"))
+                            .and_then(|k| k.as_str())
+                            .map(str::to_string)
+                    })
                     .collect()
             })
             .unwrap_or_default()

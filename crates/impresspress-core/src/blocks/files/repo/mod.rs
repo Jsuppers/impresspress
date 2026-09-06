@@ -34,19 +34,29 @@ pub mod quota;
 pub mod shares;
 pub mod views;
 
-/// One page of typed rows plus the total number of rows matching the query
-/// across all pages — the block's single return shape for a listing.
+/// One page of typed rows — the block's single return shape for a listing.
 ///
-/// It replaces `RecordList` at the repo boundary. `RecordList` also carries
-/// `page`/`page_size`, which every caller here already knows because it
-/// computed the offset it passed in, so the page keeps only what a caller
-/// cannot derive: the rows and the total.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// It replaces `RecordList` at the *repo* boundary and nowhere else. It is
+/// deliberately NOT `Serialize`: the JSON list endpoints publish the
+/// `RecordList` envelope they have always published, and
+/// [`super::contracts::RecordListView`] is the one place that envelope is
+/// built. Serializing a `Page` directly would silently reshape six response
+/// bodies that `packages/impresspress-js` reads.
+///
+/// `page` and `page_size` ride along unchanged from the database service
+/// rather than being recomputed at the boundary: they are what the service
+/// derived from the `limit`/`offset` it was given, and the view must publish
+/// exactly those.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
     /// The rows on this page, in the query's sort order.
     pub rows: Vec<T>,
     /// Total rows matching the query across all pages.
     pub total: i64,
+    /// 1-based index of this page, as the database service computed it.
+    pub page: i64,
+    /// Rows per page, as the database service computed it.
+    pub page_size: i64,
 }
 
 impl<T> Page<T> {
@@ -56,6 +66,8 @@ impl<T> Page<T> {
         Self {
             rows: list.records.iter().map(from_record).collect(),
             total: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
         }
     }
 }
