@@ -128,37 +128,33 @@ pub fn render_new_bucket_modal() -> Markup {
 /// a single GROUP BY query on the objects table
 /// ([`repo::objects::count_by_bucket`], one row per bucket) so we avoid
 /// the previous N+1 count query per bucket.
-pub async fn list_buckets_for_user(ctx: &dyn Context, user_id: &str) -> Vec<BucketRow> {
+///
+/// Both reads propagate. Either one collapsing into an empty collection is
+/// indistinguishable from the truth it is standing in for — "this account
+/// has no buckets", and "this bucket holds no objects" — so the page it
+/// feeds renders an error rather than that lie.
+pub async fn list_buckets_for_user(
+    ctx: &dyn Context,
+    user_id: &str,
+) -> Result<Vec<BucketRow>, wafer_run::WaferError> {
     use std::collections::HashMap;
 
-    let owned = match repo::buckets::list_owned_sorted(ctx, user_id).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "files bucket list failed");
-            Vec::new()
-        }
-    };
+    let owned = repo::buckets::list_owned_sorted(ctx, user_id).await?;
 
     // Restrict the GROUP BY to the buckets this user owns so the count
     // matches the previous per-bucket count semantics exactly (which
     // counted all objects in the bucket regardless of `uploaded_by`).
     let bucket_names: Vec<String> = owned.iter().map(|r| r.name.clone()).collect();
     let counts_by_bucket: HashMap<String, i64> =
-        match repo::objects::count_by_bucket(ctx, &bucket_names).await {
-            Ok(counts) => counts,
-            Err(e) => {
-                tracing::warn!(error = %e, "files bucket object counts failed");
-                HashMap::new()
-            }
-        };
+        repo::objects::count_by_bucket(ctx, &bucket_names).await?;
 
-    owned
+    Ok(owned
         .iter()
         .map(|row| {
             let count = counts_by_bucket.get(&row.name).copied().unwrap_or(0);
             BucketRow::from((row, count))
         })
-        .collect()
+        .collect())
 }
 
 /// GET `/b/storage/` — bucket list for the calling user.
@@ -169,7 +165,13 @@ pub async fn bucket_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream 
         return ui::not_found_response(msg);
     }
 
-    let rows = list_buckets_for_user(ctx, &user_id).await;
+    let rows = match list_buckets_for_user(ctx, &user_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, user_id = %user_id, "bucket list page: read failed");
+            return ui::server_error_response(msg);
+        }
+    };
 
     let new_bucket_btn = button(
         BtnVariant::Primary,
@@ -411,6 +413,71 @@ mod integration_tests {
         assert!(
             html.contains(r#"minlength="3""#) && html.contains(r#"maxlength="63""#),
             "length constraints missing: {html}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! A read that FAILED is not "this user has no buckets".
+    //!
+    //! Both reads behind `/b/storage/` used to log a warning and substitute
+    //! an empty collection, so an outage rendered "No buckets yet" — exactly
+    //! what a brand-new account renders — and a bucket whose object count
+    //! could not be read rendered `0`.
+
+    use super::{super::test_helpers::seed_two_buckets, *};
+    use crate::{
+        blocks::files::repo,
+        test_support::{admin_msg, output_http_status, FailingDbOpContext, TestContext},
+    };
+
+    #[tokio::test]
+    async fn a_failing_bucket_list_renders_the_error_page_not_an_empty_one() {
+        let ctx = TestContext::with_files().await.break_reads();
+        let out = bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/")).await;
+        assert_eq!(
+            output_http_status(out).await,
+            500,
+            "an unreadable bucket list must not render as an empty account"
+        );
+    }
+
+    /// The object-count aggregate is the page's SECOND read, and its failure
+    /// was just as invisible: every bucket rendered `0` objects.
+    #[tokio::test]
+    async fn a_failing_object_count_renders_the_error_page() {
+        let ctx = TestContext::with_files().await;
+        seed_two_buckets(&ctx, "admin_1").await;
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.aggregate", repo::objects::TABLE)],
+        );
+
+        let out = bucket_list_page(&failing, &admin_msg("retrieve", "/b/storage/")).await;
+        assert_eq!(
+            output_http_status(out).await,
+            500,
+            "an unreadable object count must not render as zero objects"
+        );
+    }
+
+    /// The success path is untouched: the page still renders the buckets and
+    /// their counts.
+    #[tokio::test]
+    async fn a_healthy_read_still_renders_the_buckets() {
+        let ctx = TestContext::with_files().await;
+        seed_two_buckets(&ctx, "admin_1").await;
+        let rows = list_buckets_for_user(&ctx, "admin_1")
+            .await
+            .expect("a healthy read succeeds");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.name == "photos")
+                .expect("photos bucket")
+                .object_count,
+            2
         );
     }
 }

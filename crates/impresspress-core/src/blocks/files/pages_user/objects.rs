@@ -208,14 +208,17 @@ pub fn render_breadcrumbs(bucket: &str, current_prefix: &str) -> Markup {
     }
 }
 
-async fn list_objects_in_bucket(ctx: &dyn Context, bucket: &str) -> Vec<ObjectRow> {
-    match repo::objects::list_for_bucket(ctx, bucket, 1000).await {
-        Ok(page) => page.rows.iter().map(ObjectRow::from).collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, bucket = %bucket, "object list failed");
-            Vec::new()
-        }
-    }
+/// The bucket's objects, or the failure that stopped us reading them.
+///
+/// An empty vector means the bucket is empty; it must never also mean the
+/// listing failed, because the page renders the two identically ("No files
+/// yet") and the folder navigation below is synthesized from these keys.
+async fn list_objects_in_bucket(
+    ctx: &dyn Context,
+    bucket: &str,
+) -> Result<Vec<ObjectRow>, wafer_run::WaferError> {
+    let page = repo::objects::list_for_bucket(ctx, bucket, 1000).await?;
+    Ok(page.rows.iter().map(ObjectRow::from).collect())
 }
 
 /// GET `/b/storage/{bucket}/[{prefix}/]` — object listing with synthesized
@@ -237,7 +240,13 @@ pub async fn object_list_page(
         return crate::ui::not_found_response(msg);
     }
 
-    let all_objects = list_objects_in_bucket(ctx, bucket).await;
+    let all_objects = match list_objects_in_bucket(ctx, bucket).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, bucket = %bucket, "object list page: read failed");
+            return crate::ui::server_error_response(msg);
+        }
+    };
     let listing = group_objects_by_prefix(&all_objects, current_prefix);
 
     let title = if current_prefix.is_empty() {
@@ -780,6 +789,41 @@ mod integration_tests {
         assert!(
             body.contains("\\u003c/script\\u003e") || body.contains("\\u003c/script>"),
             "expected escaped </script> sequence in bootstrap: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! An object listing that FAILED is not an empty bucket.
+
+    use super::*;
+    use crate::{
+        blocks::files::repo,
+        test_support::{admin_msg, output_http_status, FailingDbOpContext, TestContext},
+    };
+
+    /// The ownership check reads the *buckets* table and must still pass, so
+    /// the fault is scoped to the objects listing: this is the "bucket found,
+    /// listing failed" shape, which used to render "No files yet".
+    #[tokio::test]
+    async fn a_failing_object_list_renders_the_error_page_not_an_empty_bucket() {
+        let ctx = TestContext::with_files().await;
+        super::super::test_helpers::seed_two_buckets(&ctx, "admin_1").await;
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.list", repo::objects::TABLE)]);
+
+        let out = object_list_page(
+            &failing,
+            &admin_msg("retrieve", "/b/storage/photos/"),
+            "photos",
+            "",
+        )
+        .await;
+        assert_eq!(
+            output_http_status(out).await,
+            500,
+            "an unreadable object list must not render as an empty bucket"
         );
     }
 }
