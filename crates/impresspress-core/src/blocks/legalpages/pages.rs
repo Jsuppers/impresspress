@@ -6,18 +6,16 @@
 //! - API endpoints reference
 
 use maud::{html, Markup, PreEscaped};
-use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
-use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
-use super::service;
+use super::{
+    repo::documents::{self, DocumentRow, NewDraft},
+    service,
+};
 use crate::{
     http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
     ui::{self, components, icons, settings_form},
-    util::{json_map, RecordExt},
 };
-
-const COLLECTION: &str = super::COLLECTION;
 
 // ---------------------------------------------------------------------------
 // Document lookup
@@ -26,60 +24,18 @@ const COLLECTION: &str = super::COLLECTION;
 /// Find the current document for a given type.
 /// Prefers the latest draft (so admin sees their in-progress edits),
 /// then falls back to the published version.
-async fn find_current_doc(ctx: &dyn Context, doc_type: &str) -> Option<db::Record> {
-    // First try latest draft
-    let opts = ListOptions {
-        filters: vec![
-            Filter {
-                field: "doc_type".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(doc_type),
-            },
-            Filter {
-                field: "status".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!("draft"),
-            },
-        ],
-        sort: vec![SortField {
-            field: "updated_at".into(),
-            desc: true,
-        }],
-        limit: 1,
-        ..Default::default()
-    };
-    if let Ok(result) = db::list(ctx, COLLECTION, &opts).await {
-        if let Some(record) = result.records.into_iter().next() {
-            return Some(record);
-        }
+///
+/// A read failure is an `Err`, not an empty editor: rendering "no document"
+/// over a database error invites the admin to type a replacement into a form
+/// whose save then forks the document they could not see.
+async fn find_current_doc(
+    ctx: &dyn Context,
+    doc_type: &str,
+) -> Result<Option<DocumentRow>, WaferError> {
+    if let Some(draft) = documents::find_latest_draft(ctx, doc_type).await? {
+        return Ok(Some(draft));
     }
-
-    // Fall back to published
-    let opts = ListOptions {
-        filters: vec![
-            Filter {
-                field: "doc_type".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(doc_type),
-            },
-            Filter {
-                field: "status".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!("published"),
-            },
-        ],
-        sort: vec![SortField {
-            field: "updated_at".into(),
-            desc: true,
-        }],
-        limit: 1,
-        ..Default::default()
-    };
-    if let Ok(result) = db::list(ctx, COLLECTION, &opts).await {
-        result.records.into_iter().next()
-    } else {
-        None
-    }
+    documents::find_published(ctx, doc_type).await
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +43,10 @@ async fn find_current_doc(ctx: &dyn Context, doc_type: &str) -> Option<db::Recor
 // ---------------------------------------------------------------------------
 
 pub async fn editor_page(ctx: &dyn Context, msg: &Message, doc_type: &str) -> OutputStream {
-    let doc = find_current_doc(ctx, doc_type).await;
+    let doc = match find_current_doc(ctx, doc_type).await {
+        Ok(doc) => doc,
+        Err(e) => return err_internal("Failed to load the legal document", e),
+    };
     let default_title = if doc_type == "privacy" {
         "Privacy Policy"
     } else {
@@ -95,19 +54,18 @@ pub async fn editor_page(ctx: &dyn Context, msg: &Message, doc_type: &str) -> Ou
     };
 
     let (doc_id, title, content, status, updated_at, version) = match &doc {
-        Some(d) => {
-            let t = d.str_field("title");
-            let title = if t.is_empty() { default_title } else { t };
-            let ver = super::service::doc_version(d).unwrap_or(1);
-            (
-                d.id.as_str(),
-                title,
-                d.str_field("content"),
-                d.str_field("status"),
-                d.str_field("updated_at"),
-                ver,
-            )
-        }
+        Some(d) => (
+            d.id.as_str(),
+            if d.title.is_empty() {
+                default_title
+            } else {
+                d.title.as_str()
+            },
+            d.content.as_str(),
+            d.status.as_str(),
+            d.updated_at.as_str(),
+            d.version,
+        ),
         None => ("", default_title, "", "none", "", 1),
     };
 
@@ -499,55 +457,49 @@ pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -
         Err(e) => return err_bad_request(&format!("Invalid request: {e}")),
     };
 
-    // If editing a published document, create a new draft instead of modifying the live version
-    let should_create_new = if body.doc_id.is_empty() {
-        true
+    // Three outcomes, not two. The lookup used to fold its `Err` into "no
+    // such document, create a draft", so a transient read failure forked the
+    // document the admin was editing into a second row and answered 200
+    // (B10). An error is now reported; only a genuinely absent row, or a
+    // *published* one, creates a draft.
+    let existing = if body.doc_id.is_empty() {
+        None
     } else {
-        match db::get(ctx, COLLECTION, &body.doc_id).await {
-            Ok(doc) => {
-                doc.data
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    == "published"
-            }
-            Err(_) => true,
+        match documents::get(ctx, &body.doc_id).await {
+            Ok(found) => found,
+            Err(e) => return err_internal("Failed to load the legal-page document", e),
         }
     };
 
-    if should_create_new {
-        // Draft shape lives in `service::create_draft` (shared with the JSON
-        // API's document-create handler in `mod.rs`).
-        match service::create_draft(
+    // Editing a published document creates a new draft instead of modifying
+    // the live version, so the published text stays untouched until the admin
+    // explicitly publishes again.
+    let saved = match existing {
+        Some(doc) if doc.status != "published" => {
+            documents::update_content(ctx, &doc.id, Some(&body.title), Some(&body.content))
+                .await
+                .map(|row| row.id)
+        }
+        _ => documents::insert_draft(
             ctx,
-            &body.doc_type,
-            &body.title,
-            &body.content,
-            msg.user_id(),
+            NewDraft {
+                doc_type: &body.doc_type,
+                title: &body.title,
+                content: &body.content,
+                created_by: msg.user_id(),
+            },
         )
         .await
-        {
-            Ok(record) => ok_json(&serde_json::json!({
-                "doc_id": record.id,
-                "status": "draft",
-                "message": "Draft saved"
-            })),
-            Err(e) => err_internal("Failed to save legal-page draft", e),
-        }
-    } else {
-        let data = json_map(serde_json::json!({
-            "title": body.title,
-            "content": body.content,
-            "updated_at": crate::util::now_rfc3339()
-        }));
-        match db::update(ctx, COLLECTION, &body.doc_id, data).await {
-            Ok(_) => ok_json(&serde_json::json!({
-                "doc_id": body.doc_id,
-                "status": "draft",
-                "message": "Draft saved"
-            })),
-            Err(e) => err_internal("Failed to save legal-page draft", e),
-        }
+        .map(|row| row.id),
+    };
+
+    match saved {
+        Ok(doc_id) => ok_json(&serde_json::json!({
+            "doc_id": doc_id,
+            "status": "draft",
+            "message": "Draft saved"
+        })),
+        Err(e) => err_internal("Failed to save legal-page draft", e),
     }
 }
 
@@ -583,7 +535,7 @@ pub async fn handle_publish(ctx: &dyn Context, msg: &Message, input: InputStream
     };
 
     ok_json(&serde_json::json!({
-        "doc_id": published.record.id,
+        "doc_id": published.row.id,
         "status": "published",
         "version": published.version,
         "message": format!("Published as v{}", published.version)

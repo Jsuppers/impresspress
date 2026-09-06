@@ -34,6 +34,7 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("tickets", &["/b/tickets"]),
     ("llm", &["/b/llm"]),
     ("vector", &["/b/vector"]),
+    ("legalpages", &["/b/legalpages"]),
 ];
 
 /// Blocks whose snapshot exists only under a non-default feature.
@@ -51,10 +52,10 @@ const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[];
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// The list is now empty. `admin` left it when its four JSON API reads were
-/// typed, `tickets` when its thirteen JSON endpoints were, and `llm` /
-/// `vector` when their thirteen and nine were: every block's handlers now
-/// build `contracts` types, so every block has a non-empty snapshot to guard.
+/// The list is empty again. `admin` left it when its four JSON API reads were
+/// typed, `tickets` when its thirteen JSON endpoints were, `llm` / `vector`
+/// when their thirteen and nine were, and `legalpages` when its PATCH
+/// declared the request body that makes `status` unreachable from it.
 ///
 /// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
 /// any of them means the gate is vacuous — wrong prefix, or the block missing

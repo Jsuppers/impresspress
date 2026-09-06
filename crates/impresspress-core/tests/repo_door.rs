@@ -6,7 +6,8 @@
 //! module reaches the table through that module's functions, so a column is
 //! spelled in one Rust file and a read cannot skip whatever the door
 //! enforces (decoding, the seed hash gate, the single `assign` writer, the
-//! one decode of `files.public`). The gate is a source scan because the
+//! one decode of `files.public`, the three writers of
+//! `legalpages.documents.status`). The gate is a source scan because the
 //! table name is necessarily reachable — a block's `collections(..)` and
 //! `grants(..)` registrations name it — so nothing but a test can catch a
 //! call site that names it directly. It generalises
@@ -116,6 +117,12 @@ const TABLES: &[(&str, &str, &str, &str)] = &[
         "views::TABLE",
         "files",
     ),
+    (
+        "documents",
+        "impresspress__legalpages__documents",
+        "documents::TABLE",
+        "legalpages",
+    ),
 ];
 
 fn crate_sources() -> Vec<(String, String)> {
@@ -214,6 +221,11 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     ("share_access_logs", &["blocks/files/repo/shares.rs"]),
     ("quota", &["blocks/files/repo/quota.rs"]),
     ("views", &["blocks/files/repo/views.rs"]),
+    // The legalpages door. Nothing but the door itself: the block declares
+    // no `collections(..)` and no `grants(..)` (it owns the one table it
+    // touches, so WRAP has nothing to cross-check), which is what leaves this
+    // list at one entry.
+    ("documents", &["blocks/legalpages/repo/documents.rs"]),
     (
         "users",
         &[
@@ -387,6 +399,16 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // request rather than skip the check
             "blocks/files/cloud.rs",
         ],
+    ),
+    (
+        "documents",
+        // Category 2 only. The block declares no `collections(..)`, so there
+        // is no non-test file that has to name the table at all; this entry
+        // is the four `FailingDbOpContext` fixtures in the block's
+        // `write_loss_tests`, which name the table so the injected fault
+        // lands on the query under test. Same reason
+        // `blocks/admin/pages/blocks.rs` is listed above.
+        &["blocks/legalpages/mod.rs"],
     ),
     ("share_access_logs", &["blocks/files/mod.rs"]),
     (
