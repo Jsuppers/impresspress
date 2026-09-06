@@ -83,9 +83,14 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
         offset: 0,
     };
 
+    // "No contexts yet — create one above." is the empty state a fresh
+    // deployment renders; a failed read must never reach it.
     let contexts = match service::list_contexts(ctx, &params).await {
         Ok(r) => r.records,
-        Err(_) => vec![],
+        Err(e) => {
+            tracing::error!(error = %e, "messages context list page: read failed");
+            return ui::server_error_response(msg);
+        }
     };
 
     let content = html! {
@@ -186,9 +191,14 @@ pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStre
         offset: 0,
     };
 
+    // A conversation rendered with no messages in it is what an empty
+    // conversation looks like, so the read failing has to fail the page.
     let entries = match service::list_entries(ctx, context_id, &entries_params).await {
         Ok(r) => r.records,
-        Err(_) => vec![],
+        Err(e) => {
+            tracing::error!(error = %e, context_id = %context_id, "messages detail page: entry list failed");
+            return ui::server_error_response(msg);
+        }
     };
 
     // Sibling conversations only loaded when this is a conversation context;
@@ -203,10 +213,16 @@ pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStre
             page_size: 50,
             offset: 0,
         };
-        service::list_contexts(ctx, &sibling_params)
-            .await
-            .map(|r| r.records)
-            .unwrap_or_default()
+        // An empty sibling list renders as "this is the only conversation",
+        // which is a claim about the caller's data — not something a failed
+        // read is entitled to make.
+        match service::list_contexts(ctx, &sibling_params).await {
+            Ok(r) => r.records,
+            Err(e) => {
+                tracing::error!(error = %e, context_id = %context_id, "messages detail page: sibling list failed");
+                return ui::server_error_response(msg);
+            }
+        }
     } else {
         vec![]
     };
@@ -639,6 +655,84 @@ mod tests {
         assert!(
             !opening_tag.contains("overflow-y:auto"),
             "conversation entries-list opening tag still has overflow-y:auto — double scroll: {opening_tag}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! The two messages pages during a database outage.
+    //!
+    //! These were the block's only three swallow sites, and the only ones
+    //! that did not even log — while four lines above the entries read, the
+    //! context lookup already routes its tail through
+    //! `crud::db_error_internal`.
+
+    use super::*;
+    use crate::{
+        blocks::messages::{
+            service::{self, CONTEXTS_TABLE, ENTRIES_TABLE},
+            test_support::{ctx_with_messages, routed},
+        },
+        test_support::{admin_msg, output_http_status, FailingDbOpContext, TestContext},
+    };
+
+    async fn seed_conversation(ctx: &TestContext) -> String {
+        service::create_context(
+            ctx,
+            "admin_1",
+            "conversation",
+            "Renewal",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .expect("seed a context")
+        .id
+    }
+
+    /// "No contexts yet — create one above." is what a fresh deployment
+    /// renders. An outage rendered the same sentence.
+    #[tokio::test]
+    async fn a_failing_context_list_renders_the_error_page_not_no_contexts_yet() {
+        let ctx = ctx_with_messages().await.break_reads();
+        let out = context_list_page(&ctx, &routed(admin_msg("retrieve", "/b/messages/"))).await;
+        assert_eq!(output_http_status(out).await, 500);
+    }
+
+    /// The context itself is found and only its entries fail: the page used
+    /// to render the conversation with no messages in it.
+    #[tokio::test]
+    async fn a_failing_entry_list_renders_the_error_page_not_an_empty_conversation() {
+        let ctx = ctx_with_messages().await;
+        let id = seed_conversation(&ctx).await;
+
+        let failing = FailingDbOpContext::new(ctx.clone(), vec![("database.list", ENTRIES_TABLE)]);
+        let msg = routed(admin_msg("retrieve", &format!("/b/messages/contexts/{id}")));
+        assert_eq!(
+            output_http_status(context_detail_page(&failing, &msg).await).await,
+            500
+        );
+    }
+
+    /// The sibling thread list feeds the conversation view's thread pane —
+    /// the same pane whose emptiness hid a dead read in the llm chat page for
+    /// several PRs. A failed read must not render as "this is the only
+    /// conversation".
+    #[tokio::test]
+    async fn a_failing_sibling_list_renders_the_error_page_not_a_lone_thread() {
+        let ctx = ctx_with_messages().await;
+        let id = seed_conversation(&ctx).await;
+
+        // The context lookup is a `database.get` and still lands; only the
+        // sibling listing on the contexts table fails.
+        let failing = FailingDbOpContext::new(ctx.clone(), vec![("database.list", CONTEXTS_TABLE)]);
+        let msg = routed(admin_msg("retrieve", &format!("/b/messages/contexts/{id}")));
+        assert_eq!(
+            output_http_status(context_detail_page(&failing, &msg).await).await,
+            500
         );
     }
 }
