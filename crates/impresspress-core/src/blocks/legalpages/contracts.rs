@@ -1,9 +1,57 @@
 //! Wire types for the legalpages JSON API: what a request may say, and what
 //! a response body looks like.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::repo::{documents::DocumentRow, Page};
+
+/// Which legal document a row is: the `doc_type` column of
+/// `impresspress__legalpages__documents`.
+///
+/// Two variants because the block serves two documents: `ROUTES` declares
+/// `/b/legalpages/terms` and `/b/legalpages/privacy` and nothing else, and
+/// the admin editor is reachable at `/b/legalpages/admin/{terms,privacy}`.
+/// `doc_type` used to arrive from a request body unvalidated — the JSON
+/// create, the editor's save and the editor's publish were three doors onto
+/// the column — so `{"doc_type":"cookies"}` stored a row every public route
+/// answers 404 for and no editor page can reach. The type is what closes all
+/// three at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentType {
+    Terms,
+    Privacy,
+}
+
+impl DocumentType {
+    /// The document's name, as every page that renders it shows it.
+    ///
+    /// One table, because there were three that disagreed: `mod.rs`'s public
+    /// page fell back to "Privacy Policy" for an unrecognised type while
+    /// both of `pages.rs`'s fell back to "Terms of Service", so one
+    /// unvalidated `doc_type` was labelled two different things on two
+    /// pages. With the type there is no fall-back case left to disagree
+    /// about.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Terms => "Terms of Service",
+            Self::Privacy => "Privacy Policy",
+        }
+    }
+}
+
+/// Where a document version is in its lifecycle: the `status` column.
+///
+/// Written by exactly three repo functions, none of which takes the value
+/// from a caller — that is the B10 fix, and the type is what makes the three
+/// spellings they write one definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentStatus {
+    Draft,
+    Published,
+    Archived,
+}
 
 // This type is the B10 fix, and the doc comment below is deliberately not
 // the place that says so: it is published verbatim as the endpoint's schema
@@ -98,10 +146,10 @@ mod tests {
     fn row(id: &str, version: i64) -> DocumentRow {
         DocumentRow {
             id: id.to_string(),
-            doc_type: "terms".to_string(),
+            doc_type: DocumentType::Terms,
             title: "Terms".to_string(),
             content: "body".to_string(),
-            status: "published".to_string(),
+            status: DocumentStatus::Published,
             version,
             created_by: "admin_1".to_string(),
             published_at: Some("2026-09-01T00:00:00Z".to_string()),

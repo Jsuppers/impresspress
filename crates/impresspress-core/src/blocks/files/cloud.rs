@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{RecordListView, RecordView},
@@ -146,14 +146,12 @@ pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> Out
                 return err_forbidden("Cannot delete another user's share");
             }
         }
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Share not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Share not found", "Database error"),
     }
 
     match repo::shares::delete(ctx, id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Share not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Share not found", "Database error"),
     }
 }
 

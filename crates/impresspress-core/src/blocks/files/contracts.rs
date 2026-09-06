@@ -24,6 +24,27 @@ use serde::{Deserialize, Serialize};
 
 use super::repo::Page;
 
+/// Where an object row is in its upload: the `status` column of
+/// `impresspress__files__objects`.
+///
+/// A row is inserted `Pending` *before* the storage upload — that is what
+/// closes the quota TOCTOU window — and flipped to `Complete` afterwards.
+/// The distinction is load-bearing in two directions at once: quota
+/// accounting counts both, so an in-flight reservation is charged, while
+/// search and the admin stats count only `Complete`, so a half-finished
+/// upload is not listed as a file. Two literals compared in seven places
+/// could not say that; one type can, and a row holding neither value is
+/// now a decode failure rather than an object that is silently in neither
+/// set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStatus {
+    /// Reserved: the row exists and counts against quota, the blob may not.
+    Pending,
+    /// Uploaded: the blob is in storage and the object is listable.
+    Complete,
+}
+
 /// One record in the [`RecordListView`] envelope: the row's `id` beside the
 /// row's columns, exactly as `wafer_core::clients::database::Record`
 /// serializes. The backends put `id` in BOTH places (`row_to_record` inserts
@@ -138,7 +159,7 @@ mod tests {
                     ("key", json!("nested/a.png")),
                     ("size", json!(1024)),
                     ("content_type", json!("image/png")),
-                    ("status", json!("complete")),
+                    ("status", json!(ObjectStatus::Complete)),
                     ("uploaded_by", json!("alice")),
                     ("uploaded_at", json!("2026-05-06T10:00:00Z")),
                     ("created_at", json!("2026-05-06T10:00:00Z")),
@@ -147,7 +168,8 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
-            })],
+            })
+            .expect("the fixture row decodes")],
             total: 7,
             page: 2,
             page_size: 20,

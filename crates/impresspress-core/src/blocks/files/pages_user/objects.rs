@@ -311,13 +311,18 @@ mod tests {
                 ("key".to_string(), serde_json::json!("nested/a.png")),
                 ("size".to_string(), serde_json::json!("2048")),
                 (
+                    "status".to_string(),
+                    serde_json::json!(crate::blocks::files::contracts::ObjectStatus::Complete),
+                ),
+                (
                     "uploaded_at".to_string(),
                     serde_json::json!("2026-05-06T10:00:00Z"),
                 ),
             ]
             .into_iter()
             .collect(),
-        });
+        })
+        .expect("the fixture row decodes");
         let projected = ObjectRow::from(&row);
         assert_eq!(projected.key, "nested/a.png");
         assert_eq!(projected.size, 2048);

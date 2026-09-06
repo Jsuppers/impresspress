@@ -70,4 +70,29 @@ impl<T> Page<T> {
             page_size: list.page_size,
         }
     }
+
+    /// [`Self::decode`] for a table whose `from_record` can fail.
+    ///
+    /// `objects` is the one: its `status` is an [`ObjectStatus`], and a row
+    /// holding neither `pending` nor `complete` belongs to neither the quota
+    /// sum nor the listings — so it stops the page rather than joining it as
+    /// something the block cannot classify. The other three row types decode
+    /// every column infallibly and keep [`Self::decode`].
+    ///
+    /// [`ObjectStatus`]: super::contracts::ObjectStatus
+    pub(super) fn try_decode(
+        list: RecordList,
+        from_record: fn(&Record) -> Result<T, wafer_run::WaferError>,
+    ) -> Result<Self, wafer_run::WaferError> {
+        Ok(Self {
+            rows: list
+                .records
+                .iter()
+                .map(from_record)
+                .collect::<Result<Vec<T>, _>>()?,
+            total: list.total_count,
+            page: list.page,
+            page_size: list.page_size,
+        })
+    }
 }

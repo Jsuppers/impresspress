@@ -213,6 +213,76 @@ impl RecordExt for Record {
     }
 }
 
+/// Parse `column` of `record` into the enum that defines its value set.
+///
+/// The one decode door for an enum'd column, crate-wide. A column whose
+/// values are a fixed set has exactly one type that names them and exactly
+/// one function that turns the stored text into that type, so a value the
+/// contract does not define cannot be read as a default by one caller and
+/// as an error by another — which is what having two doors
+/// (`products::contracts::enum_column` and `products::repo::offers::wire_enum`,
+/// which disagreed on the empty column) produced.
+///
+/// A stored value outside the set is a data-integrity fault: it is reported
+/// as [`ErrorCode::Internal`](wafer_run::ErrorCode::Internal) naming the row,
+/// the column and the value — the three things an operator needs to go and
+/// look at the row — and is never mapped onto a variant. An absent column, a
+/// SQL `NULL` and an empty string all read as `""`, which is not a variant of
+/// anything, so all three are refused here; a column that legitimately holds
+/// `""` wants [`enum_column_or`] and a typed fallback.
+pub fn enum_column<T: serde::de::DeserializeOwned>(
+    record: &Record,
+    column: &str,
+) -> Result<T, wafer_run::WaferError> {
+    let value = record.str_field(column);
+    serde_json::from_value(serde_json::Value::String(value.to_string())).map_err(|_| {
+        wafer_run::WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            format!(
+                "row {} holds {column} {value:?}, which the contract does not define",
+                record.id
+            ),
+        )
+    })
+}
+
+/// [`enum_column`] for a column that is legitimately empty on some rows.
+///
+/// `empty` is a **typed variant**, not a spelling: the `&str` fallback this
+/// replaces let a caller name a default the enum did not define, so a
+/// mis-typed fallback failed at the same place — and with the same message —
+/// as genuinely corrupt data. Only the empty case takes the fallback; a
+/// non-empty value outside the set is still the fault [`enum_column`]
+/// reports.
+pub fn enum_column_or<T: serde::de::DeserializeOwned>(
+    record: &Record,
+    column: &str,
+    empty: T,
+) -> Result<T, wafer_run::WaferError> {
+    if record.str_field(column).is_empty() {
+        return Ok(empty);
+    }
+    enum_column(record, column)
+}
+
+/// An enum as the string it is stored, filtered and published as.
+///
+/// The counterpart of [`enum_column`], for the places a typed value has to
+/// go back out as text: a rendered badge, an `href` segment, a hidden form
+/// field the page's own JavaScript posts back. Serializing is what keeps
+/// those the same spelling the column holds without a per-variant label
+/// table beside the serde one to drift from it — the duplication
+/// `RefundReason::as_str` is the standing example of.
+pub fn wire_str<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        // Unreachable for the unit-variant enums this exists for; a type
+        // that serializes to something else has no single wire spelling to
+        // render and should not be asked for one.
+        _ => String::new(),
+    }
+}
+
 /// Get a field value as a string regardless of whether the DB returned it as string or number.
 pub fn field_as_string(record: &Record, key: &str) -> String {
     match record.data.get(key) {
@@ -294,11 +364,26 @@ pub fn block_request(
     resource: &str,
     original: &wafer_run::Message,
 ) -> wafer_run::Message {
-    let mut msg = wafer_run::Message::new(format!("{action}:{resource}"));
+    // A query string is split off the path and decoded into `req.query.*`,
+    // exactly as `wafer_block::http_codec::request_from_http` does for a real
+    // request. Without this the whole `path?a=b` string landed in
+    // `req.resource`, where `endpoint_match::dispatch` compares it segment by
+    // segment against the route template — so `contexts/{id}/entries?kind=message`
+    // matched no row and the callee answered 404, while `msg.query("kind")`
+    // (which reads `req.query.kind`, never `req.resource`) read `""` anyway.
+    // Both `blocks::llm` calls that carry a filter were affected: the model
+    // history and the chat sidebar came back empty on every request.
+    let (path, query) = resource.split_once('?').unwrap_or((resource, ""));
+    let mut msg = wafer_run::Message::new(format!("{action}:{path}"));
     msg.set_meta("req.action", action);
-    msg.set_meta("req.resource", resource);
+    msg.set_meta("req.resource", path);
     msg.set_meta("http.method", method);
-    msg.set_meta("http.path", resource);
+    msg.set_meta("http.path", path);
+    msg.set_meta("http.raw_query", query);
+    for (name, value) in parse_form_body(query.as_bytes()) {
+        msg.set_meta(format!("http.query.{name}"), value.clone());
+        msg.set_meta(format!("req.query.{name}"), value);
+    }
     forward_auth_meta(&mut msg, original);
     msg
 }
@@ -603,6 +688,118 @@ pub(crate) async fn daily_grouped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Colour {
+        Red,
+        SeaGreen,
+    }
+
+    fn coloured(value: serde_json::Value) -> Record {
+        Record {
+            id: "row-7".to_string(),
+            data: [("colour".to_string(), value)].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn enum_column_reads_the_stored_spelling() {
+        assert_eq!(
+            enum_column::<Colour>(&coloured(serde_json::json!("sea_green")), "colour").unwrap(),
+            Colour::SeaGreen
+        );
+    }
+
+    /// A value outside the set is a data-integrity fault, never a default:
+    /// the message has to name the row, the column and the value, because
+    /// the operator's next move is to go and look at that row.
+    #[test]
+    fn enum_column_names_the_row_the_column_and_the_value() {
+        let err = enum_column::<Colour>(&coloured(serde_json::json!("chartreuse")), "colour")
+            .expect_err("refused");
+        assert_eq!(err.code, wafer_run::ErrorCode::Internal);
+        assert!(err.message.contains("row-7"), "{}", err.message);
+        assert!(err.message.contains("colour"), "{}", err.message);
+        assert!(err.message.contains("chartreuse"), "{}", err.message);
+    }
+
+    /// An absent column and a `NULL` one both read as `""`, which is not a
+    /// variant of anything — so both are the empty case, not a bad value.
+    #[test]
+    fn enum_column_refuses_an_empty_column() {
+        for empty in [serde_json::json!(""), serde_json::json!(null)] {
+            assert!(enum_column::<Colour>(&coloured(empty), "colour").is_err());
+        }
+        assert!(enum_column::<Colour>(
+            &Record {
+                id: "row-7".to_string(),
+                data: HashMap::new(),
+            },
+            "colour"
+        )
+        .is_err());
+    }
+
+    /// The fallback is a typed variant, so a caller cannot supply a default
+    /// the enum does not define — the bug the `&str` fallback it replaces
+    /// made possible.
+    #[test]
+    fn enum_column_or_takes_the_fallback_only_for_an_empty_column() {
+        assert_eq!(
+            enum_column_or(&coloured(serde_json::json!("")), "colour", Colour::Red).unwrap(),
+            Colour::Red
+        );
+        assert_eq!(
+            enum_column_or(
+                &coloured(serde_json::json!("sea_green")),
+                "colour",
+                Colour::Red
+            )
+            .unwrap(),
+            Colour::SeaGreen
+        );
+        assert!(enum_column_or(
+            &coloured(serde_json::json!("chartreuse")),
+            "colour",
+            Colour::Red
+        )
+        .is_err());
+    }
+
+    /// A caller writes a URL, so a query string in one has to reach the
+    /// callee the way it does over HTTP: off the path and into
+    /// `req.query.*`. Leaving it on `req.resource` made the path match no
+    /// route at all — a silent 404 the two callers that used it swallowed.
+    #[test]
+    fn block_request_splits_a_query_string_off_the_path() {
+        let msg = block_request(
+            "retrieve",
+            "GET",
+            "/b/messages/api/contexts/c1/entries?kind=message&q=two+words",
+            &wafer_run::Message::new("http.request"),
+        );
+
+        assert_eq!(msg.path(), "/b/messages/api/contexts/c1/entries");
+        assert_eq!(msg.get_meta("http.path"), msg.path());
+        assert_eq!(msg.query("kind"), "message");
+        assert_eq!(msg.query("q"), "two words");
+        assert_eq!(msg.get_meta("http.query.kind"), "message");
+        assert_eq!(msg.get_meta("http.raw_query"), "kind=message&q=two+words");
+    }
+
+    #[test]
+    fn block_request_without_a_query_string_is_unchanged() {
+        let msg = block_request(
+            "create",
+            "POST",
+            "/b/messages/api/contexts/c1/entries",
+            &wafer_run::Message::new("http.request"),
+        );
+        assert_eq!(msg.path(), "/b/messages/api/contexts/c1/entries");
+        assert_eq!(msg.get_meta("http.raw_query"), "");
+        assert!(msg.query("kind").is_empty());
+    }
 
     #[test]
     fn parse_form_body_decodes_plus_to_space() {

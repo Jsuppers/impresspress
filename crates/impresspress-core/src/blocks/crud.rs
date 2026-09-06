@@ -170,6 +170,29 @@ pub fn path_var<'m>(msg: &'m Message, var: &str, missing: &str) -> Result<&'m st
     Ok(value)
 }
 
+/// A filter query parameter whose values are a closed set, as the enum that
+/// defines them — or the 400 a value outside the set turns into.
+///
+/// An absent parameter is `Ok(None)`, which every caller reads as "no
+/// filter". A value the enum does not define is refused rather than handed
+/// to the database as a literal that matches no row: `?role=bot` and
+/// `?type=cookies` used to answer `200` with an empty page, which reads as
+/// "there are none of those" and is a different sentence from "there is no
+/// such thing". serde's own unknown-variant text names the variants, so the
+/// 400 lists them without any call site spelling them a second time.
+pub fn enum_query<T: DeserializeOwned>(
+    msg: &Message,
+    param: &str,
+) -> Result<Option<T>, OutputStream> {
+    let raw = msg.query(param);
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_value::<T>(serde_json::Value::String(raw.to_string()))
+        .map(Some)
+        .map_err(|e| err_bad_request(&format!("Invalid `{param}` filter: {e}")))
+}
+
 /// The record id for a CRUD route — [`path_var`] on `{id}`, with the message
 /// the great majority of routes want (`"Missing product ID"` for a label of
 /// `"Product"`).

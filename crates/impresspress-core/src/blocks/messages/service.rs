@@ -8,6 +8,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
+use super::contracts::{EntryKind, EntryRole};
 use crate::util::json_map;
 
 /// Table backing `impresspress/messages` contexts (conversations, tasks,
@@ -166,8 +167,8 @@ pub async fn add_entry(
     ctx: &dyn Context,
     owner_id: &str,
     context_id: &str,
-    kind: &str,
-    role: &str,
+    kind: EntryKind,
+    role: EntryRole,
     sender_id: &str,
     content: &str,
     content_type: Option<&str>,
@@ -203,8 +204,8 @@ pub async fn add_entry(
 }
 
 pub struct ListEntriesParams {
-    pub kind: Option<String>,
-    pub role: Option<String>,
+    pub kind: Option<EntryKind>,
+    pub role: Option<EntryRole>,
     pub page_size: i64,
     pub offset: i64,
 }
@@ -220,18 +221,18 @@ pub async fn list_entries(
         value: serde_json::Value::String(context_id.to_string()),
     }];
 
-    if let Some(ref k) = params.kind {
+    if let Some(kind) = params.kind {
         filters.push(Filter {
             field: "kind".to_string(),
             operator: FilterOp::Equal,
-            value: serde_json::Value::String(k.clone()),
+            value: serde_json::json!(kind),
         });
     }
-    if let Some(ref r) = params.role {
+    if let Some(role) = params.role {
         filters.push(Filter {
             field: "role".to_string(),
             operator: FilterOp::Equal,
-            value: serde_json::Value::String(r.clone()),
+            value: serde_json::json!(role),
         });
     }
 

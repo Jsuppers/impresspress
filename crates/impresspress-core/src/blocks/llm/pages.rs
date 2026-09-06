@@ -981,7 +981,7 @@ mod messages_boundary_tests {
     use wafer_run::InputStream;
 
     use super::*;
-    use crate::blocks::llm::routes::test_support::{admin_msg, routed, RecordingCtx};
+    use crate::blocks::llm::routes::test_support::{admin_msg, routed, RecordedCall, RecordingCtx};
 
     /// The chat page reads the messages block's rows through the messages
     /// block, not out of its tables.
@@ -995,20 +995,11 @@ mod messages_boundary_tests {
     /// `wafer-run/database`.
     #[tokio::test]
     async fn the_chat_page_reads_threads_and_entries_through_the_messages_block() {
+        // The entries answer is scripted first because first match wins and
+        // the thread-list path is a prefix of the entries path. (Before
+        // `util::block_request` split the query string off, the thread-list
+        // fragment ended in `?`, which is what kept the two apart.)
         let ctx = RecordingCtx::default()
-            .answering(
-                "/b/messages/api/contexts?",
-                serde_json::json!({
-                    "records": [{
-                        "id": "t1",
-                        "data": {
-                            "title": "Renewal questions",
-                            "updated_at": "2026-09-06T10:00:00Z",
-                        }
-                    }],
-                    "total_count": 1,
-                }),
-            )
             .answering(
                 "/entries",
                 serde_json::json!({
@@ -1018,6 +1009,19 @@ mod messages_boundary_tests {
                             "role": "user",
                             "content": "hello",
                             "created_at": "2026-09-06T10:00:00Z",
+                        }
+                    }],
+                    "total_count": 1,
+                }),
+            )
+            .answering(
+                "/b/messages/api/contexts",
+                serde_json::json!({
+                    "records": [{
+                        "id": "t1",
+                        "data": {
+                            "title": "Renewal questions",
+                            "updated_at": "2026-09-06T10:00:00Z",
                         }
                     }],
                     "total_count": 1,
@@ -1032,19 +1036,31 @@ mod messages_boundary_tests {
         };
 
         let calls = ctx.calls();
-        let to_messages: Vec<&str> = calls
+        let to_messages: Vec<&RecordedCall> = calls
             .iter()
             .filter(|call| call.block_name == "impresspress/messages")
-            .map(|call| call.msg.path())
             .collect();
+        // The path is the *path*, and the filter rides in `req.query.*`, as
+        // it does on a real request. This assertion used to read
+        // `"…/contexts?page_size=50"` — the whole URL sitting in
+        // `req.resource`, where `endpoint_match::dispatch` compares it
+        // segment by segment against the route template. It matched nothing,
+        // so both reads answered 404 and both callers swallowed it: the
+        // sidebar and the model history were empty on every request
+        // (`util::block_request` splits the query off now).
         assert_eq!(
-            to_messages,
+            to_messages
+                .iter()
+                .map(|call| call.msg.path())
+                .collect::<Vec<_>>(),
             vec![
-                "/b/messages/api/contexts?page_size=50",
-                "/b/messages/api/contexts/t1/entries?kind=message",
+                "/b/messages/api/contexts",
+                "/b/messages/api/contexts/t1/entries",
             ],
             "the sidebar and the message pane are both read through the block"
         );
+        assert_eq!(to_messages[0].msg.query("page_size"), "50");
+        assert_eq!(to_messages[1].msg.query("kind"), "message");
         assert!(
             !calls
                 .iter()

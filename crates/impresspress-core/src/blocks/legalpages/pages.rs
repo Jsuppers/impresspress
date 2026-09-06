@@ -6,15 +6,18 @@
 //! - API endpoints reference
 
 use maud::{html, Markup, PreEscaped};
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
+    contracts::{DocumentStatus, DocumentType},
     repo::documents::{self, DocumentRow, NewDraft},
     service,
 };
 use crate::{
-    http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
+    blocks::crud,
+    http::{err_bad_request, ok_json, ResponseBuilder},
     ui::{self, components, icons, settings_form},
+    util::wire_str,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,7 +33,7 @@ use crate::{
 /// whose save then forks the document they could not see.
 async fn find_current_doc(
     ctx: &dyn Context,
-    doc_type: &str,
+    doc_type: DocumentType,
 ) -> Result<Option<DocumentRow>, WaferError> {
     if let Some(draft) = documents::find_latest_draft(ctx, doc_type).await? {
         return Ok(Some(draft));
@@ -42,16 +45,12 @@ async fn find_current_doc(
 // Editor page (Privacy / Terms)
 // ---------------------------------------------------------------------------
 
-pub async fn editor_page(ctx: &dyn Context, msg: &Message, doc_type: &str) -> OutputStream {
+pub async fn editor_page(ctx: &dyn Context, msg: &Message, doc_type: DocumentType) -> OutputStream {
     let doc = match find_current_doc(ctx, doc_type).await {
         Ok(doc) => doc,
-        Err(e) => return err_internal("Failed to load the legal document", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to load the legal document"),
     };
-    let default_title = if doc_type == "privacy" {
-        "Privacy Policy"
-    } else {
-        "Terms of Service"
-    };
+    let default_title = doc_type.title();
 
     let (doc_id, title, content, status, updated_at, version) = match &doc {
         Some(d) => (
@@ -62,11 +61,14 @@ pub async fn editor_page(ctx: &dyn Context, msg: &Message, doc_type: &str) -> Ou
                 d.title.as_str()
             },
             d.content.as_str(),
-            d.status.as_str(),
+            Some(d.status),
             d.updated_at.as_str(),
             d.version,
         ),
-        None => ("", default_title, "", "none", "", 1),
+        // `None` is genuinely "this type has no row yet", which is not one of
+        // the three stored statuses — hence `Option` rather than a fourth
+        // variant nothing can ever be written as.
+        None => ("", default_title, "", None, "", 1),
     };
 
     let page_content = editor_markup_for_test(
@@ -85,29 +87,20 @@ pub async fn editor_page(ctx: &dyn Context, msg: &Message, doc_type: &str) -> Ou
 /// Build the editor markup. Split out from `editor_page` so it can be
 /// unit-tested without a `Context`.
 pub(super) fn editor_markup_for_test(
-    doc_type: &str,
+    doc_type: DocumentType,
     doc_id: &str,
     title: &str,
     content: &str,
-    status: &str,
+    status: Option<DocumentStatus>,
     updated_at: &str,
     version: i64,
 ) -> Markup {
-    let default_title = if doc_type == "privacy" {
-        "Privacy Policy"
-    } else {
-        "Terms of Service"
-    };
-    let badge_class = match status {
-        "published" => "badge-success",
-        "draft" => "badge-warning",
-        _ => "badge-info",
-    };
-    let badge_text = match status {
-        "published" => "Published",
-        "draft" => "Draft",
-        "archived" => "Archived",
-        _ => "No document",
+    let default_title = doc_type.title();
+    let (badge_class, badge_text) = match status {
+        Some(DocumentStatus::Published) => ("badge-success", "Published"),
+        Some(DocumentStatus::Draft) => ("badge-warning", "Draft"),
+        Some(DocumentStatus::Archived) => ("badge-info", "Archived"),
+        None => ("badge-info", "No document"),
     };
 
     html! {
@@ -128,7 +121,7 @@ pub(super) fn editor_markup_for_test(
             }
             div .flex .gap-2 {
                 a .btn .btn--sm .btn--ghost
-                    href={"/b/legalpages/" (doc_type)}
+                    href={"/b/legalpages/" (wire_str(&doc_type))}
                     target="_blank"
                 {
                     "Open public page"
@@ -150,7 +143,7 @@ pub(super) fn editor_markup_for_test(
             placeholder="Document title";
 
         // Hidden fields used by save handler JS
-        input #doc-type type="hidden" value=(doc_type);
+        input #doc-type type="hidden" value=(wire_str(&doc_type));
         input #doc-id type="hidden" value=(doc_id);
         input #doc-version type="hidden" value=(version);
 
@@ -436,7 +429,10 @@ pub async fn endpoints_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 #[derive(serde::Deserialize)]
 struct SaveRequest {
-    doc_type: String,
+    /// Typed, so the editor cannot save a document the block has no route
+    /// to serve. Two other doors onto the same column — the JSON create in
+    /// `mod.rs` and `handle_publish` below — are typed for the same reason.
+    doc_type: DocumentType,
     title: String,
     content: String,
     #[serde(default)]
@@ -467,7 +463,7 @@ pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -
     } else {
         match documents::get(ctx, &body.doc_id).await {
             Ok(found) => found,
-            Err(e) => return err_internal("Failed to load the legal-page document", e),
+            Err(e) => return crud::db_error_internal(e, "Failed to load the legal-page document"),
         }
     };
 
@@ -475,7 +471,7 @@ pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -
     // the live version, so the published text stays untouched until the admin
     // explicitly publishes again.
     let saved = match existing {
-        Some(doc) if doc.status != "published" => {
+        Some(doc) if doc.status != DocumentStatus::Published => {
             documents::update_content(ctx, &doc.id, Some(&body.title), Some(&body.content))
                 .await
                 .map(|row| row.id)
@@ -483,7 +479,7 @@ pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -
         _ => documents::insert_draft(
             ctx,
             NewDraft {
-                doc_type: &body.doc_type,
+                doc_type: body.doc_type,
                 title: &body.title,
                 content: &body.content,
                 created_by: msg.user_id(),
@@ -496,10 +492,10 @@ pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -
     match saved {
         Ok(doc_id) => ok_json(&serde_json::json!({
             "doc_id": doc_id,
-            "status": "draft",
+            "status": DocumentStatus::Draft,
             "message": "Draft saved"
         })),
-        Err(e) => err_internal("Failed to save legal-page draft", e),
+        Err(e) => crud::db_error_internal(e, "Failed to save legal-page draft"),
     }
 }
 
@@ -519,7 +515,7 @@ pub async fn handle_publish(ctx: &dyn Context, msg: &Message, input: InputStream
     let published = match service::publish_document(
         ctx,
         service::PublishRequest {
-            doc_type: &body.doc_type,
+            doc_type: body.doc_type,
             doc_id: &body.doc_id,
             title: Some(&body.title),
             content: Some(&body.content),
@@ -530,13 +526,12 @@ pub async fn handle_publish(ctx: &dyn Context, msg: &Message, input: InputStream
     .await
     {
         Ok(p) => p,
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Document not found"),
-        Err(e) => return err_internal("Failed to publish legal page", e),
+        Err(e) => return crud::db_error(e, "Document not found", "Failed to publish legal page"),
     };
 
     ok_json(&serde_json::json!({
         "doc_id": published.row.id,
-        "status": "published",
+        "status": DocumentStatus::Published,
         "version": published.version,
         "message": format!("Published as v{}", published.version)
     }))

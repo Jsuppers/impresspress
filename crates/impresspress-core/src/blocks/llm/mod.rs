@@ -18,7 +18,10 @@ use wafer_run::{
 
 use self::provider_admin::ProviderAdmin;
 use crate::{
-    blocks::crud,
+    blocks::{
+        crud,
+        messages::contracts::{EntryKind, EntryRole},
+    },
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
 };
@@ -309,18 +312,23 @@ pub(super) async fn messages_list_contexts(
 }
 
 /// Call the messages block to create an entry in a context.
+///
+/// `role` is the messages block's own [`EntryRole`], not a string: the entry
+/// this writes is replayed to the model by
+/// `routes::chat::history_to_messages`, and a role neither side agreed on
+/// was replayed as the *user* (B20).
 pub(super) async fn messages_create(
     ctx: &dyn Context,
     original_msg: &Message,
     context_id: &str,
-    role: &str,
+    role: EntryRole,
     content: &str,
 ) -> Option<serde_json::Value> {
     // Serializing a plain `{kind, role, content}` map can only fail on a JSON
     // serializer bug. Surface it via tracing rather than sending an empty
     // body to the messages block, which would 400 with a confusing error.
     let body = match serde_json::to_vec(&serde_json::json!({
-        "kind": "message",
+        "kind": EntryKind::Message,
         "role": role,
         "content": content,
     })) {
@@ -432,10 +440,7 @@ impl LlmBlock {
         };
         match repo::settings::delete(ctx, &id).await {
             Ok(()) => ok_json(&contracts::ConfigDeleteResponse { deleted: true }),
-            Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-                err_not_found("Override not found")
-            }
-            Err(e) => err_internal("Database error", e),
+            Err(e) => crud::db_error(e, "Override not found", "Database error"),
         }
     }
 

@@ -17,8 +17,8 @@ use wafer_block::{
 use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, WaferError};
 
-use super::Page;
-use crate::util::RecordExt;
+use super::{super::contracts::ObjectStatus, Page};
+use crate::util::{enum_column_or, RecordExt};
 
 /// Object metadata table — one row per uploaded file (sibling of the raw
 /// storage blob in `wafer-run/storage`). Tracks size, content type, status,
@@ -37,10 +37,10 @@ pub struct ObjectRow {
     /// toward the quota rather than reading as zero.
     pub size: i64,
     pub content_type: String,
-    /// `pending` while the storage upload is in flight, `complete` after.
+    /// `Pending` while the storage upload is in flight, `Complete` after.
     /// Quota accounting counts both; user-facing search and admin stats see
-    /// only `complete`.
-    pub status: String,
+    /// only `Complete`.
+    pub status: ObjectStatus,
     pub uploaded_by: String,
     /// When the upload was reserved — the timestamp the object browser
     /// renders as "modified", and the one `delete_stale_pending` compares.
@@ -51,30 +51,43 @@ pub struct ObjectRow {
 
 impl ObjectRow {
     /// The one decode of an object row.
-    pub fn from_record(rec: &Record) -> Self {
-        Self {
+    ///
+    /// Fallible since `status` became a type: a row in neither `Pending` nor
+    /// `Complete` is counted by neither the quota sum nor the listings, so
+    /// it is reported naming the row rather than carried silently. An
+    /// *empty* column reads as `Complete`, which is exactly what the
+    /// column's own `DEFAULT 'complete'`
+    /// (`migrations/001_initial_schema.sqlite.sql`) gives a row inserted
+    /// without it; every production insert names the value.
+    pub fn from_record(rec: &Record) -> Result<Self, WaferError> {
+        Ok(Self {
             id: rec.id.clone(),
             bucket: rec.str_field("bucket").to_string(),
             key: rec.str_field("key").to_string(),
             size: rec.i64_field("size"),
             content_type: rec.str_field("content_type").to_string(),
-            status: rec.str_field("status").to_string(),
+            status: enum_column_or(rec, "status", ObjectStatus::Complete)?,
             uploaded_by: rec.str_field("uploaded_by").to_string(),
             uploaded_at: rec.str_field("uploaded_at").to_string(),
             created_at: rec.str_field("created_at").to_string(),
             updated_at: rec.str_field("updated_at").to_string(),
-        }
+        })
     }
 }
 
-/// Filter matching only fully uploaded rows (`status = 'complete'`),
-/// excluding in-flight `pending` reservations.
+/// Filter matching only fully uploaded rows, excluding in-flight
+/// [`ObjectStatus::Pending`] reservations.
 fn complete_filter() -> [Filter; 1] {
-    [Filter {
+    [status_is(ObjectStatus::Complete)]
+}
+
+/// An equality filter on the `status` column.
+fn status_is(status: ObjectStatus) -> Filter {
+    Filter {
         field: "status".to_string(),
         operator: FilterOp::Equal,
-        value: serde_json::Value::String("complete".to_string()),
-    }]
+        value: serde_json::json!(status),
+    }
 }
 
 /// Filter matching all objects uploaded by `user_id` (the rows that count
@@ -130,19 +143,17 @@ pub async fn insert_pending(
         "key": key,
         "size": size,
         "content_type": content_type,
-        "status": "pending",
+        "status": ObjectStatus::Pending,
         "uploaded_by": uploaded_by,
         "uploaded_at": crate::util::now_rfc3339(),
     }));
-    db::create(ctx, TABLE, data)
-        .await
-        .map(|r| ObjectRow::from_record(&r))
+    ObjectRow::from_record(&db::create(ctx, TABLE, data).await?)
 }
 
-/// Flip a `pending` row to `status = 'complete'` after its storage upload
-/// succeeded.
+/// Flip a [`ObjectStatus::Pending`] row to [`ObjectStatus::Complete`] after
+/// its storage upload succeeded.
 pub async fn mark_complete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
-    let data = crate::util::json_map(serde_json::json!({ "status": "complete" }));
+    let data = crate::util::json_map(serde_json::json!({ "status": ObjectStatus::Complete }));
     db::update(ctx, TABLE, id, data).await.map(|_| ())
 }
 
@@ -205,11 +216,7 @@ pub async fn delete_stale_pending(
             operator: FilterOp::Equal,
             value: serde_json::Value::String(user_id.to_string()),
         },
-        Filter {
-            field: "status".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::Value::String("pending".to_string()),
-        },
+        status_is(ObjectStatus::Pending),
         Filter {
             field: "uploaded_at".to_string(),
             operator: FilterOp::LessThan,
@@ -258,10 +265,7 @@ pub async fn search_completed(
         skip_count: false,
         ..Default::default()
     };
-    Ok(Page::decode(
-        db::list(ctx, TABLE, &opts).await?,
-        ObjectRow::from_record,
-    ))
+    Page::try_decode(db::list(ctx, TABLE, &opts).await?, ObjectRow::from_record)
 }
 
 /// List up to `limit` object rows in `bucket`, sorted by `key` ascending
@@ -284,10 +288,7 @@ pub async fn list_for_bucket(
         limit,
         ..Default::default()
     };
-    Ok(Page::decode(
-        db::list(ctx, TABLE, &opts).await?,
-        ObjectRow::from_record,
-    ))
+    Page::try_decode(db::list(ctx, TABLE, &opts).await?, ObjectRow::from_record)
 }
 
 /// Object counts per bucket for the given bucket names, via a single
@@ -358,16 +359,17 @@ pub async fn seed(
     ctx: &dyn Context,
     data: HashMap<String, serde_json::Value>,
 ) -> Result<ObjectRow, WaferError> {
-    db::create(ctx, TABLE, data)
-        .await
-        .map(|r| ObjectRow::from_record(&r))
+    ObjectRow::from_record(&db::create(ctx, TABLE, data).await?)
 }
 
 /// Test helper: every object row, unfiltered.
 #[cfg(test)]
 pub async fn list_all(ctx: &dyn Context) -> Result<Vec<ObjectRow>, WaferError> {
-    let records = db::list_all(ctx, TABLE, vec![]).await?;
-    Ok(records.iter().map(ObjectRow::from_record).collect())
+    db::list_all(ctx, TABLE, vec![])
+        .await?
+        .iter()
+        .map(ObjectRow::from_record)
+        .collect()
 }
 
 #[cfg(test)]
@@ -393,12 +395,13 @@ mod tests {
             ("key", json!("nested/a.png")),
             ("size", json!(1024)),
             ("content_type", json!("image/png")),
-            ("status", json!("complete")),
+            ("status", json!(ObjectStatus::Complete)),
             ("uploaded_by", json!("alice")),
             ("uploaded_at", json!("2026-05-06T10:00:00Z")),
             ("created_at", json!("2026-05-06T10:00:00Z")),
             ("updated_at", json!("2026-05-06T10:00:01Z")),
-        ]));
+        ]))
+        .expect("the row decodes");
         assert_eq!(
             row,
             ObjectRow {
@@ -407,7 +410,7 @@ mod tests {
                 key: "nested/a.png".to_string(),
                 size: 1024,
                 content_type: "image/png".to_string(),
-                status: "complete".to_string(),
+                status: ObjectStatus::Complete,
                 uploaded_by: "alice".to_string(),
                 uploaded_at: "2026-05-06T10:00:00Z".to_string(),
                 created_at: "2026-05-06T10:00:00Z".to_string(),
@@ -424,13 +427,48 @@ mod tests {
     #[test]
     fn from_record_reads_a_text_stored_size() {
         assert_eq!(
-            ObjectRow::from_record(&record(&[("size", json!("2048"))])).size,
+            ObjectRow::from_record(&record(&[("size", json!("2048"))]))
+                .expect("the row decodes")
+                .size,
             2048
         );
         assert_eq!(
-            ObjectRow::from_record(&record(&[("size", json!(2048))])).size,
+            ObjectRow::from_record(&record(&[("size", json!(2048))]))
+                .expect("the row decodes")
+                .size,
             2048
         );
-        assert_eq!(ObjectRow::from_record(&record(&[])).size, 0);
+        assert_eq!(
+            ObjectRow::from_record(&record(&[]))
+                .expect("the row decodes")
+                .size,
+            0
+        );
+    }
+
+    /// `status` decides whether an object is a completed upload or an
+    /// in-flight reservation — quota counts both, search and the admin stats
+    /// count only `complete`. A row holding anything else belongs to neither
+    /// set, so it is a decode failure naming the row, not a value the block
+    /// carries around and compares against two literals.
+    #[test]
+    fn a_status_outside_the_set_is_refused_and_names_the_row() {
+        for stored in ["complete", "pending"] {
+            assert!(ObjectRow::from_record(&record(&[("status", json!(stored))])).is_ok());
+        }
+        // An unset column is what the DDL's `DEFAULT 'complete'` produces.
+        assert_eq!(
+            ObjectRow::from_record(&record(&[]))
+                .expect("an unset status decodes")
+                .status,
+            ObjectStatus::Complete
+        );
+
+        let err = ObjectRow::from_record(&record(&[("status", json!("half"))]))
+            .expect_err("a status outside the set must not decode");
+        assert_eq!(err.code, wafer_run::ErrorCode::Internal);
+        assert!(err.message.contains("o1"), "{}", err.message);
+        assert!(err.message.contains("status"), "{}", err.message);
+        assert!(err.message.contains("half"), "{}", err.message);
     }
 }

@@ -7,7 +7,7 @@
 //! primitives on that verified row.
 
 use wafer_core::clients::database::Record;
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{AddEntryRequest, CreateContextRequest, UpdateContextRequest},
@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, ok_json},
 };
 
 /// Convert empty string to None (msg.query() returns "" for missing params).
@@ -67,7 +67,7 @@ pub async fn list_contexts(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     match service::list_contexts(ctx, &params).await {
         Ok(result) => ok_json(&result),
-        Err(e) => err_internal("list_contexts failed", e),
+        Err(e) => crud::db_error_internal(e, "list_contexts failed"),
     }
 }
 
@@ -91,7 +91,7 @@ pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream
     .await
     {
         Ok(record) => ok_json(&record),
-        Err(e) => err_internal("create_context failed", e),
+        Err(e) => crud::db_error_internal(e, "create_context failed"),
     }
 }
 
@@ -114,8 +114,7 @@ pub async fn update_context(ctx: &dyn Context, msg: &Message, input: InputStream
     };
     match service::update_context(ctx, &id, body.status, body.title, body.metadata).await {
         Ok(record) => ok_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Context not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Context not found", "Database error"),
     }
 }
 
@@ -126,8 +125,7 @@ pub async fn delete_context(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     match service::delete_context(ctx, &id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Context not found"),
-        Err(e) => err_internal("delete_context failed", e),
+        Err(e) => crud::db_error(e, "Context not found", "delete_context failed"),
     }
 }
 
@@ -142,14 +140,20 @@ pub async fn list_entries(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let (_, page_size, offset) = msg.pagination_params(100);
     let params = ListEntriesParams {
-        kind: non_empty(msg.query("kind")),
-        role: non_empty(msg.query("role")),
+        kind: match crud::enum_query(msg, "kind") {
+            Ok(kind) => kind,
+            Err(resp) => return resp,
+        },
+        role: match crud::enum_query(msg, "role") {
+            Ok(role) => role,
+            Err(resp) => return resp,
+        },
         page_size: page_size as i64,
         offset: offset as i64,
     };
     match service::list_entries(ctx, &context_id, &params).await {
         Ok(result) => ok_json(&result),
-        Err(e) => err_internal("list_entries failed", e),
+        Err(e) => crud::db_error_internal(e, "list_entries failed"),
     }
 }
 
@@ -167,8 +171,8 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
         ctx,
         msg.user_id(), // owner derived server-side, never from body
         &context_id,
-        &body.kind,
-        &body.role,
+        body.kind,
+        body.role,
         &body.sender_id,
         &body.content,
         body.content_type.as_deref(),
@@ -177,7 +181,7 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
     .await
     {
         Ok(record) => ok_json(&record),
-        Err(e) => err_internal("add_entry failed", e),
+        Err(e) => crud::db_error_internal(e, "add_entry failed"),
     }
 }
 
@@ -212,27 +216,12 @@ mod tests {
     use super::*;
     use crate::{blocks::messages::MessagesBlock, test_support::TestContext};
 
-    /// Build a `TestContext` with admin + auth + messages migrations applied.
-    /// No `TestContext::with_messages()` exists yet (only files/products/
-    /// userportal/vector have one) — this applies the block's migrations the
-    /// same way those constructors do: through the production-gated
-    /// `migration_helper::apply_migrations` path, after `with_auth()` so the
-    /// `impresspress__admin__block_settings` tracking table exists first.
+    /// Build a `TestContext` with admin + auth + messages migrations
+    /// applied, and this block registered under its own name — see
+    /// `blocks::messages::test_support::ctx_with_messages`, which `blocks::llm`
+    /// shares.
     async fn messages_ctx() -> TestContext {
-        let ctx = TestContext::with_auth().await;
-        let sqlite: Vec<&str> = crate::blocks::messages::migrations::SQLITE_MIGRATIONS
-            .iter()
-            .map(|(_, sql)| *sql)
-            .collect();
-        crate::migration_helper::apply_migrations(
-            &ctx,
-            "impresspress/messages",
-            &sqlite,
-            crate::blocks::messages::migrations::POSTGRES_MIGRATIONS,
-        )
-        .await
-        .expect("apply messages migrations in test fixture");
-        ctx
+        crate::blocks::messages::test_support::ctx_with_messages().await
     }
 
     /// Build a request `Message` + `InputStream`. Mirrors
@@ -553,6 +542,138 @@ mod tests {
             assert_eq!(
                 entry["data"]["role"], role,
                 "role {role} must be accepted and round-trip"
+            );
+        }
+    }
+
+    /// B20's storage half. The composer offered `agent`, `blocks::llm` wrote
+    /// `assistant`, and nothing reconciled them — so an entry posted as
+    /// `agent` was replayed to the model as the *user's* own turn.
+    ///
+    /// `agent` is still accepted, because the rows and the clients using it
+    /// are real, but it is an alias: the column holds `assistant`. The other
+    /// half — that the history built from this column carries an assistant
+    /// turn — is `blocks::llm::routes::chat`'s
+    /// `an_entry_posted_as_agent_reaches_the_model_as_an_assistant_turn`.
+    #[tokio::test]
+    async fn an_agent_role_is_stored_as_the_assistant() {
+        let ctx = messages_ctx().await;
+        let created = create_as(&ctx, "user-a", serde_json::json!({"type": "conversation"})).await;
+        let cid = created["id"].as_str().expect("id").to_string();
+
+        let entry = crate::test_support::output_json(
+            add_entry_as(
+                &ctx,
+                "user-a",
+                &cid,
+                serde_json::json!({"role": "agent", "content": "I did the thing"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            entry["data"]["role"], "assistant",
+            "`agent` is an alias of `assistant`, and `assistant` is the \
+             spelling the column holds"
+        );
+    }
+
+    /// Nothing validated `role` before it was a type: `{"role":"bot"}` was
+    /// stored verbatim, and every later reader had to guess what it meant.
+    #[tokio::test]
+    async fn a_role_outside_the_set_is_refused() {
+        let ctx = messages_ctx().await;
+        let created = create_as(&ctx, "user-a", serde_json::json!({"type": "conversation"})).await;
+        let cid = created["id"].as_str().expect("id").to_string();
+
+        let out = add_entry_as(
+            &ctx,
+            "user-a",
+            &cid,
+            serde_json::json!({"role": "bot", "content": "x"}),
+        )
+        .await;
+        assert_eq!(status_of(out).await, 400);
+
+        let out = add_entry_as(
+            &ctx,
+            "user-a",
+            &cid,
+            serde_json::json!({"kind": "telegram", "content": "x"}),
+        )
+        .await;
+        assert_eq!(status_of(out).await, 400);
+    }
+
+    /// `role`'s old default was `''`, and an empty role is invisible to the
+    /// model — `llm::routes::chat::history_to_messages` drops it. So a body
+    /// carrying only `content` posted a message the conversation it was
+    /// posted into could not see. It is a user turn now.
+    #[tokio::test]
+    async fn an_omitted_role_stores_a_user_turn() {
+        let ctx = messages_ctx().await;
+        let created = create_as(&ctx, "user-a", serde_json::json!({"type": "conversation"})).await;
+        let cid = created["id"].as_str().expect("id").to_string();
+
+        let entry = crate::test_support::output_json(
+            add_entry_as(&ctx, "user-a", &cid, serde_json::json!({"content": "hi"})).await,
+        )
+        .await;
+        assert_eq!(entry["data"]["role"], "user");
+        assert_eq!(
+            entry["data"]["kind"], "message",
+            "the kind default is unchanged — it is the column's own DEFAULT"
+        );
+    }
+
+    /// A filter value outside the set used to reach the database as a
+    /// literal that matched no row, so `?kind=nope` answered `200` with an
+    /// empty page — "this context has no entries", which is a different
+    /// sentence from "there is no such kind".
+    #[tokio::test]
+    async fn a_filter_value_outside_the_set_is_a_400_not_an_empty_page() {
+        let ctx = messages_ctx().await;
+        let created = create_as(&ctx, "user-a", serde_json::json!({"type": "conversation"})).await;
+        let cid = created["id"].as_str().expect("id").to_string();
+        add_entry_as(
+            &ctx,
+            "user-a",
+            &cid,
+            serde_json::json!({"role": "user", "content": "hi"}),
+        )
+        .await;
+
+        let listing = |filter: Option<(&'static str, &'static str)>| {
+            let (mut msg, input) = request(
+                "retrieve",
+                &format!("/b/messages/api/contexts/{cid}/entries"),
+                "user-a",
+                serde_json::json!({}),
+            );
+            if let Some((name, value)) = filter {
+                msg.set_meta(format!("req.query.{name}"), value);
+            }
+            (msg, input)
+        };
+
+        for (name, value) in [("kind", "nope"), ("role", "bot")] {
+            let (msg, input) = listing(Some((name, value)));
+            assert_eq!(
+                status_of(dispatch(&ctx, msg, input).await).await,
+                400,
+                "?{name}={value} must be refused"
+            );
+        }
+
+        // The spellings the enum defines still filter, and no filter still
+        // lists.
+        for filter in [None, Some(("kind", "message")), Some(("role", "user"))] {
+            let (msg, input) = listing(filter);
+            let listed = crate::test_support::output_json(dispatch(&ctx, msg, input).await).await;
+            assert_eq!(
+                listed["records"].as_array().expect("records").len(),
+                1,
+                "filter {filter:?} must still match the stored entry"
             );
         }
     }

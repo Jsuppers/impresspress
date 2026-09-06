@@ -15,13 +15,16 @@
 
 use wafer_run::{context::Context, WaferError};
 
-use super::repo::documents::{self, DocumentRow, NewPublished, PublishedContent};
+use super::{
+    contracts::DocumentType,
+    repo::documents::{self, DocumentRow, NewPublished, PublishedContent},
+};
 
 /// Inputs for [`publish_document`].
 pub(super) struct PublishRequest<'a> {
-    /// Document type (`terms` / `privacy`); drives version computation and
-    /// which previously published siblings get archived.
-    pub doc_type: &'a str,
+    /// Which document this publishes; drives version computation and which
+    /// previously published siblings get archived.
+    pub doc_type: DocumentType,
     /// Existing document to publish; empty string = create a new one.
     pub doc_id: &'a str,
     /// New title from the editor; `None` keeps the stored value
@@ -106,7 +109,7 @@ pub(super) async fn publish_document(
 /// (the document that was just published).
 async fn archive_published(
     ctx: &dyn Context,
-    doc_type: &str,
+    doc_type: DocumentType,
     except_id: &str,
 ) -> Result<(), WaferError> {
     for row in documents::list_published(ctx, doc_type).await? {
@@ -121,20 +124,34 @@ async fn archive_published(
 #[cfg(test)]
 mod tests {
     use super::{
-        super::{seed_doc, stored, test_ctx},
+        super::{contracts::DocumentStatus, seed_doc, stored, test_ctx},
         *,
     };
 
     #[tokio::test]
     async fn publish_existing_doc_auto_increments_and_archives_previous() {
         let ctx = test_ctx().await;
-        let live = seed_doc(&ctx, "terms", "Old Terms", "published", 3).await;
-        let draft = seed_doc(&ctx, "terms", "New Terms", "draft", 1).await;
+        let live = seed_doc(
+            &ctx,
+            DocumentType::Terms,
+            "Old Terms",
+            DocumentStatus::Published,
+            3,
+        )
+        .await;
+        let draft = seed_doc(
+            &ctx,
+            DocumentType::Terms,
+            "New Terms",
+            DocumentStatus::Draft,
+            1,
+        )
+        .await;
 
         let published = publish_document(
             &ctx,
             PublishRequest {
-                doc_type: "terms",
+                doc_type: DocumentType::Terms,
                 doc_id: &draft.id,
                 title: None,
                 content: None,
@@ -152,24 +169,34 @@ mod tests {
         // The just-published doc must NOT be archived (except_id guard) and
         // keeps its stored title (JSON publish path passes None).
         let now_live = stored(&ctx, &draft.id).await;
-        assert_eq!(now_live.status, "published");
+        assert_eq!(now_live.status, DocumentStatus::Published);
         assert_eq!(now_live.version, 4);
         assert_eq!(now_live.title, "New Terms");
         assert!(now_live.published_at.is_some());
 
         // The previously published sibling is archived.
-        assert_eq!(stored(&ctx, &live.id).await.status, "archived");
+        assert_eq!(
+            stored(&ctx, &live.id).await.status,
+            DocumentStatus::Archived
+        );
     }
 
     #[tokio::test]
     async fn publish_new_doc_creates_published_and_archives_previous() {
         let ctx = test_ctx().await;
-        let live = seed_doc(&ctx, "privacy", "Old Policy", "published", 1).await;
+        let live = seed_doc(
+            &ctx,
+            DocumentType::Privacy,
+            "Old Policy",
+            DocumentStatus::Published,
+            1,
+        )
+        .await;
 
         let published = publish_document(
             &ctx,
             PublishRequest {
-                doc_type: "privacy",
+                doc_type: DocumentType::Privacy,
                 doc_id: "",
                 title: Some("New Policy"),
                 content: Some("fresh body"),
@@ -184,12 +211,15 @@ mod tests {
         assert_ne!(published.row.id, live.id);
 
         let created = stored(&ctx, &published.row.id).await;
-        assert_eq!(created.status, "published");
+        assert_eq!(created.status, DocumentStatus::Published);
         assert_eq!(created.title, "New Policy");
         assert_eq!(created.created_by, "admin_1");
         assert!(created.published_at.is_some());
 
-        assert_eq!(stored(&ctx, &live.id).await.status, "archived");
+        assert_eq!(
+            stored(&ctx, &live.id).await.status,
+            DocumentStatus::Archived
+        );
     }
 
     /// Both create surfaces — the JSON API (`POST /b/legalpages/api/documents`)
@@ -234,7 +264,7 @@ mod tests {
         let api_doc = stored(&ctx, &api_id).await;
         let save_doc = stored(&ctx, &save_id).await;
         for doc in [&api_doc, &save_doc] {
-            assert_eq!(doc.status, "draft");
+            assert_eq!(doc.status, DocumentStatus::Draft);
             assert_eq!(doc.version, 1);
             assert_eq!(doc.created_by, "admin_1");
             assert_eq!(doc.published_at, None);
@@ -261,13 +291,27 @@ mod tests {
     #[tokio::test]
     async fn publish_respects_explicit_version_and_other_doc_types_untouched() {
         let ctx = test_ctx().await;
-        let other_type = seed_doc(&ctx, "terms", "Terms", "published", 1).await;
-        let draft = seed_doc(&ctx, "privacy", "Policy", "draft", 1).await;
+        let other_type = seed_doc(
+            &ctx,
+            DocumentType::Terms,
+            "Terms",
+            DocumentStatus::Published,
+            1,
+        )
+        .await;
+        let draft = seed_doc(
+            &ctx,
+            DocumentType::Privacy,
+            "Policy",
+            DocumentStatus::Draft,
+            1,
+        )
+        .await;
 
         let published = publish_document(
             &ctx,
             PublishRequest {
-                doc_type: "privacy",
+                doc_type: DocumentType::Privacy,
                 doc_id: &draft.id,
                 title: Some("Policy"),
                 content: Some("body"),
@@ -281,6 +325,9 @@ mod tests {
         assert_eq!(published.version, 7);
 
         // Archiving is scoped to the published doc_type.
-        assert_eq!(stored(&ctx, &other_type.id).await.status, "published");
+        assert_eq!(
+            stored(&ctx, &other_type.id).await.status,
+            DocumentStatus::Published
+        );
     }
 }
