@@ -294,21 +294,28 @@ impl RateLimitHeaders {
 }
 
 /// Return a 429 Too Many Requests response with a `Retry-After` header.
+///
+/// The one refusal in this repo that hand-builds its `WaferError`, because it
+/// has to attach `Retry-After` as response meta. That is why it carried the
+/// `"[rate_limit_exceeded] "` message prefix long after `errors.rs`'s doc
+/// comment declared the prefix gone: without a detail code, the prefix was
+/// this response's only machine-readable identity, and the SDK reads
+/// `body.code` (`packages/impresspress-js/src/http-client.ts`). It now sets
+/// the detail code the same way [`super::errors::error_response`] does, so
+/// the message is human-only and the code travels as `error.code` meta.
 pub fn rate_limited_response(retry_after: u64) -> OutputStream {
     use super::errors::ErrorCode;
-    let wafer_code = super::errors::impresspress_error_code_to_wafer(ErrorCode::RateLimitExceeded);
-    let full_message = format!(
-        "[{}] Too many requests — try again later",
-        ErrorCode::RateLimitExceeded.as_str()
-    );
-    OutputStream::error(wafer_run::WaferError {
-        code: wafer_code,
-        message: full_message,
-        meta: vec![wafer_run::MetaEntry {
-            key: "resp.header.Retry-After".to_string(),
-            value: retry_after.to_string(),
-        }],
-    })
+    let code = ErrorCode::RateLimitExceeded;
+    let mut error = wafer_run::WaferError::new(
+        super::errors::impresspress_error_code_to_wafer(code),
+        code.default_message(),
+    )
+    .with_detail_code(code.as_str());
+    error.meta.push(wafer_run::MetaEntry {
+        key: "resp.header.Retry-After".to_string(),
+        value: retry_after.to_string(),
+    });
+    OutputStream::error(error)
 }
 
 /// Outcome of a rate-limit check.
@@ -769,3 +776,47 @@ mod tests {
 // decision logic in `decide_rate_limit` above, which `rate_limit_counts_when_
 // upsert_succeeds` now covers for the success path (mirroring the existing
 // `rate_limit_decision_is_explicit_when_upsert_fails` for the failure path).
+
+#[cfg(test)]
+mod rate_limited_response_tests {
+    use super::*;
+
+    /// The `"[code] message"` prefix `errors.rs`'s doc comment calls gone
+    /// survived here, because this response hand-builds its `WaferError` to
+    /// attach `Retry-After` and so carried no `error.code` detail meta — the
+    /// prefix was its only machine-readable code. It now carries the detail
+    /// code every other refusal in this repo carries, and the message is
+    /// human-only.
+    #[tokio::test]
+    async fn the_429_carries_a_detail_code_and_no_bracket_prefix() {
+        let out = rate_limited_response(42);
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                assert_eq!(
+                    e.detail_code(),
+                    Some(super::super::errors::ErrorCode::RateLimitExceeded.as_str())
+                );
+                assert!(
+                    !e.message.starts_with('['),
+                    "message must not carry the old bracket-code prefix, got {:?}",
+                    e.message
+                );
+                assert_eq!(wafer_block::http_codec::resolve_error_status(&e), 429);
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_429_still_carries_retry_after() {
+        let headers = wafer_block::http_codec::collect_http_response(rate_limited_response(42))
+            .await
+            .headers;
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("Retry-After") && v == "42"),
+            "Retry-After must survive, got {headers:?}"
+        );
+    }
+}
