@@ -14,14 +14,28 @@ use crate::{
 ///
 /// Internal sub-tabs use `?subtab=database|all` to avoid colliding with
 /// the parent path-segment tab system (`/settings/{tab}`).
-pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
+///
+/// Returns `Err` when the custom-grant read behind either subtab fails.
+/// "No custom grants" reads as "no one has been given extra access", which
+/// is the most misleading sentence this admin surface can print, so the
+/// parent renders the error page instead of it.
+pub async fn settings_body(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
     let subtab = msg.query("subtab");
     let active_subtab = match subtab {
         "database" => "database",
         _ => "all",
     };
 
-    html! {
+    let content = if active_subtab == "database" {
+        permissions_database_tab(ctx, msg).await?
+    } else {
+        permissions_all_tab(ctx, msg).await?
+    };
+
+    Ok(html! {
         (components::tab_navigation(vec![
             components::Tab {
                 active: active_subtab == "all",
@@ -38,13 +52,9 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
         ]))
 
         div #permissions-content {
-            @if active_subtab == "database" {
-                (permissions_database_tab(ctx, msg).await)
-            } @else {
-                (permissions_all_tab(ctx, msg).await)
-            }
+            (content)
         }
-    }
+    })
 }
 
 /// Full settings page for permissions — used by WRAP grant mutation handlers
@@ -122,14 +132,17 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
     }
 }
 
-pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
-    let grants = wrap_grants::list(ctx).await.unwrap_or_default();
+pub(crate) async fn grants_custom_tab(
+    ctx: &dyn Context,
+    _msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
+    let grants = wrap_grants::list(ctx).await?;
 
     // Collect registered block names for the grantee dropdown
     let blocks = ctx.registered_blocks();
     let block_names: Vec<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
 
-    html! {
+    Ok(html! {
         div .card .mt-4 {
             div .card-header .flex .items-center .justify-between {
                 div {
@@ -358,7 +371,7 @@ pub(crate) async fn grants_custom_tab(ctx: &dyn Context, _msg: &Message) -> Mark
                 }
             }
         }))
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +415,10 @@ struct PermRow {
 
 /// "All" tab: combines code-declared and custom WRAP grants into one
 /// unified table with human-readable descriptions.
-async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
+async fn permissions_all_tab(
+    ctx: &dyn Context,
+    _msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
     let blocks = ctx.registered_blocks();
 
     // 1. Code grants (from block declarations)
@@ -435,8 +451,10 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
         }
     }
 
-    // 2. Custom DB grants
-    let custom_grants = wrap_grants::list(ctx).await.unwrap_or_default();
+    // 2. Custom DB grants. An unreadable grant table used to be dropped here
+    // and the page then rendered only the code-declared rows, so a custom
+    // grant an operator was auditing simply was not on the list.
+    let custom_grants = wrap_grants::list(ctx).await?;
     for grant in &custom_grants {
         let grantee = grant.grantee.as_str();
         let resource = grant.resource.as_str();
@@ -474,7 +492,7 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
             .then_with(|| a.sort_key.cmp(&b.sort_key))
     });
 
-    html! {
+    Ok(html! {
         div .card .mt-4 {
             div .card__body {
                 @if all_rows.is_empty() {
@@ -519,13 +537,50 @@ async fn permissions_all_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
                 }
             }
         }
-    }
+    })
 }
 
 /// "Database & Config" tab: wraps the existing grants_code_tab and grants_custom_tab.
-async fn permissions_database_tab(ctx: &dyn Context, msg: &Message) -> Markup {
-    html! {
-        (grants_custom_tab(ctx, msg).await)
+async fn permissions_database_tab(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
+    let custom = grants_custom_tab(ctx, msg).await?;
+    Ok(html! {
+        (custom)
         (grants_code_tab(ctx))
+    })
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! Both permissions subtabs read the custom WRAP grants, and both used to
+    //! render an unreadable grant table as "no one has extra access" — the
+    //! single most misleading empty state on the admin surface.
+
+    use crate::{
+        blocks::admin::pages::settings::settings_page,
+        test_support::{admin_msg, output_http_status, TestContext},
+    };
+
+    #[tokio::test]
+    async fn a_failing_grant_read_renders_the_error_page_not_no_custom_grants() {
+        let ctx = TestContext::with_admin().await.break_reads();
+        let msg = admin_msg("retrieve", "/b/admin/settings/permissions");
+        assert_eq!(
+            output_http_status(settings_page(&ctx, &msg, "permissions").await).await,
+            500
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_grant_read_fails_the_database_subtab_too() {
+        let ctx = TestContext::with_admin().await.break_reads();
+        let mut msg = admin_msg("retrieve", "/b/admin/settings/permissions");
+        msg.set_meta("req.query.subtab", "database");
+        assert_eq!(
+            output_http_status(settings_page(&ctx, &msg, "permissions").await).await,
+            500
+        );
     }
 }

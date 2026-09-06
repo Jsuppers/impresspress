@@ -56,13 +56,25 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
         ),
     ];
 
+    // Two of the four tab bodies read the database. Both of them used to
+    // swallow a failure into the same empty table a healthy deployment with
+    // nothing configured renders — "no inbound requests", "no custom grants"
+    // — so those two hand back a `Result` and the whole page fails instead.
+    // `email` and `variables` read only config and are infallible here.
     let body_markup = match active {
         "network" => network::settings_body(ctx, msg).await,
-        "variables" => variables::settings_body(ctx, msg).await,
+        "variables" => Ok(variables::settings_body(ctx, msg).await),
         "permissions" => permissions::settings_body(ctx, msg).await,
         // "email" and any unknown active (defensive — `active` is already
         // normalized above) render the email body.
-        _ => email::settings_body(ctx, msg).await,
+        _ => Ok(email::settings_body(ctx, msg).await),
+    };
+    let body_markup = match body_markup {
+        Ok(markup) => markup,
+        Err(e) => {
+            tracing::error!(error = %e, tab = %active, "admin settings page: tab read failed");
+            return crate::ui::server_error_response(msg);
+        }
     };
 
     let form_body = tabbed_page(
@@ -155,8 +167,14 @@ mod tests {
     /// assertion below is relative to it.
     const CHROME_FORMS: usize = 1;
 
+    /// The admin schema has to be applied: the network and permissions tab
+    /// bodies read `impresspress__admin__{request_logs,wrap_grants}`, and a
+    /// fixture without them is a fixture whose page never renders. These
+    /// tests ran on a bare `TestContext::new()` and passed only because both
+    /// reads swallowed "no such table" into an empty table — the same
+    /// swallow this PR removes.
     async fn render_tab(tab: &str) -> String {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::with_admin().await;
         let msg = admin_msg("retrieve", &format!("/b/admin/settings/{tab}"));
         output_html(settings_page(&ctx, &msg, tab).await).await
     }
@@ -228,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn permissions_database_subtab_grant_modal_form_is_not_nested() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::with_admin().await;
         let mut msg = admin_msg("retrieve", "/b/admin/settings/permissions");
         msg.set_meta("req.query.subtab", "database");
         let html = output_html(settings_page(&ctx, &msg, "permissions").await).await;
