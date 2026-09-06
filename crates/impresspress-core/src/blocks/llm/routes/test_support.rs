@@ -137,6 +137,79 @@ impl Context for RecordingCtx {
     }
 }
 
+/// Wrap any context and fail the llm → messages **entry writes**, letting the
+/// first `passes` of them through.
+///
+/// The persistence tests need a hop that fails, not a database that fails:
+/// `TestContext::call_block` hands the *inner* `TestContext` to a registered
+/// block, so a `FailingDbOpContext` around it is invisible to the messages
+/// block's own database calls, and `TestContext::break_writes` breaks the
+/// user turn and the assistant turn together. Failing the `call_block` hop
+/// itself is the one seam that can single out either write.
+#[derive(Clone)]
+pub(in crate::blocks::llm) struct MessagesWriteFails {
+    inner: Arc<dyn Context>,
+    passes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MessagesWriteFails {
+    /// Fail every `create` addressed to `impresspress/messages` after letting
+    /// `passes` of them through: `0` fails the user turn, `1` lets the user
+    /// turn land and fails the assistant turn.
+    pub(in crate::blocks::llm) fn after(inner: Arc<dyn Context>, passes: usize) -> Self {
+        Self {
+            inner,
+            passes: Arc::new(std::sync::atomic::AtomicUsize::new(passes)),
+        }
+    }
+
+    /// Consume one allowed pass. `true` when this write should still land.
+    fn let_one_pass(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.passes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
+#[async_trait::async_trait]
+impl Context for MessagesWriteFails {
+    async fn call_block(&self, block_name: &str, msg: Message, input: InputStream) -> OutputStream {
+        if block_name == "impresspress/messages" && msg.action() == "create" && !self.let_one_pass()
+        {
+            return OutputStream::error(WaferError::new(
+                ErrorCode::Internal,
+                "simulated messages-block outage (MessagesWriteFails)",
+            ));
+        }
+        self.inner.call_block(block_name, msg, input).await
+    }
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+    fn registered_blocks(&self) -> &[BlockInfo] {
+        self.inner.registered_blocks()
+    }
+    fn caller_id(&self) -> Option<&str> {
+        self.inner.caller_id()
+    }
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
 pub(in crate::blocks::llm) fn admin_msg(action: &str, path: &str) -> Message {
     let mut m = Message::new(format!("{action}:{path}"));
     m.set_meta(wafer_run::META_REQ_ACTION, action);
@@ -212,6 +285,11 @@ pub(super) struct StubLlmServiceBlock {
     pub(super) models: Vec<ModelInfo>,
     pub(super) status: ModelStatus,
     pub(super) chat_chunks: Vec<ChatChunk>,
+    /// How many `llm.chat` requests reached the service. A test that a
+    /// request refused *before* the model can only prove it by reading the
+    /// provider's own count: asserting the handler's status says nothing
+    /// about whether a paid backend was already called.
+    pub(super) chat_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for StubLlmServiceBlock {
@@ -220,6 +298,7 @@ impl Default for StubLlmServiceBlock {
             models: Vec::new(),
             status: ModelStatus::ready(),
             chat_chunks: Vec::new(),
+            chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -246,6 +325,8 @@ impl Block for StubLlmServiceBlock {
             ),
             ServiceOp::LLM_UNLOAD_MODEL => OutputStream::respond(Vec::new()),
             ServiceOp::LLM_CHAT => {
+                self.chat_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let frames: Vec<Vec<u8>> = self
                     .chat_chunks
                     .iter()

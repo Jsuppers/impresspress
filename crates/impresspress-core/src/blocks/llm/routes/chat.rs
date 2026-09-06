@@ -139,15 +139,25 @@ async fn dispatch_chat(
         Err(e) => return Err(err_bad_request(&format!("Invalid body: {e}"))),
     };
 
-    // 1. Persist the user message before calling the model.
-    let _ = messages_create(ctx, msg, &thread_id, EntryRole::User, &message).await;
+    // 1. Persist the user message before calling the model — and refuse if it
+    //    did not land. A turn that was not stored must not be followed by a
+    //    model call: the next request rebuilds the history from the store, so
+    //    the question this answer belongs to would simply be gone, and the
+    //    operator would have paid for the completion anyway. This is also the
+    //    prelude's first read of the thread, so the messages block's
+    //    `NotFound` for an unknown `thread_id` is the caller's 404 here.
+    if let Err(error) = messages_create(ctx, msg, &thread_id, EntryRole::User, &message).await {
+        return Err(crate::blocks::crud::db_error(
+            error,
+            "Thread not found",
+            "Chat message",
+        ));
+    }
 
     // 2. Load prior history (which now includes the just-written user msg).
     //    A history read that FAILED is not an empty conversation: prompting a
     //    paid provider with no context because the store was unreachable
-    //    charges for an answer to the wrong question. (The rest of this
-    //    prelude's swallowing — the `let _ =` on the user turn above, and
-    //    `messages_create`'s `Option` — is the llm-persistence sweep.)
+    //    charges for an answer to the wrong question.
     let history = match messages_list(ctx, msg, &thread_id).await {
         Ok(history) => history,
         Err(e) => return Err(crate::blocks::crud::db_error_internal(e, "Chat history")),
@@ -263,17 +273,29 @@ pub(in crate::blocks::llm) async fn handle_chat(
         );
     }
 
-    // Persist the assistant reply.
-    let saved = messages_create(ctx, msg, &thread_id, EntryRole::Assistant, &content).await;
-    let message_id = saved
-        .as_ref()
-        .and_then(|v| {
-            v.get("id")
-                .or_else(|| v.get("data").and_then(|d| d.get("id")))
-        })
-        .and_then(|id| id.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Persist the assistant reply. The model has already answered and has
+    // already been paid for, but no status line has been written yet, so this
+    // path still owns the one channel that can say the turn was not kept —
+    // and it used to publish `message_id: ""` in a 200 instead, which renders
+    // an answer that disappears on the client's next history refetch. (The
+    // streaming path reaches the same decision through an SSE `error` frame,
+    // because its status line is long since committed; see
+    // `super::streaming::sse_chat_response`.)
+    let message_id =
+        match messages_create(ctx, msg, &thread_id, EntryRole::Assistant, &content).await {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(
+                    thread_id = %thread_id,
+                    reply_bytes = content.len(),
+                    error = %error,
+                    "llm assistant turn was answered but could not be stored"
+                );
+                // The thread was written to moments ago, so a `NotFound` here is
+                // a missing table rather than the caller's row.
+                return crate::blocks::crud::db_error_internal(error, "Chat reply");
+            }
+        };
 
     ok_json(&contracts::ChatResponse {
         content,
@@ -329,60 +351,14 @@ mod tests {
     /// refuses, so the fixture has to carry the block the deployment does.
     #[tokio::test]
     async fn handle_chat_publishes_exactly_the_contract_fields() {
-        use std::sync::Arc;
+        let (ctx, thread_id, _chat_calls) = chat_fixture().await;
 
-        use wafer_core::clients::llm::FinishReason;
-
-        use crate::{
-            blocks::llm::{
-                routes::test_support::StubLlmServiceBlock, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
-            },
-            test_support::{output_json, TestContext},
-        };
-
-        let mut ctx = TestContext::with_llm().await;
-        register_messages_block(&mut ctx).await;
-        ctx.set_config(DEFAULT_PROVIDER_VAR, "stub-backend");
-        ctx.set_config(DEFAULT_MODEL_VAR, "stub-model");
-        ctx.register_block(
-            "wafer-run/llm",
-            Arc::new(StubLlmServiceBlock {
-                chat_chunks: vec![
-                    ChatChunk::text("Hel"),
-                    ChatChunk::text("lo"),
-                    ChatChunk::finish(FinishReason::Stop, None),
-                ],
-                ..Default::default()
-            }),
-        );
-
-        // A real thread, because the history read now reaches the messages
-        // block for real and a thread that does not exist is a 404 there.
-        let thread = crate::blocks::messages::service::create_context(
-            &ctx,
-            "user-a",
-            "conversation",
-            "T",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await
-        .expect("seed a thread");
-
-        let body = output_json(
+        let body = crate::test_support::output_json(
             handle_chat(
                 &stub_block(),
                 &ctx,
                 &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
-                InputStream::from_bytes(
-                    serde_json::to_vec(&serde_json::json!({
-                        "thread_id": thread.id,
-                        "message": "hi",
-                    }))
-                    .expect("body"),
-                ),
+                chat_body(&thread_id),
             )
             .await,
         )
@@ -407,6 +383,156 @@ mod tests {
             body["message_id"].as_str().is_some_and(|id| !id.is_empty()),
             "the stored assistant turn's id must be published, got {}",
             body["message_id"]
+        );
+    }
+
+    /// A context the chat handlers can run end to end against: the messages
+    /// block registered for real, a stub `wafer-run/llm` that answers
+    /// `"Hello"`, and one seeded thread. Returns the thread id and the stub's
+    /// chat counter, which is how a test proves the model was *not* called.
+    async fn chat_fixture() -> (
+        crate::test_support::TestContext,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::Arc;
+
+        use wafer_core::clients::llm::FinishReason;
+
+        use crate::blocks::llm::{
+            routes::test_support::StubLlmServiceBlock, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
+        };
+
+        let mut ctx = crate::test_support::TestContext::with_llm().await;
+        register_messages_block(&mut ctx).await;
+        ctx.set_config(DEFAULT_PROVIDER_VAR, "stub-backend");
+        ctx.set_config(DEFAULT_MODEL_VAR, "stub-model");
+        let chat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        ctx.register_block(
+            "wafer-run/llm",
+            Arc::new(StubLlmServiceBlock {
+                chat_chunks: vec![
+                    ChatChunk::text("Hel"),
+                    ChatChunk::text("lo"),
+                    ChatChunk::finish(FinishReason::Stop, None),
+                ],
+                chat_calls: chat_calls.clone(),
+                ..Default::default()
+            }),
+        );
+        let thread = crate::blocks::messages::service::create_context(
+            &ctx,
+            "user-a",
+            "conversation",
+            "T",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .expect("seed a thread");
+        (ctx, thread.id, chat_calls)
+    }
+
+    /// The body a chat request carries for `thread_id`.
+    fn chat_body(thread_id: &str) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "thread_id": thread_id,
+                "message": "hi",
+            }))
+            .expect("body"),
+        )
+    }
+
+    /// A user turn the store refused must not be followed by a model call.
+    ///
+    /// The write was `let _ = messages_create(..)`, so an unreachable
+    /// messages block cost the operator a paid completion and handed the user
+    /// an answer to a turn that was never recorded — and the *next* request,
+    /// which rebuilds the history from that store, could not see the question
+    /// the answer belonged to. Asserting the handler's status would not have
+    /// caught it: only the provider's own call count can say the model was
+    /// never reached.
+    #[tokio::test]
+    async fn a_user_turn_that_could_not_be_stored_never_reaches_the_model() {
+        use crate::blocks::llm::routes::test_support::MessagesWriteFails;
+
+        let (ctx, thread_id, chat_calls) = chat_fixture().await;
+        let ctx = MessagesWriteFails::after(ctx.clone_arc(), 0);
+
+        let out = handle_chat(
+            &stub_block(),
+            &ctx,
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+            chat_body(&thread_id),
+        )
+        .await;
+
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            500,
+            "a turn that was not stored must refuse, not answer"
+        );
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the model must not be called for a turn the store refused"
+        );
+    }
+
+    /// A chat request naming a thread that does not exist is that caller's
+    /// 404, not a 500: the messages block already answers `NotFound` for it,
+    /// and the write is the first thing in the prelude that asks.
+    #[tokio::test]
+    async fn a_chat_request_for_an_unknown_thread_is_a_404() {
+        let (ctx, _thread_id, chat_calls) = chat_fixture().await;
+
+        let out = handle_chat(
+            &stub_block(),
+            &ctx,
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+            chat_body("no-such-thread"),
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 404);
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no thread, no model call"
+        );
+    }
+
+    /// The assistant turn the store refused is not a 200.
+    ///
+    /// `handle_chat` used to publish `message_id: ""` and a `content` the
+    /// store had just declined to keep, so the client rendered an answer that
+    /// vanished on its next history refetch. The model has already been paid
+    /// for by this point, but the buffered path has not written a status line
+    /// yet, so it still owns the one channel that can say so.
+    #[tokio::test]
+    async fn an_assistant_turn_that_could_not_be_stored_is_not_a_200() {
+        use crate::blocks::llm::routes::test_support::MessagesWriteFails;
+
+        let (ctx, thread_id, chat_calls) = chat_fixture().await;
+        // Let the user turn land; fail the assistant turn that follows it.
+        let ctx = MessagesWriteFails::after(ctx.clone_arc(), 1);
+
+        let out = handle_chat(
+            &stub_block(),
+            &ctx,
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+            chat_body(&thread_id),
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 500);
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the model was reached — this is the write after it that failed"
         );
     }
 

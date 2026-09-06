@@ -249,9 +249,14 @@ pub(super) fn record_field<'a>(record: &'a serde_json::Value, field: &str) -> &'
         .unwrap_or_default()
 }
 
-/// The records of a `{records: [...], total_count: n}` list answer, or the
-/// error the callee terminated with.
-async fn records_of(out: OutputStream, what: &str) -> Result<Vec<serde_json::Value>, WaferError> {
+/// The messages block's decoded answer, or the error it terminated with.
+///
+/// Shared by every call this module makes, so a read and a write cannot end
+/// up classifying the same transport failure differently: whatever the callee
+/// refused with (its `NotFound` for an unknown thread, a WRAP
+/// `PermissionDenied`) is carried back as it stands, and only a stream that
+/// ended some other way, or a body that is not JSON, is minted here.
+async fn answer_of(out: OutputStream, what: &str) -> Result<serde_json::Value, WaferError> {
     let buffered = out
         .collect_buffered()
         .await
@@ -262,13 +267,19 @@ async fn records_of(out: OutputStream, what: &str) -> Result<Vec<serde_json::Val
                 format!("{what}: the messages block did not answer: {other:?}"),
             ),
         })?;
-    let value: serde_json::Value = serde_json::from_slice(&buffered.body).map_err(|error| {
+    serde_json::from_slice(&buffered.body).map_err(|error| {
         WaferError::new(
             wafer_run::ErrorCode::Internal,
             format!("{what}: could not decode the messages block's answer: {error}"),
         )
-    })?;
-    Ok(value
+    })
+}
+
+/// The records of a `{records: [...], total_count: n}` list answer, or the
+/// error the callee terminated with.
+async fn records_of(out: OutputStream, what: &str) -> Result<Vec<serde_json::Value>, WaferError> {
+    Ok(answer_of(out, what)
+        .await?
         .get("records")
         .and_then(serde_json::Value::as_array)
         .cloned()
@@ -311,45 +322,70 @@ pub(super) async fn messages_list_contexts(
         .collect())
 }
 
-/// Call the messages block to create an entry in a context.
+/// Call the messages block to create an entry in a context, returning the id
+/// of the stored entry.
 ///
 /// `role` is the messages block's own [`EntryRole`], not a string: the entry
 /// this writes is replayed to the model by
 /// `routes::chat::history_to_messages`, and a role neither side agreed on
 /// was replayed as the *user* (B20).
+///
+/// It used to return `Option`, collapsing an encode bug, an unreachable
+/// messages block and an undecodable answer into the same `None` the two
+/// callers then discarded with `let _ =`. So a turn could fail to store while
+/// the model was still called and the request still ended in a normal
+/// completion — and the *next* request, which rebuilds the model's history
+/// from that store, could not see the turn the answer belonged to. Returning
+/// the id is what makes "it was stored" and "here is what was stored"
+/// inseparable: there is no longer a value a caller can publish for a write
+/// that did not happen.
 pub(super) async fn messages_create(
     ctx: &dyn Context,
     original_msg: &Message,
     context_id: &str,
     role: EntryRole,
     content: &str,
-) -> Option<serde_json::Value> {
+) -> Result<String, WaferError> {
     // Serializing a plain `{kind, role, content}` map can only fail on a JSON
-    // serializer bug. Surface it via tracing rather than sending an empty
-    // body to the messages block, which would 400 with a confusing error.
-    let body = match serde_json::to_vec(&serde_json::json!({
+    // serializer bug, but sending an empty body to the messages block would
+    // 400 with a confusing error, so it stops here.
+    let body = serde_json::to_vec(&serde_json::json!({
         "kind": EntryKind::Message,
         "role": role,
         "content": content,
-    })) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("messages_create: failed to encode entry body: {e}");
-            return None;
-        }
-    };
+    }))
+    .map_err(|error| {
+        WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            format!("entry write: could not encode the entry body: {error}"),
+        )
+    })?;
 
     let resource = format!("/b/messages/api/contexts/{context_id}/entries");
     let mut msg = crate::util::block_request("create", "POST", &resource, original_msg);
     msg.set_meta("req.content_type", "application/json");
 
-    let out = ctx
-        .call_block("impresspress/messages", msg, InputStream::from_bytes(body))
-        .await;
-    if let Ok(buf) = out.collect_buffered().await {
-        return serde_json::from_slice::<serde_json::Value>(&buf.body).ok();
-    }
-    None
+    let answer = answer_of(
+        ctx.call_block("impresspress/messages", msg, InputStream::from_bytes(body))
+            .await,
+        "entry write",
+    )
+    .await?;
+    // `{"id": …}` is the flat shape; `database.create` answers wrap the row
+    // under `data`. Both spellings reach this module (`record_field` carries
+    // the same pair for the read half).
+    answer
+        .get("id")
+        .or_else(|| answer.get("data").and_then(|data| data.get("id")))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                "entry write: the messages block named no stored entry",
+            )
+        })
 }
 
 /// Call the messages block to list entries in a context.
