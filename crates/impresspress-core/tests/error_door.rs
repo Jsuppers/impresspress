@@ -76,6 +76,15 @@
 /// unrelated behaviour change (a WRAP denial stops answering 500) into that
 /// review would have hidden it. The eight go as their own PR, which is a
 /// mechanical diff with a behavioural test and no snapshot movement at all.
+///
+/// PR 5 (`StripeEventType`) opened two of the eight — `products/stripe.rs`
+/// and `products/pages.rs` — and took none either, for the same reason
+/// stated one size up: 29 `NotFound` classifications across the eight files
+/// is a larger diff than the enum it would have been reviewed alongside,
+/// and the enum PR moves an admin page's markup. Two PRs have now declined
+/// on the grounds that the conversion deserves its own review, which is the
+/// argument for scheduling it rather than waiting for a PR that happens to
+/// be in the neighbourhood.
 const STILL_HAND_MAPPED: &[(&str, &str)] = &[
     // ---- owed as a follow-up to PR 4; see the note above ----
     ("products/pages.rs", "PR 4 (three SSR reads)"),

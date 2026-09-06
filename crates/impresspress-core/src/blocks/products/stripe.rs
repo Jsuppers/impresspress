@@ -18,7 +18,7 @@ use super::{
         self, AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, EventStatus,
         ManagedOffer, ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus,
         PaymentLinkCreateRequest, PricingPreviewRequest, ProviderPaymentStatus,
-        ReconciliationStatus, SubscriptionStatus, WebhookAck, WebhookEventList,
+        ReconciliationStatus, StripeEventType, SubscriptionStatus, WebhookAck, WebhookEventList,
         WebhookEventSummary,
     },
     money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
@@ -3159,8 +3159,12 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
         }};
     }
 
-    match event_type {
-        "account.updated" => {
+    // Dispatch on the type, not on its spelling. Every arm below is a
+    // variant, so a type added to `StripeEventType` — which is also what the
+    // Stripe setup page advertises — does not compile until it is routed
+    // here, and the two lists cannot describe different sets of events.
+    match StripeEventType::from_wire(event_type) {
+        Some(StripeEventType::AccountUpdated) => {
             let account_id = data_object
                 .get("id")
                 .and_then(|value| value.as_str())
@@ -3187,7 +3191,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 );
             }
         }
-        "checkout.session.completed"
+        Some(StripeEventType::CheckoutSessionCompleted)
             if data_object
                 .get("payment_status")
                 .and_then(serde_json::Value::as_str)
@@ -3202,7 +3206,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 "Checkout Session is awaiting asynchronous payment confirmation"
             );
         }
-        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+        Some(
+            StripeEventType::CheckoutSessionCompleted
+            | StripeEventType::CheckoutSessionAsyncPaymentSucceeded,
+        ) => {
             // Handle product purchase completion
             let purchase_id = data_object
                 .pointer("/metadata/purchase_id")
@@ -3335,7 +3342,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "checkout.session.async_payment_failed" => {
+        Some(StripeEventType::CheckoutSessionAsyncPaymentFailed) => {
             let purchase_id = data_object
                 .pointer("/metadata/purchase_id")
                 .and_then(serde_json::Value::as_str)
@@ -3373,28 +3380,32 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "payment_intent.succeeded"
-        | "payment_intent.payment_failed"
-        | "payment_intent.processing"
-        | "payment_intent.requires_action"
-        | "payment_intent.canceled" => {
+        Some(
+            kind @ (StripeEventType::PaymentIntentSucceeded
+            | StripeEventType::PaymentIntentPaymentFailed
+            | StripeEventType::PaymentIntentProcessing
+            | StripeEventType::PaymentIntentRequiresAction
+            | StripeEventType::PaymentIntentCanceled),
+        ) => {
             let payment_intent_id = stripe_resource_id(data_object.get("id"));
             let object_status = data_object
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let status = match event_type {
-                "payment_intent.succeeded" if object_status == "succeeded" => {
+            let status = match kind {
+                StripeEventType::PaymentIntentSucceeded if object_status == "succeeded" => {
                     ProviderPaymentStatus::Succeeded
                 }
-                "payment_intent.payment_failed" => ProviderPaymentStatus::PaymentFailed,
-                "payment_intent.processing" if object_status == "processing" => {
+                StripeEventType::PaymentIntentPaymentFailed => ProviderPaymentStatus::PaymentFailed,
+                StripeEventType::PaymentIntentProcessing if object_status == "processing" => {
                     ProviderPaymentStatus::Processing
                 }
-                "payment_intent.requires_action" if object_status == "requires_action" => {
+                StripeEventType::PaymentIntentRequiresAction
+                    if object_status == "requires_action" =>
+                {
                     ProviderPaymentStatus::RequiresAction
                 }
-                "payment_intent.canceled" if object_status == "canceled" => {
+                StripeEventType::PaymentIntentCanceled if object_status == "canceled" => {
                     ProviderPaymentStatus::Canceled
                 }
                 _ => fail_webhook!(
@@ -3472,7 +3483,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "customer.subscription.updated" => {
+        Some(StripeEventType::CustomerSubscriptionUpdated) => {
             let stripe_sub_id = data_object.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let status = data_object
                 .get("status")
@@ -3575,7 +3586,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "invoice.paid" | "invoice.payment_succeeded" => {
+        Some(StripeEventType::InvoicePaid | StripeEventType::InvoicePaymentSucceeded) => {
             let stripe_sub_id = invoice_subscription_id(&data_object);
             if !stripe_sub_id.is_empty() {
                 let commerce_matched = match repo::purchases::sync_commerce_subscription(
@@ -3628,7 +3639,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "invoice.payment_failed" => {
+        Some(StripeEventType::InvoicePaymentFailed) => {
             let stripe_sub_id = invoice_subscription_id(&data_object);
             if !stripe_sub_id.is_empty() {
                 // The past-due write is derived from the invoice, not an
@@ -3686,7 +3697,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "customer.subscription.deleted" => {
+        Some(StripeEventType::CustomerSubscriptionDeleted) => {
             let stripe_sub_id = data_object.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let user_id = repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await;
 
@@ -3759,7 +3770,11 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "charge.dispute.created" | "charge.dispute.updated" | "charge.dispute.closed" => {
+        Some(
+            StripeEventType::ChargeDisputeCreated
+            | StripeEventType::ChargeDisputeUpdated
+            | StripeEventType::ChargeDisputeClosed,
+        ) => {
             let provider_dispute_id = stripe_resource_id(data_object.get("id"));
             let payment_intent_id = stripe_resource_id(data_object.get("payment_intent"));
             if provider_dispute_id.is_empty() || payment_intent_id.is_empty() {
@@ -3882,7 +3897,11 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "refund.created" | "refund.updated" | "refund.failed" => {
+        Some(
+            kind @ (StripeEventType::RefundCreated
+            | StripeEventType::RefundUpdated
+            | StripeEventType::RefundFailed),
+        ) => {
             let provider_refund_id = data_object
                 .get("id")
                 .and_then(|value| value.as_str())
@@ -3944,7 +3963,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     let provider_status = data_object
                         .get("status")
                         .and_then(|value| value.as_str())
-                        .unwrap_or(if event_type == "refund.failed" {
+                        .unwrap_or(if kind == StripeEventType::RefundFailed {
                             "failed"
                         } else {
                             "pending"
@@ -4052,7 +4071,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        "charge.refunded" => {
+        Some(StripeEventType::ChargeRefunded) => {
             let payment_intent = data_object
                 .get("payment_intent")
                 .and_then(|v| v.as_str())
@@ -4155,8 +4174,12 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             }
         }
 
-        _ => {
-            // Ignore unhandled event types
+        None => {
+            // A destination can be subscribed to more event types than this
+            // block handles, so an unrecognised type is ordinary traffic:
+            // ignore it, seal the lease below and acknowledge the delivery.
+            // Answering anything else would make Stripe retry a type no
+            // handler will ever want.
         }
     }
 

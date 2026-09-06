@@ -1381,6 +1381,84 @@ impl WebhookAck {
     }
 }
 
+/// Declare [`StripeEventType`] and the list of every variant in one place.
+///
+/// `ALL` has to be complete or the setup page under-reports what the
+/// destination must subscribe to, and a hand-written `ALL` beside a
+/// hand-written enum is exactly the second list this type exists to remove.
+/// Generating both from one `Variant => "wire.name"` table is what makes
+/// completeness a property of the declaration rather than of a test.
+macro_rules! stripe_event_types {
+    ($(#[$doc:meta])* $($variant:ident => $wire:literal,)+) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum StripeEventType {
+            $(#[serde(rename = $wire)] $variant,)+
+        }
+
+        impl StripeEventType {
+            /// Every handled type, in the order the setup page lists them.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
+        }
+    };
+}
+
+stripe_event_types! {
+    /// A Stripe webhook `type` this block does something with.
+    ///
+    /// Not a column: `stripe_events.event_type` records whatever Stripe
+    /// sent, including the types this block ignores, so
+    /// [`WebhookEventSummary`] keeps publishing that field as a string.
+    /// This type is the *handled* set — the one thing the webhook
+    /// dispatcher and the Stripe setup page both need to agree on, and did
+    /// not, because each spelled the 21 names out on its own.
+    ///
+    /// [`Self::from_wire`] returning `None` is not an error. A destination
+    /// can be subscribed to more event types than this block handles
+    /// (Stripe's dashboard offers "all events"), so an unhandled type is
+    /// ordinary traffic: the dispatcher ignores it and acknowledges the
+    /// delivery, which is what its former `_ =>` arm did.
+    ///
+    /// The variants carry no doc comments deliberately. Nothing publishes
+    /// this type today, but the moment something does, per-variant docs
+    /// turn a flat `{"enum": [...]}` into a `oneOf` of `const` subschemas
+    /// and move the snapshot for no reason — the trap PR #30 hit on eight
+    /// fields.
+    AccountUpdated => "account.updated",
+    CheckoutSessionCompleted => "checkout.session.completed",
+    CheckoutSessionAsyncPaymentSucceeded => "checkout.session.async_payment_succeeded",
+    CheckoutSessionAsyncPaymentFailed => "checkout.session.async_payment_failed",
+    PaymentIntentSucceeded => "payment_intent.succeeded",
+    PaymentIntentPaymentFailed => "payment_intent.payment_failed",
+    PaymentIntentProcessing => "payment_intent.processing",
+    PaymentIntentRequiresAction => "payment_intent.requires_action",
+    PaymentIntentCanceled => "payment_intent.canceled",
+    CustomerSubscriptionUpdated => "customer.subscription.updated",
+    CustomerSubscriptionDeleted => "customer.subscription.deleted",
+    InvoicePaid => "invoice.paid",
+    InvoicePaymentSucceeded => "invoice.payment_succeeded",
+    InvoicePaymentFailed => "invoice.payment_failed",
+    ChargeDisputeCreated => "charge.dispute.created",
+    ChargeDisputeUpdated => "charge.dispute.updated",
+    ChargeDisputeClosed => "charge.dispute.closed",
+    RefundCreated => "refund.created",
+    RefundUpdated => "refund.updated",
+    RefundFailed => "refund.failed",
+    ChargeRefunded => "charge.refunded",
+}
+
+impl StripeEventType {
+    /// The event `type` of a delivery, or `None` for a type this block does
+    /// not handle.
+    ///
+    /// The counterpart of [`crate::util::wire_str`], through the same serde
+    /// definition, so the name decoded here is the name the setup page
+    /// rendered.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+    }
+}
+
 /// Where a received Stripe event is in the block's own processing queue:
 /// the `status` column of `impresspress__products__stripe_events`.
 ///
