@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use wafer_core::clients::database::{Record, RecordList};
 use wafer_run::Message;
 
-use crate::util::RecordExt;
+use crate::{
+    blocks::auth::repo::users::{UserPage, UserRow},
+    util::RecordExt,
+};
 
 // ---------------------------------------------------------------------------
 // GET /b/admin/api/users
@@ -52,8 +55,10 @@ use crate::util::RecordExt;
 //
 // A password hash was never among them: credentials live in
 // `wafer_run__auth__local_credentials`, a different table this endpoint does
-// not read. The `record.data.remove("password_hash")` the old handler ran was
-// a no-op against a column that is not on this table.
+// not read. The two `record.data.remove("password_hash")` lines admin's
+// mutation layer used to run were no-ops against a column that is not on this
+// table, and are gone; the view is built from a typed `UserRow` now, which has
+// no field to strip.
 /// A user account as published by the admin API.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminUserView {
@@ -89,22 +94,24 @@ pub struct AdminUserView {
 }
 
 impl AdminUserView {
-    /// Project a `wafer_run__auth__users` row plus its resolved role names.
-    pub fn from_record(record: &Record, roles: Vec<String>) -> Self {
+    /// Project a decoded users row plus its resolved role names. The row
+    /// comes from `auth::repo::users`, the only place this table's columns
+    /// are read; this type is the closed list of what reaches the wire.
+    pub fn from_row(row: &UserRow, roles: Vec<String>) -> Self {
         Self {
-            id: record.id.clone(),
-            email: record.str_field("email").to_string(),
-            display_name: record.str_field("display_name").to_string(),
-            name: record.opt_str_field("name"),
-            avatar_url: record.opt_str_field("avatar_url"),
-            role: record.str_field("role").to_string(),
+            id: row.id.clone(),
+            email: row.email.clone(),
+            display_name: row.display_name.clone(),
+            name: row.name.clone(),
+            avatar_url: row.avatar_url.clone(),
+            role: row.role.clone(),
             roles,
-            email_verified: record.bool_field("email_verified"),
-            disabled: record.bool_field("disabled"),
-            last_login_at: record.opt_str_field("last_login_at"),
-            created_at: record.str_field("created_at").to_string(),
-            updated_at: record.str_field("updated_at").to_string(),
-            deleted_at: record.opt_str_field("deleted_at"),
+            email_verified: row.email_verified,
+            disabled: row.disabled,
+            last_login_at: row.last_login_at.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            deleted_at: row.deleted_at.clone(),
         }
     }
 }
@@ -152,24 +159,21 @@ pub struct AdminUserListResponse {
 }
 
 impl AdminUserListResponse {
-    /// Project a `RecordList` of user rows plus the bulk-fetched
+    /// Project a page of user rows plus the bulk-fetched
     /// `user_id → [role]` map.
-    pub fn from_record_list(
-        list: &RecordList,
-        roles_by_user: &HashMap<String, Vec<String>>,
-    ) -> Self {
+    pub fn from_page(page: &UserPage, roles_by_user: &HashMap<String, Vec<String>>) -> Self {
         Self {
-            records: list
-                .records
+            records: page
+                .rows
                 .iter()
-                .map(|record| {
-                    let roles = roles_by_user.get(&record.id).cloned().unwrap_or_default();
-                    AdminUserView::from_record(record, roles)
+                .map(|row| {
+                    let roles = roles_by_user.get(&row.id).cloned().unwrap_or_default();
+                    AdminUserView::from_row(row, roles)
                 })
                 .collect(),
-            total_count: list.total_count,
-            page: list.page,
-            page_size: list.page_size,
+            total_count: page.total_count,
+            page: page.page,
+            page_size: page.page_size,
         }
     }
 }

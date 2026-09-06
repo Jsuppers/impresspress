@@ -38,6 +38,8 @@ async fn require_user_accepts_session_cookie_and_pat_and_rejects_missing() {
             display_name: "R".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -123,6 +125,8 @@ async fn require_user_rejects_expired_session_and_pat() {
             display_name: "E".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

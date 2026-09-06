@@ -19,6 +19,8 @@ async fn mk_user(ctx: &MigrationTestCtx, email: &str) -> String {
             display_name: email.into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

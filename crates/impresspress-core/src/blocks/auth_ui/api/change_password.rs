@@ -1,14 +1,13 @@
 //! POST /b/auth/api/change-password — relocated from auth/login.rs in Task 5.
 
-use wafer_core::clients::{crypto, database as db};
+use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
     blocks::{
         auth::{
             bump_auth_version,
-            repo::{local_credentials, tokens},
-            USERS_TABLE,
+            repo::{local_credentials, tokens, users},
         },
         errors::{error_response, ErrorCode},
     },
@@ -39,9 +38,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     }
 
     // Verify user exists
-    match db::get(ctx, USERS_TABLE, user_id).await {
-        Ok(_) => {}
-        Err(_) => return err_not_found("User not found"),
+    match users::find_by_id(ctx, user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => return err_not_found("User not found"),
     };
 
     // Fetch existing credential row — must have one to change password.

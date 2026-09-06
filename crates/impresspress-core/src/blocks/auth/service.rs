@@ -175,8 +175,8 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__jwt_blocklist"),
         // P2c: same pipeline-preprocessing shape as the blocklist grant
         // above — `crate::crypto::extract_auth_meta` also calls
-        // `blocks::auth::current_auth_version()` (-> `repo::users::auth_version()`
-        // -> `db::get(ctx, USERS_TABLE, ...)`) in the router's context on
+        // `blocks::auth::current_auth_version()`, which reads the users row
+        // through `repo::users::auth_version()`, in the router's context on
         // every request bearing an access JWT. Without this grant WRAP
         // denies the users-table read and the fail-closed lookup-error
         // branch rejects every token, 403-ing every signed-in request.
@@ -455,8 +455,6 @@ mod tests {
     //! that `grants()` returns the expected consumer set.
     use std::sync::Arc;
 
-    use wafer_core::clients::database as db;
-
     use super::*;
     use crate::test_support::TestContext;
 
@@ -475,11 +473,13 @@ mod tests {
             .expect("init applies migrations and runs bootstrap");
 
         // Migrations applied → users table exists and is queryable.
-        let rows = db::list_all(&*ctx, users::TABLE, vec![])
-            .await
-            .expect("users table exists after init");
         // No bootstrap admin env vars → bootstrap no-ops, table stays empty.
-        assert_eq!(rows.len(), 0);
+        assert_eq!(
+            users::count(&*ctx)
+                .await
+                .expect("users table exists after init"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -561,6 +561,8 @@ mod tests {
                 display_name: "RT".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -580,6 +582,79 @@ mod tests {
             roles.iter().any(|r| r == "admin"),
             "merged resolver must see the roles-table admin grant: {roles:?}"
         );
+    }
+
+    /// The other direction, and the evidence spec 2.2.3 rests on: a user
+    /// whose ONLY admin claim is the inline `users.role` column — no
+    /// `user_roles` row at all — still resolves as admin everywhere
+    /// authorization is decided. Both signup paths write exactly this shape
+    /// (`helpers::initial_role_for` feeds `NewUser.role`; neither writes a
+    /// `user_roles` row), which is why the OAuth callback's roles insert
+    /// could be deleted rather than copied into password signup. If this
+    /// test ever fails, an OAuth-created admin has stopped being an admin.
+    #[tokio::test]
+    async fn inline_admin_role_alone_satisfies_require_role() {
+        use crate::platform_state::user_roles;
+
+        let ctx = Arc::new(TestContext::with_admin().await);
+        let service = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
+        service
+            .init(&*ctx)
+            .await
+            .expect("auth init applies user-table migrations");
+
+        // Exactly what `resolve_user`'s brand-new-user branch and
+        // `signup::handle` write for a bootstrap-admin email.
+        let user = users::insert(
+            &*ctx,
+            users::NewUser {
+                email: "inline-admin@e.co".into(),
+                display_name: "Inline".into(),
+                avatar_url: None,
+                role: "admin".into(),
+                email_verified: false,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("insert user");
+
+        assert!(
+            user_roles::list_for_user(&*ctx, &user.id)
+                .await
+                .expect("list grants")
+                .is_empty(),
+            "signup writes no user_roles row — the initial role is the inline column"
+        );
+
+        let roles = crate::blocks::auth::helpers::get_user_roles(&*ctx, &user.id)
+            .await
+            .expect("merged resolver must succeed");
+        assert_eq!(
+            roles,
+            vec!["admin".to_string()],
+            "the inline role is the first thing the merged resolver reads"
+        );
+
+        let raw_token = "inline-admin-raw";
+        sessions::insert(
+            &*ctx,
+            sessions::NewSession {
+                token_hash: hash_token(raw_token),
+                user_id: user.id.clone(),
+                expires_at: "9999-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .expect("seed session");
+
+        let mut msg = Message::new("auth.require_role");
+        msg.set_meta("http.header.cookie", format!("wafer_session={raw_token}"));
+        let got = service
+            .require_role(&msg, Role::Admin)
+            .await
+            .expect("an inline-role admin must satisfy Role::Admin with no user_roles row");
+        assert_eq!(got.0, user.id);
     }
 
     #[tokio::test]
@@ -604,6 +679,8 @@ mod tests {
                 display_name: "RT2".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -637,8 +714,6 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_active_rejects_disabled_and_deleted() {
-        use wafer_core::clients::database as db;
-
         use crate::test_support::TestContext;
 
         let ctx = TestContext::with_auth().await.with_wrap(
@@ -654,6 +729,8 @@ mod tests {
                 display_name: "Live".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -662,11 +739,7 @@ mod tests {
         assert!(ensure_active(&ctx, &live.id).await.is_ok());
 
         // Disabled → Unauthorized.
-        let mut patch = std::collections::HashMap::new();
-        patch.insert("disabled".to_string(), serde_json::json!(true));
-        db::update(&ctx, users::TABLE, &live.id, patch)
-            .await
-            .unwrap();
+        users::set_disabled(&ctx, &live.id, true).await.unwrap();
         assert!(matches!(
             ensure_active(&ctx, &live.id).await,
             Err(AuthError::Unauthorized)

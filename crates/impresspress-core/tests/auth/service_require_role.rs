@@ -37,6 +37,8 @@ async fn require_role_user_admin_and_bootstrap_token() {
             display_name: "A".into(),
             avatar_url: None,
             role: "admin".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -48,6 +50,8 @@ async fn require_role_user_admin_and_bootstrap_token() {
             display_name: "U".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

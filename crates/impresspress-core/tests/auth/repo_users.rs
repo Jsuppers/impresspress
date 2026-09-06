@@ -17,6 +17,8 @@ async fn insert_then_find_by_email_and_id() {
             display_name: "A".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -62,6 +64,8 @@ async fn insert_with_avatar_roundtrips() {
             display_name: "B".into(),
             avatar_url: Some("https://example.com/a.png".into()),
             role: "admin".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

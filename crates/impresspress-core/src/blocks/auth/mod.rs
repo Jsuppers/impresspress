@@ -12,9 +12,10 @@
 //!
 //! - Module decls for the supporting layers (`bootstrap`, `config`,
 //!   `migrations`, `repo`, `service`).
-//! - Constants other blocks still reference (`AUTH_BLOCK_ID`, `JWT_SECRET_KEY`,
-//!   the four `*_TABLE` re-exports from `repo/{api_keys,rate_limits,tokens,
-//!   users}.rs`, `DUMMY_HASH`).
+//! - Constants other blocks still reference (`AUTH_BLOCK_ID`,
+//!   `JWT_SECRET_KEY`, `DUMMY_HASH`). Every auth table is reached through
+//!   its own `repo::<table>` module; there are no table-name re-exports
+//!   here for a caller to build a query around.
 //! - `helpers` — token/cookie/role utilities consumed by `auth_ui::api::*`.
 //! - `authenticate_api_key` — called by `crate::pipeline` to populate auth
 //!   meta from an `Authorization: Bearer <api-key>` header.
@@ -27,7 +28,7 @@ pub mod service;
 
 use std::{collections::HashMap, time::Duration};
 
-use wafer_core::clients::{config as config_client, crypto, database as db};
+use wafer_core::clients::{config as config_client, crypto};
 
 use crate::util::hex_encode;
 
@@ -43,18 +44,6 @@ pub const AUTH_BLOCK_ID: &str = "wafer-run/auth";
 /// for token validation and by the Cloudflare adapter to seed the
 /// crypto service.
 pub const JWT_SECRET_KEY: &str = "WAFER_RUN__AUTH__JWT_SECRET";
-
-// Cross-block table-name re-exports. Each auth table is owned by its repo
-// module (`repo/users.rs`, `repo/tokens.rs`, etc.). These aliases keep
-// existing crate-local consumers (admin/, userportal/, products/,
-// rate_limit/, auth_ui/api/*) on stable identifiers without forcing them
-// to import the qualified `repo::*::TABLE` path.
-// Only consumer is `rate_limit::UserRateLimiter::check` on wasm32; native
-// code path doesn't reference it. Re-export separately so we can attach
-// the dead-code allow on the import binding.
-#[allow(unused_imports)]
-pub(crate) use repo::rate_limits::TABLE as RATE_LIMITS_TABLE;
-pub(crate) use repo::{api_keys::TABLE as API_KEYS_TABLE, users::TABLE as USERS_TABLE};
 
 /// Pre-computed Argon2id hash used for timing equalization when user is not found.
 pub(crate) const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -201,6 +190,8 @@ mod auth_version_cache_tests {
                 display_name: "Cache".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -320,23 +311,10 @@ pub(crate) mod helpers {
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
     ) -> Result<Vec<String>, repo::RepoError> {
-        use wafer_block::ErrorCode;
-
-        use crate::util::RecordExt;
-
         let mut roles: Vec<String> = Vec::new();
-        match db::get(ctx, USERS_TABLE, user_id).await {
-            Ok(rec) => {
-                let inline = rec.str_field("role");
-                if !inline.is_empty() {
-                    roles.push(inline.to_string());
-                }
-            }
-            Err(e) if e.code == ErrorCode::NotFound => {}
-            Err(e) => {
-                return Err(repo::RepoError::Db(format!(
-                    "get_user_roles: users lookup: {e}"
-                )))
+        if let Some(user) = repo::users::find_by_id(ctx, user_id).await? {
+            if !user.role.is_empty() {
+                roles.push(user.role);
             }
         }
 
@@ -842,6 +820,8 @@ pub(crate) mod helpers {
                     display_name: "Mint".into(),
                     avatar_url: None,
                     role: "user".into(),
+                    email_verified: false,
+                    verification_token_hash: None,
                 },
             )
             .await
@@ -981,6 +961,8 @@ mod api_key_lifecycle_tests {
                 display_name: "Key".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -1028,8 +1010,6 @@ mod api_key_lifecycle_tests {
 
     #[tokio::test]
     async fn disabled_user_key_is_rejected() {
-        use wafer_core::clients::database as db;
-
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
             vec![],
@@ -1037,9 +1017,9 @@ mod api_key_lifecycle_tests {
         );
         let uid = seed_user_and_key(&ctx, "raw-disabled-key").await;
 
-        let mut patch = std::collections::HashMap::new();
-        patch.insert("disabled".to_string(), serde_json::json!(true));
-        db::update(&ctx, users::TABLE, &uid, patch).await.unwrap();
+        users::set_disabled(&ctx, &uid, true)
+            .await
+            .expect("disable the key's owner");
 
         let mut msg = Message::new("http");
         authenticate_api_key(&ctx, "raw-disabled-key", &mut msg).await;

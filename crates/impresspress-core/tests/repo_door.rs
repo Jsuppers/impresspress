@@ -27,13 +27,42 @@
 //! allowlists below — each listed individually with its reason, so a NEW
 //! file naming a table fails the gate and has to justify itself here.
 
-/// `(module, table)` for every door under `src/platform_state/`.
-const TABLES: &[(&str, &str)] = &[
-    ("variables", "impresspress__admin__variables"),
-    ("block_settings", "impresspress__admin__block_settings"),
-    ("wrap_grants", "impresspress__admin__wrap_grants"),
-    ("request_logs", "impresspress__admin__request_logs"),
-    ("user_roles", "impresspress__admin__user_roles"),
+/// `(module, table, qualifier)` for every door this gate covers.
+///
+/// `qualifier` is the path fragment a file must ALSO contain for a
+/// `<module>::TABLE` token to be attributed to this door. It is what keeps a
+/// block's own same-named repo module out of the match: products has a
+/// `repo::variables::TABLE`, so `variables::TABLE` counts as the platform
+/// door only when the file also names `platform_state`. For the auth users
+/// door the fragment is `auth`, which every path to
+/// `blocks::auth::repo::users` necessarily spells.
+const TABLES: &[(&str, &str, &str)] = &[
+    (
+        "variables",
+        "impresspress__admin__variables",
+        "platform_state",
+    ),
+    (
+        "block_settings",
+        "impresspress__admin__block_settings",
+        "platform_state",
+    ),
+    (
+        "wrap_grants",
+        "impresspress__admin__wrap_grants",
+        "platform_state",
+    ),
+    (
+        "request_logs",
+        "impresspress__admin__request_logs",
+        "platform_state",
+    ),
+    (
+        "user_roles",
+        "impresspress__admin__user_roles",
+        "platform_state",
+    ),
+    ("users", "wafer_run__auth__users", "auth"),
 ];
 
 fn crate_sources() -> Vec<(String, String)> {
@@ -114,6 +143,33 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("request_logs", &["platform_state/request_logs.rs"]),
     ("user_roles", &["platform_state/user_roles.rs"]),
+    (
+        "users",
+        &[
+            // the door itself
+            "blocks/auth/repo/users.rs",
+            // `auth_grants()` spells its grant targets as literals on
+            // purpose: the WRAP audit script's const-resolver follows
+            // top-level `super::NAME` paths only, not `repo::users::TABLE`
+            // (the reason is written out above `auth_grants`)
+            "blocks/auth/service.rs",
+            // the migration-runner tests assert against the DDL the `.sql`
+            // files define; reading the name back from the constant they are
+            // testing would make them tautological
+            "blocks/auth/migrations/mod.rs",
+            // `seed_auth_user` — the ONE raw-SQL users fixture in the crate
+            // (a test needs a user under a caller-chosen id that its own
+            // authenticated `Message` names; `users::insert` mints a UUID) —
+            // plus the WRAP tests whose grant target IS the wire name
+            "test_support.rs",
+            // the KV row cache classifies tables by wire name; its tests pin
+            // the name rather than read it back from the constant
+            "cache_key.rs",
+            // the fail-closed diagnostic on the router's auth_version read
+            // names the grant an operator has to go and add
+            "crypto.rs",
+        ],
+    ),
 ];
 
 #[test]
@@ -122,7 +178,7 @@ fn only_the_door_names_a_platform_table() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (module, literal) in TABLES {
+    for (module, literal, _qualifier) in TABLES {
         let allowed = LITERAL_ALLOWED
             .iter()
             .find(|(m, _)| m == module)
@@ -137,7 +193,7 @@ fn only_the_door_names_a_platform_table() {
         assert!(
             offenders.is_empty(),
             "these files name `{literal}` directly and so bypass \
-             `platform_state::{module}`; route them through its functions: {offenders:?}"
+             the `{module}` door; route them through its functions: {offenders:?}"
         );
     }
 }
@@ -207,6 +263,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         "user_roles",
         &["blocks/admin/mod.rs", "blocks/dev/data_snapshot.rs"],
     ),
+    (
+        "users",
+        &[
+            // the export allowlist/exclusion bookkeeping; its reads go
+            // through a generic `db::list_all(ctx, table, ..)` over the
+            // allowlist and its import through `seed::import`
+            "blocks/dev/data_snapshot.rs",
+        ],
+    ),
 ];
 
 #[test]
@@ -215,7 +280,7 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (module, _) in TABLES {
+    for (module, _, qualifier) in TABLES {
         let ident = format!("{module}::TABLE");
         let allowed = IDENT_ALLOWED
             .iter()
@@ -225,13 +290,13 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
         let offenders: Vec<&String> = sources
             .iter()
             .filter(|(path, _)| !matches_allowlist(path, allowed))
-            .filter(|(_, src)| src.contains("platform_state") && src.contains(&ident))
+            .filter(|(_, src)| src.contains(qualifier) && src.contains(&ident))
             .map(|(path, _)| path)
             .collect();
         assert!(
             offenders.is_empty(),
             "these files name the table via `{ident}` instead of calling a \
-             `platform_state::{module}` function: {offenders:?}"
+             `{module}` repo function: {offenders:?}"
         );
     }
 }
@@ -244,7 +309,7 @@ fn no_allowlist_entry_is_dead() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (module, literal) in TABLES {
+    for (module, literal, _qualifier) in TABLES {
         for (m, files) in LITERAL_ALLOWED {
             if m != module {
                 continue;

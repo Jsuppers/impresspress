@@ -45,6 +45,8 @@ async fn first_oauth_login_creates_user_and_link() {
             display_name: "Alice".into(),
             avatar_url: Some("https://github.com/alice.png".into()),
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -96,6 +98,8 @@ async fn re_login_same_provider_ref_no_duplicate_user() {
             display_name: "Bob".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -166,6 +170,8 @@ async fn same_email_different_provider_merges_to_same_user() {
             display_name: "Carol".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

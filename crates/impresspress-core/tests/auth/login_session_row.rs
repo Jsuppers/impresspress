@@ -65,6 +65,8 @@ async fn seed_password_user(ctx: &MigrationTestCtx, email: &str, password: &str)
             display_name: String::new(),
             avatar_url: None,
             role: "user".to_string(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

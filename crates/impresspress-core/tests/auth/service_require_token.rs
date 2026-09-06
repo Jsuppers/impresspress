@@ -37,6 +37,8 @@ async fn require_token_enforces_scope_and_rejects_session_cookies() {
             display_name: "T".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
