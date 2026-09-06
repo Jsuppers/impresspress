@@ -23,7 +23,7 @@ use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use crate::{
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized},
+    http::{err_bad_request, err_internal, err_not_found, err_unauthorized},
     util::{field_as_string, stamp_created, stamp_updated},
 };
 
@@ -60,10 +60,7 @@ use crate::{
 /// them (`products/handlers/{sellers,offers,product}.rs`) keep their own arms
 /// and delegate only this tail.
 pub fn db_error(error: wafer_run::WaferError, not_found: &str, context: &str) -> OutputStream {
-    if error.code == ErrorCode::NotFound {
-        return err_not_found(not_found);
-    }
-    db_error_internal(error, context)
+    seal(classify_db_error(error, Some(not_found), context), context)
 }
 
 /// [`db_error`] for a call whose `NotFound` is NOT the client's row.
@@ -75,20 +72,69 @@ pub fn db_error(error: wafer_run::WaferError, not_found: &str, context: &str) ->
 /// Everything else is classified exactly as [`db_error`] classifies it,
 /// `PermissionDenied` included.
 pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputStream {
-    match error.code {
-        ErrorCode::PermissionDenied => {
+    seal(classify_db_error(error, None, context), context)
+}
+
+/// What [`db_error`] decided, before it is sealed into a response.
+///
+/// [`db_error`] seals this itself and is what almost every call site wants.
+/// A block whose every response carries an extra header cannot use it —
+/// an `OutputStream`'s meta is fixed when it is built, so the header has to
+/// go on the error before it is sealed — and `blocks::dev` is that block:
+/// design §12 makes every `/b/dev` response `Cache-Control: no-store`,
+/// including its refusals. It seals this itself through
+/// `dev::no_store_db_error`. **Nothing else may**: a third classification of
+/// a database failure is exactly what `tests/error_door.rs` exists to stop.
+pub enum DbFailure {
+    /// A refusal the client is told about as it stands: the caller's 404,
+    /// the 403 a WRAP denial becomes, the 429 a quota keeps. The cause, when
+    /// it was one that must not be published, has already been logged and
+    /// replaced.
+    Refused(wafer_run::WaferError),
+    /// An internal fault, carried back untouched — sanitizing it and minting
+    /// its correlation id is [`crate::http::err_internal`]'s job, and doing
+    /// it here would mean two places that log a 500.
+    Internal(wafer_run::WaferError),
+}
+
+/// Classify a failed database call. `not_found` is `Some` when a `NotFound`
+/// from this call means the row the *caller* named (so it is their 404), and
+/// `None` when the block chose the address itself — a `db::paginated_list`
+/// or `db::create` against a table the request never named, where a
+/// `NotFound` is a missing table and therefore a 500.
+pub fn classify_db_error(
+    error: wafer_run::WaferError,
+    not_found: Option<&str>,
+    context: &str,
+) -> DbFailure {
+    match (error.code, not_found) {
+        (ErrorCode::NotFound, Some(label)) => {
+            DbFailure::Refused(wafer_run::WaferError::new(ErrorCode::NotFound, label))
+        }
+        (ErrorCode::PermissionDenied, _) => {
             tracing::warn!(
                 context = %context,
                 error = %error,
                 "database access denied — a WRAP grant or a row guard refused this call",
             );
-            err_forbidden("Access denied")
+            DbFailure::Refused(wafer_run::WaferError::new(
+                ErrorCode::PermissionDenied,
+                "Access denied",
+            ))
         }
-        ErrorCode::ResourceExhausted => OutputStream::error(wafer_run::WaferError::new(
+        (ErrorCode::ResourceExhausted, _) => DbFailure::Refused(wafer_run::WaferError::new(
             ErrorCode::ResourceExhausted,
             error.message,
         )),
-        _ => err_internal(context, error),
+        _ => DbFailure::Internal(error),
+    }
+}
+
+/// [`DbFailure`] as the response every caller but `blocks::dev` wants.
+fn seal(failure: DbFailure, context: &str) -> OutputStream {
+    match failure {
+        DbFailure::Refused(error) => OutputStream::error(error),
+        DbFailure::Internal(error) => err_internal(context, error),
     }
 }
 

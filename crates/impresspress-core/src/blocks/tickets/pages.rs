@@ -6,7 +6,8 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{config::SecurityReadiness, repo, service};
 use crate::{
-    http::{err_internal, err_not_found},
+    blocks::crud,
+    http::err_internal,
     ui::{self, components},
 };
 
@@ -182,9 +183,11 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
     let detail = match service::detail(ctx, id).await {
         Ok(detail) => detail,
-        Err(service::ServiceError::Db(error)) if error.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Ticket not found")
+        Err(service::ServiceError::Db(error)) => {
+            return crud::db_error(error, "Ticket not found", "Could not load ticket")
         }
+        // `service::detail` reads only; the two domain variants are
+        // unreachable here, and an unreachable one is an internal fault.
         Err(error) => return err_internal("Could not load ticket", error),
     };
     let ticket = &detail.ticket;
@@ -642,4 +645,27 @@ fn pretty_json_field(record: &db::Record, name: &str) -> String {
         value => value.clone(),
     };
     serde_json::to_string_pretty(&parsed).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod denial_tests {
+    use super::*;
+    use crate::{
+        endpoint_match,
+        test_support::{admin_msg, output_http_status, TestContext},
+    };
+
+    /// The SSR detail page reads through the same service as the JSON
+    /// handler, and mapped everything but `NotFound` onto `err_internal`.
+    #[tokio::test]
+    async fn a_denied_ticket_detail_page_is_403_not_500() {
+        let ctx = TestContext::with_tickets().await.with_wrap(
+            "test/ungranted",
+            Vec::new(),
+            "impresspress/admin",
+        );
+        let mut msg = admin_msg("retrieve", "/b/tickets/admin/tickets/any-id");
+        endpoint_match::dispatch(&mut msg, crate::blocks::tickets::ROUTES);
+        assert_eq!(output_http_status(detail(&ctx, &msg).await).await, 403);
+    }
 }

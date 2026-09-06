@@ -32,11 +32,16 @@
 //! What the gate does NOT see, stated so it is not mistaken for more than it
 //! is: a handler that writes the `NotFound` arm and the `err_internal` tail
 //! more than six lines apart; a handler whose tail is something other than
-//! `err_internal` (`ui::server_error_response`, say); and every
-//! `auth::repo::RepoError` site, which has no `ErrorCode` left to classify —
-//! `RepoError` is `NotFound | Db(String)`, so the wafer code is already gone
-//! by the time a handler sees it, and those sites cannot be converted at all
-//! until `RepoError` folds into `WaferError` (PR 2).
+//! `err_internal` (`ui::server_error_response`, say); and a handler with no
+//! `NotFound` arm at all, whose bare `err_internal` tail turns a refusal
+//! into a 500 just as quietly — PR 2 found four of those in
+//! `tickets/rest.rs` and two in `vector/pages.rs` only by reading the files
+//! the allowlist sent it to.
+//!
+//! `auth::repo::RepoError` used to be named here as a site the gate could
+//! not help: it was `NotFound | Db(String)`, so the wafer code was gone
+//! before a handler ever saw it. PR 2 folded it into `WaferError`, and those
+//! sites classify like every other one now.
 
 /// Files still carrying the shape, each with the PR that converts it.
 ///
@@ -49,34 +54,13 @@
 /// makes the fix reach every block that reads through the CRUD primitives —
 /// plus `products/handlers/sellers.rs`, `admin/settings.rs` and
 /// `legalpages/mod.rs`'s two `Result<Option<_>>` handlers.
+///
+/// PR 2 folded `auth::repo::RepoError` into `WaferError` and took the seven
+/// entries it had marked for itself off this list: `admin/{ops,mod,iam}.rs`,
+/// `vector/pages.rs`, `tickets/{rest,pages}.rs` and
+/// `dev/generations_api.rs`, the last through the `dev::no_store_db_error`
+/// its entry called for.
 const STILL_HAND_MAPPED: &[(&str, &str)] = &[
-    // ---- PR 2: `RepoError` folded into `WaferError`; auth and admin ----
-    ("admin/ops.rs", "PR 2 (role lookups, one of them a swallow)"),
-    ("admin/mod.rs", "PR 2 (the WRAP-grant delete)"),
-    (
-        "admin/iam.rs",
-        "PR 2 (four role/permission/assignment lookups)",
-    ),
-    (
-        "vector/pages.rs",
-        "PR 2 (five sites; these map a block-MISSING NotFound, documented at \
-         vector/pages.rs:75, so the conversion has to keep that meaning)",
-    ),
-    (
-        "tickets/rest.rs",
-        "PR 2 (through service::ServiceError::Db)",
-    ),
-    (
-        "tickets/pages.rs",
-        "PR 2 (through service::ServiceError::Db)",
-    ),
-    (
-        "dev/generations_api.rs",
-        "PR 2 (two ledger lookups; both answer the 404 through \
-         `no_store_error` because every /b/dev response must carry \
-         Cache-Control: no-store, so the conversion needs a no-store form of \
-         `db_error` rather than the plain one)",
-    ),
     // ---- PR 3: content blocks ----
     ("messages/rest.rs", "PR 3 (two context lookups)"),
     (
@@ -220,8 +204,11 @@ fn only_crud_maps_a_database_error_by_hand() {
          `crud::db_error`, so a WRAP `PermissionDenied` ships from them as a \
          500: {unexpected:?}\n\
          Use `crud::db_error(error, \"X not found\", \"Database error\")`. If \
-         the site genuinely cannot (an `auth::repo::RepoError`, say), add it \
-         to STILL_HAND_MAPPED with the PR that converts it."
+         the site genuinely cannot — a block whose responses all carry a \
+         header, the way `blocks::dev` does — classify through \
+         `crud::classify_db_error` and seal it yourself, as \
+         `dev::no_store_db_error` does. Otherwise add it to \
+         STILL_HAND_MAPPED with the PR that converts it."
     );
 
     clean_but_listed.sort();
