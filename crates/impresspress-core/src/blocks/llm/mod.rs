@@ -215,6 +215,98 @@ pub(super) const DEFAULT_PROVIDER: &str = "impresspress/provider-llm";
 // Inter-block call helpers
 // ---------------------------------------------------------------------------
 
+/// One thread in the chat sidebar, as `impresspress/messages` reports it.
+///
+/// Not a published contract: it is the decoded shape of another block's
+/// response, and the three fields are exactly what the sidebar renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ContextView {
+    /// The context id, which is the llm thread id.
+    pub id: String,
+    /// Display title. Empty renders as "Untitled".
+    pub title: String,
+    /// RFC 3339 timestamp the list is ordered by.
+    pub updated_at: String,
+}
+
+/// Read one column out of a messages-block record as the wire delivers it.
+///
+/// The `database.list` envelope puts the column map under `data`; the
+/// top-level fallback is kept from `history_to_messages`, which has carried
+/// it since before the entries list went through `call_block`. Shared so the
+/// two readers of a messages record (the chat page's bootstrap carrier and
+/// the model-history builder) cannot drift apart on it.
+pub(super) fn record_field<'a>(record: &'a serde_json::Value, field: &str) -> &'a str {
+    record
+        .get("data")
+        .and_then(|data| data.get(field))
+        .or_else(|| record.get(field))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// The records of a `{records: [...], total_count: n}` list answer, or the
+/// error the callee terminated with.
+async fn records_of(out: OutputStream, what: &str) -> Result<Vec<serde_json::Value>, WaferError> {
+    let buffered = out
+        .collect_buffered()
+        .await
+        .map_err(|terminal| match terminal {
+            wafer_run::streams::output::TerminalNotResponse::Error(error) => error,
+            other => WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("{what}: the messages block did not answer: {other:?}"),
+            ),
+        })?;
+    let value: serde_json::Value = serde_json::from_slice(&buffered.body).map_err(|error| {
+        WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            format!("{what}: could not decode the messages block's answer: {error}"),
+        )
+    })?;
+    Ok(value
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Call the messages block to list the caller's threads — the chat page's
+/// sidebar.
+///
+/// `page_size=50` is the cap the page's own `db::list` used, and the messages
+/// block orders contexts by `updated_at` descending for every caller, so the
+/// set is the one the direct read produced except for the owner filter the
+/// block applies (`rest.rs::list_contexts`): the sidebar is owner-scoped now,
+/// as it is for every other caller of that route.
+pub(super) async fn messages_list_contexts(
+    ctx: &dyn Context,
+    original_msg: &Message,
+) -> Result<Vec<ContextView>, WaferError> {
+    let resource = "/b/messages/api/contexts?page_size=50";
+    let msg = crate::util::block_request("retrieve", "GET", resource, original_msg);
+
+    let records = records_of(
+        ctx.call_block("impresspress/messages", msg, InputStream::empty())
+            .await,
+        "thread list",
+    )
+    .await?;
+
+    Ok(records
+        .iter()
+        .map(|record| ContextView {
+            id: record
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            title: record_field(record, "title").to_string(),
+            updated_at: record_field(record, "updated_at").to_string(),
+        })
+        .collect())
+}
+
 /// Call the messages block to create an entry in a context.
 pub(super) async fn messages_create(
     ctx: &dyn Context,
@@ -252,6 +344,10 @@ pub(super) async fn messages_create(
 }
 
 /// Call the messages block to list entries in a context.
+///
+/// Shared by the chat page's bootstrap carrier and the model-history builder.
+/// Still swallows its error into an empty list — that discipline (and
+/// `messages_create`'s `Option`) is T4, Phase 3.
 pub(super) async fn messages_list(
     ctx: &dyn Context,
     original_msg: &Message,
@@ -263,14 +359,7 @@ pub(super) async fn messages_list(
     let out = ctx
         .call_block("impresspress/messages", msg, InputStream::empty())
         .await;
-    if let Ok(buf) = out.collect_buffered().await {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf.body) {
-            if let Some(records) = v.get("records").and_then(|r| r.as_array()) {
-                return records.clone();
-            }
-        }
-    }
-    vec![]
+    records_of(out, "entry list").await.unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

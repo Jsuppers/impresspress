@@ -8,12 +8,18 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
-// Table-name constants live in `crate::messages_schema` so consumers
-// (e.g. the LLM chat UI) can reference them without compiling this module.
-// Re-exported here so existing `messages::service::{CONTEXTS_TABLE,
-// ENTRIES_TABLE}` references inside the messages block continue to resolve.
-pub use crate::messages_schema::{CONTEXTS_TABLE, ENTRIES_TABLE};
 use crate::util::json_map;
+
+/// Table backing `impresspress/messages` contexts (conversations, tasks,
+/// notifications, …). Owned by this block, and named only inside it: the one
+/// consumer outside `blocks/messages/` was the LLM chat page, which reads
+/// both tables through `ctx.call_block("impresspress/messages", ..)` now.
+pub const CONTEXTS_TABLE: &str = "impresspress__messages__contexts";
+
+/// Table backing `impresspress/messages` entries (messages, artifacts,
+/// notifications, status changes). Owned by this block; see
+/// [`CONTEXTS_TABLE`].
+pub const ENTRIES_TABLE: &str = "impresspress__messages__entries";
 
 /// Build an `Equal` filter for `field` when `value` is present. Mirrors the
 /// per-field `if let Some(...) { filters.push(...) }` pattern used across

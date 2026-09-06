@@ -553,10 +553,19 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/migrations/mod.rs",
         ],
     ),
-    // The llm settings door. Nothing but the door itself: the block declares
-    // no `collections(..)` (its schema is materialised by its migrations,
-    // and `mod.rs` says so), so no non-test file has to name the table.
-    ("llm_settings", &["blocks/llm/repo/settings.rs"]),
+    // The llm settings door. The door itself plus the migration runner's
+    // own tests, which assert that the embedded DDL creates the table and
+    // its index — reading the name back from the constant they are testing
+    // would make them tautological. The block declares no `collections(..)`
+    // (its schema is materialised by its migrations, and `mod.rs` says so),
+    // so no other non-test file has to name the table.
+    (
+        "llm_settings",
+        &[
+            "blocks/llm/repo/settings.rs",
+            "blocks/llm/migrations/mod.rs",
+        ],
+    ),
 ];
 
 #[test]
@@ -927,6 +936,12 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         "product_templates",
         &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
     ),
+    // The llm settings door. One entry, and it is a fault injector: the
+    // block's `config_tests` name the table so `FailingDbOpContext` lands on
+    // the settings read under test rather than on some other table's. Same
+    // category as `blocks/admin/pages/blocks.rs` and `blocks/files/quota.rs`
+    // above.
+    ("llm_settings", &["blocks/llm/mod.rs"]),
 ];
 
 #[test]

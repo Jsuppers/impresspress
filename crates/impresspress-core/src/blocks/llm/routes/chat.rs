@@ -20,7 +20,9 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::streaming::sse_chat_response;
 use crate::{
-    blocks::llm::{contracts, messages_create, messages_list, LlmBlock, DEFAULT_PROVIDER},
+    blocks::llm::{
+        contracts, messages_create, messages_list, record_field, LlmBlock, DEFAULT_PROVIDER,
+    },
     http::{err_bad_request, err_internal, ok_json},
 };
 
@@ -67,19 +69,12 @@ fn build_text_message(role: ChatRole, content: String) -> ChatMessage {
 fn history_to_messages(history: &[serde_json::Value]) -> Vec<ChatMessage> {
     history
         .iter()
-        .filter_map(|m| {
-            let role = m
-                .get("data")
-                .and_then(|d| d.get("role"))
-                .or_else(|| m.get("role"))
-                .and_then(|r| r.as_str())?;
-            let content = m
-                .get("data")
-                .and_then(|d| d.get("content"))
-                .or_else(|| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            Some(build_text_message(role_from_str(role), content.to_string()))
+        .filter(|entry| !record_field(entry, "role").is_empty())
+        .map(|entry| {
+            build_text_message(
+                role_from_str(record_field(entry, "role")),
+                record_field(entry, "content").to_string(),
+            )
         })
         .collect()
 }

@@ -22,7 +22,6 @@ pub mod http;
 pub mod isolate_cell;
 pub mod kv;
 pub mod log_level;
-pub mod messages_schema;
 pub mod metrics;
 pub mod migration_helper;
 pub mod multipart;

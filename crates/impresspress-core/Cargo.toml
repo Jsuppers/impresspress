@@ -64,11 +64,10 @@ wasm = ["wafer-run/wasm"]
 # `impresspress/llm` block dispatch; turning off `block-llm` while leaving
 # `llm` on would still drag the block module in.
 #
-# `block-messages` is intentionally NOT implied: PR #191 hoisted the
-# messages table/column constants used by `blocks::llm::pages` into
-# `impresspress-core::messages_schema`, so the llm UI no longer depends on
-# the messages block module being compiled in. Enabling `llm` without
-# `block-messages` now compiles cleanly.
+# `block-messages` arrives through `block-llm` below: the llm block declares
+# `requires(["impresspress/messages", ..])` and reads and writes every thread
+# and entry through `ctx.call_block("impresspress/messages", ..)`, so a build
+# without the messages block registered answers every chat turn with a 404.
 llm = [
     "dep:tokio",
     "dep:tokio-stream",
@@ -108,7 +107,13 @@ native-embedding = [
 block-files = []
 block-messages = []
 block-vector = ["block-llm"]
-block-llm = []
+# `block-llm` implies `block-messages`: `llm.requires` names
+# `impresspress/messages`, and every thread the chat UI lists, every entry it
+# renders and every turn it persists goes through
+# `ctx.call_block("impresspress/messages", ..)`. Without the messages block
+# registered, `dispatch_call` answers `NotFound` and the chat page is empty
+# with no error anywhere. Cargo now says what the block always declared.
+block-llm = ["block-messages"]
 block-legalpages = ["dep:pulldown-cmark"]
 block-tickets = []
 block-userportal = []
