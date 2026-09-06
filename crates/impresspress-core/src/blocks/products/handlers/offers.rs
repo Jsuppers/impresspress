@@ -14,7 +14,7 @@ use crate::{
             stripe,
         },
     },
-    http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthorized, ok_json},
+    http::{err_bad_request, err_conflict, err_not_found, err_unauthorized, ok_json},
 };
 
 #[derive(Clone, Copy)]
@@ -80,10 +80,13 @@ pub(super) async fn verify_product(
     };
     let product = match loaded {
         Ok(product) => product,
-        Err(error) if error.code == ErrorCode::NotFound => {
-            return Err(err_not_found("Product not found"));
+        Err(error) => {
+            return Err(crud::db_error(
+                error,
+                "Product not found",
+                "Could not load product",
+            ))
         }
-        Err(error) => return Err(err_internal("Could not load product", error)),
     };
     if matches!(access, OfferAccess::Owner) {
         let user_id = msg.user_id();
@@ -99,12 +102,21 @@ pub(super) async fn verify_product(
     Ok(product)
 }
 
+/// Map an offer-lifecycle failure onto a response.
+///
+/// The first three arms are the offer domain's own classifications, each
+/// carrying the message that says what to change. The tail is a database
+/// failure and goes through the one door, so a WRAP refusal on
+/// `impresspress__products__offers` is the 403 it is rather than the 500 it
+/// used to be, and a quota keeps its 429. `db_error_internal` rather than
+/// `db_error` because the `NotFound` arm above already claims the caller's
+/// 404.
 pub(super) fn domain_error(error: WaferError) -> OutputStream {
     match error.code {
         ErrorCode::NotFound => err_not_found("Offer not found"),
         ErrorCode::InvalidArgument => err_bad_request(&error.message),
         ErrorCode::FailedPrecondition | ErrorCode::Aborted => err_conflict(&error.message),
-        _ => err_internal("Offer operation failed", error),
+        _ => crud::db_error_internal(error, "Offer operation failed"),
     }
 }
 

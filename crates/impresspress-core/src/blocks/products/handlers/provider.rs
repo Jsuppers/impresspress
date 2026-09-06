@@ -3,12 +3,15 @@
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::products::{
-        contracts::{
-            BillingPortalRequest, EventStatus, OperationStatus, ProviderOperationList,
-            ProviderOperationSummary, SellerOnboardingRequest,
+    blocks::{
+        crud,
+        products::{
+            contracts::{
+                BillingPortalRequest, EventStatus, OperationStatus, ProviderOperationList,
+                ProviderOperationSummary, SellerOnboardingRequest,
+            },
+            repo, stripe, stripe_provider,
         },
-        repo, stripe, stripe_provider,
     },
     http::{
         err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
@@ -62,14 +65,31 @@ fn provider_operation_summary(
     })
 }
 
-fn provider_error(message: &str, error: WaferError) -> OutputStream {
+/// Map a Stripe-provider failure onto a response.
+///
+/// The first three arms are this module's own domain classifications and stay
+/// here: `stripe_provider` raises `PermissionDenied` for a refusal the buyer
+/// or seller can act on ("seller account is suspended"), whose message is the
+/// answer, and `NotFound`/`InvalidArgument` likewise carry the service's own
+/// wording.
+///
+/// Everything below them is a database failure, so it goes through the one
+/// door: [`crud::db_error_internal`] keeps a quota's 429 (which this tail
+/// used to flatten into a 500) and logs anything genuinely internal against a
+/// correlation id. `db_error_internal` rather than `db_error` because a
+/// `NotFound` never reaches it — the arm above claims it — so there is no
+/// caller-named row for it to label.
+pub(in crate::blocks::products) fn provider_error(
+    message: &str,
+    error: WaferError,
+) -> OutputStream {
     match error.code {
         ErrorCode::InvalidArgument | ErrorCode::FailedPrecondition => {
             err_bad_request(&error.message)
         }
         ErrorCode::PermissionDenied => err_forbidden(&error.message),
         ErrorCode::NotFound => err_not_found(&error.message),
-        _ => err_internal(message, error),
+        _ => crud::db_error_internal(error, message),
     }
 }
 

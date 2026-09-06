@@ -162,7 +162,7 @@ pub(in crate::blocks::products) fn write_error(
     match error.code {
         ErrorCode::NotFound => err_not_found("Product not found"),
         ErrorCode::InvalidArgument => err_bad_request(&error.message),
-        _ => err_internal(context, error),
+        _ => crud::db_error_internal(error, context),
     }
 }
 
@@ -260,7 +260,10 @@ pub(super) async fn list_products(
     .await
     {
         Ok(list) => ok_json(&ProductListResponse::from_record_list(&list)),
-        Err(e) => err_internal("Database error", e),
+        // `list_page` is told its table by the block, not by the request, so a
+        // `NotFound` from it means the table is missing — a 500, not an empty
+        // page reported as a 404.
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -334,8 +337,7 @@ async fn verify_product_owner(
             }
             Ok(record)
         }
-        Err(e) if e.code == ErrorCode::NotFound => Err(err_not_found("Product not found")),
-        Err(e) => Err(err_internal("Database error", e)),
+        Err(e) => Err(crud::db_error(e, "Product not found", "Database error")),
     }
 }
 
@@ -375,8 +377,7 @@ async fn verify_deleted_product_owner(
             }
             Ok(record)
         }
-        Err(e) if e.code == ErrorCode::NotFound => Err(err_not_found("Product not found")),
-        Err(e) => Err(err_internal("Database error", e)),
+        Err(e) => Err(crud::db_error(e, "Product not found", "Database error")),
     }
 }
 
@@ -395,8 +396,7 @@ pub(super) async fn handle_get_product(ctx: &dyn Context, msg: &Message) -> Outp
     };
     match repo::products::get(ctx, id).await {
         Ok(record) => product_json(&record),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Product not found", "Database error"),
     }
 }
 
@@ -428,7 +428,8 @@ pub(super) async fn handle_create_product(
     }
     match create_product_row(ctx, data).await {
         Ok(record) => product_json(&record),
-        Err(e) => err_internal("Database error", e),
+        // An insert names no row, so its `NotFound` is a missing table.
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -468,8 +469,7 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
     };
     match repo::products::soft_delete(ctx, id).await {
         Ok(()) => ok_json(&crud::Deleted::done()),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Product not found", "Database error"),
     }
 }
 
@@ -725,10 +725,9 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
     } else {
         match repo::products::get(ctx, source_id).await {
             Ok(source) => source,
-            Err(error) if error.code == ErrorCode::NotFound => {
-                return err_not_found("Product not found");
+            Err(error) => {
+                return crud::db_error(error, "Product not found", "Could not load product")
             }
-            Err(error) => return err_internal("Could not load product", error),
         }
     };
     if owner_only {
@@ -979,7 +978,8 @@ pub(super) async fn handle_user_create_product(
 
     match create_product_row(ctx, data).await {
         Ok(record) => product_json(&record),
-        Err(e) => err_internal("Database error", e),
+        // An insert names no row, so its `NotFound` is a missing table.
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -1088,8 +1088,7 @@ pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message)
     }
     match repo::products::soft_delete(ctx, &id).await {
         Ok(()) => ok_json(&crud::Deleted::done()),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Product not found", "Database error"),
     }
 }
 

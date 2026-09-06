@@ -28,7 +28,7 @@ mod group;
 mod offers;
 mod payment_links;
 mod product;
-mod provider;
+pub(in crate::blocks::products) mod provider;
 pub(in crate::blocks::products) mod seller_policy;
 mod sellers;
 mod stats;

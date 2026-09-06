@@ -27,6 +27,7 @@ use super::{
     stripe_provider, stripe_secret_operations_allowed,
 };
 use crate::{
+    blocks::crud,
     http::{
         err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_not_found,
         err_unauthorized, ok_json,
@@ -989,10 +990,7 @@ async fn handle_offer_checkout(
     }
     let offer = match repo::offers::get_public(ctx, &request.offer_id).await {
         Ok(offer) => offer,
-        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Offer not found");
-        }
-        Err(error) => return err_internal("Could not load offer", error),
+        Err(error) => return crud::db_error(error, "Offer not found", "Could not load offer"),
     };
     let product = match repo::products::get(ctx, &offer.product_id).await {
         Ok(product) => product,
@@ -1002,10 +1000,9 @@ async fn handle_offer_checkout(
         // a server fault. Mapping it to `err_internal` showed a storefront
         // buyer a 500 for the very state the neighbouring refusal calls
         // "Offer not found".
-        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Offer not found");
+        Err(error) => {
+            return crud::db_error(error, "Offer not found", "Could not load offer product")
         }
-        Err(error) => return err_internal("Could not load offer product", error),
     };
 
     let owner_is_user = product.str_field("owner_kind") == "user";
@@ -1041,10 +1038,13 @@ async fn handle_offer_checkout(
                 // the preset was saved, so they may pin hidden or admin-only
                 // variables the buyer could never supply directly.
                 Ok(preset) => (preset.inputs, offer_pricing::InputScope::Management),
-                Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-                    return err_not_found("Checkout preset not found");
+                Err(error) => {
+                    return crud::db_error(
+                        error,
+                        "Checkout preset not found",
+                        "Could not load checkout preset",
+                    )
                 }
-                Err(error) => return err_internal("Could not load checkout preset", error),
             }
         }
         None => (request.inputs.clone(), offer_pricing::InputScope::Public),
@@ -3536,7 +3536,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         return ok_json(&WebhookAck::received());
                     }
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to load disputed purchase", error),
+                        crud::db_error_internal(error, "Failed to load disputed purchase"),
                         "disputed purchase lookup failed"
                     ),
                 };
@@ -3826,7 +3826,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                             None
                         }
                         Err(error) => fail_webhook!(
-                            err_internal("Failed to load refunded purchase", error),
+                            crud::db_error_internal(error, "Failed to load refunded purchase"),
                             "refunded purchase lookup failed"
                         ),
                     };
