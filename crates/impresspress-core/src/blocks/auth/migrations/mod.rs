@@ -40,6 +40,9 @@ const SQL_010_POSTGRES: &str = include_str!("010_strict_schema_columns.postgres.
 const SQL_011_SQLITE: &str = include_str!("011_rate_limit_retention.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_011_POSTGRES: &str = include_str!("011_rate_limit_retention.postgres.sql");
+const SQL_012_SQLITE: &str = include_str!("012_sessions_family.sqlite.sql");
+#[cfg(feature = "postgres")]
+const SQL_012_POSTGRES: &str = include_str!("012_sessions_family.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle(Init)` apply path (auth's `init`).
@@ -56,6 +59,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("009_auth_version", SQL_009_SQLITE),
     ("010_strict_schema_columns", SQL_010_SQLITE),
     ("011_rate_limit_retention", SQL_011_SQLITE),
+    ("012_sessions_family", SQL_012_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`] one
@@ -75,6 +79,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_009_POSTGRES,
     SQL_010_POSTGRES,
     SQL_011_POSTGRES,
+    SQL_012_POSTGRES,
 ];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
@@ -119,11 +124,15 @@ mod strict_upgrade_tests {
     use super::{SQLITE_MIGRATIONS, SQL_010_SQLITE};
     use crate::migration_helper::apply_ddl_via_service;
 
-    /// SQL of every auth migration BEFORE 010 — the pre-upgrade on-disk schema.
+    /// SQL of every auth migration BEFORE 010 — the pre-upgrade on-disk
+    /// schema. `take_while`, not a filter: 012 comes *after* 010 and creates
+    /// the sessions table with the columns 010 adds, so excluding only 010
+    /// would build a schema that already has them and the precondition below
+    /// would be vacuous.
     fn base_migrations_sql() -> Vec<&'static str> {
         SQLITE_MIGRATIONS
             .iter()
-            .filter(|(name, _)| *name != "010_strict_schema_columns")
+            .take_while(|(name, _)| *name != "010_strict_schema_columns")
             .map(|(_, sql)| *sql)
             .collect()
     }

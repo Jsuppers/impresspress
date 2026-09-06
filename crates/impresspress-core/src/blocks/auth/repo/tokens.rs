@@ -160,6 +160,32 @@ pub async fn revoke_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<(),
     Ok(())
 }
 
+/// Deletes rows whose `expires_at < cutoff`. Returns the number deleted.
+///
+/// Rotation revokes rather than deletes — the tombstone is what the SEC-039
+/// reuse check reads — so without this the table only ever grows: a browser
+/// tab adds a row every 30 minutes and nothing has ever removed one. A row
+/// past its `expires_at` can no longer serve reuse detection either, because
+/// the refresh handler rejects an expired refresh JWT on signature verify
+/// before it ever looks the row up.
+///
+/// Called by `auth::maintenance::sweep`. `cutoff` is compared as an ISO-8601
+/// string, the format `now_iso` writes.
+pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, RepoError> {
+    let n = db::delete_by_filters_count(
+        ctx,
+        TABLE,
+        vec![Filter {
+            field: "expires_at".into(),
+            operator: FilterOp::LessThan,
+            value: json!(cutoff),
+        }],
+    )
+    .await
+    .map_err(|e| RepoError::Db(format!("tokens delete_expired: {e}")))?;
+    Ok(n.max(0) as u64)
+}
+
 fn row_from_record(record: db::Record) -> TokenRow {
     let family = record.str_field("family").to_string();
     let user_id = record.str_field("user_id").to_string();

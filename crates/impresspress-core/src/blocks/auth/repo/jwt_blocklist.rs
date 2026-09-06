@@ -74,10 +74,10 @@ pub async fn contains(ctx: &dyn Context, jti: &str) -> bool {
 }
 
 /// Deletes all rows whose `expires_at < cutoff`. Returns the number deleted.
-/// Best-effort sweeper — not required for correctness since `expires_at`
-/// always matches the JWT's natural expiry, so an expired-and-not-yet-pruned
-/// row is harmless (the JWT itself fails structural validation first).
-#[allow(dead_code)]
+/// Called by `auth::maintenance::sweep`. Best-effort for correctness —
+/// `expires_at` always matches the JWT's natural expiry, so an
+/// expired-and-not-yet-pruned row is harmless (the JWT itself fails structural
+/// validation first) — but the table has no other reader that removes rows.
 pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, RepoError> {
     let n = db::delete_by_filters_count(
         ctx,
