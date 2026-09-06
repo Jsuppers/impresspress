@@ -41,7 +41,18 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Load block enabled/disabled state from block_settings table. Collect
     // into a `BTreeMap` so the downstream iteration order is stable across
     // process restarts (a `HashMap` would randomize per-process).
-    let block_settings_rows = block_settings::list_all(ctx).await.unwrap_or_default();
+    // An empty settings table means "nobody has toggled anything", which the
+    // map below renders as every block ENABLED — the state an untouched
+    // deployment is in. A failed read must not be allowed to say that: an
+    // operator checking whether they had disabled a block would be told they
+    // had not.
+    let block_settings_rows = match block_settings::list_all(ctx).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "admin blocks page: block-settings read failed");
+            return crate::ui::server_error_response(msg);
+        }
+    };
 
     let block_enabled: std::collections::BTreeMap<String, bool> = block_settings_rows
         .iter()
@@ -622,5 +633,23 @@ mod toggle_feature_tests {
             0,
             "a failed persist must not write a success audit row"
         );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! An unreadable `block_settings` table used to render every block as
+    //! ENABLED — the toggle state an untouched deployment has — so an
+    //! operator checking whether they had disabled a block was told they had
+    //! not.
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_http_status, TestContext};
+
+    #[tokio::test]
+    async fn a_failing_block_settings_read_renders_the_error_page_not_all_enabled() {
+        let ctx = TestContext::with_admin().await.break_reads();
+        let msg = admin_msg("retrieve", "/b/admin/blocks");
+        assert_eq!(output_http_status(blocks_page(&ctx, &msg).await).await, 500);
     }
 }

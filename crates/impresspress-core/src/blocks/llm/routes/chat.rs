@@ -143,7 +143,15 @@ async fn dispatch_chat(
     let _ = messages_create(ctx, msg, &thread_id, EntryRole::User, &message).await;
 
     // 2. Load prior history (which now includes the just-written user msg).
-    let history = messages_list(ctx, msg, &thread_id).await;
+    //    A history read that FAILED is not an empty conversation: prompting a
+    //    paid provider with no context because the store was unreachable
+    //    charges for an answer to the wrong question. (The rest of this
+    //    prelude's swallowing — the `let _ =` on the user turn above, and
+    //    `messages_create`'s `Option` — is the llm-persistence sweep.)
+    let history = match messages_list(ctx, msg, &thread_id).await {
+        Ok(history) => history,
+        Err(e) => return Err(crate::blocks::crud::db_error_internal(e, "Chat history")),
+    };
     let messages = history_to_messages(&history);
 
     // 3. Resolve the provider block / model via the block's existing logic.
@@ -312,9 +320,13 @@ mod tests {
     use crate::blocks::llm::routes::test_support::{stub_block, PanicCtx};
 
     /// The buffered reply is the contract's four fields and nothing else.
-    /// `message_id` stays present (empty) when persistence is skipped — here
-    /// no messages block is registered — because the schema says it is
-    /// always there.
+    ///
+    /// The fixture registers `impresspress/messages`, which `info().requires`
+    /// lists as a dependency of this block. It used to omit it and the test
+    /// still passed, because the history read swallowed its 404 into an empty
+    /// list and `message_id` was published as `""` — the same swallow that let
+    /// a permanently-404ing history read merge. A history read that fails now
+    /// refuses, so the fixture has to carry the block the deployment does.
     #[tokio::test]
     async fn handle_chat_publishes_exactly_the_contract_fields() {
         use std::sync::Arc;
@@ -329,6 +341,7 @@ mod tests {
         };
 
         let mut ctx = TestContext::with_llm().await;
+        register_messages_block(&mut ctx).await;
         ctx.set_config(DEFAULT_PROVIDER_VAR, "stub-backend");
         ctx.set_config(DEFAULT_MODEL_VAR, "stub-model");
         ctx.register_block(
@@ -343,12 +356,33 @@ mod tests {
             }),
         );
 
+        // A real thread, because the history read now reaches the messages
+        // block for real and a thread that does not exist is a 404 there.
+        let thread = crate::blocks::messages::service::create_context(
+            &ctx,
+            "user-a",
+            "conversation",
+            "T",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .expect("seed a thread");
+
         let body = output_json(
             handle_chat(
                 &stub_block(),
                 &ctx,
-                &Message::new("create:/b/llm/api/chat"),
-                InputStream::from_bytes(br#"{"thread_id":"t1","message":"hi"}"#.to_vec()),
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                InputStream::from_bytes(
+                    serde_json::to_vec(&serde_json::json!({
+                        "thread_id": thread.id,
+                        "message": "hi",
+                    }))
+                    .expect("body"),
+                ),
             )
             .await,
         )
@@ -369,7 +403,35 @@ mod tests {
         assert_eq!(body["content"], "Hello");
         assert_eq!(body["model"], "stub-model");
         assert_eq!(body["truncated"], false);
-        assert_eq!(body["message_id"], "");
+        assert!(
+            body["message_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "the stored assistant turn's id must be published, got {}",
+            body["message_id"]
+        );
+    }
+
+    /// Apply the messages block's migrations into `ctx` and register the
+    /// block, so `ctx.call_block("impresspress/messages", ..)` reaches the
+    /// real handlers — the shape `info().requires` declares.
+    async fn register_messages_block(ctx: &mut crate::test_support::TestContext) {
+        use std::sync::Arc;
+
+        let sqlite: Vec<&str> = crate::blocks::messages::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .map(|(_, sql)| *sql)
+            .collect();
+        crate::migration_helper::apply_migrations(
+            ctx,
+            "impresspress/messages",
+            &sqlite,
+            crate::blocks::messages::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await
+        .expect("apply messages migrations in the chat fixture");
+        ctx.register_block(
+            "impresspress/messages",
+            Arc::new(crate::blocks::messages::MessagesBlock::new()),
+        );
     }
 
     #[tokio::test]
@@ -491,7 +553,8 @@ mod tests {
             &crate::test_support::auth_msg("retrieve", "/b/llm/api/chat", "user-a"),
             &thread.id,
         )
-        .await;
+        .await
+        .expect("the history read succeeds");
         assert_eq!(
             history_to_messages(&history)
                 .iter()

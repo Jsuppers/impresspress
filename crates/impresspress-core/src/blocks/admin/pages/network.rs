@@ -9,8 +9,17 @@ use crate::{
 /// Render JUST the network monitoring body. The parent `settings_page`
 /// handler wraps this in the form-less `tabbed_page` shell. This tab is
 /// read-only monitoring — it renders no `<form>` and has nothing to save.
-pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
-    html! {
+///
+/// Returns `Err` when the monitoring read behind it fails. An outage is
+/// precisely when an operator opens this page, and an empty inbound table
+/// reads as "nothing has reached this deployment", so the parent renders the
+/// error page instead.
+pub async fn settings_body(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
+    let inbound = network_inbound_tab(ctx, msg).await?;
+    Ok(html! {
         div .filter-bar .mb-2 {
             button .btn .btn--secondary .btn--sm
                 hx-get="/b/admin/settings/network"
@@ -26,19 +35,20 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
         }]))
 
         div #network-tab-content {
-            (network_inbound_tab(ctx, msg).await)
+            (inbound)
         }
-    }
+    })
 }
 
-async fn network_inbound_tab(ctx: &dyn Context, msg: &Message) -> Markup {
+async fn network_inbound_tab(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
     let search = msg.query("search").to_string();
 
-    let summary = request_logs::summarise_by_path(ctx, &search, 50)
-        .await
-        .unwrap_or_default();
+    let summary = request_logs::summarise_by_path(ctx, &search, 50).await?;
 
-    html! {
+    Ok(html! {
         div .filter-bar {
             (components::search_input_with_value("search", "Search by path...", "/b/admin/settings/network", "#content", &search))
         }
@@ -96,7 +106,7 @@ async fn network_inbound_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                 }
             }
         }
-    }
+    })
 }
 
 /// Render one inbound-summary row: the clickable row plus its lazily-loaded
@@ -143,6 +153,11 @@ fn inbound_row(
 }
 
 /// Htmx fragment: individual requests for a given inbound path.
+///
+/// This is a fragment htmx swaps into an expanded row, not a page
+/// navigation, so a failed read goes through the one database-error door
+/// rather than swapping a whole styled 500 page into a table cell. An empty
+/// swap would have read as "this path has never been called".
 pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let method = msg.query("method").to_string();
     let path = msg.query("path").to_string();
@@ -150,9 +165,10 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
     let limit: i64 = 20;
 
     // One more than the page shows, to learn whether a next page exists.
-    let rows = request_logs::list_for_path(ctx, &method, &path, offset, limit + 1)
-        .await
-        .unwrap_or_default();
+    let rows = match request_logs::list_for_path(ctx, &method, &path, offset, limit + 1).await {
+        Ok(rows) => rows,
+        Err(e) => return crate::blocks::crud::db_error_internal(e, "Network inbound detail"),
+    };
 
     let has_more = rows.len() as i64 > limit;
     let display_rows = if has_more {
@@ -252,6 +268,41 @@ mod tests {
         assert!(
             !html.contains("method=GET&path="),
             "a raw unescaped query would mean an injection sink survived: {html}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! `/b/admin/settings/network` is a monitoring page, so an outage is
+    //! exactly when an operator opens it — and an empty inbound table read as
+    //! "no traffic has reached this deployment".
+
+    use crate::{
+        blocks::admin::pages::settings::settings_page,
+        test_support::{admin_msg, output_http_status, TestContext},
+    };
+
+    #[tokio::test]
+    async fn a_failing_inbound_summary_renders_the_error_page_not_no_traffic() {
+        let ctx = TestContext::with_admin().await.break_reads();
+        let msg = admin_msg("retrieve", "/b/admin/settings/network");
+        assert_eq!(
+            output_http_status(settings_page(&ctx, &msg, "network").await).await,
+            500
+        );
+    }
+
+    /// The per-path detail fragment htmx swaps into an expanded row. A failed
+    /// read used to swap in an empty table, which reads as "this path has
+    /// never been called".
+    #[tokio::test]
+    async fn a_failing_detail_fragment_is_an_error_not_an_empty_table() {
+        let ctx = TestContext::with_admin().await.break_reads();
+        let msg = admin_msg("retrieve", "/b/admin/settings/network/detail");
+        assert_eq!(
+            output_http_status(super::network_inbound_detail(&ctx, &msg).await).await,
+            500
         );
     }
 }

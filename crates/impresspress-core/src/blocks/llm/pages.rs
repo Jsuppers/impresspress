@@ -32,10 +32,12 @@ fn selected_thread(msg: &Message) -> Option<&str> {
 /// the optional active thread id, returns the inner page Markup. Kept
 /// pure (sync, no `Context`) so the selector-preservation contract can be
 /// verified in unit tests without mocking the database client.
+#[allow(clippy::too_many_arguments)]
 fn render_page_body(
     threads: &[ContextView],
     entries: &[serde_json::Value],
     models: &[ModelInfo],
+    models_unavailable: bool,
     default_model: &str,
     thread_id: Option<&str>,
     llm_chat_js_url: &str,
@@ -61,7 +63,7 @@ fn render_page_body(
     let thread_list = render_thread_list_pane(threads, thread_id);
     let messages_pane = render_messages_pane(entries, thread_id);
     let composer = render_composer(thread_id);
-    let right_rail = render_right_rail(models, default_model);
+    let right_rail = render_right_rail(models, models_unavailable, default_model);
 
     let chat_body =
         crate::ui::templates::chat_page(thread_list, messages_pane, composer, Some(right_rail));
@@ -93,6 +95,16 @@ fn render_page_body(
     }
 }
 
+/// What the model picker says when the remote model list could not be read.
+///
+/// The list is the one read on the chat page that is genuinely optional: the
+/// picker's "Default (remote)" entry routes without it, and the browser-side
+/// WebLLM models in `#local-models-group` never needed it — so a failure here
+/// marks the picker instead of failing the page. It must still be marked:
+/// an empty `<optgroup>` is exactly what a deployment with no remote models
+/// renders.
+const MODELS_UNAVAILABLE: &str = "Remote model list unavailable";
+
 /// Unified handler for `/b/llm/` and `/b/llm/threads/{id}`.
 ///
 /// Renders the canonical `templates::chat_page` (thread list / messages /
@@ -106,15 +118,28 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // same way this block already writes them. The list route is
     // owner-scoped, so the sidebar shows the caller's own threads.
     //
-    // A refusal or an outage still renders an empty sidebar rather than an
-    // error page, which is what the direct read did; the SSR error discipline
-    // is Phase 3 (T4).
-    let threads = messages_list_contexts(ctx, msg).await.unwrap_or_default();
+    // Both propagate. An empty sidebar and an empty message pane are what a
+    // brand-new account renders, and this page has already shipped both of
+    // them for a fortnight on a read that answered 404 to every request —
+    // exactly because these two lines swallowed it.
+    let threads = match messages_list_contexts(ctx, msg).await {
+        Ok(threads) => threads,
+        Err(e) => {
+            tracing::error!(error = %e, "llm chat page: thread list failed");
+            return ui::server_error_response(msg);
+        }
+    };
 
     // Entries for the selected thread, if any. Empty when no thread is
-    // selected.
+    // selected — that is the one genuinely empty case here.
     let entries = match thread_id {
-        Some(tid) => messages_list(ctx, msg, tid).await,
+        Some(tid) => match messages_list(ctx, msg, tid).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!(error = %e, thread_id = %tid, "llm chat page: entry list failed");
+                return ui::server_error_response(msg);
+            }
+        },
         None => Vec::new(),
     };
 
@@ -125,7 +150,15 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         .filter(|title| !title.is_empty());
     let display_title = thread_title.as_deref().unwrap_or("Chat");
 
-    let models = load_models(ctx).await;
+    // See [`MODELS_UNAVAILABLE`]: this one is optional, so it marks the
+    // picker instead of failing the page — but it is marked, not dropped.
+    let (models, models_unavailable) = match load_models(ctx).await {
+        Ok(models) => (models, false),
+        Err(e) => {
+            tracing::error!(error = %e, "llm chat page: remote model list failed");
+            (Vec::new(), true)
+        }
+    };
     let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
 
     let llm_chat_js_url = crate::ui::assets::llm_chat_js_url();
@@ -133,6 +166,7 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         &threads,
         &entries,
         &models,
+        models_unavailable,
         default_model.as_str(),
         thread_id,
         &llm_chat_js_url,
@@ -305,7 +339,11 @@ fn render_composer(thread_id: Option<&str>) -> Markup {
 /// model loading progress container, and a link to the LLM settings
 /// page. Replaces the inline above-messages model strip from the old
 /// chat_page handler.
-fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
+fn render_right_rail(
+    models: &[ModelInfo],
+    models_unavailable: bool,
+    default_model: &str,
+) -> Markup {
     html! {
         div .flex .flex-col .gap-4 .p-2 {
             div {
@@ -321,6 +359,12 @@ fn render_right_rail(models: &[ModelInfo], default_model: &str) -> Markup {
                         (render_model_picker(models, default_model))
                     }
                     optgroup #local-models-group label="Local (WebLLM)" {}
+                }
+                // Rendered only when the list could not be read, so a healthy
+                // page is byte-identical. `#model-status` beside it is owned
+                // by llm-chat.js and is overwritten at runtime.
+                @if models_unavailable {
+                    span .text-muted .d-block .mt-1 .text-xs { (MODELS_UNAVAILABLE) }
                 }
                 span #model-status .text-muted .d-block .mt-1 .text-xs {}
             }
@@ -360,10 +404,16 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let default_provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
     let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
 
-    // Load per-thread overrides. An unreadable settings table renders as an
-    // empty override list here, unchanged from before the repo move — the
-    // error discipline for the SSR page renderers is Phase 3 (T4).
-    let overrides = repo::settings::list_all(ctx).await.unwrap_or_default();
+    // Load per-thread overrides. An empty list means "no thread pins a
+    // provider" — the state an untouched deployment is in — so an unreadable
+    // settings table fails the page rather than borrowing that sentence.
+    let overrides = match repo::settings::list_all(ctx).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "llm settings page: override read failed");
+            return ui::server_error_response(msg);
+        }
+    };
 
     let content = html! {
         (components::page_header(
@@ -507,14 +557,12 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// rendering inlines the picker options from the returned `Vec<ModelInfo>`
 /// without an HTTP roundtrip or a JSON re-encode.
 ///
-/// Returns an empty vec on any failure — the picker falls back to the
-/// "Default (remote)" option and the user can still send a request.
-async fn load_models(ctx: &dyn Context) -> Vec<ModelInfo> {
-    // A dispatch failure is treated as "no models" so the picker still renders
-    // — the user can fall back to the default remote option.
-    wafer_core::clients::llm::list_models(ctx)
-        .await
-        .unwrap_or_default()
+/// Returns `Err` when the service block could not be reached or its answer
+/// could not be decoded. The caller does not fail the page for it — see
+/// [`MODELS_UNAVAILABLE`] for why this one read is optional — but it does not
+/// get to silently look like a deployment with no remote models either.
+async fn load_models(ctx: &dyn Context) -> Result<Vec<ModelInfo>, wafer_run::WaferError> {
+    wafer_core::clients::llm::list_models(ctx).await
 }
 
 /// Render the `<option>` list for the remote-model picker.
@@ -752,7 +800,7 @@ mod tests {
     #[test]
     fn render_right_rail_contains_picker_progress_settings() {
         let models: Vec<ModelInfo> = vec![];
-        let html = render_right_rail(&models, "").into_string();
+        let html = render_right_rail(&models, false, "").into_string();
         assert!(html.contains(r#"id="model-picker""#));
         assert!(html.contains(r#"id="model-progress-container""#));
         assert!(html.contains(r#"id="local-models-group""#));
@@ -794,8 +842,8 @@ mod tests {
     /// disabled composer.
     #[test]
     fn page_body_renders_empty_state_at_root() {
-        let html =
-            render_page_body(&[], &[], &[], "", None, "/b/static/llm-chat-test.js").into_string();
+        let html = render_page_body(&[], &[], &[], false, "", None, "/b/static/llm-chat-test.js")
+            .into_string();
         assert!(html.contains(r#"id="no-thread-prompt""#));
         assert!(html.contains("Start a new conversation"));
         assert!(html.contains(r#"id="chat-form""#));
@@ -814,6 +862,7 @@ mod tests {
             &threads,
             &[],
             &[],
+            false,
             "",
             Some("some-id"),
             "/b/static/llm-chat-test.js",
@@ -831,7 +880,7 @@ mod tests {
     #[test]
     fn page_body_includes_external_llm_chat_js_and_drops_inline_constants() {
         let url = "/b/static/llm-chat-deadbeef.js";
-        let html = render_page_body(&[], &[], &[], "", None, url).into_string();
+        let html = render_page_body(&[], &[], &[], false, "", None, url).into_string();
         assert!(
             html.contains(&format!(r#"src="{url}""#)),
             "missing external llm-chat.js script tag (expected src={url}): {html}"
@@ -853,7 +902,7 @@ mod tests {
     #[test]
     fn page_body_loads_purify_before_marked_and_llm_chat_js() {
         let url = "/b/static/llm-chat-deadbeef.js";
-        let html = render_page_body(&[], &[], &[], "", None, url).into_string();
+        let html = render_page_body(&[], &[], &[], false, "", None, url).into_string();
 
         let purify_url = crate::ui::assets::purify_js_url();
         let marked_url = crate::ui::assets::marked_js_url();
@@ -889,6 +938,7 @@ mod tests {
             &threads,
             &[],
             &[],
+            false,
             "",
             Some("sel-test"),
             "/b/static/llm-chat-test.js",
@@ -947,7 +997,7 @@ mod tests {
         // and inject live script. `type="application/json"` does NOT prevent
         // element termination.
         let entries = vec![record_with_content("</script><img src=x onerror=alert(1)>")];
-        let markup = render_page_body(&[], &entries, &[], "", None, "/x.js");
+        let markup = render_page_body(&[], &entries, &[], false, "", None, "/x.js");
         let html = markup.into_string();
         assert!(
             !html.contains("</script><img"),
@@ -963,8 +1013,8 @@ mod tests {
     /// class + right-rail aside).
     #[test]
     fn page_body_emits_chat_page_template_class() {
-        let html =
-            render_page_body(&[], &[], &[], "", None, "/b/static/llm-chat-test.js").into_string();
+        let html = render_page_body(&[], &[], &[], false, "", None, "/b/static/llm-chat-test.js")
+            .into_string();
         assert!(
             html.contains(r#"class="page--chat""#),
             "expected templates::chat_page wrapper class"
@@ -1140,6 +1190,180 @@ mod messages_boundary_tests {
                 .expect_err("the refusal surfaces")
                 .code,
             wafer_run::ErrorCode::PermissionDenied
+        );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! The chat page during an outage — and the reason this file is not a
+    //! cosmetic sweep.
+    //!
+    //! PR #24 moved both of this page's reads onto `call_block` with a query
+    //! string that `endpoint_match::dispatch` could never match, so both
+    //! 404'd on every request: the thread sidebar was empty and the model
+    //! history was gone. It merged green because BOTH callers swallowed the
+    //! failure into an empty list, and because the test that covered it
+    //! asserted the call had been MADE. PR #29 found it end-to-end.
+    //!
+    //! The assertions here are the ones that were missing: that the result
+    //! REACHED the page, and that a read which did not succeed cannot look
+    //! like a page with nothing on it.
+
+    use wafer_run::{ErrorCode, InputStream, WaferError};
+
+    use super::*;
+    use crate::{
+        blocks::llm::routes::test_support::{admin_msg, routed, RecordingCtx},
+        test_support::{output_html, output_http_status},
+    };
+
+    /// Answers every non-messages call the way `RecordingCtx` does and
+    /// refuses every call to `impresspress/messages`.
+    #[derive(Clone)]
+    struct MessagesDown;
+
+    #[async_trait::async_trait]
+    impl Context for MessagesDown {
+        async fn call_block(
+            &self,
+            block: &str,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            if block == "impresspress/messages" {
+                return OutputStream::error(WaferError::new(ErrorCode::Internal, "messages down"));
+            }
+            OutputStream::respond(br#"{}"#.to_vec())
+        }
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn config_get(&self, _key: &str) -> Option<&str> {
+            None
+        }
+        fn clone_arc(&self) -> std::sync::Arc<dyn Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_messages_block_renders_the_error_page_not_an_empty_chat() {
+        let msg = routed(admin_msg("retrieve", "/b/llm/threads/t1"));
+        assert_eq!(
+            output_http_status(page(&MessagesDown, &msg).await).await,
+            500,
+            "a dead thread/history read must not render as a chat with no history"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_messages_block_fails_the_root_chat_page_too() {
+        let msg = routed(admin_msg("retrieve", "/b/llm/"));
+        assert_eq!(
+            output_http_status(page(&MessagesDown, &msg).await).await,
+            500,
+            "the sidebar is read at the root page too, and its failure is not an empty sidebar"
+        );
+    }
+
+    /// The positive half: what the messages block reported reaches the
+    /// rendered page, and neither empty state is on it.
+    ///
+    /// `the_chat_page_reads_threads_and_entries_through_the_messages_block`
+    /// asserts the two calls were made and their paths; this asserts the
+    /// answers arrived, which is the assertion whose absence let the dead
+    /// read merge.
+    #[tokio::test]
+    async fn the_answers_from_the_messages_block_reach_the_rendered_page() {
+        let ctx = RecordingCtx::default()
+            .answering(
+                "/entries",
+                serde_json::json!({
+                    "records": [{
+                        "id": "e1",
+                        "data": {
+                            "role": "user",
+                            "content": "does my plan renew",
+                            "created_at": "2026-09-06T10:00:00Z",
+                        }
+                    }],
+                    "total_count": 1,
+                }),
+            )
+            .answering(
+                "/b/messages/api/contexts",
+                serde_json::json!({
+                    "records": [{
+                        "id": "t1",
+                        "data": {
+                            "title": "Renewal questions",
+                            "updated_at": "2026-09-06T10:00:00Z",
+                        }
+                    }],
+                    "total_count": 1,
+                }),
+            );
+
+        let html =
+            output_html(page(&ctx, &routed(admin_msg("retrieve", "/b/llm/threads/t1"))).await)
+                .await;
+
+        assert!(
+            html.contains("Renewal questions"),
+            "the thread the messages block reported must be in the sidebar: {html}"
+        );
+        assert!(
+            !html.contains("No threads yet."),
+            "the sidebar must not render its empty state when a thread was returned: {html}"
+        );
+        assert!(
+            html.contains("does my plan renew"),
+            "the entry the messages block reported must reach the page: {html}"
+        );
+    }
+
+    /// The model list is the one read on this page that is genuinely
+    /// optional — the picker's "Default (remote)" entry and the browser-side
+    /// WebLLM models work without it — so its failure marks the picker
+    /// rather than failing the page. What it must not do is what it did:
+    /// render exactly like a deployment that has no remote models.
+    #[tokio::test]
+    async fn an_unavailable_model_list_marks_the_picker_and_still_renders_the_chat() {
+        let ctx = RecordingCtx::default().answering(
+            "/b/messages/api/contexts",
+            serde_json::json!({ "records": [], "total_count": 0 }),
+        );
+
+        let html = output_html(page(&ctx, &routed(admin_msg("retrieve", "/b/llm/"))).await).await;
+
+        assert!(
+            html.contains(MODELS_UNAVAILABLE),
+            "an unreadable model list must say so on the picker: {html}"
+        );
+        assert!(
+            html.contains(r#"id="chat-input""#),
+            "the chat itself still renders: {html}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod settings_outage_tests {
+    //! The settings page's per-thread override list.
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_http_status, TestContext};
+
+    /// An empty override list means "no thread pins a provider", which is
+    /// what an untouched deployment renders. A failed read must not say it.
+    #[tokio::test]
+    async fn a_failing_override_read_renders_the_error_page_not_no_overrides() {
+        let ctx = TestContext::with_llm().await.break_reads();
+        let msg = admin_msg("retrieve", "/b/llm/settings");
+        assert_eq!(
+            output_http_status(settings_page(&ctx, &msg).await).await,
+            500
         );
     }
 }

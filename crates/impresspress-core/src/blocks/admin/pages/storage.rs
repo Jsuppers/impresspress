@@ -21,6 +21,16 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         { (icons::refresh_cw()) " Refresh" }
     };
 
+    // "No storage access logs yet." is what a deployment whose blocks have
+    // never touched storage renders; an unreadable log must not borrow it.
+    let logs_tab = match storage_logs_tab(ctx, msg).await {
+        Ok(markup) => markup,
+        Err(e) => {
+            tracing::error!(error = %e, "admin storage page: access-log read failed");
+            return crate::ui::server_error_response(msg);
+        }
+    };
+
     let tabs_and_body = html! {
         (components::tab_navigation(vec![components::Tab {
             active: true,
@@ -30,7 +40,7 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }]))
 
         div #storage-tab-content {
-            (storage_logs_tab(ctx, msg).await)
+            (logs_tab)
         }
     };
 
@@ -60,7 +70,10 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
+async fn storage_logs_tab(
+    ctx: &dyn Context,
+    _msg: &Message,
+) -> Result<Markup, wafer_run::WaferError> {
     let logs = db::list(
         ctx,
         STORAGE_ACCESS_LOGS,
@@ -81,11 +94,10 @@ async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
             ..Default::default()
         },
     )
-    .await
-    .map(|r| r.records)
-    .unwrap_or_default();
+    .await?
+    .records;
 
-    html! {
+    Ok(html! {
         p .text-muted .mb-4 {
             "Recent storage access by blocks. Each block is isolated to "
             code { "/storage/{block-name}/" }
@@ -140,5 +152,24 @@ async fn storage_logs_tab(ctx: &dyn Context, _msg: &Message) -> Markup {
                 }
             }
         }
+    })
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! "No storage access logs yet." is what a deployment whose blocks have
+    //! never touched storage renders. An outage rendered the same sentence.
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_http_status, TestContext};
+
+    #[tokio::test]
+    async fn a_failing_access_log_read_renders_the_error_page_not_an_empty_log() {
+        let ctx = TestContext::with_admin().await.break_reads();
+        let msg = admin_msg("retrieve", "/b/admin/storage");
+        assert_eq!(
+            output_http_status(storage_page(&ctx, &msg).await).await,
+            500
+        );
     }
 }

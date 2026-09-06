@@ -785,6 +785,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // `("database.sum", objects::TABLE)` — the same, through the
             // `/b/cloudstorage/quota` handler
             "blocks/files/cloud.rs",
+            // `("database.aggregate", objects::TABLE)` — the bucket-list
+            // page's SECOND read. `break_reads` cannot reach it (the bucket
+            // listing fails first), so the outage test names the table to put
+            // the fault on the object-count aggregate alone.
+            "blocks/files/pages_user/buckets.rs",
+            // `("database.list", objects::TABLE)` — the object-list page's
+            // "bucket found, listing failed" shape: the ownership check reads
+            // the buckets table and must still land.
+            "blocks/files/pages_user/objects.rs",
         ],
     ),
     (
@@ -795,6 +804,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // authorization test: a failed ownership read must stop the
             // request rather than skip the check
             "blocks/files/cloud.rs",
+            // `("database.list", shares::TABLE)` — the cloudstorage page's
+            // outage test, scoped so the quota reads beside it still land
+            "blocks/files/pages_user/cloudstorage.rs",
         ],
     ),
     (

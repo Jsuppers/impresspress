@@ -109,14 +109,17 @@ pub fn render_shares_table(rows: &[ShareRow]) -> Markup {
     }
 }
 
-async fn list_shares_for_user(ctx: &dyn Context, user_id: &str) -> Vec<ShareRow> {
-    match repo::shares::list_all_for_user(ctx, user_id).await {
-        Ok(rows) => rows.iter().map(ShareRow::from).collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, "shares list failed");
-            Vec::new()
-        }
-    }
+/// The user's share links, or the failure that stopped us reading them.
+///
+/// The quota card on the same page already refuses to render a figure it
+/// could not read; an empty share table is the same lie in table form ("you
+/// have shared nothing"), so it fails the page the same way.
+async fn list_shares_for_user(
+    ctx: &dyn Context,
+    user_id: &str,
+) -> Result<Vec<ShareRow>, wafer_run::WaferError> {
+    let rows = repo::shares::list_all_for_user(ctx, user_id).await?;
+    Ok(rows.iter().map(ShareRow::from).collect())
 }
 
 /// GET `/b/cloudstorage/` — share list with quota card.
@@ -126,7 +129,13 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
         return crate::ui::not_found_response(msg);
     }
 
-    let shares = list_shares_for_user(ctx, &user_id).await;
+    let shares = match list_shares_for_user(ctx, &user_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, user_id = %user_id, "cloud storage page: share list failed");
+            return crate::ui::server_error_response(msg);
+        }
+    };
     // Same quota source as upload enforcement (`quota::check_quota`), so
     // the card can never disagree with what the API enforces.
     let used_bytes = crate::blocks::files::quota::get_used_bytes(ctx, &user_id).await;
@@ -372,6 +381,35 @@ mod integration_tests {
         assert!(
             body.contains("/b/static/files-browser-"),
             "files-browser.js script tag missing: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! A share listing that FAILED is not "no share links".
+    //!
+    //! The quota card beside it already fails the page (Phase 2); the share
+    //! table did not, so an outage rendered a page that said the user had
+    //! shared nothing.
+
+    use super::*;
+    use crate::{
+        blocks::files::repo,
+        test_support::{admin_msg, output_http_status, FailingDbOpContext, TestContext},
+    };
+
+    #[tokio::test]
+    async fn a_failing_share_list_renders_the_error_page_not_an_empty_one() {
+        let ctx = TestContext::with_files().await;
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.list", repo::shares::TABLE)]);
+
+        let out = cloudstorage_page(&failing, &admin_msg("retrieve", "/b/cloudstorage/")).await;
+        assert_eq!(
+            output_http_status(out).await,
+            500,
+            "an unreadable share list must not render as no shares"
         );
     }
 }

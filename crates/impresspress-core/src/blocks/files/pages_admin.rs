@@ -137,7 +137,13 @@ pub fn render_admin_overview_quotas_hint(quotas_count: i64) -> Markup {
 pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
-    let stats = load_admin_stats(ctx).await;
+    let stats = match load_admin_stats(ctx).await {
+        Ok(stats) => stats,
+        Err(e) => {
+            tracing::error!(error = %e, "storage admin overview: stats read failed");
+            return ui::server_error_response(msg);
+        }
+    };
 
     // Tabs go in the `filters` slot (their padding gutter matches
     // /b/admin/users); stats live in the body. Keeping them in separate
@@ -169,44 +175,28 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-async fn load_admin_stats(ctx: &dyn Context) -> AdminStats {
-    let buckets = repo::buckets::count_all(ctx).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e.message, "admin overview: bucket count failed");
-        0
-    });
+/// The five overview figures, or the failure that stopped us reading one.
+///
+/// Every one of these used to fall back to `0`, and the page reads the same
+/// zeroes an untouched deployment produces — down to the "Create your first
+/// bucket" call to action, which an operator would follow into a deployment
+/// that already has buckets. The overview is a statement about the whole
+/// deployment, so a figure that could not be read fails the page rather than
+/// being published as a number.
+async fn load_admin_stats(ctx: &dyn Context) -> Result<AdminStats, wafer_run::WaferError> {
+    let buckets = repo::buckets::count_all(ctx).await?;
+    let files = repo::objects::count_completed(ctx).await?;
+    let shares = repo::shares::count_all(ctx).await?;
+    let quotas_count = repo::quota::count_all(ctx).await?;
+    let total_size_bytes = repo::objects::sum_size_completed(ctx).await? as i64;
 
-    let files = repo::objects::count_completed(ctx)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e.message, "admin overview: files count failed");
-            0
-        });
-
-    let shares = repo::shares::count_all(ctx).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e.message, "admin overview: shares count failed");
-        0
-    });
-
-    let quotas_count = repo::quota::count_all(ctx).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e.message, "admin overview: quotas count failed");
-        0
-    });
-
-    let total_size_bytes = repo::objects::sum_size_completed(ctx)
-        .await
-        .map(|s| s as i64)
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e.message, "admin overview: total size sum failed");
-            0
-        });
-
-    AdminStats {
+    Ok(AdminStats {
         buckets,
         files,
         total_size_bytes,
         shares,
         quotas_count,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -292,8 +282,8 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let rows: Vec<AdminBucketRow> = match repo::buckets::list_recent(ctx, 100).await {
         Ok(page) => page.rows.iter().map(AdminBucketRow::from).collect(),
         Err(e) => {
-            tracing::warn!(error = %e.message, "admin bucket list failed");
-            Vec::new()
+            tracing::error!(error = %e, "storage admin buckets: read failed");
+            return ui::server_error_response(msg);
         }
     };
 
@@ -423,8 +413,8 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let rows: Vec<AdminShareRow> = match repo::shares::list_recent(ctx, 100, 0).await {
         Ok(page) => page.rows.iter().map(AdminShareRow::from).collect(),
         Err(e) => {
-            tracing::warn!(error = %e.message, "admin shares list failed");
-            Vec::new()
+            tracing::error!(error = %e, "storage admin shares: read failed");
+            return ui::server_error_response(msg);
         }
     };
 
@@ -516,8 +506,8 @@ pub async fn quotas(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let rows: Vec<AdminQuotaRow> = match repo::quota::list_recent(ctx, 100).await {
         Ok(page) => page.rows.iter().map(AdminQuotaRow::from).collect(),
         Err(e) => {
-            tracing::warn!(error = %e.message, "admin quotas list failed");
-            Vec::new()
+            tracing::error!(error = %e, "storage admin quotas: read failed");
+            return ui::server_error_response(msg);
         }
     };
 
@@ -987,5 +977,46 @@ mod b13_visibility_tests {
             "a bucket created private must read private on both pages; \
              user page said public={user}, admin page said public={admin}"
         );
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    //! The four storage-admin pages during a database outage.
+    //!
+    //! Each one used to log a warning and render its empty state: an overview
+    //! of five zeroes (with the "Create your first bucket" call to action an
+    //! operator would follow into a deployment that already has buckets), and
+    //! three tables saying there are no buckets, no shares and no quotas.
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_http_status, TestContext};
+
+    #[tokio::test]
+    async fn a_failing_stats_read_renders_the_error_page_not_five_zeroes() {
+        let ctx = TestContext::with_files().await.break_reads();
+        let out = overview(&ctx, &admin_msg("retrieve", "/b/storage/admin/")).await;
+        assert_eq!(output_http_status(out).await, 500);
+    }
+
+    #[tokio::test]
+    async fn a_failing_bucket_list_renders_the_error_page() {
+        let ctx = TestContext::with_files().await.break_reads();
+        let out = buckets(&ctx, &admin_msg("retrieve", "/b/storage/admin/buckets")).await;
+        assert_eq!(output_http_status(out).await, 500);
+    }
+
+    #[tokio::test]
+    async fn a_failing_share_list_renders_the_error_page() {
+        let ctx = TestContext::with_files().await.break_reads();
+        let out = shares(&ctx, &admin_msg("retrieve", "/b/storage/admin/shares")).await;
+        assert_eq!(output_http_status(out).await, 500);
+    }
+
+    #[tokio::test]
+    async fn a_failing_quota_list_renders_the_error_page() {
+        let ctx = TestContext::with_files().await.break_reads();
+        let out = quotas(&ctx, &admin_msg("retrieve", "/b/storage/admin/quotas")).await;
+        assert_eq!(output_http_status(out).await, 500);
     }
 }
