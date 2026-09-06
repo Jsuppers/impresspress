@@ -25,7 +25,7 @@ Open **Admin → Products → Stripe setup** and configure/test the account ther
 | `IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET` | Signing secret for `/b/products/webhooks`. Test and live destinations have different secrets. |
 | `IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION` | Stripe version sent by every provider request; default is `2026-02-25.clover`. Configure the webhook destination consistently. |
 | `IMPRESSPRESS__PRODUCTS__DEFAULT_CURRENCY` | ISO three-letter default for new products. Each order remains single-currency. |
-| `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` | Two-letter platform country used by tax/shipping and Connect defaults. |
+| `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` | Two-letter platform country used by tax/shipping and Connect defaults. Blank means "not configured": Connect account creation omits the country and lets Stripe infer it, and an offer that collects a shipping address without naming its own allowed countries is refused rather than defaulting to one. A non-empty value that is not two letters is an error. |
 | `IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS` | Comma-separated HTTPS origins allowed in success/cancel/return URLs. Localhost HTTP is accepted for development. |
 | `IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX` | Default automatic-tax choice for new offers. An offer can override it. |
 | `IMPRESSPRESS__PRODUCTS__STRIPE_API_URL` | Stripe base URL. Leave as `https://api.stripe.com` outside contract tests. |
@@ -47,7 +47,7 @@ User selling is off by default. Set `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS=true`
 | Setting | Meaning |
 | --- | --- |
 | `IMPRESSPRESS__PRODUCTS__SELLER_MODERATION_REQUIRED` | Defaults to `true`; sellers submit listings and an admin approves them. |
-| `IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS` | Platform application fee in basis points, from 0 to 10,000. |
+| `IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS` | Platform application fee in basis points, from 0 to 10,000. Anything else is refused on every path — onboarding, checkout, Payment Links and the seller pages — rather than read as no fee. |
 | `IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_TEMPLATES` | Optional IDs from `simple_product`, `simple_subscription`, `configurable_product`, `configurable_subscription`. Blank allows all. |
 | `IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CURRENCIES` | Optional ISO currency allowlist. |
 | `IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CATEGORIES` | Optional seller category allowlist. |
@@ -107,6 +107,8 @@ The API returns a short-lived `client_secret`. The widget loads Stripe.js and mo
 An active offer with no variables can create a link directly. A configurable offer first saves a validated named preset, then creates/reuses an immutable Stripe Payment Link snapshot for those values. Payment Links can be copied, opened, retried after sync failure, and deactivated.
 
 Payment Links require saved Stripe shipping-rate IDs (`shr_…`). Hosted and embedded Checkout may use validated inline shipping rates.
+
+An offer that collects a shipping address must be able to name at least one country: either its own allowed-shipping-countries list, or `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY`. Stripe requires `shipping_address_collection[allowed_countries]` whenever the address is collected at all, so a checkout that can name none is refused instead of shipping somewhere nobody chose.
 
 ## Static HTML widget
 

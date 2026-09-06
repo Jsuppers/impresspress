@@ -714,10 +714,7 @@ async fn handle_create_wrap_grant(
     let form = parse_form_body(&raw);
     let grantee = form.get("grantee").cloned().unwrap_or_default();
     let resource = form.get("resource").cloned().unwrap_or_default();
-    let write = form
-        .get("write")
-        .map(|v| v == "on" || v == "true" || v == "1")
-        .unwrap_or(false);
+    let write = crate::config_vars::form_bool(&form, "write");
     let resource_type = form.get("resource_type").cloned().unwrap_or_default();
     let description = form.get("description").cloned().unwrap_or_default();
 

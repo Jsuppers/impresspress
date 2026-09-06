@@ -178,6 +178,60 @@ async fn seed_active_offer(
     offer.offer.id
 }
 
+/// Seed a platform-owned product whose single active offer collects a
+/// shipping address, with `allowed` as the offer's allowed country list
+/// (empty = "the offer names none").
+async fn seed_shipping_offer(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+    allowed: &[&str],
+) -> String {
+    seed(
+        ctx,
+        repo::products::TABLE,
+        product_id,
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Shipped print")),
+            ("slug".to_string(), serde_json::json!(product_id)),
+            ("status".to_string(), serde_json::json!("active")),
+            ("approval_status".to_string(), serde_json::json!("approved")),
+            ("owner_kind".to_string(), serde_json::json!("platform")),
+            ("owner_id".to_string(), serde_json::json!("")),
+            ("created_by".to_string(), serde_json::json!("")),
+        ]),
+    )
+    .await;
+    let definition: OfferDefinitionRequest = serde_json::from_value(serde_json::json!({
+        "name": "Shipped print",
+        "mode": "payment",
+        "currency": "nzd",
+        "pricing_model": "fixed",
+        "interval_count": 1,
+        "usage_type": "licensed",
+        "billing_scheme": "per_unit",
+        "tax_behavior": "exclusive",
+        "variables": [],
+        "components": [{
+            "key": "base",
+            "label": "Print",
+            "required": true,
+            "amount": {"type": "fixed", "unit_amount_minor": 4000}
+        }],
+        "checkout": {
+            "collect_shipping_address": true,
+            "allowed_shipping_countries": allowed,
+        }
+    }))
+    .unwrap();
+    let offer = repo::offers::create(ctx, product_id, "admin_1", &definition)
+        .await
+        .expect("create offer");
+    repo::offers::publish(ctx, product_id, &offer.offer.id)
+        .await
+        .expect("publish offer");
+    offer.offer.id
+}
+
 /// Build a valid Stripe webhook message with correct HMAC signature.
 fn webhook_msg(payload: &serde_json::Value, secret: &str) -> (Message, InputStream) {
     let payload_bytes = serde_json::to_vec(payload).unwrap();
@@ -3440,6 +3494,155 @@ async fn catalog_sync_persists_fixed_prices_and_reuses_them_in_checkout_and_paym
     assert!(link_form.contains("line_items[0][price_data][unit_amount]=100"));
 }
 
+/// [B21] A Stripe outage during catalog sync is retryable, not a rejection.
+///
+/// `stripe_catalog_post` classified every status of 400 or more as
+/// `FailedPrecondition` — terminal — while `StripeClient::request_json`, one
+/// file over, has always treated 429 and 5xx as `Internal`. So a Stripe 503
+/// reached the operator as `409 Stripe rejected catalog synchronization` and
+/// was written into the offer's `sync_error` in those words: a transient
+/// outage recorded as a permanent refusal, on the one row an operator would
+/// read to decide whether to retry.
+#[tokio::test]
+async fn catalog_sync_classifies_a_provider_outage_as_retryable() {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_outage",
+    )])
+    .await;
+    let requests = register_stripe_sequence(
+        &mut ctx,
+        vec![(503, serde_json::json!({"error": {"type": "api_error"}}))],
+    );
+    let product_id = "product_catalog_outage";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+
+    let error = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
+        .await
+        .expect_err("a 503 must fail the sync");
+    assert_eq!(
+        error.code,
+        ErrorCode::Internal,
+        "a 503 is retryable, not a terminal rejection: {}",
+        error.message
+    );
+    assert!(error.message.contains("503"), "{}", error.message);
+    let failed = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    assert!(
+        !failed.sync_error.to_ascii_lowercase().contains("reject"),
+        "the persisted sync error must not call an outage a rejection: {}",
+        failed.sync_error
+    );
+    assert!(failed.sync_error.contains("503"), "{}", failed.sync_error);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// The other half of the same classification: a deterministic 400 stays
+/// terminal, because retrying it changes nothing.
+#[tokio::test]
+async fn catalog_sync_classifies_a_provider_rejection_as_terminal() {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_rejected",
+    )])
+    .await;
+    register_stripe_sequence(
+        &mut ctx,
+        vec![(
+            400,
+            serde_json::json!({"error": {"code": "parameter_invalid_empty"}}),
+        )],
+    );
+    let product_id = "product_catalog_rejected";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+
+    let error = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
+        .await
+        .expect_err("a 400 must fail the sync");
+    assert_eq!(
+        error.code,
+        ErrorCode::FailedPrecondition,
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("parameter_invalid_empty"),
+        "the provider's own error code must survive: {}",
+        error.message
+    );
+}
+
+/// [B21] The Payment-Link deactivate classified in the opposite direction:
+/// **every** failure was `Internal`, so a deterministic 400 was reported as
+/// retryable and the caller was invited to try it again forever.
+#[tokio::test]
+async fn payment_link_deactivation_classifies_a_provider_rejection_as_terminal() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+    ])
+    .await;
+    let product_id = "product_link_deactivate";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+    let offer = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &offer.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: serde_json::from_value(serde_json::json!({"pages": 2})).unwrap(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let pending = repo::payment_links::create_pending(
+        &ctx,
+        &offer_id,
+        "",
+        "",
+        "",
+        false,
+        "deactivate-config",
+        &preview,
+        0,
+    )
+    .await
+    .unwrap();
+    let link_id = pending.managed.id;
+    repo::payment_links::mark_synced(
+        &ctx,
+        &link_id,
+        "plink_deactivate",
+        "https://buy.stripe.com/deactivate",
+    )
+    .await
+    .unwrap();
+    register_stripe_sequence(
+        &mut ctx,
+        vec![(
+            400,
+            serde_json::json!({"error": {"code": "resource_missing"}}),
+        )],
+    );
+
+    let error = stripe::deactivate_payment_link(&ctx, &offer_id, &link_id)
+        .await
+        .expect_err("Stripe rejected the deactivation");
+    assert_eq!(
+        error.code,
+        ErrorCode::FailedPrecondition,
+        "a 400 is a rejection, not an outage: {}",
+        error.message
+    );
+    assert!(
+        repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap()[0]
+            .active,
+        "a rejected deactivation must not deactivate the local row"
+    );
+}
+
 #[tokio::test]
 async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product() {
     let mut ctx = ctx_with(&[(
@@ -4420,6 +4623,169 @@ async fn seller_offer_checkout_uses_direct_charge_header_and_application_fee() {
     assert_eq!(requests[0].headers["Stripe-Account"], "acct_connected_1");
     let form = String::from_utf8(requests[0].body.clone().unwrap()).unwrap();
     assert!(form.contains("payment_intent_data[application_fee_amount]=27"));
+}
+
+/// [B22] A garbage application fee refuses the checkout instead of quietly
+/// taking no platform fee.
+///
+/// `SELLER_APPLICATION_FEE_BPS` was parsed with `.ok().filter(..)
+/// .unwrap_or(0)` on both money paths, so any value the `u16` parse rejected
+/// — a stray `%`, a percentage rather than basis points, a blanked field —
+/// charged the buyer in full and paid the platform nothing, with no error
+/// anywhere. Seller onboarding refused the identical value.
+#[tokio::test]
+async fn seller_offer_checkout_refuses_a_misconfigured_application_fee() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+        ("IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS", "2.5%"),
+    ])
+    .await;
+    let requests = register_stripe_network(
+        &mut ctx,
+        serde_json::json!({"id": "must_not_be_used", "url": "https://example.invalid"}),
+    );
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_account_bad_fee",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("seller_bad_fee")),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_bad_fee"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+        ]),
+    )
+    .await;
+    let offer_id = seed_active_offer(&ctx, "seller_product_bad_fee", "seller_bad_fee").await;
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({"offer_id": offer_id, "inputs": {"pages": 4}}),
+    );
+    assert!(
+        output_is_error(
+            stripe::handle_checkout(&ctx, &msg, input).await,
+            ErrorCode::Internal
+        )
+        .await,
+        "a fee the platform cannot parse must refuse the sale, not take zero"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "no Checkout Session may be created with a fee nobody could read"
+    );
+}
+
+/// [B23] With no platform country and no allowed shipping countries, a
+/// checkout that collects a shipping address is refused rather than shipped
+/// to the United States.
+///
+/// `stripe.rs` defaulted `PLATFORM_COUNTRY` to `"US"` and also fell back to
+/// `"US"` on an unreadable value, while the `ConfigVar` and seller
+/// onboarding default it to empty — so an NZ merchant who left it unset got
+/// a US-only Checkout and no error. Omitting the key instead is not an
+/// option: `allowed_countries` is a required member of Stripe's
+/// `shipping_address_collection`, so omitting it collects no address at all.
+#[tokio::test]
+async fn shipping_checkout_refuses_when_no_country_is_configured() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+    ])
+    .await;
+    let requests = register_stripe_network(
+        &mut ctx,
+        serde_json::json!({"id": "must_not_be_used", "url": "https://example.invalid"}),
+    );
+    let offer_id = seed_shipping_offer(&ctx, "product_shipping_no_country", &[]).await;
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({"offer_id": offer_id, "inputs": {}}),
+    );
+    let out = stripe::handle_checkout(&ctx, &msg, input).await;
+    assert!(
+        output_is_error(out, ErrorCode::InvalidArgument).await,
+        "an offer collecting a shipping address with no country list and no platform country must refuse"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "no Checkout Session may be created with a fabricated country list"
+    );
+}
+
+/// An offer that names its own shipping countries never needed the platform
+/// country and still does not: the refusal above is only for the offer that
+/// names none.
+#[tokio::test]
+async fn shipping_checkout_prefers_the_offers_own_country_list() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+    ])
+    .await;
+    let requests = register_stripe_network(
+        &mut ctx,
+        serde_json::json!({
+            "id": "cs_test_offer_countries",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_offer_countries"
+        }),
+    );
+    let offer_id = seed_shipping_offer(&ctx, "product_shipping_offer_list", &["au", "NZ"]).await;
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({"offer_id": offer_id, "inputs": {}}),
+    );
+    let body = output_to_json(stripe::handle_checkout(&ctx, &msg, input).await).await;
+    assert!(body["checkout_url"].is_string());
+    let requests = requests.lock().unwrap();
+    let form = String::from_utf8(requests[0].body.clone().unwrap()).unwrap();
+    assert!(
+        form.contains("shipping_address_collection[allowed_countries][0]=AU")
+            && form.contains("shipping_address_collection[allowed_countries][1]=NZ"),
+        "{form}"
+    );
+}
+
+/// The same offer ships once the platform country is set — and it ships to
+/// that country, not to the deleted `"US"` default.
+#[tokio::test]
+async fn shipping_checkout_uses_the_configured_platform_country() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+        ("IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY", "nz"),
+    ])
+    .await;
+    let requests = register_stripe_network(
+        &mut ctx,
+        serde_json::json!({
+            "id": "cs_test_shipping",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_shipping"
+        }),
+    );
+    let offer_id = seed_shipping_offer(&ctx, "product_shipping_nz", &[]).await;
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({"offer_id": offer_id, "inputs": {}}),
+    );
+    let body = output_to_json(stripe::handle_checkout(&ctx, &msg, input).await).await;
+    assert!(body["checkout_url"].is_string());
+    let requests = requests.lock().unwrap();
+    let form = String::from_utf8(requests[0].body.clone().unwrap()).unwrap();
+    assert!(
+        form.contains("shipping_address_collection[allowed_countries][0]=NZ"),
+        "{form}"
+    );
 }
 
 #[tokio::test]

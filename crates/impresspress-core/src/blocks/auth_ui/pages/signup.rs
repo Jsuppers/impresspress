@@ -11,10 +11,8 @@ use crate::{
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let allow_signup = ctx
-        .config_get("WAFER_RUN_SHARED__ALLOW_SIGNUP")
-        .unwrap_or("true")
-        == "true";
+    let allow_signup =
+        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await;
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
     // Validate redirect — only allow relative paths (prevent open redirect)
     let redirect = if is_safe_local_redirect(&raw_redirect) {

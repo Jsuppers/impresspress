@@ -127,7 +127,7 @@ impl SecurityReadiness {
                 crate::features::BlockSettings::state_for(value, "impresspress/tickets").enabled
             })
             .unwrap_or(true);
-        let public_enabled = bool_value(&config::get_default(ctx, PUBLIC_ENABLED, "false").await);
+        let public_enabled = crate::config_vars::get_bool(ctx, PUBLIC_ENABLED, false).await;
         let site_key_configured = !config::get_default(ctx, TURNSTILE_SITE_KEY, "")
             .await
             .trim()
@@ -196,13 +196,6 @@ pub async fn u64_value(ctx: &dyn Context, key: &str, default: u64) -> u64 {
 
 async fn positive(ctx: &dyn Context, key: &str, default: u64) -> bool {
     u64_value(ctx, key, default).await > 0
-}
-
-fn bool_value(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 #[cfg(test)]

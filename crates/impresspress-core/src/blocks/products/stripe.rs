@@ -14,6 +14,7 @@ use wafer_core::clients::{
 use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
+    config::{platform_country, seller_fee_bps, CountryCode},
     contracts::{
         self, AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, EventStatus,
         ManagedOffer, ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus,
@@ -21,7 +22,9 @@ use super::{
         ReconciliationStatus, StripeEventType, SubscriptionStatus, WebhookAck, WebhookEventList,
         WebhookEventSummary,
     },
-    money, offer_pricing, repo, stripe_client, stripe_provider, stripe_secret_operations_allowed,
+    money, offer_pricing, repo,
+    stripe_client::{self, StripeClient},
+    stripe_provider, stripe_secret_operations_allowed,
 };
 use crate::{
     http::{
@@ -558,14 +561,25 @@ pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStrea
         Ok(request) => request,
         Err(error) => return err_bad_request(&format!("Invalid body: {error}")),
     };
-    handle_offer_checkout(ctx, msg, request, &stripe_key, &stripe_api_version).await
+    // Every guard above has already run, so the only way loading the client
+    // can fail here is a key that is neither `sk_test_` nor `sk_live_`.
+    let Ok(client) = StripeClient::load(ctx).await else {
+        return err_internal_no_cause(
+            "Stripe secret key is malformed; expected an sk_test_ or sk_live_ key",
+        );
+    };
+    handle_offer_checkout(ctx, msg, request, &client).await
 }
 
-fn configured_bool(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// Whether Stripe automatic tax is on by default for new offers.
+///
+/// One reader for `IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX`: the checkout and
+/// Payment-Link money paths read it here, and so does the product wizard
+/// (`pages::product_wizard`), which used to compare the raw value against
+/// `"true"` — so `=1` turned tax on at checkout while the wizard drew the
+/// toggle off.
+pub(in crate::blocks::products) async fn automatic_tax_enabled(ctx: &dyn Context) -> bool {
+    crate::config_vars::get_bool(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", false).await
 }
 
 async fn issue_receipt_token(ctx: &dyn Context) -> Result<(String, String, String), WaferError> {
@@ -626,16 +640,33 @@ fn synced_component_price<'a>(
     })
 }
 
-fn shipping_countries(offer: &Offer, fallback_country: &str) -> Vec<String> {
-    if offer.checkout.allowed_shipping_countries.is_empty() {
-        vec![fallback_country.to_ascii_uppercase()]
-    } else {
-        offer
+/// The country list Stripe collects a shipping address for: the offer's own
+/// list, or the platform's country when the offer names none.
+///
+/// [B23] There is no third answer. `allowed_countries` is a required member
+/// of Stripe's `shipping_address_collection`, so a caller that cannot name a
+/// country cannot silently omit the key — that would leave `collect_shipping
+/// _address` on an offer that then collects no address at all. It used to
+/// substitute `"US"`, which shipped a New Zealand storefront to the United
+/// States and said nothing.
+fn shipping_countries(
+    offer: &Offer,
+    platform_country: Option<&CountryCode>,
+) -> Result<Vec<String>, String> {
+    if !offer.checkout.allowed_shipping_countries.is_empty() {
+        return Ok(offer
             .checkout
             .allowed_shipping_countries
             .iter()
             .map(|country| country.trim().to_ascii_uppercase())
-            .collect()
+            .collect());
+    }
+    match platform_country {
+        Some(country) => Ok(vec![country.as_str().to_string()]),
+        None => Err(
+            "this offer collects a shipping address but names no allowed countries; list them on the offer or set IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY"
+                .to_string(),
+        ),
     }
 }
 
@@ -661,12 +692,12 @@ fn shipping_amount_is_allowed(offer: &Offer, amount_minor: i64) -> bool {
 fn push_shipping_address_collection(
     pairs: &mut Vec<(String, String)>,
     offer: &Offer,
-    fallback_country: &str,
-) {
+    platform_country: Option<&CountryCode>,
+) -> Result<(), String> {
     if !offer.checkout.collect_shipping_address {
-        return;
+        return Ok(());
     }
-    for (index, country) in shipping_countries(offer, fallback_country)
+    for (index, country) in shipping_countries(offer, platform_country)?
         .into_iter()
         .enumerate()
     {
@@ -676,6 +707,7 @@ fn push_shipping_address_collection(
             country,
         );
     }
+    Ok(())
 }
 
 fn push_checkout_shipping_options(
@@ -754,17 +786,6 @@ fn payment_link_shipping_supported(offer: &Offer) -> Result<(), String> {
     Ok(())
 }
 
-async fn platform_country(ctx: &dyn Context) -> String {
-    let configured =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY", "US").await;
-    let country = configured.trim();
-    if country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        country.to_ascii_uppercase()
-    } else {
-        "US".to_string()
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_offer_checkout_form(
     offer: &Offer,
@@ -775,10 +796,10 @@ fn build_offer_checkout_form(
     success_url: &str,
     cancel_url: &str,
     automatic_tax: bool,
-    country: &str,
+    platform_country: Option<&CountryCode>,
     fee_minor: i64,
     fee_basis_points: u16,
-) -> Result<String, String> {
+) -> Result<Vec<(String, String)>, String> {
     let mut pairs = Vec::new();
     push_form(&mut pairs, "payment_method_types[]", "card");
     push_form(&mut pairs, "mode", wire_enum(&offer.mode)?);
@@ -839,7 +860,7 @@ fn build_offer_checkout_form(
     if offer.checkout.collect_billing_address {
         push_form(&mut pairs, "billing_address_collection", "required");
     }
-    push_shipping_address_collection(&mut pairs, offer, country);
+    push_shipping_address_collection(&mut pairs, offer, platform_country)?;
     push_checkout_shipping_options(
         &mut pairs,
         offer,
@@ -952,15 +973,14 @@ fn build_offer_checkout_form(
     if item_index == 0 {
         return Err("checkout has no included line items".to_string());
     }
-    Ok(encode_form(pairs))
+    Ok(pairs)
 }
 
 async fn handle_offer_checkout(
     ctx: &dyn Context,
     msg: &Message,
     request: CheckoutRequest,
-    stripe_key: &str,
-    stripe_api_version: &str,
+    client: &StripeClient,
 ) -> OutputStream {
     if let Some(email) = request.buyer_email.as_deref() {
         if email.len() > 254 || email.chars().any(char::is_control) {
@@ -990,25 +1010,17 @@ async fn handle_offer_checkout(
 
     let owner_is_user = product.str_field("owner_kind") == "user";
     let (seller_account_id, stripe_account_id, fee_basis_points) = if owner_is_user {
-        let user_selling =
-            config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false").await;
-        if !configured_bool(&user_selling) {
+        if !super::handlers::user_products_enabled(ctx).await {
             return err_not_found("Offer not found");
         }
         let owner_id = product.str_field("owner_id");
         let Ok(seller) = repo::seller_accounts::ready_for_user(ctx, owner_id).await else {
             return err_bad_request("This seller's Stripe account is not ready to accept charges");
         };
-        let configured_fee = config::get_default(
-            ctx,
-            "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-            "0",
-        )
-        .await
-        .parse::<u16>()
-        .ok()
-        .filter(|value| *value <= 10_000)
-        .unwrap_or(0);
+        let configured_fee = match seller_fee_bps(ctx).await {
+            Ok(fee) => fee,
+            Err(error) => return err_internal("Platform application fee is misconfigured", error),
+        };
         let fee = if seller.fee_basis_points == 0 {
             configured_fee
         } else {
@@ -1088,11 +1100,7 @@ async fn handle_offer_checkout(
         Ok(snapshot) => snapshot,
         Err(error) => return err_internal("Could not snapshot checkout inputs", error),
     };
-    let Some(expected_livemode) = stripe_client::secret_livemode(stripe_key) else {
-        return err_internal_no_cause(
-            "Stripe secret key is malformed; expected an sk_test_ or sk_live_ key",
-        );
-    };
+    let expected_livemode = client.livemode;
     let (receipt_token, receipt_token_hash, receipt_token_expires_at) =
         match issue_receipt_token(ctx).await {
             Ok(receipt) => receipt,
@@ -1166,10 +1174,14 @@ async fn handle_offer_checkout(
         return err_internal_no_cause("Checkout order could not be claimed");
     }
 
-    let automatic_tax_config =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", "false").await;
-    let automatic_tax = offer.checkout.automatic_tax || configured_bool(&automatic_tax_config);
-    let country = platform_country(ctx).await;
+    let automatic_tax = offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await;
+    let country = match platform_country(ctx).await {
+        Ok(country) => country,
+        Err(error) => {
+            let _ = repo::purchases::mark_checkout_failed(ctx, &order.id, &error.message).await;
+            return err_internal("Platform country is misconfigured", error);
+        }
+    };
     let stripe_body = match build_offer_checkout_form(
         &offer,
         &preview,
@@ -1179,7 +1191,7 @@ async fn handle_offer_checkout(
         &success_url,
         &cancel_url,
         automatic_tax,
-        &country.to_ascii_uppercase(),
+        country.as_ref(),
         fee_minor,
         fee_basis_points,
     ) {
@@ -1190,67 +1202,21 @@ async fn handle_offer_checkout(
         }
     };
 
-    let mut headers = stripe_request_headers(
-        stripe_key,
-        stripe_api_version,
-        Some(&format!("impresspress_offer_checkout_{}", order.id)),
-    );
-    if !stripe_account_id.is_empty() {
-        headers.insert("Stripe-Account".to_string(), stripe_account_id);
-    }
-    let stripe_api_url = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
-        "https://api.stripe.com",
-    )
-    .await;
-    let endpoint = format!("{stripe_api_url}/v1/checkout/sessions");
-    let response = match stripe_client::send_raw(
-        ctx,
-        "POST",
-        &endpoint,
-        &headers,
-        Some(stripe_body.as_bytes()),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = repo::purchases::mark_checkout_failed(
-                ctx,
-                &order.id,
-                "Stripe Checkout Session request failed",
-            )
-            .await;
-            return err_internal("Stripe API error", error);
-        }
-    };
-    if response.status_code >= 400 {
-        let body = String::from_utf8_lossy(&response.body);
-        tracing::error!(
-            status = response.status_code,
-            body = %body,
-            purchase_id = %order.id,
-            "Stripe offer Checkout Session creation failed"
-        );
-        let _ = repo::purchases::mark_checkout_failed(
+    let session = match client
+        .request_json(
             ctx,
-            &order.id,
-            "Stripe rejected the Checkout Session",
+            "POST",
+            "/v1/checkout/sessions",
+            Some(&stripe_account_id),
+            Some(&format!("impresspress_offer_checkout_{}", order.id)),
+            Some(stripe_body),
         )
-        .await;
-        return err_internal_no_cause("Stripe API error");
-    }
-    let session: serde_json::Value = match serde_json::from_slice(&response.body) {
+        .await
+    {
         Ok(session) => session,
-        Err(_) => {
-            let _ = repo::purchases::mark_checkout_failed(
-                ctx,
-                &order.id,
-                "Stripe response could not be decoded",
-            )
-            .await;
-            return err_internal_no_cause("Failed to parse Stripe response");
+        Err(error) => {
+            let _ = repo::purchases::mark_checkout_failed(ctx, &order.id, &error.message).await;
+            return err_internal("Stripe API error", error);
         }
     };
     let session_id = session
@@ -1319,25 +1285,14 @@ async fn payment_link_seller_context(
     if product.str_field("owner_kind") != "user" {
         return Ok((String::new(), String::new(), 0));
     }
-    let user_selling =
-        config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false").await;
-    if !configured_bool(&user_selling) {
+    if !super::handlers::user_products_enabled(ctx).await {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "user product selling is disabled",
         ));
     }
     let seller = repo::seller_accounts::ready_for_user(ctx, product.str_field("owner_id")).await?;
-    let configured_fee = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
-        "0",
-    )
-    .await
-    .parse::<u16>()
-    .ok()
-    .filter(|value| *value <= 10_000)
-    .unwrap_or(0);
+    let configured_fee = seller_fee_bps(ctx).await?;
     let fee = if seller.fee_basis_points == 0 {
         configured_fee
     } else {
@@ -1346,81 +1301,24 @@ async fn payment_link_seller_context(
     Ok((seller.id, seller.stripe_account_id, fee))
 }
 
-async fn stripe_catalog_post(
-    ctx: &dyn Context,
-    endpoint: &str,
-    headers: &HashMap<String, String>,
-    form: Vec<(String, String)>,
-) -> Result<serde_json::Value, WaferError> {
-    let body = encode_form(form);
-    let response = stripe_client::send_raw(ctx, "POST", endpoint, headers, Some(body.as_bytes()))
-        .await
-        .map_err(|error| {
-            WaferError::new(
-                wafer_run::ErrorCode::Internal,
-                format!("Stripe catalog request could not be completed: {error}"),
-            )
-        })?;
-    if response.status_code >= 400 {
-        let decoded: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or_default();
-        let code = decoded
-            .pointer("/error/code")
-            .or_else(|| decoded.pointer("/error/type"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("provider_error");
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            format!(
-                "Stripe rejected catalog synchronization (HTTP {}, code {code})",
-                response.status_code
-            ),
-        ));
-    }
-    serde_json::from_slice(&response.body).map_err(|_| {
-        WaferError::new(
-            wafer_run::ErrorCode::Internal,
-            "Stripe catalog response could not be decoded",
-        )
-    })
-}
-
+/// Read a catalog object, treating "not there" as a fact.
+///
+/// [B21] The classification is [`StripeClient`]'s — this wrapper only adds
+/// the second way Stripe says an object is gone: a `deleted: true` body on a
+/// 200. It used to own a copy of the whole decision and got it wrong for
+/// every retryable status.
 async fn stripe_catalog_get(
     ctx: &dyn Context,
-    endpoint: &str,
-    headers: &HashMap<String, String>,
+    client: &StripeClient,
+    path: &str,
+    stripe_account_id: &str,
 ) -> Result<Option<serde_json::Value>, WaferError> {
-    let response = stripe_client::send_raw(ctx, "GET", endpoint, headers, None)
-        .await
-        .map_err(|error| {
-            WaferError::new(
-                wafer_run::ErrorCode::Internal,
-                format!("Stripe catalog reconciliation could not be completed: {error}"),
-            )
-        })?;
-    if response.status_code == 404 {
+    let Some(decoded) = client
+        .request_json_optional(ctx, "GET", path, Some(stripe_account_id))
+        .await?
+    else {
         return Ok(None);
-    }
-    if response.status_code >= 400 {
-        let decoded: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or_default();
-        let code = decoded
-            .pointer("/error/code")
-            .or_else(|| decoded.pointer("/error/type"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("provider_error");
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            format!(
-                "Stripe rejected catalog reconciliation (HTTP {}, code {code})",
-                response.status_code
-            ),
-        ));
-    }
-    let decoded: serde_json::Value = serde_json::from_slice(&response.body).map_err(|_| {
-        WaferError::new(
-            wafer_run::ErrorCode::Internal,
-            "Stripe catalog reconciliation response could not be decoded",
-        )
-    })?;
+    };
     if decoded
         .get("deleted")
         .and_then(serde_json::Value::as_bool)
@@ -1430,19 +1328,6 @@ async fn stripe_catalog_get(
     } else {
         Ok(Some(decoded))
     }
-}
-
-fn stripe_catalog_headers(
-    stripe_key: &str,
-    api_version: &str,
-    stripe_account_id: &str,
-    idempotency_key: Option<&str>,
-) -> HashMap<String, String> {
-    let mut headers = stripe_request_headers(stripe_key, api_version, idempotency_key);
-    if !stripe_account_id.is_empty() {
-        headers.insert("Stripe-Account".to_string(), stripe_account_id.to_string());
-    }
-    headers
 }
 
 fn stripe_product_form(product: &Record) -> Vec<(String, String)> {
@@ -1575,31 +1460,8 @@ async fn sync_offer_catalog_inner(
             format!("offer is not valid for Stripe synchronization: {error}"),
         )
     })?;
-    let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
-    let livemode = stripe_client::secret_livemode(&stripe_key).ok_or_else(|| {
-        WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe secret key must be a test or live secret key",
-        )
-    })?;
-    let api_version = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-        DEFAULT_STRIPE_API_VERSION,
-    )
-    .await;
-    if !is_stable_stripe_api_version(&api_version) {
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe API version must be a stable named release",
-        ));
-    }
-    let api_url = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
-        "https://api.stripe.com",
-    )
-    .await;
+    let client = StripeClient::load(ctx).await?;
+    let livemode = client.livemode;
     let (_, stripe_account_id, _) = payment_link_seller_context(ctx, product).await?;
 
     let mut stripe_product_id = product.str_field("stripe_product_id").to_string();
@@ -1615,12 +1477,8 @@ async fn sync_offer_catalog_inner(
                 "stored Stripe Product id is invalid",
             ));
         }
-        let headers = stripe_catalog_headers(&stripe_key, &api_version, &stripe_account_id, None);
-        let endpoint = format!(
-            "{}/v1/products/{stripe_product_id}",
-            api_url.trim_end_matches('/')
-        );
-        match stripe_catalog_get(ctx, &endpoint, &headers).await? {
+        let path = format!("/v1/products/{stripe_product_id}");
+        match stripe_catalog_get(ctx, &client, &path, &stripe_account_id).await? {
             Some(response) => {
                 let remote_id = response
                     .get("id")
@@ -1642,13 +1500,16 @@ async fn sync_offer_catalog_inner(
                     product.id,
                     &form_hash[..16]
                 );
-                let headers = stripe_catalog_headers(
-                    &stripe_key,
-                    &api_version,
-                    &stripe_account_id,
-                    Some(&idempotency_key),
-                );
-                let updated = stripe_catalog_post(ctx, &endpoint, &headers, form).await?;
+                let updated = client
+                    .request_json(
+                        ctx,
+                        "POST",
+                        &path,
+                        Some(&stripe_account_id),
+                        Some(&idempotency_key),
+                        Some(form),
+                    )
+                    .await?;
                 stripe_product_id =
                     validate_stripe_product(&updated, Some(&stripe_product_id), livemode)?;
             }
@@ -1669,19 +1530,16 @@ async fn sync_offer_catalog_inner(
                 &stale_hash[..16]
             )
         };
-        let headers = stripe_catalog_headers(
-            &stripe_key,
-            &api_version,
-            &stripe_account_id,
-            Some(&idempotency_key),
-        );
-        let response = stripe_catalog_post(
-            ctx,
-            &format!("{}/v1/products", api_url.trim_end_matches('/')),
-            &headers,
-            stripe_product_form(product),
-        )
-        .await?;
+        let response = client
+            .request_json(
+                ctx,
+                "POST",
+                "/v1/products",
+                Some(&stripe_account_id),
+                Some(&idempotency_key),
+                Some(stripe_product_form(product)),
+            )
+            .await?;
         stripe_product_id = validate_stripe_product(&response, None, livemode)?;
         // The unfiltered write on purpose: the Stripe Product above already
         // exists. Refusing to record its id because the local product was
@@ -1718,10 +1576,8 @@ async fn sync_offer_catalog_inner(
                     "stored Stripe Price id is invalid",
                 ));
             }
-            let headers =
-                stripe_catalog_headers(&stripe_key, &api_version, &stripe_account_id, None);
-            let endpoint = format!("{}/v1/prices/{price_id}", api_url.trim_end_matches('/'));
-            match stripe_catalog_get(ctx, &endpoint, &headers).await? {
+            let path = format!("/v1/prices/{price_id}");
+            match stripe_catalog_get(ctx, &client, &path, &stripe_account_id).await? {
                 Some(response) => {
                     let active = response.get("active").and_then(serde_json::Value::as_bool);
                     if active == Some(false) {
@@ -1730,19 +1586,16 @@ async fn sync_offer_catalog_inner(
                             component.id,
                             &sha256_hex(price_id.as_bytes())[..16]
                         );
-                        let headers = stripe_catalog_headers(
-                            &stripe_key,
-                            &api_version,
-                            &stripe_account_id,
-                            Some(&idempotency_key),
-                        );
-                        let reactivated = stripe_catalog_post(
-                            ctx,
-                            &endpoint,
-                            &headers,
-                            vec![("active".to_string(), "true".to_string())],
-                        )
-                        .await?;
+                        let reactivated = client
+                            .request_json(
+                                ctx,
+                                "POST",
+                                &path,
+                                Some(&stripe_account_id),
+                                Some(&idempotency_key),
+                                Some(vec![("active".to_string(), "true".to_string())]),
+                            )
+                            .await?;
                         price_id = validate_stripe_price(
                             &reactivated,
                             Some(&price_id),
@@ -1781,12 +1634,6 @@ async fn sync_offer_catalog_inner(
                     &sha256_hex(stale_price_id.as_bytes())[..16]
                 )
             };
-            let headers = stripe_catalog_headers(
-                &stripe_key,
-                &api_version,
-                &stripe_account_id,
-                Some(&idempotency_key),
-            );
             let mut form = vec![
                 (
                     "currency".to_string(),
@@ -1840,13 +1687,16 @@ async fn sync_offer_catalog_inner(
                     ),
                 ]);
             }
-            let response = stripe_catalog_post(
-                ctx,
-                &format!("{}/v1/prices", api_url.trim_end_matches('/')),
-                &headers,
-                form,
-            )
-            .await?;
+            let response = client
+                .request_json(
+                    ctx,
+                    "POST",
+                    "/v1/prices",
+                    Some(&stripe_account_id),
+                    Some(&idempotency_key),
+                    Some(form),
+                )
+                .await?;
             price_id = validate_stripe_price(
                 &response,
                 None,
@@ -1971,31 +1821,8 @@ pub(crate) async fn archive_offer_catalog(
     // address) and `stripe_product_id`; nothing about a deleted product
     // reaches a caller, since this path only ever deactivates.
     let product = repo::products::get_including_deleted(ctx, product_id).await?;
-    let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
-    let livemode = stripe_client::secret_livemode(&stripe_key).ok_or_else(|| {
-        WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe secret key must be configured before synced offers can be archived",
-        )
-    })?;
-    let api_version = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-        DEFAULT_STRIPE_API_VERSION,
-    )
-    .await;
-    if !is_stable_stripe_api_version(&api_version) {
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe API version must be a stable named release",
-        ));
-    }
-    let api_url = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
-        "https://api.stripe.com",
-    )
-    .await;
+    let client = StripeClient::load(ctx).await?;
+    let livemode = client.livemode;
     let stripe_account_id = catalog_account_for_archive(ctx, &product).await?;
     let stripe_product_id = if product.str_field("stripe_product_id").is_empty() {
         managed.offer.stripe_product_id.as_str()
@@ -2010,13 +1837,9 @@ pub(crate) async fn archive_offer_catalog(
     }
 
     for (component, unit_amount_minor) in synced_components {
-        let endpoint = format!(
-            "{}/v1/prices/{}",
-            api_url.trim_end_matches('/'),
-            component.stripe_price_id
-        );
-        let headers = stripe_catalog_headers(&stripe_key, &api_version, &stripe_account_id, None);
-        let Some(remote) = stripe_catalog_get(ctx, &endpoint, &headers).await? else {
+        let path = format!("/v1/prices/{}", component.stripe_price_id);
+        let Some(remote) = stripe_catalog_get(ctx, &client, &path, &stripe_account_id).await?
+        else {
             continue;
         };
         let active = remote
@@ -2045,19 +1868,16 @@ pub(crate) async fn archive_offer_catalog(
             component.id,
             &sha256_hex(component.stripe_price_id.as_bytes())[..16]
         );
-        let headers = stripe_catalog_headers(
-            &stripe_key,
-            &api_version,
-            &stripe_account_id,
-            Some(&idempotency_key),
-        );
-        let archived = stripe_catalog_post(
-            ctx,
-            &endpoint,
-            &headers,
-            vec![("active".to_string(), "false".to_string())],
-        )
-        .await?;
+        let archived = client
+            .request_json(
+                ctx,
+                "POST",
+                &path,
+                Some(&stripe_account_id),
+                Some(&idempotency_key),
+                Some(vec![("active".to_string(), "false".to_string())]),
+            )
+            .await?;
         validate_stripe_price(
             &archived,
             Some(&component.stripe_price_id),
@@ -2080,10 +1900,10 @@ fn payment_link_form(
     preset_id: &str,
     after_completion_url: Option<&str>,
     automatic_tax: bool,
-    country: &str,
+    platform_country: Option<&CountryCode>,
     fee_minor: i64,
     fee_basis_points: u16,
-) -> Result<String, String> {
+) -> Result<Vec<(String, String)>, String> {
     let included: Vec<_> = preview
         .components
         .iter()
@@ -2119,7 +1939,7 @@ fn payment_link_form(
     if offer.checkout.collect_billing_address {
         push_form(&mut pairs, "billing_address_collection", "required");
     }
-    push_shipping_address_collection(&mut pairs, offer, country);
+    push_shipping_address_collection(&mut pairs, offer, platform_country)?;
     payment_link_shipping_supported(offer)?;
     for (index, option) in offer.checkout.shipping_options.iter().enumerate() {
         push_form(
@@ -2215,7 +2035,7 @@ fn payment_link_form(
             component.quantity,
         );
     }
-    Ok(encode_form(pairs))
+    Ok(pairs)
 }
 
 /// Create or reuse a shareable Payment Link for an immutable active offer and
@@ -2233,31 +2053,8 @@ pub(crate) async fn create_payment_link(
             "Stripe Payment Link creation is disabled in the browser runtime",
         ));
     }
-    let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
-    if stripe_key.trim().is_empty() {
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe is not configured",
-        ));
-    }
-    let livemode = stripe_client::secret_livemode(&stripe_key).ok_or_else(|| {
-        WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe secret key is malformed; expected an sk_test_ or sk_live_ key",
-        )
-    })?;
-    let api_version = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-        DEFAULT_STRIPE_API_VERSION,
-    )
-    .await;
-    if !is_stable_stripe_api_version(&api_version) {
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::FailedPrecondition,
-            "Stripe API version must be stable",
-        ));
-    }
+    let client = StripeClient::load(ctx).await?;
+    let livemode = client.livemode;
     let managed = repo::offers::get_for_product(ctx, &product.id, offer_id).await?;
     if managed.status != OfferStatus::Active {
         return Err(WaferError::new(
@@ -2346,9 +2143,7 @@ pub(crate) async fn create_payment_link(
         fee_basis_points,
     )
     .await?;
-    let automatic_tax_config =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", "false").await;
-    let country = platform_country(ctx).await;
+    let country = platform_country(ctx).await?;
     let body = payment_link_form(
         &offer,
         &preview,
@@ -2356,71 +2151,29 @@ pub(crate) async fn create_payment_link(
         &pending.managed.id,
         &preset_id,
         after_completion_url,
-        offer.checkout.automatic_tax || configured_bool(&automatic_tax_config),
-        &country.to_ascii_uppercase(),
+        offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await,
+        country.as_ref(),
         fee_minor,
         fee_basis_points,
     )
     .map_err(|error| WaferError::new(wafer_run::ErrorCode::InvalidArgument, error))?;
-    let mut headers = stripe_request_headers(
-        &stripe_key,
-        &api_version,
-        Some(&format!("impresspress_payment_link_{}", pending.managed.id)),
-    );
-    if !stripe_account_id.is_empty() {
-        headers.insert("Stripe-Account".to_string(), stripe_account_id);
-    }
-    let api_url = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
-        "https://api.stripe.com",
-    )
-    .await;
-    let endpoint = format!("{api_url}/v1/payment_links");
-    let response = match stripe_client::send_raw(
-        ctx,
-        "POST",
-        &endpoint,
-        &headers,
-        Some(body.as_bytes()),
-    )
-    .await
+    let response = match client
+        .request_json(
+            ctx,
+            "POST",
+            "/v1/payment_links",
+            Some(&stripe_account_id),
+            Some(&format!("impresspress_payment_link_{}", pending.managed.id)),
+            Some(body),
+        )
+        .await
     {
         Ok(response) => response,
         Err(error) => {
-            let _ = repo::payment_links::mark_error(
-                ctx,
-                &pending.managed.id,
-                "Stripe Payment Link request failed",
-            )
-            .await;
+            let _ = repo::payment_links::mark_error(ctx, &pending.managed.id, &error.message).await;
             return Err(error);
         }
     };
-    if response.status_code >= 400 {
-        tracing::error!(
-            status = response.status_code,
-            body = %String::from_utf8_lossy(&response.body),
-            payment_link_id = %pending.managed.id,
-            "Stripe Payment Link creation failed"
-        );
-        let _ = repo::payment_links::mark_error(
-            ctx,
-            &pending.managed.id,
-            "Stripe rejected the Payment Link",
-        )
-        .await;
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::Internal,
-            "Stripe rejected the Payment Link",
-        ));
-    }
-    let response: serde_json::Value = serde_json::from_slice(&response.body).map_err(|_| {
-        WaferError::new(
-            wafer_run::ErrorCode::Internal,
-            "Stripe Payment Link response could not be decoded",
-        )
-    })?;
     let stripe_id = response
         .get("id")
         .and_then(|value| value.as_str())
@@ -2466,42 +2219,20 @@ pub(crate) async fn deactivate_payment_link(
             "Stripe Payment Link deactivation is disabled in the browser runtime",
         ));
     }
-    let stripe_key = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await?;
-    let api_version = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-        DEFAULT_STRIPE_API_VERSION,
-    )
-    .await;
-    let mut headers = stripe_request_headers(
-        &stripe_key,
-        &api_version,
-        Some(&format!("impresspress_deactivate_payment_link_{link_id}")),
-    );
-    if !stored.stripe_account_id.is_empty() {
-        headers.insert(
-            "Stripe-Account".to_string(),
-            stored.stripe_account_id.clone(),
-        );
-    }
-    let api_url = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
-        "https://api.stripe.com",
-    )
-    .await;
-    let endpoint = format!(
-        "{api_url}/v1/payment_links/{}",
-        crate::util::url_path_encode(&stored.stripe_payment_link_id)
-    );
-    let response =
-        stripe_client::send_raw(ctx, "POST", &endpoint, &headers, Some(b"active=false")).await?;
-    if response.status_code >= 400 {
-        return Err(WaferError::new(
-            wafer_run::ErrorCode::Internal,
-            "Stripe rejected Payment Link deactivation",
-        ));
-    }
+    let client = StripeClient::load(ctx).await?;
+    client
+        .request_json(
+            ctx,
+            "POST",
+            &format!(
+                "/v1/payment_links/{}",
+                crate::util::url_path_encode(&stored.stripe_payment_link_id)
+            ),
+            Some(&stored.stripe_account_id),
+            Some(&format!("impresspress_deactivate_payment_link_{link_id}")),
+            Some(vec![("active".to_string(), "false".to_string())]),
+        )
+        .await?;
     repo::payment_links::deactivate_local(ctx, offer_id, link_id).await
 }
 
@@ -4357,14 +4088,6 @@ pub(crate) fn is_stable_stripe_api_version(value: &str) -> bool {
         && release != "preview"
 }
 
-fn stripe_request_headers(
-    secret_key: &str,
-    api_version: &str,
-    idempotency_key: Option<&str>,
-) -> HashMap<String, String> {
-    stripe_client::request_headers(secret_key, api_version, None, idempotency_key)
-}
-
 /// Check if a user owns a product — either via an active subscription that
 /// references it, or a completed purchase containing it as a line item.
 async fn user_owns_product(ctx: &dyn Context, user_id: &str, product_id: &str) -> bool {
@@ -4599,14 +4322,6 @@ mod tests {
     }
 
     #[test]
-    fn stripe_headers_pin_version_and_idempotency() {
-        let headers = stripe_request_headers("sk_test_x", "2026-02-25.clover", Some("checkout_1"));
-        assert_eq!(headers["Authorization"], "Bearer sk_test_x");
-        assert_eq!(headers["Stripe-Version"], "2026-02-25.clover");
-        assert_eq!(headers["Idempotency-Key"], "checkout_1");
-    }
-
-    #[test]
     fn subscription_checkout_form_uses_inline_recurring_prices_and_exact_fee_percent() {
         let offer: Offer = serde_json::from_value(serde_json::json!({
             "id": "offer_subscription",
@@ -4647,20 +4362,22 @@ mod tests {
             "presentation": "hosted"
         }))
         .unwrap();
-        let form = build_offer_checkout_form(
-            &offer,
-            &preview,
-            "Monthly service",
-            "order_subscription",
-            &request,
-            "https://shop.example/success",
-            "https://shop.example/cancel",
-            false,
-            "NZ",
-            110,
-            275,
-        )
-        .unwrap();
+        let form = encode_form(
+            build_offer_checkout_form(
+                &offer,
+                &preview,
+                "Monthly service",
+                "order_subscription",
+                &request,
+                "https://shop.example/success",
+                "https://shop.example/cancel",
+                false,
+                CountryCode::parse("NZ").as_ref(),
+                110,
+                275,
+            )
+            .unwrap(),
+        );
         assert!(form.contains("mode=subscription"));
         assert!(form.contains("[recurring][interval]=month"));
         assert!(form.contains("[recurring][interval_count]=1"));
@@ -4731,20 +4448,22 @@ mod tests {
             "presentation": "hosted"
         }))
         .unwrap();
-        let checkout = build_offer_checkout_form(
-            &offer,
-            &preview,
-            "Shipped product",
-            "order_shipping",
-            &request,
-            "https://shop.example/success",
-            "https://shop.example/cancel",
-            false,
-            "US",
-            0,
-            0,
-        )
-        .unwrap();
+        let checkout = encode_form(
+            build_offer_checkout_form(
+                &offer,
+                &preview,
+                "Shipped product",
+                "order_shipping",
+                &request,
+                "https://shop.example/success",
+                "https://shop.example/cancel",
+                false,
+                CountryCode::parse("US").as_ref(),
+                0,
+                0,
+            )
+            .unwrap(),
+        );
         assert!(checkout.contains("shipping_address_collection[allowed_countries][0]=NZ"));
         assert!(checkout.contains("shipping_address_collection[allowed_countries][1]=AU"));
         assert!(checkout
@@ -4771,7 +4490,7 @@ mod tests {
             "",
             None,
             false,
-            "US",
+            CountryCode::parse("US").as_ref(),
             0,
             0,
         )
@@ -4779,19 +4498,21 @@ mod tests {
         assert!(error.contains("Stripe shipping rate ID"));
 
         offer.checkout.shipping_options[0].stripe_shipping_rate_id = "shr_standard_123".into();
-        let payment_link = payment_link_form(
-            &offer,
-            &preview,
-            "Shipped product",
-            "link_shipping",
-            "",
-            None,
-            false,
-            "US",
-            0,
-            0,
-        )
-        .unwrap();
+        let payment_link = encode_form(
+            payment_link_form(
+                &offer,
+                &preview,
+                "Shipped product",
+                "link_shipping",
+                "",
+                None,
+                false,
+                CountryCode::parse("US").as_ref(),
+                0,
+                0,
+            )
+            .unwrap(),
+        );
         assert!(payment_link.contains("shipping_options[0][shipping_rate]=shr_standard_123"));
         assert!(payment_link.contains("shipping_options[1][shipping_rate]=shr_express_123"));
         assert!(!payment_link.contains("shipping_rate_data"));

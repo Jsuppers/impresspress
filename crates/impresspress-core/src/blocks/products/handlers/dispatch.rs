@@ -6,7 +6,6 @@
 //! bound into `req.param.*` by the matcher, and the page handlers that take
 //! an id receive the matcher's already-decoded binding.
 
-use wafer_core::clients::config;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
@@ -21,7 +20,7 @@ use crate::blocks::products::{pages, purchase, routes::Route, stripe};
 /// page (`pages::overview`) can render an accurate notice instead of a silent
 /// empty catalog when it's off.
 pub(in crate::blocks::products) async fn user_products_enabled(ctx: &dyn Context) -> bool {
-    config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false").await == "true"
+    crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", false).await
 }
 
 /// Run the handler `route` names.

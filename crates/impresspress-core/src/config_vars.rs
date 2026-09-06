@@ -270,6 +270,60 @@ pub fn var_in(vars: &[ConfigVar], key: &str) -> ConfigVar {
         })
 }
 
+/// The one truth table for a boolean flag: trimmed, ASCII-case-insensitive,
+/// `1` / `true` / `yes` / `on`.
+///
+/// Three tables were in the tree before this was the only one — `{1,true,
+/// yes,on}` in products and tickets, `{true,1}` case-sensitive in the auth
+/// API handlers, and exactly `"true"` on the auth pages and three products
+/// paths. The same key therefore had two answers on two surfaces:
+/// `WAFER_RUN_SHARED__ALLOW_SIGNUP=1` opened the signup API and hid the
+/// signup link, and `IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX=1` turned tax on
+/// in the money path while the settings page drew the toggle off.
+///
+/// Table A wins because it is the superset: every value that was true under
+/// either of the others is true here, so no deployment whose config works
+/// today stops working.
+///
+/// This is the predicate, not the reader — [`get_bool`] reads a config key
+/// through it, [`form_bool`] reads a posted form field, and
+/// [`crate::ui::settings_form`] renders a checkbox from it. Anything holding
+/// a string that means yes-or-no asks here.
+///
+/// Not for *database* values: `auth::repo`, `tickets::service` and
+/// `llm::schema` decode stored JSON, where `Bool` and `Number` are the real
+/// cases and one of them deliberately fails open. Those stay separate.
+pub fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Read a boolean config key through the config client and [`is_truthy`].
+///
+/// `default` is the value the key carries when it is unset — passed as a
+/// `bool` rather than a string so a call site cannot spell a default that
+/// the truth table then reads the other way.
+///
+/// `config::get_default` swallows every read failure into the default,
+/// including a WRAP denial; that is upstream behaviour (`wafer_core::
+/// clients::config`), and it is why a flag's default is chosen to be the
+/// safe answer at every call site rather than merely the common one.
+pub async fn get_bool(ctx: &dyn wafer_run::context::Context, key: &str, default: bool) -> bool {
+    is_truthy(
+        &wafer_core::clients::config::get_default(ctx, key, if default { "true" } else { "false" })
+            .await,
+    )
+}
+
+/// Read a posted form field through [`is_truthy`]. An absent field is
+/// `false` — an unchecked HTML checkbox posts nothing at all, and a checked
+/// one posts `on`.
+pub fn form_bool(form: &std::collections::HashMap<String, String>, key: &str) -> bool {
+    form.get(key).is_some_and(|value| is_truthy(value))
+}
+
 /// Collect all known config variables: shared + all block-declared.
 pub fn collect_all_config_vars(block_infos: &[wafer_run::BlockInfo]) -> Vec<ConfigVar> {
     let mut all = shared_config_vars();
@@ -388,6 +442,51 @@ mod shared_vars_tests {
                 "default CSP must allow {host} for embedded Checkout"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod truth_table_tests {
+    use std::collections::HashMap;
+
+    use super::{form_bool, get_bool, is_truthy};
+    use crate::test_support::TestContext;
+
+    /// Truth table A, the superset of the three tables that were in the tree:
+    /// trimmed, ASCII-case-insensitive, `1` / `true` / `yes` / `on`.
+    #[test]
+    fn the_truth_table_is_table_a() {
+        for truthy in ["1", "true", "TRUE", "True", " on ", "on", "yes", "YES"] {
+            assert!(is_truthy(truthy), "{truthy:?} must be true");
+        }
+        for falsy in ["0", "false", "FALSE", "", "   ", "bogus", "2", "onward"] {
+            assert!(!is_truthy(falsy), "{falsy:?} must be false");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_bool_reads_the_config_client_and_falls_back_to_the_default() {
+        let mut ctx = TestContext::new().await;
+        assert!(get_bool(&ctx, "WAFER_RUN_SHARED__UNSET_FLAG", true).await);
+        assert!(!get_bool(&ctx, "WAFER_RUN_SHARED__UNSET_FLAG", false).await);
+        ctx.set_config("WAFER_RUN_SHARED__FLAG", "1");
+        assert!(get_bool(&ctx, "WAFER_RUN_SHARED__FLAG", false).await);
+        ctx.set_config("WAFER_RUN_SHARED__FLAG", "no");
+        assert!(!get_bool(&ctx, "WAFER_RUN_SHARED__FLAG", true).await);
+    }
+
+    /// An HTML checkbox posts `on`, and an absent field means unchecked.
+    #[test]
+    fn form_bool_reads_a_posted_checkbox() {
+        let form = HashMap::from([
+            ("checked".to_string(), "on".to_string()),
+            ("explicit".to_string(), "true".to_string()),
+            ("blank".to_string(), String::new()),
+        ]);
+        assert!(form_bool(&form, "checked"));
+        assert!(form_bool(&form, "explicit"));
+        assert!(!form_bool(&form, "blank"));
+        assert!(!form_bool(&form, "absent"));
     }
 }
 
