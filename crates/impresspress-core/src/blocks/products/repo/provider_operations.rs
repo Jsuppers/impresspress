@@ -9,12 +9,20 @@ use wafer_block::{
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::RecordExt;
+use crate::{
+    blocks::products::contracts::OperationStatus,
+    util::{enum_column, wire_str, RecordExt},
+};
 
 pub(crate) const TABLE: &str = "impresspress__products__provider_operations";
 pub(crate) const REFUND_RECONCILE: &str = "refund.reconcile";
 const LEASE_SECONDS: i64 = 300;
 const MAX_ATTEMPTS: u64 = 8;
+
+/// The `status` column of an operation row, as the enum that defines it.
+fn status_of(record: &Record) -> Result<OperationStatus, WaferError> {
+    enum_column(record, "status")
+}
 
 pub(crate) struct OperationClaim {
     pub record: Record,
@@ -79,7 +87,10 @@ pub(crate) async fn ensure(
                 "idempotency_key".to_string(),
                 serde_json::json!(idempotency_key),
             ),
-            ("status".to_string(), serde_json::json!("pending")),
+            (
+                "status".to_string(),
+                serde_json::json!(OperationStatus::Pending),
+            ),
             ("request_json".to_string(), serde_json::json!(request_json)),
             ("created_at".to_string(), serde_json::json!(&now)),
             ("updated_at".to_string(), serde_json::json!(&now)),
@@ -110,7 +121,7 @@ pub(crate) async fn ensure(
 
 pub(crate) async fn list(
     ctx: &dyn Context,
-    status: Option<&str>,
+    status: Option<OperationStatus>,
     page: i64,
     page_size: i64,
 ) -> Result<RecordList, WaferError> {
@@ -151,7 +162,7 @@ async fn dead_letter_unclaimed(ctx: &dyn Context, record: &Record) -> Result<(),
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!(record.str_field("status")),
+                value: serde_json::json!(wire_str(&status_of(record)?)),
             },
             Filter {
                 field: "processing_owner".to_string(),
@@ -160,7 +171,10 @@ async fn dead_letter_unclaimed(ctx: &dyn Context, record: &Record) -> Result<(),
             },
         ],
         HashMap::from([
-            ("status".to_string(), serde_json::json!("dead_letter")),
+            (
+                "status".to_string(),
+                serde_json::json!(OperationStatus::DeadLetter),
+            ),
             ("processing_owner".to_string(), serde_json::json!("")),
             ("processing_started_at".to_string(), serde_json::Value::Null),
             ("next_attempt_at".to_string(), serde_json::Value::Null),
@@ -184,7 +198,11 @@ pub(crate) async fn claim_due(
             filters: vec![Filter {
                 field: "status".to_string(),
                 operator: FilterOp::In,
-                value: serde_json::json!(["pending", "failed", "processing"]),
+                value: serde_json::json!([
+                    OperationStatus::Pending,
+                    OperationStatus::Failed,
+                    OperationStatus::Processing,
+                ]),
             }],
             sort: vec![SortField {
                 field: "created_at".to_string(),
@@ -202,13 +220,17 @@ pub(crate) async fn claim_due(
         if claimed.len() >= limit {
             break;
         }
-        let eligible = match record.str_field("status") {
-            "pending" => timestamp(&record, "next_attempt_at").is_none_or(|next| next <= now_value),
-            "failed" => timestamp(&record, "next_attempt_at").is_none_or(|next| next <= now_value),
-            "processing" => timestamp(&record, "processing_started_at").is_none_or(|started| {
-                now_value.signed_duration_since(started).num_seconds() >= LEASE_SECONDS
-            }),
-            _ => false,
+        let eligible = match status_of(&record)? {
+            OperationStatus::Pending | OperationStatus::Failed => {
+                timestamp(&record, "next_attempt_at").is_none_or(|next| next <= now_value)
+            }
+            OperationStatus::Processing => {
+                timestamp(&record, "processing_started_at").is_none_or(|started| {
+                    now_value.signed_duration_since(started).num_seconds() >= LEASE_SECONDS
+                })
+            }
+            // Terminal, and the query above does not select them anyway.
+            OperationStatus::Succeeded | OperationStatus::DeadLetter => false,
         };
         if !eligible {
             continue;
@@ -232,7 +254,7 @@ pub(crate) async fn claim_due(
                 Filter {
                     field: "status".to_string(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!(record.str_field("status")),
+                    value: serde_json::json!(wire_str(&status_of(&record)?)),
                 },
                 Filter {
                     field: "processing_owner".to_string(),
@@ -241,7 +263,10 @@ pub(crate) async fn claim_due(
                 },
             ],
             HashMap::from([
-                ("status".to_string(), serde_json::json!("processing")),
+                (
+                    "status".to_string(),
+                    serde_json::json!(OperationStatus::Processing),
+                ),
                 ("attempts".to_string(), serde_json::json!(attempts)),
                 ("processing_owner".to_string(), serde_json::json!(&owner)),
                 ("processing_started_at".to_string(), serde_json::json!(&now)),
@@ -280,7 +305,7 @@ pub(crate) async fn mark_completed(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!("processing"),
+                value: serde_json::json!(OperationStatus::Processing),
             },
             Filter {
                 field: "processing_owner".to_string(),
@@ -289,7 +314,10 @@ pub(crate) async fn mark_completed(
             },
         ],
         HashMap::from([
-            ("status".to_string(), serde_json::json!("succeeded")),
+            (
+                "status".to_string(),
+                serde_json::json!(OperationStatus::Succeeded),
+            ),
             (
                 "response_json".to_string(),
                 serde_json::json!(response_json),
@@ -304,7 +332,7 @@ pub(crate) async fn mark_completed(
         ]),
     )
     .await?;
-    if rows == 1 || db::get(ctx, TABLE, id).await?.str_field("status") == "succeeded" {
+    if rows == 1 || status_of(&db::get(ctx, TABLE, id).await?)? == OperationStatus::Succeeded {
         Ok(())
     } else {
         Err(WaferError::new(
@@ -335,7 +363,7 @@ pub(crate) async fn mark_retry(
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!("processing"),
+                value: serde_json::json!(OperationStatus::Processing),
             },
             Filter {
                 field: "processing_owner".to_string(),
@@ -346,7 +374,11 @@ pub(crate) async fn mark_retry(
         HashMap::from([
             (
                 "status".to_string(),
-                serde_json::json!(if dead_letter { "dead_letter" } else { "failed" }),
+                serde_json::json!(if dead_letter {
+                    OperationStatus::DeadLetter
+                } else {
+                    OperationStatus::Failed
+                }),
             ),
             ("processing_owner".to_string(), serde_json::json!("")),
             ("processing_started_at".to_string(), serde_json::Value::Null),
@@ -405,9 +437,9 @@ pub(crate) async fn resolve_unleased(
             (
                 "status".to_string(),
                 serde_json::json!(if succeeded {
-                    "succeeded"
+                    OperationStatus::Succeeded
                 } else {
-                    "dead_letter"
+                    OperationStatus::DeadLetter
                 }),
             ),
             (
@@ -470,11 +502,11 @@ pub(crate) async fn resolve_for_aggregate(
     .records;
     for operation in operations {
         let resolved = if succeeded {
-            "succeeded"
+            OperationStatus::Succeeded
         } else {
-            "dead_letter"
+            OperationStatus::DeadLetter
         };
-        if operation.str_field("status") != resolved {
+        if status_of(&operation)? != resolved {
             resolve_unleased(ctx, &operation.id, succeeded, response_json, message).await?;
         }
     }

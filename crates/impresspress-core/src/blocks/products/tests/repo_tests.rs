@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use wafer_core::clients::database as db;
 
 use super::harness::*;
-use crate::blocks::products::repo;
+use crate::blocks::products::{
+    contracts::{OfferStatus, SubscriptionStatus},
+    repo,
+};
 
 /// `cancel_and_reset_addons` flips status to cancelled and zeroes every addon
 /// column for the matched subscription.
@@ -85,25 +88,40 @@ async fn update_status_plan_and_mark_past_due_respect_terminal_status_ranking() 
     .await;
 
     // The cancellation lands first...
-    let rows =
-        repo::subscriptions::update_status_plan(&ctx, "sub_stripe_rank", "canceled", None, 200)
-            .await
-            .expect("cancel ok");
+    let rows = repo::subscriptions::update_status_plan(
+        &ctx,
+        "sub_stripe_rank",
+        SubscriptionStatus::Canceled,
+        None,
+        200,
+    )
+    .await
+    .expect("cancel ok");
     assert_eq!(rows, 1);
 
     // ...and the same-second "active" snapshot must not resurrect it.
-    let rows =
-        repo::subscriptions::update_status_plan(&ctx, "sub_stripe_rank", "active", None, 200)
-            .await
-            .expect("refused write ok");
+    let rows = repo::subscriptions::update_status_plan(
+        &ctx,
+        "sub_stripe_rank",
+        SubscriptionStatus::Active,
+        None,
+        200,
+    )
+    .await
+    .expect("refused write ok");
     assert_eq!(rows, 0);
 
     // A strictly newer non-terminal update cannot leave the terminal state
     // either: a canceled Stripe subscription id never becomes live again.
-    let rows =
-        repo::subscriptions::update_status_plan(&ctx, "sub_stripe_rank", "active", None, 300)
-            .await
-            .expect("refused write ok");
+    let rows = repo::subscriptions::update_status_plan(
+        &ctx,
+        "sub_stripe_rank",
+        SubscriptionStatus::Active,
+        None,
+        300,
+    )
+    .await
+    .expect("refused write ok");
     assert_eq!(rows, 0);
 
     // Neither can a failed payment on a leftover open invoice.
@@ -397,7 +415,7 @@ async fn stale_offer_write_cannot_land_after_status_transition() {
     let landed = repo::offers::update_if_status(
         &ctx,
         "offer_cas",
-        "draft",
+        OfferStatus::Draft,
         HashMap::from([("stripe_price_id".to_string(), serde_json::json!(""))]),
     )
     .await
@@ -436,7 +454,7 @@ async fn stale_offer_write_cannot_land_after_status_transition() {
     let landed = repo::offers::update_if_status(
         &ctx,
         "offer_cas_draft",
-        "draft",
+        OfferStatus::Draft,
         HashMap::from([("stripe_price_id".to_string(), serde_json::json!(""))]),
     )
     .await

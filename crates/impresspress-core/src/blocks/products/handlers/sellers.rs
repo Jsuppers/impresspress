@@ -8,12 +8,15 @@ use crate::{
     blocks::{
         crud,
         products::{
-            contracts::{AdminSellerDetail, OfferStatus, ProductView, SellerAccountList},
+            contracts::{
+                AdminSellerDetail, ApprovalStatus, OfferStatus, ProductStatus, SellerAccountList,
+                SellerStatus,
+            },
             repo, stripe,
         },
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
-    util::{stamp_updated, RecordExt},
+    util::{enum_column, stamp_updated, wire_str, RecordExt},
 };
 
 /// The seller-governance classifications, then [`crud::db_error`] for
@@ -48,10 +51,15 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(products) => products,
         Err(error) => return err_internal("Could not list seller products", error),
     };
-    ok_json(&AdminSellerDetail {
-        seller,
-        products: products.iter().map(ProductView::from_record).collect(),
-    })
+    let products = match products
+        .iter()
+        .map(crate::blocks::products::contracts::ProductView::from_record)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(products) => products,
+        Err(error) => return err_internal("Product row is outside the contract", error),
+    };
+    ok_json(&AdminSellerDetail { seller, products })
 }
 
 async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> OutputStream {
@@ -66,21 +74,25 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     if product.str_field("owner_kind") != "user" {
         return err_conflict("Only seller-owned products use moderation");
     }
-    if approve
-        && product.str_field("approval_status") == "approved"
-        && product.str_field("status") == "active"
-    {
-        return ok_json(&ProductView::from_record(&product));
+    // The two columns moderation reads, each through its own enum. They are
+    // not one value spelled twice (review bug B11): a listing waiting for a
+    // moderator is `status = pending_review` and `approval_status = pending`
+    // at the same time, and neither vocabulary accepts the other's spelling.
+    let approval = match enum_column::<ApprovalStatus>(&product, "approval_status") {
+        Ok(approval) => approval,
+        Err(error) => return err_internal("Product row is outside the contract", error),
+    };
+    let status = match enum_column::<ProductStatus>(&product, "status") {
+        Ok(status) => status,
+        Err(error) => return err_internal("Product row is outside the contract", error),
+    };
+    if approve && approval == ApprovalStatus::Approved && status == ProductStatus::Active {
+        return super::product_json(&product);
     }
-    if !approve
-        && product.str_field("approval_status") == "rejected"
-        && product.str_field("status") == "draft"
-    {
-        return ok_json(&ProductView::from_record(&product));
+    if !approve && approval == ApprovalStatus::Rejected && status == ProductStatus::Draft {
+        return super::product_json(&product);
     }
-    if product.str_field("approval_status") != "pending"
-        || product.str_field("status") != "pending_review"
-    {
+    if approval != ApprovalStatus::Pending || status != ProductStatus::PendingReview {
         return err_conflict("Product is not waiting for moderation");
     }
     if approve {
@@ -93,14 +105,26 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     let now = chrono::Utc::now().to_rfc3339();
     let mut data = if approve {
         HashMap::from([
-            ("approval_status".to_string(), serde_json::json!("approved")),
-            ("status".to_string(), serde_json::json!("active")),
+            (
+                "approval_status".to_string(),
+                serde_json::json!(ApprovalStatus::Approved),
+            ),
+            (
+                "status".to_string(),
+                serde_json::json!(ProductStatus::Active),
+            ),
             ("published_at".to_string(), serde_json::json!(&now)),
         ])
     } else {
         HashMap::from([
-            ("approval_status".to_string(), serde_json::json!("rejected")),
-            ("status".to_string(), serde_json::json!("draft")),
+            (
+                "approval_status".to_string(),
+                serde_json::json!(ApprovalStatus::Rejected),
+            ),
+            (
+                "status".to_string(),
+                serde_json::json!(ProductStatus::Draft),
+            ),
             ("published_at".to_string(), serde_json::json!("")),
         ])
     };
@@ -112,7 +136,7 @@ async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> Ou
     // reach, so the write itself has to test liveness — and `NotFound` is the
     // same answer the `get` would have given a moment earlier.
     match repo::products::update_live(ctx, id, data).await {
-        Ok(product) => ok_json(&ProductView::from_record(&product)),
+        Ok(product) => super::product_json(&product),
         // The shared mapper, so this site cannot drift back to answering 500
         // for a repository refusal that names what the caller must change.
         Err(error) => super::write_error(error, "Could not moderate product"),
@@ -141,7 +165,11 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
         Ok(None) => return err_not_found("Seller not found"),
         Err(error) => return admin_error(error, "Seller not found"),
     };
-    if (account.str_field("status") == "suspended") == suspended {
+    // The stored spelling against the variant's own, not a decode: the read
+    // above deliberately holds the raw row so a seller whose data no longer
+    // decodes can still be suspended, and decoding here would put that
+    // failure mode back one line later.
+    if (account.str_field("status") == wire_str(&SellerStatus::Suspended)) == suspended {
         return match repo::seller_accounts::to_contract(&account) {
             Ok(seller) => ok_json(&seller),
             Err(error) => admin_error(error, "Seller not found"),
@@ -180,14 +208,27 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
             HashMap::from([
                 (
                     "approval_status".to_string(),
-                    serde_json::json!("suspended"),
+                    serde_json::json!(ApprovalStatus::Suspended),
                 ),
-                ("status".to_string(), serde_json::json!("archived")),
+                (
+                    "status".to_string(),
+                    serde_json::json!(ProductStatus::Archived),
+                ),
             ])
-        } else if product.str_field("approval_status") == "suspended" {
+            // Again the wire spelling rather than a decode: this loop is the
+            // fraud control's compensating write over every row the seller
+            // owns, deleted ones included, and one undecodable row must not
+            // abort it half-applied.
+        } else if product.str_field("approval_status") == wire_str(&ApprovalStatus::Suspended) {
             HashMap::from([
-                ("approval_status".to_string(), serde_json::json!("draft")),
-                ("status".to_string(), serde_json::json!("draft")),
+                (
+                    "approval_status".to_string(),
+                    serde_json::json!(ApprovalStatus::Draft),
+                ),
+                (
+                    "status".to_string(),
+                    serde_json::json!(ProductStatus::Draft),
+                ),
             ])
         } else {
             continue;

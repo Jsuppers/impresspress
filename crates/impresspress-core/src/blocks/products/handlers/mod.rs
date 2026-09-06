@@ -36,7 +36,9 @@ mod subscription;
 mod types;
 
 pub(in crate::blocks::products) use dispatch::{run, user_products_enabled};
-pub(in crate::blocks::products) use product::{is_owned_by, name_like_filter, write_error};
+pub(in crate::blocks::products) use product::{
+    is_owned_by, name_like_filter, product_json, write_error,
+};
 
 // The four table constants that used to live here (`GROUPS_TABLE`,
 // `TYPES_TABLE`, `GROUP_TEMPLATES_TABLE`, `PRODUCT_TEMPLATES_TABLE`) moved to

@@ -8,9 +8,9 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{
-        AmountRule, CommerceAnalytics, ManagedOffer, OfferStatus, SellerAccount,
-        SellerFailureSummary, StripeConnectionState, StripeConnectionStatus, VariableDefinition,
-        VariableKind,
+        AmountRule, ApprovalStatus, CommerceAnalytics, ManagedOffer, OfferStatus, OfferSyncStatus,
+        ProductStatus, SellerAccount, SellerFailureSummary, SellerStatus, StripeConnectionState,
+        StripeConnectionStatus, VariableDefinition, VariableKind,
     },
     money, repo, stripe_provider,
 };
@@ -644,7 +644,7 @@ pub async fn deleted_product_close(
                 header .card__head {
                     div .products-status-stack {
                         h2 .card__title .m-0 { (offer.offer.name) }
-                        (components::status_badge(offer_status_label(offer.status)))
+                        (components::status_badge(&commerce_wire(&offer.status)))
                     }
                     div .products-actions {
                         @if offer.status != OfferStatus::Archived {
@@ -694,15 +694,6 @@ pub async fn deleted_product_close(
     ui::shell_page(ctx, msg, shell, content).await
 }
 
-/// The wire spelling of an [`OfferStatus`], for the status badge.
-fn offer_status_label(status: OfferStatus) -> &'static str {
-    match status {
-        OfferStatus::Draft => "draft",
-        OfferStatus::Active => "active",
-        OfferStatus::Archived => "archived",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Admin: seller governance and moderation
 // ---------------------------------------------------------------------------
@@ -731,11 +722,14 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
             .entry(product.str_field("owner_id").to_string())
             .or_default() += 1;
     }
+    // The stored spellings against the variants' own, not a decode: every
+    // products SSR page renders whatever a row holds, and one row outside the
+    // contract must not cost the administrator the whole page.
     let pending: Vec<_> = seller_products
         .iter()
         .filter(|product| {
-            product.str_field("status") == "pending_review"
-                && product.str_field("approval_status") == "pending"
+            product.str_field("status") == commerce_wire(&ProductStatus::PendingReview)
+                && product.str_field("approval_status") == commerce_wire(&ApprovalStatus::Pending)
         })
         .collect();
     let selling_enabled = super::handlers::user_products_enabled(ctx).await;
@@ -795,7 +789,7 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 ];
                 @let rows: Vec<Vec<Markup>> = sellers.iter().map(|seller| vec![
                     html! { span .font-medium { (&seller.user_id) } },
-                    components::status_badge(&seller.status),
+                    components::status_badge(&commerce_wire(&seller.status)),
                     components::status_badge(if seller.capabilities.charges_enabled { "enabled" } else { "disabled" }),
                     components::status_badge(if seller.capabilities.payouts_enabled { "enabled" } else { "disabled" }),
                     html! { (product_counts.get(&seller.user_id).copied().unwrap_or_default()) },
@@ -828,17 +822,14 @@ pub async fn admin_seller_detail(
         Ok(products) => products,
         Err(error) => return crate::http::err_internal("Could not list seller products", error),
     };
-    let action = if seller.status == "suspended" {
-        "reactivate"
-    } else {
-        "suspend"
-    };
-    let action_label = if seller.status == "suspended" {
+    let suspended = seller.status == SellerStatus::Suspended;
+    let action = if suspended { "reactivate" } else { "suspend" };
+    let action_label = if suspended {
         "Reactivate seller"
     } else {
         "Suspend seller"
     };
-    let action_class = if seller.status == "suspended" {
+    let action_class = if suspended {
         "btn--primary"
     } else {
         "btn--secondary"
@@ -862,7 +853,7 @@ pub async fn admin_seller_detail(
                     p .text-muted .text-sm .text-subtitle { "Stripe verification and selling access" }
                 }
                 div .flex .gap-2 .items-center .flex-wrap {
-                    (components::status_badge(&seller.status))
+                    (components::status_badge(&commerce_wire(&seller.status)))
                     button .btn .(action_class) .btn--sm type="button" data-seller-action=(action) onclick="adminSellerSetState(this)" { (action_label) }
                 }
             }
@@ -1911,8 +1902,8 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                         @if let Some(interval) = offer.recurring_interval {
                             " · every " (offer.interval_count) " " (commerce_wire(&interval))
                         }
-                        @if managed.sync_status == "failed" { " · Stripe needs attention" }
-                        @else if managed.sync_status == "synced" { " · Synced with Stripe" }
+                        @if managed.sync_status == OfferSyncStatus::Failed { " · Stripe needs attention" }
+                        @else if managed.sync_status == OfferSyncStatus::Synced { " · Synced with Stripe" }
                     }
                 }
                 div .products-actions {
@@ -1922,9 +1913,9 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                     }
                     @if managed.status == OfferStatus::Active {
                         button .btn .btn--secondary .btn--sm type="button" onclick="productManagerOfferAction(this,'sync')" {
-                            @if managed.sync_status == "failed" {
+                            @if managed.sync_status == OfferSyncStatus::Failed {
                                 "Retry Stripe sync"
-                            } @else if managed.sync_status == "synced" {
+                            } @else if managed.sync_status == OfferSyncStatus::Synced {
                                 "Reconcile Stripe"
                             } @else {
                                 "Sync to Stripe"
@@ -2108,6 +2099,15 @@ pub async fn product_manager(
     });
     let status = product.str_field("status");
     let approval = product.str_field("approval_status");
+    // As above: the stored spelling compared against the variant's own. The
+    // badge below still renders the raw column, so a value outside the
+    // contract shows up on the page instead of replacing it with a 500.
+    let pending_review = status == commerce_wire(&ProductStatus::PendingReview);
+    let publishable = status != commerce_wire(&ProductStatus::Active) && !pending_review;
+    let archived = status == commerce_wire(&ProductStatus::Archived);
+    let live = status == commerce_wire(&ProductStatus::Active)
+        && approval == commerce_wire(&ApprovalStatus::Approved);
+    let awaiting_moderation = pending_review && approval == commerce_wire(&ApprovalStatus::Pending);
     let content = html! {
         @if admin { (admin_tabs("products")) } @else { (portal_tabs("products", seller_enabled)) }
         (components::page_header(
@@ -2124,23 +2124,23 @@ pub async fn product_manager(
                         (components::status_badge(status))
                         @if product.str_field("owner_kind") == "user" { span .badge .badge-secondary { "Review: " (approval) } }
                     }
-                    @if !admin && status == "pending_review" {
+                    @if !admin && pending_review {
                         p .text-muted .text-sm .text-subtitle { "This product is awaiting administrator review and is not public yet." }
                     }
                 }
                 div .products-actions {
-                    @if admin && product.str_field("owner_kind") == "user" && status == "pending_review" && approval == "pending" {
+                    @if admin && product.str_field("owner_kind") == "user" && awaiting_moderation {
                         button .btn .btn--primary .btn--sm type="button" data-moderation-action="approve" onclick="productManagerModerate(this,'approve')" { "Approve listing" }
                         button .btn .btn--secondary .btn--sm type="button" data-moderation-action="reject" onclick="productManagerModerate(this,'reject')" { "Return to seller" }
                     }
                     button .btn .btn--secondary .btn--sm type="button" onclick="productManagerDuplicate(this)" { "Duplicate product" }
-                    @if status != "active" && status != "pending_review" {
+                    @if publishable {
                         button .btn .btn--primary .btn--sm type="button" onclick="productManagerSetStatus('active',this)" { @if admin { "Publish product" } @else { "Submit for publication" } }
                     }
-                    @if status != "archived" {
+                    @if !archived {
                         button .btn .btn--secondary .btn--sm type="button" onclick="productManagerSetStatus('archived',this)" { "Archive product" }
                     }
-                    @if status == "active" && approval == "approved" {
+                    @if live {
                         a .btn .btn--secondary .btn--sm href=(format!("/b/products/catalog/{product_id}")) target="_blank" rel="noopener" { "View storefront" }
                     }
                 }
@@ -2871,9 +2871,9 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
         account.capabilities.details_submitted
             && account.capabilities.charges_enabled
             && account.capabilities.payouts_enabled
-            && account.status != "suspended"
+            && account.status != SellerStatus::Suspended
     });
-    let suspended = account.is_some_and(|account| account.status == "suspended");
+    let suspended = account.is_some_and(|account| account.status == SellerStatus::Suspended);
     let has_account = account.is_some_and(|account| !account.stripe_account_id.is_empty());
     html! {
         section .card {

@@ -6,7 +6,10 @@ use wafer_block::db::{Filter, FilterOp, ListOptions};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::{blocks::products::contracts::SubscriptionView, util::RecordExt};
+use crate::{
+    blocks::products::contracts::{SubscriptionStatus, SubscriptionView},
+    util::{enum_column, RecordExt},
+};
 
 /// Platform-billing subscription table — one row per user.
 pub(crate) const SUBSCRIPTIONS_TABLE: &str = "impresspress__products__subscriptions";
@@ -28,7 +31,10 @@ fn platform_update_data(
             serde_json::json!(stripe_subscription_id),
         ),
         ("plan".to_string(), serde_json::json!(plan)),
-        ("status".to_string(), serde_json::json!("active")),
+        (
+            "status".to_string(),
+            serde_json::json!(SubscriptionStatus::Active),
+        ),
         ("grace_period_end".to_string(), serde_json::Value::Null),
         (
             "stripe_event_created".to_string(),
@@ -203,7 +209,7 @@ pub(crate) async fn platform_subscription_exists(
 pub(crate) async fn update_status_plan(
     ctx: &dyn Context,
     stripe_subscription_id: &str,
-    status: &str,
+    status: SubscriptionStatus,
     plan: Option<&str>,
     event_created: i64,
 ) -> Result<i64, WaferError> {
@@ -212,9 +218,9 @@ pub(crate) async fn update_status_plan(
     };
     for _ in 0..3 {
         let current_created = current.i64_field("stripe_event_created");
-        let current_status = current.str_field("status").to_string();
+        let current_status: SubscriptionStatus = enum_column(&current, "status")?;
         if !super::subscription_transition_allowed(
-            &current_status,
+            current_status,
             current_created,
             status,
             event_created,
@@ -249,7 +255,7 @@ pub(crate) async fn update_status_plan(
                 Filter {
                     field: "status".into(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!(&current_status),
+                    value: serde_json::json!(current_status),
                 },
             ],
             data,
@@ -286,11 +292,11 @@ pub(crate) async fn mark_past_due(
     };
     for _ in 0..3 {
         let current_created = current.i64_field("stripe_event_created");
-        let current_status = current.str_field("status").to_string();
+        let current_status: SubscriptionStatus = enum_column(&current, "status")?;
         if !super::subscription_transition_allowed(
-            &current_status,
+            current_status,
             current_created,
-            "past_due",
+            SubscriptionStatus::PastDue,
             event_created,
         ) {
             return Ok(0);
@@ -299,7 +305,10 @@ pub(crate) async fn mark_past_due(
         let grace_end = (now + chrono::Duration::days(7)).to_rfc3339();
         let now = now.to_rfc3339();
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-        data.insert("status".into(), serde_json::json!("past_due"));
+        data.insert(
+            "status".into(),
+            serde_json::json!(SubscriptionStatus::PastDue),
+        );
         data.insert("grace_period_end".into(), serde_json::json!(&grace_end));
         data.insert("updated_at".into(), serde_json::json!(&now));
         data.insert(
@@ -323,7 +332,7 @@ pub(crate) async fn mark_past_due(
                 Filter {
                     field: "status".into(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!(&current_status),
+                    value: serde_json::json!(current_status),
                 },
             ],
             data,
@@ -364,7 +373,7 @@ pub(crate) async fn recover_from_paid_invoice(
             Filter {
                 field: "status".into(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!("past_due"),
+                value: serde_json::json!(SubscriptionStatus::PastDue),
             },
             Filter {
                 field: "stripe_event_created".into(),
@@ -373,7 +382,10 @@ pub(crate) async fn recover_from_paid_invoice(
             },
         ],
         HashMap::from([
-            ("status".into(), serde_json::json!("active")),
+            (
+                "status".into(),
+                serde_json::json!(SubscriptionStatus::Active),
+            ),
             ("grace_period_end".into(), serde_json::Value::Null),
             (
                 "stripe_event_created".into(),
@@ -387,6 +399,19 @@ pub(crate) async fn recover_from_paid_invoice(
 
 /// Cancel a subscription and reset every addon column to 0
 /// (`customer.subscription.deleted`). Returns rows affected.
+///
+/// **The written literal is deliberately still `cancelled`.** This table's
+/// `status` is published verbatim as `SubscriptionView.status`
+/// (`GET /b/products/subscription`), so writing
+/// [`SubscriptionStatus::Canceled`] — the canonical spelling every
+/// Stripe-sourced column uses — would change the value that endpoint
+/// returns for every subscription cancelled from this release on, while
+/// the rows already in the table kept returning the old one. That is a
+/// wire change on a published field, and it belongs with the decision to
+/// normalise the column, which has to move the stored rows too. Reads are
+/// already reconciled: [`SubscriptionStatus`]'s `cancelled` alias means
+/// every comparison in the block sees one variant whichever spelling a row
+/// holds.
 pub(crate) async fn cancel_and_reset_addons(
     ctx: &dyn Context,
     stripe_subscription_id: &str,
@@ -454,7 +479,7 @@ pub(crate) async fn set_addon_totals(
             Filter {
                 field: "status".into(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!("active"),
+                value: serde_json::json!(SubscriptionStatus::Active),
             },
         ],
         data,
