@@ -79,12 +79,7 @@ const TABLES: &[(&str, &str, &str, &str)] = &[
         "user_roles::TABLE",
         "platform_state",
     ),
-    (
-        "users",
-        "wafer_run__auth__users",
-        "users::TABLE",
-        "auth",
-    ),
+    ("users", "wafer_run__auth__users", "users::TABLE", "auth"),
     (
         "buckets",
         "impresspress__files__buckets",

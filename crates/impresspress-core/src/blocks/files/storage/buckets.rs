@@ -27,11 +27,8 @@ pub(in crate::blocks::files) async fn handle_list_buckets(
         Some(msg.user_id())
     };
     match repo::buckets::list_visible(ctx, owner).await {
-        Ok(records) => {
-            let names: Vec<&str> = records
-                .iter()
-                .filter_map(|r| r.data.get("name").and_then(|v| v.as_str()))
-                .collect();
+        Ok(rows) => {
+            let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
             ok_json(&serde_json::json!({"buckets": names}))
         }
         Err(e) => err_internal("Database error", e),

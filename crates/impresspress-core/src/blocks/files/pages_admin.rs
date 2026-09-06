@@ -210,15 +210,49 @@ async fn load_admin_stats(ctx: &dyn Context) -> AdminStats {
 }
 
 // ---------------------------------------------------------------------------
+// Column shaping
+//
+// The admin tables are narrow, so ids and timestamps are cut to a prefix.
+// These are the exact `get(..n).unwrap_or(..)` calls the row decoders used
+// to make inline, kept bit-for-bit: a value SHORTER than the cut renders the
+// fallback rather than the value, because `str::get` returns `None` for an
+// out-of-range (or non-char-boundary) index.
+// ---------------------------------------------------------------------------
+
+/// A user id cut to its first 8 bytes; an em dash when it is shorter.
+fn short_id(id: &str) -> String {
+    id.get(..8).unwrap_or("—").to_string()
+}
+
+/// An RFC 3339 timestamp cut to its `YYYY-MM-DD` prefix; empty when shorter.
+fn short_date(ts: &str) -> String {
+    ts.get(..10).unwrap_or("").to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Buckets
 // ---------------------------------------------------------------------------
 
+/// A render-side projection of [`repo::buckets::BucketRow`]: the owner id
+/// and the timestamp truncated for the table's narrow columns. It holds no
+/// decoding — `public` is the row's `bool`, decoded once in the repo (B13).
 #[derive(Clone, Debug)]
 pub struct AdminBucketRow {
     pub name: String,
     pub owner_short: String,
     pub public: bool,
     pub created_at_short: String,
+}
+
+impl From<&repo::buckets::BucketRow> for AdminBucketRow {
+    fn from(row: &repo::buckets::BucketRow) -> Self {
+        Self {
+            name: row.name.clone(),
+            owner_short: short_id(&row.created_by),
+            public: row.public,
+            created_at_short: short_date(&row.created_at),
+        }
+    }
 }
 
 /// Render the admin Buckets table (or empty state).
@@ -256,24 +290,7 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
     let rows: Vec<AdminBucketRow> = match repo::buckets::list_recent(ctx, 100).await {
-        Ok(list) => list
-            .records
-            .into_iter()
-            .map(|r| AdminBucketRow {
-                name: r.str_field("name").to_string(),
-                owner_short: r
-                    .str_field("created_by")
-                    .get(..8)
-                    .unwrap_or("—")
-                    .to_string(),
-                public: r.str_field("public") == "true",
-                created_at_short: r
-                    .str_field("created_at")
-                    .get(..10)
-                    .unwrap_or("")
-                    .to_string(),
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(AdminBucketRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e.message, "admin bucket list failed");
             Vec::new()
@@ -744,6 +761,166 @@ mod tests {
         assert!(
             html.contains(">1000<"),
             "files-per-bucket count missing: {html}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod b13_visibility_tests {
+    use serde_json::json;
+    use wafer_core::clients::database::Record;
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_html, TestContext};
+
+    /// One bucket row whose `public` column arrived in `shape`.
+    fn row_with_public(shape: serde_json::Value) -> repo::buckets::BucketRow {
+        repo::buckets::BucketRow::from_record(&Record {
+            id: "b1".to_string(),
+            data: [
+                ("name".to_string(), json!("photos")),
+                ("public".to_string(), shape),
+                ("created_by".to_string(), json!("alice-1234-5678")),
+                ("created_at".to_string(), json!("2026-05-06T10:00:00Z")),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    /// The two projections, off one repo row, for every shape `public` can
+    /// arrive in — including the Postgres `Bool` and TEXT `String` shapes the
+    /// SQLite-backed page tests below cannot produce. Both projections read
+    /// the row's already-decoded `bool`, so there is no second place for the
+    /// two pages to drift apart again.
+    #[test]
+    fn both_bucket_projections_agree_for_every_shape_public_arrives_in() {
+        for (shape, expected) in [
+            (json!(1), true),
+            (json!(true), true),
+            (json!("true"), true),
+            (json!(0), false),
+            (json!(false), false),
+            (json!("false"), false),
+        ] {
+            let row = row_with_public(shape.clone());
+            let user = super::super::pages_user::BucketRow::from((&row, 3));
+            let admin = AdminBucketRow::from(&row);
+            assert_eq!(
+                (user.public, admin.public),
+                (expected, expected),
+                "`public` as {shape} projected as user={} admin={}",
+                user.public,
+                admin.public
+            );
+        }
+    }
+
+    /// The projections shape their columns and read nothing else: the user
+    /// table keeps the full timestamp and carries the object count from the
+    /// second query, the admin table cuts the owner to 8 and the date to 10.
+    #[test]
+    fn the_bucket_projections_shape_only_what_the_table_renders() {
+        let row = row_with_public(json!(1));
+        let user = super::super::pages_user::BucketRow::from((&row, 7));
+        assert_eq!(user.name, "photos");
+        assert_eq!(user.created_at, "2026-05-06T10:00:00Z");
+        assert_eq!(user.object_count, 7);
+
+        let admin = AdminBucketRow::from(&row);
+        assert_eq!(admin.name, "photos");
+        assert_eq!(admin.owner_short, "alice-12");
+        assert_eq!(admin.created_at_short, "2026-05-06");
+    }
+
+    /// Does the user-facing bucket table say this bucket is public?
+    /// `pages_user::render_buckets_table` renders `badge-success`/"Public"
+    /// for a public bucket and a bare `badge`/"Private" otherwise.
+    fn user_page_says_public(html: &str) -> bool {
+        assert!(
+            html.contains(">photos<"),
+            "the bucket is missing from the user page entirely: {html}"
+        );
+        html.contains("badge-success")
+    }
+
+    /// Does the admin bucket table say this bucket is public?
+    /// `render_admin_buckets_table` renders `status_badge("public")` /
+    /// `status_badge("private")`, i.e. the literal word as the badge label.
+    fn admin_page_says_public(html: &str) -> bool {
+        assert!(
+            html.contains(">photos<"),
+            "the bucket is missing from the admin page entirely: {html}"
+        );
+        html.contains(">public</span>")
+    }
+
+    /// B13. `public` is written as a JSON bool by every writer
+    /// ([`repo::buckets::insert`] among them) into a column that is
+    /// `INTEGER` on SQLite and `BOOLEAN` on Postgres. The user bucket page
+    /// decoded it with `as_bool()` and the admin bucket page with
+    /// `str_field("public") == "true"`, so between them they accepted a JSON
+    /// bool and a JSON string and neither accepted the integer SQLite hands
+    /// back — one bucket, one row, two pages, and up to three different
+    /// answers depending on the backend.
+    ///
+    /// The fix is to decode it exactly once, in
+    /// [`repo::buckets::BucketRow::from_record`], through
+    /// `RecordExt::bool_field` (which accepts all three shapes). This test
+    /// therefore asserts the *correct* answer on both pages, not merely that
+    /// the two agree: on SQLite today they already agree — on "Private", for
+    /// a bucket that was created public.
+    #[tokio::test]
+    async fn both_bucket_pages_report_a_public_bucket_as_public() {
+        let ctx = TestContext::with_files().await;
+        // `admin_msg`'s user id, so the owner-scoped user page shows it too.
+        repo::buckets::insert(&ctx, "photos", true, "admin_1")
+            .await
+            .expect("seed public bucket");
+
+        let user_html = output_html(
+            super::super::pages_user::bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/"))
+                .await,
+        )
+        .await;
+        let admin_html =
+            output_html(buckets(&ctx, &admin_msg("retrieve", "/b/storage/admin/buckets")).await)
+                .await;
+
+        let user = user_page_says_public(&user_html);
+        let admin = admin_page_says_public(&admin_html);
+        assert!(
+            user && admin,
+            "a bucket created public must read public on both pages; \
+             user page said public={user}, admin page said public={admin}"
+        );
+    }
+
+    /// The other half of the same door: a private bucket must read private on
+    /// both pages. Guards the fix from over-correcting into "everything is
+    /// public".
+    #[tokio::test]
+    async fn both_bucket_pages_report_a_private_bucket_as_private() {
+        let ctx = TestContext::with_files().await;
+        repo::buckets::insert(&ctx, "photos", false, "admin_1")
+            .await
+            .expect("seed private bucket");
+
+        let user_html = output_html(
+            super::super::pages_user::bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/"))
+                .await,
+        )
+        .await;
+        let admin_html =
+            output_html(buckets(&ctx, &admin_msg("retrieve", "/b/storage/admin/buckets")).await)
+                .await;
+
+        let user = user_page_says_public(&user_html);
+        let admin = admin_page_says_public(&admin_html);
+        assert!(
+            !user && !admin,
+            "a bucket created private must read private on both pages; \
+             user page said public={user}, admin page said public={admin}"
         );
     }
 }
