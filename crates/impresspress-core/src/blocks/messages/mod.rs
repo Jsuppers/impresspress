@@ -1,4 +1,10 @@
-mod contracts;
+/// The block's wire types, including the two enums that define its `kind`
+/// and `role` columns. `pub` because `blocks::llm` converts [`EntryRole`]
+/// into `wafer_core::clients::llm::ChatRole` — the column is this block's,
+/// so the type that names its values is too (B20).
+///
+/// [`EntryRole`]: contracts::EntryRole
+pub mod contracts;
 pub(crate) mod migrations;
 pub mod pages;
 pub mod rest;
@@ -127,11 +133,35 @@ const ROUTES: &[EndpointRoute<Route>] = &[
 ];
 
 // The query and path schemas below stay hand-written: the filters come from
-// `msg.query(..)` by name via `non_empty(..)` (rest.rs) and `id` from
-// `msg.var("id")` as the table bound it, the same by-name shape as `files`'s
-// bucket/key params and `products`'s `id_path_schema`. Nothing here
-// deserializes a struct, so a type declared only to feed
-// `request_schema_of::<T>` would have no runtime user.
+// `msg.query(..)` by name (rest.rs) and `id` from `msg.var("id")` as the
+// table bound it, the same by-name shape as `files`'s bucket/key params and
+// `products`'s `id_path_schema`. Nothing here deserializes a *struct*, so a
+// type declared only to feed `request_schema_of::<T>` would have no runtime
+// user.
+//
+// The two closed-set filters are the exception, and [`enum_filter`] is why:
+// `rest::enum_query` deserializes `kind` and `role` into their enums, so the
+// published value list is that enum's own schema rather than a third copy of
+// the four spellings.
+
+/// One closed-set query parameter: the enum's derived schema, with this
+/// parameter's description attached.
+///
+/// Produces the same `{"description", "enum", "type"}` object a real enum
+/// field publishes anywhere else, so the schema says what `rest::enum_query`
+/// actually accepts — the descriptions used to carry the value list in prose
+/// and could drift from it silently.
+fn enum_filter<T: schemars::JsonSchema>(description: &str) -> serde_json::Value {
+    let mut schema = request_schema_of::<T>();
+    // The derive titles a *top-level* schema with its Rust type name; the
+    // same enum as a field of `AddEntryRequest` carries no title, and a
+    // query parameter is a field, not a document.
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("title");
+    }
+    schema["description"] = serde_json::json!(description);
+    schema
+}
 
 /// Query parameters of `GET /b/messages/api/contexts`.
 fn list_contexts_query_schema() -> serde_json::Value {
@@ -183,8 +213,8 @@ fn list_entries_query_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "kind": {"type": "string", "description": "Filter by kind (message, artifact, notification, status)"},
-            "role": {"type": "string", "description": "Filter by role (user, agent, system)"},
+            "kind": enum_filter::<contracts::EntryKind>("Filter by entry kind"),
+            "role": enum_filter::<contracts::EntryRole>("Filter by sender role"),
             "page": {"type": "integer", "default": 1},
             "page_size": {"type": "integer", "default": 100}
         }
@@ -289,15 +319,50 @@ mod tests {
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
     use wafer_run::Message;
+
+    use crate::test_support::TestContext;
+
+    /// A `TestContext` carrying this block's migrations **and** the block
+    /// itself, so `ctx.call_block("impresspress/messages", ..)` reaches the
+    /// real handlers.
+    ///
+    /// `blocks::llm` talks to this block only through `call_block`, so its
+    /// own tests need the callee registered; without it `messages_create`
+    /// silently returns `None` and a chat test proves nothing about the
+    /// entries it thinks it wrote. Migrations are applied the way
+    /// `TestContext::with_products` and friends apply theirs, after
+    /// `with_auth()` so the migration-tracking table exists first.
+    pub(crate) async fn ctx_with_messages() -> TestContext {
+        let mut ctx = TestContext::with_auth().await;
+        let sqlite: Vec<&str> = super::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .map(|(_, sql)| *sql)
+            .collect();
+        crate::migration_helper::apply_migrations(
+            &ctx,
+            "impresspress/messages",
+            &sqlite,
+            super::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await
+        .expect("apply messages migrations in test fixture");
+        ctx.register_block(
+            "impresspress/messages",
+            Arc::new(super::MessagesBlock::new()),
+        );
+        ctx
+    }
 
     /// Run `msg` through the block's own route table so `{id}` is bound the
     /// way it is on the wire, then hand the message to a handler directly.
     /// Panics when no row matches: a test that sends an unroutable path
     /// would otherwise exercise the handler's "missing id" branch by
     /// accident.
-    pub(super) fn routed(mut msg: Message) -> Message {
+    pub(crate) fn routed(mut msg: Message) -> Message {
         let route = crate::endpoint_match::dispatch(&mut msg, super::ROUTES);
         assert!(
             route.is_some(),

@@ -21,7 +21,7 @@ use crate::{
             LlmBlock,
         },
     },
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_internal, ok_json},
 };
 
 /// Reload all enabled providers from the DB and push the snapshot into the
@@ -101,7 +101,7 @@ pub(in crate::blocks::llm) async fn list_providers(
 ) -> OutputStream {
     let records = match db::list_all(ctx, PROVIDERS_TABLE, vec![]).await {
         Ok(r) => r,
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
     let providers: Vec<ProviderView> = records
         .iter()
@@ -160,7 +160,7 @@ pub(in crate::blocks::llm) async fn create_provider(
 
     let record = match db::create(ctx, PROVIDERS_TABLE, data).await {
         Ok(r) => r,
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
@@ -191,10 +191,7 @@ pub(in crate::blocks::llm) async fn update_provider(
     // Load existing record so we can apply the patch on top of stored values.
     let existing = match db::get(ctx, PROVIDERS_TABLE, &id).await {
         Ok(r) => r,
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Provider not found")
-        }
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Provider not found", "Database error"),
     };
     let mut cfg = match row_to_config(&existing) {
         Ok(c) => c,
@@ -230,10 +227,7 @@ pub(in crate::blocks::llm) async fn update_provider(
 
     let record = match db::update(ctx, PROVIDERS_TABLE, &id, data).await {
         Ok(r) => r,
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Provider not found")
-        }
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Provider not found", "Database error"),
     };
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
@@ -253,12 +247,8 @@ pub(in crate::blocks::llm) async fn delete_provider(
         Ok(value) => value.to_string(),
         Err(response) => return response,
     };
-    match db::delete(ctx, PROVIDERS_TABLE, &id).await {
-        Ok(()) => {}
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Provider not found")
-        }
-        Err(e) => return err_internal("Database error", e),
+    if let Err(e) = db::delete(ctx, PROVIDERS_TABLE, &id).await {
+        return crud::db_error(e, "Provider not found", "Database error");
     }
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
@@ -285,10 +275,7 @@ pub(in crate::blocks::llm) async fn discover_models(
     // provider name (== ProviderConfig::name), not by row id.
     let existing = match db::get(ctx, PROVIDERS_TABLE, &id).await {
         Ok(r) => r,
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-            return err_not_found("Provider not found")
-        }
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Provider not found", "Database error"),
     };
     let mut cfg = match row_to_config(&existing) {
         Ok(c) => c,

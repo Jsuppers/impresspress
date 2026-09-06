@@ -17,7 +17,7 @@ use wafer_run::{
 };
 
 use super::chat::MAX_BUFFERED_RESPONSE_BYTES;
-use crate::blocks::llm::messages_create;
+use crate::blocks::{llm::messages_create, messages::contracts::EntryRole};
 
 /// Terminal SSE frame for natural end-of-stream, letting clients distinguish
 /// it from a transport-level disconnect.
@@ -128,7 +128,14 @@ where
         // `[DONE]` already sees the new message. Persistence failure is
         // non-fatal here, exactly as in `handle_chat` (`messages_create`
         // logs and returns `None`).
-        let _ = messages_create(ctx.as_ref(), &msg, &thread_id, "assistant", &content).await;
+        let _ = messages_create(
+            ctx.as_ref(),
+            &msg,
+            &thread_id,
+            EntryRole::Assistant,
+            &content,
+        )
+        .await;
 
         let _ = sink.send_chunk(SSE_DONE_FRAME.to_vec()).await;
     })

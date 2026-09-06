@@ -62,12 +62,6 @@
 /// its entry called for.
 const STILL_HAND_MAPPED: &[(&str, &str)] = &[
     // ---- PR 3: content blocks ----
-    ("messages/rest.rs", "PR 3 (two context lookups)"),
-    (
-        "messages/pages.rs",
-        "PR 3 (the SSR context read; its 404 is `ui::not_found_response`, so \
-         it converts to `db_error` for the tail only)",
-    ),
     (
         "files/storage/buckets.rs",
         "PR 3 (a STORAGE call, not a database one: `NotFound` is a no-op and \
@@ -84,8 +78,6 @@ const STILL_HAND_MAPPED: &[(&str, &str)] = &[
     ("files/share.rs", "PR 3"),
     ("files/cloud.rs", "PR 3 (two share lookups)"),
     ("files/storage/objects.rs", "PR 3 (the object read)"),
-    ("llm/mod.rs", "PR 3 (the override delete)"),
-    ("llm/routes/providers.rs", "PR 3 (four provider lookups)"),
     // ---- PR 4: products enums (the same files move for the enum work) ----
     ("products/pages.rs", "PR 4 (three SSR reads)"),
     ("products/purchase.rs", "PR 4 (five purchase lookups)"),

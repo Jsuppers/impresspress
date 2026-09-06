@@ -20,8 +20,11 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::streaming::sse_chat_response;
 use crate::{
-    blocks::llm::{
-        contracts, messages_create, messages_list, record_field, LlmBlock, DEFAULT_PROVIDER,
+    blocks::{
+        llm::{
+            contracts, messages_create, messages_list, record_field, LlmBlock, DEFAULT_PROVIDER,
+        },
+        messages::contracts::EntryRole,
     },
     http::{err_bad_request, err_internal, ok_json},
 };
@@ -31,23 +34,27 @@ use crate::{
 /// reaches the `wafer-run/llm` service.
 const LEGACY_PROVIDER_BLOCK: &str = DEFAULT_PROVIDER;
 
-/// Map a stored message-role string to a [`ChatRole`].
+/// The messages block's role as the LLM service's [`ChatRole`].
 ///
-/// "user", "assistant", "system" map to their matching variants; anything
-/// else falls back to [`ChatRole::User`].
-fn role_from_str(role: &str) -> ChatRole {
+/// Total by construction, which is the whole of B20's fix. The function this
+/// replaces matched `"assistant"` and `"system"` and sent **everything else**
+/// to [`ChatRole::User`] — including `"agent"`, the one role the messages
+/// composer offers. So an entry an agent posted came back to the model as
+/// the user's own next instruction, and adding a role to the messages block
+/// would have silently done the same thing again. A new [`EntryRole`]
+/// variant now fails to compile here instead.
+fn chat_role(role: EntryRole) -> ChatRole {
     match role {
-        "assistant" => ChatRole::Assistant,
-        "system" => ChatRole::System,
-        // "user" or any unknown role — coerce to User rather than dropping.
-        _ => ChatRole::User,
+        EntryRole::User => ChatRole::User,
+        EntryRole::Assistant => ChatRole::Assistant,
+        EntryRole::System => ChatRole::System,
     }
 }
 
 /// Build a text-content `ChatMessage` for the given role.
 ///
-/// `ChatRole::Tool` is unreachable via `role_from_str` (it coerces to
-/// `User`), but if it ever bubbles up here a tool-result message would
+/// `ChatRole::Tool` is unreachable via [`chat_role`] (no [`EntryRole`] maps
+/// to it), but if it ever bubbles up here a tool-result message would
 /// require a `tool_call_id` we don't have — so coerce it to a user turn
 /// rather than emit an invalid Tool message.
 fn build_text_message(role: ChatRole, content: String) -> ChatMessage {
@@ -64,17 +71,26 @@ fn build_text_message(role: ChatRole, content: String) -> ChatMessage {
 }
 
 /// Convert stored message history into the `ChatMessage` vector the service
-/// interface expects. Non-text entries (or entries missing `role`) are
-/// skipped silently.
+/// interface expects.
+///
+/// An entry whose `role` is not an [`EntryRole`] is skipped, which is what
+/// already happened to the rows this can still see: `role`'s column default
+/// was `''` before the messages block typed it, and an empty role has always
+/// been dropped here. Skipping is deliberately not the same as the old
+/// fallback — an unreadable role must not become a *user* turn, because that
+/// puts words the user never wrote into the model's input.
 fn history_to_messages(history: &[serde_json::Value]) -> Vec<ChatMessage> {
     history
         .iter()
-        .filter(|entry| !record_field(entry, "role").is_empty())
-        .map(|entry| {
-            build_text_message(
-                role_from_str(record_field(entry, "role")),
+        .filter_map(|entry| {
+            let role: EntryRole = serde_json::from_value(serde_json::Value::String(
+                record_field(entry, "role").to_string(),
+            ))
+            .ok()?;
+            Some(build_text_message(
+                chat_role(role),
                 record_field(entry, "content").to_string(),
-            )
+            ))
         })
         .collect()
 }
@@ -124,7 +140,7 @@ async fn dispatch_chat(
     };
 
     // 1. Persist the user message before calling the model.
-    let _ = messages_create(ctx, msg, &thread_id, "user", &message).await;
+    let _ = messages_create(ctx, msg, &thread_id, EntryRole::User, &message).await;
 
     // 2. Load prior history (which now includes the just-written user msg).
     let history = messages_list(ctx, msg, &thread_id).await;
@@ -240,7 +256,7 @@ pub(in crate::blocks::llm) async fn handle_chat(
     }
 
     // Persist the assistant reply.
-    let saved = messages_create(ctx, msg, &thread_id, "assistant", &content).await;
+    let saved = messages_create(ctx, msg, &thread_id, EntryRole::Assistant, &content).await;
     let message_id = saved
         .as_ref()
         .and_then(|v| {
@@ -395,18 +411,118 @@ mod tests {
         }
     }
 
+    /// B20. The messages block documents `agent` as a role, its composer is
+    /// the only control in the tree that offers one, and every entry stored
+    /// with it was replayed to the model as if the *user* had written it —
+    /// so an agent's own turn came back as the user's next instruction.
+    ///
+    /// The four roles a stored entry can hold map onto three `ChatRole`s,
+    /// and `agent` is an alias of `assistant`, not of `user`.
     #[test]
-    fn role_from_str_maps_known_roles() {
-        assert_eq!(role_from_str("user"), ChatRole::User);
-        assert_eq!(role_from_str("assistant"), ChatRole::Assistant);
-        assert_eq!(role_from_str("system"), ChatRole::System);
+    fn an_agent_turn_is_replayed_as_an_assistant_turn() {
+        let history: Vec<serde_json::Value> = ["user", "assistant", "agent", "system"]
+            .iter()
+            .map(|role| serde_json::json!({ "role": role, "content": "t" }))
+            .collect();
+
+        let roles: Vec<ChatRole> = history_to_messages(&history)
+            .iter()
+            .map(|m| m.role)
+            .collect();
+
+        assert_eq!(
+            roles,
+            vec![
+                ChatRole::User,
+                ChatRole::Assistant,
+                ChatRole::Assistant,
+                ChatRole::System,
+            ],
+            "an entry stored with the messages block's `agent` role must not \
+             be replayed to the model as a user turn"
+        );
+    }
+
+    /// B20, end to end and through the real wire.
+    ///
+    /// A human posts `role=agent` — the value the messages composer offered
+    /// — into a thread, and the next chat request rebuilds its history from
+    /// that column. Before `EntryRole`, `role_from_str` sent every value it
+    /// did not recognise to `ChatRole::User`, so the agent's own turn came
+    /// back to the model as the user's next instruction. The unit test above
+    /// pins the mapping; this pins that the two blocks agree on the value
+    /// travelling between them.
+    #[tokio::test]
+    async fn an_entry_posted_as_agent_reaches_the_model_as_an_assistant_turn() {
+        use crate::blocks::messages::{service, test_support::ctx_with_messages};
+
+        let ctx = ctx_with_messages().await;
+        let thread =
+            service::create_context(&ctx, "user-a", "conversation", "T", "", "", None, None)
+                .await
+                .expect("create the thread");
+
+        // Posted the way the composer posts it: through the messages block's
+        // own HTTP surface, not through a repo call that could not see the
+        // request parsing.
+        let mut post = crate::util::block_request(
+            "create",
+            "POST",
+            &format!("/b/messages/api/contexts/{}/entries", thread.id),
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+        );
+        post.set_meta("req.content_type", "application/json");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "message",
+            "role": "agent",
+            "content": "I did the thing",
+        }))
+        .expect("body");
+        let stored = ctx
+            .call_block("impresspress/messages", post, InputStream::from_bytes(body))
+            .await;
+        assert_eq!(
+            crate::test_support::output_json(stored).await["data"]["role"],
+            "assistant"
+        );
+
+        let history = messages_list(
+            &ctx,
+            &crate::test_support::auth_msg("retrieve", "/b/llm/api/chat", "user-a"),
+            &thread.id,
+        )
+        .await;
+        assert_eq!(
+            history_to_messages(&history)
+                .iter()
+                .map(|m| m.role)
+                .collect::<Vec<_>>(),
+            vec![ChatRole::Assistant],
+            "an entry the agent posted must not reach the model as a user turn"
+        );
     }
 
     #[test]
-    fn role_from_str_unknown_falls_back_to_user() {
-        assert_eq!(role_from_str("tool"), ChatRole::User);
-        assert_eq!(role_from_str(""), ChatRole::User);
-        assert_eq!(role_from_str("random"), ChatRole::User);
+    fn every_entry_role_has_its_own_chat_role() {
+        assert_eq!(chat_role(EntryRole::User), ChatRole::User);
+        assert_eq!(chat_role(EntryRole::Assistant), ChatRole::Assistant);
+        assert_eq!(chat_role(EntryRole::System), ChatRole::System);
+    }
+
+    /// The replacement for `role_from_str_unknown_falls_back_to_user`, which
+    /// asserted that `"tool"`, `""` and `"random"` were all replayed as the
+    /// *user*. That fallback is the bug: an entry whose role cannot be read
+    /// is left out of the history rather than attributed to the person who
+    /// did not write it.
+    #[test]
+    fn an_unreadable_role_is_left_out_of_the_history() {
+        for role in ["tool", "", "random"] {
+            let history = vec![serde_json::json!({ "role": role, "content": "t" })];
+            assert!(
+                history_to_messages(&history).is_empty(),
+                "role {role:?} must not be replayed as a user turn"
+            );
+        }
     }
 
     #[test]

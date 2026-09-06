@@ -6,18 +6,29 @@
 
 use maud::{html, Markup};
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
+use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
-use super::service::{self, ListContextsParams, ListEntriesParams};
+use super::{
+    contracts::{EntryKind, EntryRole},
+    service::{self, ListContextsParams, ListEntriesParams},
+};
 use crate::{
-    http::err_internal,
+    blocks::crud,
     ui::{self, shell::Crumb},
-    util::RecordExt,
+    util::{enum_column_or, RecordExt},
 };
 
-pub fn entry_card(record: &db::Record) -> Markup {
-    let kind = record.str_field("kind");
-    let role = record.str_field("role");
+/// Render one entry.
+///
+/// `kind` and `role` are decoded through the crate's one enum door, so a
+/// column holding a value the contract does not define stops the page rather
+/// than being drawn as whatever the fall-through arm happened to be. Both
+/// empty cases are the ones the table's own DDL produces: `kind` defaults to
+/// `message`, `role` defaults to `''`, and a role-less entry has never
+/// carried a role badge.
+pub fn entry_card(record: &db::Record) -> Result<Markup, WaferError> {
+    let kind: EntryKind = enum_column_or(record, "kind", EntryKind::Message)?;
+    let role: Option<EntryRole> = enum_column_or(record, "role", None)?;
     let content = record.str_field("content");
     let content_type = record.str_field("content_type");
     let created_at = record.str_field("created_at");
@@ -30,25 +41,26 @@ pub fn entry_card(record: &db::Record) -> Markup {
     // that clashed with the orange brand. Keep in sync with
     // `messageCardHtml` in ui/assets/llm-chat.js — same cards, JS-rendered.
     let (card_variant, badge_class) = match kind {
-        "artifact" => ("message-card--neutral", "badge"),
-        "notification" => ("message-card--warning", "badge-warning"),
-        "status" => ("message-card--neutral", "badge"),
-        _ => match role {
-            "user" => ("message-card--user", "badge"),
-            "agent" | "assistant" => ("message-card--neutral", "badge"),
-            "system" => ("message-card--warning", "badge-warning"),
-            _ => ("message-card--neutral", "badge"),
+        EntryKind::Artifact | EntryKind::Status => ("message-card--neutral", "badge"),
+        EntryKind::Notification => ("message-card--warning", "badge-warning"),
+        EntryKind::Message => match role {
+            Some(EntryRole::User) => ("message-card--user", "badge"),
+            Some(EntryRole::Assistant) | None => ("message-card--neutral", "badge"),
+            Some(EntryRole::System) => ("message-card--warning", "badge-warning"),
         },
     };
 
-    html! {
+    Ok(html! {
         div .card .(card_variant) {
             div .flex .items-center .gap-2 .mb-2 {
-                span .badge .(badge_class) .text-capitalize { (kind) }
-                @if !role.is_empty() {
-                    span .badge .text-capitalize { (role) }
+                span .badge .(badge_class) .text-capitalize { (wire_str(&kind)) }
+                @if let Some(role) = role {
+                    span .badge .text-capitalize { (wire_str(&role)) }
                 }
-                @if kind == "artifact" && !content_type.is_empty() && content_type != "text/plain" {
+                @if kind == EntryKind::Artifact
+                    && !content_type.is_empty()
+                    && content_type != "text/plain"
+                {
                     span .text-muted .text-xs { (content_type) }
                 }
                 @if !date.is_empty() {
@@ -57,6 +69,20 @@ pub fn entry_card(record: &db::Record) -> Markup {
             }
             p .message-card__content { (content) }
         }
+    })
+}
+
+/// An enum as the string it is stored and published as.
+///
+/// The badges have always shown the wire spelling (`message`, `assistant`),
+/// capitalised by CSS. Serializing is what keeps that true without a
+/// per-variant label table beside the serde one to drift from it.
+fn wire_str<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        // Unreachable: every caller is a unit-variant enum with
+        // `rename_all = "snake_case"`, which serializes to a string.
+        _ => String::new(),
     }
 }
 
@@ -161,7 +187,10 @@ pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStre
     let context = match service::get_context(ctx, context_id).await {
         Ok(r) => r,
         Err(e) if e.code == ErrorCode::NotFound => return ui::not_found_response(msg),
-        Err(e) => return err_internal("Database error", e),
+        // The 404 above is the SSR not-found *page*, so only the tail goes
+        // through the one mapping — which is what makes a WRAP denial a 403
+        // here instead of the 500 it used to be.
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
 
     let entries_params = ListEntriesParams {
@@ -203,7 +232,10 @@ pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStre
         context_title
     };
 
-    let body = render_context_detail_body(&context, &entries, &siblings, context_id);
+    let body = match render_context_detail_body(&context, &entries, &siblings, context_id) {
+        Ok(body) => body,
+        Err(e) => return crud::db_error_internal(e, "Entry decode"),
+    };
 
     // Build crumbs locally so the conversation branch can carry a working
     // [Messages] link back to /b/messages/. The default branch keeps a
@@ -253,7 +285,7 @@ fn render_context_detail_body(
     entries: &[db::Record],
     siblings: &[db::Record],
     context_id: &str,
-) -> Markup {
+) -> Result<Markup, WaferError> {
     let context_type = context.str_field("type");
 
     // Why type=conversation diverges: conversation contexts are chat-shaped,
@@ -275,7 +307,7 @@ fn render_conversation_view(
     entries: &[db::Record],
     siblings: &[db::Record],
     context_id: &str,
-) -> Markup {
+) -> Result<Markup, WaferError> {
     let post_url = format!("/b/messages/api/contexts/{context_id}/entries");
 
     // Ensure the active context is always present in the thread list (a
@@ -289,14 +321,30 @@ fn render_conversation_view(
     combined.extend(siblings.iter());
 
     let thread_list = render_conversation_thread_list(&combined, context_id);
-    let messages_pane = render_conversation_messages(entries);
+    let messages_pane = render_conversation_messages(entries)?;
     let composer = render_conversation_composer(&post_url);
 
-    crate::ui::templates::chat_page(thread_list, messages_pane, composer, None)
+    Ok(crate::ui::templates::chat_page(
+        thread_list,
+        messages_pane,
+        composer,
+        None,
+    ))
 }
 
 /// Default single-pane view for task/notification/etc.
-fn render_default_view(context: &db::Record, entries: &[db::Record], context_id: &str) -> Markup {
+fn render_default_view(
+    context: &db::Record,
+    entries: &[db::Record],
+    context_id: &str,
+) -> Result<Markup, WaferError> {
+    // Rendered up front rather than inside the `@for`: maud's loop body has
+    // no way to carry a `?` out, and a card that cannot be decoded must stop
+    // the page rather than be skipped.
+    let cards = entries
+        .iter()
+        .map(entry_card)
+        .collect::<Result<Vec<_>, _>>()?;
     let context_title = context.str_field("title");
     let context_type = context.str_field("type");
     let context_status = context.str_field("status");
@@ -307,7 +355,7 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
     };
     let post_url = format!("/b/messages/api/contexts/{context_id}/entries");
 
-    html! {
+    Ok(html! {
         div .flex .items-center .gap-3 .mb-6 {
             a .btn .btn--ghost .btn--sm href="/b/messages/" { (ui::icons::arrow_left()) " Back" }
             h2 .page-title .m-0 { (display_title) }
@@ -321,8 +369,8 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
                     "No entries yet. Add one below."
                 }
             } @else {
-                @for e in entries {
-                    (entry_card(e))
+                @for card in &cards {
+                    (card)
                 }
             }
         }
@@ -346,7 +394,11 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
                     }
                     select .form-input .w-auto name="role" {
                         option value="user" { "user" }
-                        option value="agent" { "agent" }
+                        // `assistant`, not `agent`: both reach the same
+                        // stored value (`agent` is a deserialisation alias
+                        // of it) and this is the spelling the column holds
+                        // and the schema publishes.
+                        option value="assistant" { "assistant" }
                         option value="system" { "system" }
                     }
                 }
@@ -361,7 +413,7 @@ fn render_default_view(context: &db::Record, entries: &[db::Record], context_id:
                 }
             }
         }
-    }
+    })
 }
 
 fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) -> Markup {
@@ -407,26 +459,32 @@ fn render_conversation_thread_list(siblings: &[&db::Record], active_id: &str) ->
     }
 }
 
-fn render_conversation_messages(entries: &[db::Record]) -> Markup {
+fn render_conversation_messages(entries: &[db::Record]) -> Result<Markup, WaferError> {
+    // See `render_default_view`: the cards are decoded before the markup so
+    // a bad row is an error, not a silently missing message.
+    let cards = entries
+        .iter()
+        .map(entry_card)
+        .collect::<Result<Vec<_>, _>>()?;
     // The `chat_page` template's `.chat-messages` wrapper already owns
     // scroll, padding, and background for this pane (see
     // styles/layouts/page.css `.page--chat .chat-messages`). We just need
     // the #entries-list ID
     // for the htmx composer's hx-target — no extra scroll container or
     // we double-scroll and end up with a boxed-inside-boxed look.
-    html! {
+    Ok(html! {
         div #entries-list {
-            @if entries.is_empty() {
+            @if cards.is_empty() {
                 div .text-center .text-muted .p-8 {
                     "No messages yet. Send the first one below."
                 }
             } @else {
-                @for e in entries {
-                    (entry_card(e))
+                @for card in &cards {
+                    (card)
                 }
             }
         }
-    }
+    })
 }
 
 fn render_conversation_composer(post_url: &str) -> Markup {
@@ -484,7 +542,9 @@ mod tests {
             .data
             .insert("status".to_string(), serde_json::json!("active"));
 
-        let html = render_context_detail_body(&ctx_rec, &[], &[], "ctx-1").into_string();
+        let html = render_context_detail_body(&ctx_rec, &[], &[], "ctx-1")
+            .expect("the fixture rows decode")
+            .into_string();
         assert!(
             html.contains(r#"class="page--chat""#),
             "conversation type should use chat_page template; got: {html}"
@@ -509,7 +569,9 @@ mod tests {
             .data
             .insert("status".to_string(), serde_json::json!("open"));
 
-        let html = render_context_detail_body(&ctx_rec, &[], &[], "ctx-1").into_string();
+        let html = render_context_detail_body(&ctx_rec, &[], &[], "ctx-1")
+            .expect("the fixture rows decode")
+            .into_string();
         assert!(
             !html.contains(r#"class="page--chat""#),
             "task type should keep the existing single-pane shell"
@@ -544,6 +606,7 @@ mod tests {
 
         let html =
             render_context_detail_body(&active, &[], std::slice::from_ref(&sibling), "ctx-1")
+                .expect("the fixture rows decode")
                 .into_string();
         assert!(
             html.contains(r#"href="/b/messages/contexts/ctx-2""#),
@@ -566,7 +629,9 @@ mod tests {
             .data
             .insert("title".to_string(), serde_json::json!("Hello"));
 
-        let html = render_context_detail_body(&ctx_rec, &[], &[], "ctx-1").into_string();
+        let html = render_context_detail_body(&ctx_rec, &[], &[], "ctx-1")
+            .expect("the fixture rows decode")
+            .into_string();
 
         // #entries-list still exists for htmx hx-target.
         assert!(html.contains(r#"id="entries-list""#));
