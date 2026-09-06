@@ -3,7 +3,7 @@
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::files::repo,
+    blocks::files::{contracts::RecordListView, repo},
     http::{err_bad_request, err_internal, ok_json},
 };
 
@@ -26,7 +26,7 @@ pub(in crate::blocks::files) async fn handle_search(
     )
     .await
     {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Search failed", e),
     }
 }
@@ -36,7 +36,7 @@ pub(in crate::blocks::files) async fn handle_recent(
     msg: &Message,
 ) -> OutputStream {
     match repo::views::list_recent_for_user(ctx, msg.user_id(), 20).await {
-        Ok(result) => ok_json(&result),
+        Ok(page) => ok_json(&RecordListView::from_page(&page)),
         Err(e) => err_internal("Database error", e),
     }
 }

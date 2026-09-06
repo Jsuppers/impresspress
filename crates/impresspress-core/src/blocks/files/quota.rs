@@ -1,34 +1,7 @@
-use wafer_core::clients::database::Record;
 use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 
 use super::{models::QuotaConfig, repo};
-use crate::{
-    http::{err_bad_request, err_internal},
-    util::RecordExt,
-};
-
-/// Map a quota-override row onto a `QuotaConfig`, falling back to the
-/// block defaults field-by-field. Numeric fields accept both JSON numbers
-/// and TEXT-stored numeric strings (see `RecordExt::opt_i64_field`) so a
-/// TEXT-stored override is honored rather than silently replaced by the
-/// default.
-fn quota_from_record(record: &Record) -> QuotaConfig {
-    let defaults = QuotaConfig::default();
-    QuotaConfig {
-        max_storage_bytes: record
-            .opt_i64_field("max_storage_bytes")
-            .unwrap_or(defaults.max_storage_bytes),
-        max_file_size_bytes: record
-            .opt_i64_field("max_file_size_bytes")
-            .unwrap_or(defaults.max_file_size_bytes),
-        max_files_per_bucket: record
-            .opt_i64_field("max_files_per_bucket")
-            .unwrap_or(defaults.max_files_per_bucket),
-        reset_period_days: record
-            .opt_i64_field("reset_period_days")
-            .unwrap_or(defaults.reset_period_days),
-    }
-}
+use crate::http::{err_bad_request, err_internal};
 
 /// The user's effective quota: their override row when one exists,
 /// otherwise the block defaults. Only a missing row means "defaults" — any
@@ -36,7 +9,7 @@ fn quota_from_record(record: &Record) -> QuotaConfig {
 /// override" would silently lift an admin-lowered cap.
 pub async fn get_user_quota(ctx: &dyn Context, user_id: &str) -> Result<QuotaConfig, WaferError> {
     match repo::quota::find_for_user(ctx, user_id).await {
-        Ok(record) => Ok(quota_from_record(&record)),
+        Ok(row) => Ok(row.config),
         Err(e) if e.code == ErrorCode::NotFound => Ok(QuotaConfig::default()),
         Err(e) => Err(e),
     }
@@ -133,72 +106,6 @@ mod tests {
 
     use super::*;
     use crate::test_support::{output_is_error, FailingDbOpContext, TestContext};
-
-    fn record_with(data: &[(&str, serde_json::Value)]) -> Record {
-        Record {
-            id: "1".to_string(),
-            data: data
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect(),
-        }
-    }
-
-    /// Regression: the SQLite service returns TEXT-stored columns as JSON
-    /// strings. `get_user_quota` used to read overrides with a bare
-    /// `as_i64()`, so a TEXT-stored `max_storage_bytes` override silently
-    /// fell back to the 1 GiB default and enforcement ignored the
-    /// admin-configured cap.
-    #[test]
-    fn quota_from_record_honors_text_stored_overrides() {
-        let record = record_with(&[
-            ("max_storage_bytes", json!("2048")),
-            ("max_file_size_bytes", json!("1024")),
-            ("max_files_per_bucket", json!("5")),
-            ("reset_period_days", json!("7")),
-        ]);
-        let quota = quota_from_record(&record);
-        assert_eq!(
-            quota.max_storage_bytes, 2048,
-            "TEXT-stored override must be enforced, not replaced by the default"
-        );
-        assert_eq!(quota.max_file_size_bytes, 1024);
-        assert_eq!(quota.max_files_per_bucket, 5);
-        assert_eq!(quota.reset_period_days, 7);
-    }
-
-    #[test]
-    fn quota_from_record_accepts_number_typed_overrides() {
-        let record = record_with(&[
-            ("max_storage_bytes", json!(4096)),
-            ("max_file_size_bytes", json!(2048)),
-        ]);
-        let quota = quota_from_record(&record);
-        assert_eq!(quota.max_storage_bytes, 4096);
-        assert_eq!(quota.max_file_size_bytes, 2048);
-    }
-
-    #[test]
-    fn quota_from_record_defaults_missing_and_junk_fields() {
-        let record = record_with(&[("max_storage_bytes", json!("not-a-number"))]);
-        let quota = quota_from_record(&record);
-        assert_eq!(
-            quota.max_storage_bytes,
-            QuotaConfig::DEFAULT_MAX_STORAGE_BYTES
-        );
-        assert_eq!(
-            quota.max_file_size_bytes,
-            QuotaConfig::DEFAULT_MAX_FILE_SIZE_BYTES
-        );
-        assert_eq!(
-            quota.max_files_per_bucket,
-            QuotaConfig::DEFAULT_MAX_FILES_PER_BUCKET
-        );
-        assert_eq!(
-            quota.reset_period_days,
-            QuotaConfig::DEFAULT_RESET_PERIOD_DAYS
-        );
-    }
 
     #[tokio::test]
     async fn get_user_quota_returns_defaults_without_override_row() {

@@ -11,7 +11,6 @@ use crate::{
         shell::Crumb,
         templates::{list_page, PageHeader},
     },
-    util::RecordExt,
 };
 
 #[derive(Clone, Debug)]
@@ -20,6 +19,10 @@ pub struct QuotaInfo {
     pub limit_bytes: i64,
 }
 
+/// A share as the owner sees it on `/b/cloudstorage/`.
+///
+/// A render-side projection of [`repo::shares::ShareRow`] — the columns the
+/// table renders, with no decoding of its own.
 #[derive(Clone, Debug)]
 pub struct ShareRow {
     pub token: String,
@@ -28,6 +31,19 @@ pub struct ShareRow {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub access_count: i64,
+}
+
+impl From<&repo::shares::ShareRow> for ShareRow {
+    fn from(row: &repo::shares::ShareRow) -> Self {
+        Self {
+            token: row.token.clone(),
+            bucket: row.bucket.clone(),
+            key: row.key.clone(),
+            created_at: row.created_at.clone(),
+            expires_at: row.expires_at.clone(),
+            access_count: row.access_count,
+        }
+    }
 }
 
 fn quota_pct(used: i64, limit: i64) -> i64 {
@@ -95,41 +111,7 @@ pub fn render_shares_table(rows: &[ShareRow]) -> Markup {
 
 async fn list_shares_for_user(ctx: &dyn Context, user_id: &str) -> Vec<ShareRow> {
     match repo::shares::list_all_for_user(ctx, user_id).await {
-        Ok(records) => records
-            .into_iter()
-            .map(|r| ShareRow {
-                token: r
-                    .data
-                    .get("token")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                bucket: r
-                    .data
-                    .get("bucket")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                key: r
-                    .data
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                created_at: r
-                    .data
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                expires_at: r
-                    .data
-                    .get("expires_at")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                access_count: r.i64_field("access_count"),
-            })
-            .collect(),
+        Ok(rows) => rows.iter().map(ShareRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e, "shares list failed");
             Vec::new()
@@ -199,6 +181,36 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The user share projection renders the full token and the full
+    /// timestamps — nothing is cut on this page — and reads no field itself.
+    #[test]
+    fn user_share_projection_carries_the_row_through_uncut() {
+        let row = repo::shares::ShareRow::from_record(&wafer_core::clients::database::Record {
+            id: "s1".to_string(),
+            data: [
+                ("token", serde_json::json!("tok12345abcdef-more")),
+                ("bucket", serde_json::json!("photos")),
+                ("key", serde_json::json!("a.png")),
+                ("created_at", serde_json::json!("2026-05-06T10:00:00Z")),
+                ("expires_at", serde_json::json!("2026-06-06T10:00:00Z")),
+                ("access_count", serde_json::json!("4")),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        });
+        let projected = ShareRow::from(&row);
+        assert_eq!(projected.token, "tok12345abcdef-more");
+        assert_eq!(projected.bucket, "photos");
+        assert_eq!(projected.key, "a.png");
+        assert_eq!(projected.created_at, "2026-05-06T10:00:00Z");
+        assert_eq!(
+            projected.expires_at.as_deref(),
+            Some("2026-06-06T10:00:00Z")
+        );
+        assert_eq!(projected.access_count, 4);
+    }
 
     #[test]
     fn render_quota_card_under_quota() {

@@ -17,12 +17,27 @@ use crate::{
 
 /// Aggregated bucket info as shown in the user-facing table:
 /// name, public flag, created-at ISO string, and live object count.
+///
+/// A render-side projection of [`repo::buckets::BucketRow`] — it holds no
+/// decoding of its own, only the object count, which comes from a second
+/// query rather than from the bucket row.
 #[derive(Clone, Debug)]
 pub struct BucketRow {
     pub name: String,
     pub public: bool,
     pub created_at: String,
     pub object_count: i64,
+}
+
+impl From<(&repo::buckets::BucketRow, i64)> for BucketRow {
+    fn from((row, object_count): (&repo::buckets::BucketRow, i64)) -> Self {
+        Self {
+            name: row.name.clone(),
+            public: row.public,
+            created_at: row.created_at.clone(),
+            object_count,
+        }
+    }
 }
 
 /// Render the bucket-list table (or empty state).
@@ -116,8 +131,8 @@ pub fn render_new_bucket_modal() -> Markup {
 pub async fn list_buckets_for_user(ctx: &dyn Context, user_id: &str) -> Vec<BucketRow> {
     use std::collections::HashMap;
 
-    let recs = match repo::buckets::list_owned_sorted(ctx, user_id).await {
-        Ok(records) => records,
+    let owned = match repo::buckets::list_owned_sorted(ctx, user_id).await {
+        Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = %e, "files bucket list failed");
             Vec::new()
@@ -127,11 +142,7 @@ pub async fn list_buckets_for_user(ctx: &dyn Context, user_id: &str) -> Vec<Buck
     // Restrict the GROUP BY to the buckets this user owns so the count
     // matches the previous per-bucket count semantics exactly (which
     // counted all objects in the bucket regardless of `uploaded_by`).
-    let bucket_names: Vec<String> = recs
-        .iter()
-        .filter_map(|r| r.data.get("name").and_then(|v| v.as_str()))
-        .map(str::to_string)
-        .collect();
+    let bucket_names: Vec<String> = owned.iter().map(|r| r.name.clone()).collect();
     let counts_by_bucket: HashMap<String, i64> =
         match repo::objects::count_by_bucket(ctx, &bucket_names).await {
             Ok(counts) => counts,
@@ -141,35 +152,13 @@ pub async fn list_buckets_for_user(ctx: &dyn Context, user_id: &str) -> Vec<Buck
             }
         };
 
-    let mut rows: Vec<BucketRow> = Vec::with_capacity(recs.len());
-    for r in recs {
-        let name = r
-            .data
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let public = r
-            .data
-            .get("public")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let created_at = r
-            .data
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let object_count = counts_by_bucket.get(&name).copied().unwrap_or(0);
-
-        rows.push(BucketRow {
-            name,
-            public,
-            created_at,
-            object_count,
-        });
-    }
-    rows
+    owned
+        .iter()
+        .map(|row| {
+            let count = counts_by_bucket.get(&row.name).copied().unwrap_or(0);
+            BucketRow::from((row, count))
+        })
+        .collect()
 }
 
 /// GET `/b/storage/` — bucket list for the calling user.

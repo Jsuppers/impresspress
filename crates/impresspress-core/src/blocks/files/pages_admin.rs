@@ -6,7 +6,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::repo;
 use crate::{
     ui::{self, components, icons, shell::Crumb},
-    util::{format_bytes, RecordExt},
+    util::format_bytes,
 };
 
 /// Tabs navigation across the storage-admin sub-pages
@@ -210,15 +210,49 @@ async fn load_admin_stats(ctx: &dyn Context) -> AdminStats {
 }
 
 // ---------------------------------------------------------------------------
+// Column shaping
+//
+// The admin tables are narrow, so ids and timestamps are cut to a prefix.
+// These are the exact `get(..n).unwrap_or(..)` calls the row decoders used
+// to make inline, kept bit-for-bit: a value SHORTER than the cut renders the
+// fallback rather than the value, because `str::get` returns `None` for an
+// out-of-range (or non-char-boundary) index.
+// ---------------------------------------------------------------------------
+
+/// A user id cut to its first 8 bytes; an em dash when it is shorter.
+fn short_id(id: &str) -> String {
+    id.get(..8).unwrap_or("—").to_string()
+}
+
+/// An RFC 3339 timestamp cut to its `YYYY-MM-DD` prefix; empty when shorter.
+fn short_date(ts: &str) -> String {
+    ts.get(..10).unwrap_or("").to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Buckets
 // ---------------------------------------------------------------------------
 
+/// A render-side projection of [`repo::buckets::BucketRow`]: the owner id
+/// and the timestamp truncated for the table's narrow columns. It holds no
+/// decoding — `public` is the row's `bool`, decoded once in the repo (B13).
 #[derive(Clone, Debug)]
 pub struct AdminBucketRow {
     pub name: String,
     pub owner_short: String,
     pub public: bool,
     pub created_at_short: String,
+}
+
+impl From<&repo::buckets::BucketRow> for AdminBucketRow {
+    fn from(row: &repo::buckets::BucketRow) -> Self {
+        Self {
+            name: row.name.clone(),
+            owner_short: short_id(&row.created_by),
+            public: row.public,
+            created_at_short: short_date(&row.created_at),
+        }
+    }
 }
 
 /// Render the admin Buckets table (or empty state).
@@ -256,24 +290,7 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
     let rows: Vec<AdminBucketRow> = match repo::buckets::list_recent(ctx, 100).await {
-        Ok(list) => list
-            .records
-            .into_iter()
-            .map(|r| AdminBucketRow {
-                name: r.str_field("name").to_string(),
-                owner_short: r
-                    .str_field("created_by")
-                    .get(..8)
-                    .unwrap_or("—")
-                    .to_string(),
-                public: r.str_field("public") == "true",
-                created_at_short: r
-                    .str_field("created_at")
-                    .get(..10)
-                    .unwrap_or("")
-                    .to_string(),
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(AdminBucketRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e.message, "admin bucket list failed");
             Vec::new()
@@ -324,6 +341,9 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
 // Shares
 // ---------------------------------------------------------------------------
 
+/// A render-side projection of [`repo::shares::ShareRow`]: the token and the
+/// timestamps cut for the admin table's narrow columns. It holds no
+/// decoding — `max_access_count` is the row's already-normalised `Option`.
 #[derive(Clone, Debug)]
 pub struct AdminShareRow {
     pub token_short: String,
@@ -333,6 +353,26 @@ pub struct AdminShareRow {
     pub max_access_count: Option<i64>,
     pub expires_short: Option<String>,
     pub owner_short: String,
+}
+
+impl From<&repo::shares::ShareRow> for AdminShareRow {
+    fn from(row: &repo::shares::ShareRow) -> Self {
+        Self {
+            token_short: row.token.get(..12).unwrap_or("—").to_string(),
+            bucket: row.bucket.clone(),
+            key: row.key.clone(),
+            access_count: row.access_count,
+            max_access_count: row.max_access_count,
+            expires_short: row
+                .expires_at
+                .as_deref()
+                // The expiry column keeps the value when it is shorter than
+                // the cut, unlike the id and date columns above — the shape
+                // the inline decoder had.
+                .map(|exp| exp.get(..10).unwrap_or(exp).to_string()),
+            owner_short: short_id(&row.created_by),
+        }
+    }
 }
 
 /// Render the admin Shares table (or empty state). Token displayed as
@@ -381,37 +421,7 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
     let rows: Vec<AdminShareRow> = match repo::shares::list_recent(ctx, 100, 0).await {
-        Ok(list) => list
-            .records
-            .into_iter()
-            .map(|r| {
-                let max_str = r.str_field("max_access_count");
-                let max = if max_str.is_empty() {
-                    None
-                } else {
-                    max_str.parse::<i64>().ok().filter(|n| *n > 0)
-                };
-                let exp_str = r.str_field("expires_at");
-                let expires_short = if exp_str.is_empty() {
-                    None
-                } else {
-                    Some(exp_str.get(..10).unwrap_or(exp_str).to_string())
-                };
-                AdminShareRow {
-                    token_short: r.str_field("token").get(..12).unwrap_or("—").to_string(),
-                    bucket: r.str_field("bucket").to_string(),
-                    key: r.str_field("key").to_string(),
-                    access_count: r.i64_field("access_count"),
-                    max_access_count: max,
-                    expires_short,
-                    owner_short: r
-                        .str_field("created_by")
-                        .get(..8)
-                        .unwrap_or("—")
-                        .to_string(),
-                }
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(AdminShareRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e.message, "admin shares list failed");
             Vec::new()
@@ -444,12 +454,27 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
 // Quotas
 // ---------------------------------------------------------------------------
 
+/// A render-side projection of [`repo::quota::QuotaRow`]: the user id cut
+/// for the table's narrow column, and the three caps it renders. It holds no
+/// decoding — the caps come off the row's `QuotaConfig`, which is where the
+/// per-field fallback to the block defaults happens.
 #[derive(Clone, Debug)]
 pub struct AdminQuotaRow {
     pub user_short: String,
     pub max_storage_bytes: i64,
     pub max_file_size_bytes: i64,
     pub max_files_per_bucket: i64,
+}
+
+impl From<&repo::quota::QuotaRow> for AdminQuotaRow {
+    fn from(row: &repo::quota::QuotaRow) -> Self {
+        Self {
+            user_short: short_id(&row.user_id),
+            max_storage_bytes: row.config.max_storage_bytes,
+            max_file_size_bytes: row.config.max_file_size_bytes,
+            max_files_per_bucket: row.config.max_files_per_bucket,
+        }
+    }
 }
 
 /// Render the admin Storage Quotas table (or empty state). Bytes
@@ -489,16 +514,7 @@ pub async fn quotas(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
     let rows: Vec<AdminQuotaRow> = match repo::quota::list_recent(ctx, 100).await {
-        Ok(list) => list
-            .records
-            .into_iter()
-            .map(|r| AdminQuotaRow {
-                user_short: r.str_field("user_id").get(..8).unwrap_or("—").to_string(),
-                max_storage_bytes: r.i64_field("max_storage_bytes"),
-                max_file_size_bytes: r.i64_field("max_file_size_bytes"),
-                max_files_per_bucket: r.i64_field("max_files_per_bucket"),
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(AdminQuotaRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e.message, "admin quotas list failed");
             Vec::new()
@@ -660,6 +676,44 @@ mod tests {
         assert!(html.contains("2026-05-06"));
     }
 
+    /// One capped, expiring share row, as the repo decodes it.
+    fn sample_share_row() -> repo::shares::ShareRow {
+        repo::shares::ShareRow::from_record(&wafer_core::clients::database::Record {
+            id: "s1".to_string(),
+            data: [
+                ("token", serde_json::json!("tok12345abcdef-more")),
+                ("bucket", serde_json::json!("photos")),
+                ("key", serde_json::json!("a.png")),
+                ("created_by", serde_json::json!("alice-1234-5678")),
+                ("created_at", serde_json::json!("2026-05-06T10:00:00Z")),
+                ("expires_at", serde_json::json!("2026-06-06T10:00:00Z")),
+                ("access_count", serde_json::json!(4)),
+                ("max_access_count", serde_json::json!(10)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        })
+    }
+
+    /// The admin share projection cuts the token to 12 and the expiry to 10
+    /// and reads nothing else. `max_access_count` comes straight off the row:
+    /// the inline decoder it replaces read it with `str_field(..).parse()`,
+    /// which is empty for the JSON number SQLite's `INTEGER` column returns,
+    /// so a capped share rendered as uncapped.
+    #[test]
+    fn admin_share_projection_shapes_only_what_the_table_renders() {
+        let row = sample_share_row();
+        let projected = AdminShareRow::from(&row);
+        assert_eq!(projected.token_short, "tok12345abcd");
+        assert_eq!(projected.bucket, "photos");
+        assert_eq!(projected.key, "a.png");
+        assert_eq!(projected.access_count, 4);
+        assert_eq!(projected.max_access_count, Some(10));
+        assert_eq!(projected.expires_short.as_deref(), Some("2026-06-06"));
+        assert_eq!(projected.owner_short, "alice-12");
+    }
+
     #[test]
     fn render_admin_shares_table_empty_state() {
         let html = render_admin_shares_table(&[]).into_string();
@@ -715,6 +769,34 @@ mod tests {
         );
     }
 
+    /// The admin quota projection cuts the user id to 8 and reads the three
+    /// caps off the row's `QuotaConfig` — which is where a column that is
+    /// absent falls back to the block default, so the table shows the cap
+    /// that is actually enforced.
+    #[test]
+    fn admin_quota_projection_shapes_only_what_the_table_renders() {
+        let row = repo::quota::QuotaRow::from_record(&wafer_core::clients::database::Record {
+            id: "q1".to_string(),
+            data: [
+                ("user_id", serde_json::json!("alice-1234-5678")),
+                ("max_storage_bytes", serde_json::json!("5000000000")),
+                ("max_file_size_bytes", serde_json::json!(100_000_000)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        });
+        let projected = AdminQuotaRow::from(&row);
+        assert_eq!(projected.user_short, "alice-12");
+        assert_eq!(projected.max_storage_bytes, 5_000_000_000);
+        assert_eq!(projected.max_file_size_bytes, 100_000_000);
+        assert_eq!(
+            projected.max_files_per_bucket,
+            crate::blocks::files::models::QuotaConfig::DEFAULT_MAX_FILES_PER_BUCKET,
+            "a column with no override renders the default the block enforces"
+        );
+    }
+
     #[test]
     fn render_admin_quotas_table_empty_state() {
         let html = render_admin_quotas_table(&[]).into_string();
@@ -744,6 +826,166 @@ mod tests {
         assert!(
             html.contains(">1000<"),
             "files-per-bucket count missing: {html}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod b13_visibility_tests {
+    use serde_json::json;
+    use wafer_core::clients::database::Record;
+
+    use super::*;
+    use crate::test_support::{admin_msg, output_html, TestContext};
+
+    /// One bucket row whose `public` column arrived in `shape`.
+    fn row_with_public(shape: serde_json::Value) -> repo::buckets::BucketRow {
+        repo::buckets::BucketRow::from_record(&Record {
+            id: "b1".to_string(),
+            data: [
+                ("name".to_string(), json!("photos")),
+                ("public".to_string(), shape),
+                ("created_by".to_string(), json!("alice-1234-5678")),
+                ("created_at".to_string(), json!("2026-05-06T10:00:00Z")),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    /// The two projections, off one repo row, for every shape `public` can
+    /// arrive in — including the Postgres `Bool` and TEXT `String` shapes the
+    /// SQLite-backed page tests below cannot produce. Both projections read
+    /// the row's already-decoded `bool`, so there is no second place for the
+    /// two pages to drift apart again.
+    #[test]
+    fn both_bucket_projections_agree_for_every_shape_public_arrives_in() {
+        for (shape, expected) in [
+            (json!(1), true),
+            (json!(true), true),
+            (json!("true"), true),
+            (json!(0), false),
+            (json!(false), false),
+            (json!("false"), false),
+        ] {
+            let row = row_with_public(shape.clone());
+            let user = super::super::pages_user::BucketRow::from((&row, 3));
+            let admin = AdminBucketRow::from(&row);
+            assert_eq!(
+                (user.public, admin.public),
+                (expected, expected),
+                "`public` as {shape} projected as user={} admin={}",
+                user.public,
+                admin.public
+            );
+        }
+    }
+
+    /// The projections shape their columns and read nothing else: the user
+    /// table keeps the full timestamp and carries the object count from the
+    /// second query, the admin table cuts the owner to 8 and the date to 10.
+    #[test]
+    fn the_bucket_projections_shape_only_what_the_table_renders() {
+        let row = row_with_public(json!(1));
+        let user = super::super::pages_user::BucketRow::from((&row, 7));
+        assert_eq!(user.name, "photos");
+        assert_eq!(user.created_at, "2026-05-06T10:00:00Z");
+        assert_eq!(user.object_count, 7);
+
+        let admin = AdminBucketRow::from(&row);
+        assert_eq!(admin.name, "photos");
+        assert_eq!(admin.owner_short, "alice-12");
+        assert_eq!(admin.created_at_short, "2026-05-06");
+    }
+
+    /// Does the user-facing bucket table say this bucket is public?
+    /// `pages_user::render_buckets_table` renders `badge-success`/"Public"
+    /// for a public bucket and a bare `badge`/"Private" otherwise.
+    fn user_page_says_public(html: &str) -> bool {
+        assert!(
+            html.contains(">photos<"),
+            "the bucket is missing from the user page entirely: {html}"
+        );
+        html.contains("badge-success")
+    }
+
+    /// Does the admin bucket table say this bucket is public?
+    /// `render_admin_buckets_table` renders `status_badge("public")` /
+    /// `status_badge("private")`, i.e. the literal word as the badge label.
+    fn admin_page_says_public(html: &str) -> bool {
+        assert!(
+            html.contains(">photos<"),
+            "the bucket is missing from the admin page entirely: {html}"
+        );
+        html.contains(">public</span>")
+    }
+
+    /// B13. `public` is written as a JSON bool by every writer
+    /// ([`repo::buckets::insert`] among them) into a column that is
+    /// `INTEGER` on SQLite and `BOOLEAN` on Postgres. The user bucket page
+    /// decoded it with `as_bool()` and the admin bucket page with
+    /// `str_field("public") == "true"`, so between them they accepted a JSON
+    /// bool and a JSON string and neither accepted the integer SQLite hands
+    /// back — one bucket, one row, two pages, and up to three different
+    /// answers depending on the backend.
+    ///
+    /// The fix is to decode it exactly once, in
+    /// [`repo::buckets::BucketRow::from_record`], through
+    /// `RecordExt::bool_field` (which accepts all three shapes). This test
+    /// therefore asserts the *correct* answer on both pages, not merely that
+    /// the two agree: on SQLite today they already agree — on "Private", for
+    /// a bucket that was created public.
+    #[tokio::test]
+    async fn both_bucket_pages_report_a_public_bucket_as_public() {
+        let ctx = TestContext::with_files().await;
+        // `admin_msg`'s user id, so the owner-scoped user page shows it too.
+        repo::buckets::insert(&ctx, "photos", true, "admin_1")
+            .await
+            .expect("seed public bucket");
+
+        let user_html = output_html(
+            super::super::pages_user::bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/"))
+                .await,
+        )
+        .await;
+        let admin_html =
+            output_html(buckets(&ctx, &admin_msg("retrieve", "/b/storage/admin/buckets")).await)
+                .await;
+
+        let user = user_page_says_public(&user_html);
+        let admin = admin_page_says_public(&admin_html);
+        assert!(
+            user && admin,
+            "a bucket created public must read public on both pages; \
+             user page said public={user}, admin page said public={admin}"
+        );
+    }
+
+    /// The other half of the same door: a private bucket must read private on
+    /// both pages. Guards the fix from over-correcting into "everything is
+    /// public".
+    #[tokio::test]
+    async fn both_bucket_pages_report_a_private_bucket_as_private() {
+        let ctx = TestContext::with_files().await;
+        repo::buckets::insert(&ctx, "photos", false, "admin_1")
+            .await
+            .expect("seed private bucket");
+
+        let user_html = output_html(
+            super::super::pages_user::bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/"))
+                .await,
+        )
+        .await;
+        let admin_html =
+            output_html(buckets(&ctx, &admin_msg("retrieve", "/b/storage/admin/buckets")).await)
+                .await;
+
+        let user = user_page_says_public(&user_html);
+        let admin = admin_page_says_public(&admin_html);
+        assert!(
+            !user && !admin,
+            "a bucket created private must read private on both pages; \
+             user page said public={user}, admin page said public={admin}"
         );
     }
 }

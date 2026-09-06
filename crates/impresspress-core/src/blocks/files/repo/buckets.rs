@@ -8,11 +8,54 @@
 //! the SSR portal's owner check, and the share-creation path).
 
 use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
-use wafer_core::clients::database::{self as db, Record, RecordList};
+use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, WaferError};
+
+use super::Page;
+use crate::util::RecordExt;
 
 /// Buckets table — user-created storage containers (one row per bucket).
 pub const TABLE: &str = "impresspress__files__buckets";
+
+/// One bucket row, decoded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BucketRow {
+    pub id: String,
+    /// Bucket name. Unique across the table and the blob-namespace folder
+    /// name in `wafer-run/storage`.
+    pub name: String,
+    /// Whether objects in the bucket are readable by anonymous URL.
+    ///
+    /// **B13.** The column is `INTEGER` on SQLite (migration 001) and
+    /// `BOOLEAN` on Postgres, and every writer writes a JSON bool into it, so
+    /// it reads back as `Number(0|1)`, `Bool`, or — from a TEXT-typed
+    /// backend — `String("true")`. [`BucketRow::from_record`] is the only
+    /// place in the block that turns any of those into this `bool`; the user
+    /// and admin bucket pages used to do it themselves, one with `as_bool()`
+    /// and one with `str_field(..) == "true"`, and so disagreed about the
+    /// same row.
+    pub public: bool,
+    /// User id of the creator — the ownership key every access check filters
+    /// on (see [`find_owned`]).
+    pub created_by: String,
+    /// RFC 3339 creation instant.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl BucketRow {
+    /// The one decode of a bucket row, `public` included.
+    pub fn from_record(rec: &Record) -> Self {
+        Self {
+            id: rec.id.clone(),
+            name: rec.str_field("name").to_string(),
+            public: rec.bool_field("public"),
+            created_by: rec.str_field("created_by").to_string(),
+            created_at: rec.str_field("created_at").to_string(),
+            updated_at: rec.str_field("updated_at").to_string(),
+        }
+    }
+}
 
 fn created_by_filter(user_id: &str) -> Filter {
     Filter {
@@ -34,7 +77,7 @@ pub async fn find_owned(
     ctx: &dyn Context,
     name: &str,
     user_id: &str,
-) -> Result<Option<Record>, WaferError> {
+) -> Result<Option<BucketRow>, WaferError> {
     let filters = vec![
         Filter {
             field: "name".to_string(),
@@ -44,7 +87,7 @@ pub async fn find_owned(
         created_by_filter(user_id),
     ];
     let records = db::list_all(ctx, TABLE, filters).await?;
-    Ok(records.into_iter().next())
+    Ok(records.first().map(BucketRow::from_record))
 }
 
 /// List bucket rows visible to `owner`: `Some(user_id)` restricts to that
@@ -53,12 +96,13 @@ pub async fn find_owned(
 pub async fn list_visible(
     ctx: &dyn Context,
     owner: Option<&str>,
-) -> Result<Vec<Record>, WaferError> {
+) -> Result<Vec<BucketRow>, WaferError> {
     let filters = match owner {
         Some(user_id) => vec![created_by_filter(user_id)],
         None => Vec::new(),
     };
-    db::list_all(ctx, TABLE, filters).await
+    let records = db::list_all(ctx, TABLE, filters).await?;
+    Ok(records.iter().map(BucketRow::from_record).collect())
 }
 
 /// List `user_id`'s buckets sorted by `name` ascending (the SSR bucket-list
@@ -66,8 +110,8 @@ pub async fn list_visible(
 pub async fn list_owned_sorted(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Vec<Record>, WaferError> {
-    db::list_sorted(
+) -> Result<Vec<BucketRow>, WaferError> {
+    let records = db::list_sorted(
         ctx,
         TABLE,
         vec![created_by_filter(user_id)],
@@ -76,11 +120,12 @@ pub async fn list_owned_sorted(
             desc: false,
         }],
     )
-    .await
+    .await?;
+    Ok(records.iter().map(BucketRow::from_record).collect())
 }
 
 /// Most recently created buckets, newest first (admin listing).
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<RecordList, WaferError> {
+pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Page<BucketRow>, WaferError> {
     let opts = ListOptions {
         sort: vec![SortField {
             field: "created_at".to_string(),
@@ -89,7 +134,10 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<RecordList, Wa
         limit,
         ..Default::default()
     };
-    db::list(ctx, TABLE, &opts).await
+    Ok(Page::decode(
+        db::list(ctx, TABLE, &opts).await?,
+        BucketRow::from_record,
+    ))
 }
 
 /// Insert a bucket row (`created_at` stamped with
@@ -99,14 +147,19 @@ pub async fn insert(
     name: &str,
     public: bool,
     created_by: &str,
-) -> Result<Record, WaferError> {
+) -> Result<BucketRow, WaferError> {
     let data = crate::util::json_map(serde_json::json!({
         "name": name,
         "public": public,
         "created_by": created_by,
         "created_at": crate::util::now_rfc3339(),
     }));
-    db::create(ctx, TABLE, data).await
+    db::create(ctx, TABLE, data).await.map(|r| {
+        // The insert echo carries the row as the caller wrote it; the decode
+        // is the same one a later read goes through, so `public` means the
+        // same thing on both paths.
+        BucketRow::from_record(&r)
+    })
 }
 
 /// Delete the bucket row named `name` (bucket names are unique).
@@ -131,14 +184,95 @@ pub async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
 pub async fn seed(
     ctx: &dyn Context,
     data: std::collections::HashMap<String, serde_json::Value>,
-) -> Result<Record, WaferError> {
-    db::create(ctx, TABLE, data).await
+) -> Result<BucketRow, WaferError> {
+    db::create(ctx, TABLE, data)
+        .await
+        .map(|r| BucketRow::from_record(&r))
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::test_support::TestContext;
+
+    fn record_with_public(value: serde_json::Value) -> Record {
+        Record {
+            id: "b1".to_string(),
+            data: [
+                ("name".to_string(), json!("photos")),
+                ("public".to_string(), value),
+                ("created_by".to_string(), json!("alice")),
+                ("created_at".to_string(), json!("2026-05-06T10:00:00Z")),
+                ("updated_at".to_string(), json!("2026-05-06T10:00:01Z")),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// B13. The three JSON shapes `public` comes back as — `Number` from
+    /// SQLite's `INTEGER` column, `Bool` from Postgres's `BOOLEAN`, and the
+    /// string a TEXT-typed backend hands back — all mean the same thing, and
+    /// this one decode is where they become the same `bool`. Before this,
+    /// the user bucket page accepted only `Bool` (`as_bool()`) and the admin
+    /// page only `String("true")` (`str_field(..) == "true"`), so on SQLite
+    /// both read a public bucket as private and on Postgres they disagreed.
+    #[test]
+    fn from_record_decodes_every_shape_public_arrives_in() {
+        for shape in [json!(1), json!(true), json!("true")] {
+            assert!(
+                BucketRow::from_record(&record_with_public(shape.clone())).public,
+                "`public` as {shape} must decode to true"
+            );
+        }
+        for shape in [json!(0), json!(false), json!("false")] {
+            assert!(
+                !BucketRow::from_record(&record_with_public(shape.clone())).public,
+                "`public` as {shape} must decode to false"
+            );
+        }
+    }
+
+    /// The rest of the row, so a column added to the struct without a decode
+    /// cannot pass unnoticed.
+    #[test]
+    fn from_record_decodes_the_whole_row() {
+        let row = BucketRow::from_record(&record_with_public(json!(1)));
+        assert_eq!(
+            row,
+            BucketRow {
+                id: "b1".to_string(),
+                name: "photos".to_string(),
+                public: true,
+                created_by: "alice".to_string(),
+                created_at: "2026-05-06T10:00:00Z".to_string(),
+                updated_at: "2026-05-06T10:00:01Z".to_string(),
+            }
+        );
+    }
+
+    /// A round trip through the real SQLite fixture: what `insert` wrote as
+    /// a JSON bool reads back as the same `bool`, whatever the column type
+    /// turned it into in between.
+    #[tokio::test]
+    async fn public_survives_the_round_trip_through_the_database() {
+        let ctx = TestContext::with_files().await;
+        insert(&ctx, "photos", true, "alice").await.expect("seed");
+        insert(&ctx, "docs", false, "alice").await.expect("seed");
+
+        let photos = find_owned(&ctx, "photos", "alice")
+            .await
+            .expect("find_owned")
+            .expect("row");
+        let docs = find_owned(&ctx, "docs", "alice")
+            .await
+            .expect("find_owned")
+            .expect("row");
+        assert!(photos.public, "a bucket created public must read public");
+        assert!(!docs.public, "a bucket created private must read private");
+    }
 
     /// The ownership predicate matches on BOTH `name` and `created_by`:
     /// a hit requires the exact (bucket, owner) pair, cross-user lookups
@@ -153,14 +287,8 @@ mod tests {
             .await
             .expect("find_owned")
             .expect("alice owns photos");
-        assert_eq!(
-            hit.data.get("name").and_then(|v| v.as_str()),
-            Some("photos")
-        );
-        assert_eq!(
-            hit.data.get("created_by").and_then(|v| v.as_str()),
-            Some("alice")
-        );
+        assert_eq!(hit.name, "photos");
+        assert_eq!(hit.created_by, "alice");
 
         // Someone else's bucket → None (cross-user isolation).
         assert!(find_owned(&ctx, "photos", "bob")

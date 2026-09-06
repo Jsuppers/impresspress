@@ -14,15 +14,58 @@ use wafer_block::{
     db::{Filter, FilterOp, ListOptions, SortField},
     wire::database as wire,
 };
-use wafer_core::clients::database::{self as db, Record, RecordList};
+use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, WaferError};
 
+use super::Page;
 use crate::util::RecordExt;
 
 /// Object metadata table — one row per uploaded file (sibling of the raw
 /// storage blob in `wafer-run/storage`). Tracks size, content type, status,
 /// uploader and timestamps.
 pub const TABLE: &str = "impresspress__files__objects";
+
+/// One object-metadata row, decoded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ObjectRow {
+    pub id: String,
+    /// Bucket name; `(bucket, key)` is unique.
+    pub bucket: String,
+    /// Object key within the bucket.
+    pub key: String,
+    /// Size in bytes. `i64_field` so a TEXT-stored number still counts
+    /// toward the quota rather than reading as zero.
+    pub size: i64,
+    pub content_type: String,
+    /// `pending` while the storage upload is in flight, `complete` after.
+    /// Quota accounting counts both; user-facing search and admin stats see
+    /// only `complete`.
+    pub status: String,
+    pub uploaded_by: String,
+    /// When the upload was reserved — the timestamp the object browser
+    /// renders as "modified", and the one `delete_stale_pending` compares.
+    pub uploaded_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl ObjectRow {
+    /// The one decode of an object row.
+    pub fn from_record(rec: &Record) -> Self {
+        Self {
+            id: rec.id.clone(),
+            bucket: rec.str_field("bucket").to_string(),
+            key: rec.str_field("key").to_string(),
+            size: rec.i64_field("size"),
+            content_type: rec.str_field("content_type").to_string(),
+            status: rec.str_field("status").to_string(),
+            uploaded_by: rec.str_field("uploaded_by").to_string(),
+            uploaded_at: rec.str_field("uploaded_at").to_string(),
+            created_at: rec.str_field("created_at").to_string(),
+            updated_at: rec.str_field("updated_at").to_string(),
+        }
+    }
+}
 
 /// Filter matching only fully uploaded rows (`status = 'complete'`),
 /// excluding in-flight `pending` reservations.
@@ -81,7 +124,7 @@ pub async fn insert_pending(
     size: usize,
     content_type: &str,
     uploaded_by: &str,
-) -> Result<Record, WaferError> {
+) -> Result<ObjectRow, WaferError> {
     let data = crate::util::json_map(serde_json::json!({
         "bucket": bucket,
         "key": key,
@@ -91,7 +134,9 @@ pub async fn insert_pending(
         "uploaded_by": uploaded_by,
         "uploaded_at": crate::util::now_rfc3339(),
     }));
-    db::create(ctx, TABLE, data).await
+    db::create(ctx, TABLE, data)
+        .await
+        .map(|r| ObjectRow::from_record(&r))
 }
 
 /// Flip a `pending` row to `status = 'complete'` after its storage upload
@@ -183,7 +228,7 @@ pub async fn search_completed(
     query: &str,
     limit: i64,
     offset: i64,
-) -> Result<RecordList, WaferError> {
+) -> Result<Page<ObjectRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![
             Filter {
@@ -213,7 +258,10 @@ pub async fn search_completed(
         skip_count: false,
         ..Default::default()
     };
-    db::list(ctx, TABLE, &opts).await
+    Ok(Page::decode(
+        db::list(ctx, TABLE, &opts).await?,
+        ObjectRow::from_record,
+    ))
 }
 
 /// List up to `limit` object rows in `bucket`, sorted by `key` ascending
@@ -222,7 +270,7 @@ pub async fn list_for_bucket(
     ctx: &dyn Context,
     bucket: &str,
     limit: i64,
-) -> Result<RecordList, WaferError> {
+) -> Result<Page<ObjectRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![Filter {
             field: "bucket".to_string(),
@@ -236,7 +284,10 @@ pub async fn list_for_bucket(
         limit,
         ..Default::default()
     };
-    db::list(ctx, TABLE, &opts).await
+    Ok(Page::decode(
+        db::list(ctx, TABLE, &opts).await?,
+        ObjectRow::from_record,
+    ))
 }
 
 /// Object counts per bucket for the given bucket names, via a single
@@ -306,12 +357,80 @@ pub async fn sum_size_for_uploader(ctx: &dyn Context, user_id: &str) -> Result<f
 pub async fn seed(
     ctx: &dyn Context,
     data: HashMap<String, serde_json::Value>,
-) -> Result<Record, WaferError> {
-    db::create(ctx, TABLE, data).await
+) -> Result<ObjectRow, WaferError> {
+    db::create(ctx, TABLE, data)
+        .await
+        .map(|r| ObjectRow::from_record(&r))
 }
 
 /// Test helper: every object row, unfiltered.
 #[cfg(test)]
-pub async fn list_all(ctx: &dyn Context) -> Result<Vec<Record>, WaferError> {
-    db::list_all(ctx, TABLE, vec![]).await
+pub async fn list_all(ctx: &dyn Context) -> Result<Vec<ObjectRow>, WaferError> {
+    let records = db::list_all(ctx, TABLE, vec![]).await?;
+    Ok(records.iter().map(ObjectRow::from_record).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn record(data: &[(&str, serde_json::Value)]) -> Record {
+        Record {
+            id: "o1".to_string(),
+            data: data
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn from_record_decodes_the_whole_row() {
+        let row = ObjectRow::from_record(&record(&[
+            ("bucket", json!("photos")),
+            ("key", json!("nested/a.png")),
+            ("size", json!(1024)),
+            ("content_type", json!("image/png")),
+            ("status", json!("complete")),
+            ("uploaded_by", json!("alice")),
+            ("uploaded_at", json!("2026-05-06T10:00:00Z")),
+            ("created_at", json!("2026-05-06T10:00:00Z")),
+            ("updated_at", json!("2026-05-06T10:00:01Z")),
+        ]));
+        assert_eq!(
+            row,
+            ObjectRow {
+                id: "o1".to_string(),
+                bucket: "photos".to_string(),
+                key: "nested/a.png".to_string(),
+                size: 1024,
+                content_type: "image/png".to_string(),
+                status: "complete".to_string(),
+                uploaded_by: "alice".to_string(),
+                uploaded_at: "2026-05-06T10:00:00Z".to_string(),
+                created_at: "2026-05-06T10:00:00Z".to_string(),
+                updated_at: "2026-05-06T10:00:01Z".to_string(),
+            }
+        );
+    }
+
+    /// `size` is `INTEGER` in the schema but a TEXT-typed backend hands it
+    /// back as a string. `i64_field` takes both, so a TEXT-stored size still
+    /// counts toward the user's quota instead of reading as zero — the same
+    /// class of bug as B13's `public`, on the column that decides whether an
+    /// upload is admitted.
+    #[test]
+    fn from_record_reads_a_text_stored_size() {
+        assert_eq!(
+            ObjectRow::from_record(&record(&[("size", json!("2048"))])).size,
+            2048
+        );
+        assert_eq!(
+            ObjectRow::from_record(&record(&[("size", json!(2048))])).size,
+            2048
+        );
+        assert_eq!(ObjectRow::from_record(&record(&[])).size, 0);
+    }
 }
