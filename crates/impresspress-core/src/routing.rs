@@ -1850,9 +1850,10 @@ mod tests {
 
     /// The eight session-less `/b/auth/...` paths resolve to `Public` from the
     /// auth-ui block's own declaration, and the two api-key rows resolve to
-    /// `Authenticated`. These eleven were the block's undeclared surface
-    /// before PR #14; the router carve-outs that kept them reachable
-    /// are gone because these declarations carry the level.
+    /// `Authenticated`. These ten (eleven before B14 deleted `sync-user`) were
+    /// the block's undeclared surface before PR #14; the router carve-outs
+    /// that kept them reachable are gone because these declarations carry the
+    /// level.
     #[test]
     fn auth_ui_declares_its_eight_session_less_and_two_api_key_paths() {
         use wafer_run::Block as _;
