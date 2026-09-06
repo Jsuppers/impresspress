@@ -18,13 +18,10 @@ use std::collections::BTreeMap;
 
 use impresspress_core::blocks::all_block_infos;
 
-/// The derived set: every block that declares itself disableable, at the value
-/// it declares. This is the expression spec 2.1.4 puts in the seed callers.
+/// The derived set, read from the function the seed callers use.
 fn derived_defaults() -> BTreeMap<String, bool> {
-    all_block_infos()
-        .iter()
-        .filter(|i| i.can_disable)
-        .map(|i| (i.name.clone(), i.default_enabled))
+    impresspress_core::blocks::block_enabled_defaults()
+        .into_iter()
         .collect()
 }
 

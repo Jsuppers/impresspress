@@ -47,7 +47,7 @@ The three boot callers (CLI `server.rs`, Cloudflare `lib.rs`, web `config.rs`) p
 | `crates/impresspress-core/src/blocks/userportal/mod.rs` | `.default_enabled(true)` — matches what has shipped. |
 | `crates/impresspress-core/src/features.rs` | `ENABLED_DEFAULTS` and its doc block deleted. `SeedDecision.block_name: String`. `plan_seed_decisions(existing, defaults)`. `seed_plan_tests` driven by fixture slices. |
 | `crates/impresspress-core/src/platform_state/block_settings.rs` | `load_and_seed(db, defaults)`; module docs no longer name `ENABLED_DEFAULTS`. `load_and_seed_tests` driven by a fixture slice. |
-| `crates/impresspress-core/tests/block_enabled_defaults.rs` | New: the regression guard (derived == today's constant for every block in both) plus the `can_disable`/`default_enabled` filter matrix. |
+| `crates/impresspress-core/tests/block_enabled_defaults.rs` | New: the three-way guard — same name in both sets (values must agree), constant-only (droppable), derived-only (additive) — against a frozen record of what production seeded. |
 | `crates/impresspress/src/cli/server.rs` | `load_and_seed(&database, &blocks::block_enabled_defaults())`. |
 | `crates/impresspress-cloudflare/src/lib.rs` | `load_and_seed(&self.db, &blocks::block_enabled_defaults())`. |
 | `crates/impresspress-web/src/config.rs` | `load_and_seed(db, &blocks::block_enabled_defaults())`. |
@@ -89,47 +89,40 @@ The guard has to be written against the tree that still has `ENABLED_DEFAULTS`, 
 
 ---
 
-### Task 2: `plan_seed_decisions` takes the defaults
+### Task 2: the defaults become a parameter, derived from `BlockInfo`
+
+One commit. Splitting the `plan_seed_decisions` signature from its caller
+`load_and_seed`, or `load_and_seed` from the three crates that call it, would
+leave an intermediate commit that does not build — the rule PR 1 set in its
+decision 1.
 
 **Files:**
-- Modify: `crates/impresspress-core/src/features.rs`
+- Modify: `crates/impresspress-core/src/features.rs`, `crates/impresspress-core/src/blocks/mod.rs`, `crates/impresspress-core/src/platform_state/block_settings.rs`, `crates/impresspress-core/tests/block_enabled_defaults.rs`, `crates/impresspress/src/cli/server.rs`, `crates/impresspress-cloudflare/src/lib.rs`, `crates/impresspress-web/src/config.rs`
 
-**Step 1: Rewrite the lane tests against fixtures (they fail to compile).**
-- [ ] Add a `fixture()` helper returning `Vec<(String, bool)>` with a deliberate mix of `true` and `false` entries and at least five names, so the mixed-state lane test keeps its five lanes without depending on the production block count.
-- [ ] Rewrite `plan_seed_decisions_{inserts_when_row_absent, skips_when_hash_matches_current, updates_when_hash_stale, skips_user_edited, skips_empty_hash_legacy, handles_mixed_row_states}` to build `existing` from that fixture and call `plan_seed_decisions(&existing, &fixture)`. `defaults_count()` becomes `fixture.len()`.
-- [ ] Run `cargo test -p impresspress-core --lib features::` — expect a compile error: `plan_seed_decisions` takes 1 argument, 2 supplied.
+**Step 1: Point every test at the new shape (red).**
+- [ ] `features.rs::seed_plan_tests`: a `fixture() -> Vec<(String, bool)>` of six invented names with mixed values; every lane test builds `existing` from it and calls `plan_seed_decisions(&existing, &fixture)`. `defaults_count()` becomes `defaults.len()`. Add `plan_seed_decisions_ignores_rows_outside_the_defaults` — the lane `system` and `wafer-run/auth` now fall into.
+- [ ] `block_settings.rs::load_and_seed_tests`: its own three-entry `fixture()`; `ENABLED_DEFAULTS[0]` disappears from the stale-hash, user-edited and read-only lanes; `load_and_seed(&db, &defaults)`. `operational_error_tests` passes a one-entry slice.
+- [ ] `tests/block_enabled_defaults.rs`: `derived_defaults()` reads `blocks::block_enabled_defaults()` instead of building the chain itself — this step is what proves the new function reproduces the constant.
+- [ ] Run `cargo test -p impresspress-core --lib`. Expect E0061 (`takes 1 argument but 2 were supplied`) on both functions and `cannot find function block_enabled_defaults`.
 
-**Step 2: Change the signature.**
-- [ ] `pub fn plan_seed_decisions(existing: &HashMap<String, ExistingRow>, defaults: &[(String, bool)]) -> Vec<SeedDecision>`, iterating `defaults`.
-- [ ] `SeedDecision.block_name: String` (doc comment: "Block name from the caller's defaults slice", no longer "from `ENABLED_DEFAULTS`").
-- [ ] Update the `plan_seed_decisions` doc comment: it syncs rows with "the caller's defaults" and the caller is named.
-- [ ] `block_settings::load_and_seed` will not compile yet; that is Task 3.
+**Step 2: Implement (green).**
+- [ ] `blocks::block_enabled_defaults() -> Vec<(String, bool)>` directly below the manifest, with the filter/map from spec 2.1.4 and doc comments carrying decisions 3–6 above.
+- [ ] `SeedDecision.block_name: String`; `plan_seed_decisions(existing, defaults: &[(String, bool)])`, iterating `defaults`; doc comment rewritten (including the "a row outside `defaults` is left alone" contract).
+- [ ] `load_and_seed(db, defaults)` forwards to the planner; `apply_seed_decision` takes `&d.block_name`.
+- [ ] The three callers pass `&impresspress_core::blocks::block_enabled_defaults()`.
+- [ ] `cargo test -p impresspress-core --lib` and `--test block_enabled_defaults` green.
 
-**Commit:** `refactor(features): plan_seed_decisions takes the defaults as a parameter`
+**Commit:** `refactor(features): derive the block-enabled seed defaults from BlockInfo`
 
 ---
 
-### Task 3: `load_and_seed(db, defaults)`, `block_enabled_defaults()`, and the callers
-
-One commit, because the signature change and its three cross-crate callers cannot be split without leaving a crate broken (PR 1, decision 1).
+### Task 3: delete `ENABLED_DEFAULTS`
 
 **Files:**
-- Modify: `crates/impresspress-core/src/blocks/mod.rs`, `crates/impresspress-core/src/platform_state/block_settings.rs`, `crates/impresspress-core/src/features.rs`, `crates/impresspress/src/cli/server.rs`, `crates/impresspress-cloudflare/src/lib.rs`, `crates/impresspress-web/src/config.rs`, `crates/impresspress-core/tests/block_enabled_defaults.rs`
+- Modify: `crates/impresspress-core/src/features.rs`, `crates/impresspress-core/tests/block_enabled_defaults.rs`
 
-**Step 1: Point the guard test at the new function (it fails to compile).**
-- [ ] In `tests/block_enabled_defaults.rs`, replace the hand-built derived set with `impresspress_core::blocks::block_enabled_defaults()`. Keep `ENABLED_DEFAULTS` on the other side of the comparison for now — this step is what proves the new function reproduces the constant.
-- [ ] Rewrite `load_and_seed_tests` in `block_settings.rs` against a fixture slice (same shape as Task 2's), so `ENABLED_DEFAULTS[0]` disappears from the stale-hash / user-edited / read-only lanes and `seeds_all_defaults_on_empty_table` iterates the fixture.
-- [ ] Run; expect "cannot find function `block_enabled_defaults`" and the arity error on `load_and_seed`.
-
-**Step 2: Implement.**
-- [ ] `blocks::block_enabled_defaults() -> Vec<(String, bool)>` with the filter/map from spec 2.1.4 and doc comments carrying decisions 4–6 above.
-- [ ] `load_and_seed(db: &Arc<dyn DatabaseService>, defaults: &[(String, bool)])`, forwarding to `plan_seed_decisions(&existing, defaults)`. Its doc comment loses the `ENABLED_DEFAULTS` references; so do the module header and the `id_by_block` comment.
-- [ ] Callers: `server.rs`, `lib.rs`, `config.rs` each pass `&impresspress_core::blocks::block_enabled_defaults()`.
-- [ ] Run the core suite; all green.
-
-**Step 3: Delete the constant.**
-- [ ] Delete `ENABLED_DEFAULTS` and the whole doc block above it (`features.rs:201-232`), including the stale "until the LlmService trait refactor lands" paragraph.
-- [ ] In `tests/block_enabled_defaults.rs`, replace the comparison-against-the-constant with the same table inlined in the test as `SHIPPED_DEFAULTS_BEFORE_PR2` — a frozen record of the eight rows production seeded, with a comment saying it is a historical baseline and must never be edited to match a new derivation. That is what keeps the guard meaningful after the constant is gone.
+- [ ] Delete `ENABLED_DEFAULTS` and the whole doc block above it, including the stale "Restored when the LlmService trait refactor lands" paragraph (the refactor landed; `blocks/mod.rs` documents it).
+- [ ] In `tests/block_enabled_defaults.rs`, replace the reads of the constant with `SHIPPED_DEFAULTS_BEFORE_PR2` inlined in the test file: a frozen record of the eight rows production seeded, commented as a historical baseline that must never be edited to match a new derivation. That is what keeps all three guard tests meaningful once the constant is gone.
 - [ ] Run everything in Global Constraints.
 
 **Commit:** `refactor(features): seed block-enabled defaults from BlockInfo`

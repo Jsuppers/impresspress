@@ -167,6 +167,51 @@ feature_block_manifest! {
     fastembed::FastembedBlock,
 }
 
+/// The `(block_name, default_enabled)` pairs the boot-time enablement seed
+/// writes into `impresspress__admin__block_settings`.
+///
+/// Derived, not listed: a block declares whether an operator may turn it off
+/// (`can_disable`) and what it ships as (`default_enabled`) in its own
+/// `info()`, and this is the only place those declarations are collected.
+/// Passed to [`crate::platform_state::block_settings::load_and_seed`] by each
+/// target's boot path (the CLI, the Cloudflare deploy-init hook, the browser
+/// config loader), which is what keeps the planner itself free of any
+/// dependency on the block registry.
+///
+/// Three consequences of the `can_disable` filter, each deliberate:
+///
+/// - **A block that cannot be disabled gets no row.** `impresspress/system`,
+///   `impresspress/email` and `impresspress/auth-ui` are always on;
+///   [`crate::features::BlockSettings::is_block_enabled`] reports `true` for a
+///   block with no row, so an absent row and a row at `true` are the same
+///   thing to every reader. Admin renders no toggle for them either (the
+///   detail fragment gates on `can_disable`), so nothing can create one.
+/// - **`impresspress/admin` is excluded, and must stay excluded.** Its
+///   `seed_defaults_hash` column is owned by `admin::settings::seed_defaults`,
+///   which stores the shared-variable payload hash there in a different format
+///   (raw hex, no `seed:` prefix). Two writers on one column with two formats
+///   is an infinite re-seed loop on every cold start. Admin declaring
+///   `.can_disable(true)` would reintroduce that, which is why the reason is
+///   recorded here rather than in a name-matching special case.
+/// - **The set follows the build.** Each entry of the block manifest is
+///   `#[cfg]`-gated, so a bundle compiled without `block-tickets` seeds no
+///   `tickets` row. That block is not registered in such a build either, so
+///   its routes 404 whether the row says enabled or not.
+pub fn block_enabled_defaults() -> Vec<(String, bool)> {
+    enabled_defaults_from(&all_block_infos())
+}
+
+/// The rule behind [`block_enabled_defaults`], over an explicit slice so it can
+/// be exercised on constructed `BlockInfo`s rather than only on whatever the
+/// current feature set happens to register.
+fn enabled_defaults_from(infos: &[wafer_run::BlockInfo]) -> Vec<(String, bool)> {
+    infos
+        .iter()
+        .filter(|i| i.can_disable)
+        .map(|i| (i.name.clone(), i.default_enabled))
+        .collect()
+}
+
 /// Register the LLM feature block with the WAFER runtime.
 ///
 /// LlmBlock is not in the feature-block manifest because its constructor takes
@@ -216,4 +261,67 @@ pub fn register_auth(wafer: &mut wafer_run::Wafer) -> Result<(), wafer_run::Runt
     let state = auth::service::BlockState::new();
     let svc = Arc::new(auth::service::AuthServiceImpl::new(state));
     wafer_core::service_blocks::auth::register_with(wafer, svc)
+}
+
+#[cfg(test)]
+mod block_enabled_defaults_tests {
+    use std::collections::HashMap;
+
+    use wafer_run::BlockInfo;
+
+    use super::*;
+    use crate::features::{plan_seed_decisions, seed_hash_for, SeedOp};
+
+    fn info(name: &str, can_disable: bool, default_enabled: bool) -> BlockInfo {
+        BlockInfo::new(name, "0.0.1", "http-handler@v1", "fixture")
+            .can_disable(can_disable)
+            .default_enabled(default_enabled)
+    }
+
+    /// The filter keeps exactly the disableable blocks, at the value each one
+    /// declares — including a `can_disable` block that ships off, and
+    /// excluding a block that ships on but cannot be turned off (which is what
+    /// keeps `impresspress/admin` and `impresspress/system` out of the seed).
+    #[test]
+    fn only_disableable_blocks_carry_a_default() {
+        let infos = vec![
+            info("org/on", true, true),
+            info("org/off", true, false),
+            info("org/always", false, true),
+        ];
+        assert_eq!(
+            enabled_defaults_from(&infos),
+            vec![("org/on".to_string(), true), ("org/off".to_string(), false)],
+        );
+    }
+
+    /// End to end over the seam this feeds: a fresh table seeds one row per
+    /// disableable block at its declared value, and nothing at all for the
+    /// block that cannot be disabled (which then reads as enabled through the
+    /// absent-row fallback).
+    #[test]
+    fn planner_seeds_one_row_per_disableable_block() {
+        let infos = vec![
+            info("org/on", true, true),
+            info("org/off", true, false),
+            info("org/always", false, true),
+        ];
+        let defaults = enabled_defaults_from(&infos);
+        let decisions = plan_seed_decisions(&HashMap::new(), &defaults);
+
+        assert_eq!(decisions.len(), 2, "{decisions:?}");
+        for (name, expected) in [("org/on", true), ("org/off", false)] {
+            let d = decisions
+                .iter()
+                .find(|d| d.block_name == name)
+                .unwrap_or_else(|| panic!("{name} should be seeded: {decisions:?}"));
+            assert_eq!(d.op, SeedOp::Insert);
+            assert_eq!(d.enabled, expected);
+            assert_eq!(d.hash, seed_hash_for(expected));
+        }
+        assert!(
+            decisions.iter().all(|d| d.block_name != "org/always"),
+            "a block that cannot be disabled must get no row: {decisions:?}",
+        );
+    }
 }
