@@ -1,12 +1,12 @@
 //! AuthServiceImpl — implements the wafer-core `AuthService` trait.
 //!
 //! Authenticates the credential impresspress actually issues. Every signed-in
-//! request carries an `auth_token` cookie holding an access JWT, which
-//! `blocks::router` re-presents as `Authorization: Bearer <jwt>`; a Bearer
-//! that [`crate::crypto::verify_access_token`] accepts resolves to its `sub`.
-//! Any other Bearer is looked up as a personal access token in
+//! request carries an access JWT, as an `auth_token` cookie or as an
+//! `Authorization: Bearer` header; a token
+//! [`crate::crypto::verify_access_token`] accepts resolves to its `sub`. Any
+//! other token is looked up as a personal access token in
 //! `wafer_run__auth__personal_access_tokens` (whose `last_used_at` is bumped),
-//! and a request with no Bearer is unauthenticated.
+//! and a request carrying neither is unauthenticated.
 //!
 //! `require_role(Admin)` additionally honours an unexpired bootstrap token
 //! presented as a Bearer, which is how the first admin is created.
@@ -115,6 +115,31 @@ fn bearer_from(msg: &Message) -> Option<String> {
     v.strip_prefix("Bearer ").map(str::to_owned)
 }
 
+/// The credential the request presents: the `Authorization: Bearer` token, or
+/// failing that the `auth_token` cookie.
+///
+/// The cookie fallback is the same one `blocks::router` applies
+/// (`router.rs:97-107`), and it has to be repeated here because the router
+/// resolves the cookie into a Bearer *value it passes to `handle_request`* —
+/// it does not restamp the header onto the `Message`. Without this, a service
+/// method reached on a cookie-authenticated request would find no credential
+/// at all and answer `Unauthorized` to the one credential the browser
+/// actually sends.
+///
+/// Accepting it here adds no trust: the token still has to pass
+/// [`crate::crypto::verify_access_token`] or match a PAT row. The CSRF concern
+/// the router documents about cookie-sourced credentials — that a cross-site
+/// page can ride them ambiently — is answered before dispatch by
+/// `csrf::enforce_origin_policy`, and this path is reached from another
+/// block's `auth.*` message rather than from a browser navigation.
+fn presented_token(msg: &Message) -> Option<String> {
+    if let Some(bearer) = bearer_from(msg).filter(|t| !t.is_empty()) {
+        return Some(bearer);
+    }
+    let cookie = msg.cookie("auth_token");
+    (!cookie.is_empty()).then(|| cookie.to_owned())
+}
+
 /// Returns `true` iff `expires_at` parses as an RFC3339 timestamp earlier
 /// than now. Parsing the timestamp avoids the mixed-format trap of string
 /// comparison (`+00:00` vs `Z`) — the auth tables intermix both because
@@ -135,25 +160,25 @@ enum Creds {
     /// against the signature, `type`, issuer, blocklist and `auth_version`
     /// rules by [`crate::crypto::verify_access_token`].
     Jwt(String),
-    /// A Bearer that is not an access JWT, as the sha256 of the raw token —
-    /// the lookup key in `wafer_run__auth__personal_access_tokens`.
+    /// A presented token that is not an access JWT, as the sha256 of the raw
+    /// token — the lookup key in `wafer_run__auth__personal_access_tokens`.
     Pat(Vec<u8>),
 }
 
 /// Classify the credential on `msg`.
 ///
-/// A Bearer that verifies as an access JWT is that; any other Bearer is a
-/// candidate PAT; no Bearer at all is unauthenticated. There is no cookie
-/// branch: `blocks::router` has already turned the `auth_token` cookie into a
-/// Bearer header by the time any handler or service sees the message, and the
-/// `wafer_session` cookie this used to accept was issued by nothing.
+/// A token that verifies as an access JWT is that; any other token is a
+/// candidate PAT; no token at all is unauthenticated. The token is whichever
+/// of the `Authorization: Bearer` header and the `auth_token` cookie the
+/// request carries ([`presented_token`]). The `wafer_session` cookie this used
+/// to accept in a branch of its own was issued by nothing.
 ///
 /// The secret comes from the config snapshot (`ctx.config_get`, the pattern
 /// `csrf.rs` uses) and the issuer from `helpers::expected_issuer`, so this
 /// service applies exactly the deployment's own token policy — the same two
 /// values `pipeline.rs` passes to `extract_auth_meta`.
 async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthError> {
-    let Some(bearer) = bearer_from(msg) else {
+    let Some(bearer) = presented_token(msg) else {
         return Err(AuthError::Unauthorized);
     };
     let secret = ctx

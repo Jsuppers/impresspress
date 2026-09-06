@@ -114,6 +114,58 @@ async fn require_user_accepts_an_access_jwt_and_a_pat_and_rejects_missing_creds(
     assert_eq!(pat_hash, expected);
 }
 
+/// The credential a browser actually sends is the `auth_token` cookie.
+/// `blocks::router` resolves it into a Bearer *value it hands
+/// `pipeline::handle_request`* and does not restamp the header on the
+/// `Message`, so a service method reached on a cookie-authenticated request
+/// sees no `Authorization` header at all. Without the cookie fallback this
+/// service would answer `Unauthorized` to the one credential every signed-in
+/// browser request carries — the trap the spec's "why route rather than stub"
+/// paragraph warns about, just moved one layer down.
+#[tokio::test]
+async fn require_user_accepts_the_auth_token_cookie() {
+    let (raw, ctx) = fixture().await;
+    let uid = seed_user(ctx.as_ref(), "cookie-jwt@example.com").await;
+    let access = raw
+        .mint_access_token(&uid, &[], Duration::from_secs(3600))
+        .await;
+
+    let mut msg = Message::new("auth.require_user");
+    msg.set_meta("http.header.cookie", format!("auth_token={access}"));
+
+    let svc = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
+    let got = svc
+        .require_user(&msg)
+        .await
+        .expect("the auth_token cookie is the credential a browser sends");
+    assert_eq!(got.0, uid);
+}
+
+/// The cookie is a *source* for the token, not a bypass: it goes through the
+/// same verification, so a refresh token in the cookie authenticates nobody.
+#[tokio::test]
+async fn the_auth_token_cookie_is_still_verified() {
+    let (raw, ctx) = fixture().await;
+    let uid = seed_user(ctx.as_ref(), "cookie-refresh@example.com").await;
+    let refresh = raw
+        .mint_access_token(
+            &uid,
+            &[("type", serde_json::json!("refresh"))],
+            Duration::from_secs(3600),
+        )
+        .await;
+
+    let mut msg = Message::new("auth.require_user");
+    msg.set_meta("http.header.cookie", format!("auth_token={refresh}"));
+
+    let svc = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
+    let err = svc
+        .require_user(&msg)
+        .await
+        .expect_err("a refresh token in the cookie must not authenticate");
+    assert!(matches!(err, AuthError::Unauthorized), "got {err:?}");
+}
+
 /// A `wafer_session` cookie is not a credential. Nothing in the repository
 /// ever issued one; this pins that presenting one authenticates nobody, so a
 /// future re-introduction has to be deliberate.
