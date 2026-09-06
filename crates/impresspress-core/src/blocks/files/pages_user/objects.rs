@@ -11,15 +11,29 @@ use crate::{
         shell::Crumb,
         templates::{list_page, PageHeader},
     },
-    util::{format_bytes, format_timestamp, url_path_encode, RecordExt},
+    util::{format_bytes, format_timestamp, url_path_encode},
 };
 
 /// Object as the user sees it (key, size, modified timestamp).
+///
+/// A render-side projection of [`repo::objects::ObjectRow`]; the browser
+/// renders the upload instant as "modified" and needs nothing else from the
+/// row.
 #[derive(Clone, Debug)]
 pub struct ObjectRow {
     pub key: String,
     pub size: i64,
     pub modified: String,
+}
+
+impl From<&repo::objects::ObjectRow> for ObjectRow {
+    fn from(row: &repo::objects::ObjectRow) -> Self {
+        Self {
+            key: row.key.clone(),
+            size: row.size,
+            modified: row.uploaded_at.clone(),
+        }
+    }
 }
 
 /// Result of grouping a flat object list by a current-prefix folder view.
@@ -196,25 +210,7 @@ pub fn render_breadcrumbs(bucket: &str, current_prefix: &str) -> Markup {
 
 async fn list_objects_in_bucket(ctx: &dyn Context, bucket: &str) -> Vec<ObjectRow> {
     match repo::objects::list_for_bucket(ctx, bucket, 1000).await {
-        Ok(rl) => rl
-            .records
-            .into_iter()
-            .map(|r| ObjectRow {
-                key: r
-                    .data
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                size: r.i64_field("size"),
-                modified: r
-                    .data
-                    .get("uploaded_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(ObjectRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e, bucket = %bucket, "object list failed");
             Vec::new()
@@ -304,6 +300,29 @@ pub async fn object_list_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The projection takes the three columns the browser renders and reads
+    /// no field itself — the "modified" column is the row's `uploaded_at`.
+    #[test]
+    fn projects_the_three_columns_the_browser_renders() {
+        let row = repo::objects::ObjectRow::from_record(&wafer_core::clients::database::Record {
+            id: "o1".to_string(),
+            data: [
+                ("key".to_string(), serde_json::json!("nested/a.png")),
+                ("size".to_string(), serde_json::json!("2048")),
+                (
+                    "uploaded_at".to_string(),
+                    serde_json::json!("2026-05-06T10:00:00Z"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let projected = ObjectRow::from(&row);
+        assert_eq!(projected.key, "nested/a.png");
+        assert_eq!(projected.size, 2048);
+        assert_eq!(projected.modified, "2026-05-06T10:00:00Z");
+    }
 
     #[test]
     fn group_objects_by_prefix_empty() {

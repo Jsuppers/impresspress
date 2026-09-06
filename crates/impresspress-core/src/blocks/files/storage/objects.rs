@@ -539,20 +539,8 @@ mod integration_tests {
             .await
             .expect("list object rows");
         assert_eq!(rows.len(), 1, "expected exactly one object metadata row");
-        let data = &rows[0].data;
-        (
-            data.get("size")
-                .and_then(crate::util::json_as_i64)
-                .expect("size field"),
-            data.get("content_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            data.get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        )
+        let row = &rows[0];
+        (row.size, row.content_type.clone(), row.status.clone())
     }
 
     /// CRUX regression (found by driving the live app): a browser `FormData`

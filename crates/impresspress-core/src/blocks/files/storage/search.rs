@@ -64,17 +64,15 @@ mod integration_tests {
         repo::objects::seed(ctx, data).await.expect("seed object");
     }
 
+    /// The keys in a `repo::Page<ObjectRow>` response body: `rows` are the
+    /// decoded rows themselves, so `key` is a field of the row rather than
+    /// of a nested `data` map.
     fn search_result_keys(v: &serde_json::Value) -> Vec<String> {
-        v.get("records")
+        v.get("rows")
             .and_then(|r| r.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|rec| {
-                        rec.get("data")
-                            .and_then(|d| d.get("key"))
-                            .and_then(|k| k.as_str())
-                            .map(str::to_string)
-                    })
+                    .filter_map(|row| row.get("key").and_then(|k| k.as_str()).map(str::to_string))
                     .collect()
             })
             .unwrap_or_default()
