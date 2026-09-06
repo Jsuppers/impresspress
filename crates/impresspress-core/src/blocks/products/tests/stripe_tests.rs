@@ -3494,6 +3494,155 @@ async fn catalog_sync_persists_fixed_prices_and_reuses_them_in_checkout_and_paym
     assert!(link_form.contains("line_items[0][price_data][unit_amount]=100"));
 }
 
+/// [B21] A Stripe outage during catalog sync is retryable, not a rejection.
+///
+/// `stripe_catalog_post` classified every status of 400 or more as
+/// `FailedPrecondition` — terminal — while `StripeClient::request_json`, one
+/// file over, has always treated 429 and 5xx as `Internal`. So a Stripe 503
+/// reached the operator as `409 Stripe rejected catalog synchronization` and
+/// was written into the offer's `sync_error` in those words: a transient
+/// outage recorded as a permanent refusal, on the one row an operator would
+/// read to decide whether to retry.
+#[tokio::test]
+async fn catalog_sync_classifies_a_provider_outage_as_retryable() {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_outage",
+    )])
+    .await;
+    let requests = register_stripe_sequence(
+        &mut ctx,
+        vec![(503, serde_json::json!({"error": {"type": "api_error"}}))],
+    );
+    let product_id = "product_catalog_outage";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+
+    let error = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
+        .await
+        .expect_err("a 503 must fail the sync");
+    assert_eq!(
+        error.code,
+        ErrorCode::Internal,
+        "a 503 is retryable, not a terminal rejection: {}",
+        error.message
+    );
+    assert!(error.message.contains("503"), "{}", error.message);
+    let failed = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    assert!(
+        !failed.sync_error.to_ascii_lowercase().contains("reject"),
+        "the persisted sync error must not call an outage a rejection: {}",
+        failed.sync_error
+    );
+    assert!(failed.sync_error.contains("503"), "{}", failed.sync_error);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// The other half of the same classification: a deterministic 400 stays
+/// terminal, because retrying it changes nothing.
+#[tokio::test]
+async fn catalog_sync_classifies_a_provider_rejection_as_terminal() {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_rejected",
+    )])
+    .await;
+    register_stripe_sequence(
+        &mut ctx,
+        vec![(
+            400,
+            serde_json::json!({"error": {"code": "parameter_invalid_empty"}}),
+        )],
+    );
+    let product_id = "product_catalog_rejected";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+
+    let error = stripe::sync_offer_catalog(&ctx, product_id, &offer_id)
+        .await
+        .expect_err("a 400 must fail the sync");
+    assert_eq!(
+        error.code,
+        ErrorCode::FailedPrecondition,
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("parameter_invalid_empty"),
+        "the provider's own error code must survive: {}",
+        error.message
+    );
+}
+
+/// [B21] The Payment-Link deactivate classified in the opposite direction:
+/// **every** failure was `Internal`, so a deterministic 400 was reported as
+/// retryable and the caller was invited to try it again forever.
+#[tokio::test]
+async fn payment_link_deactivation_classifies_a_provider_rejection_as_terminal() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+    ])
+    .await;
+    let product_id = "product_link_deactivate";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+    let offer = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &offer.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: serde_json::from_value(serde_json::json!({"pages": 2})).unwrap(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let pending = repo::payment_links::create_pending(
+        &ctx,
+        &offer_id,
+        "",
+        "",
+        "",
+        false,
+        "deactivate-config",
+        &preview,
+        0,
+    )
+    .await
+    .unwrap();
+    let link_id = pending.managed.id;
+    repo::payment_links::mark_synced(
+        &ctx,
+        &link_id,
+        "plink_deactivate",
+        "https://buy.stripe.com/deactivate",
+    )
+    .await
+    .unwrap();
+    register_stripe_sequence(
+        &mut ctx,
+        vec![(
+            400,
+            serde_json::json!({"error": {"code": "resource_missing"}}),
+        )],
+    );
+
+    let error = stripe::deactivate_payment_link(&ctx, &offer_id, &link_id)
+        .await
+        .expect_err("Stripe rejected the deactivation");
+    assert_eq!(
+        error.code,
+        ErrorCode::FailedPrecondition,
+        "a 400 is a rejection, not an outage: {}",
+        error.message
+    );
+    assert!(
+        repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap()[0]
+            .active,
+        "a rejected deactivation must not deactivate the local row"
+    );
+}
+
 #[tokio::test]
 async fn catalog_sync_failure_is_visible_and_retry_reuses_the_persisted_product() {
     let mut ctx = ctx_with(&[(
