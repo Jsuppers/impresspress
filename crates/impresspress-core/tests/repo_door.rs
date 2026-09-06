@@ -1,15 +1,17 @@
 //! Every platform table has exactly one door.
 //!
 //! `src/platform_state/<module>.rs` owns one `impresspress__admin__*` table
-//! each: its name, its column names and its row shape. Every other module
-//! reaches the table through that module's functions, so a column is
+//! each, and `src/blocks/<block>/repo/<module>.rs` owns its block's tables
+//! the same way: the name, the column names and the row shape. Every other
+//! module reaches the table through that module's functions, so a column is
 //! spelled in one Rust file and a read cannot skip whatever the door
-//! enforces (decoding, the seed hash gate, the single `assign` writer). The
-//! gate is a source scan because the table name is necessarily reachable —
-//! `blocks/admin/mod.rs` registers it in `collections(..)` and `grants(..)`
-//! — so nothing but a test can catch a call site that names it directly.
-//! It generalises `blocks/products/tests/repo_door_test.rs`; the block
-//! repos join it one PR at a time.
+//! enforces (decoding, the seed hash gate, the single `assign` writer, the
+//! one decode of `files.public`). The gate is a source scan because the
+//! table name is necessarily reachable — a block's `collections(..)` and
+//! `grants(..)` registrations name it — so nothing but a test can catch a
+//! call site that names it directly. It generalises
+//! `blocks/products/tests/repo_door_test.rs`; the block repos join it one PR
+//! at a time.
 //!
 //! Scope: every `.rs` file under this crate's `src/`, with full-line
 //! comments removed first — prose naming a table is not a query, and a
@@ -27,42 +29,98 @@
 //! allowlists below — each listed individually with its reason, so a NEW
 //! file naming a table fails the gate and has to justify itself here.
 
-/// `(module, table, qualifier)` for every door this gate covers.
+/// `(door, table, const, qualifier)` for every door this gate covers.
 ///
-/// `qualifier` is the path fragment a file must ALSO contain for a
-/// `<module>::TABLE` token to be attributed to this door. It is what keeps a
-/// block's own same-named repo module out of the match: products has a
-/// `repo::variables::TABLE`, so `variables::TABLE` counts as the platform
-/// door only when the file also names `platform_state`. For the auth users
-/// door the fragment is `auth`, which every path to
-/// `blocks::auth::repo::users` necessarily spells.
-const TABLES: &[(&str, &str, &str)] = &[
+/// `door` names the door in the failure message and keys the two allowlists.
+/// It is the owning module's name wherever a module owns one table; where a
+/// module owns two (`files::repo::shares` owns the share rows and their
+/// child access log, because a log row is meaningless without its share)
+/// each table is its own door, so an exemption for one is not an exemption
+/// for the other.
+///
+/// `const` is the path fragment the second scan looks for — `<module>::TABLE`
+/// for a module's primary table, `<module>::<NAME>_TABLE` for a second one.
+///
+/// `qualifier` is the path fragment a file must ALSO contain for that token
+/// to be attributed to this door. It is what keeps a block's own same-named
+/// repo module out of the match: products has a `repo::variables::TABLE`, so
+/// `variables::TABLE` counts as the platform door only when the file also
+/// names `platform_state`. For the auth users door the fragment is `auth`
+/// and for the files doors it is `files`, which every path to
+/// `blocks::<block>::repo::<module>` necessarily spells.
+const TABLES: &[(&str, &str, &str, &str)] = &[
     (
         "variables",
         "impresspress__admin__variables",
+        "variables::TABLE",
         "platform_state",
     ),
     (
         "block_settings",
         "impresspress__admin__block_settings",
+        "block_settings::TABLE",
         "platform_state",
     ),
     (
         "wrap_grants",
         "impresspress__admin__wrap_grants",
+        "wrap_grants::TABLE",
         "platform_state",
     ),
     (
         "request_logs",
         "impresspress__admin__request_logs",
+        "request_logs::TABLE",
         "platform_state",
     ),
     (
         "user_roles",
         "impresspress__admin__user_roles",
+        "user_roles::TABLE",
         "platform_state",
     ),
-    ("users", "wafer_run__auth__users", "auth"),
+    (
+        "users",
+        "wafer_run__auth__users",
+        "users::TABLE",
+        "auth",
+    ),
+    (
+        "buckets",
+        "impresspress__files__buckets",
+        "buckets::TABLE",
+        "files",
+    ),
+    (
+        "objects",
+        "impresspress__files__objects",
+        "objects::TABLE",
+        "files",
+    ),
+    (
+        "shares",
+        "impresspress__files__cloud_shares",
+        "shares::TABLE",
+        "files",
+    ),
+    (
+        "share_access_logs",
+        "impresspress__files__cloud_access_logs",
+        "shares::ACCESS_LOGS_TABLE",
+        "files",
+    ),
+    (
+        "quota",
+        "impresspress__files__cloud_quotas",
+        "quota::TABLE",
+        "files",
+    ),
+    (
+        "views",
+        "impresspress__files__views",
+        "views::TABLE",
+        "files",
+    ),
 ];
 
 fn crate_sources() -> Vec<(String, String)> {
@@ -143,6 +201,24 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("request_logs", &["platform_state/request_logs.rs"]),
     ("user_roles", &["platform_state/user_roles.rs"]),
+    // The files doors. Each is its own `repo/<module>.rs` and nothing else,
+    // with one exception on the objects table: the WRAP-grant loader's
+    // fixture seeds a grant whose target IS a table name on the wire, and
+    // resolving it back through `files::repo::objects::TABLE` would make the
+    // platform-state test depend on the files block to say what it is
+    // testing.
+    ("buckets", &["blocks/files/repo/buckets.rs"]),
+    (
+        "objects",
+        &[
+            "blocks/files/repo/objects.rs",
+            "platform_state/wrap_grants.rs",
+        ],
+    ),
+    ("shares", &["blocks/files/repo/shares.rs"]),
+    ("share_access_logs", &["blocks/files/repo/shares.rs"]),
+    ("quota", &["blocks/files/repo/quota.rs"]),
+    ("views", &["blocks/files/repo/views.rs"]),
     (
         "users",
         &[
@@ -178,10 +254,10 @@ fn only_the_door_names_a_platform_table() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (module, literal, _qualifier) in TABLES {
+    for (door, literal, _ident, _qualifier) in TABLES {
         let allowed = LITERAL_ALLOWED
             .iter()
-            .find(|(m, _)| m == module)
+            .find(|(m, _)| m == door)
             .map(|(_, files)| *files)
             .unwrap_or(&[]);
         let offenders: Vec<&String> = sources
@@ -193,7 +269,7 @@ fn only_the_door_names_a_platform_table() {
         assert!(
             offenders.is_empty(),
             "these files name `{literal}` directly and so bypass \
-             the `{module}` door; route them through its functions: {offenders:?}"
+             the `{door}` door; route them through its functions: {offenders:?}"
         );
     }
 }
@@ -272,6 +348,61 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/dev/data_snapshot.rs",
         ],
     ),
+    // The files block's two categories, both of which the admin doors above
+    // are already exempted under:
+    //
+    // 1. `blocks/files/mod.rs` — `BlockInfo::collections(..)`. Advisory
+    //    declarations for WRAP and the admin database explorer, the same
+    //    reason `blocks/admin/mod.rs` is listed for the platform tables.
+    //    Every files door needs it; there is no way to declare a collection
+    //    without naming it.
+    // 2. A test naming the table only to aim `FailingDbOpContext` at it, so
+    //    the fault lands on the query under test and not on some other
+    //    table's. The same reason `blocks/admin/pages/blocks.rs` is listed.
+    //    These are not queries around the door; the door is what runs.
+    (
+        "buckets",
+        &[
+            "blocks/files/mod.rs",
+            // `("database.delete_where", buckets::TABLE)` — the bucket-delete
+            // handler's two compensating-failure tests
+            "blocks/files/storage/buckets.rs",
+        ],
+    ),
+    (
+        "objects",
+        &[
+            "blocks/files/mod.rs",
+            // `("database.delete_where"/"delete_where_count", objects::TABLE)`
+            // — the object-delete metadata-cleanup failure test
+            "blocks/files/storage/objects.rs",
+            // `("database.sum", objects::TABLE)` — the quota fail-closed test
+            "blocks/files/quota.rs",
+            // `("database.sum", objects::TABLE)` — the same, through the
+            // `/b/cloudstorage/quota` handler
+            "blocks/files/cloud.rs",
+        ],
+    ),
+    (
+        "shares",
+        &[
+            "blocks/files/mod.rs",
+            // `("database.get", shares::TABLE)` — the share-delete
+            // authorization test: a failed ownership read must stop the
+            // request rather than skip the check
+            "blocks/files/cloud.rs",
+        ],
+    ),
+    ("share_access_logs", &["blocks/files/mod.rs"]),
+    (
+        "quota",
+        &[
+            "blocks/files/mod.rs",
+            // `("database.list", quota::TABLE)` — the quota fail-closed test
+            "blocks/files/quota.rs",
+        ],
+    ),
+    ("views", &["blocks/files/mod.rs"]),
 ];
 
 #[test]
@@ -280,23 +411,22 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (module, _, qualifier) in TABLES {
-        let ident = format!("{module}::TABLE");
+    for (door, _, ident, qualifier) in TABLES {
         let allowed = IDENT_ALLOWED
             .iter()
-            .find(|(m, _)| m == module)
+            .find(|(m, _)| m == door)
             .map(|(_, files)| *files)
             .unwrap_or(&[]);
         let offenders: Vec<&String> = sources
             .iter()
             .filter(|(path, _)| !matches_allowlist(path, allowed))
-            .filter(|(_, src)| src.contains(qualifier) && src.contains(&ident))
+            .filter(|(_, src)| src.contains(qualifier) && src.contains(ident))
             .map(|(path, _)| path)
             .collect();
         assert!(
             offenders.is_empty(),
             "these files name the table via `{ident}` instead of calling a \
-             `{module}` repo function: {offenders:?}"
+             `{door}` repo function: {offenders:?}"
         );
     }
 }
@@ -309,9 +439,9 @@ fn no_allowlist_entry_is_dead() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (module, literal, _qualifier) in TABLES {
+    for (door, literal, ident, _qualifier) in TABLES {
         for (m, files) in LITERAL_ALLOWED {
-            if m != module {
+            if m != door {
                 continue;
             }
             for entry in *files {
@@ -324,16 +454,15 @@ fn no_allowlist_entry_is_dead() {
                 );
             }
         }
-        let ident = format!("{module}::TABLE");
         for (m, files) in IDENT_ALLOWED {
-            if m != module {
+            if m != door {
                 continue;
             }
             for entry in *files {
                 assert!(
                     sources
                         .iter()
-                        .any(|(path, src)| path == entry && src.contains(&ident)),
+                        .any(|(path, src)| path == entry && src.contains(ident)),
                     "`{entry}` is allowlisted for `{ident}` but no longer names it; \
                      drop the entry rather than leaving a standing exemption"
                 );
