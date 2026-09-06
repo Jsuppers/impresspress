@@ -17,6 +17,28 @@ pub use wafer_block::{
 };
 use wafer_run::OutputStream;
 
+/// The row, or the 404 its absence turns into.
+///
+/// The `Option` half of [`crate::blocks::crud::db_error`]'s sentence: a repo
+/// function that returns `Result<Option<T>, WaferError>` splits "the call
+/// failed" from "there is no such row", and this is the second half —
+/// `db_error` on the `Result`, `require_row` on the `Option`:
+///
+/// ```ignore
+/// let doc = require_row(
+///     documents::get(ctx, id).await.map_err(|e| db_error(e, "Document not found", "Database error"))?,
+///     "Document not found",
+/// )?;
+/// ```
+///
+/// `not_found` is the whole message, not a noun: the route knows what it was
+/// looking for and this function does not. It lives here rather than in
+/// `crud.rs` because it turns an `Option` into a response and has nothing to
+/// do with the generic-table helpers.
+pub fn require_row<T>(row: Option<T>, not_found: &str) -> Result<T, OutputStream> {
+    row.ok_or_else(|| err_not_found(not_found))
+}
+
 /// Build a redirect `OutputStream` with the given status (302, 303, …) and
 /// `Location` header. Single source of truth for the redirect response shape
 /// (status + `Location` + empty `text/plain` body) used by page handlers.
@@ -180,5 +202,44 @@ mod tests {
             MetaGet::get(&buf.meta, "resp.header.Location"),
             Some("/login")
         );
+    }
+}
+
+#[cfg(test)]
+mod require_row_tests {
+    use wafer_run::{MetaGet, META_RESP_STATUS};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_present_row_passes_through() {
+        assert_eq!(require_row(Some(7_u8), "User not found").ok(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn an_absent_row_is_a_404_carrying_the_label() {
+        let out = require_row(None::<u8>, "User not found").expect_err("None is a refusal");
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                assert_eq!(wafer_block::http_codec::resolve_error_status(&e), 404);
+                assert_eq!(e.message, "User not found");
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
+
+    /// `?` on the refusal hands the handler an `OutputStream` it returns
+    /// as-is — the shape every call site uses.
+    #[tokio::test]
+    async fn the_refusal_is_returnable_from_a_handler() {
+        fn handler(row: Option<u8>) -> OutputStream {
+            match require_row(row, "Document not found") {
+                Ok(_) => ResponseBuilder::new().status(200).empty(),
+                Err(refusal) => refusal,
+            }
+        }
+        let buf = handler(Some(1)).collect_buffered().await.expect("respond");
+        assert_eq!(MetaGet::get(&buf.meta, META_RESP_STATUS), Some("200"));
+        assert!(handler(None).collect_buffered().await.is_err());
     }
 }

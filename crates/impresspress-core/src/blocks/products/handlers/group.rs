@@ -27,7 +27,7 @@ use crate::{
             repo::{self, groups::TABLE as GROUPS_TABLE},
         },
     },
-    http::{err_bad_request, err_internal, err_unauthorized, ok_json},
+    http::{err_internal, err_unauthorized, ok_json},
 };
 
 /// User-owned group rows (`/b/products/groups/{id}`), owned via `user_id`.
@@ -203,10 +203,10 @@ pub(super) async fn handle_user_delete_group(ctx: &dyn Context, msg: &Message) -
 // Products in a user's group
 pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // `/b/products/groups/{id}/products`: `{id}` as the table bound it.
-    let group_id = msg.var("id");
-    if group_id.is_empty() {
-        return err_bad_request("Missing group ID");
-    }
+    let group_id = match crud::path_id(msg, "Group") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     if let Err(resp) = crud::verify_owner(
         ctx,

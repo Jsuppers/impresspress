@@ -5,8 +5,11 @@ use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
 use super::repo;
 use crate::{
-    blocks::rate_limit::{check_rate_limit, RateLimit, RateLimitOutcome, UserRateLimiter},
-    http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_not_found},
+    blocks::{
+        crud,
+        rate_limit::{check_rate_limit, RateLimit, RateLimitOutcome, UserRateLimiter},
+    },
+    http::{err_forbidden, err_internal, err_internal_no_cause, err_not_found},
     util::json_map,
 };
 
@@ -38,10 +41,10 @@ pub async fn handle_direct_access(
 ) -> OutputStream {
     // `{token}` in `GET /b/storage/direct/{token}`, as the block's route
     // table bound it.
-    let token = msg.var("token");
-    if token.is_empty() {
-        return err_bad_request("Missing share token");
-    }
+    let token = match crud::path_var(msg, "token", "Missing share token") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     // Rate-limit per remote IP before doing any work — `/storage/direct/*` is
     // public (no auth required) so without this an attacker can enumerate

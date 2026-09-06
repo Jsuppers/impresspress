@@ -8,7 +8,7 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::api_keys,
+    blocks::{auth::repo::api_keys, crud},
     http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
     util::{hex_encode, sha256_hex},
 };
@@ -170,10 +170,10 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
 /// `PATCH /b/auth/api/api-keys/{id}`. `{id}` is read only as the route table
 /// bound it.
 pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing key ID");
-    }
+    let id = match crud::path_id(msg, "Key") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let user_id = msg.user_id();
 
     // Verify ownership
@@ -193,10 +193,10 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// `DELETE /b/auth/api/api-keys/{id}`. `{id}` is read only as the route table
 /// bound it.
 pub async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing key ID");
-    }
+    let id = match crud::path_id(msg, "Key") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let user_id = msg.user_id();
 
     // Verify ownership

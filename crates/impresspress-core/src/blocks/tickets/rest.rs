@@ -17,8 +17,9 @@ use super::{
     repo::{self, TicketFilters},
     service,
 };
-use crate::http::{
-    err_bad_request, err_conflict, err_internal, err_not_found, ok_json, ResponseBuilder,
+use crate::{
+    blocks::crud,
+    http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json, ResponseBuilder},
 };
 
 const MAX_ADMIN_BODY: usize = 32 * 1_024;
@@ -86,10 +87,10 @@ pub async fn create_ticket(ctx: &dyn Context, msg: &Message, input: InputStream)
 }
 
 pub async fn get_ticket(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing ticket ID");
-    }
+    let id = match crud::path_id(msg, "Ticket") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match service::detail(ctx, id).await {
         Ok(detail) => ok_json(&TicketDetailResponse::from_detail(detail)),
         Err(service::ServiceError::Db(error)) if error.code == wafer_run::ErrorCode::NotFound => {

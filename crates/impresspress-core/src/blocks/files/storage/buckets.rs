@@ -86,11 +86,10 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
-    let bucket = extract_bucket_name(msg);
-    let bucket = bucket.as_str();
-    if bucket.is_empty() {
-        return err_bad_request("Missing bucket name");
-    }
+    let bucket = match extract_bucket_name(msg) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     if !is_valid_bucket_name(bucket) {
         return err_bad_request("Invalid bucket name");
     }

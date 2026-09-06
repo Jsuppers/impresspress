@@ -12,7 +12,7 @@ use super::{
     logs::audit_log,
 };
 use crate::{
-    blocks::auth::bump_auth_version,
+    blocks::{auth::bump_auth_version, crud},
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
     platform_state::user_roles::{self, Assigned},
     util::{json_map, RecordExt},
@@ -83,10 +83,10 @@ pub(super) async fn handle_update_role(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing role ID");
-    }
+    let id = match crud::path_id(msg, "Role") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     let raw = input.collect_to_bytes().await;
     // Typed rather than a `HashMap` peek plus a per-branch key whitelist: the
@@ -265,10 +265,10 @@ pub(super) async fn handle_create_permission(
 /// `DELETE /b/admin/api/iam/permissions/{id}`. `{id}` is read only as the
 /// route table bound it.
 pub(super) async fn handle_delete_permission(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing permission ID");
-    }
+    let id = match crud::path_id(msg, "Permission") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match db::delete(ctx, PERMISSIONS_TABLE, id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Permission not found"),
@@ -365,10 +365,10 @@ pub(super) async fn handle_assign_role(
 /// `DELETE /b/admin/api/iam/user-roles/{id}`. `{id}` is read only as the
 /// route table bound it.
 pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing user-role ID");
-    }
+    let id = match crud::path_id(msg, "User-role") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     // Prevent admins from removing their own admin role (self-lockout).
     // Also captures the affected user id so a successful removal can bump

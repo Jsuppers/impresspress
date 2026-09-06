@@ -5,20 +5,25 @@ use std::collections::HashMap;
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::products::{
-        contracts::{AdminSellerDetail, OfferStatus, ProductView, SellerAccountList},
-        repo, stripe,
+    blocks::{
+        crud,
+        products::{
+            contracts::{AdminSellerDetail, OfferStatus, ProductView, SellerAccountList},
+            repo, stripe,
+        },
     },
     http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
     util::{stamp_updated, RecordExt},
 };
 
+/// The seller-governance classifications, then [`crud::db_error`] for
+/// everything a database raises — which is what makes a WRAP refusal here a
+/// 403 rather than the 500 the old `_` arm produced.
 fn admin_error(error: WaferError, not_found: &str) -> OutputStream {
     match error.code {
-        ErrorCode::NotFound => err_not_found(not_found),
         ErrorCode::InvalidArgument => err_bad_request(&error.message),
         ErrorCode::FailedPrecondition | ErrorCode::Aborted => err_conflict(&error.message),
-        _ => err_internal("Seller governance operation failed", error),
+        _ => crud::db_error(error, not_found, "Seller governance operation failed"),
     }
 }
 
@@ -30,10 +35,10 @@ pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
 }
 
 pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing seller ID");
-    }
+    let id = match crud::path_id(msg, "Seller") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let seller = match repo::seller_accounts::get_contract(ctx, id).await {
         Ok(Some(seller)) => seller,
         Ok(None) => return err_not_found("Seller not found"),
@@ -50,10 +55,10 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let product = match repo::products::get(ctx, id).await {
         Ok(product) => product,
         Err(error) => return admin_error(error, "Product not found"),
@@ -123,10 +128,10 @@ pub(super) async fn reject_product(ctx: &dyn Context, msg: &Message) -> OutputSt
 }
 
 async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing seller ID");
-    }
+    let id = match crud::path_id(msg, "Seller") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     // The stored row, not `get_contract`'s decoded contract: suspension is a
     // fraud control, and a row whose `fee_basis_points` no longer decodes is
     // exactly the account an operator most needs to be able to suspend. The

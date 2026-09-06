@@ -8,15 +8,18 @@ use wafer_core::clients::{config, database as db};
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::llm::{
-        contracts::{
-            CreateProviderRequest, DiscoveredModelsResponse, ProviderDeleteResponse,
-            ProviderListResponse, ProviderView, UpdateProviderRequest,
+    blocks::{
+        crud,
+        llm::{
+            contracts::{
+                CreateProviderRequest, DiscoveredModelsResponse, ProviderDeleteResponse,
+                ProviderListResponse, ProviderView, UpdateProviderRequest,
+            },
+            provider_admin::ProviderAdmin,
+            providers::config::ProviderConfig,
+            schema::{config_to_row, row_to_config, TABLE as PROVIDERS_TABLE},
+            LlmBlock,
         },
-        provider_admin::ProviderAdmin,
-        providers::config::ProviderConfig,
-        schema::{config_to_row, row_to_config, TABLE as PROVIDERS_TABLE},
-        LlmBlock,
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json},
 };
@@ -174,10 +177,10 @@ pub(in crate::blocks::llm) async fn update_provider(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing provider ID");
-    }
+    let id = match crud::path_id(msg, "Provider") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
 
     let raw = input.collect_to_bytes().await;
     let body: UpdateProviderRequest = match serde_json::from_slice(&raw) {
@@ -246,10 +249,10 @@ pub(in crate::blocks::llm) async fn delete_provider(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing provider ID");
-    }
+    let id = match crud::path_id(msg, "Provider") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     match db::delete(ctx, PROVIDERS_TABLE, &id).await {
         Ok(()) => {}
         Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
@@ -273,10 +276,10 @@ pub(in crate::blocks::llm) async fn discover_models(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing provider ID");
-    }
+    let id = match crud::path_id(msg, "Provider") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
 
     // Resolve the provider name from the row — discover_models is keyed by
     // provider name (== ProviderConfig::name), not by row id.

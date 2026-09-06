@@ -18,6 +18,7 @@ use wafer_run::{
 
 use self::provider_admin::ProviderAdmin;
 use crate::{
+    blocks::crud,
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
 };
@@ -425,10 +426,10 @@ impl LlmBlock {
     /// settings page renders a delete control for every override row; this
     /// is the route it targets.
     async fn handle_delete_config(&self, ctx: &dyn Context, msg: &Message) -> OutputStream {
-        let id = msg.var("id").to_string();
-        if id.is_empty() {
-            return err_bad_request("Missing override ID");
-        }
+        let id = match crud::path_id(msg, "Override") {
+            Ok(value) => value.to_string(),
+            Err(response) => return response,
+        };
         match repo::settings::delete(ctx, &id).await {
             Ok(()) => ok_json(&contracts::ConfigDeleteResponse { deleted: true }),
             Err(e) if e.code == wafer_run::ErrorCode::NotFound => {

@@ -13,7 +13,10 @@ use super::{
     contracts::{RecordListView, RecordView},
     repo,
 };
-use crate::http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json};
+use crate::{
+    blocks::crud,
+    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+};
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match repo::shares::list_for_user(ctx, msg.user_id(), 100).await {
@@ -130,10 +133,10 @@ pub(super) async fn handle_create_share(
 }
 
 pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing share ID");
-    }
+    let id = match crud::path_id(msg, "Share") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     // Verify ownership. This lookup is the only authorization on the path,
     // so a failed read stops the request instead of skipping the check.
@@ -204,10 +207,10 @@ pub(super) async fn handle_update_quota(
 ) -> OutputStream {
     // `{id}` in `PATCH /b/cloudstorage/admin/quotas/{id}` is the user whose
     // quota is set.
-    let user_id = msg.var("id");
-    if user_id.is_empty() {
-        return err_bad_request("Missing user ID");
-    }
+    let user_id = match crud::path_id(msg, "User") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     let raw = input.collect_to_bytes().await;
     let body: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {

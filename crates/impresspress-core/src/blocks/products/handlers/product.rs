@@ -374,10 +374,10 @@ pub(super) async fn handle_list_products(ctx: &dyn Context, msg: &Message) -> Ou
 }
 
 pub(super) async fn handle_get_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match repo::products::get(ctx, id).await {
         Ok(record) => ok_json(&ProductView::from_record(&record)),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
@@ -419,10 +419,10 @@ pub(super) async fn handle_update_product(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let request: UpdateProductRequest = match read_write_body(input).await {
         Ok(request) => request,
         Err(response) => return response,
@@ -444,10 +444,10 @@ pub(super) async fn handle_update_product(
 }
 
 pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match repo::products::soft_delete(ctx, id).await {
         Ok(()) => ok_json(&crud::Deleted::done()),
         Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
@@ -470,10 +470,10 @@ pub(super) async fn handle_delete_product(ctx: &dyn Context, msg: &Message) -> O
 /// product. One table over the declared wire paths is what closed it;
 /// `routes::table_tests` pins that the former second spellings 404.
 pub(super) async fn handle_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     restore_product(ctx, id).await
 }
 
@@ -695,10 +695,10 @@ fn copied_slug(source: &wafer_core::clients::database::Record) -> String {
 }
 
 async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -> OutputStream {
-    let source_id = msg.var("id");
-    if source_id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let source_id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let source = if owner_only {
         match verify_product_owner(ctx, source_id, msg.user_id()).await {
             Ok(source) => source,
@@ -860,10 +860,10 @@ pub(super) async fn handle_user_list_products(ctx: &dyn Context, msg: &Message) 
 }
 
 pub(super) async fn handle_user_get_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     match verify_product_owner(ctx, id, msg.user_id()).await {
         Ok(record) => ok_json(&ProductView::from_record(&record)),
         Err(response) => response,
@@ -973,10 +973,10 @@ pub(super) async fn handle_user_update_product(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     let current = match verify_product_owner(ctx, &id, msg.user_id()).await {
         Ok(record) => record,
         Err(response) => return response,
@@ -1054,10 +1054,10 @@ pub(super) async fn handle_user_update_product(
 }
 
 pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     if let Err(response) = verify_product_owner(ctx, &id, msg.user_id()).await {
         return response;
     }
@@ -1095,10 +1095,10 @@ pub(super) async fn handle_user_delete_product(ctx: &dyn Context, msg: &Message)
 /// `verify_deleted_product_owner` check above, not the URL — is what refuses
 /// seller B.
 pub(super) async fn handle_user_restore_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     if let Err(response) = verify_deleted_product_owner(ctx, &id, msg.user_id()).await {
         return response;
     }

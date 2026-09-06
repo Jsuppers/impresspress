@@ -7,7 +7,10 @@ use super::{
     ops,
 };
 use crate::{
-    blocks::auth::repo::users::{self, ActiveUserQuery},
+    blocks::{
+        auth::repo::users::{self, ActiveUserQuery},
+        crud,
+    },
     http::{err_bad_request, err_internal, err_not_found, ok_json},
 };
 
@@ -45,10 +48,10 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
 /// `GET /b/admin/api/users/{id}`. `{id}` is read only as the route table
 /// bound it.
 pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing user ID");
-    }
+    let id = match crud::path_id(msg, "User") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     get_user(ctx, id).await
 }
 
@@ -68,6 +71,10 @@ async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
             ok_json(&AdminUserView::from_row(&row, roles))
         }
         Ok(None) => err_not_found("User not found"),
+        // NOT `crud::db_error`: `auth::repo::RepoError` is `NotFound |
+        // Db(String)` and has already discarded the wafer code, so a WRAP
+        // refusal cannot be told from a decode failure here. Folding
+        // `RepoError` into `WaferError` is PR 2; this arm converts with it.
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -79,10 +86,10 @@ pub(super) async fn handle_update(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing user ID");
-    }
+    let id = match crud::path_id(msg, "User") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     let raw = input.collect_to_bytes().await;
     let body: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
@@ -112,10 +119,10 @@ pub(super) async fn handle_update(
 /// `DELETE /b/admin/api/users/{id}`. `{id}` is read only as the route table
 /// bound it.
 pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing user ID");
-    }
+    let id = match crud::path_id(msg, "User") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     // Self-delete guard, soft-delete, and audit-log write live in the shared
     // ops layer (the JSON path previously logged nothing).
