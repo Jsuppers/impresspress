@@ -41,7 +41,7 @@ enum Route {
 }
 
 /// The block's HTTP surface: what `handle()` dispatches on and what
-/// `info().endpoints` is generated from. Wire paths; `{hash}` / `{id}` are
+/// `info().endpoints` is generated from. Wire paths; `{family}` / `{id}` are
 /// bound into `req.param.*` for the handlers' `msg.var` readers. The
 /// `/admin/*` rows are declared `Admin` so the central router enforces the
 /// tier; the block hand-checks nothing.
@@ -60,7 +60,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         .summary("Active sessions"),
     EndpointRoute::authenticated(
         HttpMethod::Delete,
-        "/b/userportal/sessions/{hash}",
+        "/b/userportal/sessions/{family}",
         Route::RevokeSession,
     )
     .summary("Revoke session"),
@@ -145,7 +145,7 @@ crate::impresspress_feature_block! {
     handle: |this, ctx, msg, input| {
         // Auth is enforced centrally by `route_to_block` from each row's
         // declared `AuthLevel`; the block holds no `user_id` / `is_admin`
-        // preamble. `{hash}` / `{id}` are bound into `req.param.*` for the
+        // preamble. `{family}` / `{id}` are bound into `req.param.*` for the
         // handlers' `msg.var` readers.
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
             return err_not_found("not found");
@@ -426,7 +426,7 @@ async fn handle_save_settings(ctx: &dyn Context, input: InputStream) -> OutputSt
 mod test_support {
     use wafer_run::Message;
 
-    /// Run `msg` through the block's own route table so `{hash}` / `{id}` is
+    /// Run `msg` through the block's own route table so `{family}` / `{id}` is
     /// bound the way it is on the wire, then hand the message to a handler
     /// directly. Panics when no row matches: a test that sends an unroutable
     /// path would otherwise exercise the handler's "nothing bound" branch by

@@ -218,6 +218,14 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
             "impresspress/userportal",
             "wafer_run__auth__sessions",
         ),
+        // [B12] The same revoke burns the family's refresh rows before
+        // deleting the session row — that is what actually signs the device
+        // out. Without this grant every revoke would 500 (or, worse under a
+        // swallowing handler, report success while the device kept
+        // refreshing). Read+write: `revoke_family` updates the rows, and the
+        // ownership check that precedes it reads the session row, not this
+        // table.
+        wafer_run::ResourceGrant::read_write("impresspress/userportal", "wafer_run__auth__tokens"),
         // Userportal `/b/userportal/security` lists the caller's
         // linked OAuth providers. Read-only — unlinking goes
         // through an auth POST endpoint, not the userportal block.

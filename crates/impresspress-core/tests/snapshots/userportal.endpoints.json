@@ -1,6 +1,6 @@
 [
   "DELETE /b/userportal/admin/buttons/{id} admin",
-  "DELETE /b/userportal/sessions/{hash} authenticated",
+  "DELETE /b/userportal/sessions/{family} authenticated",
   "GET /b/userportal/ authenticated",
   "GET /b/userportal/admin/buttons admin",
   "GET /b/userportal/admin/buttons/{id}/edit admin",
