@@ -341,6 +341,9 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
 // Shares
 // ---------------------------------------------------------------------------
 
+/// A render-side projection of [`repo::shares::ShareRow`]: the token and the
+/// timestamps cut for the admin table's narrow columns. It holds no
+/// decoding — `max_access_count` is the row's already-normalised `Option`.
 #[derive(Clone, Debug)]
 pub struct AdminShareRow {
     pub token_short: String,
@@ -350,6 +353,26 @@ pub struct AdminShareRow {
     pub max_access_count: Option<i64>,
     pub expires_short: Option<String>,
     pub owner_short: String,
+}
+
+impl From<&repo::shares::ShareRow> for AdminShareRow {
+    fn from(row: &repo::shares::ShareRow) -> Self {
+        Self {
+            token_short: row.token.get(..12).unwrap_or("—").to_string(),
+            bucket: row.bucket.clone(),
+            key: row.key.clone(),
+            access_count: row.access_count,
+            max_access_count: row.max_access_count,
+            expires_short: row
+                .expires_at
+                .as_deref()
+                // The expiry column keeps the value when it is shorter than
+                // the cut, unlike the id and date columns above — the shape
+                // the inline decoder had.
+                .map(|exp| exp.get(..10).unwrap_or(exp).to_string()),
+            owner_short: short_id(&row.created_by),
+        }
+    }
 }
 
 /// Render the admin Shares table (or empty state). Token displayed as
@@ -398,37 +421,7 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
     let rows: Vec<AdminShareRow> = match repo::shares::list_recent(ctx, 100, 0).await {
-        Ok(list) => list
-            .records
-            .into_iter()
-            .map(|r| {
-                let max_str = r.str_field("max_access_count");
-                let max = if max_str.is_empty() {
-                    None
-                } else {
-                    max_str.parse::<i64>().ok().filter(|n| *n > 0)
-                };
-                let exp_str = r.str_field("expires_at");
-                let expires_short = if exp_str.is_empty() {
-                    None
-                } else {
-                    Some(exp_str.get(..10).unwrap_or(exp_str).to_string())
-                };
-                AdminShareRow {
-                    token_short: r.str_field("token").get(..12).unwrap_or("—").to_string(),
-                    bucket: r.str_field("bucket").to_string(),
-                    key: r.str_field("key").to_string(),
-                    access_count: r.i64_field("access_count"),
-                    max_access_count: max,
-                    expires_short,
-                    owner_short: r
-                        .str_field("created_by")
-                        .get(..8)
-                        .unwrap_or("—")
-                        .to_string(),
-                }
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(AdminShareRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e.message, "admin shares list failed");
             Vec::new()
@@ -675,6 +668,44 @@ mod tests {
         assert!(html.contains("public"));
         assert!(html.contains("private"));
         assert!(html.contains("2026-05-06"));
+    }
+
+    /// One capped, expiring share row, as the repo decodes it.
+    fn sample_share_row() -> repo::shares::ShareRow {
+        repo::shares::ShareRow::from_record(&wafer_core::clients::database::Record {
+            id: "s1".to_string(),
+            data: [
+                ("token", serde_json::json!("tok12345abcdef-more")),
+                ("bucket", serde_json::json!("photos")),
+                ("key", serde_json::json!("a.png")),
+                ("created_by", serde_json::json!("alice-1234-5678")),
+                ("created_at", serde_json::json!("2026-05-06T10:00:00Z")),
+                ("expires_at", serde_json::json!("2026-06-06T10:00:00Z")),
+                ("access_count", serde_json::json!(4)),
+                ("max_access_count", serde_json::json!(10)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        })
+    }
+
+    /// The admin share projection cuts the token to 12 and the expiry to 10
+    /// and reads nothing else. `max_access_count` comes straight off the row:
+    /// the inline decoder it replaces read it with `str_field(..).parse()`,
+    /// which is empty for the JSON number SQLite's `INTEGER` column returns,
+    /// so a capped share rendered as uncapped.
+    #[test]
+    fn admin_share_projection_shapes_only_what_the_table_renders() {
+        let row = sample_share_row();
+        let projected = AdminShareRow::from(&row);
+        assert_eq!(projected.token_short, "tok12345abcd");
+        assert_eq!(projected.bucket, "photos");
+        assert_eq!(projected.key, "a.png");
+        assert_eq!(projected.access_count, 4);
+        assert_eq!(projected.max_access_count, Some(10));
+        assert_eq!(projected.expires_short.as_deref(), Some("2026-06-06"));
+        assert_eq!(projected.owner_short, "alice-12");
     }
 
     #[test]

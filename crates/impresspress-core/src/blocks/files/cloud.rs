@@ -117,8 +117,8 @@ pub(super) async fn handle_create_share(
         max_access_count: body.max_access_count,
     };
     match repo::shares::insert(ctx, new_share).await {
-        Ok(record) => ok_json(&serde_json::json!({
-            "id": record.id,
+        Ok(row) => ok_json(&serde_json::json!({
+            "id": row.id,
             "token": token,
             "direct_url": format!("/b/storage/direct/{}", token)
         })),
@@ -136,12 +136,7 @@ pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> Out
     // so a failed read stops the request instead of skipping the check.
     match repo::shares::find_by_id(ctx, id).await {
         Ok(share) => {
-            let owner = share
-                .data
-                .get("created_by")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if owner != msg.user_id() && !crate::util::is_admin(msg) {
+            if share.created_by != msg.user_id() && !crate::util::is_admin(msg) {
                 return err_forbidden("Cannot delete another user's share");
             }
         }
@@ -591,13 +586,12 @@ mod tests {
             .expect("successful create_share returns an id")
             .to_string();
 
-        let record = repo::shares::find_by_id(&ctx, &id)
+        let row = repo::shares::find_by_id(&ctx, &id)
             .await
             .expect("share row");
-        let expires_at = record
-            .data
-            .get("expires_at")
-            .and_then(|v| v.as_str())
+        let expires_at = row
+            .expires_at
+            .as_deref()
             .expect("expires_at set for a 24h share");
         let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
             .expect("valid rfc3339")

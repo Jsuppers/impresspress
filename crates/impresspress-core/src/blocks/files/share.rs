@@ -7,7 +7,7 @@ use super::repo;
 use crate::{
     blocks::rate_limit::{check_rate_limit, RateLimit, RateLimitOutcome, UserRateLimiter},
     http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_not_found},
-    util::{json_map, RecordExt},
+    util::json_map,
 };
 
 pub async fn generate_share_token(
@@ -76,13 +76,13 @@ pub async fn handle_direct_access(
         return err_not_found("Share not found or expired");
     };
 
-    // Check expiry
-    if let Some(expires) = share.data.get("expires_at").and_then(|v| v.as_str()) {
-        if !expires.is_empty() {
-            if let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(expires) {
-                if exp_time < chrono::Utc::now() {
-                    return err_forbidden("Share link has expired");
-                }
+    // Check expiry. `ShareRow::expires_at` is `None` for a share that never
+    // expires (a SQL NULL or a stored empty string, which meant the same
+    // thing here before the decode moved into the repo).
+    if let Some(expires) = share.expires_at.as_deref() {
+        if let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(expires) {
+            if exp_time < chrono::Utc::now() {
+                return err_forbidden("Share link has expired");
             }
         }
     }
@@ -94,7 +94,9 @@ pub async fn handle_direct_access(
     // accesses with `max_access_count = 1` both pass the check and double-
     // serve the file. With the cap inside the WHERE clause, at most one
     // updater wins per row and rowcount 0 ⇒ cap reached.
-    let max = share.i64_field("max_access_count");
+    // `None` (no cap) reaches `increment_access_count_capped` as 0, which is
+    // the "unlimited" sentinel its filter is written against.
+    let max = share.max_access_count.unwrap_or(0);
     match repo::shares::increment_access_count_capped(ctx, &share.id, max).await {
         Ok(true) => {}
         Ok(false) => return err_forbidden("Share link access limit reached"),
@@ -107,12 +109,8 @@ pub async fn handle_direct_access(
         }
     }
 
-    let bucket = share
-        .data
-        .get("bucket")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let key = share.data.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let bucket = share.bucket.as_str();
+    let key = share.key.as_str();
 
     if bucket.is_empty() || key.is_empty() {
         return err_internal_no_cause("Invalid share data");
