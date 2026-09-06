@@ -189,17 +189,8 @@ mod tests {
             .to_string()
     }
 
-    async fn seed_user(ctx: &TestContext, id: &str, email: &str) {
-        use crate::blocks::auth::USERS_TABLE;
-        let mut data: HashMap<String, Value> = HashMap::new();
-        data.insert("id".into(), json!(id));
-        data.insert("email".into(), json!(email));
-        data.insert("display_name".into(), json!(email));
-        data.insert("role".into(), json!("user"));
-        data.insert("email_verified".into(), json!(true));
-        data.insert("created_at".into(), json!(crate::util::now_rfc3339()));
-        data.insert("updated_at".into(), json!(crate::util::now_rfc3339()));
-        db::create(ctx, USERS_TABLE, data).await.unwrap();
+    async fn seed_user(ctx: &TestContext, id: &str, _email: &str) {
+        ctx.seed_auth_user(id).await;
     }
 
     #[tokio::test]

@@ -230,6 +230,8 @@ mod tests {
                 display_name: "Owner".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await

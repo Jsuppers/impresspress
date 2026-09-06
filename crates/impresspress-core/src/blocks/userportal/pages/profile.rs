@@ -3,14 +3,12 @@
 //! Change Password lives on the security page.
 
 use maud::html;
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::USERS_TABLE,
+    blocks::auth::repo::users,
     http::redirect,
     ui::{components, SiteConfig, UserInfo},
-    util::RecordExt,
 };
 
 pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -21,14 +19,18 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let site_config = SiteConfig::load(ctx).await;
     let user = UserInfo::from_message(msg);
-    let user_record = db::get(ctx, USERS_TABLE, &user_id).await.ok();
-    let display_name = user_record
+    // `UserRow.display_name`, not the `name` alias this page used to read:
+    // both are written together by `users::insert` and
+    // `users::update_profile`, and `display_name` is the column migration
+    // 001 declares NOT NULL, so it is the one that is always populated.
+    let row = users::find_by_id(ctx, &user_id).await.ok().flatten();
+    let display_name = row
         .as_ref()
-        .map(|r| r.str_field("name").to_string())
+        .map(|u| u.display_name.clone())
         .unwrap_or_default();
-    let avatar_url = user_record
+    let avatar_url = row
         .as_ref()
-        .map(|r| r.str_field("avatar_url").to_string())
+        .and_then(|u| u.avatar_url.clone())
         .unwrap_or_default();
     let email = user.as_ref().map(|u| u.email.as_str()).unwrap_or("");
 

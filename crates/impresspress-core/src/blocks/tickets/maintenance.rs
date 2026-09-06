@@ -127,13 +127,7 @@ pub async fn prune(ctx: &dyn Context) -> MaintenanceResult {
         &mut result.errors,
     )
     .await;
-    match db::delete_by_filters_count(
-        ctx,
-        crate::blocks::auth::RATE_LIMITS_TABLE,
-        vec![repo::before("updated_at", &rate_cutoff)],
-    )
-    .await
-    {
+    match crate::blocks::auth::repo::rate_limits::delete_updated_before(ctx, &rate_cutoff).await {
         Ok(count) => result.rate_counters_deleted = count,
         Err(error) => {
             tracing::warn!(error = %error, "ticket maintenance rate-counter prune failed");

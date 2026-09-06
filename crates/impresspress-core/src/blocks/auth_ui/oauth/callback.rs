@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use wafer_core::clients::{config, database as db, network};
+use wafer_core::clients::{config, network};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
@@ -14,12 +14,10 @@ use crate::{
                 signup_allowed,
             },
             repo::{oauth_pkce, provider_links, users},
-            USERS_TABLE,
         },
         auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
     },
     http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, ResponseBuilder},
-    util::json_map,
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -107,10 +105,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     // Update last_login_at on the users row (best-effort).
-    let upd = json_map(serde_json::json!({
-        "last_login_at": crate::util::now_rfc3339()
-    }));
-    if let Err(e) = db::update(ctx, USERS_TABLE, &user_id, upd).await {
+    if let Err(e) = users::touch_last_login(ctx, &user_id).await {
         tracing::warn!("Failed to update last_login_at: {e}");
     }
 
@@ -452,6 +447,13 @@ async fn resolve_user(
                         Some(info.avatar.clone())
                     },
                     role: role.to_string(),
+                    // Unchanged from before `NewUser` carried the field: the
+                    // OAuth branch never wrote `email_verified`, so the row
+                    // took migration 001's `DEFAULT 0`. Whether a provider's
+                    // assertion should count as verification is a product
+                    // question, not a repo-boundary one.
+                    email_verified: false,
+                    verification_token_hash: None,
                 };
                 // The initial role is the inline `users.role` that
                 // `get_user_roles` reads first; a `user_roles` row means a
@@ -829,21 +831,16 @@ mod security_regression_tests {
                 display_name: "Disabled User".to_string(),
                 avatar_url: None,
                 role: "user".to_string(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
         .expect("seed user");
         // Flip the real `disabled` flag (the value the fixed check reads).
-        let mut upd = crate::util::json_map(serde_json::json!({ "disabled": true }));
-        crate::util::stamp_updated(&mut upd);
-        wafer_core::clients::database::update(
-            &ctx,
-            crate::blocks::auth::USERS_TABLE,
-            &user.id,
-            upd,
-        )
-        .await
-        .expect("disable user");
+        users::set_disabled(&ctx, &user.id, true)
+            .await
+            .expect("disable user");
         // Sanity: the typed row now reports disabled.
         assert!(
             users::find_by_id(&ctx, &user.id)
@@ -893,24 +890,17 @@ mod security_regression_tests {
                 display_name: "Soft Deleted User".to_string(),
                 avatar_url: None,
                 role: "user".to_string(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
         .expect("seed user");
-        // Set `deleted_at` (soft-delete marker) — NOT `disabled`. Mirrors the
+        // Soft-delete (stamps `deleted_at`) — NOT `disabled`. Mirrors the
         // Task-1/2 lifecycle tests in `auth/repo/users.rs`.
-        let mut upd = crate::util::json_map(serde_json::json!({
-            "deleted_at": "2026-01-01T00:00:00Z"
-        }));
-        crate::util::stamp_updated(&mut upd);
-        wafer_core::clients::database::update(
-            &ctx,
-            crate::blocks::auth::USERS_TABLE,
-            &user.id,
-            upd,
-        )
-        .await
-        .expect("soft-delete user");
+        users::soft_delete(&ctx, &user.id)
+            .await
+            .expect("soft-delete user");
         // Sanity: the typed row now reports deleted/inactive but NOT disabled.
         let row = users::find_by_id(&ctx, &user.id).await.unwrap().unwrap();
         assert!(row.is_deleted(), "fixture user must be soft-deleted");
@@ -953,6 +943,8 @@ mod security_regression_tests {
                 display_name: "Disabled Linked User".to_string(),
                 avatar_url: None,
                 role: "user".to_string(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -974,16 +966,9 @@ mod security_regression_tests {
         .expect("seed provider link");
 
         // Disable AFTER linking.
-        let mut upd = crate::util::json_map(serde_json::json!({ "disabled": true }));
-        crate::util::stamp_updated(&mut upd);
-        wafer_core::clients::database::update(
-            &ctx,
-            crate::blocks::auth::USERS_TABLE,
-            &user.id,
-            upd,
-        )
-        .await
-        .expect("disable user");
+        users::set_disabled(&ctx, &user.id, true)
+            .await
+            .expect("disable user");
 
         let out = handle(&ctx, &callback_msg()).await;
         assert!(
@@ -1012,6 +997,8 @@ mod security_regression_tests {
                 display_name: "Soft Deleted Linked User".to_string(),
                 avatar_url: None,
                 role: "user".to_string(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -1029,18 +1016,9 @@ mod security_regression_tests {
         .await
         .expect("seed provider link");
 
-        let mut upd = crate::util::json_map(serde_json::json!({
-            "deleted_at": "2026-01-01T00:00:00Z"
-        }));
-        crate::util::stamp_updated(&mut upd);
-        wafer_core::clients::database::update(
-            &ctx,
-            crate::blocks::auth::USERS_TABLE,
-            &user.id,
-            upd,
-        )
-        .await
-        .expect("soft-delete user");
+        users::soft_delete(&ctx, &user.id)
+            .await
+            .expect("soft-delete user");
 
         let out = handle(&ctx, &callback_msg()).await;
         assert!(

@@ -25,6 +25,8 @@ async fn user_profile_returns_row_with_empty_orgs() {
             display_name: "P".into(),
             avatar_url: Some("https://a/x.png".into()),
             role: "admin".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -71,6 +73,8 @@ async fn user_profile_maps_non_admin_role_to_user() {
             display_name: "O".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

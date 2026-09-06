@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use wafer_block::db::{Filter, FilterOp, SortField};
+use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::context::Context;
 
@@ -137,6 +137,29 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKe
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
+/// List the `limit` most recently created API keys across every user,
+/// newest first — the admin IAM page's API-keys tab, which is a
+/// deployment-wide view rather than one account's. `key_hash` is populated
+/// on the rows; the tab renders `key_prefix` only.
+pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<ApiKeyRow>, RepoError> {
+    let list = db::list(
+        ctx,
+        TABLE,
+        &ListOptions {
+            sort: vec![SortField {
+                field: "created_at".into(),
+                desc: true,
+            }],
+            limit,
+            skip_count: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| RepoError::Db(format!("api_keys list_recent: {e}")))?;
+    list.records.iter().map(|r| row_from_map(&r.data)).collect()
+}
+
 /// Mark an API key revoked (stamps `revoked_at` with [`super::now_iso`]).
 pub async fn revoke(ctx: &dyn Context, id: &str) -> Result<(), RepoError> {
     let mut data: HashMap<String, Value> = HashMap::new();
@@ -161,22 +184,7 @@ mod tests {
     use crate::test_support::TestContext;
 
     async fn seed_user(ctx: &TestContext, user_id: &str) {
-        db::exec_raw(
-            ctx,
-            "INSERT INTO wafer_run__auth__users \
-             (id, email, display_name, role, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-            &[
-                json!(user_id),
-                json!(format!("{user_id}@example.com")),
-                json!(user_id),
-                json!("user"),
-                json!("2026-01-01T00:00:00Z"),
-                json!("2026-01-01T00:00:00Z"),
-            ],
-        )
-        .await
-        .unwrap();
+        ctx.seed_auth_user(user_id).await;
     }
 
     #[tokio::test]

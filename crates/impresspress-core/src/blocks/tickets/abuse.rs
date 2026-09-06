@@ -34,55 +34,20 @@ pub async fn check_durable(
     key: &str,
     limit: RateLimit,
 ) -> AbuseDecision {
-    use wafer_block::{
-        db::{Filter, FilterOp},
-        wire::database::OnConflict,
-    };
-    use wafer_core::clients::database as db;
-
     let now = (js_sys::Date::now() / 1000.0) as i64;
     let window_secs = limit.window.as_secs() as i64;
     let window_cutoff = now - window_secs;
-    let table = crate::blocks::auth::RATE_LIMITS_TABLE;
     let id = crate::util::sha256_hex(format!("tickets-rl:{key}:{now}").as_bytes());
-    let upsert = db::upsert(
+    let count = crate::blocks::auth::repo::rate_limits::windowed_increment(
         ctx,
-        table,
-        vec![
-            ("id".to_string(), serde_json::json!(id)),
-            ("key".to_string(), serde_json::json!(key)),
-        ],
-        vec!["key".to_string()],
-        OnConflict::WindowedCounter {
-            count_field: "count".to_string(),
-            window_field: "window_start".to_string(),
-            now,
-            window_cutoff,
-            created_fields: vec!["created_at".to_string()],
-            updated_fields: vec!["updated_at".to_string()],
-        },
-    )
-    .await;
-    let rows = db::list_all(
-        ctx,
-        table,
-        vec![
-            Filter {
-                field: "key".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(key),
-            },
-            Filter {
-                field: "window_start".into(),
-                operator: FilterOp::GreaterEqual,
-                value: serde_json::json!(window_cutoff),
-            },
-        ],
+        &id,
+        key,
+        now,
+        window_cutoff,
     )
     .await;
     match crate::blocks::rate_limit::decide_rate_limit(
-        &upsert,
-        rows,
+        count,
         "<redacted-ticket-identity>",
         limit.max_requests,
         window_secs as u64,

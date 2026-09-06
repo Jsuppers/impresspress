@@ -42,7 +42,13 @@ pub(super) use crate::util::validate_url_value;
 /// call sites in this module tree keep working.
 pub(super) use crate::util::{is_sensitive_key, MASKED_VALUE};
 use crate::{
-    blocks::auth::{bump_auth_version, USERS_TABLE},
+    blocks::auth::{
+        bump_auth_version,
+        repo::{
+            users::{self, AdminUserPatch, UserRow},
+            RepoError,
+        },
+    },
     http::{err_bad_request, err_forbidden, err_internal, err_not_found},
     platform_state::{
         user_roles,
@@ -84,13 +90,13 @@ pub(super) async fn fetch_roles(
 /// Set the `disabled` flag on a user (true = disable, false = enable), writing
 /// an audit-log row. The self-disable guard only applies when disabling.
 ///
-/// Returns the updated [`db::Record`] (password hash stripped) on success.
+/// Returns the updated [`UserRow`] on success.
 pub(super) async fn set_user_disabled(
     ctx: &dyn Context,
     msg: &Message,
     user_id: &str,
     disabled: bool,
-) -> Result<db::Record, OutputStream> {
+) -> Result<UserRow, OutputStream> {
     let admin_id = msg.user_id().to_string();
     // Prevent admins from disabling themselves (lockout). Enabling yourself is
     // harmless, so the guard is disable-only.
@@ -98,16 +104,9 @@ pub(super) async fn set_user_disabled(
         return Err(err_bad_request("Cannot disable your own account"));
     }
 
-    let mut data = HashMap::new();
-    data.insert("disabled".to_string(), serde_json::json!(disabled));
-    crate::util::stamp_updated(&mut data);
-
-    let record = match db::update(ctx, USERS_TABLE, user_id, data).await {
-        Ok(mut record) => {
-            record.data.remove("password_hash");
-            record
-        }
-        Err(e) if e.code == ErrorCode::NotFound => return Err(err_not_found("User not found")),
+    let row = match users::set_disabled(ctx, user_id, disabled).await {
+        Ok(row) => row,
+        Err(RepoError::NotFound) => return Err(err_not_found("User not found")),
         Err(e) => return Err(err_internal("Database error", e)),
     };
 
@@ -140,7 +139,7 @@ pub(super) async fn set_user_disabled(
         msg.remote_addr(),
     )
     .await;
-    Ok(record)
+    Ok(row)
 }
 
 /// Soft-delete a user, writing an audit-log row. Rejects self-deletion.
@@ -154,9 +153,9 @@ pub(super) async fn delete_user(
         return Err(err_bad_request("Cannot delete your own account"));
     }
 
-    match db::soft_delete(ctx, USERS_TABLE, user_id).await {
-        Ok(_) => {}
-        Err(e) if e.code == ErrorCode::NotFound => return Err(err_not_found("User not found")),
+    match users::soft_delete(ctx, user_id).await {
+        Ok(()) => {}
+        Err(RepoError::NotFound) => return Err(err_not_found("User not found")),
         Err(e) => return Err(err_internal("Database error", e)),
     }
 
@@ -185,45 +184,26 @@ pub(super) async fn delete_user(
     Ok(())
 }
 
-/// Apply the whitelisted user-profile fields (`name`, `disabled`,
-/// `avatar_url`) from `body`, writing an audit-log row. Enforces the
+/// Apply the fields an admin may change on an account — the whitelist is
+/// [`AdminUserPatch`] itself — writing an audit-log row. Enforces the
 /// self-disable guard, mirroring [`set_user_disabled`].
 ///
-/// Returns the updated record (password hash stripped).
+/// Returns the updated row.
 pub(super) async fn update_user_fields(
     ctx: &dyn Context,
     msg: &Message,
     user_id: &str,
     body: &HashMap<String, serde_json::Value>,
-) -> Result<db::Record, OutputStream> {
+) -> Result<UserRow, OutputStream> {
     let admin_id = msg.user_id().to_string();
-    if admin_id == user_id {
-        if let Some(disabled) = body.get("disabled") {
-            if disabled == &serde_json::Value::Bool(true) || disabled == &serde_json::json!(1) {
-                return Err(err_bad_request("Cannot disable your own account"));
-            }
-        }
+    let patch = AdminUserPatch::from_body(body);
+    if admin_id == user_id && patch.disabled == Some(true) {
+        return Err(err_bad_request("Cannot disable your own account"));
     }
 
-    // Whether this patch touches the `disabled` lifecycle field — captured
-    // before `data` is consumed by the whitelist loop below, so the P2c bump
-    // after the write knows whether it's needed.
-    let touches_disabled = body.contains_key("disabled");
-
-    let mut data = HashMap::new();
-    for key in &["name", "disabled", "avatar_url"] {
-        if let Some(val) = body.get(*key) {
-            data.insert(key.to_string(), val.clone());
-        }
-    }
-    crate::util::stamp_updated(&mut data);
-
-    let record = match db::update(ctx, USERS_TABLE, user_id, data).await {
-        Ok(mut record) => {
-            record.data.remove("password_hash");
-            record
-        }
-        Err(e) if e.code == ErrorCode::NotFound => return Err(err_not_found("User not found")),
+    let row = match users::patch_admin_fields(ctx, user_id, &patch).await {
+        Ok(row) => row,
+        Err(RepoError::NotFound) => return Err(err_not_found("User not found")),
         Err(e) => return Err(err_internal("Database error", e)),
     };
 
@@ -232,7 +212,7 @@ pub(super) async fn update_user_fields(
     // bump auth_version the same way whenever it does, so a PATCH that
     // disables a user can't bypass JWT invalidation just because it went
     // through the generic field-update endpoint instead.
-    if touches_disabled {
+    if patch.touches_disabled() {
         if let Err(e) = bump_auth_version(ctx, user_id).await {
             tracing::error!(
                 user_id = %user_id,
@@ -254,7 +234,7 @@ pub(super) async fn update_user_fields(
         msg.remote_addr(),
     )
     .await;
-    Ok(record)
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +715,24 @@ mod tests {
         );
     }
 
+    /// Seed a user through the repo and hand back the id it minted.
+    async fn seed_user(ctx: &impl Context, email: &str) -> String {
+        users::insert(
+            ctx,
+            users::NewUser {
+                email: email.to_string(),
+                display_name: email.to_string(),
+                avatar_url: None,
+                role: "user".to_string(),
+                email_verified: false,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed user")
+        .id
+    }
+
     /// Self-disable and self-delete guards hold; a successful user mutation
     /// writes an audit row.
     #[tokio::test]
@@ -756,16 +754,9 @@ mod tests {
         assert_eq!(audit_count(&ctx, "user.disable").await, 0);
 
         // Seed another user, then disable them — succeeds and logs.
-        let mut data = HashMap::new();
-        data.insert("id".to_string(), serde_json::json!("u2"));
-        data.insert("email".to_string(), serde_json::json!("u2@example.com"));
-        data.insert("display_name".to_string(), serde_json::json!("User Two"));
-        crate::util::stamp_created(&mut data);
-        db::create(&ctx, USERS_TABLE, data)
-            .await
-            .expect("seed user");
+        let u2 = seed_user(&ctx, "u2@example.com").await;
 
-        expect_ok(set_user_disabled(&ctx, &msg, "u2", true).await);
+        expect_ok(set_user_disabled(&ctx, &msg, &u2, true).await);
         assert_eq!(audit_count(&ctx, "user.disable").await, 1);
     }
 
@@ -784,56 +775,93 @@ mod tests {
             .expect("apply auth migrations");
         let msg = admin_msg("update", "/admin/users/admin_1");
 
-        let seed = |id: &str, email: &str| {
-            let mut data = HashMap::new();
-            data.insert("id".to_string(), serde_json::json!(id));
-            data.insert("email".to_string(), serde_json::json!(email));
-            data.insert("display_name".to_string(), serde_json::json!(id));
-            crate::util::stamp_created(&mut data);
-            data
-        };
-
-        db::create(&ctx, USERS_TABLE, seed("disable-me", "d@example.com"))
-            .await
-            .expect("seed user");
-        assert_eq!(users::auth_version(&ctx, "disable-me").await.unwrap(), 0);
-        expect_ok(set_user_disabled(&ctx, &msg, "disable-me", true).await);
+        let disable_me = seed_user(&ctx, "d@example.com").await;
+        assert_eq!(users::auth_version(&ctx, &disable_me).await.unwrap(), 0);
+        expect_ok(set_user_disabled(&ctx, &msg, &disable_me, true).await);
         assert_eq!(
-            users::auth_version(&ctx, "disable-me").await.unwrap(),
+            users::auth_version(&ctx, &disable_me).await.unwrap(),
             1,
             "disable must bump auth_version"
         );
 
-        db::create(&ctx, USERS_TABLE, seed("delete-me", "del@example.com"))
-            .await
-            .expect("seed user");
-        assert_eq!(users::auth_version(&ctx, "delete-me").await.unwrap(), 0);
-        expect_ok(delete_user(&ctx, &msg, "delete-me").await);
+        let delete_me = seed_user(&ctx, "del@example.com").await;
+        assert_eq!(users::auth_version(&ctx, &delete_me).await.unwrap(), 0);
+        expect_ok(delete_user(&ctx, &msg, &delete_me).await);
         assert_eq!(
-            users::auth_version(&ctx, "delete-me").await.unwrap(),
+            users::auth_version(&ctx, &delete_me).await.unwrap(),
             1,
             "soft-delete must bump auth_version"
         );
 
-        db::create(&ctx, USERS_TABLE, seed("patch-me", "p@example.com"))
-            .await
-            .expect("seed user");
+        let patch_me = seed_user(&ctx, "p@example.com").await;
         let mut body: HashMap<String, serde_json::Value> = HashMap::new();
         body.insert("name".to_string(), serde_json::json!("New Name"));
-        expect_ok(update_user_fields(&ctx, &msg, "patch-me", &body).await);
+        expect_ok(update_user_fields(&ctx, &msg, &patch_me, &body).await);
         assert_eq!(
-            users::auth_version(&ctx, "patch-me").await.unwrap(),
+            users::auth_version(&ctx, &patch_me).await.unwrap(),
             0,
             "a field update that doesn't touch `disabled` must not bump auth_version"
         );
 
         let mut disable_body: HashMap<String, serde_json::Value> = HashMap::new();
         disable_body.insert("disabled".to_string(), serde_json::json!(true));
-        expect_ok(update_user_fields(&ctx, &msg, "patch-me", &disable_body).await);
+        expect_ok(update_user_fields(&ctx, &msg, &patch_me, &disable_body).await);
         assert_eq!(
-            users::auth_version(&ctx, "patch-me").await.unwrap(),
+            users::auth_version(&ctx, &patch_me).await.unwrap(),
             1,
             "a field update that DOES touch `disabled` must bump auth_version"
+        );
+    }
+
+    /// A body naming a column outside [`AdminUserPatch`]'s three fields
+    /// changes nothing: the whitelist is the type, so `role` and `email` are
+    /// not reachable from a `PATCH` at all.
+    #[tokio::test]
+    async fn admin_patch_ignores_columns_outside_the_whitelist() {
+        let ctx = admin_ctx().await;
+        crate::blocks::auth::migrations::apply(&ctx)
+            .await
+            .expect("apply auth migrations");
+        let msg = admin_msg("update", "/admin/users/admin_1");
+        let id = seed_user(&ctx, "whitelist@example.com").await;
+
+        let mut body: HashMap<String, serde_json::Value> = HashMap::new();
+        body.insert("role".to_string(), serde_json::json!("admin"));
+        body.insert("email".to_string(), serde_json::json!("attacker@evil.test"));
+        body.insert("deleted_at".to_string(), serde_json::json!("2026-01-01"));
+        body.insert("name".to_string(), serde_json::json!("Renamed"));
+        let row = expect_ok(update_user_fields(&ctx, &msg, &id, &body).await);
+
+        assert_eq!(row.name.as_deref(), Some("Renamed"), "name is writable");
+        assert_eq!(row.role, "user", "role is not an admin-writable field");
+        assert_eq!(
+            row.email, "whitelist@example.com",
+            "email is not an admin-writable field"
+        );
+        assert!(
+            !row.is_deleted(),
+            "deleted_at is not an admin-writable field"
+        );
+    }
+
+    /// `{"disabled": 1}` — the shape the admin UI has sent — still disables.
+    #[tokio::test]
+    async fn admin_patch_accepts_an_integer_disabled_flag() {
+        let ctx = admin_ctx().await;
+        crate::blocks::auth::migrations::apply(&ctx)
+            .await
+            .expect("apply auth migrations");
+        let msg = admin_msg("update", "/admin/users/admin_1");
+        let id = seed_user(&ctx, "intflag@example.com").await;
+
+        let mut body: HashMap<String, serde_json::Value> = HashMap::new();
+        body.insert("disabled".to_string(), serde_json::json!(1));
+        let row = expect_ok(update_user_fields(&ctx, &msg, &id, &body).await);
+        assert!(row.disabled);
+        assert_eq!(
+            users::auth_version(&ctx, &id).await.unwrap(),
+            1,
+            "an integer disabled flag must still count as touching the flag"
         );
     }
 }

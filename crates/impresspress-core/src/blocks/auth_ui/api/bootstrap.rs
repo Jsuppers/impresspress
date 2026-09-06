@@ -308,10 +308,7 @@ mod tests {
 
         // Only one admin user exists — the second attempt never reached
         // `bootstrap_with_email_password`.
-        let count =
-            wafer_core::clients::database::count(&ctx, crate::blocks::auth::USERS_TABLE, &[])
-                .await
-                .unwrap();
+        let count = crate::blocks::auth::repo::users::count(&ctx).await.unwrap();
         assert_eq!(
             count, 1,
             "the second redemption must not create a second user"
@@ -383,10 +380,7 @@ mod tests {
              (got {outcome_a:?} and {outcome_b:?})"
         );
 
-        let count =
-            wafer_core::clients::database::count(&ctx, crate::blocks::auth::USERS_TABLE, &[])
-                .await
-                .unwrap();
+        let count = crate::blocks::auth::repo::users::count(&ctx).await.unwrap();
         assert_eq!(
             count, 1,
             "a single bootstrap token must create at most one admin account"

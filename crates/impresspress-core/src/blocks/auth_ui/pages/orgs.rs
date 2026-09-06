@@ -69,8 +69,6 @@ fn render_orgs_body(orgs: &[orgs::OrgRow]) -> Markup {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-    use wafer_core::clients::database as db;
 
     use super::*;
     use crate::{
@@ -81,21 +79,7 @@ mod tests {
     };
 
     async fn seed_user(ctx: &TestContext, user_id: &str) {
-        db::exec_raw(
-            ctx,
-            "INSERT INTO wafer_run__auth__users (id, email, display_name, role, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-            &[
-                json!(user_id),
-                json!(format!("{user_id}@example.com")),
-                json!(user_id),
-                json!("user"),
-                json!("2026-01-01T00:00:00Z"),
-                json!("2026-01-01T00:00:00Z"),
-            ],
-        )
-        .await
-        .unwrap();
+        ctx.seed_auth_user(user_id).await;
     }
 
     #[tokio::test]

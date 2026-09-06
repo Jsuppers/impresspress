@@ -20,6 +20,8 @@ async fn insert_find_touch_delete_expired() {
             display_name: "S".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

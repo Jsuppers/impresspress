@@ -96,6 +96,8 @@ mod tests {
                 display_name: "Ada".to_string(),
                 avatar_url: None,
                 role: "user".to_string(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await

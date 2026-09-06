@@ -1,6 +1,6 @@
 //! POST /b/auth/api/signup — relocated from auth/login.rs in Task 5.
 
-use wafer_core::clients::{config, crypto, database as db};
+use wafer_core::clients::{config, crypto};
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
@@ -10,7 +10,6 @@ use crate::{
                 email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
             },
             repo::{local_credentials, users},
-            USERS_TABLE,
         },
         auth_ui::{
             contracts::{SignupRequest, SignupResponse, SignupUser, TokenType},
@@ -19,7 +18,7 @@ use crate::{
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ResponseBuilder},
-    util::{hex_encode, json_map, sha256_hex},
+    util::{hex_encode, sha256_hex},
 };
 
 /// Returns `Ok(true)` when a user with `email_lower` already exists, `Ok(false)`
@@ -149,7 +148,15 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // admin email (re-uses the same key as bootstrap for consistency).
     let role = initial_role_for(ctx, &email_lower).await;
 
-    // Insert via typed repo — no password_hash on the users row.
+    // Insert via typed repo — no password_hash on the users row (those live
+    // in `local_credentials`), and no `user_roles` row: the initial role is
+    // the inline `users.role` column `NewUser.role` writes, which is what
+    // `helpers::get_user_roles` reads first.
+    //
+    // The verification state rides on the insert. It used to be a second
+    // `UPDATE` against the row this call had just created, which meant a
+    // signup could leave a user verified-by-default if that write failed
+    // (it was only warned about).
     let user = match users::insert(
         ctx,
         users::NewUser {
@@ -157,6 +164,11 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             display_name: body.name.unwrap_or_default(),
             avatar_url: None,
             role: role.to_string(),
+            email_verified: !require_verification,
+            // Persist only `sha256_hex(raw)`; the raw token goes out solely
+            // in the verification email below.
+            verification_token_hash: (!verification_token.is_empty())
+                .then(|| sha256_hex(verification_token.as_bytes())),
         },
     )
     .await
@@ -167,26 +179,6 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     if let Err(e) = local_credentials::insert(ctx, &user.id, &password_hash, false).await {
         return err_internal("Failed to store credentials", e);
-    }
-
-    // Set email_verified and verification_token on the legacy USERS_TABLE row
-    // (Plan A2 users table stores email_verified too — keep them in sync).
-    // Persist only `sha256_hex(raw)`; the raw token goes out only in the
-    // verification email below.
-    {
-        let stored_verification = if verification_token.is_empty() {
-            String::new()
-        } else {
-            sha256_hex(verification_token.as_bytes())
-        };
-        let mut upd = json_map(serde_json::json!({
-            "email_verified": !require_verification,
-            "verification_token": stored_verification,
-        }));
-        crate::util::stamp_updated(&mut upd);
-        if let Err(e) = db::update(ctx, USERS_TABLE, &user.id, upd).await {
-            tracing::warn!("Failed to set email_verified on signup: {e}");
-        }
     }
 
     let roles = vec![role.to_string()];

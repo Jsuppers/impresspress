@@ -946,6 +946,8 @@ mod tests {
                 display_name: "Grantee".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await
@@ -987,6 +989,8 @@ mod tests {
                 display_name: "Demotee".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await

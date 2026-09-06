@@ -228,6 +228,45 @@ impl TestContext {
         self
     }
 
+    /// Seed one `wafer_run__auth__users` row under a caller-chosen id.
+    ///
+    /// The ONE raw-SQL users fixture in this crate (CLAUDE.md's test-fixture
+    /// exception). Ten test modules hand-wrote this same `INSERT` because
+    /// `repo::users::insert` mints a UUID, while each of them needs the id
+    /// its own authenticated `Message` — or a foreign key on another auth
+    /// table — already names. Consolidating them keeps the users table's
+    /// wire name and NOT NULL column set spelled in one place, which is what
+    /// `tests/repo_door.rs` checks.
+    ///
+    /// `email` is `{user_id}@example.com` and `display_name` is `user_id`;
+    /// the role is `"user"`, so a test that needs an admin sets it through
+    /// the repo afterwards.
+    pub async fn seed_auth_user(&self, user_id: &str) {
+        self.seed_auth_user_verified(user_id, false).await;
+    }
+
+    /// [`Self::seed_auth_user`] with an explicit `email_verified` flag,
+    /// written as the `0`/`1` INTEGER the migration declares.
+    pub async fn seed_auth_user_verified(&self, user_id: &str, email_verified: bool) {
+        wafer_core::clients::database::exec_raw(
+            self,
+            "INSERT INTO wafer_run__auth__users \
+             (id, email, display_name, role, email_verified, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                serde_json::json!(user_id),
+                serde_json::json!(format!("{user_id}@example.com")),
+                serde_json::json!(user_id),
+                serde_json::json!("user"),
+                serde_json::json!(i64::from(email_verified)),
+                serde_json::json!("2026-01-01T00:00:00Z"),
+                serde_json::json!("2026-01-01T00:00:00Z"),
+            ],
+        )
+        .await
+        .expect("seed auth user fixture");
+    }
+
     /// Build a `TestContext` with admin migrations applied (only).
     ///
     /// Use this for tests that exercise a block's own `init()` / migration
@@ -2162,21 +2201,7 @@ mod tests {
     async fn with_auth_applies_orgs_and_users_tables() {
         let ctx = TestContext::with_auth().await;
         // Verify auth tables exist by inserting a user, then an org, then selecting.
-        db::exec_raw(
-            &ctx,
-            "INSERT INTO wafer_run__auth__users (id, email, display_name, role, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-            &[
-                serde_json::json!("user-a"),
-                serde_json::json!("alice@example.com"),
-                serde_json::json!("Alice"),
-                serde_json::json!("user"),
-                serde_json::json!("2026-01-01T00:00:00Z"),
-                serde_json::json!("2026-01-01T00:00:00Z"),
-            ],
-        )
-        .await
-        .expect("insert user");
+        ctx.seed_auth_user("user-a").await;
 
         db::exec_raw(
             &ctx,

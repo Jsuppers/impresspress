@@ -55,6 +55,11 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
                     display_name: body.name.unwrap_or_default(),
                     avatar_url: None,
                     role: "user".to_string(),
+                    // Unchanged: this endpoint never wrote either column, so
+                    // the row takes migration 001's `email_verified DEFAULT 0`
+                    // and a NULL verification token.
+                    email_verified: false,
+                    verification_token_hash: None,
                 },
             )
             .await

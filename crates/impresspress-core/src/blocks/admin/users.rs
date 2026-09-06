@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 
-use wafer_block::db::{Filter, FilterOp, SortField};
-use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{AdminUserListQuery, AdminUserListResponse, AdminUserView},
     ops,
 };
 use crate::{
-    blocks::auth::USERS_TABLE as COLLECTION,
+    blocks::auth::repo::users::{self, ActiveUserQuery},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
 };
 
@@ -17,48 +15,28 @@ use crate::{
 pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let query = AdminUserListQuery::from_message(msg);
 
-    let mut filters = vec![Filter {
-        field: "deleted_at".to_string(),
-        operator: FilterOp::IsNull,
-        value: serde_json::Value::Null,
-    }];
-
-    if let Some(search) = &query.search {
-        filters.push(Filter {
-            field: "email".to_string(),
-            operator: FilterOp::Like,
-            value: serde_json::Value::String(format!("%{search}%")),
-        });
-    }
-
-    let sort = vec![SortField {
-        field: "created_at".to_string(),
-        desc: true,
-    }];
-
-    match db::paginated_list(
+    // The `deleted_at IS NULL` predicate, the sort and the search shape all
+    // live in `users::list_active_page`, shared with the SSR users tab.
+    match users::list_active_page(
         ctx,
-        COLLECTION,
-        i64::from(query.page),
-        i64::from(query.page_size),
-        filters,
-        sort,
+        &ActiveUserQuery {
+            page: i64::from(query.page),
+            page_size: i64::from(query.page_size),
+            search: query.search.clone(),
+        },
     )
     .await
     {
-        Ok(result) => {
+        Ok(page) => {
             // Bulk-enrich with roles via a single `In`-filter query (was N+1:
             // one `list_all` per row), then project each row onto the closed
             // `AdminUserView` field list. The projection is what keeps
             // `verification_token` (and any column a future migration adds) off
             // the wire — the previous code echoed the whole row and removed one
             // field by name.
-            let user_ids: Vec<&str> = result.records.iter().map(|r| r.id.as_str()).collect();
+            let user_ids: Vec<&str> = page.rows.iter().map(|r| r.id.as_str()).collect();
             let roles_by_user = ops::fetch_roles(ctx, &user_ids).await;
-            ok_json(&AdminUserListResponse::from_record_list(
-                &result,
-                &roles_by_user,
-            ))
+            ok_json(&AdminUserListResponse::from_page(&page, &roles_by_user))
         }
         Err(e) => err_internal("Database error", e),
     }
@@ -75,8 +53,8 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
 }
 
 async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
-    match db::get(ctx, COLLECTION, id).await {
-        Ok(record) => {
+    match users::find_by_id(ctx, id).await {
+        Ok(Some(row)) => {
             // Get roles via the shared single-query helper.
             let roles = ops::fetch_roles(ctx, &[id])
                 .await
@@ -87,9 +65,9 @@ async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
             // grafted on beside `data` rather than inside it — so the two read
             // paths disagreed about where a user's roles lived and both echoed
             // `verification_token`.
-            ok_json(&AdminUserView::from_record(&record, roles))
+            ok_json(&AdminUserView::from_row(&row, roles))
         }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("User not found"),
+        Ok(None) => err_not_found("User not found"),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -115,19 +93,17 @@ pub(super) async fn handle_update(
     // The self-disable guard, safe-field whitelist, and audit-log write all
     // live in the shared ops layer so the SSR surface can't diverge.
     match ops::update_user_fields(ctx, msg, id, &body).await {
-        Ok(record) => {
-            // Same projection as GET (`get_user` / `handle_list`): the ops
-            // layer returns the raw `db::Record`, whose `password_hash.remove`
-            // is a no-op (no such column on this table — credentials live in
-            // `local_credentials`) and which otherwise still carries
-            // `verification_token` / `last_verification_sent` / `auth_version`.
-            // Echoing it here would leak the same columns the GET handlers
-            // used to, through a fourth response shape.
+        Ok(row) => {
+            // Same projection as GET (`get_user` / `handle_list`). The row
+            // type carries only the columns `auth::repo::users` decodes, so
+            // `verification_token` / `last_verification_sent` / `auth_version`
+            // are not reachable from here at all — they used to ride along in
+            // the raw record this handler echoed.
             let roles = ops::fetch_roles(ctx, &[id])
                 .await
                 .remove(id)
                 .unwrap_or_default();
-            ok_json(&AdminUserView::from_record(&record, roles))
+            ok_json(&AdminUserView::from_row(&row, roles))
         }
         Err(out) => out,
     }
@@ -151,7 +127,6 @@ pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStr
 
 #[cfg(test)]
 mod tests {
-    use wafer_core::clients::database as db;
 
     use super::*;
     use crate::{
@@ -161,27 +136,33 @@ mod tests {
 
     /// Seed one user row carrying every column the table has, including the
     /// two the API must never publish.
+    /// Seed a user carrying the three columns the untyped handler used to
+    /// echo (`verification_token`, `last_verification_sent`, `auth_version`),
+    /// so the field-set assertions below are not vacuous. `insert` dual-writes
+    /// `display_name` and the `name` alias, so both read "Ada".
     async fn seed_user(ctx: &dyn Context) -> String {
-        let mut data = crate::util::json_map(serde_json::json!({
-            "email": "admin@example.com",
-            "display_name": "Ada",
-            "name": "Ada Lovelace",
-            "avatar_url": serde_json::Value::Null,
-            "role": "user",
-            "email_verified": 1,
-            "disabled": 0,
-            "last_login_at": serde_json::Value::Null,
-            "deleted_at": serde_json::Value::Null,
-            // The two columns the untyped handler used to echo.
-            "verification_token": "3d1f0ac0deadbeef",
-            "last_verification_sent": "2026-08-01T00:00:00Z",
-            "auth_version": 7,
-        }));
-        crate::util::stamp_created(&mut data);
-        db::create(ctx, COLLECTION, data)
+        let user = users::insert(
+            ctx,
+            users::NewUser {
+                email: "admin@example.com".to_string(),
+                display_name: "Ada".to_string(),
+                avatar_url: None,
+                role: "user".to_string(),
+                email_verified: true,
+                verification_token_hash: Some("3d1f0ac0deadbeef".to_string()),
+            },
+        )
+        .await
+        .expect("seed user");
+        users::set_verification_token(ctx, &user.id, "3d1f0ac0deadbeef", "2026-08-01T00:00:00Z")
             .await
-            .expect("seed user")
-            .id
+            .expect("seed verification bookkeeping");
+        for _ in 0..7 {
+            users::bump_auth_version(ctx, &user.id)
+                .await
+                .expect("seed auth_version");
+        }
+        user.id
     }
 
     async fn users_ctx() -> TestContext {

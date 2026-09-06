@@ -1,6 +1,6 @@
 //! POST /b/auth/api/login — relocated from auth/login.rs in Task 5.
 
-use wafer_core::clients::{config, crypto, database as db};
+use wafer_core::clients::{config, crypto};
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
         auth::{
             helpers::{ensure_admin_role, issue_tokens_and_cookie},
             repo::{local_credentials, users},
-            DUMMY_HASH, USERS_TABLE,
+            DUMMY_HASH,
         },
         auth_ui::{
             contracts::{AuthenticatedUser, LoginRequest, LoginResponse, TokenType},
@@ -17,7 +17,6 @@ use crate::{
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ResponseBuilder},
-    util::json_map,
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
@@ -97,9 +96,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             Err(r) => return r,
         };
 
-    // Update last login
-    let upd = json_map(serde_json::json!({"last_login_at": crate::util::now_rfc3339()}));
-    if let Err(e) = db::update(ctx, USERS_TABLE, &user.id, upd).await {
+    // Update last login. Best-effort: the sign-in has already succeeded
+    // and the tokens are already minted, so a failed bookkeeping write is
+    // logged, not returned.
+    if let Err(e) = users::touch_last_login(ctx, &user.id).await {
         tracing::warn!("Failed to update last login time: {e}");
     }
 

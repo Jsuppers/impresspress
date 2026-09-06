@@ -10,7 +10,7 @@ use crate::{
     endpoint_match::{self, EndpointRoute},
     http::{err_forbidden, err_internal, err_not_found, ok_json},
     ui::{self, components, icons, settings_form},
-    util::{parse_form_body, stamp_updated},
+    util::parse_form_body,
 };
 
 pub(crate) mod migrations;
@@ -274,14 +274,13 @@ async fn handle_update_profile(
 
     let name = body.get("name").map(|s| s.as_str()).unwrap_or("");
 
-    let mut data = std::collections::HashMap::new();
-    data.insert("name".to_string(), serde_json::json!(name));
-    data.insert("display_name".to_string(), serde_json::json!(name));
-    stamp_updated(&mut data);
-
-    if let Err(e) = db::update(ctx, crate::blocks::auth::USERS_TABLE, &user_id, data).await {
-        // Pass the full WaferError (code + meta + message) so the
-        // helper logs structured info instead of just the rendered string.
+    // `update_profile` dual-writes `display_name` and the `name` alias, so
+    // the typed row and the raw column cannot drift apart.
+    if let Err(e) =
+        crate::blocks::auth::repo::users::update_profile(ctx, &user_id, Some(name), None).await
+    {
+        // Pass the full RepoError so the helper logs the underlying failure
+        // instead of just a rendered string.
         return err_internal("Failed to update profile", e);
     }
 
@@ -293,23 +292,22 @@ async fn handle_update_profile(
 #[cfg(test)]
 mod update_profile_csrf_tests {
     use super::*;
-    use crate::{
-        test_support::{auth_msg, output_status, TestContext},
-        util::RecordExt,
-    };
+    use crate::test_support::{auth_msg, output_status, TestContext};
 
     async fn seed_user(ctx: &TestContext, user_id: &str) {
-        let mut data = std::collections::HashMap::new();
-        data.insert("id".to_string(), serde_json::json!(user_id));
-        data.insert("email".to_string(), serde_json::json!("u@example.com"));
-        data.insert("display_name".to_string(), serde_json::json!("Old Name"));
-        data.insert("name".to_string(), serde_json::json!("Old Name"));
-        data.insert("role".to_string(), serde_json::json!("user"));
-        data.insert("email_verified".to_string(), serde_json::json!(true));
-        crate::util::stamp_created(&mut data);
-        db::create(ctx, crate::blocks::auth::USERS_TABLE, data)
+        ctx.seed_auth_user(user_id).await;
+        crate::blocks::auth::repo::users::update_profile(ctx, user_id, Some("Old Name"), None)
             .await
-            .expect("seed user row");
+            .expect("seed profile name");
+    }
+
+    /// The `display_name`/`name` pair as the repo reports it.
+    async fn profile_name(ctx: &TestContext, user_id: &str) -> String {
+        crate::blocks::auth::repo::users::find_by_id(ctx, user_id)
+            .await
+            .expect("read user")
+            .expect("user exists")
+            .display_name
     }
 
     #[tokio::test]
@@ -326,10 +324,7 @@ mod update_profile_csrf_tests {
             handle_update_profile(&ctx, &msg, InputStream::from_bytes(form.into_bytes())).await;
         assert_eq!(output_status(out).await, 303, "valid token must succeed");
 
-        let updated = db::get(&ctx, crate::blocks::auth::USERS_TABLE, "user-1")
-            .await
-            .unwrap();
-        assert_eq!(updated.str_field("name"), "New Name");
+        assert_eq!(profile_name(&ctx, "user-1").await, "New Name");
     }
 
     #[tokio::test]
@@ -347,10 +342,7 @@ mod update_profile_csrf_tests {
         );
 
         // Row must be unchanged — rejection happens before the update.
-        let unchanged = db::get(&ctx, crate::blocks::auth::USERS_TABLE, "user-1")
-            .await
-            .unwrap();
-        assert_eq!(unchanged.str_field("name"), "Old Name");
+        assert_eq!(profile_name(&ctx, "user-1").await, "Old Name");
     }
 
     #[tokio::test]

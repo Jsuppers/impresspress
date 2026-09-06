@@ -1,23 +1,17 @@
 use std::collections::HashMap;
 
 use maud::html;
-use wafer_block::{
-    db::{Filter, FilterOp, ListOptions, SortField},
-    wire::database as wire,
-};
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
 use crate::{
-    blocks::auth::USERS_TABLE as USERS,
+    blocks::auth::repo::users::{self, DailySignups},
     platform_state::request_logs::{self, DailyCounts, TodayCounts},
     ui::{
         components, icons,
         shell::Topbar,
         templates::{dashboard_page, PageHeader, StatTile},
     },
-    util::{daily_grouped, to_wire_filters, RecordExt},
 };
 
 /// Trailing 30-day window as `(oldest_day, oldest_day_midnight_iso)`.
@@ -43,22 +37,9 @@ fn zero_filled_30d(by_day: &HashMap<String, i64>, start: chrono::NaiveDate) -> V
         .collect()
 }
 
-/// Project one aggregate `alias` out of grouped daily `rows` (from
-/// [`daily_grouped`]) into a zero-filled 30-entry series. A group whose
-/// conditional sum was `NULL` reads as `0`.
-fn series_from_rows(
-    rows: &[wire::Record],
-    alias: &str,
-    start: chrono::NaiveDate,
-) -> Vec<(String, i64)> {
-    let by_day: HashMap<String, i64> = rows
-        .iter()
-        .filter_map(|r| {
-            let day = r.data.get("created_at").and_then(|v| v.as_str())?;
-            let cnt = r.data.get(alias).and_then(|v| v.as_i64()).unwrap_or(0);
-            Some((day.to_string(), cnt))
-        })
-        .collect();
+/// Project the daily signup counts into a zero-filled 30-entry series.
+fn series_from_signups(rows: &[DailySignups], start: chrono::NaiveDate) -> Vec<(String, i64)> {
+    let by_day: HashMap<String, i64> = rows.iter().map(|r| (r.day.clone(), r.count)).collect();
     zero_filled_30d(&by_day, start)
 }
 
@@ -71,50 +52,6 @@ fn series_from_daily(
 ) -> Vec<(String, i64)> {
     let by_day: HashMap<String, i64> = days.iter().map(|d| (d.day.clone(), pick(d))).collect();
     zero_filled_30d(&by_day, start)
-}
-
-/// Header-tile USER counts in ONE statement: `(total_active, active_today)`.
-///
-/// Both counts share the `deleted_at IS NULL` predicate, so it becomes the
-/// query's `WHERE` and the "created today" restriction rides along as a
-/// conditional `CaseWhenSum` — replacing the two separate `db::count`
-/// round-trips with a single aggregate that returns the same two numbers.
-async fn user_counts(ctx: &dyn Context, today_start: &str) -> (i64, i64) {
-    let active = [Filter {
-        field: "deleted_at".into(),
-        operator: FilterOp::IsNull,
-        value: serde_json::Value::Null,
-    }];
-    let created_today = [Filter {
-        field: "created_at".into(),
-        operator: FilterOp::GreaterEqual,
-        value: serde_json::json!(today_start),
-    }];
-    let req = wire::AggregateRequest {
-        collection: USERS.to_string(),
-        select_columns: vec![],
-        aggregates: vec![
-            wire::AggregateColumnDef::Count {
-                alias: "total".into(),
-            },
-            wire::AggregateColumnDef::CaseWhenSum {
-                when: to_wire_filters(&created_today),
-                alias: "today".into(),
-            },
-        ],
-        filters: to_wire_filters(&active),
-        group_by: vec![],
-        sort: vec![],
-        limit: 0,
-    };
-    let rows = db::aggregate(ctx, req).await.unwrap_or_default();
-    let row = rows.first();
-    let read = |k: &str| {
-        row.and_then(|r| r.data.get(k))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-    };
-    (read("total"), read("today"))
 }
 
 pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -131,45 +68,18 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // aggregates, two recent-row lists, and two daily grouped aggregates.
     let (start_30d, start_iso) = window_30d();
 
-    let user_counts_fut = user_counts(ctx, &today_start);
+    let user_counts_fut = users::active_count_and_created_since(ctx, &today_start);
     let request_counts_fut = request_logs::today_counts(ctx, &today_start);
 
-    let users_daily_fut = daily_grouped(
-        ctx,
-        USERS,
-        &start_iso,
-        vec![Filter {
-            field: "deleted_at".into(),
-            operator: FilterOp::IsNull,
-            value: serde_json::Value::Null,
-        }],
-        vec![wire::AggregateColumnDef::Count {
-            alias: "cnt".into(),
-        }],
-    );
+    let users_daily_fut = users::daily_signups(ctx, &start_iso);
     let requests_daily_fut = request_logs::daily_counts(ctx, &start_iso);
 
-    let recent_users_opts = ListOptions {
-        columns: Some(vec!["id".into(), "email".into(), "created_at".into()]),
-        filters: vec![Filter {
-            field: "deleted_at".into(),
-            operator: FilterOp::IsNull,
-            value: serde_json::Value::Null,
-        }],
-        sort: vec![SortField {
-            field: "created_at".into(),
-            desc: true,
-        }],
-        limit: 5,
-        skip_count: true,
-        ..Default::default()
-    };
-    let recent_users_fut = db::list(ctx, USERS, &recent_users_opts);
+    let recent_users_fut = users::list_recent_active(ctx, 5);
 
     let recent_errors_fut = request_logs::list_recent_errors(ctx, 5);
 
     let (
-        (user_count, new_users_today),
+        user_counts_r,
         request_counts_r,
         recent_users_r,
         recent_errors_r,
@@ -189,7 +99,8 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
         errors: errors_today,
         avg_ms,
     } = request_counts_r.unwrap_or_default();
-    let recent_users = recent_users_r.map(|rl| rl.records).unwrap_or_default();
+    let (user_count, new_users_today) = user_counts_r.unwrap_or((0, 0));
+    let recent_users = recent_users_r.unwrap_or_default();
     let recent_errors = recent_errors_r.unwrap_or_default();
     let users_daily_rows = users_daily_r.unwrap_or_default();
     let request_days = request_days_r.unwrap_or_default();
@@ -197,7 +108,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Two grouped statements back all three charts: the USERS series comes from
     // its own daily aggregate; the request-log "requests" and "errors" series
     // are two metrics projected out of the *same* per-day counts.
-    let new_users_daily = series_from_rows(&users_daily_rows, "cnt", start_30d);
+    let new_users_daily = series_from_signups(&users_daily_rows, start_30d);
     let requests_daily = series_from_daily(&request_days, |d| d.requests, start_30d);
     let errors_daily = series_from_daily(&request_days, |d| d.errors, start_30d);
 
@@ -273,8 +184,8 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         table .table {
                             tbody {
                                 @for record in &recent_users {
-                                    @let email = record.str_field("email");
-                                    @let created = record.str_field("created_at");
+                                    @let email = record.email.as_str();
+                                    @let created = record.created_at.as_str();
                                     tr {
                                         td .text-sm { (email) }
                                         td .text-muted .text-sm .text-right { (created.get(..10).unwrap_or(created)) }
@@ -369,22 +280,16 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 #[cfg(test)]
 mod tests {
-    //! Correctness: the consolidated user aggregates return byte-for-byte the
-    //! same numbers the previous per-filter `db::count` / per-metric grouped
-    //! queries produced. Each helper is checked against the equivalent
-    //! separate `db::count` calls over the same seeded in-memory database, and
-    //! against hand-computed expectations for the fixed seed. The request-log
-    //! aggregates have the same check beside their owner,
-    //! `platform_state::request_logs`.
+    //! The dashboard's own arithmetic: the 30-day zero-fill that turns a
+    //! sparse per-day aggregate into the chart's x-axis. The aggregates
+    //! themselves are `auth::repo::users` and `platform_state::request_logs`
+    //! functions now, and are checked against separate `db::count` calls
+    //! beside their owners.
 
     use std::collections::HashMap;
 
-    use serde_json::json;
-    use wafer_block::db::{Filter, FilterOp};
-    use wafer_core::clients::database as db;
-
-    use super::{series_from_rows, user_counts, window_30d, wire, USERS};
-    use crate::{test_support::TestContext, util::daily_grouped};
+    use super::{series_from_signups, window_30d, zero_filled_30d};
+    use crate::blocks::auth::repo::users::DailySignups;
 
     #[test]
     fn dashboard_renders_stats_before_charts() {
@@ -411,21 +316,7 @@ mod tests {
         assert!(stats < charts, "stat tiles must precede the charts row");
     }
 
-    async fn seed_user(ctx: &TestContext, id: &str, created_at: &str, deleted_at: Option<&str>) {
-        let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-        data.insert("id".into(), json!(id));
-        data.insert("email".into(), json!(format!("{id}@example.test")));
-        data.insert("display_name".into(), json!(id));
-        data.insert("created_at".into(), json!(created_at));
-        if let Some(ts) = deleted_at {
-            data.insert("deleted_at".into(), json!(ts));
-        }
-        db::create(ctx, USERS, data)
-            .await
-            .unwrap_or_else(|e| panic!("seed user {id}: {e}"));
-    }
-
-    /// Value for `date` in a `(date, count)` series, or `-1` if the day is absent.
+    /// Value for `date` in a `(date, count)` series, or `-1` if absent.
     fn day_value(series: &[(String, i64)], date: &str) -> i64 {
         series
             .iter()
@@ -434,92 +325,47 @@ mod tests {
             .unwrap_or(-1)
     }
 
-    fn sum(series: &[(String, i64)]) -> i64 {
-        series.iter().map(|(_, c)| c).sum()
-    }
-
-    #[tokio::test]
-    async fn consolidated_aggregates_match_per_filter_queries() {
-        let ctx = TestContext::with_auth().await;
-
-        let today = chrono::Utc::now().date_naive();
-        // Noon timestamps so a stored `...T12:00:00` sorts after `today_start`
-        // (`...T00:00:00`) yet buckets to the same day under SQLite's `date()`.
-        let at = |ago: i64| {
-            (today - chrono::Duration::days(ago))
-                .format("%Y-%m-%dT12:00:00")
-                .to_string()
-        };
+    #[test]
+    fn signup_series_is_zero_filled_over_the_thirty_day_window() {
+        let (start_30d, _) = window_30d();
         let day = |ago: i64| {
-            (today - chrono::Duration::days(ago))
+            (chrono::Utc::now().date_naive() - chrono::Duration::days(ago))
                 .format("%Y-%m-%d")
                 .to_string()
         };
-        let today_start = format!("{}T00:00:00", today.format("%Y-%m-%d"));
-
-        // Users: 3 active today, 2 active 5d ago, 1 active 40d ago (outside the
-        // 30-day window), 2 deleted today (excluded by `deleted_at IS NULL`).
-        for i in 0..3 {
-            seed_user(&ctx, &format!("u_today_{i}"), &at(0), None).await;
-        }
-        for i in 0..2 {
-            seed_user(&ctx, &format!("u_5d_{i}"), &at(5), None).await;
-        }
-        seed_user(&ctx, "u_40d", &at(40), None).await;
-        for i in 0..2 {
-            seed_user(&ctx, &format!("u_del_{i}"), &at(0), Some(&at(0))).await;
-        }
-
-        // --- header tile counts: consolidated vs. separate per-filter counts ---
-        let active = [Filter {
-            field: "deleted_at".into(),
-            operator: FilterOp::IsNull,
-            value: serde_json::Value::Null,
-        }];
-        let active_today = [
-            Filter {
-                field: "deleted_at".into(),
-                operator: FilterOp::IsNull,
-                value: serde_json::Value::Null,
+        let rows = vec![
+            DailySignups {
+                day: day(0),
+                count: 3,
             },
-            Filter {
-                field: "created_at".into(),
-                operator: FilterOp::GreaterEqual,
-                value: json!(&today_start),
+            DailySignups {
+                day: day(5),
+                count: 2,
+            },
+            // Outside the window: dropped rather than folded into an edge day.
+            DailySignups {
+                day: day(40),
+                count: 9,
             },
         ];
-        let total_expected = db::count(&ctx, USERS, &active).await.unwrap();
-        let new_expected = db::count(&ctx, USERS, &active_today).await.unwrap();
-        let (total, new_today) = user_counts(&ctx, &today_start).await;
+        let series = series_from_signups(&rows, start_30d);
+        assert_eq!(series.len(), 30, "30-entry zero-filled series");
+        assert_eq!(day_value(&series, &day(0)), 3);
+        assert_eq!(day_value(&series, &day(5)), 2);
+        assert_eq!(day_value(&series, &day(1)), 0, "a quiet day reads as zero");
         assert_eq!(
-            (total, new_today),
-            (total_expected, new_expected),
-            "user_counts must match separate db::count calls"
+            series.iter().map(|(_, c)| c).sum::<i64>(),
+            5,
+            "the 40-days-ago row is outside the window"
         );
-        assert_eq!((total, new_today), (6, 3), "hand-computed user counts");
+    }
 
-        // --- daily chart series ---
-        let (start_30d, start_iso) = window_30d();
-
-        let users_rows = daily_grouped(
-            &ctx,
-            USERS,
-            &start_iso,
-            vec![Filter {
-                field: "deleted_at".into(),
-                operator: FilterOp::IsNull,
-                value: serde_json::Value::Null,
-            }],
-            vec![wire::AggregateColumnDef::Count {
-                alias: "cnt".into(),
-            }],
-        )
-        .await
-        .expect("daily users aggregate");
-        let new_users_daily = series_from_rows(&users_rows, "cnt", start_30d);
-        assert_eq!(new_users_daily.len(), 30, "30-entry zero-filled series");
-        assert_eq!(day_value(&new_users_daily, &day(0)), 3, "3 users today");
-        assert_eq!(day_value(&new_users_daily, &day(5)), 2, "2 users 5d ago");
-        assert_eq!(sum(&new_users_daily), 5, "40d-ago user + deleted excluded");
+    #[test]
+    fn zero_fill_starts_at_the_window_start_and_runs_forward() {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let series = zero_filled_30d(&HashMap::from([("2026-01-03".to_string(), 7)]), start);
+        assert_eq!(series[0].0, "2026-01-01");
+        assert_eq!(series[29].0, "2026-01-30");
+        assert_eq!(series[2], ("2026-01-03".to_string(), 7));
     }
 }

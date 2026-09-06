@@ -233,6 +233,8 @@ mod resend_tests {
                 display_name: "U".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await

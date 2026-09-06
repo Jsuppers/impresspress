@@ -1,5 +1,5 @@
 use maud::{html, Markup};
-use wafer_block::db::{Filter, FilterOp, FilterTree, ListOptions, SortField};
+use wafer_block::db::{ListOptions, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
@@ -7,7 +7,10 @@ use super::{admin_page, crumb};
 use crate::{
     blocks::{
         admin::{ops, ROLES_TABLE},
-        auth::{API_KEYS_TABLE as API_KEYS, USERS_TABLE as USERS},
+        auth::repo::{
+            api_keys,
+            users::{self, ActiveUserQuery, UserRow},
+        },
     },
     http::ResponseBuilder,
     ui::{
@@ -101,62 +104,20 @@ async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> M
     let (page, page_size, _) = msg.pagination_params(20);
     let search = msg.query("search").to_string();
 
-    let result = if !search.is_empty() {
-        // Search by email OR id, via a filter_tree OR-group AND-ed onto the
-        // deleted_at IS NULL predicate. total_count is the in-page count
-        // here (skip_count: true); the search UI doesn't paginate beyond
-        // what fits in one page. `skip_count: true` is load-bearing for that
-        // total_count == in-page-count parity — flipping it to `false` would
-        // make `db::list` run the separate COUNT query and change
-        // `total_count` to the full matched-row count across all pages.
-        let like = format!("%{search}%");
-        let offset = ((page - 1) * page_size) as i64;
-        db::list(
-            ctx,
-            USERS,
-            &ListOptions {
-                filter_tree: Some(vec![FilterTree::All(vec![
-                    FilterTree::Leaf(Filter {
-                        field: "deleted_at".into(),
-                        operator: FilterOp::IsNull,
-                        value: serde_json::Value::Null,
-                    }),
-                    FilterTree::Any(vec![
-                        FilterTree::Leaf(Filter {
-                            field: "email".into(),
-                            operator: FilterOp::Like,
-                            value: serde_json::json!(like),
-                        }),
-                        FilterTree::Leaf(Filter {
-                            field: "id".into(),
-                            operator: FilterOp::Like,
-                            value: serde_json::json!(like),
-                        }),
-                    ]),
-                ])]),
-                sort: vec![SortField {
-                    field: "created_at".into(),
-                    desc: true,
-                }],
-                limit: page_size as i64,
-                offset,
-                skip_count: true,
-                ..Default::default()
-            },
-        )
-        .await
-    } else {
-        let filters = vec![Filter {
-            field: "deleted_at".into(),
-            operator: FilterOp::IsNull,
-            value: serde_json::Value::Null,
-        }];
-        let sort = vec![SortField {
-            field: "created_at".into(),
-            desc: true,
-        }];
-        db::paginated_list(ctx, USERS, page as i64, page_size as i64, filters, sort).await
-    };
+    // Both the filter (`deleted_at IS NULL`), the sort and the search shape
+    // (email OR id) live in `users::list_active_page`, shared with the JSON
+    // list endpoint. `total_count` is now the full matched count across all
+    // pages, so the footer below paginates a search correctly instead of
+    // reporting the in-page count as the total.
+    let result = users::list_active_page(
+        ctx,
+        &ActiveUserQuery {
+            page: page as i64,
+            page_size: page_size as i64,
+            search: (!search.is_empty()).then(|| search.clone()),
+        },
+    )
+    .await;
 
     html! {
         div .filter-bar {
@@ -165,19 +126,19 @@ async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> M
 
         @match &result {
             Ok(list) => {
-                (users_table(&list.records, ctx, current_user_id).await)
+                (users_table(&list.rows, ctx, current_user_id).await)
 
                 (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
             }
             Err(e) => {
-                div .login-error { "Failed to load users: " (e.message) }
+                div .login-error { "Failed to load users: " (e) }
             }
         }
     }
 }
 
 /// Render the users table body. Async because it enriches each user with roles.
-async fn users_table(records: &[db::Record], ctx: &dyn Context, current_user_id: &str) -> Markup {
+async fn users_table(records: &[UserRow], ctx: &dyn Context, current_user_id: &str) -> Markup {
     // Bulk-fetch all roles for the visible users in a single query (was N+1:
     // one `list_all` per row), via the shared `ops::fetch_roles` helper.
     let user_ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
@@ -218,10 +179,10 @@ async fn users_table(records: &[db::Record], ctx: &dyn Context, current_user_id:
 /// `current_uid` is `""` when the caller is rendering a single-row update
 /// fragment (no "(you)" affordance) — the mutation endpoints reject
 /// self-disable before reaching this path.
-fn single_user_row(record: &db::Record, roles: &[String], current_uid: &str) -> Markup {
-    let email = record.str_field("email");
-    let disabled = record.bool_field("disabled");
-    let created = record.str_field("created_at");
+fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> Markup {
+    let email = record.email.as_str();
+    let disabled = record.disabled;
+    let created = record.created_at.as_str();
     let is_self = !current_uid.is_empty() && record.id == current_uid;
     html! {
         tr #{"user-row-" (record.id)} {
@@ -278,7 +239,7 @@ fn single_user_row(record: &db::Record, roles: &[String], current_uid: &str) -> 
 
 /// Render a single user table row (used by enable/disable mutations).
 async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
-    let Ok(record) = db::get(ctx, USERS, user_id).await else {
+    let Ok(Some(record)) = users::find_by_id(ctx, user_id).await else {
         return html! {};
     };
 
@@ -456,15 +417,10 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
 }
 
 async fn api_keys_tab(ctx: &dyn Context) -> Markup {
-    let opts = ListOptions {
-        sort: vec![SortField {
-            field: "created_at".into(),
-            desc: true,
-        }],
-        limit: 100,
-        ..Default::default()
-    };
-    let result = db::list(ctx, API_KEYS, &opts).await;
+    // Every key in the deployment, newest first — this tab is the operator's
+    // view, not one account's (`api_keys::list_for_user` is what the
+    // userportal and the auth-ui CRUD endpoints use).
+    let result = api_keys::list_recent(ctx, 100).await;
 
     html! {
         div .flex .items-center .justify-between .mb-4 {
@@ -489,17 +445,17 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                             }
                         }
                         tbody {
-                            @if list.records.is_empty() {
+                            @if list.is_empty() {
                                 tr {
                                     td colspan="6" .text-center .text-muted .p-8 { "No API keys" }
                                 }
                             }
-                            @for record in &list.records {
-                                @let prefix = record.str_field("key_prefix");
-                                @let name = record.str_field("name");
-                                @let user_id = record.str_field("user_id");
-                                @let created = record.str_field("created_at");
-                                @let revoked = record.str_field("revoked_at");
+                            @for record in list {
+                                @let prefix = record.key_prefix.as_str();
+                                @let name = record.name.as_str();
+                                @let user_id = record.user_id.as_str();
+                                @let created = record.created_at.as_str();
+                                @let revoked = record.revoked_at.as_deref().unwrap_or("");
                                 tr {
                                     td { code { (prefix) "..." } }
                                     td { (name) }
@@ -532,7 +488,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                 }
             }
             Err(e) => {
-                div .login-error { "Failed to load API keys: " (e.message) }
+                div .login-error { "Failed to load API keys: " (e) }
             }
         }
 
@@ -574,6 +530,8 @@ mod tests {
                 display_name: "Owner".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await

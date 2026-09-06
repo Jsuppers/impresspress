@@ -20,6 +20,8 @@ async fn pat_insert_find_with_scopes() {
             display_name: "P".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -70,6 +72,8 @@ async fn pat_insert_with_multi_scope_and_expiry() {
             display_name: "M".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await
@@ -131,6 +135,8 @@ async fn pat_token_hash_is_stored_as_hex_string_not_json_byte_array() {
             display_name: "Hex".into(),
             avatar_url: None,
             role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
         },
     )
     .await

@@ -58,61 +58,34 @@ pub(crate) async fn bootstrap_with_email_password(
     password: &str,
 ) -> Result<(), WaferError> {
     let hash = crypto::hash(ctx, password).await?;
-    let id = uuid::Uuid::now_v7().to_string();
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    // Write the admin user row directly with the union of Plan A2 columns
-    // (display_name, role, email_verified) AND the legacy columns the rest
-    // of impresspress still reads (`name`, `disabled`, `deleted_at`).
-    // The single `db::create` call invokes the backend's `ensure_table`
-    // which auto-adds any missing columns — so even when migration 001
-    // already created the Plan A2 schema, this insert materializes the
-    // legacy columns for downstream readers.
+    // One insert through the repo. The hand-built column map this replaced
+    // justified itself with "the legacy columns the rest of impresspress
+    // still reads (`name`, `disabled`, `deleted_at`)"; migration 006 creates
+    // all three — `disabled INTEGER NOT NULL DEFAULT 0` and a nullable
+    // `deleted_at`, which are exactly the values the map wrote — and
+    // `users::insert` already dual-writes `name` with `display_name`. The
+    // only value the map still carried on its own was `email_verified`,
+    // which is now a `NewUser` field.
     //
-    // Bypassing `repo::users::insert` here is intentional: bootstrap is a
-    // one-shot operator action, not a steady-state user-creation flow.
-    // Each legacy field is removed when its readers migrate to Plan A2:
-    //   - `name` — userportal/profile.rs reads `display_name` first then
-    //     `name`; admin pages still mix.
-    //   - `disabled` / `deleted_at` — admin pages soft-delete + status.
-    let mut data: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
-    data.insert("id".to_string(), serde_json::Value::String(id.clone()));
-    data.insert(
-        "email".to_string(),
-        serde_json::Value::String(email.to_string()),
-    );
-    data.insert(
-        "display_name".to_string(),
-        serde_json::Value::String("Admin".to_string()),
-    );
-    data.insert(
-        "avatar_url".to_string(),
-        serde_json::Value::String(String::new()),
-    );
-    data.insert(
-        "role".to_string(),
-        serde_json::Value::String("admin".to_string()),
-    );
-    // Bootstrapped admins are inherently trusted — they're the operator who
-    // set BOOTSTRAP_ADMIN_PASSWORD. Marking verified avoids the unverified
-    // state on /b/userportal/security on first login.
-    data.insert("email_verified".to_string(), serde_json::Value::Bool(true));
-    data.insert(
-        "created_at".to_string(),
-        serde_json::Value::String(now.clone()),
-    );
-    data.insert("updated_at".to_string(), serde_json::Value::String(now));
-    // Legacy companion columns — see comment block above.
-    data.insert(
-        "name".to_string(),
-        serde_json::Value::String("Admin".to_string()),
-    );
-    data.insert("disabled".to_string(), serde_json::Value::Bool(false));
-    data.insert("deleted_at".to_string(), serde_json::Value::Null);
-
-    wafer_core::clients::database::create(ctx, users::TABLE, data).await?;
-    local_credentials::insert(ctx, &id, &hash, false)
+    // A bootstrapped admin is inherently trusted (the operator set
+    // BOOTSTRAP_ADMIN_PASSWORD), so it is verified on creation; without
+    // that, /b/userportal/security would show them unverified on first
+    // login.
+    let user = users::insert(
+        ctx,
+        users::NewUser {
+            email: email.to_string(),
+            display_name: "Admin".to_string(),
+            avatar_url: None,
+            role: "admin".to_string(),
+            email_verified: true,
+            verification_token_hash: None,
+        },
+    )
+    .await
+    .map_err(internal)?;
+    local_credentials::insert(ctx, &user.id, &hash, false)
         .await
         .map_err(internal)?;
     Ok(())

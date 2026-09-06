@@ -463,6 +463,8 @@ mod tests {
                 display_name: "Verify".into(),
                 avatar_url: None,
                 role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
             },
         )
         .await

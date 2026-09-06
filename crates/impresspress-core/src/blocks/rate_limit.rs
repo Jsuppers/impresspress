@@ -6,9 +6,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-#[cfg(target_arch = "wasm32")]
-use wafer_core::clients::database as db;
-use wafer_core::clients::{config, database::Record};
+use wafer_core::clients::config;
 use wafer_run::{context::Context, OutputStream, WaferError};
 
 /// Per-user rate limiter using fixed-window counters.
@@ -187,69 +185,23 @@ impl UserRateLimiter {
     /// within the current window, or reset if the window has expired.
     #[cfg(target_arch = "wasm32")]
     pub async fn check(&self, ctx: &dyn Context, key: &str, limit: RateLimit) -> Result<u32, u64> {
-        use wafer_block::{
-            db::{Filter, FilterOp},
-            wire::database::OnConflict,
-        };
-
         // std::time::SystemTime::now() panics on wasm32-unknown-unknown
         // (no system clock). Use js_sys::Date::now() which returns ms since epoch.
         let now = (js_sys::Date::now() / 1000.0) as i64;
         let window_secs = limit.window.as_secs() as i64;
         let window_cutoff = now - window_secs;
 
-        // Atomic fixed-window upsert: increment count if window is current,
-        // reset count + window_start if expired. The server renders the
-        // dialect-portable SQL (CASE WHEN + CURRENT_TIMESTAMP) from the
-        // structured `OnConflict::WindowedCounter` request.
-        use crate::blocks::auth::RATE_LIMITS_TABLE as RATE_LIMITS;
         let id = crate::util::sha256_hex(format!("rl:{key}:{now}").as_bytes());
-        let upsert_result = db::upsert(
+        let count = crate::blocks::auth::repo::rate_limits::windowed_increment(
             ctx,
-            RATE_LIMITS,
-            vec![
-                ("id".to_string(), serde_json::json!(id)),
-                ("key".to_string(), serde_json::json!(key)),
-            ],
-            vec!["key".to_string()],
-            OnConflict::WindowedCounter {
-                count_field: "count".to_string(),
-                window_field: "window_start".to_string(),
-                now,
-                window_cutoff,
-                created_fields: vec!["created_at".to_string()],
-                updated_fields: vec!["updated_at".to_string()],
-            },
-        )
-        .await;
-
-        // Read back the current count for this window via the typed client
-        // (replaces a hand-rolled `db::query_raw` of `build_select_columns`).
-        let rows_result = db::list_all(
-            ctx,
-            RATE_LIMITS,
-            vec![
-                Filter {
-                    field: "key".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(key),
-                },
-                Filter {
-                    field: "window_start".into(),
-                    operator: FilterOp::GreaterEqual,
-                    value: serde_json::json!(window_cutoff),
-                },
-            ],
-        )
-        .await;
-
-        match decide_rate_limit(
-            &upsert_result,
-            rows_result,
+            &id,
             key,
-            limit.max_requests,
-            window_secs as u64,
-        ) {
+            now,
+            window_cutoff,
+        )
+        .await;
+
+        match decide_rate_limit(count, key, limit.max_requests, window_secs as u64) {
             BackendCheckOutcome::Allowed(remaining) => Ok(remaining),
             BackendCheckOutcome::Limited(retry_after) => Err(retry_after),
             // Availability is preserved (the request is still allowed), but
@@ -289,49 +241,34 @@ pub enum BackendCheckOutcome {
 }
 
 /// Decide the outcome of a D1-backed fixed-window rate-limit check from the
-/// raw upsert/read-back results, without touching the backend itself.
+/// counter `auth::repo::rate_limits::windowed_increment` reported, without
+/// touching the backend itself.
 ///
-/// A failure on either the write (`upsert_result`) or the read
-/// (`rows_result`) fails open for availability, but loudly: it emits a
+/// A failure of that call — the upsert or the read-back; its error names
+/// which — fails open for availability, but loudly: it emits a
 /// `tracing::warn!` and returns [`BackendCheckOutcome::FailedOpen`] instead
-/// of silently deriving `count = 0` from an empty/absent row set.
+/// of silently deriving `count = 0` from an empty/absent row set. An empty
+/// read-back is `Ok(0)`, which is a real "no requests in this window yet"
+/// and stays a normal allow.
 pub fn decide_rate_limit(
-    upsert_result: &Result<i64, WaferError>,
-    rows_result: Result<Vec<Record>, WaferError>,
+    count: Result<i64, WaferError>,
     key: &str,
     max_requests: u32,
     retry_after_secs: u64,
 ) -> BackendCheckOutcome {
-    if let Err(e) = upsert_result {
-        tracing::warn!(
-            error = %e,
-            key = %key,
-            "rate-limit backend upsert failed — failing open (allowing request, count unknown)"
-        );
-        return BackendCheckOutcome::FailedOpen {
-            reason: e.to_string(),
-        };
-    }
-
-    let rows = match rows_result {
-        Ok(rows) => rows,
+    let count = match count {
+        Ok(count) => count as u32,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 key = %key,
-                "rate-limit backend read-back failed — failing open (allowing request, count unknown)"
+                "rate-limit backend failed — failing open (allowing request, count unknown)"
             );
             return BackendCheckOutcome::FailedOpen {
                 reason: e.to_string(),
             };
         }
     };
-
-    let count = rows
-        .first()
-        .and_then(|r| r.data.get("count"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as u32;
 
     if count > max_requests {
         BackendCheckOutcome::Limited(retry_after_secs)
@@ -730,76 +667,72 @@ mod tests {
         }
     }
 
-    fn count_row(count: i64) -> Record {
-        let mut data = std::collections::HashMap::new();
-        data.insert("count".to_string(), serde_json::json!(count));
-        Record {
-            id: "row1".to_string(),
-            data,
-        }
-    }
-
     #[test]
-    fn rate_limit_decision_is_explicit_when_upsert_fails() {
+    fn rate_limit_decision_is_explicit_when_the_backend_fails() {
         // Regression for the CF incident where a missing `rate_limits` table
-        // left limiting silently inert for weeks. A backend write failure
-        // must be a logged, explicit fail-open — not an unlabeled count=0
+        // left limiting silently inert for weeks. A backend failure — the
+        // upsert or the read-back; `windowed_increment`'s error names which —
+        // must be a logged, explicit fail-open, not an unlabeled count=0
         // allow.
-        let outcome = decide_rate_limit(&Err(wafer_error("D1 down")), Ok(vec![]), "k", 5, 60);
-        assert!(matches!(outcome, BackendCheckOutcome::FailedOpen { .. }));
-    }
-
-    #[test]
-    fn rate_limit_decision_is_explicit_when_read_back_fails() {
-        // Same regression, but for the read-back half of the check: the
-        // upsert can succeed while the follow-up `list_all` still fails.
-        let outcome = decide_rate_limit(&Ok(1), Err(wafer_error("D1 down")), "k", 5, 60);
-        assert!(matches!(outcome, BackendCheckOutcome::FailedOpen { .. }));
+        let upsert = decide_rate_limit(
+            Err(wafer_error("rate_limits windowed upsert: D1 down")),
+            "k",
+            5,
+            60,
+        );
+        assert!(matches!(upsert, BackendCheckOutcome::FailedOpen { .. }));
+        let read_back = decide_rate_limit(
+            Err(wafer_error("rate_limits count read-back: D1 down")),
+            "k",
+            5,
+            60,
+        );
+        assert!(matches!(read_back, BackendCheckOutcome::FailedOpen { .. }));
     }
 
     #[test]
     fn rate_limit_decision_allows_under_limit() {
-        let outcome = decide_rate_limit(&Ok(1), Ok(vec![count_row(2)]), "k", 5, 60);
+        let outcome = decide_rate_limit(Ok(2), "k", 5, 60);
         assert_eq!(outcome, BackendCheckOutcome::Allowed(3));
     }
 
     #[test]
     fn rate_limit_decision_limits_over_limit() {
-        let outcome = decide_rate_limit(&Ok(1), Ok(vec![count_row(6)]), "k", 5, 60);
+        let outcome = decide_rate_limit(Ok(6), "k", 5, 60);
         assert_eq!(outcome, BackendCheckOutcome::Limited(60));
     }
 
     #[test]
-    fn rate_limit_decision_treats_empty_rows_as_zero_count_not_failure() {
+    fn rate_limit_decision_treats_a_zero_count_as_success_not_failure() {
         // No row yet for this window (first request) is a legitimate empty
-        // result, not a backend failure — must stay a normal `Allowed`, not
-        // `FailedOpen`.
-        let outcome = decide_rate_limit(&Ok(1), Ok(vec![]), "k", 5, 60);
+        // result, which `windowed_increment` reports as `Ok(0)` — must stay a
+        // normal `Allowed`, not `FailedOpen`.
+        let outcome = decide_rate_limit(Ok(0), "k", 5, 60);
         assert_eq!(outcome, BackendCheckOutcome::Allowed(5));
     }
 
     #[test]
     fn rate_limit_counts_when_upsert_succeeds() {
-        // Regression for the adapter fail-open bug this PR fixes: before the
-        // D1 / KV-cached-D1 / browser `DatabaseService::upsert` forwarders
-        // existed (added alongside this test), every wasm rate-limit check's
-        // `upsert_result` was `Err("... not implemented by this database
-        // backend")`, so `decide_rate_limit` always took the `FailedOpen`
-        // branch below — the limiter silently allowed every request at full
-        // quota, on every backend, forever. Method *presence* is now
+        // Regression for the adapter fail-open bug: before the D1 /
+        // KV-cached-D1 / browser `DatabaseService::upsert` forwarders existed
+        // (added alongside this test), every wasm rate-limit check's upsert
+        // was `Err("... not implemented by this database backend")`, so
+        // `decide_rate_limit` always took the `FailedOpen` branch below — the
+        // limiter silently allowed every request at full quota, on every
+        // backend, forever. Method *presence* is now
         // compile-enforced (`upsert`/`aggregate` are required `DatabaseService`
         // trait methods; the adapters would not build without the forwarders),
-        // so a real deployment's `upsert_result` is `Ok(_)`. This test locks in
-        // that once `upsert` actually succeeds, the decision is a real
+        // so a real deployment's counter read is `Ok(_)`. This test locks in
+        // that once the counter actually lands, the decision is a real
         // count-based `Allowed`/`Limited` — never the fail-open branch.
 
         // Under the limit: counts, allows-by-remaining (not fail-open).
-        let under = decide_rate_limit(&Ok(1), Ok(vec![count_row(2)]), "k", 5, 60);
+        let under = decide_rate_limit(Ok(2), "k", 5, 60);
         assert!(!matches!(under, BackendCheckOutcome::FailedOpen { .. }));
         assert_eq!(under, BackendCheckOutcome::Allowed(3));
 
         // Over the limit: counts, denies (not fail-open).
-        let over = decide_rate_limit(&Ok(1), Ok(vec![count_row(6)]), "k", 5, 60);
+        let over = decide_rate_limit(Ok(6), "k", 5, 60);
         assert!(!matches!(over, BackendCheckOutcome::FailedOpen { .. }));
         assert_eq!(over, BackendCheckOutcome::Limited(60));
     }
