@@ -34,6 +34,7 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("tickets", &["/b/tickets"]),
     ("llm", &["/b/llm"]),
     ("vector", &["/b/vector"]),
+    ("legalpages", &["/b/legalpages"]),
 ];
 
 /// Blocks whose snapshot exists only under a non-default feature.
@@ -51,15 +52,22 @@ const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[];
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// The list is now empty. `admin` left it when its four JSON API reads were
-/// typed, `tickets` when its thirteen JSON endpoints were, and `llm` /
-/// `vector` when their thirteen and nine were: every block's handlers now
-/// build `contracts` types, so every block has a non-empty snapshot to guard.
+/// `admin` left it when its four JSON API reads were typed, `tickets` when
+/// its thirteen JSON endpoints were, and `llm` / `vector` when their thirteen
+/// and nine were: those blocks' handlers all build `contracts` types.
 ///
-/// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
-/// any of them means the gate is vacuous — wrong prefix, or the block missing
-/// from the document's block list — and must fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &[];
+/// `legalpages` is on it for exactly one commit. It joins `SNAPSHOTTED_BLOCKS`
+/// here with the baseline the *current* tree produces, and not one of its
+/// seventeen declared rows calls `.input` / `.output` / `.path_params` /
+/// `.query_params`, so `has_schema()` is false for every one of them and the
+/// block contributes no path to `/openapi.json` at all. That empty baseline is
+/// the honest starting point for the next commit's diff, which declares the
+/// PATCH request body and takes this entry away again.
+///
+/// Every other block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot
+/// for any of them means the gate is vacuous — wrong prefix, or the block
+/// missing from the document's block list — and must fail loudly.
+const LEGITIMATELY_EMPTY: &[&str] = &["legalpages"];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")

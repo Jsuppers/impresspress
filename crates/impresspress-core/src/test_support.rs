@@ -1646,6 +1646,15 @@ pub fn real_block_infos() -> Vec<BlockInfo> {
         crate::blocks::vector::VectorBlock::new().info(),
     ];
 
+    // Legalpages ships under its own feature, which the `cfg` on this
+    // function does not require, so it joins only when compiled in. It has
+    // to join at all because `tests/openapi_snapshot.rs` now guards it: a
+    // block absent from this list contributes no path to the generated
+    // document, and its snapshot would read `{}` forever no matter what it
+    // declared.
+    #[cfg(feature = "block-legalpages")]
+    infos.push(crate::blocks::legalpages::LegalPagesBlock::new().info());
+
     // The dev sandbox ships only under its own (non-default) feature, so its
     // `BlockInfo` joins the document only when the block is compiled in. Like
     // `llm` above, `info()` is declarative — neither the `RuntimeControl` nor
