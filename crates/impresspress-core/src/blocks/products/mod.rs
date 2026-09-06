@@ -14,18 +14,15 @@ mod stripe_provider;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use handlers::{
-    GROUPS_TABLE, GROUP_TEMPLATES_TABLE, PRODUCT_TEMPLATES_TABLE, TYPES_TABLE,
-};
-// The products table's own door tests (`tests/repo_door_test.rs`) refuse a
-// call site outside `repo::products` that names the table directly — the
-// data snapshot's export allowlist is one, deliberately (it needs the name
-// for its `TABLE_ALLOWLIST`/`TABLE_EXCLUDED` bookkeeping and as the
-// `DataSnapshot` JSON key), and is listed in `TABLE_IDENT_ALLOWED` there
-// with its own justification rather than routed around the scanner through
-// an extra same-value constant under a different name. The two functions
-// alongside it are how it reads and writes the live set without a query
-// built directly on the name.
+// The crate-level door test (`tests/repo_door.rs`) refuses a call site
+// outside `repo::products` that names the table directly — the data
+// snapshot's export allowlist is one, deliberately (it needs the name for
+// its `TABLE_ALLOWLIST`/`TABLE_EXCLUDED` bookkeeping and as the
+// `DataSnapshot` JSON key), and is listed in `IDENT_ALLOWED` there with its
+// own justification rather than routed around the scanner through an extra
+// same-value constant under a different name. The two functions alongside it
+// are how it reads and writes the live set without a query built directly on
+// the name.
 //
 // `block-dev`-gated because `blocks::dev::data_snapshot` is the ONLY consumer
 // of all three, and the dev block is off in every default build: an
@@ -49,12 +46,15 @@ pub(crate) use repo::products::{
 #[cfg(feature = "block-dev")]
 pub(crate) use repo::{
     checkout_presets::TABLE as CHECKOUT_PRESETS_TABLE, disputes::TABLE as DISPUTES_TABLE,
-    entitlements::TABLE as ENTITLEMENTS_TABLE, offer_components::TABLE as OFFER_COMPONENTS_TABLE,
+    entitlements::TABLE as ENTITLEMENTS_TABLE, group_templates::TABLE as GROUP_TEMPLATES_TABLE,
+    groups::TABLE as GROUPS_TABLE, offer_components::TABLE as OFFER_COMPONENTS_TABLE,
     offers::TABLE as OFFERS_TABLE, payment_links::TABLE as PAYMENT_LINKS_TABLE,
+    product_templates::TABLE as PRODUCT_TEMPLATES_TABLE,
     product_versions::TABLE as PRODUCT_VERSIONS_TABLE,
     provider_operations::TABLE as PROVIDER_OPERATIONS_TABLE, refunds::TABLE as REFUNDS_TABLE,
     seller_accounts::TABLE as SELLER_ACCOUNTS_TABLE, stripe_events::TABLE as STRIPE_EVENTS_TABLE,
     subscription_items::TABLE as SUBSCRIPTION_ITEMS_TABLE, subscriptions::SUBSCRIPTIONS_TABLE,
+    types::TABLE as TYPES_TABLE,
 };
 pub(crate) use repo::{
     purchases::{LINE_ITEMS_TABLE, PURCHASES_TABLE},
@@ -324,12 +324,12 @@ crate::impresspress_feature_block! {
             // Cloudflare D1 build).
             .collections(vec![
                 CollectionSchema::new(repo::products::TABLE),
-                CollectionSchema::new(GROUPS_TABLE),
-                CollectionSchema::new(TYPES_TABLE),
+                CollectionSchema::new(repo::groups::TABLE),
+                CollectionSchema::new(repo::types::TABLE),
                 CollectionSchema::new(PURCHASES_TABLE),
                 CollectionSchema::new(LINE_ITEMS_TABLE),
-                CollectionSchema::new(GROUP_TEMPLATES_TABLE),
-                CollectionSchema::new(PRODUCT_TEMPLATES_TABLE),
+                CollectionSchema::new(repo::group_templates::TABLE),
+                CollectionSchema::new(repo::product_templates::TABLE),
                 CollectionSchema::new(VARIABLES_TABLE),
                 CollectionSchema::new(repo::subscriptions::SUBSCRIPTIONS_TABLE),
                 CollectionSchema::new(repo::product_versions::TABLE),

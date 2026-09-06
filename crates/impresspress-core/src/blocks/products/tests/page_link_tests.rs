@@ -351,7 +351,7 @@ async fn seeded_ctx() -> (crate::test_support::TestContext, Seeds) {
 
     seed(
         &ctx,
-        super::super::GROUPS_TABLE,
+        super::super::repo::groups::TABLE,
         "grp_1",
         HashMap::from([
             ("name".to_string(), serde_json::json!("Group one")),

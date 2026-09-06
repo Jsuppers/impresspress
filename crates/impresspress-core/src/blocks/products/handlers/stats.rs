@@ -1,10 +1,8 @@
 //! Admin dashboard stats: `/b/products/api/admin/stats`.
 
 use wafer_block::db::{Filter, FilterOp};
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::GROUPS_TABLE;
 use crate::{
     blocks::products::{
         contracts::{AdminStats, SellerStats},
@@ -29,7 +27,7 @@ pub(super) async fn handle_stats(ctx: &dyn Context, _msg: &Message) -> OutputStr
         repo::products::count(ctx, &active_filter),
         repo::purchases::count_all(ctx),
         repo::purchases::commerce_analytics(ctx, None),
-        db::count(ctx, GROUPS_TABLE, &[]),
+        repo::groups::count(ctx, &[]),
     );
 
     // A repository failure on any of these must surface as an error, not be

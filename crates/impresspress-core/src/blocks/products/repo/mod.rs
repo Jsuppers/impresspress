@@ -8,9 +8,12 @@
 pub(crate) mod checkout_presets;
 pub(crate) mod disputes;
 pub(crate) mod entitlements;
+pub(crate) mod group_templates;
+pub(crate) mod groups;
 pub(crate) mod offer_components;
 pub(crate) mod offers;
 pub(crate) mod payment_links;
+pub(crate) mod product_templates;
 pub(crate) mod product_versions;
 pub(crate) mod products;
 pub(crate) mod provider_operations;
@@ -20,6 +23,7 @@ pub(crate) mod seller_accounts;
 pub(crate) mod stripe_events;
 pub(crate) mod subscription_items;
 pub(crate) mod subscriptions;
+pub(crate) mod types;
 pub(crate) mod variables;
 
 /// How far along the Stripe subscription lifecycle a status is, for ordering

@@ -1526,6 +1526,21 @@ pub(crate) async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
     db::count(ctx, PURCHASES_TABLE, &[]).await
 }
 
+/// Count one buyer's orders — the "Orders" stat on the customer portal home.
+/// `user_id` is the buyer column, not the seller's.
+pub(crate) async fn count_for_user(ctx: &dyn Context, user_id: &str) -> Result<i64, WaferError> {
+    db::count(
+        ctx,
+        PURCHASES_TABLE,
+        &[Filter {
+            field: "user_id".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(user_id.to_string()),
+        }],
+    )
+    .await
+}
+
 #[derive(Default)]
 struct AnalyticsAccumulator {
     gross_volume_minor: i128,

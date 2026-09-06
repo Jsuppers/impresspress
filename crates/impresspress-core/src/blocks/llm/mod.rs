@@ -3,13 +3,14 @@ pub mod migrations;
 pub mod pages;
 pub mod provider_admin;
 pub mod providers;
+pub(crate) mod repo;
 pub mod routes;
 pub mod schema;
 pub mod ui;
 
 use std::sync::Arc;
 
-use wafer_core::clients::{config, database as db};
+use wafer_core::clients::config;
 use wafer_run::{
     context::Context, Block, BlockInfo, ConfigVar, HttpMethod, InputStream, InstanceMode,
     LifecycleEvent, LifecycleType, Message, OutputStream, WaferError,
@@ -19,7 +20,6 @@ use self::provider_admin::ProviderAdmin;
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
-    util::json_map,
 };
 
 /// In-block dispatch targets, one per declared HTTP endpoint.
@@ -198,8 +198,6 @@ impl LlmBlock {
     }
 }
 
-pub(crate) const SETTINGS_TABLE: &str = "impresspress__llm__settings";
-
 pub(super) const DEFAULT_PROVIDER_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_PROVIDER";
 pub(super) const DEFAULT_MODEL_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MODEL";
 pub(super) const DEFAULT_PROVIDER: &str = "impresspress/provider-llm";
@@ -216,6 +214,98 @@ pub(super) const DEFAULT_PROVIDER: &str = "impresspress/provider-llm";
 // ---------------------------------------------------------------------------
 // Inter-block call helpers
 // ---------------------------------------------------------------------------
+
+/// One thread in the chat sidebar, as `impresspress/messages` reports it.
+///
+/// Not a published contract: it is the decoded shape of another block's
+/// response, and the three fields are exactly what the sidebar renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ContextView {
+    /// The context id, which is the llm thread id.
+    pub id: String,
+    /// Display title. Empty renders as "Untitled".
+    pub title: String,
+    /// RFC 3339 timestamp the list is ordered by.
+    pub updated_at: String,
+}
+
+/// Read one column out of a messages-block record as the wire delivers it.
+///
+/// The `database.list` envelope puts the column map under `data`; the
+/// top-level fallback is kept from `history_to_messages`, which has carried
+/// it since before the entries list went through `call_block`. Shared so the
+/// two readers of a messages record (the chat page's bootstrap carrier and
+/// the model-history builder) cannot drift apart on it.
+pub(super) fn record_field<'a>(record: &'a serde_json::Value, field: &str) -> &'a str {
+    record
+        .get("data")
+        .and_then(|data| data.get(field))
+        .or_else(|| record.get(field))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// The records of a `{records: [...], total_count: n}` list answer, or the
+/// error the callee terminated with.
+async fn records_of(out: OutputStream, what: &str) -> Result<Vec<serde_json::Value>, WaferError> {
+    let buffered = out
+        .collect_buffered()
+        .await
+        .map_err(|terminal| match terminal {
+            wafer_run::streams::output::TerminalNotResponse::Error(error) => error,
+            other => WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("{what}: the messages block did not answer: {other:?}"),
+            ),
+        })?;
+    let value: serde_json::Value = serde_json::from_slice(&buffered.body).map_err(|error| {
+        WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            format!("{what}: could not decode the messages block's answer: {error}"),
+        )
+    })?;
+    Ok(value
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Call the messages block to list the caller's threads — the chat page's
+/// sidebar.
+///
+/// `page_size=50` is the cap the page's own `db::list` used, and the messages
+/// block orders contexts by `updated_at` descending for every caller, so the
+/// set is the one the direct read produced except for the owner filter the
+/// block applies (`rest.rs::list_contexts`): the sidebar is owner-scoped now,
+/// as it is for every other caller of that route.
+pub(super) async fn messages_list_contexts(
+    ctx: &dyn Context,
+    original_msg: &Message,
+) -> Result<Vec<ContextView>, WaferError> {
+    let resource = "/b/messages/api/contexts?page_size=50";
+    let msg = crate::util::block_request("retrieve", "GET", resource, original_msg);
+
+    let records = records_of(
+        ctx.call_block("impresspress/messages", msg, InputStream::empty())
+            .await,
+        "thread list",
+    )
+    .await?;
+
+    Ok(records
+        .iter()
+        .map(|record| ContextView {
+            id: record
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            title: record_field(record, "title").to_string(),
+            updated_at: record_field(record, "updated_at").to_string(),
+        })
+        .collect())
+}
 
 /// Call the messages block to create an entry in a context.
 pub(super) async fn messages_create(
@@ -254,6 +344,10 @@ pub(super) async fn messages_create(
 }
 
 /// Call the messages block to list entries in a context.
+///
+/// Shared by the chat page's bootstrap carrier and the model-history builder.
+/// Still swallows its error into an empty list — that discipline (and
+/// `messages_create`'s `Option`) is T4, Phase 3.
 pub(super) async fn messages_list(
     ctx: &dyn Context,
     original_msg: &Message,
@@ -265,14 +359,7 @@ pub(super) async fn messages_list(
     let out = ctx
         .call_block("impresspress/messages", msg, InputStream::empty())
         .await;
-    if let Ok(buf) = out.collect_buffered().await {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf.body) {
-            if let Some(records) = v.get("records").and_then(|r| r.as_array()) {
-                return records.clone();
-            }
-        }
-    }
-    vec![]
+    records_of(out, "entry list").await.unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -281,22 +368,27 @@ pub(super) async fn messages_list(
 
 impl LlmBlock {
     /// Resolve which provider block and model to use for a request.
+    ///
+    /// Returns `Err` when the per-thread override cannot be read. Falling
+    /// back to the global default on a database outage would route a
+    /// thread's traffic to a backend its owner had pinned away from, and the
+    /// caller would never learn.
     pub(super) async fn resolve_provider(
         &self,
         ctx: &dyn Context,
         thread_id: &str,
         req_provider: Option<&str>,
         req_model: Option<&str>,
-    ) -> (String, String) {
+    ) -> Result<(String, String), WaferError> {
         // Check per-thread override first
-        let thread_setting = self.get_thread_setting(ctx, thread_id).await;
+        let thread_setting = repo::settings::find_for_thread(ctx, thread_id).await?;
 
         let provider_block = thread_setting
             .as_ref()
-            .and_then(|s| s.data.get("provider_block").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| req_provider.map(|s| s.to_string()))
+            .map(|setting| setting.provider_block.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| req_provider.map(str::to_string))
             .unwrap_or_else(|| {
                 // Will be filled below from config
                 String::new()
@@ -304,10 +396,10 @@ impl LlmBlock {
 
         let model = thread_setting
             .as_ref()
-            .and_then(|s| s.data.get("model").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| req_model.map(|s| s.to_string()))
+            .map(|setting| setting.model.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| req_model.map(str::to_string))
             .unwrap_or_default();
 
         let default_provider =
@@ -326,22 +418,7 @@ impl LlmBlock {
             model
         };
 
-        (final_provider, final_model)
-    }
-
-    /// Get the per-thread settings record from the DB, if any.
-    ///
-    /// Returns the whole [`db::Record`] (not just its `data`) so callers that
-    /// need the record id for a follow-up update don't have to re-query.
-    async fn get_thread_setting(&self, ctx: &dyn Context, thread_id: &str) -> Option<db::Record> {
-        db::get_by_field(
-            ctx,
-            SETTINGS_TABLE,
-            "thread_id",
-            serde_json::Value::String(thread_id.to_string()),
-        )
-        .await
-        .ok()
+        Ok((final_provider, final_model))
     }
 
     /// `DELETE /b/llm/api/config/{id}` — remove one per-thread override. The
@@ -352,7 +429,7 @@ impl LlmBlock {
         if id.is_empty() {
             return err_bad_request("Missing override ID");
         }
-        match db::delete(ctx, SETTINGS_TABLE, &id).await {
+        match repo::settings::delete(ctx, &id).await {
             Ok(()) => ok_json(&contracts::ConfigDeleteResponse { deleted: true }),
             Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
                 err_not_found("Override not found")
@@ -422,46 +499,43 @@ impl LlmBlock {
             );
         }
 
-        // Per-thread override update
+        // Per-thread override update. The lookup's error is NOT "no
+        // override": treating it as one used to write a second row for a
+        // thread that already had one.
         if let Some(thread_id) = body.thread_id {
-            let existing = self.get_thread_setting(ctx, &thread_id).await;
+            let existing = match repo::settings::find_for_thread(ctx, &thread_id).await {
+                Ok(existing) => existing,
+                Err(e) => return err_internal("Database error", e),
+            };
 
-            if let Some(record) = existing {
-                // Update the existing record in place — the single fetch above
-                // already gave us both the id and the current data.
-                let mut data = record.data;
-                if let Some(pb) = body.provider_block {
-                    data.insert("provider_block".to_string(), serde_json::json!(pb));
+            let written = match existing {
+                // Update the existing row in place — the single fetch above
+                // already gave us both the id and the current values.
+                Some(row) => {
+                    repo::settings::update(
+                        ctx,
+                        &row,
+                        body.provider_block.as_deref(),
+                        body.model.as_deref(),
+                    )
+                    .await
                 }
-                if let Some(m) = body.model {
-                    data.insert("model".to_string(), serde_json::json!(m));
+                None => {
+                    repo::settings::insert(
+                        ctx,
+                        &thread_id,
+                        body.provider_block.as_deref().unwrap_or_default(),
+                        body.model.as_deref().unwrap_or_default(),
+                    )
+                    .await
                 }
-                crate::util::stamp_updated(&mut data);
-                match db::update(ctx, SETTINGS_TABLE, &record.id, data).await {
-                    Ok(r) => {
-                        return ok_json(&ConfigUpdateResponse::Override(
-                            ThreadOverrideView::from_record(&r),
-                        ))
-                    }
-                    Err(e) => return err_internal("Database error", e),
-                }
-            } else {
-                // Create new per-thread setting
-                let mut data = json_map(serde_json::json!({
-                    "thread_id": thread_id,
-                    "provider_block": body.provider_block.unwrap_or_default(),
-                    "model": body.model.unwrap_or_default(),
-                }));
-                crate::util::stamp_created(&mut data);
-                match db::create(ctx, SETTINGS_TABLE, data).await {
-                    Ok(r) => {
-                        return ok_json(&ConfigUpdateResponse::Override(
-                            ThreadOverrideView::from_record(&r),
-                        ))
-                    }
-                    Err(e) => return err_internal("Database error", e),
-                }
-            }
+            };
+            return match written {
+                Ok(row) => ok_json(&ConfigUpdateResponse::Override(ThreadOverrideView::from(
+                    &row,
+                ))),
+                Err(e) => err_internal("Database error", e),
+            };
         }
 
         ok_json(&ConfigUpdateResponse::Acknowledged(ConfigAcknowledgement {
@@ -730,7 +804,7 @@ mod config_tests {
             serde_json::json!(true),
             "the settings page's delete button must reach a route"
         );
-        let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+        let rows = repo::settings::list_all(&ctx)
             .await
             .expect("list overrides");
         assert!(rows.is_empty(), "the override row must be gone");
@@ -858,7 +932,7 @@ mod config_tests {
         .await;
 
         assert_eq!(out, serde_json::json!({ "updated": true }));
-        let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+        let rows = repo::settings::list_all(&ctx)
             .await
             .expect("list overrides");
         assert!(
@@ -914,7 +988,7 @@ mod config_tests {
                 }
                 other => panic!("{value}: expected InvalidArgument, got {other:?}"),
             }
-            let rows = db::list_all(&ctx, SETTINGS_TABLE, vec![])
+            let rows = repo::settings::list_all(&ctx)
                 .await
                 .expect("list overrides");
             assert!(
@@ -922,6 +996,69 @@ mod config_tests {
                 "{value}: a refused request must not have written an override"
             );
         }
+    }
+
+    /// A settings-table read that FAILS is not "no override".
+    ///
+    /// `get_thread_setting` ended in `.ok()`, so a database outage looked
+    /// exactly like an absent row: `handle_post_config` took its "create"
+    /// branch and wrote a SECOND override for a thread that already had one,
+    /// leaving two rows the `thread_id` lookup then picks between
+    /// arbitrarily; and `resolve_provider` silently fell back to the global
+    /// default provider and model, billing a thread's traffic to a backend
+    /// its owner had pinned away from.
+    #[tokio::test]
+    async fn a_failing_settings_read_is_an_error_not_an_absent_override() {
+        let ctx = TestContext::with_llm().await;
+        output_json(
+            block()
+                .handle_post_config(
+                    &ctx,
+                    body(serde_json::json!({
+                        "thread_id": "t1",
+                        "provider_block": "openai-main",
+                        "model": "gpt-4o",
+                    })),
+                )
+                .await,
+        )
+        .await;
+
+        let failing = crate::test_support::FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.list", repo::settings::TABLE)],
+        );
+
+        match block()
+            .handle_post_config(
+                &failing,
+                body(serde_json::json!({ "thread_id": "t1", "model": "gpt-4o-mini" })),
+            )
+            .await
+            .collect_buffered()
+            .await
+        {
+            Err(TerminalNotResponse::Error(e)) => assert_eq!(e.code, ErrorCode::Internal),
+            other => panic!("a failed lookup must not be treated as an absent row: {other:?}"),
+        }
+        let rows = repo::settings::list_all(&ctx)
+            .await
+            .expect("list overrides");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the failed lookup must not have created a second override for t1"
+        );
+
+        assert_eq!(
+            block()
+                .resolve_provider(&failing, "t1", None, None)
+                .await
+                .expect_err("the outage surfaces")
+                .code,
+            ErrorCode::Internal,
+            "a failed settings read must not fall back to the default provider/model"
+        );
     }
 
     #[tokio::test]

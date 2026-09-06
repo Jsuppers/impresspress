@@ -20,7 +20,9 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::streaming::sse_chat_response;
 use crate::{
-    blocks::llm::{contracts, messages_create, messages_list, LlmBlock, DEFAULT_PROVIDER},
+    blocks::llm::{
+        contracts, messages_create, messages_list, record_field, LlmBlock, DEFAULT_PROVIDER,
+    },
     http::{err_bad_request, err_internal, ok_json},
 };
 
@@ -67,19 +69,12 @@ fn build_text_message(role: ChatRole, content: String) -> ChatMessage {
 fn history_to_messages(history: &[serde_json::Value]) -> Vec<ChatMessage> {
     history
         .iter()
-        .filter_map(|m| {
-            let role = m
-                .get("data")
-                .and_then(|d| d.get("role"))
-                .or_else(|| m.get("role"))
-                .and_then(|r| r.as_str())?;
-            let content = m
-                .get("data")
-                .and_then(|d| d.get("content"))
-                .or_else(|| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            Some(build_text_message(role_from_str(role), content.to_string()))
+        .filter(|entry| !record_field(entry, "role").is_empty())
+        .map(|entry| {
+            build_text_message(
+                role_from_str(record_field(entry, "role")),
+                record_field(entry, "content").to_string(),
+            )
         })
         .collect()
 }
@@ -136,9 +131,16 @@ async fn dispatch_chat(
     let messages = history_to_messages(&history);
 
     // 3. Resolve the provider block / model via the block's existing logic.
-    let (provider_block, resolved_model) = block
+    //    An unreadable per-thread override is an error, not a silent fall
+    //    back to the global default: the caller pinned a backend and would
+    //    otherwise be billed to another one without ever learning.
+    let (provider_block, resolved_model) = match block
         .resolve_provider(ctx, &thread_id, provider.as_deref(), model.as_deref())
-        .await;
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => return Err(err_internal("resolve_provider failed", e)),
+    };
 
     // 4. Map the legacy `impresspress/provider-llm` default into a concrete
     //    backend_id (first enabled provider). Non-legacy values pass through.

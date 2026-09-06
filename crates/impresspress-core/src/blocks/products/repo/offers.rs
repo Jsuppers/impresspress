@@ -460,6 +460,13 @@ pub(crate) async fn mark_sync_error(
     db::update(ctx, TABLE, offer_id, data).await.map(|_| ())
 }
 
+/// Count the offers matching `filters` (`&[]` for the whole catalog). The
+/// admin overview page's "Offers" stat; a failure surfaces as a 500 rather
+/// than a fabricated `0`.
+pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, WaferError> {
+    db::count(ctx, TABLE, filters).await
+}
+
 pub(crate) async fn get_for_product(
     ctx: &dyn Context,
     product_id: &str,

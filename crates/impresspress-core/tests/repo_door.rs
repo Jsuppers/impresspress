@@ -39,8 +39,13 @@
 /// each table is its own door, so an exemption for one is not an exemption
 /// for the other.
 ///
-/// `const` is the path fragment the second scan looks for — `<module>::TABLE`
-/// for a module's primary table, `<module>::<NAME>_TABLE` for a second one.
+/// `consts` are the path fragments the second scan looks for. `<module>::TABLE`
+/// for a module's primary table and `<module>::<NAME>_TABLE` for a second one
+/// cover a caller that spells the whole path; a door whose constant is
+/// re-exported under an alias (`products/mod.rs` hands `blocks::dev` a
+/// `<NAME>_TABLE` alias for every collection the block declares) lists the
+/// alias too, because `use blocks::products::OFFERS_TABLE` is a call site the
+/// path spelling never sees.
 ///
 /// `qualifier` is the path fragment a file must ALSO contain for that token
 /// to be attributed to this door. It is what keeps a block's own same-named
@@ -49,79 +54,217 @@
 /// names `platform_state`. For the auth users door the fragment is `auth`
 /// and for the files doors it is `files`, which every path to
 /// `blocks::<block>::repo::<module>` necessarily spells.
-const TABLES: &[(&str, &str, &str, &str)] = &[
+const TABLES: &[(&str, &str, &[&str], &str)] = &[
     (
         "variables",
         "impresspress__admin__variables",
-        "variables::TABLE",
+        &["variables::TABLE"],
         "platform_state",
     ),
     (
         "block_settings",
         "impresspress__admin__block_settings",
-        "block_settings::TABLE",
+        &["block_settings::TABLE"],
         "platform_state",
     ),
     (
         "wrap_grants",
         "impresspress__admin__wrap_grants",
-        "wrap_grants::TABLE",
+        &["wrap_grants::TABLE"],
         "platform_state",
     ),
     (
         "request_logs",
         "impresspress__admin__request_logs",
-        "request_logs::TABLE",
+        &["request_logs::TABLE"],
         "platform_state",
     ),
     (
         "user_roles",
         "impresspress__admin__user_roles",
-        "user_roles::TABLE",
+        &["user_roles::TABLE"],
         "platform_state",
     ),
-    ("users", "wafer_run__auth__users", "users::TABLE", "auth"),
+    ("users", "wafer_run__auth__users", &["users::TABLE"], "auth"),
     (
         "buckets",
         "impresspress__files__buckets",
-        "buckets::TABLE",
+        &["buckets::TABLE"],
         "files",
     ),
     (
         "objects",
         "impresspress__files__objects",
-        "objects::TABLE",
+        &["objects::TABLE"],
         "files",
     ),
     (
         "shares",
         "impresspress__files__cloud_shares",
-        "shares::TABLE",
+        &["shares::TABLE"],
         "files",
     ),
     (
         "share_access_logs",
         "impresspress__files__cloud_access_logs",
-        "shares::ACCESS_LOGS_TABLE",
+        &["shares::ACCESS_LOGS_TABLE"],
         "files",
     ),
     (
         "quota",
         "impresspress__files__cloud_quotas",
-        "quota::TABLE",
+        &["quota::TABLE"],
         "files",
     ),
     (
         "views",
         "impresspress__files__views",
-        "views::TABLE",
+        &["views::TABLE"],
         "files",
     ),
     (
         "documents",
         "impresspress__legalpages__documents",
-        "documents::TABLE",
+        &["documents::TABLE"],
         "legalpages",
+    ),
+    // The products doors. Every table the block declares, each owned by its
+    // own `repo/<module>.rs`. The second const on most rows is the alias
+    // `blocks/products/mod.rs` re-exports for `blocks::dev::data_snapshot`'s
+    // closed-list bookkeeping; `purchases` and `subscriptions` name their
+    // constants that way inside the door itself, which is why those doors
+    // appear on their own IDENT list below.
+    (
+        "products",
+        "impresspress__products__products",
+        &["products::TABLE"],
+        "products",
+    ),
+    (
+        "product_versions",
+        "impresspress__products__product_versions",
+        &["product_versions::TABLE", "PRODUCT_VERSIONS_TABLE"],
+        "products",
+    ),
+    (
+        "offers",
+        "impresspress__products__offers",
+        &["offers::TABLE", "OFFERS_TABLE"],
+        "products",
+    ),
+    (
+        "offer_components",
+        "impresspress__products__offer_components",
+        &["offer_components::TABLE", "OFFER_COMPONENTS_TABLE"],
+        "products",
+    ),
+    (
+        "payment_links",
+        "impresspress__products__payment_links",
+        &["payment_links::TABLE", "PAYMENT_LINKS_TABLE"],
+        "products",
+    ),
+    (
+        "checkout_presets",
+        "impresspress__products__checkout_presets",
+        &["checkout_presets::TABLE", "CHECKOUT_PRESETS_TABLE"],
+        "products",
+    ),
+    (
+        "purchases",
+        "impresspress__products__purchases",
+        &["PURCHASES_TABLE"],
+        "products",
+    ),
+    (
+        "line_items",
+        "impresspress__products__line_items",
+        &["LINE_ITEMS_TABLE"],
+        "products",
+    ),
+    (
+        "refunds",
+        "impresspress__products__refunds",
+        &["refunds::TABLE", "REFUNDS_TABLE"],
+        "products",
+    ),
+    (
+        "disputes",
+        "impresspress__products__disputes",
+        &["disputes::TABLE", "DISPUTES_TABLE"],
+        "products",
+    ),
+    (
+        "entitlements",
+        "impresspress__products__entitlements",
+        &["entitlements::TABLE", "ENTITLEMENTS_TABLE"],
+        "products",
+    ),
+    (
+        "subscriptions",
+        "impresspress__products__subscriptions",
+        &["SUBSCRIPTIONS_TABLE"],
+        "products",
+    ),
+    (
+        "subscription_items",
+        "impresspress__products__subscription_items",
+        &["subscription_items::TABLE", "SUBSCRIPTION_ITEMS_TABLE"],
+        "products",
+    ),
+    (
+        "seller_accounts",
+        "impresspress__products__seller_accounts",
+        &["seller_accounts::TABLE", "SELLER_ACCOUNTS_TABLE"],
+        "products",
+    ),
+    (
+        "provider_operations",
+        "impresspress__products__provider_operations",
+        &["provider_operations::TABLE", "PROVIDER_OPERATIONS_TABLE"],
+        "products",
+    ),
+    (
+        "stripe_events",
+        "impresspress__products__stripe_events",
+        &["stripe_events::TABLE", "STRIPE_EVENTS_TABLE"],
+        "products",
+    ),
+    (
+        "products_variables",
+        "impresspress__products__variables",
+        &["variables::TABLE", "PRODUCTS_VARIABLES_TABLE"],
+        "products",
+    ),
+    (
+        "groups",
+        "impresspress__products__groups",
+        &["groups::TABLE", "GROUPS_TABLE"],
+        "products",
+    ),
+    (
+        "types",
+        "impresspress__products__types",
+        &["types::TABLE", "TYPES_TABLE"],
+        "products",
+    ),
+    (
+        "group_templates",
+        "impresspress__products__group_templates",
+        &["group_templates::TABLE", "GROUP_TEMPLATES_TABLE"],
+        "products",
+    ),
+    (
+        "product_templates",
+        "impresspress__products__product_templates",
+        &["product_templates::TABLE", "PRODUCT_TEMPLATES_TABLE"],
+        "products",
+    ),
+    (
+        "llm_settings",
+        "impresspress__llm__settings",
+        &["settings::TABLE"],
+        "llm",
     ),
 ];
 
@@ -253,6 +396,176 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "crypto.rs",
         ],
     ),
+    // The products doors. Three categories, and nothing else:
+    //
+    // 1. `blocks/products/repo/<module>.rs` — the door itself, where the
+    //    name is defined.
+    // 2. `blocks/products/migrations/mod.rs` — the migration runner's own
+    //    tests, which necessarily work below the repo layer (migration 020
+    //    repairs a row the repo layer can no longer produce), and which
+    //    assert against the DDL the `.sql` files next to them define.
+    // 3. `blocks/products/tests/*.rs` — fixture setup that seeds rows the
+    //    repo layer would not write (soft-deleted products, a pre-migration
+    //    stripe event) and asserts on the raw stored row.
+    //
+    // `blocks/products/stripe.rs` is the one production file on this list,
+    // for the reason its door already documents: `repo/stripe_events.rs`
+    // owns the name only, and the webhook pipeline that is the table's sole
+    // reader and writer predates the convention. Moving that pipeline behind
+    // the door is a separate change; the entry says so rather than hiding it.
+    (
+        "products",
+        &[
+            "blocks/products/repo/products.rs",
+            "blocks/products/migrations/mod.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/page_link_tests.rs",
+        ],
+    ),
+    (
+        "product_versions",
+        &[
+            "blocks/products/repo/product_versions.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "offers",
+        &[
+            "blocks/products/repo/offers.rs",
+            "blocks/products/migrations/mod.rs",
+            "blocks/products/tests/offer_management_tests.rs",
+            "blocks/products/tests/repo_tests.rs",
+        ],
+    ),
+    (
+        "offer_components",
+        &[
+            "blocks/products/repo/offer_components.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "payment_links",
+        &[
+            "blocks/products/repo/payment_links.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "checkout_presets",
+        &[
+            "blocks/products/repo/checkout_presets.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "purchases",
+        &[
+            "blocks/products/repo/purchases.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/purchase_tests.rs",
+            "blocks/products/tests/repo_tests.rs",
+            "blocks/products/tests/seller_governance_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "line_items",
+        &[
+            "blocks/products/repo/purchases.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/purchase_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "refunds",
+        &[
+            "blocks/products/repo/refunds.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "disputes",
+        &[
+            "blocks/products/repo/disputes.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "entitlements",
+        &[
+            "blocks/products/repo/entitlements.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "subscriptions",
+        &[
+            "blocks/products/repo/subscriptions.rs",
+            "blocks/products/tests/repo_tests.rs",
+        ],
+    ),
+    (
+        "subscription_items",
+        &[
+            "blocks/products/repo/subscription_items.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "seller_accounts",
+        &[
+            "blocks/products/repo/seller_accounts.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "provider_operations",
+        &[
+            "blocks/products/repo/provider_operations.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    (
+        "stripe_events",
+        &[
+            "blocks/products/repo/stripe_events.rs",
+            "blocks/products/migrations/mod.rs",
+            // category 4: the webhook pipeline that predates the convention
+            "blocks/products/stripe.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    ("products_variables", &["blocks/products/repo/variables.rs"]),
+    ("groups", &["blocks/products/repo/groups.rs"]),
+    ("types", &["blocks/products/repo/types.rs"]),
+    (
+        "group_templates",
+        &["blocks/products/repo/group_templates.rs"],
+    ),
+    (
+        "product_templates",
+        &[
+            "blocks/products/repo/product_templates.rs",
+            "blocks/products/migrations/mod.rs",
+        ],
+    ),
+    // The llm settings door. The door itself plus the migration runner's
+    // own tests, which assert that the embedded DDL creates the table and
+    // its index — reading the name back from the constant they are testing
+    // would make them tautological. The block declares no `collections(..)`
+    // (its schema is materialised by its migrations, and `mod.rs` says so),
+    // so no other non-test file has to name the table.
+    (
+        "llm_settings",
+        &[
+            "blocks/llm/repo/settings.rs",
+            "blocks/llm/migrations/mod.rs",
+        ],
+    ),
 ];
 
 #[test]
@@ -261,7 +574,7 @@ fn only_the_door_names_a_platform_table() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (door, literal, _ident, _qualifier) in TABLES {
+    for (door, literal, _consts, _qualifier) in TABLES {
         let allowed = LITERAL_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
@@ -420,6 +733,215 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("views", &["blocks/files/mod.rs"]),
+    // The products doors. Four categories:
+    //
+    // 1. `blocks/products/mod.rs` — `BlockInfo::collections(..)` plus the
+    //    curated `block-dev`-gated re-export list that lets
+    //    `blocks::dev::data_snapshot` name every collection this block
+    //    declares without retyping a literal. Advisory declarations, not
+    //    queries; the same reason `blocks/admin/mod.rs` and
+    //    `blocks/files/mod.rs` are listed above. Every products door needs
+    //    it.
+    // 2. `blocks/dev/data_snapshot.rs` — the export allowlist/exclusion
+    //    bookkeeping and the `DataSnapshot` JSON keys. Its reads go through
+    //    a generic `db::list_all(ctx, table, ..)` over the allowlist and its
+    //    writes through `seed::import`; already listed for the platform
+    //    doors above for exactly this.
+    // 3. `blocks/products/tests/*.rs` — fixtures that seed or assert on raw
+    //    rows, and fault injectors (`FailingDbOpContext`) that name the
+    //    table so the injected failure lands on the query under test.
+    // 4. Two production files that pass the constant to a shared helper
+    //    rather than building a query on it: `handlers/group.rs` and
+    //    `handlers/types.rs` hand `repo::{groups,types}::TABLE` to
+    //    `blocks/crud.rs`'s generic `list_page` / `create_record` /
+    //    `update_record` / `delete_record` / `verify_owner` /
+    //    `{get,update,delete}_owned`, whose table name always comes from the
+    //    caller (the same property that made `crud.rs` carry an
+    //    `// audit-allow-file:` pragma for the WRAP audit). Folding those
+    //    into per-table repo functions moves the HTTP error mapping `crud`
+    //    encapsulates and is a separate change. `blocks/products/stripe.rs`
+    //    is the fifth, for the reason `repo/stripe_events.rs` documents.
+    //
+    // `repo/purchases.rs` and `repo/subscriptions.rs` are on their own
+    // lists: their constants are named `PURCHASES_TABLE`,
+    // `LINE_ITEMS_TABLE` and `SUBSCRIPTIONS_TABLE` rather than `TABLE`, so
+    // the door's own uses match the scan.
+    (
+        "products",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/offer_management_tests.rs",
+            "blocks/products/tests/offer_pricing_tests.rs",
+            "blocks/products/tests/repo_tests.rs",
+            "blocks/products/tests/seller_governance_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "product_versions",
+        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+    ),
+    (
+        "offers",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/offer_pricing_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "offer_components",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/offer_pricing_tests.rs",
+        ],
+    ),
+    (
+        "payment_links",
+        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+    ),
+    (
+        "checkout_presets",
+        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+    ),
+    (
+        "purchases",
+        &[
+            "blocks/products/repo/purchases.rs",
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/page_link_tests.rs",
+            "blocks/products/tests/provider_tests.rs",
+            "blocks/products/tests/storefront_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "line_items",
+        &[
+            "blocks/products/repo/purchases.rs",
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+        ],
+    ),
+    (
+        "refunds",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/purchase_tests.rs",
+        ],
+    ),
+    (
+        "disputes",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/purchase_tests.rs",
+        ],
+    ),
+    (
+        "entitlements",
+        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+    ),
+    (
+        "subscriptions",
+        &[
+            "blocks/products/repo/subscriptions.rs",
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "subscription_items",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "seller_accounts",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+            "blocks/products/tests/page_link_tests.rs",
+            "blocks/products/tests/provider_tests.rs",
+            "blocks/products/tests/repo_tests.rs",
+            "blocks/products/tests/seller_governance_tests.rs",
+            "blocks/products/tests/stripe_tests.rs",
+        ],
+    ),
+    (
+        "provider_operations",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/provider_tests.rs",
+        ],
+    ),
+    (
+        "stripe_events",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            // category 4: the webhook pipeline that predates the convention
+            "blocks/products/stripe.rs",
+        ],
+    ),
+    (
+        "products_variables",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/offer_pricing_tests.rs",
+        ],
+    ),
+    (
+        "groups",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            // category 4: `crud::{list_page, create_record, update_record,
+            // delete_record, verify_owner, *_owned}` take the table from the
+            // caller
+            "blocks/products/handlers/group.rs",
+            "blocks/products/tests/page_link_tests.rs",
+            "blocks/products/tests/repo_tests.rs",
+        ],
+    ),
+    (
+        "types",
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            // category 4, same as groups
+            "blocks/products/handlers/types.rs",
+        ],
+    ),
+    (
+        "group_templates",
+        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+    ),
+    (
+        "product_templates",
+        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+    ),
+    // The llm settings door. One entry, and it is a fault injector: the
+    // block's `config_tests` name the table so `FailingDbOpContext` lands on
+    // the settings read under test rather than on some other table's. Same
+    // category as `blocks/admin/pages/blocks.rs` and `blocks/files/quota.rs`
+    // above.
+    ("llm_settings", &["blocks/llm/mod.rs"]),
 ];
 
 #[test]
@@ -428,7 +950,7 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (door, _, ident, qualifier) in TABLES {
+    for (door, _, consts, qualifier) in TABLES {
         let allowed = IDENT_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
@@ -437,12 +959,14 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
         let offenders: Vec<&String> = sources
             .iter()
             .filter(|(path, _)| !matches_allowlist(path, allowed))
-            .filter(|(_, src)| src.contains(qualifier) && src.contains(ident))
+            .filter(|(_, src)| {
+                src.contains(qualifier) && consts.iter().any(|ident| src.contains(ident))
+            })
             .map(|(path, _)| path)
             .collect();
         assert!(
             offenders.is_empty(),
-            "these files name the table via `{ident}` instead of calling a \
+            "these files name the table via one of `{consts:?}` instead of calling a \
              `{door}` repo function: {offenders:?}"
         );
     }
@@ -456,7 +980,7 @@ fn no_allowlist_entry_is_dead() {
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
         .collect();
-    for (door, literal, ident, _qualifier) in TABLES {
+    for (door, literal, consts, _qualifier) in TABLES {
         for (m, files) in LITERAL_ALLOWED {
             if m != door {
                 continue;
@@ -477,11 +1001,10 @@ fn no_allowlist_entry_is_dead() {
             }
             for entry in *files {
                 assert!(
-                    sources
-                        .iter()
-                        .any(|(path, src)| path == entry && src.contains(ident)),
-                    "`{entry}` is allowlisted for `{ident}` but no longer names it; \
-                     drop the entry rather than leaving a standing exemption"
+                    sources.iter().any(|(path, src)| path == entry
+                        && consts.iter().any(|ident| src.contains(ident))),
+                    "`{entry}` is allowlisted for `{consts:?}` but no longer names any \
+                     of them; drop the entry rather than leaving a standing exemption"
                 );
             }
         }
@@ -490,12 +1013,16 @@ fn no_allowlist_entry_is_dead() {
 
 /// The old names are gone: `admin_schema.rs` and the `blocks::admin`
 /// re-exports (`BLOCK_SETTINGS_TABLE`, `WRAP_GRANTS_TABLE`,
-/// `REQUEST_LOGS_TABLE`, `USER_ROLES_TABLE`, `admin::VARIABLES_TABLE`). A
-/// file that still imports one would compile only by redefining it, which
-/// is the same bypass wearing the old name. (`VARIABLES_TABLE` on its own
-/// is not banned: products aliases its own `repo::variables::TABLE` to it.)
+/// `REQUEST_LOGS_TABLE`, `USER_ROLES_TABLE`, `admin::VARIABLES_TABLE`),
+/// `messages_schema.rs` (the module that existed so `blocks/llm` could read
+/// the messages block's tables by name), and `PRODUCTS_TABLE` (the products
+/// table's pre-`repo` constant, previously guarded by the block's own door
+/// test). A file that still imports one would compile only by redefining it,
+/// which is the same bypass wearing the old name. (`VARIABLES_TABLE` on its
+/// own is not banned: products aliases its own `repo::variables::TABLE` to
+/// it.)
 #[test]
-fn the_old_admin_table_names_are_gone() {
+fn the_old_table_name_shims_are_gone() {
     let sources: Vec<(String, String)> = crate_sources()
         .into_iter()
         .map(|(path, src)| (path, code_only(&src)))
@@ -508,6 +1035,9 @@ fn the_old_admin_table_names_are_gone() {
         "REQUEST_LOGS_TABLE",
         "USER_ROLES_TABLE",
         "admin::VARIABLES_TABLE",
+        "messages_schema::",
+        "mod messages_schema",
+        "PRODUCTS_TABLE",
     ] {
         let offenders: Vec<&String> = sources
             .iter()
@@ -517,6 +1047,46 @@ fn the_old_admin_table_names_are_gone() {
         assert!(
             offenders.is_empty(),
             "`{old}` still referenced in {offenders:?}"
+        );
+    }
+}
+
+/// The messages block's two tables are named only inside the messages block.
+///
+/// This is the cross-block half of the same rule, and it is stated as a
+/// boundary rather than as a door because `messages/rest.rs` genuinely hands
+/// `service::{CONTEXTS_TABLE, ENTRIES_TABLE}` to shared helpers
+/// (`crud::verify_owner`, `crud::delete_record`) whose table comes from the
+/// caller — allowlisting that file would buy a standing exemption for
+/// nothing, since the risk this test exists for was never inside the block.
+/// It was `blocks/llm/pages.rs`, which listed both tables with `db::list`
+/// while the same block wrote through `ctx.call_block`. That direct read is
+/// the whole reason `messages_schema.rs` existed and the reason
+/// `messages/mod.rs` had to grant `impresspress/llm` read access to two
+/// tables it does not own.
+#[test]
+fn the_messages_tables_are_named_only_inside_the_messages_block() {
+    let sources: Vec<(String, String)> = crate_sources()
+        .into_iter()
+        .map(|(path, src)| (path, code_only(&src)))
+        .collect();
+    for name in [
+        "impresspress__messages__contexts",
+        "impresspress__messages__entries",
+        "CONTEXTS_TABLE",
+        "ENTRIES_TABLE",
+    ] {
+        let offenders: Vec<&String> = sources
+            .iter()
+            .filter(|(path, _)| !path.starts_with("blocks/messages/"))
+            .filter(|(_, src)| src.contains(name))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`{name}` belongs to `impresspress/messages`; these files outside \
+             `blocks/messages/` name it instead of calling the block through \
+             `ctx.call_block(\"impresspress/messages\", ..)`: {offenders:?}"
         );
     }
 }

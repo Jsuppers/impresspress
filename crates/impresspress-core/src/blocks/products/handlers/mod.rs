@@ -37,31 +37,16 @@ mod types;
 
 pub(in crate::blocks::products) use dispatch::{run, user_products_enabled};
 pub(in crate::blocks::products) use product::{is_owned_by, name_like_filter, write_error};
-use wafer_core::clients::database as db;
-use wafer_run::context::Context;
 
-/// Product groups (categories / bundles) table.
-pub(crate) const GROUPS_TABLE: &str = "impresspress__products__groups";
-
-/// Product types (taxonomy) table.
-pub(crate) const TYPES_TABLE: &str = "impresspress__products__types";
-
-/// Reusable group template definitions (admin-authored).
-pub(crate) const GROUP_TEMPLATES_TABLE: &str = "impresspress__products__group_templates";
-
-/// Reusable product template definitions (admin-authored).
-pub(crate) const PRODUCT_TEMPLATES_TABLE: &str = "impresspress__products__product_templates";
-
-/// Look up the id of the `name = "default"` template seeded by the Init
-/// lifecycle. Used so client-omitted `*_template_id` fields default to a
-/// real (UUIDv7) row instead of the literal integer `1` (which never
-/// matches the seeded record and breaks any FK constraint).
-///
-/// Shared by [`product::handle_user_create_product`] (`product_template_id`)
-/// and [`group::handle_user_create_group`] (`group_template_id`).
-async fn default_template_id(ctx: &dyn Context, table: &str) -> Option<String> {
-    db::get_by_field(ctx, table, "name", serde_json::json!("default"))
-        .await
-        .ok()
-        .map(|r| r.id)
-}
+// The four table constants that used to live here (`GROUPS_TABLE`,
+// `TYPES_TABLE`, `GROUP_TEMPLATES_TABLE`, `PRODUCT_TEMPLATES_TABLE`) moved to
+// `repo::{groups, types, group_templates, product_templates}`, where the rest
+// of the block's tables have always been declared. They were the last four
+// products tables with no door, which is what let the SSR pages and the stats
+// endpoint build their own queries against them; `tests/repo_door.rs` now
+// covers all of them.
+//
+// `default_template_id(ctx, table)` went with them. It took the table as a
+// parameter and so was a query no module owned; it is
+// `repo::group_templates::default_id` and `repo::product_templates::default_id`
+// now, one per table.

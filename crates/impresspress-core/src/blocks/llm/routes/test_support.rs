@@ -53,24 +53,64 @@ pub(super) fn stub_block() -> LlmBlock {
 }
 
 /// One recorded `call_block` invocation on a [`RecordingCtx`].
-pub(super) struct RecordedCall {
-    pub(super) block_name: String,
-    pub(super) msg: Message,
-    pub(super) body: Vec<u8>,
+pub(in crate::blocks::llm) struct RecordedCall {
+    pub(in crate::blocks::llm) block_name: String,
+    pub(in crate::blocks::llm) msg: Message,
+    pub(in crate::blocks::llm) body: Vec<u8>,
 }
 
 /// Context that records every `call_block` invocation (block name, message,
 /// drained input body) and answers with a canned OK JSON body. `clone_arc`
 /// hands out a handle sharing the same call log, so a test can inspect calls
 /// made through the cloned Arc.
+///
+/// [`RecordingCtx::answering`] scripts a reply for one request path, which is
+/// what lets a test drive a handler that reads another block through
+/// `call_block` — the chat page, which lists threads and entries from
+/// `impresspress/messages`.
+/// A scripted reply: any request whose path contains the fragment is
+/// answered with the body.
+struct ScriptedAnswer {
+    resource_fragment: String,
+    body: Vec<u8>,
+}
+
 #[derive(Clone, Default)]
-pub(super) struct RecordingCtx {
+pub(in crate::blocks::llm) struct RecordingCtx {
     calls: Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+    answers: Arc<std::sync::Mutex<Vec<ScriptedAnswer>>>,
 }
 
 impl RecordingCtx {
-    pub(super) fn calls(&self) -> std::sync::MutexGuard<'_, Vec<RecordedCall>> {
+    pub(in crate::blocks::llm) fn calls(&self) -> std::sync::MutexGuard<'_, Vec<RecordedCall>> {
         self.calls.lock().expect("call log lock")
+    }
+
+    /// Answer any request whose path contains `resource_fragment` with
+    /// `body`. First match wins; anything unscripted keeps the canned
+    /// `{"id":"entry-1"}` reply.
+    pub(in crate::blocks::llm) fn answering(
+        self,
+        resource_fragment: &str,
+        body: serde_json::Value,
+    ) -> Self {
+        self.answers
+            .lock()
+            .expect("answers lock")
+            .push(ScriptedAnswer {
+                resource_fragment: resource_fragment.to_string(),
+                body: serde_json::to_vec(&body).expect("scripted body"),
+            });
+        self
+    }
+
+    fn scripted(&self, path: &str) -> Option<Vec<u8>> {
+        self.answers
+            .lock()
+            .expect("answers lock")
+            .iter()
+            .find(|answer| path.contains(answer.resource_fragment.as_str()))
+            .map(|answer| answer.body.clone())
     }
 }
 
@@ -78,12 +118,13 @@ impl RecordingCtx {
 impl Context for RecordingCtx {
     async fn call_block(&self, block_name: &str, msg: Message, input: InputStream) -> OutputStream {
         let body = input.collect_to_bytes().await;
+        let scripted = self.scripted(msg.path());
         self.calls().push(RecordedCall {
             block_name: block_name.to_string(),
             msg,
             body,
         });
-        OutputStream::respond(br#"{"id":"entry-1"}"#.to_vec())
+        OutputStream::respond(scripted.unwrap_or_else(|| br#"{"id":"entry-1"}"#.to_vec()))
     }
     fn is_cancelled(&self) -> bool {
         false
@@ -96,7 +137,7 @@ impl Context for RecordingCtx {
     }
 }
 
-pub(super) fn admin_msg(action: &str, path: &str) -> Message {
+pub(in crate::blocks::llm) fn admin_msg(action: &str, path: &str) -> Message {
     let mut m = Message::new(format!("{action}:{path}"));
     m.set_meta(wafer_run::META_REQ_ACTION, action);
     m.set_meta(wafer_run::META_REQ_RESOURCE, path);
@@ -105,7 +146,7 @@ pub(super) fn admin_msg(action: &str, path: &str) -> Message {
     m
 }
 
-pub(super) fn user_msg(action: &str, path: &str) -> Message {
+pub(in crate::blocks::llm) fn user_msg(action: &str, path: &str) -> Message {
     let mut m = Message::new(format!("{action}:{path}"));
     m.set_meta(wafer_run::META_REQ_ACTION, action);
     m.set_meta(wafer_run::META_REQ_RESOURCE, path);
@@ -119,7 +160,7 @@ pub(super) fn user_msg(action: &str, path: &str) -> Message {
 /// message to a handler directly. Panics when no row matches: a test that
 /// sends an unroutable path would otherwise exercise the handler's
 /// "missing id" branch by accident.
-pub(super) fn routed(mut msg: Message) -> Message {
+pub(in crate::blocks::llm) fn routed(mut msg: Message) -> Message {
     let route = crate::endpoint_match::dispatch(&mut msg, crate::blocks::llm::ROUTES);
     assert!(
         route.is_some(),

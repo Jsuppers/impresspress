@@ -196,7 +196,6 @@ crate::impresspress_feature_block! {
     pub struct MessagesBlock;
     name: "impresspress/messages",
     info: |_this| {
-        use wafer_block::types::ResourceGrant;
         use wafer_run::CollectionSchema;
 
         BlockInfo::new(
@@ -207,15 +206,14 @@ crate::impresspress_feature_block! {
         )
         .instance_mode(InstanceMode::Singleton)
         .requires(vec!["wafer-run/database".into()])
-        // The chat UI in `impresspress/llm` reads thread + entry rows directly
-        // via the typed `db::list` client (see `llm/pages.rs`). Without these
-        // grants the WRAP runtime denies the call and the chat sidebar
-        // renders empty in production. Surfaced by the static
-        // `scripts/audit-wrap-grants.sh` audit (PR #84).
-        .grants(vec![
-            ResourceGrant::read("impresspress/llm", service::CONTEXTS_TABLE),
-            ResourceGrant::read("impresspress/llm", service::ENTRIES_TABLE),
-        ])
+        // No `grants(..)`. The two `ResourceGrant::read("impresspress/llm", ..)`
+        // entries that used to be here existed only because the chat UI read
+        // this block's tables directly with `db::list`. It reaches them
+        // through `ctx.call_block("impresspress/messages", ..)` now, and a
+        // call_block callee's own database access is authorized as itself
+        // (`RuntimeContext::dispatch_call` makes this block's `node_id` the
+        // `caller_id` of the database sub-context), so WRAP Rule 3 —
+        // "the caller owns the resource" — admits it with no grant at all.
         // Advisory table list — admin "Database tables" discovery + the WRAP
         // grant-UI read only `CollectionSchema::name`. The schema itself
         // (columns, indexes, FKs) lives solely in the block's hand-authored

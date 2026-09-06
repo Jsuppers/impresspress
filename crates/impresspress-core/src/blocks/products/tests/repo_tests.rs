@@ -447,3 +447,279 @@ async fn stale_offer_write_cannot_land_after_status_transition() {
         .unwrap();
     assert_eq!(record.data["stripe_price_id"], "");
 }
+
+// ---------------------------------------------------------------------------
+// The doors that replaced `pages.rs`'s hand-rolled reads
+// ---------------------------------------------------------------------------
+//
+// `handlers/sellers.rs` and `pages.rs` each ran their own `db::list_all` +
+// `to_contract` and their own `db::get` + `to_contract` against the seller
+// accounts table, and their own `owner_id` filter against the products table.
+// These tests pin that the shared functions answer what the duplicated reads
+// answered, so a future divergence between the JSON API and the SSR page is a
+// test failure rather than a support ticket.
+
+async fn seed_seller_account(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    user_id: &str,
+    fee_basis_points: i64,
+) {
+    seed(
+        ctx,
+        repo::seller_accounts::TABLE,
+        id,
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!(user_id)),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!(format!("acct_{id}")),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("requirements_json".to_string(), serde_json::json!("{}")),
+            (
+                "fee_basis_points".to_string(),
+                serde_json::json!(fee_basis_points),
+            ),
+        ]),
+    )
+    .await;
+}
+
+/// `list_contracts` is exactly the read both call sites hand-rolled: every
+/// row of the table, each through `to_contract`.
+#[tokio::test]
+async fn list_contracts_equals_every_row_through_to_contract() {
+    let ctx = ctx().await;
+    seed_seller_account(&ctx, "seller_a", "user_a", 250).await;
+    seed_seller_account(&ctx, "seller_b", "user_b", 100).await;
+
+    let expected: Vec<_> = db::list_all(&ctx, repo::seller_accounts::TABLE, vec![])
+        .await
+        .expect("rows")
+        .iter()
+        .map(repo::seller_accounts::to_contract)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("projections");
+
+    let actual = repo::seller_accounts::list_contracts(&ctx)
+        .await
+        .expect("list_contracts");
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), 2, "both seeded rows are listed");
+}
+
+/// A row that cannot be projected fails the whole read. A seller list quietly
+/// missing the one account that would not decode is a governance surface that
+/// hides an account, which is worse than an error.
+#[tokio::test]
+async fn list_contracts_fails_when_a_row_cannot_be_projected() {
+    let ctx = ctx().await;
+    seed_seller_account(&ctx, "seller_ok", "user_ok", 250).await;
+    // 10_001 basis points is over the 100% ceiling `to_contract` enforces.
+    seed_seller_account(&ctx, "seller_bad", "user_bad", 10_001).await;
+
+    let error = repo::seller_accounts::list_contracts(&ctx)
+        .await
+        .expect_err("an unprojectable row fails the read");
+    assert_eq!(error.code, wafer_run::ErrorCode::Internal);
+}
+
+/// `get_contract` projects the row and reports a missing id as `Ok(None)`, so
+/// a caller answers 404 without matching on an error code.
+#[tokio::test]
+async fn get_contract_projects_the_row_and_answers_none_for_a_missing_id() {
+    let ctx = ctx().await;
+    seed_seller_account(&ctx, "seller_a", "user_a", 250).await;
+
+    let record = db::get(&ctx, repo::seller_accounts::TABLE, "seller_a")
+        .await
+        .expect("row");
+    let expected = repo::seller_accounts::to_contract(&record).expect("projection");
+
+    assert_eq!(
+        repo::seller_accounts::get_contract(&ctx, "seller_a")
+            .await
+            .expect("get_contract"),
+        Some(expected)
+    );
+    assert_eq!(
+        repo::seller_accounts::get_contract(&ctx, "seller_missing")
+            .await
+            .expect("get_contract"),
+        None
+    );
+}
+
+async fn seed_owned_product(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    owner_id: &str,
+    deleted: bool,
+) {
+    let mut data = HashMap::from([
+        ("name".to_string(), serde_json::json!("Listing")),
+        ("slug".to_string(), serde_json::json!(id)),
+        ("status".to_string(), serde_json::json!("active")),
+        ("approval_status".to_string(), serde_json::json!("approved")),
+        ("owner_kind".to_string(), serde_json::json!("user")),
+        ("owner_id".to_string(), serde_json::json!(owner_id)),
+        ("created_by".to_string(), serde_json::json!(owner_id)),
+    ]);
+    if deleted {
+        data.insert(
+            "deleted_at".to_string(),
+            serde_json::json!("2026-09-06T00:00:00Z"),
+        );
+    }
+    seed(ctx, repo::products::TABLE, id, data).await;
+}
+
+/// A seller's catalog is their LIVE products only, and only theirs; the
+/// suspension read is the same owner filter over both sets. The two are one
+/// word apart, which is why they are pinned together.
+#[tokio::test]
+async fn list_owned_by_is_the_owners_live_products_only() {
+    let ctx = ctx().await;
+    seed_owned_product(&ctx, "p_live", "user_a", false).await;
+    seed_owned_product(&ctx, "p_deleted", "user_a", true).await;
+    seed_owned_product(&ctx, "p_other", "user_b", false).await;
+
+    let live: Vec<String> = repo::products::list_owned_by(&ctx, "user_a")
+        .await
+        .expect("live")
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(live, vec!["p_live".to_string()]);
+
+    let mut every: Vec<String> = repo::products::list_owned_by_including_deleted(&ctx, "user_a")
+        .await
+        .expect("every")
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    every.sort();
+    assert_eq!(every, vec!["p_deleted".to_string(), "p_live".to_string()]);
+}
+
+async fn seed_group(ctx: &crate::test_support::TestContext, id: &str, name: &str, user_id: &str) {
+    seed(
+        ctx,
+        repo::groups::TABLE,
+        id,
+        HashMap::from([
+            ("name".to_string(), serde_json::json!(name)),
+            ("user_id".to_string(), serde_json::json!(user_id)),
+        ]),
+    )
+    .await;
+}
+
+/// `groups::count` counts and `groups::list_by_name` sorts by name and honors
+/// the caller's filters — the four reads (admin overview, admin stats, admin
+/// groups page, a user's own groups) that used to be four separate queries
+/// spread over three files.
+#[tokio::test]
+async fn groups_count_and_list_by_name_replace_the_hand_rolled_reads() {
+    use crate::util::RecordExt;
+
+    let ctx = ctx().await;
+    seed_group(&ctx, "grp_z", "Zebra", "user_a").await;
+    seed_group(&ctx, "grp_a", "Alpaca", "user_a").await;
+    seed_group(&ctx, "grp_m", "Manatee", "user_b").await;
+
+    assert_eq!(repo::groups::count(&ctx, &[]).await.expect("count"), 3);
+
+    let all: Vec<String> = repo::groups::list_by_name(&ctx, vec![], 100)
+        .await
+        .expect("list")
+        .records
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(
+        all,
+        vec![
+            "grp_a".to_string(),
+            "grp_m".to_string(),
+            "grp_z".to_string()
+        ],
+        "name-ascending"
+    );
+
+    let owned = vec![wafer_block::db::Filter {
+        field: "user_id".to_string(),
+        operator: wafer_block::db::FilterOp::Equal,
+        value: serde_json::json!("user_a"),
+    }];
+    let mine: Vec<String> = repo::groups::list_by_name(&ctx, owned, 1000)
+        .await
+        .expect("list")
+        .records
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(mine, vec!["grp_a".to_string(), "grp_z".to_string()]);
+
+    assert_eq!(
+        repo::groups::get(&ctx, "grp_a")
+            .await
+            .expect("group")
+            .str_field("name"),
+        "Alpaca"
+    );
+}
+
+/// A failing groups count is an error, not a zero. Both surfaces that count
+/// groups render a headline number, and a fabricated `0` reads as real
+/// business data during an outage — the admin overview page additionally
+/// trips its "Add your first product" empty state on it. The count moved
+/// behind `repo::groups::count`, which returns `Result`; these two are the
+/// call sites that have to keep propagating it.
+#[tokio::test]
+async fn a_failing_groups_count_fails_the_stats_endpoint_and_the_overview_page() {
+    use wafer_run::ErrorCode;
+
+    use crate::test_support::FailingDbOpContext;
+
+    let base = ctx().await;
+    seed_group(&base, "grp_a", "Alpaca", "").await;
+
+    // Both requests answer on a healthy context, so the assertions below
+    // cannot pass because the path stopped routing.
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    assert_eq!(
+        output_to_json(dispatch(&base, msg, input).await).await["total_groups"],
+        serde_json::json!(1)
+    );
+    let (msg, input) = admin_get_msg("/b/products/admin");
+    assert!(output_to_html(dispatch(&base, msg, input).await)
+        .await
+        .contains("Groups"));
+
+    let failing = FailingDbOpContext::new(base, vec![("database.count", repo::groups::TABLE)]);
+
+    assert_eq!(
+        repo::groups::count(&failing, &[])
+            .await
+            .expect_err("the outage surfaces")
+            .code,
+        wafer_run::ErrorCode::Internal
+    );
+
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    assert!(
+        output_is_error(dispatch(&failing, msg, input).await, ErrorCode::Internal).await,
+        "the stats endpoint must report the outage, not answer total_groups = 0"
+    );
+
+    let (msg, input) = admin_get_msg("/b/products/admin");
+    assert!(
+        output_is_error(dispatch(&failing, msg, input).await, ErrorCode::Internal).await,
+        "the admin overview page must report the outage, not render 0 groups"
+    );
+}
