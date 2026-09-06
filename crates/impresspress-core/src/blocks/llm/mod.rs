@@ -355,20 +355,26 @@ pub(super) async fn messages_create(
 /// Call the messages block to list entries in a context.
 ///
 /// Shared by the chat page's bootstrap carrier and the model-history builder.
-/// Still swallows its error into an empty list — that discipline (and
-/// `messages_create`'s `Option`) is T4, Phase 3.
+///
+/// It used to end in `.unwrap_or_default()`, and that is the swallow that let
+/// a dead read ship: when `util::block_request` put `path?query` into
+/// `req.resource`, this call matched no route and 404'd on every request, so
+/// the chat had no history and the sidebar was empty — and nothing failed.
+/// The two callers want different things from the error (the page renders it,
+/// the chat prelude refuses to prompt a paid provider with no history), so it
+/// is theirs to decide, not this function's to discard.
 pub(super) async fn messages_list(
     ctx: &dyn Context,
     original_msg: &Message,
     context_id: &str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, WaferError> {
     let resource = format!("/b/messages/api/contexts/{context_id}/entries?kind=message");
     let msg = crate::util::block_request("retrieve", "GET", &resource, original_msg);
 
     let out = ctx
         .call_block("impresspress/messages", msg, InputStream::empty())
         .await;
-    records_of(out, "entry list").await.unwrap_or_default()
+    records_of(out, "entry list").await
 }
 
 // ---------------------------------------------------------------------------
