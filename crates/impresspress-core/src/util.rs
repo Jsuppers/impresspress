@@ -265,6 +265,24 @@ pub fn enum_column_or<T: serde::de::DeserializeOwned>(
     enum_column(record, column)
 }
 
+/// An enum as the string it is stored, filtered and published as.
+///
+/// The counterpart of [`enum_column`], for the places a typed value has to
+/// go back out as text: a rendered badge, an `href` segment, a hidden form
+/// field the page's own JavaScript posts back. Serializing is what keeps
+/// those the same spelling the column holds without a per-variant label
+/// table beside the serde one to drift from it — the duplication
+/// `RefundReason::as_str` is the standing example of.
+pub fn wire_str<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        // Unreachable for the unit-variant enums this exists for; a type
+        // that serializes to something else has no single wire spelling to
+        // render and should not be asked for one.
+        _ => String::new(),
+    }
+}
+
 /// Get a field value as a string regardless of whether the DB returned it as string or number.
 pub fn field_as_string(record: &Record, key: &str) -> String {
     match record.data.get(key) {

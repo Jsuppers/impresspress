@@ -11,9 +11,12 @@ use super::{
     validation::{is_valid_bucket_name, is_valid_storage_key},
 };
 use crate::{
-    blocks::files::{
-        contracts::{ObjectInfoResponse, ObjectListResponse},
-        repo,
+    blocks::{
+        crud,
+        files::{
+            contracts::{ObjectInfoResponse, ObjectListResponse},
+            repo,
+        },
     },
     http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
 };
@@ -127,8 +130,7 @@ pub(in crate::blocks::files) async fn handle_get_object(
             let leading = crate::streaming::download_leading_meta(&content_type, &[]);
             crate::streaming::stream_download(stream, leading)
         }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Object not found"),
-        Err(e) => err_internal("Storage error", e),
+        Err(e) => crud::db_error(e, "Object not found", "Storage error"),
     }
 }
 
@@ -305,14 +307,14 @@ pub(in crate::blocks::files) async fn handle_delete_object(
     let blob_existed = match store::delete(ctx, bucket, key).await {
         Ok(()) => true,
         Err(e) if e.code == ErrorCode::NotFound => false,
-        Err(e) => return err_internal("Delete failed", e),
+        Err(e) => return crud::db_error_internal(e, "Delete failed"),
     };
 
     // The metadata cleanup is reported, never swallowed: a surviving row
     // keeps charging the uploader's quota for a blob that no longer exists.
     let rows_removed = match repo::objects::delete_by_bucket_key(ctx, bucket, key).await {
         Ok(rows) => rows,
-        Err(e) => return err_internal("Delete failed to clean up object metadata", e),
+        Err(e) => return crud::db_error_internal(e, "Delete failed to clean up object metadata"),
     };
 
     if !blob_existed && rows_removed == 0 {
@@ -327,8 +329,9 @@ mod integration_tests {
         super::test_helpers::{ctx_with_storage, seed_bucket, seed_object_row},
         *,
     };
-    use crate::test_support::{
-        auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
+    use crate::{
+        blocks::files::contracts::ObjectStatus,
+        test_support::{auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext},
     };
 
     /// A download served via `handle_get_object` must take the STREAMING
@@ -534,13 +537,13 @@ mod integration_tests {
 
     /// Fetch the single object-metadata row (asserting there is exactly
     /// one) and return its `(size, content_type, status)`.
-    async fn sole_object_row(ctx: &TestContext) -> (i64, String, String) {
+    async fn sole_object_row(ctx: &TestContext) -> (i64, String, ObjectStatus) {
         let rows = repo::objects::list_all(ctx)
             .await
             .expect("list object rows");
         assert_eq!(rows.len(), 1, "expected exactly one object metadata row");
         let row = &rows[0];
-        (row.size, row.content_type.clone(), row.status.clone())
+        (row.size, row.content_type.clone(), row.status)
     }
 
     /// CRUX regression (found by driving the live app): a browser `FormData`
@@ -598,7 +601,7 @@ mod integration_tests {
             "metadata size must be the extracted content length, not the envelope length"
         );
         assert_eq!(content_type, "text/html");
-        assert_eq!(status, "complete");
+        assert_eq!(status, ObjectStatus::Complete);
     }
 
     /// Non-multipart (raw body) uploads keep the existing behavior: the body
@@ -628,7 +631,7 @@ mod integration_tests {
         let (size, content_type, status) = sole_object_row(&ctx).await;
         assert_eq!(size, body.len() as i64);
         assert_eq!(content_type, "text/plain");
-        assert_eq!(status, "complete");
+        assert_eq!(status, ObjectStatus::Complete);
     }
 
     /// A multipart upload without `?key=` falls back to the file part's

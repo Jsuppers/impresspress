@@ -8,7 +8,7 @@ use super::{
     access::is_bucket_access_denied, params::extract_bucket_name, validation::is_valid_bucket_name,
 };
 use crate::{
-    blocks::files::repo,
+    blocks::{crud, files::repo},
     http::{err_bad_request, err_forbidden, err_internal, ok_json},
 };
 
@@ -103,7 +103,11 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
     match store::delete_folder(ctx, bucket).await {
         Ok(()) => {}
         Err(e) if e.code == ErrorCode::NotFound => {}
-        Err(e) => return err_internal("Failed to delete bucket", e),
+        // The tail is the one mapping even though the call is to STORAGE,
+        // not the database: the codes are the same set, and a
+        // `PermissionDenied` from the storage service is a refusal the
+        // caller can act on, not the 500 it used to ship as.
+        Err(e) => return crud::db_error_internal(e, "Failed to delete bucket"),
     }
 
     // Metadata cleanup is reported, never swallowed: surviving object rows
@@ -112,13 +116,13 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
     // bucket row is what the access check above reads, so keeping it until
     // everything else is clean is what lets the owner retry.
     if let Err(e) = repo::objects::delete_for_bucket(ctx, bucket).await {
-        return err_internal(
-            "Bucket deleted but its object records could not be removed",
+        return crud::db_error_internal(
             e,
+            "Bucket deleted but its object records could not be removed",
         );
     }
     if let Err(e) = repo::buckets::delete_by_name(ctx, bucket).await {
-        return err_internal("Bucket deleted but its record could not be removed", e);
+        return crud::db_error_internal(e, "Bucket deleted but its record could not be removed");
     }
     ok_json(&serde_json::json!({"deleted": true}))
 }

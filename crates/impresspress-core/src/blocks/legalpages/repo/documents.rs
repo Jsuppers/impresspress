@@ -17,8 +17,11 @@ use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use super::Page;
-use crate::util::{json_map, now_rfc3339, RecordExt};
+use super::{
+    super::contracts::{DocumentStatus, DocumentType},
+    Page,
+};
+use crate::util::{enum_column, json_map, now_rfc3339, RecordExt};
 
 /// Legal documents: one row per version of a `terms` / `privacy` document.
 pub const TABLE: &str = "impresspress__legalpages__documents";
@@ -32,14 +35,14 @@ pub const TABLE: &str = "impresspress__legalpages__documents";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DocumentRow {
     pub id: String,
-    /// `terms` or `privacy`.
-    pub doc_type: String,
+    /// Which document this is a version of.
+    pub doc_type: DocumentType,
     pub title: String,
     /// Markdown source, rendered by `markdown_to_html` on the way out.
     pub content: String,
-    /// `draft`, `published` or `archived`. Written only by
-    /// [`insert_published`], [`mark_published`] and [`mark_archived`].
-    pub status: String,
+    /// Written only by [`insert_published`], [`mark_published`] and
+    /// [`mark_archived`], none of which takes the value from a caller.
+    pub status: DocumentStatus,
     pub version: i64,
     pub created_by: String,
     /// RFC 3339 instant of the last publish; `None` for a row that has never
@@ -52,29 +55,32 @@ pub struct DocumentRow {
 impl DocumentRow {
     /// The one decode of a document row.
     ///
-    /// `version` goes through `RecordExt::i64_field`, which accepts both a
-    /// JSON number and a numeric string: rows created before migration 001
-    /// materialised the table through `ensure_table`, which gives every
-    /// column TEXT affinity.
-    pub fn from_record(rec: &Record) -> Self {
-        Self {
+    /// Fallible since `doc_type` and `status` became types: a stored value
+    /// outside either set is a data-integrity fault, and `util::enum_column`
+    /// reports it naming the row rather than letting a page render a
+    /// document that is neither terms nor privacy. `version` goes through
+    /// `RecordExt::i64_field`, which accepts both a JSON number and a
+    /// numeric string: rows created before migration 001 materialised the
+    /// table through `ensure_table`, which gives every column TEXT affinity.
+    pub fn from_record(rec: &Record) -> Result<Self, WaferError> {
+        Ok(Self {
             id: rec.id.clone(),
-            doc_type: rec.str_field("doc_type").to_string(),
+            doc_type: enum_column(rec, "doc_type")?,
             title: rec.str_field("title").to_string(),
             content: rec.str_field("content").to_string(),
-            status: rec.str_field("status").to_string(),
+            status: enum_column(rec, "status")?,
             version: rec.i64_field("version"),
             created_by: rec.str_field("created_by").to_string(),
             published_at: rec.opt_str_field("published_at"),
             created_at: rec.str_field("created_at").to_string(),
             updated_at: rec.str_field("updated_at").to_string(),
-        }
+        })
     }
 }
 
 /// A new draft, as [`insert_draft`] stores it.
 pub struct NewDraft<'a> {
-    pub doc_type: &'a str,
+    pub doc_type: DocumentType,
     pub title: &'a str,
     pub content: &'a str,
     /// Recorded as `created_by`.
@@ -84,7 +90,7 @@ pub struct NewDraft<'a> {
 /// A document published without ever having been a draft, as
 /// [`insert_published`] stores it.
 pub struct NewPublished<'a> {
-    pub doc_type: &'a str,
+    pub doc_type: DocumentType,
     pub title: &'a str,
     pub content: &'a str,
     pub version: i64,
@@ -105,21 +111,21 @@ pub struct PublishedContent<'a> {
 
 /// Every row of one document type. The first of the two filter shapes this
 /// table is ever queried by.
-fn of_type(doc_type: &str) -> Vec<Filter> {
+fn of_type(doc_type: DocumentType) -> Vec<Filter> {
     vec![Filter {
         field: "doc_type".to_string(),
         operator: FilterOp::Equal,
-        value: serde_json::Value::String(doc_type.to_string()),
+        value: serde_json::json!(doc_type),
     }]
 }
 
 /// Every row of one document type in one status. The second filter shape.
-fn of_type_with_status(doc_type: &str, status: &str) -> Vec<Filter> {
+fn of_type_with_status(doc_type: DocumentType, status: DocumentStatus) -> Vec<Filter> {
     let mut filters = of_type(doc_type);
     filters.push(Filter {
         field: "status".to_string(),
         operator: FilterOp::Equal,
-        value: serde_json::Value::String(status.to_string()),
+        value: serde_json::json!(status),
     });
     filters
 }
@@ -147,11 +153,12 @@ async fn first_matching(
         limit: 1,
         ..Default::default()
     };
-    Ok(db::list(ctx, TABLE, &opts)
+    db::list(ctx, TABLE, &opts)
         .await?
         .records
         .first()
-        .map(DocumentRow::from_record))
+        .map(DocumentRow::from_record)
+        .transpose()
 }
 
 /// One document by id; `None` when there is no such row.
@@ -161,7 +168,7 @@ async fn first_matching(
 /// the editor's save handler used to do (B10).
 pub async fn get(ctx: &dyn Context, id: &str) -> Result<Option<DocumentRow>, WaferError> {
     match db::get(ctx, TABLE, id).await {
-        Ok(record) => Ok(Some(DocumentRow::from_record(&record))),
+        Ok(record) => DocumentRow::from_record(&record).map(Some),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -171,17 +178,26 @@ pub async fn get(ctx: &dyn Context, id: &str) -> Result<Option<DocumentRow>, Waf
 /// legacy data that predates the one-published-row invariant.
 pub async fn find_published(
     ctx: &dyn Context,
-    doc_type: &str,
+    doc_type: DocumentType,
 ) -> Result<Option<DocumentRow>, WaferError> {
-    newest_by_version(ctx, of_type_with_status(doc_type, "published")).await
+    newest_by_version(
+        ctx,
+        of_type_with_status(doc_type, DocumentStatus::Published),
+    )
+    .await
 }
 
 /// The most recently edited draft of `doc_type`.
 pub async fn find_latest_draft(
     ctx: &dyn Context,
-    doc_type: &str,
+    doc_type: DocumentType,
 ) -> Result<Option<DocumentRow>, WaferError> {
-    first_matching(ctx, of_type_with_status(doc_type, "draft"), "updated_at").await
+    first_matching(
+        ctx,
+        of_type_with_status(doc_type, DocumentStatus::Draft),
+        "updated_at",
+    )
+    .await
 }
 
 /// The highest version recorded for `doc_type` in any status; `0` when the
@@ -189,7 +205,7 @@ pub async fn find_latest_draft(
 ///
 /// A read failure is an `Err`, not a `0`: answering `0` would make the next
 /// publish restart the type's version numbering at 1.
-pub async fn latest_version(ctx: &dyn Context, doc_type: &str) -> Result<i64, WaferError> {
+pub async fn latest_version(ctx: &dyn Context, doc_type: DocumentType) -> Result<i64, WaferError> {
     Ok(newest_by_version(ctx, of_type(doc_type))
         .await?
         .map_or(0, |row| row.version))
@@ -199,15 +215,17 @@ pub async fn latest_version(ctx: &dyn Context, doc_type: &str) -> Result<i64, Wa
 /// exists to resolve.
 pub async fn list_published(
     ctx: &dyn Context,
-    doc_type: &str,
+    doc_type: DocumentType,
 ) -> Result<Vec<DocumentRow>, WaferError> {
-    Ok(
-        db::list_all(ctx, TABLE, of_type_with_status(doc_type, "published"))
-            .await?
-            .iter()
-            .map(DocumentRow::from_record)
-            .collect(),
+    db::list_all(
+        ctx,
+        TABLE,
+        of_type_with_status(doc_type, DocumentStatus::Published),
     )
+    .await?
+    .iter()
+    .map(DocumentRow::from_record)
+    .collect()
 }
 
 /// One page of documents, most recently edited first, optionally narrowed to
@@ -218,7 +236,7 @@ pub async fn list_published(
 /// they last touched at the top.
 pub async fn list_page(
     ctx: &dyn Context,
-    doc_type: Option<&str>,
+    doc_type: Option<DocumentType>,
     page: i64,
     page_size: i64,
 ) -> Result<Page<DocumentRow>, WaferError> {
@@ -233,10 +251,7 @@ pub async fn list_page(
         skip_count: false,
         ..Default::default()
     };
-    Ok(Page::decode(
-        db::list(ctx, TABLE, &opts).await?,
-        DocumentRow::from_record,
-    ))
+    Page::decode(db::list(ctx, TABLE, &opts).await?, DocumentRow::from_record)
 }
 
 /// How many documents the table holds, in any status.
@@ -255,15 +270,13 @@ pub async fn insert_draft(ctx: &dyn Context, new: NewDraft<'_>) -> Result<Docume
         "doc_type": new.doc_type,
         "title": new.title,
         "content": new.content,
-        "status": "draft",
+        "status": DocumentStatus::Draft,
         "version": 1,
         "created_by": new.created_by,
         "created_at": now,
         "updated_at": now,
     }));
-    db::create(ctx, TABLE, data)
-        .await
-        .map(|rec| DocumentRow::from_record(&rec))
+    DocumentRow::from_record(&db::create(ctx, TABLE, data).await?)
 }
 
 /// Store a document that is published on creation — the shape a publish of a
@@ -285,16 +298,14 @@ pub async fn insert_published(
         "doc_type": new.doc_type,
         "title": new.title,
         "content": new.content,
-        "status": "published",
+        "status": DocumentStatus::Published,
         "version": new.version,
         "created_by": new.created_by,
         "created_at": new.now,
         "updated_at": new.now,
         "published_at": new.now,
     }));
-    db::create(ctx, TABLE, data)
-        .await
-        .map(|rec| DocumentRow::from_record(&rec))
+    DocumentRow::from_record(&db::create(ctx, TABLE, data).await?)
 }
 
 /// Replace a document's text, stamping `updated_at`. A `None` field is left
@@ -316,9 +327,7 @@ pub async fn update_content(
     if let Some(content) = content {
         data.insert("content".to_string(), serde_json::json!(content));
     }
-    db::update(ctx, TABLE, id, data)
-        .await
-        .map(|rec| DocumentRow::from_record(&rec))
+    DocumentRow::from_record(&db::update(ctx, TABLE, id, data).await?)
 }
 
 /// Publish `id` as `version`, stamping `published_at` and `updated_at` with
@@ -334,7 +343,7 @@ pub async fn mark_published(
     text: PublishedContent<'_>,
 ) -> Result<DocumentRow, WaferError> {
     let mut data = json_map(serde_json::json!({
-        "status": "published",
+        "status": DocumentStatus::Published,
         "version": version,
         "published_at": now,
         "updated_at": now,
@@ -345,9 +354,7 @@ pub async fn mark_published(
     if let Some(content) = text.content {
         data.insert("content".to_string(), serde_json::json!(content));
     }
-    db::update(ctx, TABLE, id, data)
-        .await
-        .map(|rec| DocumentRow::from_record(&rec))
+    DocumentRow::from_record(&db::update(ctx, TABLE, id, data).await?)
 }
 
 /// Retire a previously published document.
@@ -360,7 +367,7 @@ pub async fn mark_archived(ctx: &dyn Context, id: &str) -> Result<(), WaferError
         ctx,
         TABLE,
         id,
-        json_map(serde_json::json!({ "status": "archived" })),
+        json_map(serde_json::json!({ "status": DocumentStatus::Archived })),
     )
     .await
     .map(|_| ())
@@ -403,13 +410,13 @@ mod tests {
     #[test]
     fn from_record_decodes_the_whole_row() {
         assert_eq!(
-            DocumentRow::from_record(&record(&[])),
+            DocumentRow::from_record(&record(&[])).expect("the row decodes"),
             DocumentRow {
                 id: "doc-1".to_string(),
-                doc_type: "terms".to_string(),
+                doc_type: DocumentType::Terms,
                 title: "Terms of Service".to_string(),
                 content: "# Terms".to_string(),
-                status: "published".to_string(),
+                status: DocumentStatus::Published,
                 version: 4,
                 created_by: "admin_1".to_string(),
                 published_at: Some("2026-09-01T00:00:00Z".to_string()),
@@ -423,7 +430,8 @@ mod tests {
     /// gives every column TEXT affinity, so `version` reads back as a string.
     #[test]
     fn version_survives_text_storage() {
-        let row = DocumentRow::from_record(&record(&[("version", json!("7"))]));
+        let row =
+            DocumentRow::from_record(&record(&[("version", json!("7"))])).expect("the row decodes");
         assert_eq!(row.version, 7);
     }
 
@@ -434,10 +442,20 @@ mod tests {
     fn an_unpublished_row_has_no_published_at() {
         let mut absent = record(&[]);
         absent.data.remove("published_at");
-        assert_eq!(DocumentRow::from_record(&absent).published_at, None);
+        assert_eq!(
+            DocumentRow::from_record(&absent)
+                .expect("the row decodes")
+                .published_at,
+            None
+        );
 
         let null = record(&[("published_at", json!(null))]);
-        assert_eq!(DocumentRow::from_record(&null).published_at, None);
+        assert_eq!(
+            DocumentRow::from_record(&null)
+                .expect("the row decodes")
+                .published_at,
+            None
+        );
     }
 
     /// The row must mirror the table, or serializing it into the published
@@ -460,7 +478,8 @@ mod tests {
         columns.sort();
 
         let serialized =
-            serde_json::to_value(DocumentRow::from_record(&record(&[]))).expect("row serializes");
+            serde_json::to_value(DocumentRow::from_record(&record(&[])).expect("the row decodes"))
+                .expect("row serializes");
         let mut fields: Vec<String> = serialized
             .as_object()
             .expect("a row is a JSON object")

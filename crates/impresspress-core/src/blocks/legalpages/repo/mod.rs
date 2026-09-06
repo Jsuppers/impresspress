@@ -49,12 +49,23 @@ pub struct Page<T> {
 impl<T> Page<T> {
     /// Decode a `RecordList` into a page of rows with the table's own
     /// `from_record`. The only place a listing crosses from records to rows.
-    fn decode(list: RecordList, from_record: fn(&Record) -> T) -> Self {
-        Self {
-            rows: list.records.iter().map(from_record).collect(),
+    ///
+    /// Fallible because `from_record` is: a row whose `doc_type` or `status`
+    /// holds a value the contract does not define stops the listing rather
+    /// than reaching a page as something it is not.
+    fn decode(
+        list: RecordList,
+        from_record: fn(&Record) -> Result<T, wafer_run::WaferError>,
+    ) -> Result<Self, wafer_run::WaferError> {
+        Ok(Self {
+            rows: list
+                .records
+                .iter()
+                .map(from_record)
+                .collect::<Result<Vec<T>, _>>()?,
             total: list.total_count,
             page: list.page,
             page_size: list.page_size,
-        }
+        })
     }
 }

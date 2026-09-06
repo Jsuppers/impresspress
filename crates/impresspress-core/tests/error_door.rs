@@ -60,24 +60,15 @@
 /// `vector/pages.rs`, `tickets/{rest,pages}.rs` and
 /// `dev/generations_api.rs`, the last through the `dev::no_store_db_error`
 /// its entry called for.
+///
+/// PR 3 took its ten: `messages/{rest,pages}.rs`, `legalpages/{mod,pages}.rs`,
+/// `files/{share,cloud}.rs`, `files/storage/{objects,buckets}.rs`,
+/// `llm/mod.rs` and `llm/routes/providers.rs`. Four of those are STORAGE
+/// calls rather than database ones (`files/share.rs` and both
+/// `files/storage/*`); the codes are the same set and the mapping is the
+/// same sentence, so they go through the same door. Only the nine products
+/// entries below are left, all for PR 4.
 const STILL_HAND_MAPPED: &[(&str, &str)] = &[
-    // ---- PR 3: content blocks ----
-    (
-        "files/storage/buckets.rs",
-        "PR 3 (a STORAGE call, not a database one: `NotFound` is a no-op and \
-         the tail is `err_internal`, so a denied delete_folder ships as 500)",
-    ),
-    (
-        "legalpages/pages.rs",
-        "PR 3 (the SSR editor's document read)",
-    ),
-    (
-        "legalpages/mod.rs",
-        "PR 3 (the two remaining PATCH/DELETE tails)",
-    ),
-    ("files/share.rs", "PR 3"),
-    ("files/cloud.rs", "PR 3 (two share lookups)"),
-    ("files/storage/objects.rs", "PR 3 (the object read)"),
     // ---- PR 4: products enums (the same files move for the enum work) ----
     ("products/pages.rs", "PR 4 (three SSR reads)"),
     ("products/purchase.rs", "PR 4 (five purchase lookups)"),

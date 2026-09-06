@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use wafer_core::clients::{crypto, storage as store};
-use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
+use wafer_run::{context::Context, Message, OutputStream};
 
 use super::repo;
 use crate::{
@@ -152,7 +152,6 @@ pub async fn handle_direct_access(
             );
             crate::streaming::stream_download(stream, leading)
         }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("File not found"),
-        Err(e) => err_internal("Storage error", e),
+        Err(e) => crud::db_error(e, "File not found", "Storage error"),
     }
 }

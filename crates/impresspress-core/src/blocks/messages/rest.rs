@@ -27,29 +27,6 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-/// A filter query parameter whose values are a closed set, as the enum that
-/// defines them — or the 400 a value outside the set turns into.
-///
-/// An absent parameter is `None` (no filter). A value the enum does not
-/// define is refused rather than handed to the database as a literal that
-/// matches no row: `?role=bot` used to answer `200` with an empty page,
-/// which reads as "this context has no entries" and is a different sentence
-/// from "there is no such role". serde's own unknown-variant text names the
-/// variants, so the 400 lists them without this module spelling them a
-/// second time.
-fn enum_query<T: serde::de::DeserializeOwned>(
-    msg: &Message,
-    param: &str,
-) -> Result<Option<T>, OutputStream> {
-    let raw = msg.query(param);
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_value::<T>(serde_json::Value::String(raw.to_string()))
-        .map(Some)
-        .map_err(|e| err_bad_request(&format!("Invalid `{param}` filter: {e}")))
-}
-
 /// The row `{id}` names in `table`, once the caller's ownership of it is
 /// verified, or the 400 / 401 / 404 to send instead.
 ///
@@ -163,11 +140,11 @@ pub async fn list_entries(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let (_, page_size, offset) = msg.pagination_params(100);
     let params = ListEntriesParams {
-        kind: match enum_query(msg, "kind") {
+        kind: match crud::enum_query(msg, "kind") {
             Ok(kind) => kind,
             Err(resp) => return resp,
         },
-        role: match enum_query(msg, "role") {
+        role: match crud::enum_query(msg, "role") {
             Ok(role) => role,
             Err(resp) => return resp,
         },

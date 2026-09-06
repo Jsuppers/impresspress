@@ -15,7 +15,7 @@ use super::{
 use crate::{
     blocks::crud,
     ui::{self, shell::Crumb},
-    util::{enum_column_or, RecordExt},
+    util::{enum_column_or, wire_str, RecordExt},
 };
 
 /// Render one entry.
@@ -70,20 +70,6 @@ pub fn entry_card(record: &db::Record) -> Result<Markup, WaferError> {
             p .message-card__content { (content) }
         }
     })
-}
-
-/// An enum as the string it is stored and published as.
-///
-/// The badges have always shown the wire spelling (`message`, `assistant`),
-/// capitalised by CSS. Serializing is what keeps that true without a
-/// per-variant label table beside the serde one to drift from it.
-fn wire_str<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(text)) => text,
-        // Unreachable: every caller is a unit-variant enum with
-        // `rename_all = "snake_case"`, which serializes to a string.
-        _ => String::new(),
-    }
 }
 
 pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
