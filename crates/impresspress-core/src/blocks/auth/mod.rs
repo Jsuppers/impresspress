@@ -551,6 +551,15 @@ pub(crate) mod helpers {
         );
         access_claims.insert("jti".to_string(), serde_json::Value::String(jti));
         access_claims.insert("iss".to_string(), serde_json::Value::String(issuer.clone()));
+        // [B12] The rotation family, carried on the access token as well as
+        // the refresh token. It is what tells the userportal sessions page
+        // which listed device is the one making the request; reading it off
+        // the request's own cookie instead would let any caller paint the
+        // "current session" badge on another user's row.
+        access_claims.insert(
+            "family".to_string(),
+            serde_json::Value::String(family.clone()),
+        );
         access_claims.insert(
             repo::users::AUTH_VERSION_FIELD.to_string(),
             serde_json::json!(auth_version),
@@ -827,6 +836,45 @@ pub(crate) mod helpers {
             .await
             .unwrap()
             .id
+        }
+
+        /// The access token carries the same `family` the refresh token does.
+        /// Without it the userportal cannot tell which listed device is the
+        /// one making the request, and `current_session_family` would have to
+        /// read an unverified value off the cookie.
+        #[tokio::test]
+        async fn minted_access_token_carries_the_refresh_family() {
+            let ctx = ctx_with_crypto().await;
+            let uid = seed_user(&ctx).await;
+
+            let Ok((access_token, refresh_token, family)) = generate_tokens(
+                &ctx,
+                &uid,
+                "mint@example.com",
+                &["user".to_string()],
+                "password",
+                None,
+            )
+            .await
+            else {
+                panic!("mint tokens failed")
+            };
+
+            let access = crypto::verify(&ctx, &access_token)
+                .await
+                .expect("verify access token");
+            let refresh = crypto::verify(&ctx, &refresh_token)
+                .await
+                .expect("verify refresh token");
+            assert_eq!(
+                access.get("family").and_then(|v| v.as_str()),
+                Some(family.as_str()),
+                "the access token must carry the family the refresh token anchors"
+            );
+            assert_eq!(
+                refresh.get("family").and_then(|v| v.as_str()),
+                Some(family.as_str())
+            );
         }
 
         #[tokio::test]

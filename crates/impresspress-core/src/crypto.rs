@@ -7,8 +7,9 @@
 //! the native runtime, impresspress-cloudflare, and impresspress-browser. Call them
 //! directly; this module no longer mirrors them.
 //!
-//! What remains here is genuinely impresspress-specific policy: extracting auth
-//! meta from a `Bearer` token in the HTTP pipeline — issuer check (SEC-038),
+//! What remains here is genuinely impresspress-specific policy: verifying an
+//! access token and extracting auth meta from a `Bearer` token in the HTTP
+//! pipeline — issuer check (SEC-038),
 //! JWT blocklist (SEC-042), role mapping, and derived-key-only verification
 //! (per-block HKDF from the auth-ui block id; the master-secret fallback was
 //! removed — F40).
@@ -28,26 +29,174 @@ pub const META_AUTH_JTI: &str = "auth.jti";
 /// `expires_at` (only needs to live as long as the original JWT).
 pub const META_AUTH_EXP: &str = "auth.exp";
 
+/// Meta key holding the access JWT's `family` — the refresh-rotation family
+/// this login belongs to — when present. Read by the userportal sessions page
+/// to mark the row for the device making the request. Set only from a token
+/// [`verify_access_token`] accepted, so it can never be spoofed by a caller
+/// putting a family on the request itself.
+pub const META_AUTH_FAMILY: &str = "auth.family";
+
+/// The claims of a verified access token, in the shape both consumers need.
+///
+/// Produced by [`verify_access_token`] and nowhere else: a value of this type
+/// means the token's signature, `type`, issuer, blocklist status and
+/// `auth_version` have all been checked. `roles` is already joined the way the
+/// meta wants it, and the string fields are empty (not absent) when the claim
+/// was missing, because every reader treats the two the same.
+#[derive(Debug, Clone)]
+pub struct AccessClaims {
+    /// `sub` — the user id. `None` when the token carries no subject.
+    pub sub: Option<String>,
+    /// `email`, or `None` when absent.
+    pub email: Option<String>,
+    /// The `roles` array joined with `,`, falling back to the legacy `role`
+    /// scalar, or `""` when neither is present.
+    pub roles: String,
+    /// `jti` (SEC-042), or `""`.
+    pub jti: String,
+    /// `exp` in UNIX seconds. Always present in practice — verification uses
+    /// [`JwtExpPolicy::Required`] — but typed as an `Option` because the claim
+    /// is read back out of the decoded map rather than out of the policy.
+    pub exp: Option<i64>,
+    /// `family` — the refresh-rotation family this login belongs to, or `""`
+    /// on a token minted before the claim existed.
+    pub family: String,
+}
+
+/// Verify an access token and return its claims, or `None` if it does not
+/// authenticate.
+///
+/// The single gate every access JWT passes through, in this order:
+///
+/// 1. HS256 signature against the `impresspress/auth-ui`-derived key
+///    (`HKDF(jwt_secret, AUTH_UI_BLOCK_ID)`), with
+///    [`JwtExpPolicy::Required`]: impresspress's mints all stamp `exp`, so an
+///    exp-less token was not produced by this stack and accepting one would
+///    create a forever-valid credential. The former master-secret fallback is
+///    gone (F40) — production tokens are always signed by auth-ui through the
+///    crypto service's `sign_for(caller_id, ..)`.
+/// 2. Allow-list on `type`: only an explicit `"access"` authenticates. A
+///    refresh token — or any token whose `type` is missing or something else
+///    — is rejected. A denylist would silently accept a future token type
+///    minted with the same key.
+/// 3. [SEC-038] `iss` equals `expected_iss` (the deployment's canonical
+///    issuer, `WAFER_RUN_SHARED__FRONTEND_URL`), so a leaked dev/staging
+///    secret cannot authenticate against production. An empty `expected_iss`
+///    disables the check — defensive, for a misconfigured deployment that
+///    would otherwise silently 401 every request.
+/// 4. [SEC-042] `jti` is not blocklisted. A blocklisted token was logged out
+///    before its natural `exp`; it is treated exactly as if it had expired.
+/// 5. [P2c] The embedded `auth_version` is not behind the user's stored
+///    value — a password change, disable, soft-delete or role change (all of
+///    which call `blocks::auth::bump_auth_version`) invalidates every
+///    already-issued access JWT here instead of waiting out its expiry. A
+///    missing claim defaults to `0`, matching the column's default, so tokens
+///    minted before the claim existed keep working until the first bump. The
+///    read goes through `current_auth_version`'s short-lived cache, so this
+///    costs no DB round trip per request. It fails closed: a lookup error
+///    rejects the token rather than risk accepting a stale credential.
+///
+/// Both consumers call this and nothing else: [`extract_auth_meta`] (the
+/// pipeline's per-request meta population) and
+/// `blocks::auth::service::AuthServiceImpl` (the `auth@v1` credential the
+/// framework auth block authenticates).
+pub async fn verify_access_token(
+    ctx: &dyn wafer_run::context::Context,
+    token: &str,
+    jwt_secret: &str,
+    expected_iss: &str,
+) -> Option<AccessClaims> {
+    // Session tokens (access + refresh) are minted by the `impresspress/auth-ui`
+    // block — login, signup, bootstrap, refresh, and the oauth callback all
+    // hit handlers dispatched in that block's context, and the crypto handler
+    // at wafer-core/src/interfaces/crypto/handler.rs routes CRYPTO_SIGN
+    // through `sign_for(caller_id, ...)`. So the verify key is HKDF-derived
+    // from `AUTH_UI_BLOCK_ID`, not `AUTH_BLOCK_ID`.
+    let derived_secret = primitives::derive_block_key(
+        jwt_secret.as_bytes(),
+        crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+    );
+    let claims =
+        primitives::jwt_verify(token, derived_secret.as_bytes(), JwtExpPolicy::Required).ok()?;
+
+    let token_type = claims.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if token_type != "access" {
+        return None;
+    }
+
+    if !expected_iss.is_empty() {
+        let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+        if iss != expected_iss {
+            return None;
+        }
+    }
+
+    let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
+    if !jti.is_empty() && crate::blocks::auth::repo::jwt_blocklist::contains(ctx, jti).await {
+        return None;
+    }
+
+    let sub = claims.get("sub").and_then(|v| v.as_str());
+    if let Some(uid) = sub {
+        let claim_version = claims
+            .get(crate::blocks::auth::repo::users::AUTH_VERSION_FIELD)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        match crate::blocks::auth::current_auth_version(ctx, uid).await {
+            Ok(current) if claim_version < current => return None,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %uid,
+                    "verify_access_token: auth_version lookup failed, rejecting token: {e}"
+                );
+                return None;
+            }
+        }
+    }
+
+    // Roles: prefer the structured `roles` array, fall back to the legacy
+    // `role` scalar.
+    let roles = if let Some(roles_arr) = claims.get("roles").and_then(|v| v.as_array()) {
+        roles_arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        claims
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    Some(AccessClaims {
+        sub: sub.map(str::to_owned),
+        email: claims
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        roles,
+        jti: jti.to_string(),
+        exp: claims.get("exp").and_then(|v| v.as_i64()),
+        family: claims
+            .get("family")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
 /// Extract JWT claims from an `Authorization: Bearer <token>` header and
 /// set auth meta fields on the message.
 ///
 /// Sets: `auth.user_id`, `auth.user_email`, `auth.user_roles`, and (when
-/// present in the JWT) `auth.jti` + `auth.exp`.
+/// present in the JWT) `auth.jti`, `auth.exp` and `auth.family`.
 ///
-/// Silently does nothing if the token is invalid, fails the issuer
-/// check (SEC-038), is blocklisted (SEC-042), or isn't an `access`
-/// token (allow-list: only `type == "access"` authenticates) — the
-/// request continues as unauthenticated.
-///
-/// Verification uses [`JwtExpPolicy::Required`]: impresspress's token mints all
-/// stamp `exp`, so an exp-less token was not produced by this stack and
-/// accepting one would create a forever-valid credential.
-///
-/// [SEC-038] `expected_iss` is the deployment's canonical issuer
-/// (`WAFER_RUN_SHARED__FRONTEND_URL`). Tokens whose `iss` claim doesn't
-/// match are rejected as if they were unsigned — prevents a leaked
-/// signing secret in dev/staging from authenticating against production
-/// (and vice versa).
+/// Silently does nothing when [`verify_access_token`] refuses the token —
+/// the request continues as unauthenticated. Every rejection rule and its
+/// reasoning lives there; this function is the meta-setting shell over it.
 pub async fn extract_auth_meta(
     ctx: &dyn wafer_run::context::Context,
     auth_header: &str,
@@ -60,119 +209,30 @@ pub async fn extract_auth_meta(
     let Some(token) = auth_header.strip_prefix("Bearer ") else {
         return;
     };
-
-    // Session tokens (access + refresh) are minted by the `impresspress/auth-ui`
-    // block — login, signup, bootstrap, refresh, and the oauth callback all
-    // hit handlers dispatched in that block's context, and the crypto handler
-    // at wafer-core/src/interfaces/crypto/handler.rs routes CRYPTO_SIGN
-    // through `sign_for(caller_id, ...)`. So the verify key is HKDF-derived
-    // from `AUTH_UI_BLOCK_ID`, not `AUTH_BLOCK_ID`.
-    //
-    // Production session tokens are ALWAYS signed with the auth-ui-derived key
-    // (the crypto service's `sign_for(AUTH_UI_BLOCK_ID, ...)`). There is no
-    // legitimate token signed with the raw master secret, so we verify against
-    // the derived key only. The former master-secret fallback existed for test
-    // fixtures and once masked a real regression (PR #170 silently reverted the
-    // derived-key swap because tests only exercised the fallback branch).
-    let derived_secret = primitives::derive_block_key(
-        jwt_secret.as_bytes(),
-        crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
-    );
-    let Ok(claims) =
-        primitives::jwt_verify(token, derived_secret.as_bytes(), JwtExpPolicy::Required)
-    else {
+    let Some(claims) = verify_access_token(ctx, token, jwt_secret, expected_iss).await else {
         return;
     };
 
-    // Allow-list: only an explicit "access" token authenticates. A refresh
-    // token — or any token whose `type` is missing or not "access" — is
-    // rejected. A denylist ("reject only refresh") would silently accept any
-    // future token type minted with the same key.
-    let token_type = claims.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if token_type != "access" {
-        return;
-    }
-
-    // [SEC-038] Require iss claim to match the deployment's expected issuer.
-    // An empty expected_iss disables the check (defensive — should never be
-    // empty in production, but a misconfigured deployment shouldn't 401
-    // every request silently).
-    if !expected_iss.is_empty() {
-        let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
-        if iss != expected_iss {
-            return;
-        }
-    }
-
-    // SEC-042: reject blocklisted JWTs after structural validation. A
-    // blocklisted token was logged out before its natural exp; treat it
-    // exactly as if it had expired (request continues as unauthenticated,
-    // never as a different user).
-    let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
-    if !jti.is_empty() && crate::blocks::auth::repo::jwt_blocklist::contains(ctx, jti).await {
-        return;
-    }
-
-    // [P2c] Reject a token whose embedded `auth_version` is behind the
-    // user's current stored value — a password change, disable,
-    // soft-delete, or role change (all of which call
-    // `crate::blocks::auth::bump_auth_version`) invalidates every
-    // already-issued access JWT this way instead of waiting out the
-    // token's natural expiry. A missing claim defaults to `0`, matching the
-    // `auth_version` column's default, so tokens minted before this claim
-    // existed keep authenticating until the first bump. Reads through
-    // `current_auth_version`'s short-lived cache rather than the users
-    // table directly, so this doesn't cost a DB read on every request.
-    // Fails closed: a lookup error rejects the token rather than risk
-    // accepting a stale/compromised credential.
-    let sub = claims.get("sub").and_then(|v| v.as_str());
-    if let Some(uid) = sub {
-        let claim_version = claims
-            .get(crate::blocks::auth::repo::users::AUTH_VERSION_FIELD)
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        match crate::blocks::auth::current_auth_version(ctx, uid).await {
-            Ok(current) if claim_version < current => return,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    user_id = %uid,
-                    "extract_auth_meta: auth_version lookup failed, rejecting token: {e}"
-                );
-                return;
-            }
-        }
-    }
-
-    if let Some(sub) = sub {
+    if let Some(sub) = claims.sub.as_deref() {
         msg.set_meta(META_AUTH_USER_ID, sub);
     }
-    if let Some(email) = claims.get("email").and_then(|v| v.as_str()) {
+    if let Some(email) = claims.email.as_deref() {
         msg.set_meta(META_AUTH_USER_EMAIL, email);
     }
+    // Always stamped, even empty: `util::is_admin` and the WebMCP tier filter
+    // read this key, and an absent key and an empty one must not differ.
+    msg.set_meta(META_AUTH_USER_ROLES, &claims.roles);
 
-    // Roles: prefer the structured `roles` array, fall back to the legacy
-    // `role` scalar. Avoids allocating a `String` when the array is absent
-    // or the legacy field is the only one present.
-    if let Some(roles_arr) = claims.get("roles").and_then(|v| v.as_array()) {
-        let joined = roles_arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        msg.set_meta(META_AUTH_USER_ROLES, &joined);
-    } else if let Some(role) = claims.get("role").and_then(|v| v.as_str()) {
-        msg.set_meta(META_AUTH_USER_ROLES, role);
-    } else {
-        msg.set_meta(META_AUTH_USER_ROLES, "");
+    // Stash jti + exp so logout can read them without re-verifying the JWT,
+    // and the family so the userportal can mark the calling device.
+    if !claims.jti.is_empty() {
+        msg.set_meta(META_AUTH_JTI, &claims.jti);
     }
-
-    // Stash jti + exp so logout can read them without re-verifying the JWT.
-    if !jti.is_empty() {
-        msg.set_meta(META_AUTH_JTI, jti);
-    }
-    if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
+    if let Some(exp) = claims.exp {
         msg.set_meta(META_AUTH_EXP, exp.to_string());
+    }
+    if !claims.family.is_empty() {
+        msg.set_meta(META_AUTH_FAMILY, &claims.family);
     }
 }
 
@@ -262,6 +322,154 @@ mod tests {
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
         );
         primitives::jwt_sign(claims, Duration::from_secs(ttl_secs), derived.as_bytes())
+            .expect("test jwt_sign")
+    }
+
+    /// `verify_access_token` is the one place an access JWT is checked;
+    /// `extract_auth_meta` is a meta-setting shell over it and
+    /// `AuthServiceImpl::extract_creds` calls the same function. These pin
+    /// the shared contract directly rather than through the meta side effect.
+    #[tokio::test]
+    async fn verify_access_token_accepts_a_minted_access_jwt() {
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let secret = "test-secret";
+        let token = sign_access_jwt(secret, "user-a", Some("jti-1"), 3600);
+        let claims = verify_access_token(&ctx, &token, secret, "")
+            .await
+            .expect("a freshly minted access token must verify");
+        assert_eq!(claims.sub.as_deref(), Some("user-a"));
+        assert_eq!(claims.jti, "jti-1");
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_rejects_a_refresh_jwt() {
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let master = "test-secret";
+        let derived = primitives::derive_block_key(
+            master.as_bytes(),
+            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+        );
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), serde_json::json!("user-a"));
+        claims.insert("type".to_string(), serde_json::json!("refresh"));
+        let token =
+            primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes()).unwrap();
+        assert!(verify_access_token(&ctx, &token, master, "")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_rejects_a_foreign_issuer() {
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let secret = "test-secret";
+        let token = sign_access_jwt_with(secret, |claims| {
+            claims.insert("sub".to_string(), serde_json::json!("user-a"));
+            claims.insert("iss".to_string(), serde_json::json!("https://elsewhere"));
+        });
+        assert!(verify_access_token(&ctx, &token, secret, "https://here")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_rejects_a_blocklisted_jti() {
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let secret = "test-secret";
+        let token = sign_access_jwt(secret, "user-a", Some("jti-gone"), 3600);
+        crate::blocks::auth::repo::jwt_blocklist::insert(
+            &ctx,
+            crate::blocks::auth::repo::jwt_blocklist::NewBlocklistEntry {
+                jti: "jti-gone",
+                user_id: "user-a",
+                expires_at: "2099-01-01T00:00:00Z",
+            },
+        )
+        .await
+        .expect("insert blocklist row");
+        assert!(verify_access_token(&ctx, &token, secret, "")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_rejects_a_stale_auth_version() {
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let secret = "test-secret";
+        let user = crate::blocks::auth::repo::users::insert(
+            &ctx,
+            crate::blocks::auth::repo::users::NewUser {
+                email: "stale@example.com".into(),
+                display_name: "Stale".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed user");
+        crate::blocks::auth::bump_auth_version(&ctx, &user.id)
+            .await
+            .expect("bump");
+
+        // Token minted before the bump: auth_version 0 against a stored 1.
+        let uid = user.id.clone();
+        let token = sign_access_jwt_with(secret, |claims| {
+            claims.insert("sub".to_string(), serde_json::json!(uid));
+            claims.insert(
+                crate::blocks::auth::repo::users::AUTH_VERSION_FIELD.to_string(),
+                serde_json::json!(0),
+            );
+        });
+        assert!(verify_access_token(&ctx, &token, secret, "")
+            .await
+            .is_none());
+    }
+
+    /// The current-session badge reads the family off the *verified* token,
+    /// so the claim has to reach the message as meta.
+    #[tokio::test]
+    async fn extract_auth_meta_sets_the_family_from_the_verified_token() {
+        use wafer_run::Message;
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let secret = "test-secret";
+        let token = sign_access_jwt_with(secret, |claims| {
+            claims.insert("sub".to_string(), serde_json::json!("user-a"));
+            claims.insert("family".to_string(), serde_json::json!("fam-42"));
+        });
+        let mut msg = Message::new("http.request");
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        assert_eq!(msg.get_meta(META_AUTH_FAMILY), "fam-42");
+    }
+
+    /// A token with no `family` claim leaves the meta empty rather than
+    /// stamping a blank value that a reader could mistake for a match.
+    #[tokio::test]
+    async fn extract_auth_meta_leaves_the_family_empty_when_the_token_has_none() {
+        use wafer_run::Message;
+        let ctx = crate::test_support::TestContext::with_auth().await;
+        let secret = "test-secret";
+        let token = sign_access_jwt(secret, "user-a", None, 3600);
+        let mut msg = Message::new("http.request");
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        assert_eq!(msg.get_meta(META_AUTH_FAMILY), "");
+    }
+
+    /// `sign_access_jwt` with arbitrary extra claims. `type` is always
+    /// `"access"`; the caller adds `sub` and whatever else the case needs.
+    fn sign_access_jwt_with(
+        secret: &str,
+        fill: impl FnOnce(&mut HashMap<String, serde_json::Value>),
+    ) -> String {
+        let mut claims = HashMap::new();
+        claims.insert("type".to_string(), serde_json::json!("access"));
+        fill(&mut claims);
+        let derived = primitives::derive_block_key(
+            secret.as_bytes(),
+            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+        );
+        primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
             .expect("test jwt_sign")
     }
 
