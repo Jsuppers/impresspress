@@ -977,13 +977,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
     if !seller_currencies.is_empty() && !seller_currencies.contains(&default_currency) {
         default_currency = seller_currencies[0].clone();
     }
-    let automatic_tax = wafer_core::clients::config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX",
-        "false",
-    )
-    .await
-        == "true";
+    let automatic_tax = super::stripe::automatic_tax_enabled(ctx).await;
     let configured_country = wafer_core::clients::config::get_default(
         ctx,
         "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",

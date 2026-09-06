@@ -25,6 +25,7 @@ use wafer_run::{context::Context, InputStream, OutputStream};
 pub use wafer_run::{ConfigVar, InputType};
 
 use crate::{
+    config_vars::is_truthy,
     http::{err_bad_request, err_internal, ok_json},
     util::{is_sensitive_key, validate_url_value, MASKED_VALUE},
 };
@@ -114,7 +115,7 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
         InputType::Toggle => html! {
             div .form-group {
                 label .form-checkbox {
-                    input type="checkbox" name=(var.key) checked[value == "true"];
+                    input type="checkbox" name=(var.key) checked[is_truthy(value)];
                     (label)
                 }
                 @if !var.description.is_empty() {

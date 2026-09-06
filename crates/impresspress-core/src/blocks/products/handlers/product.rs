@@ -853,13 +853,12 @@ pub(super) async fn handle_duplicate_product(ctx: &dyn Context, msg: &Message) -
 // --- User's own products ---
 
 async fn seller_moderation_required(ctx: &dyn Context) -> bool {
-    config::get_default(
+    crate::config_vars::get_bool(
         ctx,
         "IMPRESSPRESS__PRODUCTS__SELLER_MODERATION_REQUIRED",
-        "true",
+        true,
     )
     .await
-        == "true"
 }
 
 pub(super) async fn handle_user_list_products(ctx: &dyn Context, msg: &Message) -> OutputStream {

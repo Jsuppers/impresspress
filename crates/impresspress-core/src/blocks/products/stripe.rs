@@ -561,11 +561,15 @@ pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStrea
     handle_offer_checkout(ctx, msg, request, &stripe_key, &stripe_api_version).await
 }
 
-fn configured_bool(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// Whether Stripe automatic tax is on by default for new offers.
+///
+/// One reader for `IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX`: the checkout and
+/// Payment-Link money paths read it here, and so does the product wizard
+/// (`pages::product_wizard`), which used to compare the raw value against
+/// `"true"` — so `=1` turned tax on at checkout while the wizard drew the
+/// toggle off.
+pub(in crate::blocks::products) async fn automatic_tax_enabled(ctx: &dyn Context) -> bool {
+    crate::config_vars::get_bool(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", false).await
 }
 
 async fn issue_receipt_token(ctx: &dyn Context) -> Result<(String, String, String), WaferError> {
@@ -990,9 +994,7 @@ async fn handle_offer_checkout(
 
     let owner_is_user = product.str_field("owner_kind") == "user";
     let (seller_account_id, stripe_account_id, fee_basis_points) = if owner_is_user {
-        let user_selling =
-            config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false").await;
-        if !configured_bool(&user_selling) {
+        if !super::handlers::user_products_enabled(ctx).await {
             return err_not_found("Offer not found");
         }
         let owner_id = product.str_field("owner_id");
@@ -1166,9 +1168,7 @@ async fn handle_offer_checkout(
         return err_internal_no_cause("Checkout order could not be claimed");
     }
 
-    let automatic_tax_config =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", "false").await;
-    let automatic_tax = offer.checkout.automatic_tax || configured_bool(&automatic_tax_config);
+    let automatic_tax = offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await;
     let country = platform_country(ctx).await;
     let stripe_body = match build_offer_checkout_form(
         &offer,
@@ -1319,9 +1319,7 @@ async fn payment_link_seller_context(
     if product.str_field("owner_kind") != "user" {
         return Ok((String::new(), String::new(), 0));
     }
-    let user_selling =
-        config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false").await;
-    if !configured_bool(&user_selling) {
+    if !super::handlers::user_products_enabled(ctx).await {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "user product selling is disabled",
@@ -2346,8 +2344,6 @@ pub(crate) async fn create_payment_link(
         fee_basis_points,
     )
     .await?;
-    let automatic_tax_config =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", "false").await;
     let country = platform_country(ctx).await;
     let body = payment_link_form(
         &offer,
@@ -2356,7 +2352,7 @@ pub(crate) async fn create_payment_link(
         &pending.managed.id,
         &preset_id,
         after_completion_url,
-        offer.checkout.automatic_tax || configured_bool(&automatic_tax_config),
+        offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await,
         &country.to_ascii_uppercase(),
         fee_minor,
         fee_basis_points,

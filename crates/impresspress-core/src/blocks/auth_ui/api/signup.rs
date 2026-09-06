@@ -131,8 +131,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // Check if email verification is required
     let require_verification =
-        config::get_default(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "false").await;
-    let require_verification = require_verification == "true" || require_verification == "1";
+        crate::config_vars::get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false).await;
 
     // Generate verification token if needed
     let verification_token = if require_verification {

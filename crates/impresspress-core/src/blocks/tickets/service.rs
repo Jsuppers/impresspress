@@ -617,18 +617,12 @@ async fn expiry_for(ctx: &dyn Context, status: TicketStatus) -> String {
 }
 
 async fn public_submissions_enabled(ctx: &dyn Context) -> bool {
-    matches!(
-        config::get_default(
-            ctx,
-            "IMPRESSPRESS__TICKETS__PUBLIC_SUBMISSIONS_ENABLED",
-            "false",
-        )
-        .await
-        .trim()
-        .to_ascii_lowercase()
-        .as_str(),
-        "true" | "1" | "yes" | "on"
+    crate::config_vars::get_bool(
+        ctx,
+        "IMPRESSPRESS__TICKETS__PUBLIC_SUBMISSIONS_ENABLED",
+        false,
     )
+    .await
 }
 
 fn new_reference() -> String {

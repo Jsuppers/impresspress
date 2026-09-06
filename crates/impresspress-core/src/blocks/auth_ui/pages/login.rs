@@ -18,10 +18,8 @@ use crate::{
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx);
-    let allow_signup = ctx
-        .config_get("WAFER_RUN_SHARED__ALLOW_SIGNUP")
-        .unwrap_or("true")
-        == "true";
+    let allow_signup =
+        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await;
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
     // Validate redirect — only allow relative paths (prevent open redirect)
     let redirect = if is_safe_local_redirect(&raw_redirect) {
@@ -50,10 +48,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // full credential triple (CLIENT_ID + CLIENT_SECRET + REDIRECT_URL) is
     // present in env. Avoids rendering a "Continue with GitHub" button that
     // would 4xx as soon as it's clicked.
-    let oauth_enabled = ctx
-        .config_get("WAFER_RUN_SHARED__ENABLE_OAUTH")
-        .unwrap_or("false")
-        == "true";
+    let oauth_enabled =
+        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", false).await;
     let oauth_providers: Vec<&'static str> = if oauth_enabled {
         ["github", "google", "microsoft"]
             .iter()
@@ -140,6 +136,64 @@ mod tests {
 
     use super::handle;
     use crate::test_support::{output_html, TestContext};
+
+    /// The page and the API must answer "is signup allowed?" the same way.
+    ///
+    /// `WAFER_RUN_SHARED__ALLOW_SIGNUP=1` opened the signup API
+    /// (`auth::helpers::signup_allowed` accepted `"true"` or `"1"`) while
+    /// this page compared against `"true"` alone and hid the link — so the
+    /// only route to a form that works was to already know the URL.
+    #[tokio::test]
+    async fn signup_link_and_signup_api_read_the_same_truth_table() {
+        for enabled in ["1", "true", "YES", " on "] {
+            let mut ctx = TestContext::new().await;
+            ctx.set_config("WAFER_RUN_SHARED__ALLOW_SIGNUP", enabled);
+            let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
+            assert!(
+                crate::blocks::auth::helpers::signup_allowed(&ctx).await,
+                "the signup API must accept {enabled:?}"
+            );
+            assert!(
+                html.contains("/b/auth/signup"),
+                "the signup link must be rendered for {enabled:?}: {html}"
+            );
+        }
+        for disabled in ["0", "false", "", "bogus"] {
+            let mut ctx = TestContext::new().await;
+            ctx.set_config("WAFER_RUN_SHARED__ALLOW_SIGNUP", disabled);
+            let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
+            assert!(
+                !crate::blocks::auth::helpers::signup_allowed(&ctx).await,
+                "the signup API must refuse {disabled:?}"
+            );
+            assert!(
+                !html.contains("/b/auth/signup"),
+                "the signup link must be hidden for {disabled:?}: {html}"
+            );
+        }
+    }
+
+    /// The same divergence on the OAuth flag: `=1` let `oauth/start.rs`
+    /// begin the flow while this page drew no button.
+    #[tokio::test]
+    async fn oauth_buttons_follow_the_same_truth_table_as_the_oauth_start_handler() {
+        let mut ctx = TestContext::new().await;
+        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "1");
+        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_ID", "gh_id");
+        ctx.set_config(
+            "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_SECRET",
+            "gh_secret",
+        );
+        ctx.set_config(
+            "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI",
+            "https://app/cb",
+        );
+        let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
+        assert!(
+            html.contains(r#"data-provider="github""#),
+            "ENABLE_OAUTH=1 must render the provider button the start handler accepts: {html}"
+        );
+    }
 
     fn login_msg(query: &[(&str, &str)]) -> Message {
         let mut msg = Message::new("http.request");

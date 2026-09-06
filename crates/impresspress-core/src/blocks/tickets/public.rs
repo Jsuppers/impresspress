@@ -508,7 +508,7 @@ fn parse_submission(content_type: &str, raw: &[u8]) -> Result<Submission, String
             subject_id: form_value(&form, "subject_id"),
             evidence_url: form_value(&form, "evidence_url"),
             reporter_email: form_value(&form, "reporter_email"),
-            reporter_wants_reply: bool_form(&form, "reporter_wants_reply"),
+            reporter_wants_reply: crate::config_vars::form_bool(&form, "reporter_wants_reply"),
             priority: None,
         },
         form_token: required("form_token")?,
@@ -619,15 +619,6 @@ fn public_headers(builder: ResponseBuilder) -> ResponseBuilder {
 
 fn form_value(form: &HashMap<String, String>, key: &str) -> String {
     form.get(key).cloned().unwrap_or_default()
-}
-
-fn bool_form(form: &HashMap<String, String>, key: &str) -> bool {
-    form.get(key).is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 
 fn safe_back_url(value: &str) -> String {

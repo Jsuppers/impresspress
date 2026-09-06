@@ -496,7 +496,10 @@ pub async fn handle_create_variable(
     // Absent means sensitive, same as the JSON API. The modal always posts an
     // explicit value (a hidden `0` that a checked box overrides with `1`), so
     // "absent" here is a post that bypassed the form, and it fails safe.
-    let sensitive = body.get("sensitive").map(|s| s == "1").unwrap_or(true);
+    let sensitive = body
+        .get("sensitive")
+        .map(|value| crate::config_vars::is_truthy(value))
+        .unwrap_or(true);
 
     // Key-required guard, URL/SSRF validation (the SSR path previously had
     // none), audit-log write, and the create live in the shared ops layer.

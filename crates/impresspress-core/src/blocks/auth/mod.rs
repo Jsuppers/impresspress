@@ -394,8 +394,7 @@ pub(crate) mod helpers {
     /// brand-new-user branch — `WAFER_RUN_SHARED__AUTH__SIGNUP_ENABLED` was a
     /// dead duplicate with the opposite default and has been removed.
     pub(crate) async fn signup_allowed(ctx: &dyn wafer_run::context::Context) -> bool {
-        let raw = config_client::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", "true").await;
-        raw == "true" || raw == "1"
+        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await
     }
 
     /// Whether `email`'s domain is permitted to register.

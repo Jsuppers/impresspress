@@ -11,7 +11,7 @@
 //!    same family ID with `generation + 1`. Return the new access + refresh
 //!    pair.
 
-use wafer_core::clients::{config, crypto};
+use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
@@ -123,8 +123,8 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     let require_verification =
-        config::get_default(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "false").await;
-    if (require_verification == "true" || require_verification == "1") && !user.email_verified {
+        crate::config_vars::get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false).await;
+    if require_verification && !user.email_verified {
         return error_response(ErrorCode::EmailNotVerified, "Email not verified");
     }
 

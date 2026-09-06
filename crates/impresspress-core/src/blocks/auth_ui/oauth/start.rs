@@ -37,8 +37,9 @@ fn generate_state_id() -> Result<String, String> {
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Check ENABLE_OAUTH flag
-    let enable_oauth = config::get_default(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", "false").await;
-    if enable_oauth != "true" && enable_oauth != "1" {
+    let enable_oauth =
+        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", false).await;
+    if !enable_oauth {
         return err_forbidden("OAuth login is not enabled");
     }
 
