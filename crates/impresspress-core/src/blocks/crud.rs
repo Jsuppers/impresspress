@@ -60,8 +60,22 @@ use crate::{
 /// them (`products/handlers/{sellers,offers,product}.rs`) keep their own arms
 /// and delegate only this tail.
 pub fn db_error(error: wafer_run::WaferError, not_found: &str, context: &str) -> OutputStream {
+    if error.code == ErrorCode::NotFound {
+        return err_not_found(not_found);
+    }
+    db_error_internal(error, context)
+}
+
+/// [`db_error`] for a call whose `NotFound` is NOT the client's row.
+///
+/// `db::paginated_list` and `db::create` are told the table by the block, not
+/// by the request, so a `NotFound` from them means the table is missing —
+/// a deployment fault, and a 500. Turning it into a 404 would tell a caller
+/// their query found nothing when in fact nothing could be queried.
+/// Everything else is classified exactly as [`db_error`] classifies it,
+/// `PermissionDenied` included.
+pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputStream {
     match error.code {
-        ErrorCode::NotFound => err_not_found(not_found),
         ErrorCode::PermissionDenied => {
             tracing::warn!(
                 context = %context,
@@ -170,7 +184,7 @@ pub async fn list_page(
     });
     db::paginated_list(ctx, collection, page, page_size, filters, sort)
         .await
-        .map_err(|e| db_error(e, "Collection not found", "Database error"))
+        .map_err(|e| db_error_internal(e, "Database error"))
 }
 
 /// Fetch `id` from `collection`, mapping a missing row to a 404 labelled
@@ -203,10 +217,10 @@ pub async fn create_record(
     stamp_created(&mut data);
     let created = db::create(ctx, collection, data)
         .await
-        .map_err(|e| db_error(e, "Collection not found", "Database error"))?;
+        .map_err(|e| db_error_internal(e, "Database error"))?;
     db::get(ctx, collection, &created.id)
         .await
-        .map_err(|e| db_error(e, "Record not found", "Database error"))
+        .map_err(|e| db_error_internal(e, "Database error"))
 }
 
 /// Apply `data` to `id` in `collection`, stamping `updated_at`; a missing
@@ -409,6 +423,24 @@ mod db_error_tests {
             }
             other => panic!("expected an error terminal, got {other:?}"),
         }
+    }
+
+    /// `db_error_internal` is the same classification MINUS the 404: a
+    /// `NotFound` from a call the block addressed (a missing table) is a
+    /// deployment fault, not the caller's missing row.
+    #[tokio::test]
+    async fn db_error_internal_keeps_a_missing_table_a_500_but_still_403s_a_denial() {
+        let missing_table = db_error_internal(
+            wafer_err(ErrorCode::NotFound, "no such table"),
+            "Database error",
+        );
+        assert_eq!(output_http_status(missing_table).await, 500);
+
+        let denied = db_error_internal(
+            wafer_err(ErrorCode::PermissionDenied, "WRAP: no grant"),
+            "Database error",
+        );
+        assert_eq!(output_http_status(denied).await, 403);
     }
 
     #[tokio::test]
