@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_opt_str, map_str, now_iso, RepoError};
+use super::{db_failed, internal_error, map_opt_str, map_str, now_iso};
 
 pub const TABLE: &str = "wafer_run__auth__oauth_pkce_states";
 
@@ -42,14 +42,13 @@ pub struct PkceStateRow {
     pub expires_at: String,
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<PkceStateRow, RepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<PkceStateRow, WaferError> {
     Ok(PkceStateRow {
-        provider: map_opt_str(m, "provider")
-            .ok_or_else(|| RepoError::Db("missing provider".into()))?,
+        provider: map_opt_str(m, "provider").ok_or_else(|| internal_error("missing provider"))?,
         code_verifier: map_opt_str(m, "code_verifier")
-            .ok_or_else(|| RepoError::Db("missing code_verifier".into()))?,
+            .ok_or_else(|| internal_error("missing code_verifier"))?,
         redirect_uri: map_opt_str(m, "redirect_uri")
-            .ok_or_else(|| RepoError::Db("missing redirect_uri".into()))?,
+            .ok_or_else(|| internal_error("missing redirect_uri"))?,
         expires_at: map_str(m, "expires_at"),
     })
 }
@@ -57,8 +56,9 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<PkceStateRow, RepoError> {
 /// Insert a new PKCE state row.
 ///
 /// PRIMARY-KEY collisions on `state_id` indicate a generator failure (the
-/// caller is expected to pull fresh random bytes), surfaced as `RepoError::Db`.
-pub async fn insert(ctx: &dyn Context, new: NewPkceState<'_>) -> Result<(), RepoError> {
+/// caller is expected to pull fresh random bytes), surfaced as whatever
+/// [`wafer_run::ErrorCode`] the backend classified the collision with.
+pub async fn insert(ctx: &dyn Context, new: NewPkceState<'_>) -> Result<(), WaferError> {
     let now = now_iso();
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("state_id".into(), json!(new.state_id));
@@ -69,7 +69,7 @@ pub async fn insert(ctx: &dyn Context, new: NewPkceState<'_>) -> Result<(), Repo
     data.insert("expires_at".into(), json!(new.expires_at));
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("oauth_pkce insert: {e}")))?;
+        .map_err(|e| db_failed("oauth_pkce insert", e))?;
     Ok(())
 }
 
@@ -80,7 +80,7 @@ pub async fn insert(ctx: &dyn Context, new: NewPkceState<'_>) -> Result<(), Repo
 /// timeout). Uses `db::take_by_filters` which dispatches to
 /// `DELETE … WHERE … RETURNING *` (sqlite 3.35+, postgres) so the read
 /// and delete are atomic in a single statement.
-pub async fn take(ctx: &dyn Context, state_id: &str) -> Result<Option<PkceStateRow>, RepoError> {
+pub async fn take(ctx: &dyn Context, state_id: &str) -> Result<Option<PkceStateRow>, WaferError> {
     let rows = db::take_by_filters(
         ctx,
         TABLE,
@@ -91,7 +91,7 @@ pub async fn take(ctx: &dyn Context, state_id: &str) -> Result<Option<PkceStateR
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("oauth_pkce take: {e}")))?;
+    .map_err(|e| db_failed("oauth_pkce take", e))?;
     let Some(r) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -107,7 +107,7 @@ pub async fn take(ctx: &dyn Context, state_id: &str) -> Result<Option<PkceStateR
 /// Called by `auth::maintenance::sweep` — not required for correctness, since
 /// [`take`] also drops expired rows on read, but an OAuth flow the user
 /// abandons leaves a row nothing ever reads.
-pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, RepoError> {
+pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, WaferError> {
     let n = db::delete_by_filters_count(
         ctx,
         TABLE,
@@ -118,7 +118,7 @@ pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, Repo
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("oauth_pkce delete_expired: {e}")))?;
+    .map_err(|e| db_failed("oauth_pkce delete_expired", e))?;
     Ok(n.max(0) as u64)
 }
 

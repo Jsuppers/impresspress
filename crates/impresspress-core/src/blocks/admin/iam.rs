@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use wafer_block::db::{ListOptions, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{
@@ -106,8 +106,7 @@ pub(super) async fn handle_update_role(
     // including a transient DB error, as "not a system role").
     let existing = match db::get(ctx, ROLES_TABLE, id).await {
         Ok(record) => record,
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Role not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Role not found", "Database error"),
     };
 
     let is_system = existing.bool_field("is_system");
@@ -142,8 +141,7 @@ pub(super) async fn handle_update_role(
     crate::util::stamp_updated(&mut data);
     let record = match db::update(ctx, ROLES_TABLE, id, data).await {
         Ok(record) => record,
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Role not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Role not found", "Database error"),
     };
 
     if let Some(new_name) = rename_to {
@@ -271,8 +269,7 @@ pub(super) async fn handle_delete_permission(ctx: &dyn Context, msg: &Message) -
     };
     match db::delete(ctx, PERMISSIONS_TABLE, id).await {
         Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Permission not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Permission not found", "Database error"),
     }
 }
 
@@ -412,8 +409,7 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
             .await;
             ok_json(&serde_json::json!({"deleted": true}))
         }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("User-role assignment not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "User-role assignment not found", "Database error"),
     }
 }
 
@@ -447,7 +443,7 @@ mod tests {
 
     use async_trait::async_trait;
     use wafer_block::db::{Filter, FilterOp};
-    use wafer_run::{BlockInfo, WaferError};
+    use wafer_run::{BlockInfo, ErrorCode, WaferError};
 
     use super::*;
     use crate::{

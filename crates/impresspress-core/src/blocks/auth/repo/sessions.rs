@@ -29,9 +29,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_str, now_iso, RepoError};
+use super::{db_failed, internal_error, map_str, now_iso};
 
 pub const TABLE: &str = "wafer_run__auth__sessions";
 
@@ -63,12 +63,11 @@ pub struct NewSession {
     pub expires_at: String,
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<SessionRow, RepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<SessionRow, WaferError> {
     Ok(SessionRow {
-        family: super::map_opt_str(m, "family")
-            .ok_or_else(|| RepoError::Db("missing family".into()))?,
+        family: super::map_opt_str(m, "family").ok_or_else(|| internal_error("missing family"))?,
         user_id: super::map_opt_str(m, "user_id")
-            .ok_or_else(|| RepoError::Db("missing user_id".into()))?,
+            .ok_or_else(|| internal_error("missing user_id"))?,
         auth_method: map_str(m, "auth_method"),
         created_at: map_str(m, "created_at"),
         last_used_at: map_str(m, "last_used_at"),
@@ -99,7 +98,7 @@ fn user_filter(user_id: &str) -> Filter {
 /// affected nothing, so a family whose row was swept or dropped re-appears on
 /// the device list at its next refresh rather than staying invisible until the
 /// user signs in again.
-pub async fn insert(ctx: &dyn Context, new: NewSession) -> Result<(), RepoError> {
+pub async fn insert(ctx: &dyn Context, new: NewSession) -> Result<(), WaferError> {
     let now = now_iso();
     let mut data = HashMap::new();
     data.insert("family".into(), json!(new.family));
@@ -110,7 +109,7 @@ pub async fn insert(ctx: &dyn Context, new: NewSession) -> Result<(), RepoError>
     data.insert("expires_at".into(), json!(new.expires_at));
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("insert session: {e}")))?;
+        .map_err(|e| db_failed("insert session", e))?;
     Ok(())
 }
 
@@ -120,13 +119,13 @@ pub async fn insert(ctx: &dyn Context, new: NewSession) -> Result<(), RepoError>
 /// which is the signal issuance uses to [`insert`] one instead. `created_at`
 /// is deliberately untouched: it is when the device signed in, and rotation is
 /// not a new sign-in.
-pub async fn touch(ctx: &dyn Context, family: &str, expires_at: &str) -> Result<u64, RepoError> {
+pub async fn touch(ctx: &dyn Context, family: &str, expires_at: &str) -> Result<u64, WaferError> {
     let mut data = HashMap::new();
     data.insert("last_used_at".into(), json!(now_iso()));
     data.insert("expires_at".into(), json!(expires_at));
     let n = db::update_by_filters_count(ctx, TABLE, vec![family_filter(family)], data)
         .await
-        .map_err(|e| RepoError::Db(format!("session touch: {e}")))?;
+        .map_err(|e| db_failed("session touch", e))?;
     Ok(n.max(0) as u64)
 }
 
@@ -139,14 +138,14 @@ pub async fn find_for_user(
     ctx: &dyn Context,
     user_id: &str,
     family: &str,
-) -> Result<Option<SessionRow>, RepoError> {
+) -> Result<Option<SessionRow>, WaferError> {
     let records = db::list_all(
         ctx,
         TABLE,
         vec![family_filter(family), user_filter(user_id)],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("session find_for_user: {e}")))?;
+    .map_err(|e| db_failed("session find_for_user", e))?;
     match records.first() {
         Some(r) => Ok(Some(row_from_map(&r.data)?)),
         None => Ok(None),
@@ -155,7 +154,10 @@ pub async fn find_for_user(
 
 /// Return all of `user_id`'s families, ordered by `last_used_at` DESC so the
 /// most recently active device sorts first.
-pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<SessionRow>, RepoError> {
+pub async fn list_for_user(
+    ctx: &dyn Context,
+    user_id: &str,
+) -> Result<Vec<SessionRow>, WaferError> {
     let records = db::list_sorted(
         ctx,
         TABLE,
@@ -166,7 +168,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<Sessi
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("session list_for_user: {e}")))?;
+    .map_err(|e| db_failed("session list_for_user", e))?;
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
@@ -175,10 +177,10 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<Sessi
 /// Unscoped on purpose: its one caller, the userportal revoke, has already
 /// established whose family it is through [`find_for_user`].
 /// [`delete_all_for_user`] is what logout uses.
-pub async fn delete(ctx: &dyn Context, family: &str) -> Result<u64, RepoError> {
+pub async fn delete(ctx: &dyn Context, family: &str) -> Result<u64, WaferError> {
     let n = db::delete_by_filters_count(ctx, TABLE, vec![family_filter(family)])
         .await
-        .map_err(|e| RepoError::Db(format!("session delete: {e}")))?;
+        .map_err(|e| db_failed("session delete", e))?;
     Ok(n.max(0) as u64)
 }
 
@@ -187,10 +189,10 @@ pub async fn delete(ctx: &dyn Context, family: &str) -> Result<u64, RepoError> {
 /// Logout's counterpart to `tokens::revoke_all_for_user`: the two run
 /// together so the device list and the refresh tokens agree about which
 /// devices are still signed in.
-pub async fn delete_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<u64, RepoError> {
+pub async fn delete_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<u64, WaferError> {
     let n = db::delete_by_filters_count(ctx, TABLE, vec![user_filter(user_id)])
         .await
-        .map_err(|e| RepoError::Db(format!("session delete_all_for_user: {e}")))?;
+        .map_err(|e| db_failed("session delete_all_for_user", e))?;
     Ok(n.max(0) as u64)
 }
 
@@ -198,7 +200,7 @@ pub async fn delete_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<u64
 ///
 /// `cutoff` is compared as an ISO-8601 string; rows store timestamps in the
 /// same text format (see [`now_iso`]). Called by `auth::maintenance::sweep`.
-pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, RepoError> {
+pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, WaferError> {
     let n = db::delete_by_filters_count(
         ctx,
         TABLE,
@@ -209,7 +211,7 @@ pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, Repo
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("session delete_expired: {e}")))?;
+    .map_err(|e| db_failed("session delete_expired", e))?;
     Ok(n.max(0) as u64)
 }
 

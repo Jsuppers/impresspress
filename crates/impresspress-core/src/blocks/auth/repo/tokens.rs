@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{now_iso, RepoError};
+use super::{db_failed, now_iso};
 use crate::util::{sha256_hex, RecordExt};
 
 pub const TABLE: &str = "wafer_run__auth__tokens";
@@ -45,7 +45,7 @@ pub async fn insert(
     family: &str,
     generation: i64,
     expires_at: &str,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     let id = uuid::Uuid::now_v7().to_string();
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("id".into(), json!(id));
@@ -61,7 +61,7 @@ pub async fn insert(
 
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("tokens insert: {e}")))?;
+        .map_err(|e| db_failed("tokens insert", e))?;
     Ok(())
 }
 
@@ -80,7 +80,7 @@ pub struct TokenRow {
 pub async fn find_by_token(
     ctx: &dyn Context,
     raw_token: &str,
-) -> Result<Option<TokenRow>, RepoError> {
+) -> Result<Option<TokenRow>, WaferError> {
     let filters = vec![Filter {
         field: "token_hash".into(),
         operator: FilterOp::Equal,
@@ -88,7 +88,7 @@ pub async fn find_by_token(
     }];
     let records = db::list_all(ctx, TABLE, filters)
         .await
-        .map_err(|e| RepoError::Db(format!("tokens lookup: {e}")))?;
+        .map_err(|e| db_failed("tokens lookup", e))?;
     Ok(records.into_iter().next().map(row_from_record))
 }
 
@@ -98,7 +98,7 @@ pub async fn find_by_token(
 /// request hits a revoked row but `family_has_live_row` is true, the row
 /// being presented was already rotated and the family is under attack —
 /// revoke the whole family.
-pub async fn family_has_live_row(ctx: &dyn Context, family: &str) -> Result<bool, RepoError> {
+pub async fn family_has_live_row(ctx: &dyn Context, family: &str) -> Result<bool, WaferError> {
     let filters = vec![
         Filter {
             field: "family".into(),
@@ -113,23 +113,23 @@ pub async fn family_has_live_row(ctx: &dyn Context, family: &str) -> Result<bool
     ];
     let records = db::list_all(ctx, TABLE, filters)
         .await
-        .map_err(|e| RepoError::Db(format!("tokens family lookup: {e}")))?;
+        .map_err(|e| db_failed("tokens family lookup", e))?;
     Ok(!records.is_empty())
 }
 
 /// Mark a single row as revoked.
-pub async fn revoke_by_id(ctx: &dyn Context, id: &str) -> Result<(), RepoError> {
+pub async fn revoke_by_id(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("revoked".into(), json!(true));
     db::update(ctx, TABLE, id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("tokens revoke_by_id: {e}")))?;
+        .map_err(|e| db_failed("tokens revoke_by_id", e))?;
     Ok(())
 }
 
 /// Mark every row in `family` as revoked. Used both for normal logout-style
 /// invalidation and for reuse-attack detection.
-pub async fn revoke_family(ctx: &dyn Context, family: &str) -> Result<(), RepoError> {
+pub async fn revoke_family(ctx: &dyn Context, family: &str) -> Result<(), WaferError> {
     let filters = vec![Filter {
         field: "family".into(),
         operator: FilterOp::Equal,
@@ -139,14 +139,14 @@ pub async fn revoke_family(ctx: &dyn Context, family: &str) -> Result<(), RepoEr
     data.insert("revoked".into(), json!(true));
     db::update_by_filters(ctx, TABLE, filters, data)
         .await
-        .map_err(|e| RepoError::Db(format!("tokens revoke_family: {e}")))?;
+        .map_err(|e| db_failed("tokens revoke_family", e))?;
     Ok(())
 }
 
 /// Mark every row owned by `user_id` as revoked. Used by logout,
 /// password-reset, and password-change flows to invalidate sessions
 /// across all the user's devices.
-pub async fn revoke_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<(), RepoError> {
+pub async fn revoke_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
     let filters = vec![Filter {
         field: "user_id".into(),
         operator: FilterOp::Equal,
@@ -156,7 +156,7 @@ pub async fn revoke_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<(),
     data.insert("revoked".into(), json!(true));
     db::update_by_filters(ctx, TABLE, filters, data)
         .await
-        .map_err(|e| RepoError::Db(format!("tokens revoke_all_for_user: {e}")))?;
+        .map_err(|e| db_failed("tokens revoke_all_for_user", e))?;
     Ok(())
 }
 
@@ -171,7 +171,7 @@ pub async fn revoke_all_for_user(ctx: &dyn Context, user_id: &str) -> Result<(),
 ///
 /// Called by `auth::maintenance::sweep`. `cutoff` is compared as an ISO-8601
 /// string, the format `now_iso` writes.
-pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, RepoError> {
+pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, WaferError> {
     let n = db::delete_by_filters_count(
         ctx,
         TABLE,
@@ -182,7 +182,7 @@ pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, Repo
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("tokens delete_expired: {e}")))?;
+    .map_err(|e| db_failed("tokens delete_expired", e))?;
     Ok(n.max(0) as u64)
 }
 

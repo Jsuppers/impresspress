@@ -7,9 +7,9 @@
 use serde_json::json;
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{now_iso, RepoError};
+use super::{db_failed, now_iso};
 use crate::util::hex_encode;
 
 pub const TABLE: &str = "wafer_run__auth__bootstrap_tokens";
@@ -21,7 +21,7 @@ pub async fn insert(
     ctx: &dyn Context,
     token_hash: Vec<u8>,
     expires_at: &str,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     use std::collections::HashMap;
 
     use serde_json::Value;
@@ -36,7 +36,7 @@ pub async fn insert(
 
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("bootstrap_tokens insert: {e}")))?;
+        .map_err(|e| db_failed("bootstrap_tokens insert", e))?;
     Ok(())
 }
 
@@ -44,7 +44,7 @@ pub async fn insert(
 ///
 /// Compared as ISO-8601 strings to match the text format the migration
 /// schema stores.
-pub async fn is_valid(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, RepoError> {
+pub async fn is_valid(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, WaferError> {
     let now = now_iso();
     let hex = hex_encode(token_hash);
     let filters = vec![
@@ -61,7 +61,7 @@ pub async fn is_valid(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, Repo
     ];
     let records = db::list_all(ctx, TABLE, filters)
         .await
-        .map_err(|e| RepoError::Db(format!("bootstrap_tokens lookup: {e}")))?;
+        .map_err(|e| db_failed("bootstrap_tokens lookup", e))?;
     Ok(!records.is_empty())
 }
 
@@ -72,7 +72,7 @@ pub async fn is_valid(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, Repo
 /// Single-use semantics: even if multiple rows happened to share the same
 /// hash (shouldn't, but the schema doesn't enforce uniqueness here), this
 /// removes all of them so subsequent `is_valid` calls return false.
-pub async fn delete_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<(), RepoError> {
+pub async fn delete_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<(), WaferError> {
     let hex = hex_encode(token_hash);
     let filters = vec![Filter {
         field: "token_hash".into(),
@@ -81,11 +81,11 @@ pub async fn delete_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<(), 
     }];
     let records = db::list_all(ctx, TABLE, filters)
         .await
-        .map_err(|e| RepoError::Db(format!("bootstrap_tokens lookup for delete: {e}")))?;
+        .map_err(|e| db_failed("bootstrap_tokens lookup for delete", e))?;
     for record in records {
         db::delete(ctx, TABLE, &record.id)
             .await
-            .map_err(|e| RepoError::Db(format!("bootstrap_tokens delete: {e}")))?;
+            .map_err(|e| db_failed("bootstrap_tokens delete", e))?;
     }
     Ok(())
 }
@@ -104,7 +104,7 @@ pub async fn delete_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<(), 
 /// serializes the two `DELETE`s, so at most one caller's `take_valid_by_hash`
 /// returns `true`. Callers MUST perform this consumption *before* creating
 /// the privileged account, so only the winner of the atomic take proceeds.
-pub async fn take_valid_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, RepoError> {
+pub async fn take_valid_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, WaferError> {
     let now = now_iso();
     let hex = hex_encode(token_hash);
     let filters = vec![
@@ -121,7 +121,7 @@ pub async fn take_valid_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<
     ];
     let records = db::take_by_filters(ctx, TABLE, filters)
         .await
-        .map_err(|e| RepoError::Db(format!("bootstrap_tokens take_valid_by_hash: {e}")))?;
+        .map_err(|e| db_failed("bootstrap_tokens take_valid_by_hash", e))?;
     Ok(!records.is_empty())
 }
 

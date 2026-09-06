@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_opt_str, map_str, now_iso, RepoError};
+use super::{db_failed, internal_error, map_opt_str, map_str, now_iso};
 
 pub const TABLE: &str = "wafer_run__auth__provider_links";
 
@@ -39,14 +39,12 @@ pub struct NewLink<'a> {
     pub access_token: &'a str,
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, RepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, WaferError> {
     Ok(ProviderLink {
-        provider: map_opt_str(m, "provider")
-            .ok_or_else(|| RepoError::Db("missing provider".into()))?,
+        provider: map_opt_str(m, "provider").ok_or_else(|| internal_error("missing provider"))?,
         provider_ref: map_opt_str(m, "provider_ref")
-            .ok_or_else(|| RepoError::Db("missing provider_ref".into()))?,
-        user_id: map_opt_str(m, "user_id")
-            .ok_or_else(|| RepoError::Db("missing user_id".into()))?,
+            .ok_or_else(|| internal_error("missing provider_ref"))?,
+        user_id: map_opt_str(m, "user_id").ok_or_else(|| internal_error("missing user_id"))?,
         provider_login: map_str(m, "provider_login"),
         access_token: map_str(m, "access_token"),
         linked_at: map_str(m, "linked_at"),
@@ -57,7 +55,7 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, RepoError> {
 /// `linked_at` in place when a row with the same `(provider, provider_ref)`
 /// already exists. Manual two-step (list → update_by_filters or create) since
 /// `db::*` has no two-key upsert primitive.
-pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), RepoError> {
+pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferError> {
     let now = now_iso();
     let filters = vec![
         Filter {
@@ -73,7 +71,7 @@ pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), RepoError
     ];
     let existing = db::list_all(ctx, TABLE, filters.clone())
         .await
-        .map_err(|e| RepoError::Db(format!("provider_links upsert lookup: {e}")))?;
+        .map_err(|e| db_failed("provider_links upsert lookup", e))?;
 
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("user_id".into(), json!(new.user_id));
@@ -89,12 +87,12 @@ pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), RepoError
         data.insert("provider_ref".into(), json!(new.provider_ref));
         db::create(ctx, TABLE, data)
             .await
-            .map_err(|e| RepoError::Db(format!("provider_links insert: {e}")))?;
+            .map_err(|e| db_failed("provider_links insert", e))?;
     } else {
         // Update by the same (provider, provider_ref) filters — no synthetic id needed.
         db::update_by_filters(ctx, TABLE, filters, data)
             .await
-            .map_err(|e| RepoError::Db(format!("provider_links update: {e}")))?;
+            .map_err(|e| db_failed("provider_links update", e))?;
     }
     Ok(())
 }
@@ -105,7 +103,7 @@ pub async fn find_by_provider_ref(
     ctx: &dyn Context,
     provider: &str,
     provider_ref: &str,
-) -> Result<Option<ProviderLink>, RepoError> {
+) -> Result<Option<ProviderLink>, WaferError> {
     let filters = vec![
         Filter {
             field: "provider".into(),
@@ -120,7 +118,7 @@ pub async fn find_by_provider_ref(
     ];
     let records = db::list_all(ctx, TABLE, filters)
         .await
-        .map_err(|e| RepoError::Db(format!("provider_links find: {e}")))?;
+        .map_err(|e| db_failed("provider_links find", e))?;
     match records.first() {
         Some(r) => Ok(Some(row_from_map(&r.data)?)),
         None => Ok(None),
@@ -140,7 +138,7 @@ pub async fn find_by_provider_ref(
 pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Vec<ProviderLink>, RepoError> {
+) -> Result<Vec<ProviderLink>, WaferError> {
     let records = db::list_sorted(
         ctx,
         TABLE,
@@ -155,7 +153,7 @@ pub async fn list_for_user(
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("provider_links list_for_user: {e}")))?;
+    .map_err(|e| db_failed("provider_links list_for_user", e))?;
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 

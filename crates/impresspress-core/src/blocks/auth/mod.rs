@@ -30,6 +30,7 @@ pub mod service;
 use std::{collections::HashMap, time::Duration};
 
 use wafer_core::clients::{config as config_client, crypto};
+use wafer_run::WaferError;
 
 use crate::util::hex_encode;
 
@@ -107,7 +108,7 @@ async fn current_auth_version_at(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
     now_ms: i64,
-) -> Result<i64, repo::RepoError> {
+) -> Result<i64, WaferError> {
     if let Some(v) = {
         let guard = auth_version_cache()
             .lock()
@@ -144,7 +145,7 @@ async fn current_auth_version_at(
 pub(crate) async fn current_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
-) -> Result<i64, repo::RepoError> {
+) -> Result<i64, WaferError> {
     current_auth_version_at(ctx, user_id, crate::util::now_millis() as i64).await
 }
 
@@ -167,7 +168,7 @@ fn invalidate_auth_version_cache(user_id: &str) {
 pub(crate) async fn bump_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
-) -> Result<(), repo::RepoError> {
+) -> Result<(), WaferError> {
     repo::users::bump_auth_version(ctx, user_id).await?;
     invalidate_auth_version_cache(user_id);
     Ok(())
@@ -306,7 +307,7 @@ pub(crate) mod helpers {
     pub(crate) async fn get_user_roles(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
-    ) -> Result<Vec<String>, repo::RepoError> {
+    ) -> Result<Vec<String>, WaferError> {
         let mut roles: Vec<String> = Vec::new();
         if let Some(user) = repo::users::find_by_id(ctx, user_id).await? {
             if !user.role.is_empty() {
@@ -316,7 +317,7 @@ pub(crate) mod helpers {
 
         let grants = user_roles::list_for_user(ctx, user_id)
             .await
-            .map_err(|e| repo::RepoError::Db(format!("get_user_roles: roles table lookup: {e}")))?;
+            .map_err(|e| repo::db_failed("get_user_roles: roles table lookup", e))?;
         for grant in grants {
             if !roles.contains(&grant.role) {
                 roles.push(grant.role);
@@ -340,14 +341,15 @@ pub(crate) mod helpers {
     /// on login would be an availability foot-gun (one typo in env locks
     /// everyone out).
     ///
-    /// Propagates [`repo::RepoError`] (SB-3) when the underlying roles read
-    /// fails — a WRAP denial or DB error must not be mistaken for "user has
-    /// no admin row yet" and drive a duplicate insert into `user_roles::TABLE`.
+    /// Propagates the read's own [`wafer_run::WaferError`] (SB-3) when the
+    /// underlying roles read fails — a WRAP denial or DB error must not be
+    /// mistaken for "user has no admin row yet" and drive a duplicate insert
+    /// into `user_roles::TABLE`.
     pub(crate) async fn ensure_admin_role(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
         email: &str,
-    ) -> Result<Vec<String>, repo::RepoError> {
+    ) -> Result<Vec<String>, WaferError> {
         // Read the bootstrap-admin email *before* the role lookup. The
         // common case in production is "unset" — early-return then,
         // skipping the second `db::create` path entirely. Authenticated

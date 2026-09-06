@@ -9,9 +9,9 @@ use wafer_block::{
     wire::database as wire,
 };
 use wafer_core::clients::database::{self as db, Record};
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_bool, map_opt_str, map_str, now_iso, RepoError};
+use super::{db_failed, internal_error, map_bool, map_opt_str, map_str, now_iso};
 use crate::util::{daily_grouped, to_wire_filters, RecordExt};
 
 pub const TABLE: &str = "wafer_run__auth__users";
@@ -88,10 +88,10 @@ pub struct NewUser {
     pub verification_token_hash: Option<String>,
 }
 
-fn row_from(id: String, m: &HashMap<String, Value>) -> Result<UserRow, RepoError> {
+fn row_from(id: String, m: &HashMap<String, Value>) -> Result<UserRow, WaferError> {
     Ok(UserRow {
         id,
-        email: map_opt_str(m, "email").ok_or_else(|| RepoError::Db("missing email".into()))?,
+        email: map_opt_str(m, "email").ok_or_else(|| internal_error("missing email"))?,
         display_name: map_str(m, "display_name"),
         name: map_opt_str(m, "name"),
         avatar_url: map_opt_str(m, "avatar_url"),
@@ -105,18 +105,18 @@ fn row_from(id: String, m: &HashMap<String, Value>) -> Result<UserRow, RepoError
     })
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<UserRow, RepoError> {
-    let id = map_opt_str(m, "id").ok_or_else(|| RepoError::Db("missing id".into()))?;
+fn row_from_map(m: &HashMap<String, Value>) -> Result<UserRow, WaferError> {
+    let id = map_opt_str(m, "id").ok_or_else(|| internal_error("missing id"))?;
     row_from(id, m)
 }
 
 /// Decode a listed row. A `columns`-projected `SELECT` need not carry the
 /// `id` column in `data`, but the envelope always does, so the envelope is
 /// the fallback.
-fn row_from_record(rec: &Record) -> Result<UserRow, RepoError> {
+fn row_from_record(rec: &Record) -> Result<UserRow, WaferError> {
     let id = map_opt_str(&rec.data, "id").unwrap_or_else(|| rec.id.clone());
     if id.is_empty() {
-        return Err(RepoError::Db("missing id".into()));
+        return Err(internal_error("missing id"));
     }
     row_from(id, &rec.data)
 }
@@ -148,7 +148,7 @@ fn newest_first() -> Vec<SortField> {
     }]
 }
 
-pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, RepoError> {
+pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, WaferError> {
     let id = Uuid::now_v7().to_string();
     let now = now_iso();
     let mut data: HashMap<String, Value> = HashMap::new();
@@ -169,16 +169,16 @@ pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, RepoErro
 
     let rec = db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("insert: {e}")))?;
+        .map_err(|e| db_failed("insert", e))?;
     row_from_map(&rec.data)
 }
 
-pub async fn find_by_email(ctx: &dyn Context, email: &str) -> Result<Option<UserRow>, RepoError> {
+pub async fn find_by_email(ctx: &dyn Context, email: &str) -> Result<Option<UserRow>, WaferError> {
     use wafer_block::ErrorCode;
     match db::get_by_field(ctx, TABLE, "email", json!(email)).await {
         Ok(rec) => Ok(Some(row_from_map(&rec.data)?)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("select by email: {e}"))),
+        Err(e) => Err(db_failed("select by email", e)),
     }
 }
 
@@ -186,19 +186,19 @@ pub async fn find_by_email(ctx: &dyn Context, email: &str) -> Result<Option<User
 ///
 /// Used by the block's bootstrap logic to decide whether to create the first
 /// admin user. A non-zero count means "already bootstrapped — no-op".
-pub async fn count(ctx: &dyn Context) -> Result<u64, RepoError> {
+pub async fn count(ctx: &dyn Context) -> Result<u64, WaferError> {
     let n = db::count(ctx, TABLE, &[])
         .await
-        .map_err(|e| RepoError::Db(format!("users count: {e}")))?;
+        .map_err(|e| db_failed("users count", e))?;
     Ok(n.max(0) as u64)
 }
 
-pub async fn find_by_id(ctx: &dyn Context, id: &str) -> Result<Option<UserRow>, RepoError> {
+pub async fn find_by_id(ctx: &dyn Context, id: &str) -> Result<Option<UserRow>, WaferError> {
     use wafer_block::ErrorCode;
     match db::get(ctx, TABLE, id).await {
         Ok(rec) => Ok(Some(row_from_map(&rec.data)?)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("select by id: {e}"))),
+        Err(e) => Err(db_failed("select by id", e)),
     }
 }
 
@@ -207,7 +207,7 @@ pub async fn find_by_id(ctx: &dyn Context, id: &str) -> Result<Option<UserRow>, 
 ///
 /// Accepts both SQLite TEXT-int (`'0'`/`'1'`), Postgres BOOLEAN, JSON `bool`,
 /// and string `'true'`/`'false'` via `RecordExt::bool_field`.
-pub async fn is_email_verified(ctx: &dyn Context, user_id: &str) -> Result<bool, RepoError> {
+pub async fn is_email_verified(ctx: &dyn Context, user_id: &str) -> Result<bool, WaferError> {
     use wafer_block::ErrorCode;
 
     use crate::util::RecordExt;
@@ -215,7 +215,7 @@ pub async fn is_email_verified(ctx: &dyn Context, user_id: &str) -> Result<bool,
     match db::get(ctx, TABLE, user_id).await {
         Ok(r) => Ok(r.bool_field("email_verified")),
         Err(e) if e.code == ErrorCode::NotFound => Ok(false),
-        Err(e) => Err(RepoError::Db(format!("get user {user_id}: {e}"))),
+        Err(e) => Err(db_failed(&format!("get user {user_id}"), e)),
     }
 }
 
@@ -229,14 +229,14 @@ pub async fn set_email_verified(
     ctx: &dyn Context,
     user_id: &str,
     verified: bool,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("email_verified".to_string(), json!(verified));
     crate::util::stamp_updated(&mut data);
 
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("set email_verified for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("set email_verified for {user_id}"), e))?;
     Ok(())
 }
 
@@ -248,32 +248,35 @@ pub async fn set_email_verified(
 pub async fn find_by_verification_token(
     ctx: &dyn Context,
     token_hash: &str,
-) -> Result<Option<UserRow>, RepoError> {
+) -> Result<Option<UserRow>, WaferError> {
     use wafer_block::ErrorCode;
     match db::get_by_field(ctx, TABLE, "verification_token", json!(token_hash)).await {
         Ok(rec) => Ok(Some(row_from_map(&rec.data)?)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("find by verification_token: {e}"))),
+        Err(e) => Err(db_failed("find by verification_token", e)),
     }
 }
 
 /// Mark a user's email as verified and clear their `verification_token` in one
 /// write. Stamps `updated_at` with [`super::now_iso`].
-pub async fn mark_email_verified(ctx: &dyn Context, user_id: &str) -> Result<(), RepoError> {
+pub async fn mark_email_verified(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("email_verified".to_string(), json!(true));
     data.insert("verification_token".to_string(), json!(""));
     data.insert("updated_at".to_string(), json!(now_iso()));
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("mark verified for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("mark verified for {user_id}"), e))?;
     Ok(())
 }
 
 /// Read a user's `last_verification_sent` timestamp (the resend cooldown
 /// anchor). Returns an empty string when unset/absent. `Ok(None)` would be
 /// indistinguishable from "never sent" here, so absence collapses to `""`.
-pub async fn last_verification_sent(ctx: &dyn Context, user_id: &str) -> Result<String, RepoError> {
+pub async fn last_verification_sent(
+    ctx: &dyn Context,
+    user_id: &str,
+) -> Result<String, WaferError> {
     use wafer_block::ErrorCode;
 
     use crate::util::RecordExt;
@@ -281,7 +284,7 @@ pub async fn last_verification_sent(ctx: &dyn Context, user_id: &str) -> Result<
     match db::get(ctx, TABLE, user_id).await {
         Ok(r) => Ok(r.str_field("last_verification_sent").to_string()),
         Err(e) if e.code == ErrorCode::NotFound => Ok(String::new()),
-        Err(e) => Err(RepoError::Db(format!("get last_verification_sent: {e}"))),
+        Err(e) => Err(db_failed("get last_verification_sent", e)),
     }
 }
 
@@ -292,14 +295,14 @@ pub async fn set_verification_token(
     user_id: &str,
     token_hash: &str,
     sent_at: &str,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("verification_token".to_string(), json!(token_hash));
     data.insert("last_verification_sent".to_string(), json!(sent_at));
     data.insert("updated_at".to_string(), json!(now_iso()));
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("set verification_token for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("set verification_token for {user_id}"), e))?;
     Ok(())
 }
 
@@ -321,7 +324,7 @@ pub struct ResetTokenUser {
 pub async fn find_by_reset_token(
     ctx: &dyn Context,
     token_hash: &str,
-) -> Result<Option<ResetTokenUser>, RepoError> {
+) -> Result<Option<ResetTokenUser>, WaferError> {
     use wafer_block::ErrorCode;
 
     use crate::util::RecordExt;
@@ -332,7 +335,7 @@ pub async fn find_by_reset_token(
             reset_token_expires: rec.str_field("reset_token_expires").to_string(),
         })),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("find by reset_token: {e}"))),
+        Err(e) => Err(db_failed("find by reset_token", e)),
     }
 }
 
@@ -343,27 +346,27 @@ pub async fn set_reset_token(
     user_id: &str,
     token_hash: &str,
     expires_at: &str,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("reset_token".to_string(), json!(token_hash));
     data.insert("reset_token_expires".to_string(), json!(expires_at));
     data.insert("updated_at".to_string(), json!(now_iso()));
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("set reset_token for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("set reset_token for {user_id}"), e))?;
     Ok(())
 }
 
 /// Clear a user's password-reset token + expiry after a successful reset.
 /// Stamps `updated_at`.
-pub async fn clear_reset_token(ctx: &dyn Context, user_id: &str) -> Result<(), RepoError> {
+pub async fn clear_reset_token(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("reset_token".to_string(), json!(""));
     data.insert("reset_token_expires".to_string(), json!(""));
     data.insert("updated_at".to_string(), json!(now_iso()));
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("clear reset_token for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("clear reset_token for {user_id}"), e))?;
     Ok(())
 }
 
@@ -379,7 +382,7 @@ pub async fn update_profile(
     user_id: &str,
     name: Option<&str>,
     avatar_url: Option<&str>,
-) -> Result<UserRow, RepoError> {
+) -> Result<UserRow, WaferError> {
     let mut data = std::collections::HashMap::new();
     if let Some(n) = name {
         data.insert("display_name".to_string(), json!(n));
@@ -391,7 +394,7 @@ pub async fn update_profile(
     data.insert("updated_at".to_string(), json!(now_iso()));
     let rec = db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("update profile for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("update profile for {user_id}"), e))?;
     row_from_map(&rec.data)
 }
 
@@ -402,7 +405,7 @@ pub async fn update_profile(
 /// (`crate::crypto::extract_auth_meta`, via `blocks::auth::current_auth_version`)
 /// doesn't otherwise require the row to exist for a JWT to authenticate, so a
 /// missing row must not be indistinguishable from a real DB failure here.
-pub async fn auth_version(ctx: &dyn Context, user_id: &str) -> Result<i64, RepoError> {
+pub async fn auth_version(ctx: &dyn Context, user_id: &str) -> Result<i64, WaferError> {
     use wafer_block::ErrorCode;
 
     use crate::util::RecordExt;
@@ -410,9 +413,7 @@ pub async fn auth_version(ctx: &dyn Context, user_id: &str) -> Result<i64, RepoE
     match db::get(ctx, TABLE, user_id).await {
         Ok(r) => Ok(r.i64_field(AUTH_VERSION_FIELD)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(0),
-        Err(e) => Err(RepoError::Db(format!(
-            "get auth_version for {user_id}: {e}"
-        ))),
+        Err(e) => Err(db_failed(&format!("get auth_version for {user_id}"), e)),
     }
 }
 
@@ -426,7 +427,7 @@ pub async fn auth_version(ctx: &dyn Context, user_id: &str) -> Result<i64, RepoE
 /// Callers should go through `blocks::auth::bump_auth_version`, which wraps
 /// this with the verify-side cache invalidation so the two can't drift out
 /// of sync; this function is the DB half only.
-pub async fn bump_auth_version(ctx: &dyn Context, user_id: &str) -> Result<(), RepoError> {
+pub async fn bump_auth_version(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
     let filters = vec![Filter {
         field: "id".to_string(),
         operator: FilterOp::Equal,
@@ -434,27 +435,14 @@ pub async fn bump_auth_version(ctx: &dyn Context, user_id: &str) -> Result<(), R
     }];
     db::increment_field_where(ctx, TABLE, AUTH_VERSION_FIELD, 1, &filters)
         .await
-        .map_err(|e| RepoError::Db(format!("bump_auth_version for {user_id}: {e}")))?;
+        .map_err(|e| db_failed(&format!("bump_auth_version for {user_id}"), e))?;
     Ok(())
-}
-
-/// Map a client error onto [`RepoError`], preserving the backend's
-/// "no such row" as [`RepoError::NotFound`]. The lifecycle writers below all
-/// address a user by id, and their callers answer a missing row with 404 and
-/// anything else with 500 — a distinction that has to survive the collapse
-/// into `RepoError`.
-fn write_error(e: wafer_run::WaferError, what: &str) -> RepoError {
-    if e.code == wafer_block::ErrorCode::NotFound {
-        RepoError::NotFound
-    } else {
-        RepoError::Db(format!("{what}: {e}"))
-    }
 }
 
 /// Stamp `last_login_at` with the current time. Called on every successful
 /// sign-in (password and OAuth); best-effort at the call sites, which log
 /// and continue rather than failing a login that has already succeeded.
-pub async fn touch_last_login(ctx: &dyn Context, user_id: &str) -> Result<(), RepoError> {
+pub async fn touch_last_login(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert(
         "last_login_at".to_string(),
@@ -463,7 +451,7 @@ pub async fn touch_last_login(ctx: &dyn Context, user_id: &str) -> Result<(), Re
     data.insert("updated_at".to_string(), json!(now_iso()));
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| write_error(e, &format!("touch last_login for {user_id}")))?;
+        .map_err(|e| db_failed(&format!("touch last_login for {user_id}"), e))?;
     Ok(())
 }
 
@@ -477,13 +465,13 @@ pub async fn set_disabled(
     ctx: &dyn Context,
     user_id: &str,
     disabled: bool,
-) -> Result<UserRow, RepoError> {
+) -> Result<UserRow, WaferError> {
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("disabled".to_string(), json!(disabled));
     data.insert("updated_at".to_string(), json!(now_iso()));
     let rec = db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| write_error(e, &format!("set disabled for {user_id}")))?;
+        .map_err(|e| db_failed(&format!("set disabled for {user_id}"), e))?;
     row_from_record(&rec)
 }
 
@@ -493,10 +481,10 @@ pub async fn set_disabled(
 ///
 /// Same split as [`set_disabled`]: the `auth_version` bump belongs to the
 /// caller.
-pub async fn soft_delete(ctx: &dyn Context, user_id: &str) -> Result<(), RepoError> {
+pub async fn soft_delete(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
     db::soft_delete(ctx, TABLE, user_id)
         .await
-        .map_err(|e| write_error(e, &format!("soft-delete {user_id}")))?;
+        .map_err(|e| db_failed(&format!("soft-delete {user_id}"), e))?;
     Ok(())
 }
 
@@ -547,7 +535,7 @@ pub async fn patch_admin_fields(
     ctx: &dyn Context,
     user_id: &str,
     patch: &AdminUserPatch,
-) -> Result<UserRow, RepoError> {
+) -> Result<UserRow, WaferError> {
     let mut data: HashMap<String, Value> = HashMap::new();
     if let Some(name) = patch.name.as_deref() {
         data.insert("name".to_string(), json!(name));
@@ -561,7 +549,7 @@ pub async fn patch_admin_fields(
     data.insert("updated_at".to_string(), json!(now_iso()));
     let rec = db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| write_error(e, &format!("patch admin fields for {user_id}")))?;
+        .map_err(|e| db_failed(&format!("patch admin fields for {user_id}"), e))?;
     row_from_record(&rec)
 }
 
@@ -595,7 +583,7 @@ pub struct UserPage {
 pub async fn list_active_page(
     ctx: &dyn Context,
     query: &ActiveUserQuery,
-) -> Result<UserPage, RepoError> {
+) -> Result<UserPage, WaferError> {
     let page = query.page.max(1);
     let page_size = if query.page_size < 1 {
         20
@@ -635,7 +623,7 @@ pub async fn list_active_page(
 
     let list = db::list(ctx, TABLE, &opts)
         .await
-        .map_err(|e| RepoError::Db(format!("list active users: {e}")))?;
+        .map_err(|e| db_failed("list active users", e))?;
     let rows = list
         .records
         .iter()
@@ -657,7 +645,7 @@ pub async fn list_active_page(
 pub async fn active_count_and_created_since(
     ctx: &dyn Context,
     since_iso: &str,
-) -> Result<(i64, i64), RepoError> {
+) -> Result<(i64, i64), WaferError> {
     let created_since = [Filter {
         field: "created_at".to_string(),
         operator: FilterOp::GreaterEqual,
@@ -682,7 +670,7 @@ pub async fn active_count_and_created_since(
     };
     let rows = db::aggregate(ctx, req)
         .await
-        .map_err(|e| RepoError::Db(format!("user counts: {e}")))?;
+        .map_err(|e| db_failed("user counts", e))?;
     let row = rows.first();
     let read = |k: &str| {
         row.and_then(|r| r.data.get(k))
@@ -708,7 +696,7 @@ pub struct DailySignups {
 pub async fn daily_signups(
     ctx: &dyn Context,
     since_iso: &str,
-) -> Result<Vec<DailySignups>, RepoError> {
+) -> Result<Vec<DailySignups>, WaferError> {
     let rows = daily_grouped(
         ctx,
         TABLE,
@@ -719,7 +707,7 @@ pub async fn daily_signups(
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("daily signups: {e}")))?;
+    .map_err(|e| db_failed("daily signups", e))?;
     Ok(rows
         .iter()
         .map(|r| DailySignups {
@@ -732,7 +720,7 @@ pub async fn daily_signups(
 /// The `limit` most recently created live accounts, newest first — the
 /// admin dashboard's "Recent Users" card. `skip_count: true`: the card
 /// shows rows, never a total.
-pub async fn list_recent_active(ctx: &dyn Context, limit: i64) -> Result<Vec<UserRow>, RepoError> {
+pub async fn list_recent_active(ctx: &dyn Context, limit: i64) -> Result<Vec<UserRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![active_filter()],
         sort: newest_first(),
@@ -742,7 +730,7 @@ pub async fn list_recent_active(ctx: &dyn Context, limit: i64) -> Result<Vec<Use
     };
     let list = db::list(ctx, TABLE, &opts)
         .await
-        .map_err(|e| RepoError::Db(format!("list recent users: {e}")))?;
+        .map_err(|e| db_failed("list recent users", e))?;
     list.records.iter().map(row_from_record).collect()
 }
 
@@ -880,21 +868,26 @@ mod lifecycle_and_listing_tests {
         );
     }
 
+    /// A lifecycle write against a user that is not there keeps the
+    /// backend's `NotFound`, which is what lets `admin::ops` answer 404.
+    /// The deleted `RepoError` had a dedicated `NotFound` variant for this
+    /// one case; the code carries it for every case now, including the
+    /// `PermissionDenied` the variant had no room for.
     #[tokio::test]
     async fn a_lifecycle_write_against_a_missing_user_is_not_found() {
         let ctx = ctx().await;
-        assert!(matches!(
-            set_disabled(&ctx, "nope", true).await,
-            Err(RepoError::NotFound)
-        ));
-        assert!(matches!(
+        for outcome in [
+            set_disabled(&ctx, "nope", true).await.map(|_| ()),
             soft_delete(&ctx, "nope").await,
-            Err(RepoError::NotFound)
-        ));
-        assert!(matches!(
-            patch_admin_fields(&ctx, "nope", &AdminUserPatch::default()).await,
-            Err(RepoError::NotFound)
-        ));
+            patch_admin_fields(&ctx, "nope", &AdminUserPatch::default())
+                .await
+                .map(|_| ()),
+        ] {
+            assert_eq!(
+                outcome.expect_err("no such user").code,
+                wafer_block::ErrorCode::NotFound
+            );
+        }
     }
 
     #[test]

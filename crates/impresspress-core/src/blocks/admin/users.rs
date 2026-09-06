@@ -9,9 +9,9 @@ use super::{
 use crate::{
     blocks::{
         auth::repo::users::{self, ActiveUserQuery},
-        crud,
+        crud::{self, db_error, db_error_internal},
     },
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_not_found, ok_json},
 };
 
 /// `GET /b/admin/api/users`.
@@ -41,7 +41,9 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
             let roles_by_user = ops::fetch_roles(ctx, &user_ids).await;
             ok_json(&AdminUserListResponse::from_page(&page, &roles_by_user))
         }
-        Err(e) => err_internal("Database error", e),
+        // A `NotFound` from a paginated list is a missing table, not a
+        // missing user — `db_error_internal`, not `db_error`.
+        Err(e) => db_error_internal(e, "Database error"),
     }
 }
 
@@ -71,11 +73,7 @@ async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
             ok_json(&AdminUserView::from_row(&row, roles))
         }
         Ok(None) => err_not_found("User not found"),
-        // NOT `crud::db_error`: `auth::repo::RepoError` is `NotFound |
-        // Db(String)` and has already discarded the wafer code, so a WRAP
-        // refusal cannot be told from a decode failure here. Folding
-        // `RepoError` into `WaferError` is PR 2; this arm converts with it.
-        Err(e) => err_internal("Database error", e),
+        Err(e) => db_error(e, "User not found", "Database error"),
     }
 }
 
@@ -138,7 +136,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::admin::test_support::routed,
-        test_support::{admin_msg, output_json, TestContext},
+        test_support::{admin_msg, output_http_status, output_json, TestContext},
     };
 
     /// Seed one user row carrying every column the table has, including the
@@ -325,5 +323,76 @@ mod tests {
                 "PUT /b/admin/api/users/{{id}} leaked `{leaked}`: {raw}"
             );
         }
+    }
+
+    /// A context that reached the admin block with NO WRAP grants, so every
+    /// typed database call it makes is refused by the same
+    /// `wrap::check_access` the runtime applies. The auth schema is applied
+    /// first, so the refusal is a denial and not a missing table.
+    async fn denied_users_ctx() -> TestContext {
+        users_ctx()
+            .await
+            .with_wrap("test/ungranted", Vec::new(), "impresspress/admin")
+    }
+
+    /// The reason `RepoError` had to fold into `WaferError`.
+    ///
+    /// `auth::repo::users::find_by_id` used to answer with
+    /// `RepoError::Db(String)`, which had already thrown the wafer code away
+    /// — so by the time this handler saw the failure it could not tell a
+    /// WRAP refusal from a decode fault, and answered `500 Internal server
+    /// error (ref: …)` for both. An operator running a deployment whose
+    /// admin block is missing its `wafer_run__auth__users` grant read that
+    /// as an outage.
+    #[tokio::test]
+    async fn a_denied_user_read_is_403_not_500() {
+        let ctx = denied_users_ctx().await;
+        assert_eq!(
+            output_http_status(get_user(&ctx, "any-id").await).await,
+            403
+        );
+    }
+
+    /// The same denial through every other auth-repo-backed admin user
+    /// handler, so the fix is the repo layer's and not one handler's.
+    #[tokio::test]
+    async fn a_denied_user_list_is_403_not_500() {
+        let ctx = denied_users_ctx().await;
+        let out = handle_list(&ctx, &admin_msg("retrieve", "/b/admin/api/users")).await;
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_user_update_is_403_not_500() {
+        let ctx = denied_users_ctx().await;
+        let input = InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({"name": "Ada Updated"})).unwrap(),
+        );
+        let msg = routed(admin_msg("update", "/b/admin/api/users/any-id"));
+        assert_eq!(
+            output_http_status(handle_update(&ctx, &msg, input).await).await,
+            403
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_user_delete_is_403_not_500() {
+        let ctx = denied_users_ctx().await;
+        let msg = routed(admin_msg("delete", "/b/admin/api/users/any-id"));
+        assert_eq!(
+            output_http_status(handle_delete(&ctx, &msg).await).await,
+            403
+        );
+    }
+
+    /// The granted path still answers as it did, so the 403 above is the
+    /// denial and not a blanket refusal.
+    #[tokio::test]
+    async fn a_granted_read_of_a_missing_user_is_still_404() {
+        let ctx = users_ctx().await;
+        assert_eq!(
+            output_http_status(get_user(&ctx, "no-such-user").await).await,
+            404
+        );
     }
 }
