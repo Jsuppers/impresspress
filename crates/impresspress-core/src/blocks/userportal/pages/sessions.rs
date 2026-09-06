@@ -1,16 +1,23 @@
-//! `/b/userportal/sessions` — list active sessions, revoke individual ones.
+//! `/b/userportal/sessions` — list the caller's signed-in devices and revoke
+//! individual ones.
+//!
+//! [B12] A row is a login family, so the list has one entry per device rather
+//! than one per access token the device was ever issued, and revoking an entry
+//! actually signs that device out: the revoke burns the refresh family in
+//! `tokens` before deleting the row. Before this it removed the list entry and
+//! nothing else, so the device kept refreshing and simply re-appeared.
 
 use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::{repo::sessions, service::hash_token},
-    http::{redirect, ResponseBuilder},
+    blocks::auth::repo::{sessions, tokens},
+    crypto::META_AUTH_FAMILY,
+    http::{err_internal, redirect, ResponseBuilder},
     ui::{
         components::{badge, BadgeVariant},
         SiteConfig,
     },
-    util::hex_encode,
 };
 
 pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -29,42 +36,33 @@ pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
     };
 
-    let current_hash = current_session_hash(msg);
+    let current_family = current_session_family(msg);
 
     let body = html! {
         p .text-muted .m-0 .mb-4 .text-sm {
             "Sessions signed in to your account. Revoke any you don't recognize."
         }
-        (render_table(&rows, current_hash.as_deref()))
+        (render_table(&rows, current_family))
     };
 
     let config = SiteConfig::load(ctx).await;
     super::account_page(&config, "Sessions", Some("/b/userportal/"), body)
 }
 
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+/// The login family the request's own access token belongs to, or `None` when
+/// the request carries no verified token. Used to mark one row with a
+/// "Current session" badge.
+///
+/// Read from `auth.family` meta, which `crypto::extract_auth_meta` sets only
+/// from a token it accepted. Taking the family off the request's own cookie
+/// instead would let any caller paint the badge on another user's row — a UX
+/// signal, but one worth not letting a stranger forge.
+fn current_session_family(msg: &Message) -> Option<&str> {
+    let family = msg.get_meta(META_AUTH_FAMILY);
+    (!family.is_empty()).then_some(family)
 }
 
-/// Compute the SHA-256 hash of the request's `auth_token` cookie (the JWT
-/// issued at login), or `None` if no cookie is present. Used to mark the row
-/// matching the current request with a "Current session" badge — a UX
-/// signal, not a security gate.
-fn current_session_hash(msg: &Message) -> Option<Vec<u8>> {
-    let cookie = msg.cookie("auth_token");
-    if cookie.is_empty() {
-        return None;
-    }
-    Some(hash_token(cookie))
-}
-
-fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> Markup {
+fn render_table(rows: &[sessions::SessionRow], current_family: Option<&str>) -> Markup {
     if rows.is_empty() {
         return html! {
             div .empty-state { p { "No active sessions." } }
@@ -82,7 +80,7 @@ fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> M
             }
             tbody {
                 @for r in rows {
-                    @let is_current = current_hash.is_some_and(|h| h == r.token_hash.as_slice());
+                    @let is_current = current_family == Some(r.family.as_str());
                     tr .session-row {
                         // Timestamps render as semantic <time> elements —
                         // correct HTML for datetimes, and the visual-baseline
@@ -99,7 +97,7 @@ fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> M
                         td data-label="Expires" { time datetime=(r.expires_at) { (r.expires_at) } }
                         td data-label="" {
                             button .btn .btn--ghost .btn--sm
-                                hx-delete=(format!("/b/userportal/sessions/{}", hex_encode(&r.token_hash)))
+                                hx-delete=(format!("/b/userportal/sessions/{}", r.family))
                                 hx-target="closest tr"
                                 hx-swap="outerHTML"
                             { "Revoke" }
@@ -111,11 +109,25 @@ fn render_table(rows: &[sessions::SessionRow], current_hash: Option<&[u8]>) -> M
     }
 }
 
-/// DELETE `/b/userportal/sessions/{hash}` (the token hash, hex). Scoped to
-/// caller's user_id — refusing to revoke another user's session looks
-/// indistinguishable from "no such session" (returns 200 with no body either
-/// way; htmx removes the row). Returns 401 if anonymous, 400 if the bound
-/// `{hash}` is missing or malformed.
+/// DELETE `/b/userportal/sessions/{family}` — sign one device out.
+///
+/// [B12] Three steps, in this order and all of them load-bearing:
+///
+/// 1. Resolve the family *scoped to the caller*. `tokens::revoke_family` takes
+///    a family and no user, so ownership has to be established before it is
+///    called. A family that is not the caller's looks exactly like one that
+///    does not exist (200, no body — htmx removes the row either way), so the
+///    response never reveals which.
+/// 2. Revoke every refresh row in the family. This is what actually signs the
+///    device out; skipping it (what this handler used to do) removed the list
+///    entry while the device kept rotating tokens and re-appeared on the next
+///    refresh.
+/// 3. Delete the session row.
+///
+/// Steps 2 and 3 propagate their errors as a 500. "Revoked" that silently did
+/// not revoke is the failure mode this whole change exists to remove, so a
+/// user must not be told a device is signed out when it is not. Returns 401 if
+/// anonymous, 400 if the bound `{family}` is missing.
 pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
@@ -123,15 +135,32 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
             .status(401)
             .body(b"unauthenticated".to_vec(), "text/plain");
     }
-    let hash = match decode_hex(msg.var("hash")) {
-        Some(h) if !h.is_empty() => h,
-        _ => {
+    let family = msg.var("family").to_string();
+    if family.is_empty() {
+        return ResponseBuilder::new()
+            .status(400)
+            .body(b"bad family".to_vec(), "text/plain");
+    }
+
+    match sessions::find_for_user(ctx, &user_id, &family).await {
+        Ok(Some(_)) => {}
+        // No such session for this caller — indistinguishable from someone
+        // else's, on purpose.
+        Ok(None) => {
             return ResponseBuilder::new()
-                .status(400)
-                .body(b"bad token_hash".to_vec(), "text/plain");
+                .status(200)
+                .body(Vec::new(), "text/html")
         }
-    };
-    let _ = sessions::delete_for_user(ctx, &user_id, &hash).await;
+        Err(e) => return err_internal("Could not look up the session", e),
+    }
+
+    if let Err(e) = tokens::revoke_family(ctx, &family).await {
+        return err_internal("Could not revoke the session", e);
+    }
+    if let Err(e) = sessions::delete(ctx, &family).await {
+        return err_internal("Could not remove the session", e);
+    }
+
     // Empty 200 — htmx swaps the row out via outerHTML.
     ResponseBuilder::new()
         .status(200)
@@ -144,20 +173,17 @@ mod tests {
     use super::*;
     use crate::{
         blocks::{
-            auth::{
-                repo::sessions::{insert, NewSession},
-                service::hash_token,
-            },
+            auth::repo::sessions::{insert, NewSession},
             userportal::test_support::routed,
         },
+        crypto::META_AUTH_FAMILY,
         test_support::{anon_msg, auth_msg, output_html, output_status, TestContext},
     };
 
-    /// Inject an `auth_token` cookie into a request `Message` by setting the
-    /// `http.header.cookie` meta — mirroring how a real HTTP frontend
-    /// surfaces cookies to handlers.
-    fn with_auth_cookie(mut msg: wafer_run::Message, token: &str) -> wafer_run::Message {
-        msg.set_meta("http.header.cookie", format!("auth_token={token}"));
+    /// Present a login family on the message the way `extract_auth_meta` does
+    /// after verifying the request's access token.
+    fn with_family(mut msg: wafer_run::Message, family: &str) -> wafer_run::Message {
+        msg.set_meta(META_AUTH_FAMILY, family);
         msg
     }
 
@@ -165,12 +191,21 @@ mod tests {
         ctx.seed_auth_user(user_id).await;
     }
 
-    fn fake_session(user_id: &str, hash_byte: u8) -> NewSession {
+    fn fake_session(user_id: &str, family: &str) -> NewSession {
         NewSession {
-            token_hash: vec![hash_byte; 32],
+            family: family.into(),
             user_id: user_id.into(),
+            auth_method: "password".into(),
             expires_at: "2099-01-01T00:00:00Z".into(),
         }
+    }
+
+    /// A live refresh row in `family`, so the revoke path has something to
+    /// burn and the test can prove it burned it.
+    async fn seed_refresh_row(ctx: &TestContext, user_id: &str, family: &str) {
+        tokens::insert(ctx, user_id, family, family, 0, "2099-01-01T00:00:00Z")
+            .await
+            .expect("seed refresh row");
     }
 
     #[tokio::test]
@@ -195,8 +230,8 @@ mod tests {
     async fn populated_renders_one_row_per_session_with_revoke() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
-        insert(&ctx, fake_session("user-a", 0x02)).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-2")).await.unwrap();
 
         let msg = auth_msg("retrieve", "/b/userportal/sessions", "user-a");
         let resp = sessions_page(&ctx, &msg).await;
@@ -206,64 +241,62 @@ mod tests {
         // Two Revoke buttons (one per row).
         assert!(
             html.matches(">Revoke<").count() >= 2,
-            "expected ≥2 Revoke buttons, got: {}",
+            "expected \u{2265}2 Revoke buttons, got: {}",
             html.matches(">Revoke<").count()
+        );
+        // The revoke control addresses the family, which is what the route
+        // binds and what `tokens::revoke_family` takes.
+        assert!(
+            html.contains("/b/userportal/sessions/fam-1"),
+            "the revoke URL must carry the family: {html}"
         );
     }
 
     #[tokio::test]
     async fn revoke_anonymous_returns_401() {
         let ctx = TestContext::with_auth().await;
-        let msg = routed(anon_msg("delete", "/b/userportal/sessions/aabb"));
+        let msg = routed(anon_msg("delete", "/b/userportal/sessions/fam-1"));
         let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 401);
     }
 
+    /// [B12] The point of the change: revoking a device signs it out. The
+    /// family's refresh rows are revoked *and* the row is removed; before
+    /// this the handler removed the row and the device simply re-appeared on
+    /// its next rotation.
     #[tokio::test]
-    async fn revoke_malformed_hex_returns_400() {
+    async fn revoke_own_session_revokes_the_family_and_deletes_the_row() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        let msg = routed(auth_msg("delete", "/b/userportal/sessions/zzz", "user-a"));
-        let resp = handle_revoke(&ctx, &msg).await;
-        assert_eq!(output_status(resp).await, 400);
-    }
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
+        seed_refresh_row(&ctx, "user-a", "fam-1").await;
+        assert!(tokens::family_has_live_row(&ctx, "fam-1").await.unwrap());
 
-    #[tokio::test]
-    async fn revoke_own_session_deletes_it() {
-        let ctx = TestContext::with_auth().await;
-        seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
-        assert_eq!(
-            sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
-            1
-        );
-
-        let hex_hash: String = (0..32).map(|_| "01".to_string()).collect();
-        let msg = routed(auth_msg(
-            "delete",
-            &format!("/b/userportal/sessions/{hex_hash}"),
-            "user-a",
-        ));
+        let msg = routed(auth_msg("delete", "/b/userportal/sessions/fam-1", "user-a"));
         let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 200);
-        assert_eq!(
-            sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
-            0
+
+        assert!(
+            !tokens::family_has_live_row(&ctx, "fam-1").await.unwrap(),
+            "revoking a device must burn its refresh family, not just the list entry"
         );
+        assert!(sessions::list_for_user(&ctx, "user-a")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
-    /// `handle_revoke` reads `{hash}` only as the route table bound it: the
-    /// same message is refused unrouted and deletes the session once it has
+    /// `handle_revoke` reads `{family}` only as the route table bound it: the
+    /// same message is refused unrouted and revokes the session once it has
     /// been through `ROUTES`.
     #[tokio::test]
-    async fn revoke_reads_only_the_bound_hash() {
+    async fn revoke_reads_only_the_bound_family() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
-        let hex_hash: String = (0..32).map(|_| "01".to_string()).collect();
-        let path = format!("/b/userportal/sessions/{hex_hash}");
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
+        let path = "/b/userportal/sessions/fam-1";
 
-        let unrouted = handle_revoke(&ctx, &auth_msg("delete", &path, "user-a")).await;
+        let unrouted = handle_revoke(&ctx, &auth_msg("delete", path, "user-a")).await;
         assert_eq!(
             output_status(unrouted).await,
             400,
@@ -274,65 +307,81 @@ mod tests {
             1
         );
 
-        let through_table = handle_revoke(&ctx, &routed(auth_msg("delete", &path, "user-a"))).await;
+        let through_table = handle_revoke(&ctx, &routed(auth_msg("delete", path, "user-a"))).await;
         assert_eq!(output_status(through_table).await, 200);
-        assert_eq!(
-            sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
-            0
-        );
+        assert!(sessions::list_for_user(&ctx, "user-a")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
+    /// Another user's family is not revocable, and the response does not say
+    /// so — it is indistinguishable from a family that does not exist. This
+    /// is the ownership gate `tokens::revoke_family`, which takes no user id,
+    /// cannot provide for itself.
     #[tokio::test]
-    async fn revoke_other_users_session_is_no_op_returns_200() {
+    async fn revoke_other_users_session_is_a_no_op_returning_200() {
         let ctx = TestContext::with_auth().await;
         for u in ["user-a", "user-b"] {
             seed_user(&ctx, u).await;
         }
-        insert(&ctx, fake_session("user-b", 0x02)).await.unwrap();
+        insert(&ctx, fake_session("user-b", "fam-b")).await.unwrap();
+        seed_refresh_row(&ctx, "user-b", "fam-b").await;
 
-        // user-a tries to revoke user-b's session.
-        let hex_hash: String = (0..32).map(|_| "02".to_string()).collect();
-        let msg = routed(auth_msg(
-            "delete",
-            &format!("/b/userportal/sessions/{hex_hash}"),
-            "user-a",
-        ));
+        let msg = routed(auth_msg("delete", "/b/userportal/sessions/fam-b", "user-a"));
         let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 200);
-        // user-b's session is still there — no leak.
+
         assert_eq!(
             sessions::list_for_user(&ctx, "user-b").await.unwrap().len(),
-            1
+            1,
+            "user-b's device is still listed"
+        );
+        assert!(
+            tokens::family_has_live_row(&ctx, "fam-b").await.unwrap(),
+            "and still signed in — a stranger cannot revoke it"
         );
     }
 
-    /// When the request's `auth_token` cookie hashes to one of the user's
-    /// session rows, that row gets a "Current session" badge. Other rows
-    /// don't. Mirrors how the JWT login path stores `hash_token(jwt)` in
-    /// `token_hash`.
+    /// A failed revoke is reported as one. Answering 200 while the family
+    /// stayed live is exactly the lie this change removes.
+    #[tokio::test]
+    async fn a_failed_family_revoke_is_a_500_not_a_silent_success() {
+        use crate::test_support::{output_is_error, FailingDbOpContext};
+
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
+        seed_refresh_row(&ctx, "user-a", "fam-1").await;
+        let failing = FailingDbOpContext::new(ctx, vec![("database.update_where", tokens::TABLE)]);
+
+        let msg = routed(auth_msg("delete", "/b/userportal/sessions/fam-1", "user-a"));
+        let resp = handle_revoke(&failing, &msg).await;
+        assert!(output_is_error(resp, "Internal").await);
+        assert!(
+            tokens::family_has_live_row(&failing, "fam-1")
+                .await
+                .unwrap(),
+            "precondition for the assertion above: the family really is still live"
+        );
+    }
+
+    /// The row whose family matches the request's *verified* token gets the
+    /// badge. Other rows do not.
     #[tokio::test]
     async fn current_session_row_gets_badge() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
+        insert(&ctx, fake_session("user-a", "fam-here"))
+            .await
+            .unwrap();
+        insert(&ctx, fake_session("user-a", "fam-elsewhere"))
+            .await
+            .unwrap();
 
-        // Two sessions: one matches the request's cookie, one doesn't.
-        let current_jwt = "eyJfake.jwt.value";
-        let current_hash = hash_token(current_jwt);
-        insert(
-            &ctx,
-            NewSession {
-                token_hash: current_hash,
-                user_id: "user-a".into(),
-                expires_at: "2099-01-01T00:00:00Z".into(),
-            },
-        )
-        .await
-        .unwrap();
-        insert(&ctx, fake_session("user-a", 0xee)).await.unwrap();
-
-        let msg = with_auth_cookie(
+        let msg = with_family(
             auth_msg("retrieve", "/b/userportal/sessions", "user-a"),
-            current_jwt,
+            "fam-here",
         );
         let resp = sessions_page(&ctx, &msg).await;
         let html = output_html(resp).await;
@@ -349,47 +398,45 @@ mod tests {
         );
     }
 
-    /// No `auth_token` cookie means no row matches — page renders without
-    /// any current-session badge but still lists rows normally. Guards the
-    /// "page must not crash for cookie-less callers" requirement.
+    /// No verified family on the request means no badge, but the list still
+    /// renders. Guards the "page must not crash for a caller whose token
+    /// predates the `family` claim" requirement.
     #[tokio::test]
-    async fn no_cookie_renders_no_badge() {
+    async fn no_family_meta_renders_no_badge() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
-        // auth_msg sets user_id meta but no cookie header.
         let msg = auth_msg("retrieve", "/b/userportal/sessions", "user-a");
         let resp = sessions_page(&ctx, &msg).await;
         let html = output_html(resp).await;
 
         assert!(
             !html.contains("Current session"),
-            "no badge expected when no auth_token cookie present"
+            "no badge expected when the request carries no verified family"
         );
-        // Row still rendered — page didn't degrade.
         assert!(html.contains(">Revoke<"), "row body still present");
     }
 
-    /// A cookie that doesn't hash to any session row produces no badge.
-    /// Catches the case where a stale/invalid token sneaks into the request
-    /// (e.g. expired-but-not-yet-cleared client cookie).
+    /// A family that matches none of the caller's rows produces no badge —
+    /// the case where a device was revoked in another tab while this one's
+    /// token is still live.
     #[tokio::test]
-    async fn cookie_with_no_matching_row_renders_no_badge() {
+    async fn a_family_with_no_matching_row_renders_no_badge() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
-        let msg = with_auth_cookie(
+        let msg = with_family(
             auth_msg("retrieve", "/b/userportal/sessions", "user-a"),
-            "eyJ.unrelated.jwt",
+            "fam-unrelated",
         );
         let resp = sessions_page(&ctx, &msg).await;
         let html = output_html(resp).await;
 
         assert!(
             !html.contains("Current session"),
-            "no badge expected when cookie hash doesn't match any row"
+            "no badge expected when the family matches no row"
         );
     }
 
@@ -406,7 +453,7 @@ mod tests {
         // that lifecycle.
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
         let ctx = ctx.with_wrap("impresspress/userportal", Vec::new(), "impresspress/admin");
 
@@ -425,7 +472,7 @@ mod tests {
 
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
@@ -439,13 +486,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    /// The revoke path now writes to `tokens` as well as `sessions`, so
+    /// auth's grant list has to cover both for the userportal — a missing
+    /// `tokens` grant would turn every revoke into a 500.
     #[tokio::test]
-    async fn wrap_allows_sessions_delete_with_auth_block_grants() {
+    async fn wrap_allows_the_whole_revoke_path_with_auth_block_grants() {
         use crate::blocks::auth::service::auth_grants;
 
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        insert(&ctx, fake_session("user-a", 0x01)).await.unwrap();
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
+        seed_refresh_row(&ctx, "user-a", "fam-1").await;
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
@@ -453,9 +504,8 @@ mod tests {
             "impresspress/admin",
         );
 
-        let removed = sessions::delete_for_user(&ctx, "user-a", &[0x01u8; 32])
-            .await
-            .expect("auth's production grants must cover userportal sessions write");
-        assert_eq!(removed, 1);
+        let msg = routed(auth_msg("delete", "/b/userportal/sessions/fam-1", "user-a"));
+        assert_eq!(output_status(handle_revoke(&ctx, &msg).await).await, 200);
+        assert!(!tokens::family_has_live_row(&ctx, "fam-1").await.unwrap());
     }
 }

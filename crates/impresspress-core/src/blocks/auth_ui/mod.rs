@@ -5,12 +5,14 @@
 //!
 //! - **Framework auth** (`wafer-run/auth`, lives in `wafer-run` proper):
 //!   service-shaped block exposing `auth@v1` (`require_user`/`require_role`/
-//!   token issue+verify). Owns `JWT_SECRET`, `REQUIRE_VERIFICATION`,
-//!   `ALLOWED_EMAIL_DOMAINS`, `INTERNAL_SECRET`. No HTTP routes.
+//!   `require_token`) over impresspress's `auth::service::AuthServiceImpl`,
+//!   which authenticates the access JWT this block mints. Owns `JWT_SECRET`,
+//!   `REQUIRE_VERIFICATION` and `ALLOWED_EMAIL_DOMAINS`. No HTTP routes.
 //!
-//! - **auth-ui** (this module): all `/b/auth/*` HTTP routes. Reads/writes
-//!   auth tables via `repo::*` under WRAP grant. Calls the framework auth
-//!   block via the `auth@v1` typed client for identity primitives.
+//! - **auth-ui** (this module): all `/b/auth/*` HTTP routes. Reads and writes
+//!   the auth tables through `auth::repo::*` under WRAP grant — it does not
+//!   call `auth@v1`, and no caller of that interface exists anywhere in the
+//!   workspace today.
 //!
 //! Declares the full `BlockInfo` (endpoints, requires, OAuth-creds
 //! config_keys) from [`ROUTES`], runs the per-user/IP rate-limit check keyed
@@ -33,10 +35,24 @@ use wafer_run::{
 use super::rate_limit::{apply_route_limit, LimitKey, RateLimit, UserRateLimiter};
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
-    http::err_not_found,
+    http::{err_not_found, ok_json},
 };
 
 pub const AUTH_UI_BLOCK_ID: &str = "impresspress/auth-ui";
+
+/// [B12] Message kind that forces one auth retention pass and answers with the
+/// [`SweepResult`](crate::blocks::auth::maintenance::SweepResult).
+///
+/// Mirrors `tickets.maintenance`. The sweep already runs on its own, throttled
+/// from token issuance, so this exists for an operator who wants a pass now and
+/// for the Worker `scheduled` handler Phase 4 adds — not because anything
+/// depends on it.
+///
+/// It is handled here rather than on the framework `wafer-run/auth` block
+/// because that block routes every message through wafer-core's own `auth@v1`
+/// handler, and wafer-run is pinned. auth-ui already holds the WRAP grants for
+/// every auth table, so this is also where the pass can actually run.
+pub const MAINTENANCE_MESSAGE_KIND: &str = "auth.maintenance";
 
 /// Handler for one row of [`ROUTES`]. `Verify` serves both the `GET` and the
 /// `POST` row of `/b/auth/api/verify` (the token arrives in the query string
@@ -69,7 +85,6 @@ enum Route {
     ForgotPassword,
     ResetPassword,
     OauthProviders,
-    SyncUser,
     Bootstrap,
 }
 
@@ -239,14 +254,6 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         Route::OauthProviders,
     )
     .summary("Configured OAuth providers"),
-    // Public to the router; `api/sync_user.rs` refuses unless the
-    // `x-internal-secret` header matches `INTERNAL_SECRET` (constant-time).
-    EndpointRoute::public(
-        HttpMethod::Post,
-        "/b/auth/api/oauth/sync-user",
-        Route::SyncUser,
-    )
-    .summary("Internal OAuth user sync"),
     // ── Bootstrap admin token redemption ──
     EndpointRoute::public(HttpMethod::Post, "/b/auth/api/bootstrap", Route::Bootstrap)
         .summary("Redeem bootstrap admin token"),
@@ -289,8 +296,7 @@ const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLim
         | Route::OauthStart
         | Route::OauthCallback
         | Route::Logout
-        | Route::OauthProviders
-        | Route::SyncUser => None,
+        | Route::OauthProviders => None,
     }
 }
 
@@ -401,13 +407,16 @@ crate::impresspress_feature_block! {
         .description(
             "Impresspress auth HTTP surface (SSR pages, JSON API, OAuth, bootstrap \
              token redemption). Reads/writes auth tables via repo::* under WRAP \
-             grant. Calls wafer-run/auth via auth@v1 for require_user/role/token.",
+             grant.",
         )
         .endpoints(endpoint_match::declare(ROUTES))
         .config_keys(config_vars())
         .admin_url("/b/auth/admin/settings")
     },
     handle: |this, ctx, msg, input| {
+        if msg.kind == MAINTENANCE_MESSAGE_KIND {
+            return ok_json(&crate::blocks::auth::maintenance::sweep(ctx).await);
+        }
         // Auth is enforced centrally by `route_to_block` from each row's
         // declared `AuthLevel`. `{id}` is bound into `req.param.*` for the
         // api-key handlers' `msg.var` reader.
@@ -449,7 +458,6 @@ crate::impresspress_feature_block! {
             Route::ForgotPassword => api::forgot_password::handle(ctx, input).await,
             Route::ResetPassword => api::reset_password::handle(ctx, input).await,
             Route::OauthProviders => oauth::providers::handle(ctx).await,
-            Route::SyncUser => api::sync_user::handle(ctx, &msg, input).await,
             Route::Bootstrap => api::bootstrap::handle(ctx, &msg, input).await,
         }
     },
@@ -604,5 +612,36 @@ mod table_tests {
             assert_eq!(ep.path, row.template);
             assert_eq!(ep.auth, row.auth, "{}", row.template);
         }
+    }
+
+    /// [B14] `POST /b/auth/api/oauth/sync-user` is gone: neither declared nor
+    /// dispatched.
+    ///
+    /// It created a user from an email behind an `x-internal-secret` header
+    /// checked against `WAFER_RUN__AUTH__INTERNAL_SECRET` — a config var no
+    /// `ConfigVar` declared and `auth_grants()` granted no `Config` read for,
+    /// so under WRAP the read returned `""` and the handler answered 403 to
+    /// everyone. Nothing in `crates/`, `packages/`, `examples/`, `docs/` or
+    /// `.github/` ever called it, and what it did (create-or-find a user by
+    /// email for an OAuth identity) is what `oauth::callback::resolve_user`
+    /// does behind PKCE. Declaring and granting the secret would have kept an
+    /// unauthenticated-shaped user-creation surface alive for a caller that
+    /// does not exist.
+    #[test]
+    fn sync_user_is_neither_declared_nor_dispatched() {
+        assert!(
+            !ROUTES
+                .iter()
+                .any(|r| r.template == "/b/auth/api/oauth/sync-user"),
+            "the sync-user row must be gone from the declaration"
+        );
+
+        let mut msg = Message::new("http.request");
+        msg.set_meta("req.action", "create");
+        msg.set_meta("req.resource", "/b/auth/api/oauth/sync-user");
+        assert!(
+            endpoint_match::dispatch(&mut msg, ROUTES).is_none(),
+            "no row may match the deleted path"
+        );
     }
 }

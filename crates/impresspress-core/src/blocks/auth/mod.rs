@@ -11,7 +11,7 @@
 //! What lives in this module after the split:
 //!
 //! - Module decls for the supporting layers (`bootstrap`, `config`,
-//!   `migrations`, `repo`, `service`).
+//!   `maintenance`, `migrations`, `repo`, `service`).
 //! - Constants other blocks still reference (`AUTH_BLOCK_ID`,
 //!   `JWT_SECRET_KEY`, `DUMMY_HASH`). Every auth table is reached through
 //!   its own `repo::<table>` module; there are no table-name re-exports
@@ -22,6 +22,7 @@
 
 pub mod bootstrap;
 pub mod config;
+pub mod maintenance;
 pub mod migrations;
 pub mod repo;
 pub mod service;
@@ -31,11 +32,6 @@ use std::{collections::HashMap, time::Duration};
 use wafer_core::clients::{config as config_client, crypto};
 
 use crate::util::hex_encode;
-
-/// Refresh-token lifetime (7 days). Mirrored in [`helpers::generate_tokens`]
-/// when signing the JWT and in [`helpers::store_refresh_token`] when writing
-/// the row's `expires_at`. Centralised here so the two stay in lockstep.
-pub(crate) const REFRESH_TOKEN_TTL_SECS: u64 = 604_800;
 
 pub const AUTH_BLOCK_ID: &str = "wafer-run/auth";
 
@@ -551,6 +547,15 @@ pub(crate) mod helpers {
         );
         access_claims.insert("jti".to_string(), serde_json::Value::String(jti));
         access_claims.insert("iss".to_string(), serde_json::Value::String(issuer.clone()));
+        // [B12] The rotation family, carried on the access token as well as
+        // the refresh token. It is what tells the userportal sessions page
+        // which listed device is the one making the request; reading it off
+        // the request's own cookie instead would let any caller paint the
+        // "current session" badge on another user's row.
+        access_claims.insert(
+            "family".to_string(),
+            serde_json::Value::String(family.clone()),
+        );
         access_claims.insert(
             repo::users::AUTH_VERSION_FIELD.to_string(),
             serde_json::json!(auth_version),
@@ -590,7 +595,7 @@ pub(crate) mod helpers {
         let refresh_token = crypto::sign(
             ctx,
             &refresh_claims,
-            Duration::from_secs(super::REFRESH_TOKEN_TTL_SECS),
+            Duration::from_secs(refresh_ttl_secs(ctx).await),
         )
         .await
         .map_err(wafer_run::OutputStream::error)?;
@@ -626,10 +631,7 @@ pub(crate) mod helpers {
         family: &str,
         generation: i64,
     ) {
-        let expires_at = (chrono::Utc::now()
-            + chrono::Duration::seconds(super::REFRESH_TOKEN_TTL_SECS as i64))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+        let expires_at = refresh_expires_at(ctx).await;
         if let Err(e) =
             super::repo::tokens::insert(ctx, user_id, token, family, generation, &expires_at).await
         {
@@ -667,11 +669,9 @@ pub(crate) mod helpers {
             .unwrap_or(PASSWORD_MIN_LENGTH_DEFAULT as usize)
     }
 
-    /// Resolve the configured session-row lifetime in days
+    /// Resolve the configured login lifetime in days
     /// (`WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS`). Falls back to the
-    /// declared default if unset or unparseable. The session row is the
-    /// userportal device-list signal; its expiry is independent of the JWT
-    /// access-token lifetime (which is gated by [`access_token_lifetime_secs`]).
+    /// declared default if unset or unparseable.
     pub(crate) async fn session_lifetime_days(ctx: &dyn wafer_run::context::Context) -> u32 {
         use super::config::{SESSION_LIFETIME_DAYS_DEFAULT, SESSION_LIFETIME_DAYS_KEY};
         let raw = config_client::get_default(ctx, SESSION_LIFETIME_DAYS_KEY, "").await;
@@ -679,6 +679,29 @@ pub(crate) mod helpers {
             .ok()
             .filter(|n| *n > 0)
             .unwrap_or(SESSION_LIFETIME_DAYS_DEFAULT)
+    }
+
+    /// [B12] The refresh-token TTL in seconds — the one value that decides
+    /// how long a login lasts.
+    ///
+    /// [`generate_tokens`] signs the refresh JWT with it,
+    /// [`store_refresh_token`] writes the row's `expires_at` from it, and
+    /// [`issue_tokens_and_cookie`] gives the session row the same expiry, so
+    /// the device list cannot claim a session outlives its token. Derived
+    /// from [`session_lifetime_days`] rather than a constant of its own: two
+    /// constants for one lifetime is what let them disagree (30 days on the
+    /// row, 7 on the token).
+    pub(crate) async fn refresh_ttl_secs(ctx: &dyn wafer_run::context::Context) -> u64 {
+        u64::from(session_lifetime_days(ctx).await) * 86_400
+    }
+
+    /// The RFC-3339-ish `expires_at` a refresh row and its session row share:
+    /// now plus [`refresh_ttl_secs`], in the `…Z` form every auth table uses.
+    async fn refresh_expires_at(ctx: &dyn wafer_run::context::Context) -> String {
+        let ttl = refresh_ttl_secs(ctx).await;
+        (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
     }
 
     /// Outcome of [`issue_tokens_and_cookie`]: the freshly minted token pair,
@@ -696,21 +719,78 @@ pub(crate) mod helpers {
     /// Shared token-issuance tail for every login flow (password login, signup,
     /// bootstrap redemption, OAuth callback, and refresh rotation).
     ///
-    /// Mints the access + refresh JWTs, persists the refresh-token row, writes
-    /// the userportal session row, and builds the `auth_token` cookie — the
-    /// exact sequence that was previously copy-pasted across all five handlers
-    /// (and which the OAuth copy had drifted from, silently omitting the
-    /// session row). Centralising it guarantees every authentication path is
-    /// visible on the userportal device list.
+    /// [B12] Record this login family on the userportal device list: touch
+    /// the row it already has, or insert one when it has none.
+    ///
+    /// Touch-then-insert rather than a branch on whether the caller passed a
+    /// family, because "no row" is not the same question as "new family". A
+    /// family can lose its row — migration 012 drops the pre-B12 table and
+    /// re-runs whenever any auth migration changes the block's SQL hash, and
+    /// the sweeper removes rows whose expiry has passed. Without the fallback
+    /// such a device would rotate its tokens forever while never appearing on
+    /// the list again.
+    ///
+    /// Best-effort by design: a failure here loses a list entry, not a
+    /// session, and must not turn a successful login into a 500.
+    async fn record_login_family(
+        ctx: &dyn wafer_run::context::Context,
+        user_id: &str,
+        family: &str,
+        auth_method: &str,
+        expires_at: &str,
+    ) {
+        use super::repo::sessions;
+
+        match sessions::touch(ctx, family, expires_at).await {
+            Ok(0) => {
+                if let Err(e) = sessions::insert(
+                    ctx,
+                    sessions::NewSession {
+                        family: family.to_string(),
+                        user_id: user_id.to_string(),
+                        auth_method: auth_method.to_string(),
+                        expires_at: expires_at.to_string(),
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        auth_method = %auth_method,
+                        "failed to persist session row for login: {e}"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                user_id = %user_id,
+                family = %family,
+                "failed to touch session row on rotation: {e}"
+            ),
+        }
+    }
+
+    /// Mints the access + refresh JWTs, persists the refresh-token row,
+    /// records the login family on the userportal device list, and builds the
+    /// `auth_token` cookie — the exact sequence that was previously
+    /// copy-pasted across all five handlers (and which the OAuth copy had
+    /// drifted from, silently omitting the session row). Centralising it
+    /// guarantees every authentication path is visible on the device list.
     ///
     /// `family` follows [`generate_tokens`]: `None` mints a brand-new rotation
     /// family (initial authentication), `Some(existing)` re-issues within an
     /// established family (refresh rotation). `generation` is the refresh-row
     /// generation to persist (`0` for a new family, `prev + 1` on rotation).
     ///
+    /// [B12] The session row is keyed by that family, not by the access
+    /// token, so a rotation touches the row the device already has instead of
+    /// adding a forty-eighth one for the day. Its `expires_at` is the refresh
+    /// row's, so the list cannot claim a device is signed in after its refresh
+    /// token has expired.
+    ///
     /// The session-row write failing does not abort issuance — it is a UX
-    /// signal, not a security gate (auth is entirely JWT-based today) — but it
-    /// is logged.
+    /// signal, not a security gate (auth is entirely JWT-based) — but it is
+    /// logged.
     pub(crate) async fn issue_tokens_and_cookie(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
@@ -720,23 +800,25 @@ pub(crate) mod helpers {
         family: Option<&str>,
         generation: i64,
     ) -> std::result::Result<IssuedLogin, wafer_run::OutputStream> {
-        use super::{repo::sessions, service::hash_token};
-
         let (access_token, refresh_token, issued_family) =
             generate_tokens(ctx, user_id, email, roles, auth_method, family).await?;
 
         store_refresh_token(ctx, user_id, &refresh_token, &issued_family, generation).await;
+        record_login_family(
+            ctx,
+            user_id,
+            &issued_family,
+            auth_method,
+            &refresh_expires_at(ctx).await,
+        )
+        .await;
 
-        let lifetime_days = session_lifetime_days(ctx).await;
-        if let Err(e) =
-            sessions::create_for_user(ctx, user_id, hash_token(&access_token), lifetime_days).await
-        {
-            tracing::warn!(
-                user_id = %user_id,
-                auth_method = %auth_method,
-                "failed to persist session row for login: {e}"
-            );
-        }
+        // [B12] Retention runs from here because it is the one path every
+        // deployment exercises on its own — the Cloudflare Worker has no
+        // `scheduled` handler yet (Phase 4) and no operator has to remember to
+        // POST anything. It is throttled to at most once an hour, so a login
+        // storm costs one sweep.
+        super::maintenance::sweep_if_due(ctx).await;
 
         let access_lifetime = access_token_lifetime_secs(ctx).await;
         let cookie = build_auth_cookie(&access_token, access_lifetime, ctx).await;
@@ -827,6 +909,45 @@ pub(crate) mod helpers {
             .await
             .unwrap()
             .id
+        }
+
+        /// The access token carries the same `family` the refresh token does.
+        /// Without it the userportal cannot tell which listed device is the
+        /// one making the request, and `current_session_family` would have to
+        /// read an unverified value off the cookie.
+        #[tokio::test]
+        async fn minted_access_token_carries_the_refresh_family() {
+            let ctx = ctx_with_crypto().await;
+            let uid = seed_user(&ctx).await;
+
+            let Ok((access_token, refresh_token, family)) = generate_tokens(
+                &ctx,
+                &uid,
+                "mint@example.com",
+                &["user".to_string()],
+                "password",
+                None,
+            )
+            .await
+            else {
+                panic!("mint tokens failed")
+            };
+
+            let access = crypto::verify(&ctx, &access_token)
+                .await
+                .expect("verify access token");
+            let refresh = crypto::verify(&ctx, &refresh_token)
+                .await
+                .expect("verify refresh token");
+            assert_eq!(
+                access.get("family").and_then(|v| v.as_str()),
+                Some(family.as_str()),
+                "the access token must carry the family the refresh token anchors"
+            );
+            assert_eq!(
+                refresh.get("family").and_then(|v| v.as_str()),
+                Some(family.as_str())
+            );
         }
 
         #[tokio::test]

@@ -14,7 +14,6 @@ mod password_policy;
 pub mod refresh;
 pub mod reset_password;
 pub mod signup;
-pub mod sync_user;
 pub mod verify;
 
 /// Send a transactional email through the `impresspress/email` block.

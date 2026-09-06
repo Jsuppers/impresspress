@@ -256,9 +256,9 @@ pub const ROUTES: &[Route] = &[
         "wafer-run/inspector",
     ),
     // Auth — SSR pages + API under /b/auth/. The session-less paths (OAuth
-    // callback, password reset, verification, provider list, internal
-    // sync-user) are declared public by the auth-ui block; each handler
-    // gates itself by a token, signature or shared secret.
+    // callback, password reset, verification, provider list) are declared
+    // public by the auth-ui block; each handler gates itself by a token or a
+    // signature.
     Route::new("/b/auth/", RouteAccess::Public, "impresspress/auth-ui"),
     // Admin — SSR pages + API under /b/admin/, every row declared `admin` on
     // top of this tier. The bare `/b/admin` form is covered by
@@ -1848,13 +1848,14 @@ mod tests {
         assert_eq!(buf.body, b"DISPATCHED");
     }
 
-    /// The nine session-less `/b/auth/...` paths resolve to `Public` from the
+    /// The eight session-less `/b/auth/...` paths resolve to `Public` from the
     /// auth-ui block's own declaration, and the two api-key rows resolve to
-    /// `Authenticated`. These eleven were the block's undeclared surface
-    /// before PR #14; the router carve-outs that kept nine of them reachable
-    /// are gone because these declarations carry the level.
+    /// `Authenticated`. These ten (eleven before B14 deleted `sync-user`) were
+    /// the block's undeclared surface before PR #14; the router carve-outs
+    /// that kept them reachable are gone because these declarations carry the
+    /// level.
     #[test]
-    fn auth_ui_declares_its_nine_session_less_and_two_api_key_paths() {
+    fn auth_ui_declares_its_eight_session_less_and_two_api_key_paths() {
         use wafer_run::Block as _;
 
         let info = crate::blocks::auth_ui::AuthUiBlock::new().info();
@@ -1875,9 +1876,11 @@ mod tests {
         }
     }
 
-    /// The nine auth-ui `(action, path)` pairs that legitimately have no
-    /// session: each handler gates itself by a token, signature or shared
-    /// secret, and the block declares each `public`.
+    /// The eight auth-ui `(action, path)` pairs that legitimately have no
+    /// session: each handler gates itself by a token or a signature, and the
+    /// block declares each `public`. (It was nine until B14 deleted
+    /// `POST /b/auth/api/oauth/sync-user`, whose gate was a config var no
+    /// `ConfigVar` declared and `auth_grants()` did not grant.)
     const AUTH_UI_SESSION_LESS_PATHS: &[(&str, &str)] = &[
         ("retrieve", "/b/auth/reset-password"),
         ("retrieve", "/b/auth/oauth/callback"),
@@ -1887,13 +1890,12 @@ mod tests {
         ("create", "/b/auth/api/forgot-password"),
         ("create", "/b/auth/api/reset-password"),
         ("retrieve", "/b/auth/api/oauth/providers"),
-        ("create", "/b/auth/api/oauth/sync-user"),
     ];
 
     /// Each session-less auth-ui path reaches dispatch anonymously from the
     /// auth-ui declaration alone, driven through `route_to_block` with the
     /// block's real `info()`. This is the router-level proof behind
-    /// `auth_ui_declares_its_nine_session_less_and_two_api_key_paths`: a
+    /// `auth_ui_declares_its_eight_session_less_and_two_api_key_paths`: a
     /// router entry that merely restates one of these rows is redundant.
     #[tokio::test]
     async fn auth_ui_session_less_paths_dispatch_anonymously_from_the_declaration() {

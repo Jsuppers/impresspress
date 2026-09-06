@@ -8,7 +8,7 @@ use crate::{
             helpers::build_auth_cookie,
             repo::{
                 jwt_blocklist::{self, NewBlocklistEntry},
-                tokens,
+                sessions, tokens,
             },
         },
         auth_ui::contracts::LogoutResponse,
@@ -32,6 +32,22 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 user_id = %user_id,
                 error = %e,
                 "logout: refresh-token revocation failed"
+            );
+            return err_internal("Logout could not fully revoke the session", e);
+        }
+
+        // [B12] Logout is an all-devices operation — the line above revokes
+        // every refresh family the user has — so every session row goes with
+        // them. Leaving the rows behind is what made `/b/userportal/sessions`
+        // list devices as signed in for weeks after the tokens that kept them
+        // alive had been revoked. Same fail-closed treatment as the
+        // revocation itself: a list that still shows a revoked device is a
+        // security-relevant lie, not a cosmetic one.
+        if let Err(e) = sessions::delete_all_for_user(ctx, user_id).await {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "logout: session-row deletion failed"
             );
             return err_internal("Logout could not fully revoke the session", e);
         }
@@ -145,6 +161,65 @@ mod tests {
             output_is_error(out, "Internal").await,
             "a JWT blocklist insert failure must not be reported as a successful logout"
         );
+    }
+
+    /// [B12] The device list and the refresh tokens have to agree: logout
+    /// revokes every family, so it must remove every row too.
+    #[tokio::test]
+    async fn logout_deletes_the_users_session_rows() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("user-1").await;
+        ctx.seed_auth_user("user-2").await;
+        for (user_id, family) in [
+            ("user-1", "fam-a"),
+            ("user-1", "fam-b"),
+            ("user-2", "fam-c"),
+        ] {
+            sessions::insert(
+                &ctx,
+                sessions::NewSession {
+                    family: family.into(),
+                    user_id: user_id.into(),
+                    auth_method: "password".into(),
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                },
+            )
+            .await
+            .expect("seed session row");
+        }
+
+        let out = handle(&ctx, &auth_msg("update", "/b/auth/api/logout", "user-1")).await;
+        assert_eq!(output_status(out).await, 303);
+
+        assert!(
+            sessions::list_for_user(&ctx, "user-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "logout revokes every family, so it removes every device row"
+        );
+        assert_eq!(
+            sessions::list_for_user(&ctx, "user-2").await.unwrap().len(),
+            1,
+            "another user's devices are untouched"
+        );
+    }
+
+    /// A session-row deletion failure is not reported as a successful logout:
+    /// a device list that still shows a revoked device is a lie about who is
+    /// signed in.
+    #[tokio::test]
+    async fn session_row_deletion_failure_does_not_report_success() {
+        let ctx = TestContext::with_auth().await;
+        let failing =
+            FailingDbOpContext::new(ctx, vec![("database.delete_where_count", sessions::TABLE)]);
+
+        let out = handle(
+            &failing,
+            &auth_msg("update", "/b/auth/api/logout", "user-1"),
+        )
+        .await;
+        assert!(output_is_error(out, "Internal").await);
     }
 
     #[tokio::test]

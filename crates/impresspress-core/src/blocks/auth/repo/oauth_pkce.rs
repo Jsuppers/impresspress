@@ -104,9 +104,9 @@ pub async fn take(ctx: &dyn Context, state_id: &str) -> Result<Option<PkceStateR
 }
 
 /// Deletes all rows whose `expires_at < cutoff`. Returns the number deleted.
-/// Intended for a background sweeper (TODO: not yet wired) — not required
-/// for correctness since [`take`] also drops expired rows on read.
-#[allow(dead_code)]
+/// Called by `auth::maintenance::sweep` — not required for correctness, since
+/// [`take`] also drops expired rows on read, but an OAuth flow the user
+/// abandons leaves a row nothing ever reads.
 pub async fn delete_expired(ctx: &dyn Context, cutoff: &str) -> Result<u64, RepoError> {
     let n = db::delete_by_filters_count(
         ctx,

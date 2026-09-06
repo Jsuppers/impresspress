@@ -17,8 +17,16 @@ use std::collections::HashMap;
 use wafer_core::clients::config as config_client;
 use wafer_run::{context::Context, ConfigVar, InputType};
 
-/// `WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS` — how many days a freshly
-/// issued session cookie stays valid.
+/// `WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS` — how many days a login
+/// stays valid before the user has to sign in again.
+///
+/// [B12] The single source for the refresh-token TTL. The refresh token's
+/// `exp`, its row's `expires_at` and the session row's `expires_at` are all
+/// derived from this one value ([`super::helpers::refresh_ttl_secs`]), so the
+/// device list cannot say a session lives longer than the token that keeps it
+/// alive. It used to govern only the session row, while the refresh token
+/// carried a separate 7-day constant — which is why the list showed devices as
+/// live for 30 days that had in fact been signed out for 23.
 pub const SESSION_LIFETIME_DAYS_KEY: &str = "WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS";
 
 /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` — email of the admin user to
@@ -53,7 +61,12 @@ pub const REQUIRE_VERIFICATION_KEY: &str = "WAFER_RUN__AUTH__REQUIRE_VERIFICATIO
 pub const ALLOWED_EMAIL_DOMAINS_KEY: &str = "WAFER_RUN__AUTH__ALLOWED_EMAIL_DOMAINS";
 
 /// Default session lifetime when the config var is unset.
-pub const SESSION_LIFETIME_DAYS_DEFAULT: u32 = 30;
+///
+/// [B12] Seven days, not the previous thirty: this value is now the refresh
+/// TTL, and the refresh TTL was a hardcoded 604 800 seconds. Seven days keeps
+/// how long a login actually lasts exactly what it was; raising it is a
+/// product decision, and it is now one setting rather than two.
+pub const SESSION_LIFETIME_DAYS_DEFAULT: u32 = 7;
 
 /// Default value for [`PASSWORD_MIN_LENGTH_KEY`].
 pub const PASSWORD_MIN_LENGTH_DEFAULT: u32 = 8;
@@ -227,16 +240,24 @@ fn non_empty<S: AsRef<str>>(s: Option<S>) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// [B12] Seven, not thirty. This var is now the refresh TTL, and the
+    /// refresh TTL was a hardcoded 604 800 seconds — so the default that
+    /// preserves how long a login lasts is seven days.
     #[test]
-    fn session_lifetime_days_defaults_to_30_when_unset() {
+    fn session_lifetime_days_defaults_to_seven_when_unset() {
         let cfg = AuthConfig::from_env_for_test(&[]);
-        assert_eq!(cfg.session_lifetime_days, 30);
+        assert_eq!(cfg.session_lifetime_days, 7);
+        assert_eq!(
+            u64::from(SESSION_LIFETIME_DAYS_DEFAULT) * 86_400,
+            604_800,
+            "the default must reproduce the 604800s the deleted REFRESH_TOKEN_TTL_SECS hardcoded"
+        );
     }
 
     #[test]
     fn session_lifetime_days_parses_int() {
-        let cfg = AuthConfig::from_env_for_test(&[(SESSION_LIFETIME_DAYS_KEY, "7")]);
-        assert_eq!(cfg.session_lifetime_days, 7);
+        let cfg = AuthConfig::from_env_for_test(&[(SESSION_LIFETIME_DAYS_KEY, "14")]);
+        assert_eq!(cfg.session_lifetime_days, 14);
     }
 
     #[test]
@@ -299,13 +320,17 @@ mod tests {
         assert!(var.optional);
     }
 
+    /// The declared default the admin UI shows has to be the one the code
+    /// falls back to, or an operator reading the settings page would be told
+    /// a login lasts four times longer than it does.
     #[test]
-    fn session_lifetime_var_has_default_of_30() {
+    fn session_lifetime_var_has_default_of_seven() {
         let var = auth_config_vars()
             .into_iter()
             .find(|v| v.key == SESSION_LIFETIME_DAYS_KEY)
             .expect("session var declared");
-        assert_eq!(var.default, "30");
+        assert_eq!(var.default, SESSION_LIFETIME_DAYS_DEFAULT.to_string());
+        assert_eq!(var.default, "7");
         // Not optional — session lifetime is always needed and always has a default.
         assert!(!var.optional);
     }
