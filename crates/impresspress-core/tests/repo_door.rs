@@ -86,6 +86,27 @@ const TABLES: &[(&str, &str, &[&str], &str)] = &[
         "platform_state",
     ),
     ("users", "wafer_run__auth__users", &["users::TABLE"], "auth"),
+    // The three auth doors this PR adds. `sessions` and `tokens` are the
+    // pair B12 re-keyed and wired retention for; `maintenance` is the
+    // sweeper's singleton, new in migration 012.
+    (
+        "sessions",
+        "wafer_run__auth__sessions",
+        &["sessions::TABLE"],
+        "auth",
+    ),
+    (
+        "refresh_tokens",
+        "wafer_run__auth__tokens",
+        &["tokens::TABLE"],
+        "auth",
+    ),
+    (
+        "auth_maintenance",
+        "wafer_run__auth__maintenance",
+        &["maintenance::TABLE"],
+        "auth",
+    ),
     (
         "buckets",
         "impresspress__files__buckets",
@@ -396,6 +417,27 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "crypto.rs",
         ],
     ),
+    // The auth session / refresh-token / maintenance doors. Same two
+    // categories the `users` door above is exempted under, and nothing else:
+    // `auth_grants()` spells its grant targets as literals so the WRAP audit
+    // script's const-resolver can follow them, and the migration runner's own
+    // tests assert against the DDL the `.sql` files next to them define.
+    (
+        "sessions",
+        &[
+            "blocks/auth/repo/sessions.rs",
+            "blocks/auth/service.rs",
+            "blocks/auth/migrations/mod.rs",
+        ],
+    ),
+    (
+        "refresh_tokens",
+        &["blocks/auth/repo/tokens.rs", "blocks/auth/service.rs"],
+    ),
+    // Nothing but the door: the sweeper's singleton is granted through
+    // auth-ui's existing `wafer_run__auth__*` wildcard, so no grant literal
+    // names it, and the migration tests do not assert on its DDL.
+    ("auth_maintenance", &["blocks/auth/repo/maintenance.rs"]),
     // The products doors. Three categories, and nothing else:
     //
     // 1. `blocks/products/repo/<module>.rs` — the door itself, where the
@@ -667,6 +709,42 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // allowlist and its import through `seed::import`
             "blocks/dev/data_snapshot.rs",
         ],
+    ),
+    // The auth doors B12 adds. Two categories, both already established
+    // above: the export allowlist's closed-list bookkeeping, and tests naming
+    // a table only to aim `FailingDbOpContext` at it so the injected fault
+    // lands on the query under test.
+    (
+        "sessions",
+        &[
+            "blocks/dev/data_snapshot.rs",
+            // `("database.delete_where_count", sessions::TABLE)` — logout's
+            // "a failed session-row delete is not a successful logout" test
+            "blocks/auth_ui/api/logout.rs",
+        ],
+    ),
+    (
+        "refresh_tokens",
+        &[
+            "blocks/dev/data_snapshot.rs",
+            // Five `FailingDbOpContext` fixtures across the flows that revoke
+            // refresh rows: logout, password change, password reset, refresh
+            // rotation, and the userportal per-device revoke.
+            "blocks/auth_ui/api/logout.rs",
+            "blocks/auth_ui/api/change_password.rs",
+            "blocks/auth_ui/api/reset_password.rs",
+            "blocks/auth_ui/api/refresh.rs",
+            "blocks/userportal/pages/sessions.rs",
+            // `("database.delete_where_count", tokens::TABLE)` — the sweep's
+            // "one failing table is named and the others still run" test
+            "blocks/auth/maintenance.rs",
+        ],
+    ),
+    (
+        "auth_maintenance",
+        // `("database.get", maintenance::TABLE)` — the throttle's
+        // "an unreadable stamp skips rather than sweeps" test
+        &["blocks/auth/maintenance.rs"],
     ),
     // The files block's two categories, both of which the admin doors above
     // are already exempted under:

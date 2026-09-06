@@ -22,7 +22,6 @@
   "POST /b/auth/api/forgot-password public",
   "POST /b/auth/api/login public",
   "POST /b/auth/api/logout authenticated",
-  "POST /b/auth/api/oauth/sync-user public",
   "POST /b/auth/api/refresh public",
   "POST /b/auth/api/resend-verification public",
   "POST /b/auth/api/reset-password public",
