@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_bool, map_opt_str, map_str, now_iso};
+use super::{db_failed, internal_error, map_bool, map_opt_str, map_str, now_iso};
 
 pub const TABLE: &str = "wafer_run__auth__orgs";
 
@@ -32,6 +32,14 @@ pub struct OrgRow {
 /// Errors surfaced by this repo. Two distinct unique-constraint violations
 /// produce two distinct variants — callers in Plan C Cluster 2 need to map
 /// each to its proper 409 message.
+///
+/// The third variant carries the database client's own error, not a string
+/// rendering of it, for the reason [`super`]'s deleted `RepoError` had to
+/// stop doing so: `Db(String)` erases the [`wafer_run::ErrorCode`], and with
+/// it the difference between a WRAP refusal (403), a missing row (404) and a
+/// fault (500). The two domain variants above stay variants because no
+/// `ErrorCode` distinguishes them — both are `AlreadyExists`, with different
+/// messages.
 #[derive(thiserror::Error, Debug)]
 pub enum OrgsRepoError {
     #[error("org with that name already exists")]
@@ -39,13 +47,14 @@ pub enum OrgsRepoError {
     #[error("that provider org is already claimed by another user")]
     AlreadyClaimed,
     #[error("db: {0}")]
-    Db(String),
+    Db(WaferError),
 }
 
 fn row_from_map(m: &HashMap<String, Value>) -> Result<OrgRow, OrgsRepoError> {
     Ok(OrgRow {
-        id: map_opt_str(m, "id").ok_or_else(|| OrgsRepoError::Db("missing id".into()))?,
-        name: map_opt_str(m, "name").ok_or_else(|| OrgsRepoError::Db("missing name".into()))?,
+        id: map_opt_str(m, "id").ok_or_else(|| OrgsRepoError::Db(internal_error("missing id")))?,
+        name: map_opt_str(m, "name")
+            .ok_or_else(|| OrgsRepoError::Db(internal_error("missing name")))?,
         owner_user_id: map_opt_str(m, "owner_user_id"),
         verified_via: map_opt_str(m, "verified_via"),
         verified_ref: map_opt_str(m, "verified_ref"),
@@ -67,7 +76,7 @@ pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow
         }],
     )
     .await
-    .map_err(|e| OrgsRepoError::Db(format!("orgs find_by_name: {e}")))?;
+    .map_err(|e| OrgsRepoError::Db(db_failed("orgs find_by_name", e)))?;
     match rows.into_iter().next() {
         Some(r) => Ok(Some(row_from_map(&r.data)?)),
         None => Ok(None),
@@ -91,7 +100,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<OrgRo
         }],
     )
     .await
-    .map_err(|e| OrgsRepoError::Db(format!("orgs list_for_user: {e}")))?;
+    .map_err(|e| OrgsRepoError::Db(db_failed("orgs list_for_user", e)))?;
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
@@ -138,7 +147,7 @@ pub async fn upsert_claimed(
         ],
     )
     .await
-    .map_err(|e| OrgsRepoError::Db(format!("orgs claim-check: {e}")))?;
+    .map_err(|e| OrgsRepoError::Db(db_failed("orgs claim-check", e)))?;
     if n > 0 {
         return Err(OrgsRepoError::AlreadyClaimed);
     }
@@ -161,11 +170,11 @@ pub async fn upsert_claimed(
     data.insert("created_at".into(), json!(now));
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| OrgsRepoError::Db(format!("orgs insert: {e}")))?;
+        .map_err(|e| OrgsRepoError::Db(db_failed("orgs insert", e)))?;
 
     find_by_name(ctx, claim.name)
         .await?
-        .ok_or_else(|| OrgsRepoError::Db("insert returned no row".into()))
+        .ok_or_else(|| OrgsRepoError::Db(internal_error("insert returned no row")))
 }
 
 #[cfg(test)]

@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_opt_str, map_str, now_iso, RepoError};
+use super::{db_failed, internal_error, map_opt_str, map_str, now_iso};
 
 pub const TABLE: &str = "wafer_run__auth__api_keys";
 
@@ -61,9 +61,9 @@ pub struct NewApiKey<'a> {
     pub expires_at: Option<&'a str>,
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<ApiKeyRow, RepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<ApiKeyRow, WaferError> {
     Ok(ApiKeyRow {
-        id: map_opt_str(m, "id").ok_or_else(|| RepoError::Db("missing id".into()))?,
+        id: map_opt_str(m, "id").ok_or_else(|| internal_error("missing id"))?,
         user_id: map_str(m, "user_id"),
         name: map_str(m, "name"),
         key_prefix: map_str(m, "key_prefix"),
@@ -75,7 +75,7 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<ApiKeyRow, RepoError> {
 }
 
 /// Insert a new API-key row and return it.
-pub async fn insert(ctx: &dyn Context, new: NewApiKey<'_>) -> Result<ApiKeyRow, RepoError> {
+pub async fn insert(ctx: &dyn Context, new: NewApiKey<'_>) -> Result<ApiKeyRow, WaferError> {
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("user_id".into(), json!(new.user_id));
     data.insert("name".into(), json!(new.name));
@@ -87,7 +87,7 @@ pub async fn insert(ctx: &dyn Context, new: NewApiKey<'_>) -> Result<ApiKeyRow, 
     }
     let rec = db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("api_keys insert: {e}")))?;
+        .map_err(|e| db_failed("api_keys insert", e))?;
     row_from_map(&rec.data)
 }
 
@@ -96,29 +96,29 @@ pub async fn insert(ctx: &dyn Context, new: NewApiKey<'_>) -> Result<ApiKeyRow, 
 pub async fn find_by_key_hash(
     ctx: &dyn Context,
     key_hash: &str,
-) -> Result<Option<ApiKeyRow>, RepoError> {
+) -> Result<Option<ApiKeyRow>, WaferError> {
     use wafer_block::ErrorCode;
     match db::get_by_field(ctx, TABLE, "key_hash", json!(key_hash)).await {
         Ok(rec) => Ok(Some(row_from_map(&rec.data)?)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("api_keys find_by_key_hash: {e}"))),
+        Err(e) => Err(db_failed("api_keys find_by_key_hash", e)),
     }
 }
 
 /// Look up an API key by its primary `id`. Returns `Ok(None)` when missing.
-pub async fn find_by_id(ctx: &dyn Context, id: &str) -> Result<Option<ApiKeyRow>, RepoError> {
+pub async fn find_by_id(ctx: &dyn Context, id: &str) -> Result<Option<ApiKeyRow>, WaferError> {
     use wafer_block::ErrorCode;
     match db::get(ctx, TABLE, id).await {
         Ok(rec) => Ok(Some(row_from_map(&rec.data)?)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("api_keys find_by_id: {e}"))),
+        Err(e) => Err(db_failed("api_keys find_by_id", e)),
     }
 }
 
 /// List a user's API keys, newest first (most recent `created_at` at the top).
 /// `key_hash` is populated on the rows; callers serialising to clients must
 /// not leak it.
-pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKeyRow>, RepoError> {
+pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKeyRow>, WaferError> {
     let records = db::list_sorted(
         ctx,
         TABLE,
@@ -133,7 +133,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKe
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("api_keys list_for_user: {e}")))?;
+    .map_err(|e| db_failed("api_keys list_for_user", e))?;
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
@@ -141,7 +141,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKe
 /// newest first — the admin IAM page's API-keys tab, which is a
 /// deployment-wide view rather than one account's. `key_hash` is populated
 /// on the rows; the tab renders `key_prefix` only.
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<ApiKeyRow>, RepoError> {
+pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<ApiKeyRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
@@ -156,25 +156,25 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<ApiKeyRow>
         },
     )
     .await
-    .map_err(|e| RepoError::Db(format!("api_keys list_recent: {e}")))?;
+    .map_err(|e| db_failed("api_keys list_recent", e))?;
     list.records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
 /// Mark an API key revoked (stamps `revoked_at` with [`super::now_iso`]).
-pub async fn revoke(ctx: &dyn Context, id: &str) -> Result<(), RepoError> {
+pub async fn revoke(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("revoked_at".into(), json!(now_iso()));
     db::update(ctx, TABLE, id, data)
         .await
-        .map_err(|e| RepoError::Db(format!("api_keys revoke: {e}")))?;
+        .map_err(|e| db_failed("api_keys revoke", e))?;
     Ok(())
 }
 
 /// Hard-delete an API-key row by id.
-pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), RepoError> {
+pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
     db::delete(ctx, TABLE, id)
         .await
-        .map_err(|e| RepoError::Db(format!("api_keys delete: {e}")))?;
+        .map_err(|e| db_failed("api_keys delete", e))?;
     Ok(())
 }
 

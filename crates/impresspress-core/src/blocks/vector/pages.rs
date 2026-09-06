@@ -58,7 +58,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_internal, err_internal_no_cause, err_not_found, ok_json},
+    http::{err_bad_request, err_internal, err_internal_no_cause, ok_json},
 };
 
 // Per-route dispatch now lives in `VectorBlock::handle` via the shared
@@ -299,10 +299,11 @@ pub(super) async fn delete_index(ctx: &dyn Context, msg: &Message) -> OutputStre
             .await;
             ok_json(&AckResponse { ok: true })
         }
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("index not found: {name}"))
-        }
-        Err(e) => err_internal("delete_index failed", e),
+        Err(e) => crud::db_error(
+            e,
+            &format!("index not found: {name}"),
+            "delete_index failed",
+        ),
     }
 }
 
@@ -331,11 +332,12 @@ pub(super) async fn upsert(ctx: &dyn Context, input: InputStream) -> OutputStrea
     let entries: Vec<VectorEntry> = body.entries.into_iter().map(VectorEntry::from).collect();
     match vclient::upsert(ctx, &prefixed, entries).await {
         Ok(()) => ok_json(&AckResponse { ok: true }),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("index not found: {}", body.index))
-        }
         Err(e) if e.code == ErrorCode::InvalidArgument => err_bad_request(&e.message),
-        Err(e) => err_internal("upsert failed", e),
+        Err(e) => crud::db_error(
+            e,
+            &format!("index not found: {}", body.index),
+            "upsert failed",
+        ),
     }
 }
 
@@ -361,10 +363,7 @@ pub(super) async fn delete_single(ctx: &dyn Context, msg: &Message) -> OutputStr
     let prefixed = service::prefixed_index_name(index);
     match vclient::delete(ctx, &prefixed, vec![id.to_string()]).await {
         Ok(()) => ok_json(&AckResponse { ok: true }),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("index not found: {index}"))
-        }
-        Err(e) => err_internal("delete failed", e),
+        Err(e) => crud::db_error(e, &format!("index not found: {index}"), "delete failed"),
     }
 }
 
@@ -436,7 +435,7 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
     // registry table existed.
     let (model_id, keyword_search) = match load_index_metadata(ctx, &prefixed).await {
         Ok(m) => m,
-        Err(e) => return err_internal("load index metadata failed", e),
+        Err(e) => return crud::db_error_internal(e, "load index metadata failed"),
     };
 
     // Default mode reflects the index's declared capabilities. An index
@@ -464,7 +463,7 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
                     Some(v) => v,
                     None => return err_internal_no_cause("embedding block returned no vectors"),
                 },
-                Err(e) => return err_internal("embed failed", e),
+                Err(e) => return crud::db_error_internal(e, "embed failed"),
             }
         }
         _ => return err_bad_request("either 'text' or 'vector' is required"),
@@ -496,11 +495,12 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
         Ok(matches) => ok_json(&QueryResponse {
             matches: matches.into_iter().map(VectorMatchView::from).collect(),
         }),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("index not found: {}", body.index))
-        }
         Err(e) if e.code == ErrorCode::InvalidArgument => err_bad_request(&e.message),
-        Err(e) => err_internal("query failed", e),
+        Err(e) => crud::db_error(
+            e,
+            &format!("index not found: {}", body.index),
+            "query failed",
+        ),
     }
 }
 
@@ -619,7 +619,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     // query route does.
     let (model_id, _keyword_search) = match load_index_metadata(ctx, &prefixed).await {
         Ok(m) => m,
-        Err(e) => return err_internal("load index metadata failed", e),
+        Err(e) => return crud::db_error_internal(e, "load index metadata failed"),
     };
 
     // Re-ingestion safety: wipe any chunks we previously wrote for this
@@ -638,11 +638,11 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     let prior_ids = match vclient::list_ids(ctx, &prefixed, prior_filter).await {
         Ok(ids) => ids,
         Err(e) if e.code == ErrorCode::NotFound => Vec::new(),
-        Err(e) => return err_internal("failed to list prior chunks", e),
+        Err(e) => return crud::db_error_internal(e, "failed to list prior chunks"),
     };
     if !prior_ids.is_empty() {
         if let Err(e) = vclient::delete(ctx, &prefixed, prior_ids).await {
-            return err_internal("failed to clear prior chunks", e);
+            return crud::db_error_internal(e, "failed to clear prior chunks");
         }
     }
 
@@ -724,11 +724,12 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     let n = entries.len();
     match vclient::upsert(ctx, &prefixed, entries).await {
         Ok(()) => ok_json(&IngestResponse { chunks_created: n }),
-        Err(e) if e.code == ErrorCode::NotFound => {
-            err_not_found(&format!("index not found: {}", body.index))
-        }
         Err(e) if e.code == ErrorCode::InvalidArgument => err_bad_request(&e.message),
-        Err(e) => err_internal("upsert failed", e),
+        Err(e) => crud::db_error(
+            e,
+            &format!("index not found: {}", body.index),
+            "upsert failed",
+        ),
     }
 }
 
@@ -774,7 +775,7 @@ mod ingest_cleanup_tests {
     use wafer_run::{Block as RunBlock, BlockCategory, BlockInfo, LifecycleEvent};
 
     use super::*;
-    use crate::test_support::{output_is_error, output_json, TestContext};
+    use crate::test_support::{output_http_status, output_json, TestContext};
 
     /// Stub `wafer-run/vector` block that answers `vector.list_ids` with a
     /// caller-supplied error and errors loudly on anything else.
@@ -887,11 +888,14 @@ mod ingest_cleanup_tests {
         )
         .await;
 
-        assert!(
-            output_is_error(out, "Internal").await,
-            "a non-NotFound list_ids error must abort ingest via err_internal, \
-             not be silently swallowed — swallowing it would skip cleanup and \
-             leave stale tail chunks that queries then serve"
+        assert_eq!(
+            output_http_status(out).await,
+            403,
+            "a non-NotFound list_ids error must abort ingest, not be silently \
+             swallowed — swallowing it would skip cleanup and leave stale tail \
+             chunks that queries then serve. It aborts through \
+             `crud::db_error_internal` now, so the WRAP refusal this stub \
+             raises keeps its code instead of being sanitized into a 500."
         );
     }
 
@@ -1419,5 +1423,213 @@ mod backend_availability_tests {
             "create_index must report Unavailable (503), not NotFound or Internal, \
              when the wafer-run/vector backend isn't registered"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: what a refusal from the vector backend classifies as.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod denial_classification_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use wafer_run::{Block as RunBlock, BlockCategory, BlockInfo, LifecycleEvent};
+
+    use super::*;
+    use crate::{
+        blocks::vector::test_support::routed,
+        test_support::{auth_msg, output_http_status, TestContext},
+    };
+
+    /// A `wafer-run/vector` stand-in that refuses every op with one
+    /// caller-supplied error, so a handler's classification is the only
+    /// thing under test.
+    struct RefusingVectorBlock {
+        error: WaferError,
+    }
+
+    #[async_trait]
+    impl RunBlock for RefusingVectorBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new(
+                "wafer-run/vector",
+                "0.0.1",
+                "vector@v1",
+                "stub vector block that refuses every op",
+            )
+            .category(BlockCategory::Service)
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            OutputStream::error(self.error.clone())
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn Context,
+            _e: LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
+    /// A registry row for `prefixed`, so `load_index_metadata` resolves from
+    /// the database instead of falling through to `describe_index`.
+    async fn seed_registry_row(ctx: &dyn Context, prefixed: &str) {
+        db::upsert(
+            ctx,
+            REGISTRY_TABLE,
+            vec![
+                ("prefixed_name".to_string(), serde_json::json!(prefixed)),
+                ("model".to_string(), serde_json::json!(DEFAULT_MODEL)),
+                ("dimensions".to_string(), serde_json::json!(384)),
+                ("keyword_search".to_string(), serde_json::json!(0)),
+            ],
+            vec!["prefixed_name".to_string()],
+            OnConflict::SetColumns(vec![
+                "model".to_string(),
+                "dimensions".to_string(),
+                "keyword_search".to_string(),
+            ]),
+        )
+        .await
+        .expect("seed registry row");
+    }
+
+    async fn ctx_refusing_with(code: ErrorCode) -> TestContext {
+        let mut ctx = TestContext::with_vector().await;
+        ctx.register_block(
+            "wafer-run/vector",
+            Arc::new(RefusingVectorBlock {
+                error: WaferError::new(code, "WRAP: caller not authorized for this index"),
+            }),
+        );
+        ctx
+    }
+
+    fn json_input(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(serde_json::to_vec(&value).expect("serialize body"))
+    }
+
+    /// The behaviour fix. `vclient::*` reaches the vector backend through
+    /// the same WRAP check every database call goes through, so a caller
+    /// without a grant on the index gets `PermissionDenied` — which every
+    /// handler here collapsed into `err_internal`, i.e. a 500 an operator
+    /// cannot tell from the backend being down.
+    #[tokio::test]
+    async fn a_denied_upsert_is_403_not_500() {
+        let ctx = ctx_refusing_with(ErrorCode::PermissionDenied).await;
+        let out = upsert(
+            &ctx,
+            json_input(serde_json::json!({
+                "index": "denied_idx",
+                "entries": [{"id": "a", "vector": [0.1, 0.2]}],
+            })),
+        )
+        .await;
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    /// The registry row is seeded so `load_index_metadata` answers from the
+    /// database and the refusal under test is `vclient::query`'s own.
+    #[tokio::test]
+    async fn a_denied_query_is_403_not_500() {
+        let ctx = ctx_refusing_with(ErrorCode::PermissionDenied).await;
+        seed_registry_row(&ctx, &service::prefixed_index_name("denied_idx")).await;
+        let out = query(
+            &ctx,
+            json_input(serde_json::json!({
+                "index": "denied_idx",
+                "vector": [0.1, 0.2],
+            })),
+        )
+        .await;
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_single_delete_is_403_not_500() {
+        let ctx = ctx_refusing_with(ErrorCode::PermissionDenied).await;
+        let msg = routed(auth_msg(
+            "delete",
+            "/b/vector/api/denied_idx/vec-1",
+            "user-1",
+        ));
+        assert_eq!(
+            output_http_status(delete_single(&ctx, &msg).await).await,
+            403
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_index_delete_is_403_not_500() {
+        let ctx = ctx_refusing_with(ErrorCode::PermissionDenied).await;
+        let msg = routed(auth_msg(
+            "delete",
+            "/b/vector/api/indexes/denied_idx",
+            "user-1",
+        ));
+        assert_eq!(
+            output_http_status(delete_index(&ctx, &msg).await).await,
+            403
+        );
+    }
+
+    /// The metadata lookup `query` makes before it queries is the other
+    /// half: with no registry row it falls through to `describe_index`, and
+    /// a refusal there used to be a 500 too.
+    #[tokio::test]
+    async fn a_denied_index_metadata_lookup_is_403_not_500() {
+        let ctx = ctx_refusing_with(ErrorCode::PermissionDenied).await;
+        let out = query(
+            &ctx,
+            json_input(serde_json::json!({
+                "index": "unregistered_idx",
+                "vector": [0.1, 0.2],
+            })),
+        )
+        .await;
+        assert_eq!(output_http_status(out).await, 403);
+    }
+
+    /// The `NotFound` these handlers already answered stays a 404 with the
+    /// same "index not found" label, so the 403 above is the new
+    /// classification and not a blanket refusal. The up-front
+    /// `vector_backend_available` check is what keeps this `NotFound`
+    /// meaning "no such index" rather than "no such block".
+    #[tokio::test]
+    async fn a_missing_index_is_still_404() {
+        let ctx = ctx_refusing_with(ErrorCode::NotFound).await;
+        let out = upsert(
+            &ctx,
+            json_input(serde_json::json!({
+                "index": "gone_idx",
+                "entries": [{"id": "a", "vector": [0.1, 0.2]}],
+            })),
+        )
+        .await;
+        assert_eq!(output_http_status(out).await, 404);
+    }
+
+    /// And an `InvalidArgument` from the backend is still the caller's 400.
+    #[tokio::test]
+    async fn a_rejected_upsert_is_still_400() {
+        let ctx = ctx_refusing_with(ErrorCode::InvalidArgument).await;
+        let out = upsert(
+            &ctx,
+            json_input(serde_json::json!({
+                "index": "bad_idx",
+                "entries": [{"id": "a", "vector": [0.1, 0.2]}],
+            })),
+        )
+        .await;
+        assert_eq!(output_http_status(out).await, 400);
     }
 }

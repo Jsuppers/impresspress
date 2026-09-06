@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{decode_hex, map_opt_str, map_str, now_iso, RepoError};
+use super::{db_failed, decode_hex, internal_error, map_opt_str, map_str, now_iso};
 use crate::util::hex_encode;
 
 pub const TABLE: &str = "wafer_run__auth__personal_access_tokens";
@@ -48,34 +48,33 @@ fn decode_bytes(v: &Value) -> Option<Vec<u8>> {
 /// We stored a JSON-encoded array as a string. The sqlite service helpfully
 /// auto-parses text starting with `[`/`{` back into a `Value::Array`, so the
 /// repo layer accepts both the post-parsing array and the raw JSON string.
-fn decode_scopes(v: &Value) -> Result<Vec<String>, RepoError> {
+fn decode_scopes(v: &Value) -> Result<Vec<String>, WaferError> {
     match v {
         Value::Array(arr) => Ok(arr
             .iter()
             .filter_map(|x| x.as_str().map(str::to_owned))
             .collect()),
         Value::String(s) => serde_json::from_str::<Vec<String>>(s)
-            .map_err(|e| RepoError::Db(format!("scopes json: {e}"))),
+            .map_err(|e| internal_error(format!("scopes json: {e}"))),
         Value::Null => Ok(Vec::new()),
-        other => Err(RepoError::Db(format!(
+        other => Err(internal_error(format!(
             "scopes has unexpected shape: {other}"
         ))),
     }
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<PatRow, RepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<PatRow, WaferError> {
     let token_hash = m
         .get("token_hash")
         .and_then(decode_bytes)
-        .ok_or_else(|| RepoError::Db("missing token_hash".into()))?;
+        .ok_or_else(|| internal_error("missing token_hash"))?;
     let scopes = match m.get("scopes") {
         Some(v) => decode_scopes(v)?,
         None => Vec::new(),
     };
     Ok(PatRow {
         token_hash,
-        user_id: map_opt_str(m, "user_id")
-            .ok_or_else(|| RepoError::Db("missing user_id".into()))?,
+        user_id: map_opt_str(m, "user_id").ok_or_else(|| internal_error("missing user_id"))?,
         name: map_str(m, "name"),
         scopes,
         created_at: map_str(m, "created_at"),
@@ -84,10 +83,10 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<PatRow, RepoError> {
     })
 }
 
-pub async fn insert(ctx: &dyn Context, new: NewPat) -> Result<(), RepoError> {
+pub async fn insert(ctx: &dyn Context, new: NewPat) -> Result<(), WaferError> {
     let now = now_iso();
     let scopes_json = serde_json::to_string(&new.scopes)
-        .map_err(|e| RepoError::Db(format!("scopes ser: {e}")))?;
+        .map_err(|e| internal_error(format!("scopes ser: {e}")))?;
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("token_hash".into(), json!(hex_encode(&new.token_hash)));
     data.insert("user_id".into(), json!(new.user_id));
@@ -99,7 +98,7 @@ pub async fn insert(ctx: &dyn Context, new: NewPat) -> Result<(), RepoError> {
     }
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("pat insert: {e}")))?;
+        .map_err(|e| db_failed("pat insert", e))?;
     Ok(())
 }
 
@@ -108,7 +107,7 @@ pub async fn insert(ctx: &dyn Context, new: NewPat) -> Result<(), RepoError> {
 /// Ordering is by `created_at DESC` so the UI can render "most recent at the
 /// top". `token_hash` is returned on the row but API callers are expected to
 /// strip it before serialising to the client.
-pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<PatRow>, RepoError> {
+pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<PatRow>, WaferError> {
     let records = db::list_sorted(
         ctx,
         TABLE,
@@ -123,14 +122,14 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<PatRo
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("pat list: {e}")))?;
+    .map_err(|e| db_failed("pat list", e))?;
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
 pub async fn find_by_token_hash(
     ctx: &dyn Context,
     hash: &[u8],
-) -> Result<Option<PatRow>, RepoError> {
+) -> Result<Option<PatRow>, WaferError> {
     let rows = db::list_all(
         ctx,
         TABLE,
@@ -141,7 +140,7 @@ pub async fn find_by_token_hash(
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("pat select: {e}")))?;
+    .map_err(|e| db_failed("pat select", e))?;
     match rows.into_iter().next() {
         Some(r) => Ok(Some(row_from_map(&r.data)?)),
         None => Ok(None),
@@ -159,7 +158,7 @@ pub async fn delete_by_id(
     ctx: &dyn Context,
     user_id: &str,
     token_hash: &[u8],
-) -> Result<bool, RepoError> {
+) -> Result<bool, WaferError> {
     let n = db::delete_by_filters_count(
         ctx,
         TABLE,
@@ -177,13 +176,13 @@ pub async fn delete_by_id(
         ],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("pat delete: {e}")))?;
+    .map_err(|e| db_failed("pat delete", e))?;
     Ok(n > 0)
 }
 
 /// Bumps `last_used_at` for the row identified by `hash`. Silently no-ops if
 /// the row is missing.
-pub async fn touch_last_used(ctx: &dyn Context, hash: &[u8]) -> Result<(), RepoError> {
+pub async fn touch_last_used(ctx: &dyn Context, hash: &[u8]) -> Result<(), WaferError> {
     let now = now_iso();
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("last_used_at".into(), json!(now));
@@ -198,6 +197,6 @@ pub async fn touch_last_used(ctx: &dyn Context, hash: &[u8]) -> Result<(), RepoE
         data,
     )
     .await
-    .map_err(|e| RepoError::Db(format!("pat touch: {e}")))?;
+    .map_err(|e| db_failed("pat touch", e))?;
     Ok(())
 }

@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::{map_bool, map_opt_str, map_str, now_iso, RepoError};
+use super::{db_failed, internal_error, map_bool, map_opt_str, map_str, now_iso};
 
 pub const TABLE: &str = "wafer_run__auth__local_credentials";
 
@@ -24,12 +24,11 @@ pub struct LocalCredentialRow {
     pub created_at: String,
 }
 
-fn row_from_map(m: &HashMap<String, Value>) -> Result<LocalCredentialRow, RepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<LocalCredentialRow, WaferError> {
     Ok(LocalCredentialRow {
-        user_id: map_opt_str(m, "user_id")
-            .ok_or_else(|| RepoError::Db("missing user_id".into()))?,
+        user_id: map_opt_str(m, "user_id").ok_or_else(|| internal_error("missing user_id"))?,
         password_hash: map_opt_str(m, "password_hash")
-            .ok_or_else(|| RepoError::Db("missing password_hash".into()))?,
+            .ok_or_else(|| internal_error("missing password_hash"))?,
         must_reset: map_bool(m, "must_reset"),
         created_at: map_str(m, "created_at"),
     })
@@ -42,7 +41,7 @@ pub async fn insert(
     user_id: &str,
     password_hash: &str,
     must_reset: bool,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     let id = uuid::Uuid::now_v7().to_string();
     let now = now_iso();
     let mut data: HashMap<String, Value> = HashMap::new();
@@ -54,7 +53,7 @@ pub async fn insert(
 
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("local_credentials insert: {e}")))?;
+        .map_err(|e| db_failed("local_credentials insert", e))?;
     Ok(())
 }
 
@@ -66,7 +65,7 @@ pub async fn update_password(
     ctx: &dyn Context,
     user_id: &str,
     new_hash: &str,
-) -> Result<(), RepoError> {
+) -> Result<(), WaferError> {
     use wafer_block::ErrorCode;
     let filters = vec![Filter {
         field: "user_id".into(),
@@ -79,23 +78,23 @@ pub async fn update_password(
             data.insert("password_hash".into(), json!(new_hash));
             db::update_by_filters(ctx, TABLE, filters, data)
                 .await
-                .map_err(|e| RepoError::Db(format!("local_credentials update_password: {e}")))?;
+                .map_err(|e| db_failed("local_credentials update_password", e))?;
             Ok(())
         }
         Err(e) if e.code == ErrorCode::NotFound => insert(ctx, user_id, new_hash, false).await,
-        Err(e) => Err(RepoError::Db(format!("local_credentials lookup: {e}"))),
+        Err(e) => Err(db_failed("local_credentials lookup", e)),
     }
 }
 
 pub async fn find_by_user_id(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Option<LocalCredentialRow>, RepoError> {
+) -> Result<Option<LocalCredentialRow>, WaferError> {
     use wafer_block::ErrorCode;
     match db::get_by_field(ctx, TABLE, "user_id", json!(user_id)).await {
         Ok(rec) => Ok(Some(row_from_map(&rec.data)?)),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(RepoError::Db(format!("local_credentials select: {e}"))),
+        Err(e) => Err(db_failed("local_credentials select", e)),
     }
 }
 

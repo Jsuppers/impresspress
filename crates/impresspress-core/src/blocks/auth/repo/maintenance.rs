@@ -17,9 +17,9 @@ use std::collections::HashMap;
 
 use serde_json::json;
 use wafer_core::clients::database as db;
-use wafer_run::context::Context;
+use wafer_run::{context::Context, WaferError};
 
-use super::RepoError;
+use super::db_failed;
 
 pub const TABLE: &str = "wafer_run__auth__maintenance";
 
@@ -32,13 +32,13 @@ pub const SINGLETON_ID: &str = "singleton";
 ///
 /// A missing row is `Ok("")` rather than an error: the caller's next move is
 /// to sweep, which is also the right move if the row somehow went away.
-pub async fn last_swept_at(ctx: &dyn Context) -> Result<String, RepoError> {
+pub async fn last_swept_at(ctx: &dyn Context) -> Result<String, WaferError> {
     use wafer_block::ErrorCode;
 
     match db::get(ctx, TABLE, SINGLETON_ID).await {
         Ok(record) => Ok(crate::util::RecordExt::str_field(&record, "last_swept_at").to_string()),
         Err(e) if e.code == ErrorCode::NotFound => Ok(String::new()),
-        Err(e) => Err(RepoError::Db(format!("maintenance last_swept_at: {e}"))),
+        Err(e) => Err(db_failed("maintenance last_swept_at", e)),
     }
 }
 
@@ -47,7 +47,7 @@ pub async fn last_swept_at(ctx: &dyn Context) -> Result<String, RepoError> {
 /// Update-then-create, the shape `tickets::maintenance::store_result` uses:
 /// the migration seeds the row, but a database restored without it must not
 /// leave the throttle permanently unwritable.
-pub async fn record_sweep(ctx: &dyn Context, at: &str) -> Result<(), RepoError> {
+pub async fn record_sweep(ctx: &dyn Context, at: &str) -> Result<(), WaferError> {
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
     data.insert("last_swept_at".into(), json!(at));
     if db::update(ctx, TABLE, SINGLETON_ID, data.clone())
@@ -59,7 +59,7 @@ pub async fn record_sweep(ctx: &dyn Context, at: &str) -> Result<(), RepoError> 
     data.insert("id".into(), json!(SINGLETON_ID));
     db::create(ctx, TABLE, data)
         .await
-        .map_err(|e| RepoError::Db(format!("maintenance record_sweep: {e}")))?;
+        .map_err(|e| db_failed("maintenance record_sweep", e))?;
     Ok(())
 }
 

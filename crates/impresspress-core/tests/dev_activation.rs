@@ -1078,6 +1078,68 @@ async fn every_generations_response_is_never_cached() {
     }
 }
 
+/// A WRAP refusal reading the ledger is a **403**, not the 500 the
+/// hand-written `NotFound`/`err_internal` pair produced.
+///
+/// The ledger is `impresspress__dev__generations`, so a caller reaching it
+/// without dev's own grants is refused by `wrap::check_access`. Both
+/// handlers answered `no_store_error(NotFound, …)` for a missing generation
+/// and `err_internal` for everything else, so an operator whose deployment
+/// had lost the dev block's grant saw an outage.
+#[tokio::test]
+async fn a_denied_generations_read_is_403_not_500() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await.with_wrap(
+        "test/ungranted",
+        Vec::new(),
+        "impresspress/admin",
+    );
+
+    for (label, out) in [
+        ("the listing", dev_get(&ctx, "/b/dev/api/generations").await),
+        (
+            "one generation",
+            dev_get(&ctx, "/b/dev/api/generations/g1").await,
+        ),
+        (
+            "a rollback",
+            dev_post(&ctx, "/b/dev/api/generations/g1/rollback", json!({})).await,
+        ),
+    ] {
+        assert_eq!(output_http_status(out).await, 403, "{label}");
+    }
+}
+
+/// …and the refusal still carries the block-wide `Cache-Control: no-store`,
+/// which is why the conversion needed a no-store form of `crud::db_error`
+/// rather than the plain one. Design §12 admits exactly one exception, the
+/// sanitized 500 from `err_internal`; a 403 is not it.
+#[tokio::test]
+async fn a_denied_generations_read_is_still_never_cached() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await.with_wrap(
+        "test/ungranted",
+        Vec::new(),
+        "impresspress/admin",
+    );
+
+    for (label, out) in [
+        ("the listing", dev_get(&ctx, "/b/dev/api/generations").await),
+        (
+            "one generation",
+            dev_get(&ctx, "/b/dev/api/generations/g1").await,
+        ),
+        (
+            "a rollback",
+            dev_post(&ctx, "/b/dev/api/generations/g1/rollback", json!({})).await,
+        ),
+    ] {
+        assert_eq!(
+            output_http_header(out, "Cache-Control").await.as_deref(),
+            Some("no-store"),
+            "{label}"
+        );
+    }
+}
+
 /// The one failure that has to be unwound rather than merely refused: the
 /// runtime has already been swapped when the publish fails (design §7.3).
 #[tokio::test]

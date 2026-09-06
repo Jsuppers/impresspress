@@ -19,7 +19,7 @@ use wafer_block::{
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
-use super::RepoError;
+use super::db_failed;
 
 pub const TABLE: &str = "wafer_run__auth__rate_limits";
 
@@ -94,7 +94,7 @@ pub async fn windowed_increment(
 
 /// Drop counter rows whose `updated_at` is strictly before `cutoff`, and
 /// report how many went. The retention sweep behind ticket maintenance.
-pub async fn delete_updated_before(ctx: &dyn Context, cutoff: &str) -> Result<i64, RepoError> {
+pub async fn delete_updated_before(ctx: &dyn Context, cutoff: &str) -> Result<i64, WaferError> {
     db::delete_by_filters_count(
         ctx,
         TABLE,
@@ -105,7 +105,7 @@ pub async fn delete_updated_before(ctx: &dyn Context, cutoff: &str) -> Result<i6
         }],
     )
     .await
-    .map_err(|e| RepoError::Db(format!("rate_limits prune: {e}")))
+    .map_err(|e| db_failed("rate_limits prune", e))
 }
 
 fn prefixed(e: WaferError, what: &str) -> WaferError {

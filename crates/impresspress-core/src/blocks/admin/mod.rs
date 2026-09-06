@@ -20,8 +20,7 @@ pub(crate) use logs::{AUDIT_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
 pub const ADMIN_BLOCK_ID: &str = "impresspress/admin";
 
 use wafer_run::{
-    context::Context, BlockInfo, ErrorCode, HttpMethod, InputStream, InstanceMode, Message,
-    OutputStream,
+    context::Context, BlockInfo, HttpMethod, InputStream, InstanceMode, Message, OutputStream,
 };
 
 use crate::{
@@ -774,8 +773,7 @@ async fn handle_delete_wrap_grant(ctx: &dyn Context, mut msg: Message) -> Output
     // grant still re-rendered the page as a success.
     match wrap_grants::delete(ctx, grant_id).await {
         Ok(()) => {}
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Grant not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Grant not found", "Database error"),
     }
 
     logs::audit_log(

@@ -351,9 +351,52 @@ pub(crate) fn no_store_error_status(
     OutputStream::error(error)
 }
 
+/// [`crate::blocks::crud::db_error`] for a `/b/dev` response.
+///
+/// The classification is not re-derived here — `crud::classify_db_error` is
+/// the one place that decides what a failed database call means, and a
+/// second copy is exactly what `tests/error_door.rs` exists to stop. What
+/// this adds is the sealing: every `/b/dev` response carries
+/// `Cache-Control: no-store` (design §12), and an `OutputStream`'s meta is
+/// fixed when it is built, so the header has to go on the error *before* it
+/// is sealed. The `Internal` arm still goes through
+/// [`crate::http::err_internal`], the one deliberate exception
+/// [`no_store_error`] already documents.
+pub(crate) fn no_store_db_error(error: WaferError, not_found: &str, context: &str) -> OutputStream {
+    seal_no_store(
+        crate::blocks::crud::classify_db_error(error, Some(not_found), context),
+        context,
+    )
+}
+
+/// [`no_store_db_error`] for a call whose `NotFound` is NOT the client's row
+/// — the [`crate::blocks::crud::db_error_internal`] of this pair, and split
+/// for the same reason: a `NotFound` from a listing the block addressed
+/// itself is a missing table, not a generation the caller named.
+pub(crate) fn no_store_db_error_internal(error: WaferError, context: &str) -> OutputStream {
+    seal_no_store(
+        crate::blocks::crud::classify_db_error(error, None, context),
+        context,
+    )
+}
+
+/// Seal a [`crate::blocks::crud::DbFailure`] as a `/b/dev` response.
+fn seal_no_store(failure: crate::blocks::crud::DbFailure, context: &str) -> OutputStream {
+    match failure {
+        crate::blocks::crud::DbFailure::Refused(error) => OutputStream::error(with_no_store(error)),
+        crate::blocks::crud::DbFailure::Internal(error) => {
+            crate::http::err_internal(context, error)
+        }
+    }
+}
+
 /// A [`WaferError`] carrying the block-wide `Cache-Control: no-store`.
 fn no_store_wafer_error(code: wafer_run::ErrorCode, message: &str) -> WaferError {
-    let mut error = WaferError::new(code, message);
+    with_no_store(WaferError::new(code, message))
+}
+
+/// `error` with the block-wide `Cache-Control: no-store` header attached.
+fn with_no_store(mut error: WaferError) -> WaferError {
     error.meta.push(wafer_run::MetaEntry {
         key: format!(
             "{}Cache-Control",

@@ -42,14 +42,14 @@ pub(super) use crate::util::validate_url_value;
 /// call sites in this module tree keep working.
 pub(super) use crate::util::{is_sensitive_key, MASKED_VALUE};
 use crate::{
-    blocks::auth::{
-        bump_auth_version,
-        repo::{
-            users::{self, AdminUserPatch, UserRow},
-            RepoError,
+    blocks::{
+        auth::{
+            bump_auth_version,
+            repo::users::{self, AdminUserPatch, UserRow},
         },
+        crud::{db_error, db_error_internal},
     },
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found},
+    http::{err_bad_request, err_forbidden, err_internal},
     platform_state::{
         user_roles,
         variables::{self, NewVariable, VariablePatch, VariableRow},
@@ -106,8 +106,7 @@ pub(super) async fn set_user_disabled(
 
     let row = match users::set_disabled(ctx, user_id, disabled).await {
         Ok(row) => row,
-        Err(RepoError::NotFound) => return Err(err_not_found("User not found")),
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error(e, "User not found", "Database error")),
     };
 
     // P2c: a disable/enable is a lifecycle change existing access JWTs must
@@ -155,8 +154,7 @@ pub(super) async fn delete_user(
 
     match users::soft_delete(ctx, user_id).await {
         Ok(()) => {}
-        Err(RepoError::NotFound) => return Err(err_not_found("User not found")),
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error(e, "User not found", "Database error")),
     }
 
     // P2c: same reasoning as `set_user_disabled` — a soft-delete must
@@ -203,8 +201,7 @@ pub(super) async fn update_user_fields(
 
     let row = match users::patch_admin_fields(ctx, user_id, &patch).await {
         Ok(row) => row,
-        Err(RepoError::NotFound) => return Err(err_not_found("User not found")),
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error(e, "User not found", "Database error")),
     };
 
     // P2c: this whitelist can also flip `disabled` (the SSR path uses
@@ -303,13 +300,12 @@ pub(super) async fn delete_role(
         }
         Ok(_) => {}
         Err(e) if e.code == ErrorCode::NotFound => {}
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error_internal(e, "Database error")),
     }
 
     match db::delete(ctx, ROLES_TABLE, role_id).await {
         Ok(()) => {}
-        Err(e) if e.code == ErrorCode::NotFound => return Err(err_not_found("Role not found")),
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error(e, "Role not found", "Database error")),
     }
 
     audit_log(

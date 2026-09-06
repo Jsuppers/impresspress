@@ -7,8 +7,9 @@ use wafer_run::{
 };
 
 use crate::{
+    blocks::crud,
     endpoint_match::{self, EndpointRoute},
-    http::{err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_forbidden, err_not_found, ok_json},
     ui::{self, components, icons, settings_form},
     util::parse_form_body,
 };
@@ -279,9 +280,13 @@ async fn handle_update_profile(
     if let Err(e) =
         crate::blocks::auth::repo::users::update_profile(ctx, &user_id, Some(name), None).await
     {
-        // Pass the full RepoError so the helper logs the underlying failure
-        // instead of just a rendered string.
-        return err_internal("Failed to update profile", e);
+        // `db_error_internal`, not `db_error`: this row is the signed-in
+        // user's own, so a `NotFound` here means their account vanished
+        // mid-session — an internal inconsistency, not a 404 the form can
+        // act on. What the classification is here for is the arm above it:
+        // a WRAP refusal on `wafer_run__auth__users` now answers 403 instead
+        // of the 500 that made a missing grant look like an outage.
+        return crud::db_error_internal(e, "Failed to update profile");
     }
 
     // Plain form POST → 303 See Other so the browser follows up with a GET
