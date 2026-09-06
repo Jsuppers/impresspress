@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_internal, ok_json, require_row},
     platform_state::{
         block_settings::{self, BlockSettingsPatch},
         variables::{self, NewVariable, VariablePatch},
@@ -89,25 +89,26 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
         Err(response) => return response,
     };
 
-    match variables::get_by_key(ctx, key).await {
-        Ok(Some(mut row)) => {
-            // SEC-060: mask on the row flag OR the `_SECRET` / `_KEY` suffix —
-            // the single-key getter previously masked on the flag alone, so a
-            // `*_SECRET` key with the flag unset leaked its value here.
-            if ops::is_sensitive_key(key, i64::from(row.sensitive)) {
-                row.value = MASKED_VALUE.to_string();
-            }
-            // The row is echoed in the `{id, data}` record envelope this
-            // endpoint has always published; it is declared without a schema
-            // until it is typed.
-            ok_json(&db::Record {
-                id: row.id.clone(),
-                data: row.to_data(),
-            })
-        }
-        Ok(None) => err_not_found("Setting not found"),
-        Err(e) => err_internal("Database error", e),
+    let mut row = match variables::get_by_key(ctx, key)
+        .await
+        .map_err(|e| crud::db_error(e, "Setting not found", "Database error"))
+        .and_then(|row| require_row(row, "Setting not found"))
+    {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    // SEC-060: mask on the row flag OR the `_SECRET` / `_KEY` suffix — the
+    // single-key getter previously masked on the flag alone, so a `*_SECRET`
+    // key with the flag unset leaked its value here.
+    if ops::is_sensitive_key(key, i64::from(row.sensitive)) {
+        row.value = MASKED_VALUE.to_string();
     }
+    // The row is echoed in the `{id, data}` record envelope this endpoint has
+    // always published; it is declared without a schema until it is typed.
+    ok_json(&db::Record {
+        id: row.id.clone(),
+        data: row.to_data(),
+    })
 }
 
 /// `PATCH /b/admin/api/settings/{key}`. `{key}` is read only as the route
@@ -221,13 +222,17 @@ pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStr
         return err_bad_request(&format!("Cannot delete shared system variable: {key}"));
     }
 
-    match variables::get_by_key(ctx, key).await {
-        Ok(Some(row)) => match variables::delete(ctx, &row.id).await {
-            Ok(()) => ok_json(&serde_json::json!({"deleted": key})),
-            Err(e) => err_internal("Database error", e),
-        },
-        Ok(None) => err_not_found("Setting not found"),
-        Err(e) => err_internal("Database error", e),
+    let row = match variables::get_by_key(ctx, key)
+        .await
+        .map_err(|e| crud::db_error(e, "Setting not found", "Database error"))
+        .and_then(|row| require_row(row, "Setting not found"))
+    {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    match variables::delete(ctx, &row.id).await {
+        Ok(()) => ok_json(&serde_json::json!({"deleted": key})),
+        Err(e) => crud::db_error(e, "Setting not found", "Database error"),
     }
 }
 
@@ -930,5 +935,46 @@ mod create_tests {
         )
         .await;
         assert!(!sensitive_flag(&ctx, "SITE_MOTTO").await);
+    }
+}
+
+#[cfg(test)]
+mod wrap_denial_tests {
+    use super::*;
+    use crate::test_support::{admin_msg, output_http_status, TestContext};
+
+    /// A block deployed without the grant its handler needs answers **403**,
+    /// not `500 Internal server error (ref: …)`.
+    ///
+    /// The three-arm `Ok(Some) / Ok(None) / Err` shape these handlers used
+    /// tested only for the missing row; a WRAP refusal fell through the `Err`
+    /// arm into `err_internal`, so a missing `ResourceGrant` in production was
+    /// indistinguishable from a corrupt row. `crud::db_error` is the arm that
+    /// was missing.
+    async fn denied_ctx() -> TestContext {
+        TestContext::with_admin().await.with_wrap(
+            "test/ungranted",
+            Vec::new(),
+            "impresspress/admin",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_denied_settings_read_is_403() {
+        let ctx = denied_ctx().await;
+        let mut msg = admin_msg("retrieve", "/b/admin/api/settings/SOME_KEY");
+        msg.set_meta("req.param.key", "SOME_KEY");
+        assert_eq!(output_http_status(handle_get(&ctx, &msg).await).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_denied_settings_delete_is_403() {
+        let ctx = denied_ctx().await;
+        let mut msg = admin_msg("delete", "/b/admin/api/settings/SOME_KEY");
+        msg.set_meta("req.param.key", "SOME_KEY");
+        assert_eq!(
+            output_http_status(handle_delete(&ctx, &msg).await).await,
+            403
+        );
     }
 }

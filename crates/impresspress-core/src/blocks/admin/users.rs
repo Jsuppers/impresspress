@@ -71,6 +71,10 @@ async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
             ok_json(&AdminUserView::from_row(&row, roles))
         }
         Ok(None) => err_not_found("User not found"),
+        // NOT `crud::db_error`: `auth::repo::RepoError` is `NotFound |
+        // Db(String)` and has already discarded the wafer code, so a WRAP
+        // refusal cannot be told from a decode failure here. Folding
+        // `RepoError` into `WaferError` is PR 2; this arm converts with it.
         Err(e) => err_internal("Database error", e),
     }
 }

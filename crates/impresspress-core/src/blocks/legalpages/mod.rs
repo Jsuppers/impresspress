@@ -17,7 +17,7 @@ use self::{
 use crate::{
     blocks::crud,
     endpoint_match::{self, request_schema_of, EndpointRoute},
-    http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
+    http::{err_bad_request, err_internal, err_not_found, ok_json, require_row, ResponseBuilder},
     ui::{self, templates, SiteConfig},
 };
 
@@ -342,10 +342,13 @@ impl LegalPagesBlock {
 
         // Fetch the document first: its `doc_type` drives version
         // computation and which published siblings get archived.
-        let doc = match documents::get(ctx, id).await {
-            Ok(Some(doc)) => doc,
-            Ok(None) => return err_not_found("Document not found"),
-            Err(e) => return err_internal("Database error", e),
+        let doc = match documents::get(ctx, id)
+            .await
+            .map_err(|e| crud::db_error(e, "Document not found", "Database error"))
+            .and_then(|row| require_row(row, "Document not found"))
+        {
+            Ok(doc) => doc,
+            Err(response) => return response,
         };
 
         match service::publish_document(
@@ -372,10 +375,13 @@ impl LegalPagesBlock {
             Ok(id) => id,
             Err(resp) => return resp,
         };
-        match documents::get(ctx, id).await {
-            Ok(Some(row)) => ok_json(&DocumentView::from_row(&row)),
-            Ok(None) => err_not_found("Document not found"),
-            Err(e) => err_internal("Database error", e),
+        match documents::get(ctx, id)
+            .await
+            .map_err(|e| crud::db_error(e, "Document not found", "Database error"))
+            .and_then(|row| require_row(row, "Document not found"))
+        {
+            Ok(row) => ok_json(&DocumentView::from_row(&row)),
+            Err(response) => response,
         }
     }
 
@@ -1383,5 +1389,28 @@ mod table_tests {
             Some(Route::ApiPublish)
         ));
         assert_eq!(msg.var("id"), "doc-7");
+    }
+
+    /// A WRAP refusal on the document read is a **403**, not the
+    /// `500 Internal server error (ref: …)` the old `Err(e) => err_internal`
+    /// tail produced. Before `crud::db_error` there was no arm in this repo
+    /// that could tell a missing grant from a corrupt row.
+    #[tokio::test]
+    async fn a_denied_document_read_is_403_not_500() {
+        use crate::test_support::{admin_msg, output_http_status, TestContext};
+
+        let ctx = TestContext::with_auth().await.with_wrap(
+            "test/ungranted",
+            Vec::new(),
+            "impresspress/admin",
+        );
+        let mut msg = admin_msg("retrieve", "/b/legalpages/api/documents/doc-7");
+        assert!(matches!(
+            endpoint_match::dispatch(&mut msg, ROUTES),
+            Some(Route::ApiGet)
+        ));
+
+        let out = LegalPagesBlock::new().handle_admin_get(&ctx, &msg).await;
+        assert_eq!(output_http_status(out).await, 403);
     }
 }

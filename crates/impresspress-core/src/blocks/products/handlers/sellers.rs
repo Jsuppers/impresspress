@@ -16,12 +16,14 @@ use crate::{
     util::{stamp_updated, RecordExt},
 };
 
+/// The seller-governance classifications, then [`crud::db_error`] for
+/// everything a database raises — which is what makes a WRAP refusal here a
+/// 403 rather than the 500 the old `_` arm produced.
 fn admin_error(error: WaferError, not_found: &str) -> OutputStream {
     match error.code {
-        ErrorCode::NotFound => err_not_found(not_found),
         ErrorCode::InvalidArgument => err_bad_request(&error.message),
         ErrorCode::FailedPrecondition | ErrorCode::Aborted => err_conflict(&error.message),
-        _ => err_internal("Seller governance operation failed", error),
+        _ => crud::db_error(error, not_found, "Seller governance operation failed"),
     }
 }
 
