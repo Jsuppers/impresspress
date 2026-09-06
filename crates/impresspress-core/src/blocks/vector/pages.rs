@@ -56,7 +56,10 @@ use super::{
     ingestion::{self, DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_RATIO},
     service::{self, REGISTRY_TABLE, TABLE_PREFIX},
 };
-use crate::http::{err_bad_request, err_internal, err_internal_no_cause, err_not_found, ok_json};
+use crate::{
+    blocks::crud,
+    http::{err_bad_request, err_internal, err_internal_no_cause, err_not_found, ok_json},
+};
 
 // Per-route dispatch now lives in `VectorBlock::handle` via the shared
 // `endpoint_match` table; the JSON handlers below are called directly from
@@ -269,10 +272,10 @@ pub(super) async fn delete_index(ctx: &dyn Context, msg: &Message) -> OutputStre
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
-    let name = msg.var("name");
-    if name.is_empty() {
-        return err_bad_request("index name is required");
-    }
+    let name = match crud::path_var(msg, "name", "index name is required") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     if let Err(e) = service::validate_index_name(name) {
         return err_bad_request(&e.message);
     }

@@ -2,7 +2,10 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use wafer_sql_utils::{introspect, Backend};
 
-use crate::http::{err_bad_request, err_forbidden, err_internal, ok_json};
+use crate::{
+    blocks::crud,
+    http::{err_bad_request, err_forbidden, err_internal, ok_json},
+};
 
 /// Lightweight per-table summary: name + row count. Shared by the JSON
 /// `GET /b/admin/api/database/tables` handler and the SSR database page's
@@ -163,10 +166,10 @@ pub(super) async fn handle_tables(ctx: &dyn Context) -> OutputStream {
 /// `GET /b/admin/api/database/tables/{name}/columns`. `{name}` is read only
 /// as the route table bound it.
 pub(super) async fn handle_columns(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let table_name = msg.var("name");
-    if table_name.is_empty() {
-        return err_bad_request("Missing table name");
-    }
+    let table_name = match crud::path_var(msg, "name", "Missing table name") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     // The table name is user input from the URL path; an invalid identifier
     // is a bad request, not a server error.

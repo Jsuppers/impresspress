@@ -704,7 +704,7 @@ fn redirect_308(target: &str) -> OutputStream {
 // WRAP grant handlers
 // ---------------------------------------------------------------------------
 
-use crate::util::parse_form_body;
+use crate::{blocks::crud, util::parse_form_body};
 
 async fn handle_create_wrap_grant(
     ctx: &dyn Context,
@@ -762,10 +762,10 @@ async fn handle_create_wrap_grant(
 /// `DELETE /b/admin/grants/rules/{id}`. `{id}` is read only as the route
 /// table bound it.
 async fn handle_delete_wrap_grant(ctx: &dyn Context, mut msg: Message) -> OutputStream {
-    let grant_id = msg.var("id").to_string();
-    if grant_id.is_empty() {
-        return err_bad_request("Missing grant ID");
-    }
+    let grant_id = match crud::path_id(&msg, "Grant") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     let grant_id = grant_id.as_str();
 
     // Persist first; only render the page and write the audit event after a

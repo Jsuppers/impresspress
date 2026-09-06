@@ -12,6 +12,7 @@ use super::{
     repo, stripe_provider,
 };
 use crate::{
+    blocks::crud,
     http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
     util::RecordExt,
 };
@@ -224,10 +225,10 @@ async fn purchase_response(
 }
 
 pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing purchase ID");
-    }
+    let id = match crud::path_id(msg, "Purchase") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     let purchase = match repo::purchases::get(ctx, id).await {
         Ok(p) => p,
@@ -257,10 +258,10 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// output types: routing already gates this one at `AuthLevel::Admin`, so
 /// there is no ownership check to make here.
 pub async fn handle_get_admin(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing purchase ID");
-    }
+    let id = match crud::path_id(msg, "Purchase") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let purchase = match repo::purchases::get(ctx, id).await {
         Ok(p) => p,
         Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Purchase not found"),
@@ -270,10 +271,10 @@ pub async fn handle_get_admin(ctx: &dyn Context, msg: &Message) -> OutputStream 
 }
 
 pub async fn handle_get_seller(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing purchase ID");
-    }
+    let id = match crud::path_id(msg, "Purchase") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => return err_forbidden("Complete seller setup before viewing seller orders"),
@@ -341,10 +342,10 @@ fn valid_refund_operation_key(value: &str) -> bool {
 }
 
 pub async fn handle_refund(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing purchase ID");
-    }
+    let id = match crud::path_id(msg, "Purchase") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     refund_purchase(ctx, msg, input, id).await
 }
 
@@ -353,10 +354,10 @@ pub async fn handle_seller_refund(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let id = msg.var("id").to_string();
-    if id.is_empty() {
-        return err_bad_request("Missing purchase ID");
-    }
+    let id = match crud::path_id(msg, "Purchase") {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => return err_forbidden("Complete seller setup before refunding seller orders"),

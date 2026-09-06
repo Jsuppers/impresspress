@@ -1,18 +1,19 @@
 //! The path variables the block's route table binds for the storage API:
 //! bucket name (`{name}`) and object key (`{key...}`, may contain `/`).
 
-use wafer_run::Message;
+use wafer_run::{Message, OutputStream};
 
-/// The bucket name bound by the table's `{name}` segment; empty when the
-/// request matched no row that has one.
-pub(super) fn extract_bucket_name(msg: &Message) -> String {
-    msg.var("name").to_string()
+/// The bucket name bound by the table's `{name}` segment, or the 400 an
+/// unbound segment turns into. Every handler that reads it needs it, so the
+/// guard is the accessor rather than five copies of `if bucket.is_empty()`.
+pub(super) fn extract_bucket_name(msg: &Message) -> Result<&str, OutputStream> {
+    crate::blocks::crud::path_var(msg, "name", "Missing bucket name")
 }
 
 /// The object key bound by the table's `{key...}` rest segment (slashes
-/// preserved, percent-decoded); empty when the request matched no such row.
-pub(super) fn extract_object_key(msg: &Message) -> String {
-    msg.var("key").to_string()
+/// preserved, percent-decoded), or the 400 an unbound segment turns into.
+pub(super) fn extract_object_key(msg: &Message) -> Result<&str, OutputStream> {
+    crate::blocks::crud::path_var(msg, "key", "Missing object key")
 }
 
 #[cfg(test)]
@@ -37,7 +38,7 @@ mod tests {
             "/b/storage/api/buckets/my-bucket/objects",
             &[("name", "my-bucket")],
         );
-        assert_eq!(extract_bucket_name(&m), "my-bucket");
+        assert_eq!(extract_bucket_name(&m).ok(), Some("my-bucket"));
     }
 
     #[test]
@@ -47,7 +48,7 @@ mod tests {
             "/b/storage/api/buckets/b/objects/dir/file.txt",
             &[("key", "dir/file.txt")],
         );
-        assert_eq!(extract_object_key(&m), "dir/file.txt");
+        assert_eq!(extract_object_key(&m).ok(), Some("dir/file.txt"));
     }
 
     /// The readers see only what the block's table bound: an unrouted
@@ -63,15 +64,15 @@ mod tests {
             "/b/storage/api/buckets/photos/objects/dir/file.txt",
             "alice",
         );
-        assert_eq!(extract_bucket_name(&unrouted), "");
-        assert_eq!(extract_object_key(&unrouted), "");
+        assert!(extract_bucket_name(&unrouted).is_err());
+        assert!(extract_object_key(&unrouted).is_err());
 
         let bound = routed(unrouted);
-        assert_eq!(extract_bucket_name(&bound), "photos");
-        assert_eq!(extract_object_key(&bound), "dir/file.txt");
+        assert_eq!(extract_bucket_name(&bound).ok(), Some("photos"));
+        assert_eq!(extract_object_key(&bound).ok(), Some("dir/file.txt"));
 
         let bucket_only = routed(auth_msg("delete", "/b/storage/api/buckets/photos", "alice"));
-        assert_eq!(extract_bucket_name(&bucket_only), "photos");
-        assert_eq!(extract_object_key(&bucket_only), "");
+        assert_eq!(extract_bucket_name(&bucket_only).ok(), Some("photos"));
+        assert!(extract_object_key(&bucket_only).is_err());
     }
 }

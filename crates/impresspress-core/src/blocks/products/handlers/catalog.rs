@@ -10,11 +10,14 @@ use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
 use crate::{
-    blocks::products::{
-        contracts::{CatalogProductListResponse, CatalogProductView, PageQuery},
-        repo,
+    blocks::{
+        crud,
+        products::{
+            contracts::{CatalogProductListResponse, CatalogProductView, PageQuery},
+            repo,
+        },
     },
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_internal, err_not_found, ok_json},
     util::RecordExt,
 };
 
@@ -48,10 +51,10 @@ pub(super) async fn handle_catalog(ctx: &dyn Context, msg: &Message) -> OutputSt
 }
 
 pub(super) async fn handle_get_product_public(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let id = match crud::path_id(msg, "Product") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     match repo::products::get(ctx, id).await {
         Ok(record) => {

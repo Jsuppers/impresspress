@@ -8,6 +8,7 @@ use super::{
     ops::{self, MASKED_VALUE},
 };
 use crate::{
+    blocks::crud,
     http::{err_bad_request, err_internal, err_not_found, ok_json},
     platform_state::{
         block_settings::{self, BlockSettingsPatch},
@@ -83,10 +84,10 @@ pub(super) async fn handle_list(ctx: &dyn Context) -> OutputStream {
 /// `GET /b/admin/api/settings/{key}`. `{key}` is read only as the route
 /// table bound it.
 pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let key = msg.var("key");
-    if key.is_empty() {
-        return err_bad_request("Missing setting key");
-    }
+    let key = match crud::path_var(msg, "key", "Missing setting key") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     match variables::get_by_key(ctx, key).await {
         Ok(Some(mut row)) => {
@@ -116,10 +117,10 @@ pub(super) async fn handle_set(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let key = msg.var("key");
-    if key.is_empty() {
-        return err_bad_request("Missing setting key");
-    }
+    let key = match crud::path_var(msg, "key", "Missing setting key") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     #[derive(serde::Deserialize)]
     struct Req {
@@ -211,10 +212,10 @@ pub(super) async fn handle_create(
 /// `DELETE /b/admin/api/settings/{key}`. `{key}` is read only as the route
 /// table bound it.
 pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let key = msg.var("key");
-    if key.is_empty() {
-        return err_bad_request("Missing setting key");
-    }
+    let key = match crud::path_var(msg, "key", "Missing setting key") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     if key.starts_with("WAFER_RUN_SHARED__") {
         return err_bad_request(&format!("Cannot delete shared system variable: {key}"));

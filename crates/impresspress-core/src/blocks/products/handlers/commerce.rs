@@ -6,15 +6,18 @@ use wafer_core::clients::{config, database::Record};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::products::{
-        contracts::{
-            FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus, PricingPreviewRequest,
-            ReconciliationStatus, StorefrontConfig, StorefrontOffer, StorefrontProduct, StripeMode,
-            VariableVisibility, COMMERCE_SCHEMA_VERSION,
+    blocks::{
+        crud,
+        products::{
+            contracts::{
+                FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus,
+                PricingPreviewRequest, ReconciliationStatus, StorefrontConfig, StorefrontOffer,
+                StorefrontProduct, StripeMode, VariableVisibility, COMMERCE_SCHEMA_VERSION,
+            },
+            offer_pricing,
+            repo::{offers, payment_links, products, purchases},
+            stripe_secret_operations_allowed,
         },
-        offer_pricing,
-        repo::{offers, payment_links, products, purchases},
-        stripe_secret_operations_allowed,
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
     util::{sha256_hex, RecordExt},
@@ -181,10 +184,10 @@ fn fulfillment(record: &Record) -> Result<FulfillmentKind, WaferError> {
 }
 
 pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let product_id = msg.var("product_id");
-    if product_id.is_empty() {
-        return err_bad_request("Missing product ID");
-    }
+    let product_id = match crud::path_var(msg, "product_id", "Missing product ID") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
         Err(error) if error.code == ErrorCode::NotFound => {

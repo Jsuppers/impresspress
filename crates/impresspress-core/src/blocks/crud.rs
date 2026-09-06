@@ -92,19 +92,33 @@ impl Deleted {
     }
 }
 
-/// The record id for a CRUD route — `{id}` as the block's route table bound
-/// it — or the 400 a missing id turns into. The matcher never binds an empty
-/// segment, so the guard only fires for a handler called with a message that
-/// did not go through the table.
-pub fn path_id<'m>(msg: &'m Message, not_found_label: &str) -> Result<&'m str, OutputStream> {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return Err(err_bad_request(&format!(
-            "Missing {} ID",
-            not_found_label.to_lowercase()
-        )));
+/// The value the block's route table bound to `{var}`, or the 400 an empty
+/// binding turns into. The matcher never binds an empty segment, so the
+/// guard only fires for a handler called with a message that did not go
+/// through the table.
+///
+/// `missing` is the whole 400 message, not a noun to be formatted: the noun
+/// is per-route (`"Missing bucket name"`, `"Missing setting key"`,
+/// `"Missing offer ID"`) and deriving it from a label would be a mapping
+/// layer that has to be read to be understood. [`path_id`] is the one
+/// spelling common enough to be worth a shorthand.
+pub fn path_var<'m>(msg: &'m Message, var: &str, missing: &str) -> Result<&'m str, OutputStream> {
+    let value = msg.var(var);
+    if value.is_empty() {
+        return Err(err_bad_request(missing));
     }
-    Ok(id)
+    Ok(value)
+}
+
+/// The record id for a CRUD route — [`path_var`] on `{id}`, with the message
+/// the great majority of routes want (`"Missing product ID"` for a label of
+/// `"Product"`).
+pub fn path_id<'m>(msg: &'m Message, not_found_label: &str) -> Result<&'m str, OutputStream> {
+    path_var(
+        msg,
+        "id",
+        &format!("Missing {} ID", not_found_label.to_lowercase()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +379,7 @@ mod db_error_tests {
         let out = db_error(
             wafer_err(
                 ErrorCode::PermissionDenied,
-                "WRAP: block 'impresspress/products' has no grant for 'wafer_run__auth__users'",
+                "WRAP: block 'impresspress/products' has no grant for the table it read",
             ),
             "Product not found",
             "Database error",
@@ -431,13 +445,15 @@ mod db_error_tests {
     // End to end: the same denial arriving through the CRUD primitives.
     // ---------------------------------------------------------------------
 
-    const FOREIGN_TABLE: &str = "wafer_run__auth__users";
+    /// A table this test owns, so `tests/repo_door.rs` does not see the
+    /// fixture as `crud.rs` reaching past another block's door.
+    const FOREIGN_TABLE: &str = "impresspress__crudtest__rows";
 
     /// A context acting as a block with NO grants, so every typed database
-    /// call it makes against a table it does not own is refused by the same
-    /// `wrap::check_access` the runtime applies.
+    /// call it makes is refused by the same `wrap::check_access` the runtime
+    /// applies.
     async fn denied_ctx() -> TestContext {
-        TestContext::with_auth()
+        TestContext::new()
             .await
             .with_wrap("test/ungranted", Vec::new(), "impresspress/admin")
     }
@@ -508,11 +524,86 @@ mod db_error_tests {
     /// denial and not a blanket refusal.
     #[tokio::test]
     async fn a_granted_read_of_a_missing_row_is_still_404() {
-        let ctx = TestContext::with_auth().await;
-        let _ = db::create(&ctx, FOREIGN_TABLE, HashMap::new()).await;
-        let out = get_record(&ctx, FOREIGN_TABLE, "no-such-id", "User")
+        let ctx = TestContext::new().await;
+        db::ensure_table(
+            &ctx,
+            &wafer_block::wire::database::TableDef {
+                name: FOREIGN_TABLE.to_string(),
+                columns: vec![wafer_block::wire::database::ColumnDef {
+                    name: "id".to_string(),
+                    kind: "text".to_string(),
+                    nullable: false,
+                    primary_key: true,
+                    auto_increment: false,
+                    unique: false,
+                    default: None,
+                }],
+                indexes: vec![],
+                primary_key: vec![],
+                unique_keys: vec![],
+            },
+        )
+        .await
+        .expect("the ungated fixture creates its table");
+        let out = get_record(&ctx, FOREIGN_TABLE, "no-such-id", "Row")
             .await
             .expect_err("the row does not exist");
         assert_eq!(output_http_status(out).await, 404);
+    }
+}
+
+#[cfg(test)]
+mod path_var_tests {
+    use super::*;
+    use crate::test_support::output_http_status;
+
+    fn msg_with(var: &str, value: &str) -> Message {
+        let mut m = Message::new("http.request");
+        m.set_meta(format!("req.param.{var}"), value);
+        m
+    }
+
+    #[test]
+    fn a_bound_segment_is_its_value() {
+        let m = msg_with("offer_id", "off_1");
+        assert_eq!(
+            path_var(&m, "offer_id", "Missing offer ID").ok(),
+            Some("off_1")
+        );
+        let m = msg_with("id", "prod_1");
+        assert_eq!(path_id(&m, "Product").ok(), Some("prod_1"));
+    }
+
+    #[tokio::test]
+    async fn an_unbound_segment_is_a_400_carrying_the_caller_s_message() {
+        let m = Message::new("http.request");
+        let out = path_var(&m, "offer_id", "Missing offer ID").expect_err("no binding");
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.message, "Missing offer ID");
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+        let out = path_var(&Message::new("http.request"), "id", "Missing product ID")
+            .expect_err("no binding");
+        assert_eq!(output_http_status(out).await, 400);
+    }
+
+    /// `path_id` produces exactly the message the hand-rolled guards it
+    /// replaces spelled, so converting them changes no wire text.
+    #[tokio::test]
+    async fn path_id_spells_the_message_the_hand_rolled_guards_spelled() {
+        for (label, expected) in [
+            ("Product", "Missing product ID"),
+            ("Seller", "Missing seller ID"),
+            ("User", "Missing user ID"),
+            ("Grant", "Missing grant ID"),
+        ] {
+            let out = path_id(&Message::new("http.request"), label).expect_err("no binding");
+            match out.collect_buffered().await {
+                Err(wafer_run::TerminalNotResponse::Error(e)) => assert_eq!(e.message, expected),
+                other => panic!("expected an error terminal, got {other:?}"),
+            }
+        }
     }
 }

@@ -217,11 +217,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
 /// `endpoint_match::dispatch` binds nothing and is refused here rather than
 /// parsed out of the path.
 fn document_id(msg: &Message) -> Result<&str, OutputStream> {
-    let id = msg.var("id");
-    if id.is_empty() {
-        return Err(err_bad_request("Missing document ID"));
-    }
-    Ok(id)
+    crud::path_id(msg, "Document")
 }
 
 impl LegalPagesBlock {
