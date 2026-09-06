@@ -92,10 +92,13 @@ pub(crate) async fn handle_guest_order_status(ctx: &dyn Context, msg: &Message) 
     }
     let order = match purchases::get(ctx, order_id).await {
         Ok(order) => order,
-        Err(error) if error.code == ErrorCode::NotFound => {
-            return err_not_found("Order status not found");
+        Err(error) => {
+            return crud::db_error(
+                error,
+                "Order status not found",
+                "Could not load order status",
+            )
         }
-        Err(error) => return err_internal("Could not load order status", error),
     };
     let expected_hash = order.str_field("receipt_token_hash");
     let expires_at = order.str_field("receipt_token_expires_at");
@@ -191,10 +194,7 @@ pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) 
     };
     let product = match products::get(ctx, product_id).await {
         Ok(product) => product,
-        Err(error) if error.code == ErrorCode::NotFound => {
-            return err_not_found("Product not found");
-        }
-        Err(error) => return err_internal("Could not load product", error),
+        Err(error) => return crud::db_error(error, "Product not found", "Could not load product"),
     };
     // `products::get` already answers `NotFound` for a soft-deleted row; only
     // `status`/`approval_status` are this handler's own rules to enforce.
@@ -268,8 +268,7 @@ pub(crate) async fn handle_preview(ctx: &dyn Context, input: InputStream) -> Out
     };
     let offer = match offers::get_public(ctx, &request.offer_id).await {
         Ok(offer) => offer,
-        Err(error) if error.code == ErrorCode::NotFound => return err_not_found("Offer not found"),
-        Err(error) => return err_internal("Could not load offer", error),
+        Err(error) => return crud::db_error(error, "Offer not found", "Could not load offer"),
     };
     match offer_pricing::evaluate_offer(&offer, &request, offer_pricing::InputScope::Public) {
         Ok(preview) => ok_json(&preview),

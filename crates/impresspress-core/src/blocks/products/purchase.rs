@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_forbidden, err_internal, ok_json},
     util::RecordExt,
 };
 
@@ -266,8 +266,7 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let purchase = match repo::purchases::get(ctx, id).await {
         Ok(p) => p,
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Purchase not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Purchase not found", "Database error"),
     };
 
     // A buyer may read only their own order. An admin reading this same path
@@ -298,8 +297,7 @@ pub async fn handle_get_admin(ctx: &dyn Context, msg: &Message) -> OutputStream 
     };
     let purchase = match repo::purchases::get(ctx, id).await {
         Ok(p) => p,
-        Err(e) if e.code == ErrorCode::NotFound => return err_not_found("Purchase not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error(e, "Purchase not found", "Database error"),
     };
     purchase_response(ctx, purchase).await
 }
@@ -316,10 +314,7 @@ pub async fn handle_get_seller(ctx: &dyn Context, msg: &Message) -> OutputStream
     };
     let purchase = match repo::purchases::get(ctx, id).await {
         Ok(purchase) => purchase,
-        Err(error) if error.code == ErrorCode::NotFound => {
-            return err_not_found("Purchase not found")
-        }
-        Err(error) => return err_internal("Database error", error),
+        Err(error) => return crud::db_error(error, "Purchase not found", "Database error"),
     };
     if purchase.str_field("seller_account_id") != account.id {
         return err_forbidden("Access denied");
@@ -430,10 +425,7 @@ pub async fn handle_seller_refund(
     };
     let purchase = match repo::purchases::get(ctx, &id).await {
         Ok(purchase) => purchase,
-        Err(error) if error.code == ErrorCode::NotFound => {
-            return err_not_found("Purchase not found")
-        }
-        Err(error) => return err_internal("Database error", error),
+        Err(error) => return crud::db_error(error, "Purchase not found", "Database error"),
     };
     if purchase.str_field("seller_account_id") != account.id {
         return err_forbidden("Access denied");
@@ -487,10 +479,7 @@ async fn refund_purchase(
 
     let purchase = match repo::purchases::get(ctx, &id).await {
         Ok(purchase) => purchase,
-        Err(error) if error.code == ErrorCode::NotFound => {
-            return err_not_found("Purchase not found")
-        }
-        Err(error) => return err_internal("Database error", error),
+        Err(error) => return crud::db_error(error, "Purchase not found", "Database error"),
     };
     let order_status = match OrderStatus::from_record(&purchase) {
         Ok(status) => status,

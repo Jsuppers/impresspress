@@ -1,4 +1,5 @@
 mod config_tests;
+mod error_mapping_tests;
 mod example_fixture_tests;
 mod handler_tests;
 mod harness;

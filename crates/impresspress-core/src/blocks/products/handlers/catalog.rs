@@ -7,7 +7,7 @@
 //! type for what is withheld and why.
 
 use wafer_block::db::{Filter, FilterOp, SortField};
-use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
+use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::{
@@ -46,7 +46,10 @@ pub(super) async fn handle_catalog(ctx: &dyn Context, msg: &Message) -> OutputSt
     .await
     {
         Ok(list) => ok_json(&CatalogProductListResponse::from_record_list(&list)),
-        Err(e) => err_internal("Database error", e),
+        // The table is the block's, not the request's: a `NotFound` here is a
+        // missing table, so it stays a 500 rather than telling the caller
+        // their query found nothing.
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -69,7 +72,6 @@ pub(super) async fn handle_get_product_public(ctx: &dyn Context, msg: &Message) 
                 Err(error) => err_internal("Product row is outside the contract", error),
             }
         }
-        Err(e) if e.code == ErrorCode::NotFound => err_not_found("Product not found"),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error(e, "Product not found", "Database error"),
     }
 }

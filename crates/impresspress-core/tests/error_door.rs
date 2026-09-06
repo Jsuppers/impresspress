@@ -38,17 +38,23 @@
 //! `tickets/rest.rs` and two in `vector/pages.rs` only by reading the files
 //! the allowlist sent it to.
 //!
+//! That last blind spot outlived the allowlist. `products/stripe.rs`'s
+//! webhook dispatcher still tails roughly forty database and Stripe-API
+//! failures into `err_internal` with no `NotFound` arm above them, and
+//! `products/purchase.rs`'s refund orchestration does the same; separating
+//! the database calls from the Stripe calls there is a reading job per site,
+//! not a mechanical one, so it is owed as its own PR rather than smuggled
+//! into this gate's scope. An empty list below does NOT mean every products
+//! refusal is classified — it means no file writes the *shape*.
+//!
 //! `auth::repo::RepoError` used to be named here as a site the gate could
 //! not help: it was `NotFound | Db(String)`, so the wafer code was gone
 //! before a handler ever saw it. PR 2 folded it into `WaferError`, and those
 //! sites classify like every other one now.
 
-/// Files still carrying the shape, each with the PR that converts it.
-///
-/// This list is a worklist, not an exemption: every entry is a place a WRAP
-/// refusal still ships as a 500. It shrinks to empty over PRs 2–4 of this
-/// phase, and a file that comes off it can never go back on without editing
-/// this test.
+/// Files still carrying the shape. **Empty**, and the history of how it got
+/// there, because each entry was a place a WRAP refusal shipped as a 500 and
+/// the order they came off in is the argument for keeping it at zero.
 ///
 /// PR 1 converted the seven sites inside `blocks/crud.rs` — which is what
 /// makes the fix reach every block that reads through the CRUD primitives —
@@ -67,47 +73,33 @@
 /// calls rather than database ones (`files/share.rs` and both
 /// `files/storage/*`); the codes are the same set and the mapping is the
 /// same sentence, so they go through the same door. Only the eight products
-/// entries below are left.
+/// entries were left after it.
 ///
 /// PR 4 took **none** of them, deliberately. The entries were written on the
 /// assumption that the enum work would open these files anyway, and it did —
 /// but it opened them to move two published snapshots, the SDK's order and
 /// seller types and every products status column at once. Folding a second,
 /// unrelated behaviour change (a WRAP denial stops answering 500) into that
-/// review would have hidden it. The eight go as their own PR, which is a
+/// review would have hidden it. The eight went as their own PR, which is a
 /// mechanical diff with a behavioural test and no snapshot movement at all.
 ///
 /// PR 5 (`StripeEventType`) opened two of the eight — `products/stripe.rs`
-/// and `products/pages.rs` — and took none either, for the same reason
-/// stated one size up: 29 `NotFound` classifications across the eight files
-/// is a larger diff than the enum it would have been reviewed alongside,
-/// and the enum PR moves an admin page's markup. Two PRs have now declined
-/// on the grounds that the conversion deserves its own review, which is the
-/// argument for scheduling it rather than waiting for a PR that happens to
-/// be in the neighbourhood.
-const STILL_HAND_MAPPED: &[(&str, &str)] = &[
-    // ---- owed as a follow-up to PR 4; see the note above ----
-    ("products/pages.rs", "PR 4 (three SSR reads)"),
-    ("products/purchase.rs", "PR 4 (five purchase lookups)"),
-    ("products/stripe.rs", "PR 4 (three catalog reads)"),
-    (
-        "products/handlers/offers.rs",
-        "PR 4 (and `domain_error`'s tail)",
-    ),
-    (
-        "products/handlers/commerce.rs",
-        "PR 4 (three storefront reads)",
-    ),
-    ("products/handlers/catalog.rs", "PR 4"),
-    (
-        "products/handlers/provider.rs",
-        "PR 4 (`provider_error`'s tail)",
-    ),
-    (
-        "products/handlers/product.rs",
-        "PR 4 (six lookups plus `write_error`'s tail)",
-    ),
-];
+/// and `products/pages.rs` — and took none either, for the same reason.
+///
+/// That PR has now landed and the list is **empty**. All 29 `NotFound`
+/// classifications across the eight products files classify through
+/// `crud::db_error` / `crud::db_error_internal`, or through one of the three
+/// block-private helpers (`handlers::product::write_error`,
+/// `handlers::offers::domain_error`, `handlers::provider::provider_error`)
+/// whose tails now delegate to it while keeping their own domain arms.
+/// `products/tests/error_mapping_tests.rs` is the behavioural half: a real
+/// `wrap::check_access` denial per file, each paired with the 404 a granted
+/// read of a missing row still gives.
+///
+/// An empty list is the invariant, not a milestone: a file that hand-maps a
+/// database error fails this test, and re-listing one takes an edit here and
+/// the review that comes with it.
+const STILL_HAND_MAPPED: &[(&str, &str)] = &[];
 
 /// The one file allowed to contain the mapping, because it IS the mapping.
 const THE_DOOR: &str = "crud.rs";

@@ -572,10 +572,13 @@ pub async fn deleted_product_close(
 ) -> OutputStream {
     let product = match repo::products::get_deleted(ctx, product_id).await {
         Ok(product) => product,
-        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-            return crate::http::err_not_found("Product not found");
+        Err(error) => {
+            return crate::blocks::crud::db_error(
+                error,
+                "Product not found",
+                "Could not load product",
+            )
         }
-        Err(error) => return crate::http::err_internal("Could not load product", error),
     };
     if !admin && !super::handlers::is_owned_by(&product, msg.user_id()) {
         // The shared ownership rule, the same one `product_manager` and every
@@ -2050,10 +2053,13 @@ pub async fn product_manager(
     // so the hand-written `deleted_at` check this used to need is gone too.
     let product = match repo::products::get(ctx, product_id).await {
         Ok(product) => product,
-        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-            return crate::http::err_not_found("Product not found");
+        Err(error) => {
+            return crate::blocks::crud::db_error(
+                error,
+                "Product not found",
+                "Could not load product",
+            )
         }
-        Err(error) => return crate::http::err_internal("Could not load product", error),
     };
     if !admin && !super::handlers::is_owned_by(&product, msg.user_id()) {
         // The shared rule again — this page and the API that backs its
@@ -3246,10 +3252,9 @@ async fn order_detail(
 ) -> OutputStream {
     let purchase = match repo::purchases::get(ctx, purchase_id).await {
         Ok(purchase) => purchase,
-        Err(error) if error.code == wafer_run::ErrorCode::NotFound => {
-            return crate::http::err_not_found("Purchase not found")
+        Err(error) => {
+            return crate::blocks::crud::db_error(error, "Purchase not found", "Database error")
         }
-        Err(error) => return crate::http::err_internal("Database error", error),
     };
     match access {
         OrderPageAccess::Admin => {}
