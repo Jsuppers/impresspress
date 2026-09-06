@@ -5,28 +5,30 @@ use serde::Serialize;
 
 use super::repo::{documents::DocumentRow, Page};
 
-/// Body of `PATCH /b/legalpages/api/documents/{id}`.
+// This type is the B10 fix, and the doc comment below is deliberately not
+// the place that says so: it is published verbatim as the endpoint's schema
+// description in `/openapi.json`, so it describes the contract, not its
+// history. The history is that the handler used to read the body into a
+// `HashMap<String, Value>` and hand the whole map to `crud::update_record`,
+// which writes every key as a column — so `PATCH {"status":"published"}`
+// published a document without going through `service::publish_document`,
+// and therefore without archiving the sibling published before it, leaving
+// the doc type with two rows claiming to be live. `deny_unknown_fields` is
+// what makes the refusal explicit rather than silent: a client that sends
+// `status` or `version` gets a 400 naming the field, not a 200 that quietly
+// ignored it.
+
+/// Body of `PATCH /b/legalpages/api/documents/{id}`: a document's text.
 ///
-/// This type is the B10 fix. The handler used to read the body into a
-/// `HashMap<String, Value>` and hand the whole map to `crud::update_record`,
-/// which writes every key as a column — so `PATCH {"status":"published"}`
-/// published a document without going through `service::publish_document`,
-/// and therefore without archiving the sibling that was published before it.
-/// The doc type was left with two rows claiming to be live.
-///
-/// `deny_unknown_fields` is what makes the refusal explicit rather than
-/// silent: a client that sends `status` or `version` gets a 400 naming the
-/// field, not a 200 that quietly ignored it. `title` and `content` are the
-/// only columns a PATCH may reach; `status` moves only through
-/// `service::publish_document`.
+/// `title` and `content` are the only columns this endpoint can reach, and
+/// any other field is refused by name. A document's `status` and `version`
+/// change only through a publish.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateDocumentRequest {
     /// New document title. Omitted leaves the stored title.
-    #[serde(default)]
     pub title: Option<String>,
     /// New Markdown body. Omitted leaves the stored body.
-    #[serde(default)]
     pub content: Option<String>,
 }
 

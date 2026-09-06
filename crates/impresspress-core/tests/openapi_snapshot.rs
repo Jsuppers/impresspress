@@ -52,22 +52,15 @@ const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[];
 /// empty snapshot for them is correct rather than a sign the prefix map or
 /// the document's block list is wrong.
 ///
-/// `admin` left it when its four JSON API reads were typed, `tickets` when
-/// its thirteen JSON endpoints were, and `llm` / `vector` when their thirteen
-/// and nine were: those blocks' handlers all build `contracts` types.
+/// The list is empty again. `admin` left it when its four JSON API reads were
+/// typed, `tickets` when its thirteen JSON endpoints were, `llm` / `vector`
+/// when their thirteen and nine were, and `legalpages` when its PATCH
+/// declared the request body that makes `status` unreachable from it.
 ///
-/// `legalpages` is on it for exactly one commit. It joins `SNAPSHOTTED_BLOCKS`
-/// here with the baseline the *current* tree produces, and not one of its
-/// seventeen declared rows calls `.input` / `.output` / `.path_params` /
-/// `.query_params`, so `has_schema()` is false for every one of them and the
-/// block contributes no path to `/openapi.json` at all. That empty baseline is
-/// the honest starting point for the next commit's diff, which declares the
-/// PATCH request body and takes this entry away again.
-///
-/// Every other block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot
-/// for any of them means the gate is vacuous — wrong prefix, or the block
-/// missing from the document's block list — and must fail loudly.
-const LEGITIMATELY_EMPTY: &[&str] = &["legalpages"];
+/// Every block in `SNAPSHOTTED_BLOCKS` has schemas, so an empty snapshot for
+/// any of them means the gate is vacuous — wrong prefix, or the block missing
+/// from the document's block list — and must fail loudly.
+const LEGITIMATELY_EMPTY: &[&str] = &[];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")

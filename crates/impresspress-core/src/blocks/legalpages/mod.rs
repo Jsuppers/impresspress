@@ -16,7 +16,7 @@ use self::{
 };
 use crate::{
     blocks::crud,
-    endpoint_match::{self, EndpointRoute},
+    endpoint_match::{self, request_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json, ResponseBuilder},
     ui::{self, templates, SiteConfig},
 };
@@ -148,7 +148,9 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/legalpages/api/documents/{id}",
         Route::ApiUpdate,
     )
-    .summary("Update document"),
+    .summary("Update document")
+    .input(request_schema_of::<UpdateDocumentRequest>)
+    .path_params(id_path_schema),
     EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/legalpages/api/documents/{id}",
@@ -156,6 +158,27 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Delete document"),
 ];
+
+/// Path-parameter schema for the `{id}` routes.
+///
+/// Hand-written rather than derived, the same way `tickets::id_path_schema`
+/// is: every handler reads the id with `msg.var("id")` by name, so a struct
+/// declared only to feed `request_schema_of::<T>` would have no runtime user.
+/// `tests/openapi_snapshot.rs::path_placeholders_and_path_parameters_agree`
+/// requires it of any published path that carries a `{…}` placeholder.
+fn id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Document identifier, as returned by the list endpoint."
+            }
+        }
+    })
+}
 
 /// The legalpages block's own declared config vars. Single source of truth for
 /// both `BlockInfo::config_keys` and the admin settings page (rendered via
