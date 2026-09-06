@@ -229,7 +229,7 @@ pub(super) async fn handle_update_quota(
     }
 
     match repo::quota::upsert_for_user(ctx, user_id, body).await {
-        Ok(record) => ok_json(&record),
+        Ok(row) => ok_json(&row),
         Err(e) => err_internal("Database error", e),
     }
 }

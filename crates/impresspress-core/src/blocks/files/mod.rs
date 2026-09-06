@@ -898,12 +898,10 @@ mod handle_tests {
                 InputStream::from_bytes(body),
             )
             .await;
-        let record = output_json(out).await;
-        assert_eq!(
-            record["data"]["user_id"],
-            serde_json::json!("u-9"),
-            "{record}"
-        );
+        // The handler publishes the typed `repo::quota::QuotaRow`, so
+        // `user_id` is a field of the row rather than of a nested `data` map.
+        let row = output_json(out).await;
+        assert_eq!(row["user_id"], serde_json::json!("u-9"), "{row}");
         let quota = quota::get_user_quota(&ctx, "u-9").await.expect("quota row");
         assert_eq!(quota.max_storage_bytes, 5);
     }

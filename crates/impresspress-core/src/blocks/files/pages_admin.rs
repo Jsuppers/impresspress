@@ -6,7 +6,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::repo;
 use crate::{
     ui::{self, components, icons, shell::Crumb},
-    util::{format_bytes, RecordExt},
+    util::format_bytes,
 };
 
 /// Tabs navigation across the storage-admin sub-pages
@@ -454,12 +454,27 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
 // Quotas
 // ---------------------------------------------------------------------------
 
+/// A render-side projection of [`repo::quota::QuotaRow`]: the user id cut
+/// for the table's narrow column, and the three caps it renders. It holds no
+/// decoding — the caps come off the row's `QuotaConfig`, which is where the
+/// per-field fallback to the block defaults happens.
 #[derive(Clone, Debug)]
 pub struct AdminQuotaRow {
     pub user_short: String,
     pub max_storage_bytes: i64,
     pub max_file_size_bytes: i64,
     pub max_files_per_bucket: i64,
+}
+
+impl From<&repo::quota::QuotaRow> for AdminQuotaRow {
+    fn from(row: &repo::quota::QuotaRow) -> Self {
+        Self {
+            user_short: short_id(&row.user_id),
+            max_storage_bytes: row.config.max_storage_bytes,
+            max_file_size_bytes: row.config.max_file_size_bytes,
+            max_files_per_bucket: row.config.max_files_per_bucket,
+        }
+    }
 }
 
 /// Render the admin Storage Quotas table (or empty state). Bytes
@@ -499,16 +514,7 @@ pub async fn quotas(ctx: &dyn Context, msg: &Message) -> OutputStream {
     use crate::ui::templates::{list_page, PageHeader};
 
     let rows: Vec<AdminQuotaRow> = match repo::quota::list_recent(ctx, 100).await {
-        Ok(list) => list
-            .records
-            .into_iter()
-            .map(|r| AdminQuotaRow {
-                user_short: r.str_field("user_id").get(..8).unwrap_or("—").to_string(),
-                max_storage_bytes: r.i64_field("max_storage_bytes"),
-                max_file_size_bytes: r.i64_field("max_file_size_bytes"),
-                max_files_per_bucket: r.i64_field("max_files_per_bucket"),
-            })
-            .collect(),
+        Ok(page) => page.rows.iter().map(AdminQuotaRow::from).collect(),
         Err(e) => {
             tracing::warn!(error = %e.message, "admin quotas list failed");
             Vec::new()
@@ -760,6 +766,34 @@ mod tests {
         assert!(
             !html.contains("/ "),
             "should not show max divisor when None: {html}"
+        );
+    }
+
+    /// The admin quota projection cuts the user id to 8 and reads the three
+    /// caps off the row's `QuotaConfig` — which is where a column that is
+    /// absent falls back to the block default, so the table shows the cap
+    /// that is actually enforced.
+    #[test]
+    fn admin_quota_projection_shapes_only_what_the_table_renders() {
+        let row = repo::quota::QuotaRow::from_record(&wafer_core::clients::database::Record {
+            id: "q1".to_string(),
+            data: [
+                ("user_id", serde_json::json!("alice-1234-5678")),
+                ("max_storage_bytes", serde_json::json!("5000000000")),
+                ("max_file_size_bytes", serde_json::json!(100_000_000)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        });
+        let projected = AdminQuotaRow::from(&row);
+        assert_eq!(projected.user_short, "alice-12");
+        assert_eq!(projected.max_storage_bytes, 5_000_000_000);
+        assert_eq!(projected.max_file_size_bytes, 100_000_000);
+        assert_eq!(
+            projected.max_files_per_bucket,
+            crate::blocks::files::models::QuotaConfig::DEFAULT_MAX_FILES_PER_BUCKET,
+            "a column with no override renders the default the block enforces"
         );
     }
 
