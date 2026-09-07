@@ -183,6 +183,35 @@ pub async fn load(db: &Arc<dyn DatabaseService>) -> Vec<ResourceGrant> {
         .collect()
 }
 
+/// The resource one test fixture grants over: a real table name on the wire,
+/// which is why it is spelled here and not in the tests that use it.
+#[cfg(test)]
+pub(crate) const FIXTURE_RESOURCE: &str = "impresspress__files__objects";
+
+/// Test-only: insert one admin-created grant over [`FIXTURE_RESOURCE`], the
+/// row [`load`] is then expected to return. The caller applies the admin DDL
+/// first.
+///
+/// It lives in this module rather than in each test that needs a seeded grant
+/// because this module owns both the table name and that resource literal, and
+/// `tests/repo_door.rs` is the gate that keeps it that way: the same three
+/// lines written in `builder/boot.rs` would have to spell [`TABLE`] there,
+/// which is exactly the bypass the door exists to catch.
+#[cfg(test)]
+pub(crate) async fn seed_fixture_grant(db: &Arc<dyn DatabaseService>) {
+    let row = NewWrapGrant {
+        grantee: "impresspress/files".to_string(),
+        resource: FIXTURE_RESOURCE.to_string(),
+        write: true,
+        resource_type: "db".to_string(),
+        description: String::new(),
+    }
+    .into_row();
+    db.create(TABLE, row.to_data())
+        .await
+        .expect("seed fixture grant");
+}
+
 // ---------------------------------------------------------------------------
 // Runtime flavour: over `Context`, under WRAP.
 // ---------------------------------------------------------------------------

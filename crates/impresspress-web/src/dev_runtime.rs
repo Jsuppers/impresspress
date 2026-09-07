@@ -550,7 +550,7 @@ impl RuntimeControl for BrowserRuntimeControl {
 /// So this is that context, and it is deliberately thin:
 ///
 /// * `call_block` looks the block up in the live runtime and calls it. The
-///   runtime has already been sealed and `init_all_blocks` has run (see
+///   runtime has already been sealed and every block's `Init` has run (see
 ///   `builder::boot`), so there is no lazy init left to drive.
 /// * `caller_id` is the dev block. This is the load-bearing field:
 ///   `ImpresspressStorageBlock` namespaces every folder by it, so a boot that

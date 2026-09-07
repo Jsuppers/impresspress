@@ -150,12 +150,17 @@ async fn build_runtime_with_extra_blocks(
         .await
         .expect("construct local storage service");
 
-    let mut builder = ImpresspressBuilder::new()
-        .database(database)
-        .storage(storage)
-        .config(Arc::new(
-            wafer_core::service_blocks::config::EnvConfigService::new(),
-        ))
+    // `RuntimeConfig::install` is the only way to hand a `ConfigService` to the
+    // builder, so a caller cannot fill the async surface and forget the
+    // synchronous snapshot. This harness needs neither key: it is testing what
+    // `build()` logs, not what blocks read.
+    let mut builder = impresspress_core::builder::RuntimeConfig::new()
+        .install(
+            ImpresspressBuilder::new()
+                .database(database)
+                .storage(storage),
+            |_empty| Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+        )
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "webmcp-refusal-boot-logging-test-jwt-secret".to_string(),

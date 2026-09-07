@@ -523,6 +523,13 @@ impl ImpresspressBuilder {
             wafer.add_wrap_grants(external_grants);
         }
 
+        // 13. The synchronous `ctx.config_get` surface, from the same
+        // `RuntimeConfig` that produced the async `ConfigService` at step 1.
+        // Installed here rather than by each target after `build()` so the two
+        // surfaces cannot be filled from different literals — see
+        // `builder::RuntimeConfig`.
+        super::config::write_snapshot(&mut wafer, self.config_snapshot);
+
         Ok((wafer, storage_block))
     }
 }

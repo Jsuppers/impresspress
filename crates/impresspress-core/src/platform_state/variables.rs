@@ -355,10 +355,11 @@ pub async fn set(
 /// fallback.
 ///
 /// Ordering contract: this MUST run after the admin block's `lifecycle(Init)`
-/// (so migration 002's `block` column exists) and BEFORE
-/// [`wafer_run::Wafer::init_all_blocks`] on the targets that seed post-admin
-/// (Cloudflare, browser). Native seeds pre-wafer, so it ensures the tables
-/// itself first via [`crate::migration_helper::apply_ddl_via_service`].
+/// (so migration 002's `block` column exists) and BEFORE the remaining blocks
+/// initialize, on the targets that seed post-admin (Cloudflare, browser) —
+/// which is exactly the slot [`crate::builder::BootHooks::seed_after_admin_init`]
+/// occupies in [`crate::builder::boot`]. Native seeds pre-wafer, so it ensures
+/// the tables itself first via [`crate::migration_helper::apply_ddl_via_service`].
 pub async fn seed_auto_generated(db: &Arc<dyn DatabaseService>) {
     let block_infos = crate::blocks::all_block_infos();
     for info in &block_infos {
