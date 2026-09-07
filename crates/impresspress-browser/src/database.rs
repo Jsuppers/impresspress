@@ -36,9 +36,13 @@
 //! (e.g. `create`) may issue several SQL statements internally (a lazy
 //! column-add ALTER, then the INSERT) — those all share the ONE flush at the
 //! end of the call, instead of the previous behavior of flushing after every
-//! single statement. See `with_flush`'s doc comment for the full contract,
-//! including why the flush still happens when the wrapped operation itself
-//! returns an error.
+//! single statement.
+//!
+//! The contract itself lives in [`with_flush_mapped`] and its precedence rules
+//! in [`resolve_flush_outcome`], because this is not the only writer to that
+//! database: `vector::service` writes the same sql.js file through the same
+//! bridge and goes through the same helper. There is one durability contract
+//! for the crate, not one per service.
 
 use std::{
     collections::HashMap,
@@ -73,6 +77,53 @@ static STRICT_SCHEMA: AtomicBool = AtomicBool::new(false);
 /// Browser-side DatabaseService backed by sql.js via the JS bridge.
 pub struct BrowserDatabaseService;
 
+/// The crate's ONE durability contract: run a mutating `op`, then flush the
+/// sql.js database to OPFS exactly once, whatever `op` returned.
+///
+/// [`BrowserDatabaseService::with_flush`] is this with `E = DatabaseError`;
+/// `vector::service` is the other caller, with `E = VectorError`. `map_flush`
+/// turns the JS rejection into the caller's error type, which is the only
+/// thing that ever differed between them — the precedence rules below are the
+/// contract and must not be restated per caller. Before this was shared, the
+/// vector service ran `bridge::dbFlush()` itself with `?`, which skipped the
+/// flush entirely whenever the operation that mutated the database failed.
+///
+/// See [`resolve_flush_outcome`] for the precedence and why each arm is what
+/// it is.
+pub(crate) async fn with_flush_mapped<T, E>(
+    op: impl std::future::Future<Output = Result<T, E>>,
+    map_flush: impl FnOnce(String) -> E,
+) -> Result<T, E> {
+    let result = op.await;
+    let flush = bridge::dbFlush()
+        .await
+        .map(|_| ())
+        .map_err(|e| map_flush(format!("flush to OPFS: {}", bridge::describe(&e))));
+    resolve_flush_outcome(result, flush)
+}
+
+/// Which of an operation's outcome and its flush's outcome the caller is told
+/// about. Pure, so it is testable without a bridge (`flush_precedence`).
+///
+/// - `op` succeeds, flush succeeds → `Ok`. The common case: durable.
+/// - `op` succeeds, flush fails → the flush error. The mutation is sitting in
+///   memory only (quota exceeded, OPFS permission revoked); reporting success
+///   would tell the caller data is durable when a Service Worker eviction
+///   could still lose it.
+/// - `op` fails → the operation's own error, whatever the flush did. It is the
+///   more specific and more actionable of the two. The flush is still
+///   *attempted* — a failed logical operation may have applied some of its
+///   statements already (a lazy column-add ALTER before a rejected INSERT),
+///   and skipping the flush would leave those in memory until some unrelated
+///   later mutation happened to write them out.
+pub(crate) fn resolve_flush_outcome<T, E>(op: Result<T, E>, flush: Result<(), E>) -> Result<T, E> {
+    match (op, flush) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Ok(_), Err(flush_err)) => Err(flush_err),
+        (Err(op_err), _) => Err(op_err),
+    }
+}
+
 // SAFETY: `BrowserDatabaseService` is a unit struct with no shared state.
 // wasm32-unknown-unknown has no threads, so the `Send`/`Sync` bounds
 // required by `Arc<dyn DatabaseService>` are satisfied trivially — no
@@ -83,39 +134,13 @@ unsafe impl Sync for BrowserDatabaseService {}
 impl BrowserDatabaseService {
     /// Run a mutating `op`, then flush the sql.js DB to OPFS exactly once —
     /// this is the coalescing point described in the module doc comment.
-    ///
-    /// Flushes even when `op` itself resolves to `Err`: the shared
-    /// `DbExec` defaults can issue more than one statement per logical
-    /// operation (e.g. `create`'s lazy column-add ALTER before its INSERT),
-    /// so an operation that ultimately fails may still have mutated the
-    /// in-memory sql.js DB. Skipping the flush in that case would silently
-    /// discard an already-applied statement until some *later* mutation
-    /// happens to flush it — an unnecessary, avoidable durability gap.
-    ///
-    /// Outcome precedence:
-    /// - `op` succeeds, flush succeeds → `Ok` (the common case: durable).
-    /// - `op` succeeds, flush fails → `Err` (the flush error). The mutation
-    ///   is only sitting in memory at this point (quota exceeded, OPFS
-    ///   permission revoked, etc.) — reporting success here would tell the
-    ///   caller data is durable when a Service Worker eviction could lose
-    ///   it, so this must surface as a failure.
-    /// - `op` fails (regardless of flush outcome) → `Err` (the operation's
-    ///   own error) — more specific/actionable than whatever the flush
-    ///   attempt did; we still attempt the flush as a best-effort capture
-    ///   of any partial writes the failed operation may have already made.
+    /// [`with_flush_mapped`] owns the contract; this is it at
+    /// `E = DatabaseError`.
     async fn with_flush<T>(
         &self,
         op: impl std::future::Future<Output = Result<T, DatabaseError>>,
     ) -> Result<T, DatabaseError> {
-        let result = op.await;
-        let flush = bridge::dbFlush().await.map(|_| ()).map_err(|e| {
-            DatabaseError::Internal(format!("flush to OPFS: {}", bridge::describe(&e)))
-        });
-        match (result, flush) {
-            (Ok(v), Ok(())) => Ok(v),
-            (Ok(_), Err(flush_err)) => Err(flush_err),
-            (Err(op_err), _) => Err(op_err),
-        }
+        with_flush_mapped(op, DatabaseError::Internal).await
     }
 
     /// Run `sql` and hand back the raw per-column JSON row objects sql.js
@@ -631,5 +656,64 @@ mod strict_schema_policy {
 
         DatabaseService::set_strict_schema(&svc, false);
         assert!(!DbExec::strict_schema(&svc));
+    }
+}
+
+/// The flush precedence every mutating path in this crate shares. Pure — no
+/// bridge, no OPFS.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod flush_precedence {
+    use wafer_core::interfaces::database::service::DatabaseError;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::resolve_flush_outcome;
+
+    #[wasm_bindgen_test]
+    fn a_durable_success_is_a_success() {
+        let out: Result<u8, DatabaseError> = resolve_flush_outcome(Ok(7), Ok(()));
+        assert_eq!(out.expect("ok"), 7);
+    }
+
+    /// A mutation that only reached memory must not be reported as done: a
+    /// Service Worker eviction would lose it.
+    #[wasm_bindgen_test]
+    fn a_failed_flush_beats_a_successful_operation() {
+        let out: Result<u8, DatabaseError> =
+            resolve_flush_outcome(Ok(7), Err(DatabaseError::Internal("quota".into())));
+        match out {
+            Err(DatabaseError::Internal(msg)) => assert_eq!(msg, "quota"),
+            other => panic!("expected the flush error, got {other:?}"),
+        }
+    }
+
+    /// …but the operation's own error is the more actionable of the two, so it
+    /// wins even when the flush also failed.
+    #[wasm_bindgen_test]
+    fn the_operations_error_beats_the_flushs() {
+        let out: Result<u8, DatabaseError> = resolve_flush_outcome(
+            Err(DatabaseError::NotFound),
+            Err(DatabaseError::Internal("quota".into())),
+        );
+        assert!(matches!(out, Err(DatabaseError::NotFound)));
+    }
+
+    /// The same three answers for the vector service's error type — the point
+    /// of sharing the helper is that the two callers cannot drift.
+    #[wasm_bindgen_test]
+    fn the_vector_services_error_type_gets_the_same_precedence() {
+        use wafer_core::interfaces::vector::service::VectorError;
+
+        let ok: Result<(), VectorError> = resolve_flush_outcome(Ok(()), Ok(()));
+        assert!(ok.is_ok());
+
+        let flush_failed: Result<(), VectorError> =
+            resolve_flush_outcome(Ok(()), Err(VectorError::Internal("quota".into())));
+        assert!(matches!(flush_failed, Err(VectorError::Internal(_))));
+
+        let both_failed: Result<(), VectorError> = resolve_flush_outcome(
+            Err(VectorError::IndexNotFound("idx".into())),
+            Err(VectorError::Internal("quota".into())),
+        );
+        assert!(matches!(both_failed, Err(VectorError::IndexNotFound(_))));
     }
 }
