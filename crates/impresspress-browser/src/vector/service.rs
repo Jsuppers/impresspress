@@ -238,8 +238,119 @@ impl VectorService for BrowserVectorService {
         mode: SearchMode,
         keyword_query: Option<String>,
     ) -> VResult<Vec<VectorMatch>> {
-        self.query_impl(index, vector, top_k, filter, mode, keyword_query)
-            .await
+        let state = self
+            .lookup(index)?
+            .ok_or_else(|| VectorError::IndexNotFound(index.into()))?;
+
+        let needs_keyword = matches!(mode, SearchMode::Keyword | SearchMode::Hybrid);
+        if needs_keyword && !state.keyword_search {
+            return Err(VectorError::KeywordSearchNotEnabled);
+        }
+        if needs_keyword && keyword_query.as_deref().unwrap_or("").is_empty() {
+            return Err(VectorError::KeywordQueryRequired(mode));
+        }
+        if mode != SearchMode::Keyword && vector.len() as u32 != state.dimensions {
+            return Err(VectorError::DimensionMismatch {
+                expected: state.dimensions,
+                got: vector.len() as u32,
+            });
+        }
+
+        let f = filter.unwrap_or_default();
+        let fetch_n = if matches!(mode, SearchMode::Hybrid) {
+            50.max(top_k)
+        } else {
+            top_k
+        };
+
+        use crate::vector::score;
+
+        match mode {
+            SearchMode::Vector => {
+                let candidates = load_all_vectors(index, state.dimensions, &f)?;
+                let scored = score::top_k_borrowed(
+                    &vector,
+                    candidates
+                        .iter()
+                        .map(|(id, v, _m)| (id.as_str(), v.as_slice())),
+                    fetch_n,
+                    state.metric,
+                );
+                Ok(attach_metadata(&candidates, scored))
+            }
+            SearchMode::Keyword => {
+                let kq =
+                    keyword_query.ok_or(VectorError::KeywordQueryRequired(SearchMode::Keyword))?;
+                let ids = fts_search(index, &kq, fetch_n)?;
+                let metadata = load_metadata_for_ids(index, &ids)?;
+                Ok(ids
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(rank, id)| {
+                        let m = metadata.get(&id).cloned().flatten();
+                        if !f.matches(m.as_ref()) {
+                            return None;
+                        }
+                        Some(VectorMatch {
+                            id,
+                            score: 1.0 / (1.0 + rank as f32),
+                            metadata: m,
+                        })
+                    })
+                    .collect())
+            }
+            SearchMode::Hybrid => {
+                let kq =
+                    keyword_query.ok_or(VectorError::KeywordQueryRequired(SearchMode::Hybrid))?;
+                let candidates = load_all_vectors(index, state.dimensions, &f)?;
+                let vec_top = score::top_k_borrowed(
+                    &vector,
+                    candidates
+                        .iter()
+                        .map(|(id, v, _m)| (id.as_str(), v.as_slice())),
+                    fetch_n,
+                    state.metric,
+                );
+                let kw_top = fts_search(index, &kq, fetch_n)?;
+
+                // Reciprocal Rank Fusion, from the shared implementation the
+                // native sqlite-vec backend also fuses with. `fuse_scored`
+                // keeps the real RRF value (the inline copy this replaced
+                // existed because of a comment claiming only the
+                // score-discarding `fuse` was available), truncates to
+                // `top_k` itself, and breaks score ties by id — so two ids
+                // that fuse to the same score come back in a stable order
+                // instead of whatever the old `HashMap` iteration produced.
+                let vec_ids: Vec<String> = vec_top.iter().map(|(id, _)| id.clone()).collect();
+                let fused = vector_rrf::fuse_scored(
+                    &[vec_ids, kw_top.clone()],
+                    top_k,
+                    vector_rrf::DEFAULT_RRF_K,
+                );
+
+                // Hydrate metadata from both sources: vector candidates carry it
+                // already, FTS-only ids need a separate meta lookup.
+                let mut by_id: std::collections::HashMap<String, Option<serde_json::Value>> =
+                    candidates.into_iter().map(|(id, _v, m)| (id, m)).collect();
+                let kw_only_ids: Vec<String> = kw_top
+                    .into_iter()
+                    .filter(|id| !by_id.contains_key(id))
+                    .collect();
+                let kw_meta = load_metadata_for_ids(index, &kw_only_ids)?;
+                for (id, m) in kw_meta {
+                    by_id.insert(id, m);
+                }
+
+                Ok(fused
+                    .into_iter()
+                    .map(|(id, score)| VectorMatch {
+                        metadata: by_id.get(&id).cloned().flatten(),
+                        id,
+                        score,
+                    })
+                    .collect())
+            }
+        }
     }
 
     async fn delete(&self, index: &str, ids: Vec<String>) -> VResult<()> {
@@ -361,130 +472,6 @@ impl BrowserVectorService {
         bridge::db_exec_raw(&del_sql, del_params_js)
             .map_err(|e| VectorError::Internal(js_err(e)))?;
         Ok(())
-    }
-
-    async fn query_impl(
-        &self,
-        index: &str,
-        vector: Vec<f32>,
-        top_k: usize,
-        filter: Option<MetadataFilter>,
-        mode: SearchMode,
-        keyword_query: Option<String>,
-    ) -> VResult<Vec<VectorMatch>> {
-        let state = self
-            .lookup(index)?
-            .ok_or_else(|| VectorError::IndexNotFound(index.into()))?;
-
-        let needs_keyword = matches!(mode, SearchMode::Keyword | SearchMode::Hybrid);
-        if needs_keyword && !state.keyword_search {
-            return Err(VectorError::KeywordSearchNotEnabled);
-        }
-        if needs_keyword && keyword_query.as_deref().unwrap_or("").is_empty() {
-            return Err(VectorError::KeywordQueryRequired(mode));
-        }
-        if mode != SearchMode::Keyword && vector.len() as u32 != state.dimensions {
-            return Err(VectorError::DimensionMismatch {
-                expected: state.dimensions,
-                got: vector.len() as u32,
-            });
-        }
-
-        let f = filter.unwrap_or_default();
-        let fetch_n = if matches!(mode, SearchMode::Hybrid) {
-            50.max(top_k)
-        } else {
-            top_k
-        };
-
-        use crate::vector::score;
-
-        match mode {
-            SearchMode::Vector => {
-                let candidates = load_all_vectors(index, state.dimensions, &f)?;
-                let scored = score::top_k_borrowed(
-                    &vector,
-                    candidates
-                        .iter()
-                        .map(|(id, v, _m)| (id.as_str(), v.as_slice())),
-                    fetch_n,
-                    state.metric,
-                );
-                Ok(attach_metadata(&candidates, scored))
-            }
-            SearchMode::Keyword => {
-                let kq =
-                    keyword_query.ok_or(VectorError::KeywordQueryRequired(SearchMode::Keyword))?;
-                let ids = fts_search(index, &kq, fetch_n)?;
-                let metadata = load_metadata_for_ids(index, &ids)?;
-                Ok(ids
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(rank, id)| {
-                        let m = metadata.get(&id).cloned().flatten();
-                        if !f.matches(m.as_ref()) {
-                            return None;
-                        }
-                        Some(VectorMatch {
-                            id,
-                            score: 1.0 / (1.0 + rank as f32),
-                            metadata: m,
-                        })
-                    })
-                    .collect())
-            }
-            SearchMode::Hybrid => {
-                let kq =
-                    keyword_query.ok_or(VectorError::KeywordQueryRequired(SearchMode::Hybrid))?;
-                let candidates = load_all_vectors(index, state.dimensions, &f)?;
-                let vec_top = score::top_k_borrowed(
-                    &vector,
-                    candidates
-                        .iter()
-                        .map(|(id, v, _m)| (id.as_str(), v.as_slice())),
-                    fetch_n,
-                    state.metric,
-                );
-                let kw_top = fts_search(index, &kq, fetch_n)?;
-
-                // Reciprocal Rank Fusion, from the shared implementation the
-                // native sqlite-vec backend also fuses with. `fuse_scored`
-                // keeps the real RRF value (the inline copy this replaced
-                // existed because of a comment claiming only the
-                // score-discarding `fuse` was available), truncates to
-                // `top_k` itself, and breaks score ties by id — so two ids
-                // that fuse to the same score come back in a stable order
-                // instead of whatever the old `HashMap` iteration produced.
-                let vec_ids: Vec<String> = vec_top.iter().map(|(id, _)| id.clone()).collect();
-                let fused = vector_rrf::fuse_scored(
-                    &[vec_ids, kw_top.clone()],
-                    top_k,
-                    vector_rrf::DEFAULT_RRF_K,
-                );
-
-                // Hydrate metadata from both sources: vector candidates carry it
-                // already, FTS-only ids need a separate meta lookup.
-                let mut by_id: std::collections::HashMap<String, Option<serde_json::Value>> =
-                    candidates.into_iter().map(|(id, _v, m)| (id, m)).collect();
-                let kw_only_ids: Vec<String> = kw_top
-                    .into_iter()
-                    .filter(|id| !by_id.contains_key(id))
-                    .collect();
-                let kw_meta = load_metadata_for_ids(index, &kw_only_ids)?;
-                for (id, m) in kw_meta {
-                    by_id.insert(id, m);
-                }
-
-                Ok(fused
-                    .into_iter()
-                    .map(|(id, score)| VectorMatch {
-                        metadata: by_id.get(&id).cloned().flatten(),
-                        id,
-                        score,
-                    })
-                    .collect())
-            }
-        }
     }
 }
 
