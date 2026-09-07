@@ -13,6 +13,18 @@ name: Regen Visual Baselines
 #   gh workflow run regen-visual-baselines.yml -f branch=<branch-name>
 #
 # Or from the Actions UI: select the workflow and provide a branch input.
+#
+# If the dispatch 404s, this file is present on the default branch but not
+# indexed in that repository's Actions — which is what a fork gets when Actions
+# were disabled at fork time. Pushing a change to this file on the default
+# branch re-indexes it. Until then the fallback is to take the render straight
+# from a failing run: the `playwright-report-visual` artifact holds the
+# `*-actual.png` the runner produced, which is byte-identical to what
+# `--update-snapshots` would have written here.
+#
+# The bot push this workflow makes does NOT retrigger a pull request's checks,
+# so after a baseline lands, push again yourself or the pull request keeps its
+# stale verdict.
 
 on:
   workflow_dispatch:
