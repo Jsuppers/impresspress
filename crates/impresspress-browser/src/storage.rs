@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
+use wafer_block::{InputStream, OutputStream};
 use wafer_core::interfaces::storage::service::{
     FolderInfo, ListOptions, ObjectInfo, ObjectList, StorageError, StorageService,
 };
+use wafer_run::{ErrorCode, WaferError};
 
 use crate::bridge;
 // Pure, host-testable opaque list-cursor codec (envelope shared with the
@@ -90,6 +92,98 @@ struct GetMeta {
     size: i64,
 }
 
+/// `storageGetStream`'s resolved shape: the metadata eagerly, plus the id of
+/// the registered byte reader carrying the body.
+#[derive(Deserialize)]
+struct GetStreamStart {
+    stream_id: String,
+    meta: GetMeta,
+}
+
+/// Drain a registered byte reader into `sink`, chunk by chunk.
+///
+/// Shared by `get_streaming` here and `network::do_request_streaming`, because
+/// the loop is the same and the two ways of getting it wrong are the same: an
+/// unknown-id rejection must not be mistaken for end-of-stream, and a consumer
+/// that stops early must release the reader instead of leaving it holding an
+/// OPFS file handle (or an HTTP connection) for the life of the Service
+/// Worker.
+///
+/// A read failure surfaces as an `Error` terminal AFTER the bytes already
+/// forwarded — never a silent truncation reported as a clean `Complete`.
+/// `cap` bounds the running total; `None` means no cap.
+pub(crate) async fn drain_reader_into(
+    stream_id: String,
+    cap: Option<usize>,
+    what: &str,
+    sink: wafer_block::OutputSink,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut received: usize = 0;
+    loop {
+        // Race the pull against cancellation so a dropped consumer stops the
+        // read promptly rather than after the next chunk resolves.
+        let Some(next) = cancel
+            .run_until_cancelled(bridge::reader_next_chunk(&stream_id))
+            .await
+        else {
+            bridge::reader_cancel(&stream_id).await;
+            return;
+        };
+        let chunk: Option<Vec<u8>> = match next {
+            Ok(value) => match serde_wasm_bindgen::from_value(value) {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    let _ = sink
+                        .error(WaferError::new(
+                            ErrorCode::Internal,
+                            format!("{what}: decode chunk: {e}"),
+                        ))
+                        .await;
+                    bridge::reader_cancel(&stream_id).await;
+                    return;
+                }
+            },
+            Err(e) => {
+                let _ = sink
+                    .error(WaferError::new(
+                        ErrorCode::Internal,
+                        format!("{what}: {}", bridge::describe(&e)),
+                    ))
+                    .await;
+                // The JS side already dropped the entry on a read rejection,
+                // and `readerCancel` is idempotent, so this is safe either way.
+                bridge::reader_cancel(&stream_id).await;
+                return;
+            }
+        };
+        // `null` — and only `null` — is end of stream.
+        let Some(chunk) = chunk else { break };
+
+        if let Some(cap) = cap {
+            received = received.saturating_add(chunk.len());
+            if received > cap {
+                let _ = sink
+                    .error(WaferError::new(
+                        ErrorCode::Unavailable,
+                        format!("{what}: body exceeds cap of {cap} bytes"),
+                    ))
+                    .await;
+                bridge::reader_cancel(&stream_id).await;
+                return;
+            }
+        }
+
+        if sink.send_chunk(chunk).await.is_err() {
+            // Consumer dropped the stream — stop reading and release the
+            // source.
+            bridge::reader_cancel(&stream_id).await;
+            return;
+        }
+    }
+    let _ = sink.complete(vec![]).await;
+}
+
 /// `storageList`'s resolved shape: the requested page of keys plus the
 /// TRUE total of matching entries (before slicing to the page). `total`
 /// drives both the offset-mode has-more check and cursor-mode continuation
@@ -140,6 +234,99 @@ impl StorageService for BrowserStorageService {
         };
 
         Ok((resp.data, info))
+    }
+
+    /// Streams the object out of OPFS chunk by chunk instead of taking the
+    /// trait default, which calls [`get`](Self::get) and wraps the whole
+    /// buffered body as one chunk.
+    ///
+    /// That default is what ran here before, silently: a download served by
+    /// `blocks::files` (`storage/objects.rs`, `share.rs`) went through
+    /// `get_stream`, which reaches this method, so every object was read whole
+    /// into the Service Worker's linear memory — the same memory the entire
+    /// runtime, sql.js included, is sharing — before the first byte reached
+    /// the client. `File.stream()` is a real `ReadableStream`, so there is no
+    /// reason for this target to be the buffered one.
+    ///
+    /// `ObjectInfo.size` and the streamed bytes come from the SAME `File`
+    /// snapshot (`storageGetStream` takes it once), so a concurrent writer
+    /// cannot make the advertised length disagree with the bytes that arrive.
+    ///
+    /// A read failure surfaces as an `Error` terminal after whatever already
+    /// streamed; a dropped consumer releases the OPFS reader.
+    async fn get_streaming(
+        &self,
+        folder: &str,
+        key: &str,
+    ) -> Result<(OutputStream, ObjectInfo), StorageError> {
+        let val = bridge::storage_get_stream(folder, key)
+            .await
+            .map_err(map_rejection)?;
+
+        let started: GetStreamStart = serde_wasm_bindgen::from_value(val).map_err(|e| {
+            StorageError::Internal(format!("decode storage get-stream response: {e}"))
+        })?;
+
+        let info = ObjectInfo {
+            key: key.to_string(),
+            size: started.meta.size,
+            content_type: started.meta.content_type,
+            // Parity with the buffered `get`, which does not read the OPFS
+            // file's own timestamp either.
+            last_modified: Utc::now(),
+        };
+
+        let what = format!("read {folder}/{key}");
+        let stream = OutputStream::from_producer(move |sink, cancel| async move {
+            // No cap: the caller asked to stream precisely so the object need
+            // not fit in memory, and the object is local storage the operator
+            // already owns.
+            drain_reader_into(started.stream_id, None, &what, sink, cancel).await;
+        });
+
+        Ok((stream, info))
+    }
+
+    /// Writes the object incrementally instead of taking the trait default,
+    /// which collects the whole `InputStream` to a `Vec` and forwards to
+    /// [`put`](Self::put) — the buffering the streaming request path exists to
+    /// avoid, and worse here than on a server because the buffer shares one
+    /// linear memory with the runtime.
+    ///
+    /// The OPFS writable holds an exclusive lock on the file, so every path
+    /// out of a started write ends in a `finish` or an abort; the object does
+    /// not become visible to `get` until `finish` has also written the
+    /// metadata sidecar, so a failed upload leaves no half-written object with
+    /// plausible metadata.
+    async fn put_streaming(
+        &self,
+        folder: &str,
+        key: &str,
+        data: InputStream,
+        content_type: &str,
+    ) -> Result<(), StorageError> {
+        use futures::StreamExt;
+
+        let id = bridge::storage_put_stream_start(folder, key)
+            .await
+            .map_err(map_rejection)?;
+        let id = id.as_string().ok_or_else(|| {
+            StorageError::Internal("storagePutStreamStart did not resolve a writer id".to_string())
+        })?;
+
+        let mut data = Box::pin(data);
+        while let Some(chunk) = data.next().await {
+            if let Err(e) = bridge::storage_put_stream_chunk(&id, &chunk).await {
+                bridge::storage_put_stream_abort(&id).await;
+                return Err(map_rejection(e));
+            }
+        }
+
+        if let Err(e) = bridge::storage_put_stream_finish(&id, content_type).await {
+            bridge::storage_put_stream_abort(&id).await;
+            return Err(map_rejection(e));
+        }
+        Ok(())
     }
 
     async fn delete(&self, folder: &str, key: &str) -> Result<(), StorageError> {

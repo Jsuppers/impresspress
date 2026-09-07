@@ -53,6 +53,58 @@ extern "C" {
     #[wasm_bindgen(catch, js_name = storageGet)]
     pub async fn storage_get(folder: &str, key: &str) -> Result<JsValue, JsValue>;
 
+    /// Streaming counterpart of [`storage_get`]: resolves
+    /// `{ stream_id: string, meta: { content_type, size } }`, the metadata
+    /// eagerly and the body as a registered byte reader to be drained with
+    /// [`reader_next_chunk`]. Rejects with a `NotFoundError` `DOMException`
+    /// like `storageGet`.
+    ///
+    /// A returned `stream_id` MUST be drained to `null` or released with
+    /// [`reader_cancel`] — an abandoned one holds an OPFS file handle for the
+    /// life of the Service Worker.
+    #[wasm_bindgen(catch, js_name = storageGetStream)]
+    pub async fn storage_get_stream(folder: &str, key: &str) -> Result<JsValue, JsValue>;
+
+    /// Open `folder/key` for a chunked write; resolves the writer id the
+    /// three calls below take. The object is not visible to `storageGet`
+    /// until [`storage_put_stream_finish`].
+    ///
+    /// The open writer holds an exclusive lock on the file, so every path out
+    /// of a started write must reach `finish` or
+    /// [`storage_put_stream_abort`].
+    #[wasm_bindgen(catch, js_name = storagePutStreamStart)]
+    pub async fn storage_put_stream_start(folder: &str, key: &str) -> Result<JsValue, JsValue>;
+
+    /// Append one chunk to a chunked write. Rejects on an unknown id rather
+    /// than dropping the bytes.
+    #[wasm_bindgen(catch, js_name = storagePutStreamChunk)]
+    pub async fn storage_put_stream_chunk(id: &str, chunk: &[u8]) -> Result<JsValue, JsValue>;
+
+    /// Close a chunked write and write its metadata sidecar, with the size
+    /// counted from the chunks that actually arrived.
+    #[wasm_bindgen(catch, js_name = storagePutStreamFinish)]
+    pub async fn storage_put_stream_finish(
+        id: &str,
+        content_type: &str,
+    ) -> Result<JsValue, JsValue>;
+
+    /// Abandon a chunked write, releasing the file lock. Idempotent and never
+    /// rejects, so an error path can call it without masking its own error.
+    #[wasm_bindgen(js_name = storagePutStreamAbort)]
+    pub async fn storage_put_stream_abort(id: &str);
+
+    /// Pull the next chunk of a registered byte stream (from
+    /// [`storage_get_stream`] or [`http_fetch_stream`]). Resolves `null` at
+    /// end of stream — the ONLY end signal — and rejects on an unknown id,
+    /// which is a bookkeeping bug rather than a finished stream.
+    #[wasm_bindgen(catch, js_name = readerNextChunk)]
+    pub async fn reader_next_chunk(id: &str) -> Result<JsValue, JsValue>;
+
+    /// Release a registered byte stream that will not be drained. Idempotent
+    /// and never rejects.
+    #[wasm_bindgen(js_name = readerCancel)]
+    pub async fn reader_cancel(id: &str);
+
     /// Delete file + metadata from OPFS. Rejects with a `NotFoundError`
     /// `DOMException` if the folder or key doesn't exist.
     #[wasm_bindgen(catch, js_name = storageDelete)]
@@ -123,6 +175,28 @@ extern "C" {
         headers_json: &str,
         body: &[u8],
         max_response_bytes: f64,
+    ) -> Result<JsValue, JsValue>;
+
+    /// Streaming counterpart of [`http_fetch`]: resolves
+    /// `{ status, headers: [[name, value], ...], stream_id: string | null }`
+    /// — the head eagerly, the body as a registered byte reader to be drained
+    /// with [`reader_next_chunk`]. `stream_id` is `null` for a bodyless
+    /// response (204, `HEAD`).
+    ///
+    /// Issued with the same `init` as `httpFetch` (`redirect: 'error'`
+    /// included; `bridge.js`'s `fetchInit` builds both). No byte cap
+    /// argument: on a streamed response the cap is a running total the Rust
+    /// consumer keeps, because it is the side that decides what to do with
+    /// the bytes already delivered.
+    ///
+    /// A returned `stream_id` MUST be drained to `null` or released with
+    /// [`reader_cancel`].
+    #[wasm_bindgen(catch, js_name = httpFetchStream)]
+    pub async fn http_fetch_stream(
+        method: &str,
+        url: &str,
+        headers_json: &str,
+        body: &[u8],
     ) -> Result<JsValue, JsValue>;
 
     // ─── Asset loader bridge (SW → main thread) ───────────────────────────────

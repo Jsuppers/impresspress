@@ -2,9 +2,12 @@ use std::collections::HashMap;
 
 use impresspress_core::streaming::MAX_NETWORK_RESPONSE_BYTES;
 use serde::Deserialize;
-use wafer_core::interfaces::network::service::{NetworkError, NetworkService, Request, Response};
+use wafer_block::OutputStream;
+use wafer_core::interfaces::network::service::{
+    NetworkError, NetworkService, Request, Response, ResponseHead,
+};
 
-use crate::bridge;
+use crate::{bridge, storage::drain_reader_into};
 
 pub struct BrowserNetworkService;
 
@@ -36,6 +39,32 @@ struct FetchResponse {
     headers: Vec<(String, String)>,
     #[serde(default)]
     body: Vec<u8>,
+}
+
+/// `httpFetchStream`'s resolved shape: the head eagerly, and the id of the
+/// registered byte reader carrying the body — or `null` for a response with no
+/// body at all (204, `HEAD`).
+#[derive(Deserialize)]
+struct FetchStreamStart {
+    status: u16,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    stream_id: Option<String>,
+}
+
+/// The one place the request URL is checked before it reaches `fetch`.
+///
+/// A free function rather than a line in `do_request`, because
+/// `do_request_streaming` has to apply exactly the same gate and a second copy
+/// is a second thing to forget — the mistake the Cloudflare adapter avoids by
+/// routing both entry points through one `send`.
+fn refuse_if_ssrf(url: &str) -> Result<(), NetworkError> {
+    if impresspress_core::ssrf::is_ssrf_blocked_url(url) {
+        return Err(NetworkError::RequestError(format!(
+            "SSRF: refusing request to internal/blocked address: {url}"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait(?Send)]
@@ -90,12 +119,7 @@ impl NetworkService for BrowserNetworkService {
     /// here it is the browser's own network partitioning that has to. With the
     /// initial URL gated and redirects refused, that is the sole residual.
     async fn do_request(&self, req: &Request) -> Result<Response, NetworkError> {
-        if impresspress_core::ssrf::is_ssrf_blocked_url(&req.url) {
-            return Err(NetworkError::RequestError(format!(
-                "SSRF: refusing request to internal/blocked address: {}",
-                req.url
-            )));
-        }
+        refuse_if_ssrf(&req.url)?;
 
         let headers_json = serde_json::to_string(&req.headers)
             .map_err(|e| NetworkError::Other(format!("failed to serialize headers: {e}")))?;
@@ -129,6 +153,88 @@ impl NetworkService for BrowserNetworkService {
             headers: group_headers(fetch_resp.headers),
             body: fetch_resp.body,
         })
+    }
+
+    /// Streams the response body chunk by chunk instead of taking the trait
+    /// default, which calls [`do_request`](Self::do_request) and wraps the
+    /// whole buffered body as a single chunk.
+    ///
+    /// That default is what ran here before. It is not a neutral fallback in
+    /// this target: the buffer is in the Service Worker's linear memory, which
+    /// sql.js and the rest of the runtime share, and a consumer that asked to
+    /// stream did so precisely because it did not want the body resident.
+    ///
+    /// Goes through the same gates as the buffered path and shares both with
+    /// it rather than restating them: [`refuse_if_ssrf`] before dispatch, and
+    /// `bridge.js`'s `fetchInit` — `redirect: 'error'` included — for the
+    /// request itself. See [`do_request`](Self::do_request)'s doc for why
+    /// refusing a redirect is the other half of the URL gate, and for the DNS-
+    /// rebinding residual neither half closes.
+    ///
+    /// [`MAX_NETWORK_RESPONSE_BYTES`] is enforced two ways, mirroring
+    /// `impresspress-cloudflare`'s: an advertised `Content-Length` over the
+    /// cap is refused before a byte streams, and the running total is checked
+    /// per chunk, which is the only guard a chunked response has. Over the cap
+    /// the stream ends in an `Error` terminal after the bytes already
+    /// forwarded — never a silent truncation reported as a clean completion.
+    async fn do_request_streaming(
+        &self,
+        req: &Request,
+    ) -> Result<(ResponseHead, OutputStream), NetworkError> {
+        refuse_if_ssrf(&req.url)?;
+
+        let headers_json = serde_json::to_string(&req.headers)
+            .map_err(|e| NetworkError::Other(format!("failed to serialize headers: {e}")))?;
+        let body_bytes: &[u8] = req.body.as_deref().unwrap_or(&[]);
+
+        let js_val = bridge::http_fetch_stream(&req.method, &req.url, &headers_json, body_bytes)
+            .await
+            .map_err(|e| NetworkError::RequestError(bridge::describe(&e)))?;
+
+        let started: FetchStreamStart = serde_wasm_bindgen::from_value(js_val).map_err(|e| {
+            NetworkError::RequestError(format!("failed to decode fetch response head: {e}"))
+        })?;
+
+        let headers = group_headers(started.headers);
+        let cap = MAX_NETWORK_RESPONSE_BYTES;
+
+        // Refuse an over-large advertised length before any byte streams. The
+        // header name is matched lowercase because `bridge.js` builds the pair
+        // list from the Fetch API's own iteration, which lowercases names.
+        if let Some(advertised) = headers
+            .get("content-length")
+            .and_then(|values| values.first())
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if advertised > cap {
+                if let Some(id) = &started.stream_id {
+                    bridge::reader_cancel(id).await;
+                }
+                return Err(NetworkError::RequestError(format!(
+                    "response body {advertised} bytes exceeds cap of {cap} bytes"
+                )));
+            }
+        }
+
+        let head = ResponseHead {
+            status_code: started.status,
+            headers,
+        };
+
+        // A bodyless response (204, HEAD) registers no reader; answer with an
+        // empty body stream rather than failing the request, which is parity
+        // with the buffered path's empty `Vec`.
+        let body_stream = match started.stream_id {
+            Some(stream_id) => {
+                let what = format!("reading response body from {}", req.url);
+                OutputStream::from_producer(move |sink, cancel| async move {
+                    drain_reader_into(stream_id, Some(cap), &what, sink, cancel).await;
+                })
+            }
+            None => OutputStream::respond(Vec::new()),
+        };
+
+        Ok((head, body_stream))
     }
 }
 
@@ -281,16 +387,29 @@ mod tests {
         );
     }
 
-    async fn refusal_for(url: &str) -> String {
-        let req = Request {
+    fn get(url: &str) -> Request {
+        Request {
             method: "GET".to_string(),
             url: url.to_string(),
             headers: std::collections::HashMap::new(),
             body: None,
-        };
-        match BrowserNetworkService.do_request(&req).await {
+        }
+    }
+
+    async fn refusal_for(url: &str) -> String {
+        match BrowserNetworkService.do_request(&get(url)).await {
             Err(NetworkError::RequestError(msg)) => msg,
             other => panic!("expected an SSRF refusal for {url}, got {other:?}"),
+        }
+    }
+
+    async fn streaming_refusal_for(url: &str) -> String {
+        // `OutputStream` is not `Debug`, so the success arm cannot be printed
+        // — it is enough to say the request was not refused.
+        match BrowserNetworkService.do_request_streaming(&get(url)).await {
+            Err(NetworkError::RequestError(msg)) => msg,
+            Err(other) => panic!("expected an SSRF refusal for {url}, got {other:?}"),
+            Ok(_) => panic!("expected an SSRF refusal for {url}, the request was dispatched"),
         }
     }
 
@@ -325,5 +444,84 @@ mod tests {
                 "{url} was not refused by the SSRF gate: {msg}"
             );
         }
+    }
+
+    /// The streaming entry point applies the SAME gate as the buffered one.
+    /// **Fails on the pre-change tree** in a way worth spelling out: there was
+    /// no streaming entry point at all, so `do_request_streaming` was the
+    /// trait default, which called `do_request` and inherited its gate by
+    /// accident. Now that this target implements the method, the gate has to
+    /// be applied deliberately — which is why both go through
+    /// `refuse_if_ssrf`, and why this test exists next to its buffered twin.
+    #[wasm_bindgen_test]
+    async fn the_streaming_path_refuses_the_same_internal_targets() {
+        for url in [
+            "http://localhost/admin",
+            "http://api.localhost:8080/admin",
+            "http://localhost./",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/",
+            "http://192.168.1.1/",
+            "http://[::1]/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "file:///etc/passwd",
+        ] {
+            let msg = streaming_refusal_for(url).await;
+            assert!(
+                msg.starts_with("SSRF: refusing request to internal/blocked address:"),
+                "{url} was not refused by the SSRF gate on the streaming path: {msg}"
+            );
+        }
+    }
+
+    /// `httpFetchStream` resolves the head plus a reader id, not a body. A
+    /// bodyless response (204, `HEAD`) carries `stream_id: null`, which is not
+    /// an error — the buffered path answers an empty `Vec` for the same
+    /// response.
+    #[wasm_bindgen_test]
+    fn the_streaming_head_decodes_with_and_without_a_body() {
+        let with_body = Object::new();
+        Reflect::set(
+            &with_body,
+            &JsValue::from_str("status"),
+            &JsValue::from_f64(200.0),
+        )
+        .unwrap();
+        let pairs = Array::new();
+        let pair = Array::new();
+        pair.push(&JsValue::from_str("content-length"));
+        pair.push(&JsValue::from_str("11"));
+        pairs.push(&pair);
+        Reflect::set(&with_body, &JsValue::from_str("headers"), &pairs).unwrap();
+        Reflect::set(
+            &with_body,
+            &JsValue::from_str("stream_id"),
+            &JsValue::from_str("bytes-1"),
+        )
+        .unwrap();
+
+        let decoded: super::FetchStreamStart =
+            serde_wasm_bindgen::from_value(with_body.into()).expect("decode streaming head");
+        assert_eq!(decoded.status, 200);
+        assert_eq!(decoded.stream_id.as_deref(), Some("bytes-1"));
+        assert_eq!(
+            decoded.headers,
+            vec![("content-length".to_string(), "11".to_string())]
+        );
+
+        let bodyless = Object::new();
+        Reflect::set(
+            &bodyless,
+            &JsValue::from_str("status"),
+            &JsValue::from_f64(204.0),
+        )
+        .unwrap();
+        Reflect::set(&bodyless, &JsValue::from_str("headers"), &Array::new()).unwrap();
+        Reflect::set(&bodyless, &JsValue::from_str("stream_id"), &JsValue::NULL).unwrap();
+
+        let decoded: super::FetchStreamStart =
+            serde_wasm_bindgen::from_value(bodyless.into()).expect("decode bodyless head");
+        assert_eq!(decoded.status, 204);
+        assert!(decoded.stream_id.is_none());
     }
 }
