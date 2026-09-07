@@ -1055,11 +1055,12 @@ async fn tickets_openapi_does_not_publish_the_honeypot() {
 ///
 /// A trailing `...` on a placeholder is impresspress's matcher syntax for a
 /// rest segment (`{key...}` binds the remainder of the path; see
-/// `endpoint_match`), and the parameter it binds is named without the marker,
-/// so the marker is stripped before comparing. Rendering a rest placeholder
-/// as a plain `{key}` belongs to the upstream projection in wafer-core, which
-/// should strip it; until it does, this pins that a rest-param row is never
-/// published without its parameter, nor a parameter without its placeholder.
+/// `endpoint_match`), and the parameter it binds is named without the marker.
+/// wafer-run's OpenAPI projection strips the marker when it publishes the row
+/// (upstream #331): OpenAPI has no multi-segment parameter, so `{key...}` is
+/// published as `{key}` naming the same parameter. So a published document
+/// carries no marker at all, and the second half of this test pins that the
+/// stripping happened rather than the row vanishing — see the anchor below.
 #[tokio::test]
 async fn path_placeholders_and_path_parameters_agree() {
     let ctx = impresspress_core::test_support::TestContext::new().await;
@@ -1079,20 +1080,18 @@ async fn path_placeholders_and_path_parameters_agree() {
         }
     }
 
-    let mut saw_rest_placeholder = false;
     let mut mismatches = Vec::new();
     for (path, item) in paths {
         let mut placeholders: Vec<String> = path
             .split('/')
             .filter_map(|seg| seg.strip_prefix('{')?.strip_suffix('}'))
-            .map(|name| match name.strip_suffix("...") {
-                Some(rest) => {
-                    saw_rest_placeholder = true;
-                    rest.to_string()
-                }
-                None => name.to_string(),
-            })
+            .map(str::to_string)
             .collect();
+        assert!(
+            placeholders.iter().all(|name| !name.ends_with("...")),
+            "{path}: a published path key carries impresspress's rest marker, which no OpenAPI \
+             client can fill — the projection must strip it"
+        );
         placeholders.sort();
         placeholders.dedup();
 
@@ -1115,10 +1114,86 @@ async fn path_placeholders_and_path_parameters_agree() {
         ));
     }
 
-    assert!(
-        saw_rest_placeholder,
-        "expected at least one rest placeholder (files' `{{key...}}`) so the marker-stripping \
-         branch is exercised and this test cannot pass vacuously"
-    );
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+
+    // Anti-vacuity anchor.
+    //
+    // The old anchor demanded a published path key still containing a raw
+    // `...`, which is exactly what a conformant document may no longer have:
+    // it could only ever be satisfied by the bug #331 fixed. The invariant
+    // worth pinning is the other half — that a rest-parameter route is
+    // *published*, under its marker-stripped key, naming the same plain
+    // parameter it declares. So the rest routes are read from the block
+    // declarations (which still spell the marker, since that is impresspress's
+    // own matcher syntax) and each is looked up in the document.
+    //
+    // This bites three ways: an empty `rest_routes` means the fixture no
+    // longer contains a rest route and the check below proves nothing; a
+    // missing path key means the projection stopped stripping (or dropped the
+    // row); a missing parameter means it stripped the name as well as the key.
+    let mut rest_routes: Vec<(String, String)> = Vec::new();
+    for info in impresspress_core::test_support::real_block_infos() {
+        for endpoint in &info.endpoints {
+            // `generate_openapi` publishes only schema-carrying endpoints, so
+            // a rest row without one (files' `DELETE …/objects/{key...}`) is
+            // legitimately absent from the document.
+            if !endpoint.has_schema() {
+                continue;
+            }
+            let published: String = endpoint
+                .path
+                .split('/')
+                .map(|seg| {
+                    match seg
+                        .strip_prefix('{')
+                        .and_then(|n| n.strip_suffix('}'))
+                        .and_then(|n| n.strip_suffix("..."))
+                    {
+                        Some(rest) => format!("{{{rest}}}"),
+                        None => seg.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            for seg in endpoint.path.split('/') {
+                let Some(name) = seg.strip_prefix('{').and_then(|n| n.strip_suffix('}')) else {
+                    continue;
+                };
+                if let Some(rest) = name.strip_suffix("...") {
+                    rest_routes.push((published.clone(), rest.to_string()));
+                }
+            }
+        }
+    }
+    rest_routes.sort();
+    rest_routes.dedup();
+
+    assert!(
+        !rest_routes.is_empty(),
+        "expected at least one schema-carrying route declared with a rest segment (files' \
+         `GET /b/storage/api/buckets/{{name}}/objects/{{key...}}`), or the check below proves \
+         nothing about how a rest parameter is published"
+    );
+
+    for (published, param) in &rest_routes {
+        let item = paths.get(published).unwrap_or_else(|| {
+            panic!(
+                "a rest-segment route declared with `{{{param}...}}` must be published under its \
+                 marker-stripped key `{published}`; published keys: {:?}",
+                paths.keys().collect::<Vec<_>>()
+            )
+        });
+        let mut declared = Vec::new();
+        path_param_names(item, &mut declared);
+        for (key, operation) in item.as_object().expect("path item object") {
+            if key != "parameters" {
+                path_param_names(operation, &mut declared);
+            }
+        }
+        assert!(
+            declared.iter().any(|name| name == param),
+            "`{published}` must declare its rest segment as the plain `in: path` parameter \
+             `{param}`; declared: {declared:?}"
+        );
+    }
 }
