@@ -68,14 +68,33 @@ const CLOUD_METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata"];
 
 /// True when `host` is a well-known cloud instance-metadata DNS hostname.
 ///
-/// `host` is compared case-insensitively and with a single trailing FQDN dot
+/// `host` is compared case-insensitively and with trailing FQDN dots
 /// (`metadata.google.internal.`) stripped, since either form resolves to the
-/// same metadata endpoint.
+/// same metadata endpoint. See [`strip_root_dots`] for why *every* trailing
+/// dot goes rather than one.
 pub fn is_cloud_metadata_host(host: &str) -> bool {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = strip_root_dots(host);
     CLOUD_METADATA_HOSTS
         .iter()
         .any(|blocked| host.eq_ignore_ascii_case(blocked))
+}
+
+/// Strip every trailing dot from a URL host.
+///
+/// One trailing dot is the ordinary FQDN root marker: `localhost.` and
+/// `metadata.google.internal.` resolve exactly like the undotted spellings, so
+/// a hostname denylist that did not strip it would be trivially evaded.
+///
+/// *Every* trailing dot rather than one, because `url::Url::parse` accepts
+/// `http://localhost../` and hands back the host `localhost..` verbatim — an
+/// empty final label, which is not a resolvable DNS name in any resolver this
+/// code has to survive, but which a one-dot strip leaves as `localhost.` with
+/// an empty last label and therefore waves through. A host string with a
+/// trailing dot run is never a legitimate public name, so removing the whole
+/// run cannot block anything real; leaving it is a spelling of an internal
+/// name that this precheck does not recognise. Fail closed.
+fn strip_root_dots(host: &str) -> &str {
+    host.trim_end_matches('.')
 }
 
 /// True when `host` names the RFC 6761 `localhost` pseudo-domain, which
@@ -89,14 +108,14 @@ pub fn is_cloud_metadata_host(host: &str) -> bool {
 /// waving either through is the same hole as waving `http://localhost/`
 /// through.
 ///
-/// Compared case-insensitively and with a single trailing FQDN dot stripped,
-/// for the same reason [`is_cloud_metadata_host`] strips it: `localhost.` and
-/// `foo.localhost.` resolve exactly like the undotted spellings. A name that
-/// merely *contains* the label elsewhere (`localhost.example.com`) or ends in
-/// the same letters without the dot separator (`notlocalhost`) is an ordinary
-/// public name and is not matched.
+/// Compared case-insensitively and with trailing FQDN dots stripped
+/// ([`strip_root_dots`]), for the same reason [`is_cloud_metadata_host`] strips
+/// them: `localhost.` and `foo.localhost.` resolve exactly like the undotted
+/// spellings. A name that merely *contains* the label elsewhere
+/// (`localhost.example.com`) or ends in the same letters without the dot
+/// separator (`notlocalhost`) is an ordinary public name and is not matched.
 pub fn is_loopback_host(host: &str) -> bool {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = strip_root_dots(host);
     // The rule is on the *last label*, which is exactly what RFC 6761 reserves:
     // `localhost` itself and anything under it. Splitting on `.` rather than
     // testing a `.localhost` suffix is what keeps `localhost.example.com` (last
@@ -178,6 +197,11 @@ mod tests {
         assert!(is_cloud_metadata_host("METADATA."));
         // A longer host that merely starts with "metadata" is not the endpoint.
         assert!(!is_cloud_metadata_host("metadata.example.com"));
+        // Same trailing-dot-run rule as the loopback predicate: one strip left
+        // `metadata.google.internal..` unmatched.
+        assert!(is_cloud_metadata_host("metadata.google.internal.."));
+        assert!(is_cloud_metadata_host("metadata.."));
+        assert!(is_ssrf_blocked_url("http://metadata.google.internal../"));
     }
 
     #[test]
@@ -198,6 +222,12 @@ mod tests {
         // the same reason `is_cloud_metadata_host` strips it.
         assert!(is_ssrf_blocked_url("http://localhost./"));
         assert!(is_ssrf_blocked_url("http://foo.localhost./"));
+        // `url::Url::parse` accepts a trailing dot RUN and hands back the host
+        // verbatim (`localhost..`), so one strip is not enough.
+        assert!(is_ssrf_blocked_url("http://localhost../"));
+        assert!(is_ssrf_blocked_url("http://foo.localhost.../"));
+        assert!(is_loopback_host("localhost.."));
+        assert!(is_loopback_host("api.localhost..."));
 
         assert!(is_loopback_host("localhost"));
         assert!(is_loopback_host("LOCALHOST."));
