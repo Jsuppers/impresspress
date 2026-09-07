@@ -457,7 +457,10 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
     let vector = match (body.vector.take(), body.text.as_deref()) {
         (Some(v), _) if !v.is_empty() => v,
         (_, Some(text)) if !text.is_empty() => {
-            let block = embedding_block_for_model(&model_id);
+            let block = match embedding_block_for_model(ctx, &model_id) {
+                Ok(b) => b,
+                Err(e) => return OutputStream::error(e),
+            };
             match vclient::embed(ctx, block, vec![text.to_string()]).await {
                 Ok((_, _, mut vectors)) => match vectors.pop() {
                     Some(v) => v,
@@ -564,21 +567,53 @@ async fn load_index_metadata(
     Ok((DEFAULT_MODEL.to_string(), desc.keyword_search))
 }
 
-/// Map a model id to the embedding block that serves it on this runtime.
+/// The interface identifier every embedding block declares.
 ///
-/// On native we route everything to `impresspress/fastembed` — fastembed's
-/// catalog covers every model in our native-embed support matrix. Plan 2
-/// (Workers AI) and Plan 3 (browser/transformers) will split this by
-/// `model_id` so different models dispatch to different embedding blocks.
-fn embedding_block_for_model(_model_id: &str) -> &'static str {
-    #[cfg(target_arch = "wasm32")]
-    {
-        "impresspress/transformers-embed"
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        "impresspress/fastembed"
-    }
+/// `FastembedBlock` (native ONNX) and `TransformersEmbedBlock` (injected
+/// service, browser Transformers.js in practice) both publish `embedding@v1`
+/// in their `BlockInfo` and both delegate to
+/// `wafer_core::interfaces::vector::handler::handle_embedding_message`, so the
+/// declared protocol — not a block name and not the build target — is what
+/// says a block can embed.
+const EMBEDDING_INTERFACE: &str = "embedding@v1";
+
+/// Resolve the embedding block that serves `model_id` **on this runtime**.
+///
+/// Reads `ctx.registered_blocks()`, the same signal
+/// [`service::vector_backend_available`] reads for the vector backend, and
+/// picks the block declaring [`EMBEDDING_INTERFACE`]. At most one is ever
+/// registered: the two registration sites in `builder::registration` are
+/// mutually exclusive (`native-embedding` registers `impresspress/fastembed`,
+/// an injected embedding service registers
+/// `impresspress/transformers-embed`), and both produce `wafer-run/vector`,
+/// which cannot be registered twice.
+///
+/// This used to be a `cfg(target_arch)` body naming `impresspress/fastembed`
+/// off wasm32 and `impresspress/transformers-embed` on it, with `model_id`
+/// ignored — so a native build with no embedding block registered (the
+/// default: `block-fastembed` is off in `default`) still handed its text to
+/// `impresspress/fastembed` and the absent capability surfaced as
+/// `500 embed failed` wrapping a `NotFound: block … not found`. That is the
+/// ambiguity `err_vector_backend_unavailable` documents for the vector
+/// backend, so the answer here is the same shape: `Unavailable`, naming the
+/// model that could not be embedded.
+fn embedding_block_for_model<'a>(
+    ctx: &'a dyn Context,
+    model_id: &str,
+) -> Result<&'a str, WaferError> {
+    ctx.registered_blocks()
+        .iter()
+        .find(|b| b.interface == EMBEDDING_INTERFACE)
+        .map(|b| b.name.as_str())
+        .ok_or_else(|| {
+            WaferError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "no embedding block is registered on this deployment, so \
+                     model '{model_id}' cannot be embedded"
+                ),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -647,8 +682,18 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     }
 
     // Split into chunks. Empty / whitespace-only text produces no chunks;
-    // return early rather than inventing an empty entry.
-    //
+    // return early rather than inventing an empty entry. `ingestion::chunk`
+    // yields nothing exactly when the document has no whitespace-separated
+    // words, so answering the zero-chunk contract here is the same reply the
+    // `chunks.is_empty()` branch below gives — and it keeps a document with
+    // nothing to embed from demanding an embedding block. The prior-chunk
+    // cleanup above has already run, so re-ingesting a document that was
+    // emptied still clears its old chunks.
+    let whitespace_tokens = body.text.split_whitespace().count() as u64;
+    if whitespace_tokens == 0 {
+        return ok_json(&IngestResponse { chunks_created: 0 });
+    }
+
     // The chunker counts whitespace-words as a proxy for tokens. To size
     // chunks against the embedder's real BPE limit (bge-m3 produces ~1.3-1.5
     // BPE tokens per whitespace word on English prose, more on CJK and heavy
@@ -659,19 +704,18 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     // count_tokens returns 0 or the call errors — chunks may run slightly
     // over BPE-budget, which is the same approximation in use before this
     // change.
-    let embedding_block = embedding_block_for_model(&model_id);
-    let whitespace_tokens = body.text.split_whitespace().count() as u64;
-    let effective_chunk_tokens = if whitespace_tokens == 0 {
-        DEFAULT_CHUNK_TOKENS
-    } else {
+    let embedding_block = match embedding_block_for_model(ctx, &model_id) {
+        Ok(b) => b,
+        Err(e) => return OutputStream::error(e),
+    };
+    let effective_chunk_tokens =
         match vclient::count_tokens(ctx, embedding_block, body.text.clone()).await {
             Ok(bpe) if bpe > 0 => {
                 let ratio = (bpe as f32) / (whitespace_tokens as f32);
                 ((DEFAULT_CHUNK_TOKENS as f32) / ratio.max(1.0)).round() as usize
             }
             _ => DEFAULT_CHUNK_TOKENS,
-        }
-    };
+        };
 
     let mut chunks = ingestion::chunk(&body.text, effective_chunk_tokens, DEFAULT_OVERLAP_RATIO);
     if body.contextual {
@@ -684,8 +728,8 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
         return ok_json(&IngestResponse { chunks_created: 0 });
     }
 
-    // Embed via the right block for this model. On native today that's
-    // always `impresspress/fastembed`; see `embedding_block_for_model`.
+    // Embed via the block this runtime registered for the protocol; see
+    // `embedding_block_for_model`.
     let (_model_name, _dims, vectors) =
         match vclient::embed(ctx, embedding_block, chunks.clone()).await {
             Ok(tuple) => tuple,
@@ -741,7 +785,8 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
 ///
 /// Thin shim over `vclient::embed` — we look up which block serves the
 /// requested model on this runtime and dispatch. Empty `texts` is allowed
-/// (the embedding block returns an empty vector list).
+/// (the embedding block returns an empty vector list). A runtime with no
+/// embedding block registered answers 503, not 500.
 pub(super) async fn embed(ctx: &dyn Context, input: InputStream) -> OutputStream {
     let raw = input.collect_to_bytes().await;
     let body: EmbedRequest = match serde_json::from_slice(&raw) {
@@ -750,7 +795,10 @@ pub(super) async fn embed(ctx: &dyn Context, input: InputStream) -> OutputStream
     };
 
     let model = body.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let block = embedding_block_for_model(&model);
+    let block = match embedding_block_for_model(ctx, &model) {
+        Ok(b) => b,
+        Err(e) => return OutputStream::error(e),
+    };
 
     match vclient::embed(ctx, block, body.texts).await {
         Ok((model, dimensions, vectors)) => ok_json(&EmbedResponse {
@@ -1631,5 +1679,148 @@ mod denial_classification_tests {
         )
         .await;
         assert_eq!(output_http_status(out).await, 400);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: which block embeds is resolved from the runtime's registry, not
+// from the build target.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod embedding_block_resolution_tests {
+    use std::sync::Arc;
+
+    use wafer_core::interfaces::vector::service::{EmbeddingService, Result as VectorResult};
+
+    use super::*;
+    use crate::{
+        blocks::{
+            transformers_embed::TransformersEmbedBlock, vector::test_support::StubVectorBlock,
+        },
+        test_support::{output_http_status, TestContext},
+    };
+
+    /// The service `TransformersEmbedBlock` wraps. These tests never reach an
+    /// `embedding.embed` call — they are about *which block* the resolver
+    /// picks — but the real block takes a real service, and using the real
+    /// block is the point: its `BlockInfo` is what the resolver reads.
+    struct StubEmbeddingService;
+
+    #[wafer_block::wafer_async_trait]
+    impl EmbeddingService for StubEmbeddingService {
+        fn model(&self) -> &str {
+            "multilingual-e5-small"
+        }
+        fn dimensions(&self) -> u32 {
+            384
+        }
+        async fn embed(&self, texts: Vec<String>) -> VectorResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.25f32; 384]).collect())
+        }
+    }
+
+    fn json_input(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(serde_json::to_vec(&value).expect("serialize body"))
+    }
+
+    /// Seed the registry row `query` reads, so `load_index_metadata` resolves
+    /// from the DB and the stub vector block never sees a `describe_index`.
+    async fn seed_registry_row(ctx: &dyn Context, prefixed: &str) {
+        db::upsert(
+            ctx,
+            REGISTRY_TABLE,
+            vec![
+                ("prefixed_name".to_string(), serde_json::json!(prefixed)),
+                ("model".to_string(), serde_json::json!(DEFAULT_MODEL)),
+                ("dimensions".to_string(), serde_json::json!(384)),
+                ("keyword_search".to_string(), serde_json::json!(0)),
+            ],
+            vec!["prefixed_name".to_string()],
+            OnConflict::SetColumns(vec![
+                "model".to_string(),
+                "dimensions".to_string(),
+                "keyword_search".to_string(),
+            ]),
+        )
+        .await
+        .expect("seed registry row");
+    }
+
+    /// A runtime with no embedding block registered cannot embed, and the
+    /// caller has to be able to tell that from a failed embedding call.
+    ///
+    /// `POST /b/vector/api/embed` used to hand its text to whichever block
+    /// name the *build target* named — `impresspress/fastembed` off wasm32 —
+    /// whether or not that block was registered, so a missing capability
+    /// surfaced as `500 embed failed` wrapping a `NotFound: block … not
+    /// found`. That is the same conflation `err_vector_backend_unavailable`
+    /// exists to prevent for the vector backend, and it gets the same
+    /// answer: 503.
+    #[tokio::test]
+    async fn embed_without_an_embedding_block_reports_the_capability_missing() {
+        let ctx = TestContext::with_vector().await;
+
+        let out = embed(&ctx, json_input(serde_json::json!({ "texts": ["a"] }))).await;
+
+        assert_eq!(
+            output_http_status(out).await,
+            503,
+            "no embedding block is registered on this runtime, so the answer is \
+             'this deployment cannot embed' (503), not 'the embedding failed' (500)"
+        );
+    }
+
+    /// Same for `query` with `text` instead of a pre-computed vector: the
+    /// vector backend is present, the embedder is not.
+    #[tokio::test]
+    async fn query_by_text_without_an_embedding_block_reports_the_capability_missing() {
+        let mut ctx = TestContext::with_vector().await;
+        ctx.register_block("wafer-run/vector", Arc::new(StubVectorBlock::default()));
+        seed_registry_row(&ctx, &service::prefixed_index_name("docs")).await;
+
+        let out = query(
+            &ctx,
+            json_input(serde_json::json!({ "index": "docs", "text": "hello" })),
+        )
+        .await;
+
+        assert_eq!(output_http_status(out).await, 503);
+    }
+
+    /// With an embedding block registered, the resolver names *that* block —
+    /// on native, where the deleted `cfg(target_arch)` body would have said
+    /// `impresspress/fastembed` regardless of what is actually there.
+    #[tokio::test]
+    async fn a_registered_embedding_block_is_the_one_resolved() {
+        let mut ctx = TestContext::with_vector().await;
+        ctx.register_block(
+            "impresspress/transformers-embed",
+            Arc::new(TransformersEmbedBlock::new(Arc::new(StubEmbeddingService))),
+        );
+
+        assert_eq!(
+            embedding_block_for_model(&ctx, DEFAULT_MODEL).expect("an embedding block"),
+            "impresspress/transformers-embed",
+        );
+    }
+
+    /// And the model id reaches the diagnostic, so an operator reading the
+    /// error knows what could not be embedded rather than only that
+    /// something could not be.
+    #[tokio::test]
+    async fn the_unavailable_error_names_the_model() {
+        let ctx = TestContext::with_vector().await;
+
+        let err = embedding_block_for_model(&ctx, "paraphrase-multilingual-MiniLM-L12-v2")
+            .expect_err("no embedding block is registered");
+
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(
+            err.message
+                .contains("paraphrase-multilingual-MiniLM-L12-v2"),
+            "message was {:?}",
+            err.message
+        );
     }
 }

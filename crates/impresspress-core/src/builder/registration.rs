@@ -190,20 +190,23 @@ impl ImpresspressBuilder {
                 vec_svc,
                 emb_svc.clone(),
             )?;
-            #[cfg(target_arch = "wasm32")]
-            {
-                // `TransformersEmbedBlock` only requires `MaybeSend + MaybeSync`
-                // (a no-op marker on wasm32 — see wafer_block::compat), so this
-                // `Arc` doesn't promise cross-thread safety; wasm32 is
-                // single-threaded and this whole block is wasm32-only.
-                #[allow(clippy::arc_with_non_send_sync)]
-                wafer.register_block(
-                    "impresspress/transformers-embed".to_string(),
-                    Arc::new(
-                        crate::blocks::transformers_embed::TransformersEmbedBlock::new(emb_svc),
-                    ),
-                )?;
-            }
+            // Registered on every target, because the condition is the
+            // injected service and not the build. `TransformersEmbedBlock`
+            // only requires `MaybeSend + MaybeSync` (real `Send + Sync` on
+            // native, a no-op marker on wasm32 — see wafer_block::compat), so
+            // this `Arc` doesn't promise cross-thread safety on wasm32, which
+            // is single-threaded.
+            //
+            // This used to carry a `cfg(target_arch = "wasm32")`, so a native
+            // caller that injected an embedding service got
+            // `wafer-run/vector` registered and the block that actually
+            // embeds silently dropped — and every embed call then failed with
+            // "block not found" wrapped in a 500.
+            #[allow(clippy::arc_with_non_send_sync)]
+            wafer.register_block(
+                "impresspress/transformers-embed".to_string(),
+                Arc::new(crate::blocks::transformers_embed::TransformersEmbedBlock::new(emb_svc)),
+            )?;
         }
 
         // 5. The wafer-run/* middleware blocks (cors, inspector, readonly-guard,

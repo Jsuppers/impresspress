@@ -3,7 +3,12 @@
 //! Mirror of `blocks/fastembed.rs`, but accepts an injected
 //! `Arc<dyn EmbeddingService>` so the WASM-specific service in
 //! `impresspress-browser` can be constructed by `impresspress-web` and passed in
-//! via the `ImpresspressBuilder`. Compiled only on `wasm32`.
+//! via the `ImpresspressBuilder`.
+//!
+//! Nothing here is target-specific: the block holds the injected service and
+//! delegates to the shared `handle_embedding_message`. It is registered
+//! wherever an embedding service was injected, on any target — see
+//! `builder::registration`.
 
 use std::sync::Arc;
 
