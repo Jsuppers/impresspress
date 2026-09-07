@@ -713,10 +713,24 @@ mod discovery_tests {
             "list-objects response schema must match ObjectList {{objects, total_count}}: {list}"
         );
 
-        let get_obj = &paths["/b/storage/api/buckets/{name}/objects/{key...}"]["get"];
+        // The row is declared `…/objects/{key...}` — impresspress's matcher
+        // syntax for a rest segment. OpenAPI has no multi-segment parameter,
+        // so wafer-core's projection publishes it as a plain `{key}` naming
+        // the same parameter.
+        let get_obj = &paths["/b/storage/api/buckets/{name}/objects/{key}"]["get"];
         assert!(
             !get_obj.is_null(),
             "get-object must appear in /openapi.json: {body}"
+        );
+        assert_eq!(
+            get_obj["parameters"]
+                .as_array()
+                .expect("get-object has path parameters")
+                .iter()
+                .filter(|p| p["in"] == "path" && p["name"] == "key")
+                .count(),
+            1,
+            "get-object must declare the rest segment as the {{key}} path param: {get_obj}"
         );
         assert!(
             get_obj["responses"]["200"].get("content").is_none(),

@@ -361,10 +361,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `Cargo.toml` / `Cargo.lock` are in the filter because the workspace
+      # manifest pins the wafer-run rev this crate's services are written
+      # against: a pin bump changes what these tests compile and run without
+      # touching a file under `crates/impresspress-cloudflare/`, and skipping
+      # them there is exactly the coverage hole this job exists to close.
       - name: Check for impresspress-cloudflare changes
         id: cloudflare-changes
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/ Cargo.toml Cargo.lock)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -400,11 +405,14 @@ jobs:
           fetch-depth: 0
 
       # Gate like the `sdk` job below: skip the (slower, wasm-target) build
-      # entirely on PRs that don't touch impresspress-browser.
+      # entirely on PRs that don't touch impresspress-browser. `Cargo.toml` /
+      # `Cargo.lock` join the filter for the same reason as the cloudflare job
+      # above: a wafer-run pin bump moves this crate's dependencies without
+      # touching a file under `crates/impresspress-browser/`.
       - name: Check for impresspress-browser changes
         id: browser-changes
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-browser/)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-browser/ Cargo.toml Cargo.lock)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
