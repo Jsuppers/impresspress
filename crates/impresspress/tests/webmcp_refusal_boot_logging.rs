@@ -154,13 +154,21 @@ async fn build_runtime_with_extra_blocks(
     // builder, so a caller cannot fill the async surface and forget the
     // synchronous snapshot. This harness needs neither key: it is testing what
     // `build()` logs, not what blocks read.
-    let mut builder = impresspress_core::builder::RuntimeConfig::new()
-        .install(
-            ImpresspressBuilder::new()
-                .database(database)
-                .storage(storage),
-            |_empty| Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
-        )
+    let (builder, ()) = impresspress_core::builder::RuntimeConfig::new().install(
+        ImpresspressBuilder::new()
+            .database(database)
+            .storage(storage),
+        |map| {
+            (
+                impresspress_core::builder::fill_config_service(
+                    Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+                    map,
+                ),
+                (),
+            )
+        },
+    );
+    let mut builder = builder
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "webmcp-refusal-boot-logging-test-jwt-secret".to_string(),

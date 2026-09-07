@@ -29,10 +29,10 @@
 -- That failure is not survivable. `migration_helper::apply_if_blessed`
 -- tolerates only a duplicate `ALTER ... ADD COLUMN`, so a unique violation
 -- propagates, the migration hash is never stamped, and every later boot
--- re-runs and re-fails. On Cloudflare `builder::strict_init_all_blocks`
+-- re-runs and re-fails. On Cloudflare `builder::InitPolicy::Strict`
 -- turns a block Init failure into `Err` and `IMPRESSPRESS_RUN_MIGRATIONS` is
 -- baked into the deployment, so every request 500s until someone hand-edits
--- D1. Natively the tolerant `init_all_blocks` only logs, but the engine
+-- D1. Natively `builder::InitPolicy::Tolerant` only logs, but the engine
 -- rolls the whole statement back, so not one row gets repaired. The guard
 -- therefore skips the rows it cannot make safe rather than losing the ones
 -- it can.

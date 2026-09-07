@@ -304,13 +304,21 @@ async fn a_prepared_plans_grants_reach_the_sealed_runtime() {
         .await
         .expect("construct local storage service");
 
-    let builder = impresspress_core::builder::RuntimeConfig::new()
-        .install(
-            impresspress_core::builder::ImpresspressBuilder::new()
-                .database(database)
-                .storage(storage),
-            |_empty| Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
-        )
+    let (builder, ()) = impresspress_core::builder::RuntimeConfig::new().install(
+        impresspress_core::builder::ImpresspressBuilder::new()
+            .database(database)
+            .storage(storage),
+        |map| {
+            (
+                impresspress_core::builder::fill_config_service(
+                    Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+                    map,
+                ),
+                (),
+            )
+        },
+    );
+    let builder = builder
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "prepared-grants-test-jwt-secret-value".to_string(),

@@ -528,11 +528,17 @@ mod tests {
         );
     }
 
-    /// The seed hook runs under EVERY policy, including the `Strict` one the
+    /// The hook runs under EVERY policy, including the `Strict` one the
     /// Cloudflare request path uses. Before this funnel existed, that path
     /// called `strict_init_all_blocks` directly and no `BootHooks` value
-    /// reached it at all, so `seed_after_admin_init` was skipped on every
-    /// Cloudflare request build (ruling 5.5).
+    /// reached it at all, so `seed_after_admin_init` never ran on a Cloudflare
+    /// request build — not because anyone decided it should not (ruling 5.5).
+    ///
+    /// What each target's hook *does* is that target's decision and not this
+    /// funnel's: Cloudflare's request-path hook is deliberately a read and a
+    /// republish, with no write in it, while its deploy funnel seeds. The
+    /// guarantee here is only that the hook a caller supplies is reached, in
+    /// this position, under every policy.
     #[tokio::test]
     async fn every_policy_runs_the_seed_hook_after_admin() {
         for policy in [

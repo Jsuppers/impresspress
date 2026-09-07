@@ -15,8 +15,9 @@
 //! them together. `RuntimeConfig` makes that structural: a key is written once
 //! and lands in both, and the *only* way to hand a `ConfigService` to
 //! [`ImpresspressBuilder`] is [`RuntimeConfig::install`], which takes the
-//! snapshot in the same call. A target that fills one surface and forgets the
-//! other no longer compiles.
+//! snapshot in the same call — so a target cannot fill the async surface and
+//! leave the snapshot empty. See [`RuntimeConfig::install`] for the one thing
+//! that is still the target's own contract: using the map it is handed.
 //!
 //! The one legitimate divergence — Cloudflare's per-request application config,
 //! which must reach the async service map but must never be baked into a
@@ -129,15 +130,36 @@ impl RuntimeConfig {
     /// already holds), and the snapshot is stored on the builder, which
     /// installs it on the `Wafer` at the end of `build()`.
     ///
-    /// This is the only way to give a runtime a `ConfigService`, which is what
-    /// makes "fill one surface and forget the other" a compile error.
-    pub fn install(
+    /// `make_service` returns `(service_for_the_builder, kept)`, and `install`
+    /// returns `(builder, kept)`. `kept` is whatever the target needs to hold
+    /// on to besides the service the builder gets: Cloudflare builds the
+    /// request-current concrete service from the map and hands the builder a
+    /// stateless forwarder instead, and used to smuggle the concrete one back
+    /// out through a captured `Option` plus an `expect` for a panic that could
+    /// not happen. Targets with nothing to keep return `()`.
+    ///
+    /// # What this does, and does not, make impossible
+    ///
+    /// Enforced by the type system: this is the only way to give a builder a
+    /// `ConfigService`, and it takes the snapshot in the same call — so a
+    /// target cannot fill the async surface and leave the synchronous one
+    /// empty.
+    ///
+    /// Not enforced: that `make_service` uses the map it is handed. A
+    /// constructor that drops it fills the snapshot and leaves the async
+    /// surface empty, which is the same defect facing the other way. That was
+    /// not hypothetical — the browser's closure was `|_empty| config_svc`,
+    /// correct only for as long as its `RuntimeConfig` stayed empty. Every
+    /// target consumes the map today, and a target whose service is filled by
+    /// `set` should use [`fill_config_service`] rather than write the loop
+    /// again.
+    pub fn install<T>(
         self,
         builder: ImpresspressBuilder,
-        make_service: impl FnOnce(HashMap<String, String>) -> Arc<dyn ConfigService>,
-    ) -> ImpresspressBuilder {
-        let service = make_service(self.service);
-        builder.with_config_surfaces(service, self.snapshot)
+        make_service: impl FnOnce(HashMap<String, String>) -> (Arc<dyn ConfigService>, T),
+    ) -> (ImpresspressBuilder, T) {
+        let (service, kept) = make_service(self.service);
+        (builder.with_config_surfaces(service, self.snapshot), kept)
     }
 
     /// Publish both surfaces onto an already-built runtime — the post-admin-init
@@ -161,6 +183,23 @@ impl RuntimeConfig {
         snapshot.extend(self.snapshot);
         write_snapshot(wafer, snapshot);
     }
+}
+
+/// [`RuntimeConfig::install`]'s `make_service` for a target whose
+/// `ConfigService` is filled by `set` rather than constructed from the map:
+/// native's `EnvConfigService`, the browser's shared handle. Writes every key
+/// through and hands the same service back.
+///
+/// Exists so "use the map you were given" is a call rather than a loop each
+/// target writes for itself — the loop the browser did not write.
+pub fn fill_config_service(
+    service: Arc<dyn ConfigService>,
+    map: HashMap<String, String>,
+) -> Arc<dyn ConfigService> {
+    for (key, value) in &map {
+        service.set(key, value);
+    }
+    service
 }
 
 /// The single non-test `Wafer::set_config_snapshot` call site in the workspace.

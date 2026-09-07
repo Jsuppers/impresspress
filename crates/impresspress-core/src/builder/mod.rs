@@ -35,7 +35,7 @@ pub use boot::{
     boot, BlockInitOutcome, BootHooks, BootReport, GrantSource, InitPolicy, StepOutcome,
     PREPARE_RUNTIME_PLAN_KEY,
 };
-pub use config::{RuntimeConfig, ServiceOnlyKey};
+pub use config::{fill_config_service, RuntimeConfig, ServiceOnlyKey};
 pub use prepared::PreparedPlanExporter;
 
 pub struct ImpresspressBuilder {

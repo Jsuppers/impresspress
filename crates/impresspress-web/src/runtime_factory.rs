@@ -360,7 +360,7 @@ impl RuntimeFactory {
         #[cfg_attr(not(feature = "browser-devtools"), allow(unused_mut))]
         let mut security_headers = serde_json::json!({ "csp": self.csp() });
 
-        // Both config surfaces, empty. The browser is the one target that
+        // Both config surfaces, empty today. The browser is the one target that
         // cannot know a single key at build time: the `variables` table does
         // not exist until admin's migration runs, so every value arrives
         // through `BrowserBootHooks::seed_after_admin_init`, which publishes
@@ -369,12 +369,19 @@ impl RuntimeFactory {
         // the async `ConfigService` and the synchronous snapshot in one
         // owner's hands — the builder has no other way to receive a
         // `ConfigService`.
+        //
+        // `fill_config_service` rather than a closure that ignores its
+        // argument: this handle is filled by `set`, so the map must be written
+        // through it. Discarding the map was correct only for as long as the
+        // `RuntimeConfig` above stayed empty — the first `both()` added here
+        // would otherwise reach the snapshot and be dropped from the async
+        // surface, silently.
         let config_svc = self.config_svc.clone();
-        let with_config = builder::RuntimeConfig::new().install(
+        let (with_config, ()) = builder::RuntimeConfig::new().install(
             ImpresspressBuilder::new()
                 .database(impresspress_browser::make_database_service())
                 .storage(impresspress_browser::make_storage_service()),
-            |_empty| config_svc,
+            |map| (builder::fill_config_service(config_svc, map), ()),
         );
 
         #[cfg_attr(not(feature = "browser-devtools"), allow(unused_mut))]

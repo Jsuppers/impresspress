@@ -21,7 +21,7 @@ use impresspress_native::{
     collect_app_env_vars, init_tracing, load_dotenv, register_http_listener,
     register_observability_hooks, serve_until_shutdown, InfraConfig,
 };
-use wafer_core::interfaces::{config::service::ConfigService, database::service::DatabaseService};
+use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::Wafer;
 
 use crate::cli::server_config::filter_to_declared_keys;
@@ -274,16 +274,13 @@ pub async fn build_native_runtime(
         );
     }
 
-    let with_config = runtime_config.install(
+    let (with_config, ()) = runtime_config.install(
         ImpresspressBuilder::new()
             .database(database)
             .storage(storage),
         |map| {
             let svc = wafer_core::service_blocks::config::EnvConfigService::new();
-            for (key, value) in &map {
-                svc.set(key, value);
-            }
-            Arc::new(svc)
+            (builder::fill_config_service(Arc::new(svc), map), ())
         },
     );
 

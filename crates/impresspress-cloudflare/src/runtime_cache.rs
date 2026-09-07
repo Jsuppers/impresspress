@@ -798,15 +798,13 @@ where
         }
     };
 
-    // One lifecycle: D1 grants before seal, seal, admin first, the seed hook,
-    // every remaining slot, then the grants into the storage block. Strict,
-    // because publishing a Wafer with a failed lazy-init slot would let
-    // concurrent requests wait on one another's init future, which is not a
-    // valid execution model here. The concrete services are dropped instead of
-    // entering ReadyRuntime.
-    if let Err(e) =
-        crate::boot_built_runtime(&mut built, impresspress_core::builder::InitPolicy::Strict).await
-    {
+    // One lifecycle: D1 grants before seal, seal, admin first, the request
+    // path's read-only hook, every remaining slot, then the grants into the
+    // storage block. Strict, because publishing a Wafer with a failed
+    // lazy-init slot would let concurrent requests wait on one another's init
+    // future, which is not a valid execution model here. The concrete services
+    // are dropped instead of entering ReadyRuntime.
+    if let Err(e) = crate::boot_dynamic_request_runtime(&mut built).await {
         if dirty_consumed {
             mark_dirty();
         }
@@ -1042,11 +1040,13 @@ where
     )
     .await?;
 
-    // Literally the same call the stored dynamic build makes. It used to be
-    // that build's five statements copied, and a copy is how two paths drift:
-    // both remembered the grant load, neither passed a `BootHooks`, and no
-    // reader could tell which of those was a decision.
-    crate::boot_built_runtime(&mut built, impresspress_core::builder::InitPolicy::Strict)
+    // Literally the same call the stored dynamic build makes — the two request
+    // paths are one decision, not two. It used to be that build's five
+    // statements copied, and a copy is how two paths drift: both remembered
+    // the grant load, neither passed a `BootHooks`, and no reader could tell
+    // which of those was a decision. The deploy funnel is the one that differs
+    // (it seeds), and it says so by calling `boot_deploy_runtime` instead.
+    crate::boot_dynamic_request_runtime(&mut built)
         .await
         .map_err(|e| format!("transient-runtime boot: {e}"))?;
 
