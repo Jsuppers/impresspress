@@ -454,8 +454,22 @@ jobs:
         if: steps.browser-changes.outputs.skip != 'true'
         run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
 
+      # `--import ./js/test/node-hooks.mjs` is what makes this step able to
+      # pass at all. `js/bridge.js` is a wasm-bindgen snippet module with a
+      # top-level `import initSqlJs from '/vendor/sql-wasm-esm.js'` — an
+      # absolute site-root path a Service Worker resolves and plain Node cannot,
+      # so without the hook the generated test module fails to load with
+      # ERR_MODULE_NOT_FOUND and every wasm test in the crate is skipped before
+      # a single one runs. The hook (already used by the `node --test` step
+      # above) stubs that one specifier and passes everything else through.
+      # NODE_OPTIONS rather than an argument because wasm-bindgen-test-runner
+      # builds the `node` command line itself; the path is relative to
+      # `crates/impresspress-browser`, which is where `wasm-pack` runs `cargo
+      # test` from.
       - name: Run impresspress-browser wasm tests (Node)
         if: steps.browser-changes.outputs.skip != 'true'
+        env:
+          NODE_OPTIONS: --import ./js/test/node-hooks.mjs
         run: wasm-pack test --node crates/impresspress-browser
 
   # E2E is split into a single build stage plus two independent test stages so

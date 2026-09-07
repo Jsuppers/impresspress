@@ -584,7 +584,8 @@ export async function llmUnloadEngine(modelId) {
  * Start a streaming chat completion. Returns a stream id; pump with
  * `llmNextStreamFrame`. Frames are `{kind:'chunk', payload:<openai chunk
  * JSON>}` then a terminal `{kind:'done'}` or `{kind:'error', payload}`.
- * @param {string} bodyJson - JSON request body as built by Rust encode_request_body
+ * @param {string} bodyJson - JSON request body as built by Rust
+ *   `impresspress_core::llm_wire::openai::encode_chat_body`
  * @returns {Promise<string>} stream id
  */
 export async function llmChatStream(bodyJson) {
@@ -911,16 +912,36 @@ export async function readCookieHeader() {
 
 /**
  * Execute an HTTP fetch request.
+ *
+ * The caller has already run the URL through the shared SSRF gate
+ * (`BrowserNetworkService::do_request`); this function does the transport.
+ *
  * @param {string} method
  * @param {string} url
  * @param {string} headersJson - JSON object of header key/value pairs
  * @param {Uint8Array|null} body
- * @returns {{status: number, headers: Object<string, string>, body: Uint8Array}}
+ * @param {number} maxResponseBytes - response-body ceiling, from
+ *   `network::DEFAULT_MAX_RESPONSE_BYTES`. Enforced here rather than in Rust
+ *   because this is where the bytes are read: an advertised `Content-Length`
+ *   over the cap is refused before the body is touched, and the running total
+ *   is checked per chunk for a chunked response that advertises nothing.
+ *   Reading the whole body first and measuring it afterwards would have
+ *   already spent the memory the cap exists to protect — a Service Worker has
+ *   one linear memory and shares it with the page's whole runtime.
+ * @returns {{status: number, headers: Array<[string, string]>, body: Uint8Array}}
  *   A plain JS object — NOT a JSON string. `network.rs` decodes it directly
  *   with `serde_wasm_bindgen::from_value`, so `body` is a real `Uint8Array`
  *   (deserializes straight into `Vec<u8>`) rather than a JSON number array.
+ *
+ *   `headers` is an ARRAY OF PAIRS, not an object. Per the Fetch spec a
+ *   `Headers` iteration combines repeated names into one comma-joined value
+ *   *except* `Set-Cookie`, which it yields once per cookie — so an object
+ *   keyed by name kept only the last one, and a response setting a session
+ *   cookie and a CSRF cookie silently delivered one of them. Comma-joining
+ *   `Set-Cookie` is not an alternative: its own grammar uses commas (in
+ *   `Expires` dates, among others), so a joined value cannot be split back.
  */
-export async function httpFetch(method, url, headersJson, body) {
+export async function httpFetch(method, url, headersJson, body, maxResponseBytes) {
     const headersObj = JSON.parse(headersJson);
     const init = {
         method,
@@ -933,16 +954,61 @@ export async function httpFetch(method, url, headersJson, body) {
 
     const response = await fetch(url, init);
 
-    const responseHeaders = {};
+    const responseHeaders = [];
     response.headers.forEach((value, name) => {
-        responseHeaders[name] = value;
+        responseHeaders.push([name, value]);
     });
-
-    const responseBuffer = await response.arrayBuffer();
 
     return {
         status: response.status,
         headers: responseHeaders,
-        body: new Uint8Array(responseBuffer),
+        body: await readCappedBody(response, maxResponseBytes),
     };
+}
+
+/**
+ * Read a fetch response body into a `Uint8Array`, refusing anything over
+ * `cap` bytes. Throws (rejecting the `httpFetch` promise, which `network.rs`
+ * surfaces as a `NetworkError::RequestError`) rather than truncating: a
+ * silently short body is a worse failure than a loud one.
+ *
+ * @param {Response} response
+ * @param {number} cap
+ * @returns {Promise<Uint8Array>}
+ */
+async function readCappedBody(response, cap) {
+    const advertised = Number(response.headers.get('content-length'));
+    if (Number.isFinite(advertised) && advertised > cap) {
+        throw new Error(
+            `response body ${advertised} bytes exceeds cap of ${cap} bytes`,
+        );
+    }
+
+    // A bodyless response (204, HEAD) has `body === null`.
+    if (!response.body) {
+        return new Uint8Array(0);
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        // The only guard for a chunked / unknown-length response.
+        if (received > cap) {
+            await reader.cancel();
+            throw new Error(`response body exceeds cap of ${cap} bytes`);
+        }
+        chunks.push(value);
+    }
+
+    const out = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return out;
 }

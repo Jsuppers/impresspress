@@ -22,8 +22,6 @@ pub mod openai;
 pub mod openai_compatible;
 #[cfg(feature = "llm")]
 mod service;
-#[cfg(feature = "llm")]
-pub(crate) mod sse;
 
 #[cfg(feature = "llm")]
 pub use service::ProviderLlmService;

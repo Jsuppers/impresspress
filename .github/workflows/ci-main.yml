@@ -283,6 +283,27 @@ jobs:
       - name: Run storage_paths.mjs unit tests (node --test)
         run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
 
+      # The browser adapter's own wasm tests. `ci.yml` runs these in a
+      # dedicated `browser-wasm-test` job, but that job is path-filtered to
+      # crates/impresspress-browser/ + Cargo.{toml,lock} and exists only on the
+      # PR workflow — so nothing has ever run them on a merge to `main`. The
+      # response-shaping, SSRF and row-codec behaviour they pin lives only in
+      # wasm (a host `cargo test` compiles none of it), which makes this the
+      # only place on this workflow where that behaviour is checked at all.
+      #
+      # See the ci.yml step for why NODE_OPTIONS is required: bridge.js's
+      # top-level `/vendor/sql-wasm-esm.js` import does not resolve under Node
+      # without the hook, and the whole suite fails to load.
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          version: 'v0.15.0'
+
+      - name: Run impresspress-browser wasm tests (Node)
+        env:
+          NODE_OPTIONS: --import ./js/test/node-hooks.mjs
+        run: wasm-pack test --node crates/impresspress-browser
+
   # The only job that compiles, boots and exercises the browser development
   # sandbox. `impresspress-web/src/dev_runtime.rs` — wasmi `inspect`/`probe`,
   # the runtime rebuild, `replace_wafer`, boot convergence, seed-on-boot —

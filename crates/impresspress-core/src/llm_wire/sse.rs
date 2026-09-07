@@ -34,6 +34,12 @@ pub struct SseFrameStream {
     buf: String,
 }
 
+impl Default for SseFrameStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseFrameStream {
     pub fn new() -> Self {
         Self { buf: String::new() }
