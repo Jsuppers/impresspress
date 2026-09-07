@@ -741,3 +741,87 @@ async fn a_failing_groups_count_fails_the_stats_endpoint_and_the_overview_page()
         "the admin overview page must report the outage, not render 0 groups"
     );
 }
+
+/// The five lookups whose caller could not tell "no" from "the database is
+/// down".
+///
+/// Each answered a plain `bool` or `Option` and collapsed a failed read into
+/// the negative answer, and a caller then acted on it: a blip in
+/// `find_user_by_stripe_sub` skipped the addon-total sync and the outbound
+/// `products.subscription.updated` while the webhook still reported success,
+/// a blip in either `default_id` wrote a group or a product with no template
+/// instead of the seeded default, and a blip in the two ownership reads told
+/// a buyer they did not own the product a purchase required.
+///
+/// The positive controls share this test on purpose: the point is not that a
+/// broken read errors, it is that a legitimately absent row still answers no.
+#[tokio::test]
+async fn the_ownership_and_template_lookups_separate_no_from_a_failed_read() {
+    let healthy = ctx().await;
+
+    assert!(
+        !repo::subscriptions::active_plan_exists(&healthy, "user_1", "plan_x")
+            .await
+            .expect("a healthy read answers"),
+        "no subscription row is a legitimate no"
+    );
+    assert!(
+        !repo::purchases::line_item_exists_for_product(
+            &healthy,
+            vec![serde_json::json!("purchase_1")],
+            "prod_x"
+        )
+        .await
+        .expect("a healthy read answers"),
+        "no line item is a legitimate no"
+    );
+    assert_eq!(
+        repo::subscriptions::find_user_by_stripe_sub(&healthy, "sub_absent")
+            .await
+            .expect("a healthy read answers"),
+        None,
+        "no subscription for that Stripe id is a legitimate absence"
+    );
+    // Seeding the two "default" templates is the Init lifecycle's job, not
+    // the migrations', so a migrated-but-uninitialised database legitimately
+    // has none — which is the `Ok(None)` a create may still proceed on.
+    repo::group_templates::default_id(&healthy)
+        .await
+        .expect("a healthy read answers");
+    repo::product_templates::default_id(&healthy)
+        .await
+        .expect("a healthy read answers");
+
+    let broken = ctx().await.break_reads();
+
+    assert!(
+        repo::subscriptions::active_plan_exists(&broken, "user_1", "plan_x")
+            .await
+            .is_err(),
+        "a failed subscription read must not read as `you do not own this`"
+    );
+    assert!(
+        repo::purchases::line_item_exists_for_product(
+            &broken,
+            vec![serde_json::json!("purchase_1")],
+            "prod_x"
+        )
+        .await
+        .is_err(),
+        "a failed line-item read must not read as `you do not own this`"
+    );
+    assert!(
+        repo::subscriptions::find_user_by_stripe_sub(&broken, "sub_absent")
+            .await
+            .is_err(),
+        "a failed owner lookup must not read as `this subscription is unowned`"
+    );
+    assert!(
+        repo::group_templates::default_id(&broken).await.is_err(),
+        "a failed template read must not read as `there is no default template`"
+    );
+    assert!(
+        repo::product_templates::default_id(&broken).await.is_err(),
+        "a failed template read must not read as `there is no default template`"
+    );
+}

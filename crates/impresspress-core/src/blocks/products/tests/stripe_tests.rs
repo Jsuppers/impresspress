@@ -5878,3 +5878,224 @@ async fn a_paid_link_for_a_soft_deleted_product_still_reconciles_into_an_order()
     // resurrect a listing into the public catalog.
     assert!(repo::products::get(&ctx, product_id).await.is_err());
 }
+
+/// A buyer who cannot be checked is not a buyer who does not own it.
+///
+/// `user_owns_product` collapsed all three of its reads into `false` — the
+/// middle one literally as `Err(_) => false` — so a database outage answered
+/// "You must sign in and own the required product before purchasing this
+/// item." to a signed-in buyer who already owned it. That refusal names the
+/// buyer as the problem, is a 400 no client retries, and leaves no trace of
+/// the outage anywhere near the storefront.
+#[tokio::test]
+async fn a_gated_checkout_reports_an_outage_instead_of_denying_ownership() {
+    let ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    seed(
+        &ctx,
+        "impresspress__products__products",
+        "prereq",
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Prerequisite")),
+            ("status".to_string(), serde_json::json!("active")),
+        ]),
+    )
+    .await;
+    let offer_id = seed_gated_offer(&ctx, "gated", "prereq").await;
+
+    // The positive control: with a healthy database the buyer genuinely does
+    // not own `prereq`, and that answer is unchanged.
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "buyer_1",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    assert!(
+        output_is_error(
+            stripe::handle_checkout(&ctx, &msg, input).await,
+            ErrorCode::InvalidArgument,
+        )
+        .await,
+        "a buyer who really does not own the prerequisite still gets the 400"
+    );
+
+    // Now the subscription read — the first of the three — cannot answer.
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.list", "impresspress__products__subscriptions")],
+    );
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "buyer_1",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    assert!(
+        output_is_error(
+            stripe::handle_checkout(&failing, &msg, input).await,
+            ErrorCode::Internal,
+        )
+        .await,
+        "an ownership check that could not run must report the outage, not deny the buyer"
+    );
+
+    // And the same for the line-item half, which the subscription read falls
+    // through to. It is only reached once the buyer has a completed order to
+    // look inside, so seed one — without it the check short-circuits on an
+    // empty id list and the read under test never runs.
+    seed(
+        &ctx,
+        repo::purchases::PURCHASES_TABLE,
+        "order_probe",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("buyer_1")),
+            ("buyer_user_id".to_string(), serde_json::json!("buyer_1")),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("total_cents".to_string(), serde_json::json!(1000)),
+            ("currency".to_string(), serde_json::json!("USD")),
+        ]),
+    )
+    .await;
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.list", repo::purchases::LINE_ITEMS_TABLE)],
+    );
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "buyer_1",
+        serde_json::json!({ "offer_id": offer_id }),
+    );
+    assert!(
+        output_is_error(
+            stripe::handle_checkout(&failing, &msg, input).await,
+            ErrorCode::Internal,
+        )
+        .await,
+        "the line-item half of the ownership check propagates too"
+    );
+}
+
+/// Seed a published offer on `product_id`, which requires `requires`.
+async fn seed_gated_offer(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+    requires: &str,
+) -> String {
+    seed(
+        ctx,
+        "impresspress__products__products",
+        product_id,
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Gated product")),
+            ("status".to_string(), serde_json::json!("active")),
+            ("requires".to_string(), serde_json::json!(requires)),
+        ]),
+    )
+    .await;
+    let definition: OfferDefinitionRequest = serde_json::from_value(serde_json::json!({
+        "name": "Plan",
+        "mode": "payment",
+        "currency": "usd",
+        "pricing_model": "fixed",
+        "usage_type": "licensed",
+        "billing_scheme": "per_unit",
+        "tax_behavior": "exclusive",
+        "components": [{
+            "key": "price",
+            "label": "Plan",
+            "required": true,
+            "amount": {"type": "fixed", "unit_amount_minor": 1000}
+        }]
+    }))
+    .expect("offer definition");
+    let offer = repo::offers::create(ctx, product_id, "admin_1", &definition)
+        .await
+        .expect("create offer");
+    repo::offers::publish(ctx, product_id, &offer.offer.id)
+        .await
+        .expect("publish offer");
+    offer.offer.id
+}
+
+/// A subscription whose owner could not be looked up is not an unowned one.
+///
+/// `find_user_by_stripe_sub` collapsed a failed read into `None`, and the
+/// `customer.subscription.updated` arm reads that as "nobody owns this":
+/// the addon-total sync and the outbound `products.subscription.updated`
+/// were both skipped and the delivery still answered Stripe with a success,
+/// so nothing retried and the platform's view of a paying account drifted
+/// silently.
+#[tokio::test]
+async fn a_subscription_update_whose_owner_lookup_fails_does_not_report_success() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed(
+        &ctx,
+        "impresspress__products__subscriptions",
+        "sub_owner_probe",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("owner_1")),
+            (
+                "stripe_subscription_id".to_string(),
+                serde_json::json!("sub_owner_probe"),
+            ),
+            ("status".to_string(), serde_json::json!("active")),
+            ("plan".to_string(), serde_json::json!("pro")),
+        ]),
+    )
+    .await;
+
+    let event = serde_json::json!({
+        "id": "evt_owner_probe",
+        "type": "customer.subscription.updated",
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_owner_probe",
+            "status": "active",
+            "cancel_at_period_end": false,
+            "canceled_at": null
+        }}
+    });
+
+    // Positive control: the same delivery succeeds against a healthy
+    // database, so the assertion below cannot pass because the event was
+    // malformed.
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert_eq!(
+        crate::test_support::output_http_status(stripe::handle_webhook(&ctx, &msg, input).await)
+            .await,
+        200,
+    );
+
+    // A second, identical delivery under an outage on the owner lookup.
+    // `stripe_events` de-duplicates by id, so this one carries its own.
+    let mut retry = event.clone();
+    retry["id"] = serde_json::json!("evt_owner_probe_2");
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.list", "impresspress__products__subscriptions")],
+    )
+    .after_passing(2);
+    let (msg, input) = webhook_msg(&retry, WEBHOOK_SECRET);
+    assert!(
+        output_is_error(
+            stripe::handle_webhook(&failing, &msg, input).await,
+            ErrorCode::Internal,
+        )
+        .await,
+        "an owner lookup that could not run must make Stripe redeliver, not report success"
+    );
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_owner_probe_2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["status"], "failed");
+    assert_eq!(
+        event_row.data["last_error"], "subscription owner lookup failed",
+        "the failure has to name the lookup, not a downstream symptom"
+    );
+}

@@ -374,7 +374,18 @@ pub(crate) async fn create_checkout_order(
             ("updated_at".to_string(), serde_json::json!(&now)),
         ]);
         if let Err(error) = add_line_item(ctx, item_data).await {
-            let _ = delete_with_line_items(ctx, &purchase.id).await;
+            // Compensation: still return the original failure, because that
+            // is what the caller has to act on. But a compensation that
+            // itself failed leaves a half-built order with no line items and
+            // nothing pointing at it, so the id has to reach the log or no
+            // one can ever find the row.
+            if let Err(rollback) = delete_with_line_items(ctx, &purchase.id).await {
+                tracing::error!(
+                    purchase_id = %purchase.id,
+                    error = %rollback,
+                    "could not roll back a half-built order; it is orphaned"
+                );
+            }
             return Err(error);
         }
     }
@@ -1879,13 +1890,17 @@ pub(crate) async fn completed_purchase_ids(
 }
 
 /// Probe whether any of `purchase_ids` contains `product_id` as a line item.
+///
+/// `Ok(false)` is "none of them does". A failed read is `Err`: this is the
+/// second half of the ownership check a gated checkout runs, and it used to
+/// end in `matches!(rows, Ok(..))`, so an outage read as "you do not own it".
 pub(crate) async fn line_item_exists_for_product(
     ctx: &dyn Context,
     purchase_ids: Vec<serde_json::Value>,
     product_id: &str,
-) -> bool {
+) -> Result<bool, WaferError> {
     if purchase_ids.is_empty() {
-        return false;
+        return Ok(false);
     }
     let rows = db::list(
         ctx,
@@ -1909,6 +1924,6 @@ pub(crate) async fn line_item_exists_for_product(
             ..Default::default()
         },
     )
-    .await;
-    matches!(rows, Ok(rows) if !rows.records.is_empty())
+    .await?;
+    Ok(!rows.records.is_empty())
 }

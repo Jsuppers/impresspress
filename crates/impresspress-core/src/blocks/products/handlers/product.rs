@@ -965,11 +965,20 @@ pub(super) async fn handle_user_create_product(
         .get("product_template_id")
         .is_none_or(|value| value.as_str().is_some_and(str::is_empty))
     {
-        if let Some(default_id) = repo::product_templates::default_id(ctx).await {
-            data.insert(
-                "product_template_id".to_string(),
-                serde_json::Value::String(default_id),
-            );
+        match repo::product_templates::default_id(ctx).await {
+            Ok(Some(default_id)) => {
+                data.insert(
+                    "product_template_id".to_string(),
+                    serde_json::Value::String(default_id),
+                );
+            }
+            // No default template seeded: proceed without one, as this create
+            // always has.
+            Ok(None) => {}
+            // Same reasoning as the group create: a failed read is not "there
+            // is no default template", and writing the product anyway leaves
+            // a template-less row behind that reads as a choice.
+            Err(error) => return crud::db_error_internal(error, "Could not load product template"),
         }
     }
     if let Err(response) = seller_policy::validate_product_fields(ctx, &data).await {
