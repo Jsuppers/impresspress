@@ -15,7 +15,17 @@
 //!
 //! Tables must already exist via the owning block's migration files (applied
 //! at `lifecycle(Init)`); the shared `ensure_data_columns`/`ensure_query_columns`
-//! add only missing *columns* (always `TEXT` on SQLite) on demand.
+//! add only missing *columns* (always `TEXT` on SQLite) on demand — unless
+//! STRICT_SCHEMA is on, which this backend now honours (see [`STRICT_SCHEMA`]).
+//!
+//! ## The `DatabaseService` impl is a ledger, not a list of forwards
+//!
+//! It is written with [`wafer_core::forward_database_service!`], whose
+//! `ops { … }` block must name every operation on the trait or it does not
+//! expand. Eight of the trait's operations carry defaults that are NOT
+//! pass-throughs, so an implementation that leaves one out does not inherit
+//! "the same behaviour" — it inherits a different one, silently. Writing the
+//! word `inherit` is how a default gets taken here.
 //!
 //! ## OPFS flush durability contract
 //!
@@ -26,27 +36,118 @@
 //! (e.g. `create`) may issue several SQL statements internally (a lazy
 //! column-add ALTER, then the INSERT) — those all share the ONE flush at the
 //! end of the call, instead of the previous behavior of flushing after every
-//! single statement. See `with_flush`'s doc comment for the full contract,
-//! including why the flush still happens when the wrapped operation itself
-//! returns an error.
+//! single statement.
+//!
+//! The contract itself lives in [`with_flush_mapped`] and its precedence rules
+//! in [`resolve_flush_outcome`], because this is not the only writer to that
+//! database: `vector::service` writes the same sql.js file through the same
+//! bridge and goes through the same helper. There is one durability contract
+//! for the crate, not one per service.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use wafer_block::db::{Filter, ListOptions};
+// The `forward_database_service!` ledger below spells every generated
+// signature with a fully-qualified path, so only the types the `custom` bodies
+// name in their own signatures are imported here.
+use wafer_block::db::Filter;
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
     exec::DbExec,
-    service::{
-        AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table,
-        UpsertSpec,
-    },
+    service::{Column, DatabaseError, DatabaseService, Record, Table, UpsertSpec},
 };
 use wafer_sql_utils::{introspect, Backend};
 
 use crate::{bridge, db_codec};
 
+/// The resolved `WAFER_RUN__DATABASE__STRICT_SCHEMA` verdict, written once by
+/// `DatabaseService::set_strict_schema` at the shared `DatabaseBlock`'s `Init`
+/// and read by [`DbExec::strict_schema`] on every operation.
+///
+/// A static rather than a field because [`BrowserDatabaseService`] is a unit
+/// struct: it carries no handle, and every instance addresses the one global
+/// sql.js/OPFS database — `impresspress-web` constructs a second one for its
+/// boot hook precisely because they are interchangeable. STRICT_SCHEMA is a
+/// property of that database, so a per-instance field would let two handles
+/// disagree about the same schema.
+static STRICT_SCHEMA: AtomicBool = AtomicBool::new(false);
+
 /// Browser-side DatabaseService backed by sql.js via the JS bridge.
 pub struct BrowserDatabaseService;
+
+/// The crate's ONE durability contract: run a mutating `op`, then flush the
+/// sql.js database to OPFS exactly once, whatever `op` returned.
+///
+/// [`BrowserDatabaseService::with_flush`] is this with `E = DatabaseError`;
+/// `vector::service` is the other caller, with `E = VectorError`. `map_flush`
+/// turns the JS rejection into the caller's error type, which is the only
+/// thing that ever differed between them — the precedence rules below are the
+/// contract and must not be restated per caller. Before this was shared, the
+/// vector service ran `bridge::dbFlush()` itself with `?`, which skipped the
+/// flush entirely whenever the operation that mutated the database failed.
+///
+/// See [`resolve_flush_outcome`] for the precedence and why each arm is what
+/// it is.
+pub(crate) async fn with_flush_mapped<T, E>(
+    op: impl std::future::Future<Output = Result<T, E>>,
+    map_flush: impl FnOnce(String) -> E,
+) -> Result<T, E> {
+    with_flush_through(op, flush_through_bridge, map_flush).await
+}
+
+/// The one flush this crate performs: hand the sql.js database to `bridge.js`
+/// to write out to OPFS.
+async fn flush_through_bridge() -> Result<(), String> {
+    bridge::dbFlush()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("flush to OPFS: {}", bridge::describe(&e)))
+}
+
+/// [`with_flush_mapped`] with the flush supplied by the caller.
+///
+/// `flush` is a closure, not a future, so it cannot be started before `op`
+/// finishes — and so the ONE property the whole contract rests on, that the
+/// flush runs whatever `op` returned, is assertable without a bridge or an
+/// OPFS. That property is the regression this shape exists to prevent: the
+/// vector service used to run `bridge::dbFlush()` with `?`, which skipped the
+/// flush entirely whenever the mutating operation failed.
+async fn with_flush_through<T, E, Fut>(
+    op: impl std::future::Future<Output = Result<T, E>>,
+    flush: impl FnOnce() -> Fut,
+    map_flush: impl FnOnce(String) -> E,
+) -> Result<T, E>
+where
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let result = op.await;
+    let flush = flush().await.map_err(map_flush);
+    resolve_flush_outcome(result, flush)
+}
+
+/// Which of an operation's outcome and its flush's outcome the caller is told
+/// about. Pure, so it is testable without a bridge (`flush_precedence`).
+///
+/// - `op` succeeds, flush succeeds → `Ok`. The common case: durable.
+/// - `op` succeeds, flush fails → the flush error. The mutation is sitting in
+///   memory only (quota exceeded, OPFS permission revoked); reporting success
+///   would tell the caller data is durable when a Service Worker eviction
+///   could still lose it.
+/// - `op` fails → the operation's own error, whatever the flush did. It is the
+///   more specific and more actionable of the two. The flush is still
+///   *attempted* — a failed logical operation may have applied some of its
+///   statements already (a lazy column-add ALTER before a rejected INSERT),
+///   and skipping the flush would leave those in memory until some unrelated
+///   later mutation happened to write them out.
+pub(crate) fn resolve_flush_outcome<T, E>(op: Result<T, E>, flush: Result<(), E>) -> Result<T, E> {
+    match (op, flush) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Ok(_), Err(flush_err)) => Err(flush_err),
+        (Err(op_err), _) => Err(op_err),
+    }
+}
 
 // SAFETY: `BrowserDatabaseService` is a unit struct with no shared state.
 // wasm32-unknown-unknown has no threads, so the `Send`/`Sync` bounds
@@ -58,39 +159,13 @@ unsafe impl Sync for BrowserDatabaseService {}
 impl BrowserDatabaseService {
     /// Run a mutating `op`, then flush the sql.js DB to OPFS exactly once —
     /// this is the coalescing point described in the module doc comment.
-    ///
-    /// Flushes even when `op` itself resolves to `Err`: the shared
-    /// `DbExec` defaults can issue more than one statement per logical
-    /// operation (e.g. `create`'s lazy column-add ALTER before its INSERT),
-    /// so an operation that ultimately fails may still have mutated the
-    /// in-memory sql.js DB. Skipping the flush in that case would silently
-    /// discard an already-applied statement until some *later* mutation
-    /// happens to flush it — an unnecessary, avoidable durability gap.
-    ///
-    /// Outcome precedence:
-    /// - `op` succeeds, flush succeeds → `Ok` (the common case: durable).
-    /// - `op` succeeds, flush fails → `Err` (the flush error). The mutation
-    ///   is only sitting in memory at this point (quota exceeded, OPFS
-    ///   permission revoked, etc.) — reporting success here would tell the
-    ///   caller data is durable when a Service Worker eviction could lose
-    ///   it, so this must surface as a failure.
-    /// - `op` fails (regardless of flush outcome) → `Err` (the operation's
-    ///   own error) — more specific/actionable than whatever the flush
-    ///   attempt did; we still attempt the flush as a best-effort capture
-    ///   of any partial writes the failed operation may have already made.
+    /// [`with_flush_mapped`] owns the contract; this is it at
+    /// `E = DatabaseError`.
     async fn with_flush<T>(
         &self,
         op: impl std::future::Future<Output = Result<T, DatabaseError>>,
     ) -> Result<T, DatabaseError> {
-        let result = op.await;
-        let flush = bridge::dbFlush().await.map(|_| ()).map_err(|e| {
-            DatabaseError::Internal(format!("flush to OPFS: {}", bridge::describe(&e)))
-        });
-        match (result, flush) {
-            (Ok(v), Ok(())) => Ok(v),
-            (Ok(_), Err(flush_err)) => Err(flush_err),
-            (Err(op_err), _) => Err(op_err),
-        }
+        with_flush_mapped(op, DatabaseError::Internal).await
     }
 
     /// Run `sql` and hand back the raw per-column JSON row objects sql.js
@@ -129,6 +204,13 @@ impl BrowserDatabaseService {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl DbExec for BrowserDatabaseService {
     const BACKEND: Backend = Backend::Sqlite;
+
+    /// The flag `DatabaseService::set_strict_schema` recorded. When it is on,
+    /// the shared orchestration skips the per-operation table-exists probe and
+    /// the lazy ADD COLUMN path, trusting the migrated schema.
+    fn strict_schema(&self) -> bool {
+        STRICT_SCHEMA.load(Ordering::Relaxed)
+    }
 
     /// Decoding is [`record_from_json_row`], the one policy every SQL-family
     /// backend now shares — the private `db_codec::build_records` this
@@ -204,224 +286,200 @@ impl DbExec for BrowserDatabaseService {
     }
 }
 
-// ─── DatabaseService — forwards into the shared DbExec defaults ───────────────
+// ─── DatabaseService — an explicit ledger over the shared DbExec defaults ─────
 //
-// Every method that can mutate the sql.js DB wraps its `DbExec` default call
-// in `with_flush` so exactly one OPFS flush happens per logical call,
-// regardless of how many `run_execute` statements the shared default issued
-// internally. Read-only methods (`get`/`list`/`count`/`sum`/`query_raw`/
-// `aggregate`) forward directly — nothing to flush. `take_where` is a
-// mutator (`DELETE ... RETURNING`) despite its read-shaped return value, so
-// it is flushed like the other mutators below.
+// Written with `forward_database_service!` rather than by hand. The macro's
+// `ops { … }` block names EVERY operation on the trait and refuses to expand
+// if one is missing, so the twenty-three lines below are a ledger of what this
+// backend does with each: `forward` = the shared `DbExec` default, `custom` =
+// written here, `inherit` = deliberately the `DatabaseService` trait default.
+// Eight of those trait defaults are not pass-throughs (`take_where` is a
+// list-then-delete loop instead of `DELETE … RETURNING`, `set_strict_schema`
+// is a silent no-op, …), and a backend that omits one does not get "the same
+// behaviour" — it gets a different, worse one, invisibly. That is the bug the
+// ledger makes unrepresentable.
+//
+// The `custom` entries here are all the same thing: every method that can
+// mutate the sql.js database wraps its `DbExec` default in `with_flush`, so
+// exactly one OPFS flush happens per logical call however many `run_execute`
+// statements the shared default issued internally. `take_where` is a mutator
+// (`DELETE … RETURNING`) despite its read-shaped return, so it is flushed too.
+// `set_strict_schema` is custom because `DbExec` has no such operation to
+// forward to — it is the setter behind `DbExec::strict_schema`.
+wafer_core::forward_database_service! {
+    impl DatabaseService for BrowserDatabaseService {
+        forward_to DbExec;
 
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-impl DatabaseService for BrowserDatabaseService {
-    async fn get(&self, collection: &str, id: &str) -> Result<Record, DatabaseError> {
-        DbExec::get(self, collection, id).await
-    }
+        ops {
+            get: forward,
+            list: forward,
+            create: custom,
+            update: custom,
+            delete: custom,
+            count: forward,
+            sum: forward,
+            query_raw: forward,
+            exec_raw: custom,
+            delete_where: custom,
+            delete_where_count: custom,
+            take_where: custom,
+            update_where: custom,
+            update_where_count: custom,
+            increment_field_where: custom,
+            upsert: custom,
+            aggregate: forward,
+            ensure_schema_table: custom,
+            ensure_schema_tables: inherit,
+            schema_table_exists: forward,
+            schema_drop_table: custom,
+            schema_add_column: custom,
+            set_strict_schema: custom,
+        }
 
-    async fn list(
-        &self,
-        collection: &str,
-        opts: &ListOptions,
-    ) -> Result<RecordList, DatabaseError> {
-        DbExec::list(self, collection, opts).await
-    }
+        async fn create(
+            &self,
+            collection: &str,
+            data: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            self.with_flush(DbExec::create(self, collection, data))
+                .await
+        }
 
-    async fn create(
-        &self,
-        collection: &str,
-        data: HashMap<String, serde_json::Value>,
-    ) -> Result<Record, DatabaseError> {
-        self.with_flush(DbExec::create(self, collection, data))
+        async fn update(
+            &self,
+            collection: &str,
+            id: &str,
+            data: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            self.with_flush(DbExec::update(self, collection, id, data))
+                .await
+        }
+
+        async fn delete(&self, collection: &str, id: &str) -> Result<(), DatabaseError> {
+            self.with_flush(DbExec::delete(self, collection, id)).await
+        }
+
+        async fn exec_raw(
+            &self,
+            query: &str,
+            args: &[serde_json::Value],
+        ) -> Result<i64, DatabaseError> {
+            self.with_flush(DbExec::exec_raw(self, query, args)).await
+        }
+
+        async fn delete_where(
+            &self,
+            collection: &str,
+            filters: &[Filter],
+        ) -> Result<(), DatabaseError> {
+            self.with_flush(DbExec::delete_where(self, collection, filters))
+                .await
+        }
+
+        async fn delete_where_count(
+            &self,
+            collection: &str,
+            filters: &[Filter],
+        ) -> Result<i64, DatabaseError> {
+            self.with_flush(DbExec::delete_where_count(self, collection, filters))
+                .await
+        }
+
+        async fn take_where(
+            &self,
+            collection: &str,
+            filters: &[Filter],
+        ) -> Result<Vec<Record>, DatabaseError> {
+            self.with_flush(DbExec::take_where(self, collection, filters))
+                .await
+        }
+
+        async fn update_where(
+            &self,
+            collection: &str,
+            filters: &[Filter],
+            data: HashMap<String, serde_json::Value>,
+        ) -> Result<(), DatabaseError> {
+            self.with_flush(DbExec::update_where(self, collection, filters, data))
+                .await
+        }
+
+        async fn update_where_count(
+            &self,
+            collection: &str,
+            filters: &[Filter],
+            data: HashMap<String, serde_json::Value>,
+        ) -> Result<i64, DatabaseError> {
+            self.with_flush(DbExec::update_where_count(self, collection, filters, data))
+                .await
+        }
+
+        async fn increment_field_where(
+            &self,
+            collection: &str,
+            col: &str,
+            delta: i64,
+            filters: &[Filter],
+        ) -> Result<i64, DatabaseError> {
+            self.with_flush(DbExec::increment_field_where(
+                self, collection, col, delta, filters,
+            ))
             .await
-    }
+        }
 
-    async fn update(
-        &self,
-        collection: &str,
-        id: &str,
-        data: HashMap<String, serde_json::Value>,
-    ) -> Result<Record, DatabaseError> {
-        self.with_flush(DbExec::update(self, collection, id, data))
-            .await
-    }
+        async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+            self.with_flush(DbExec::upsert(self, collection, spec))
+                .await
+        }
 
-    async fn delete(&self, collection: &str, id: &str) -> Result<(), DatabaseError> {
-        self.with_flush(DbExec::delete(self, collection, id)).await
-    }
+        /// The DDL sequence itself is [`DbExec::ensure_schema_table`] — the
+        /// shared default this file used to carry a copy of. The copy had
+        /// drifted in one way that mattered and one that did not: it built the
+        /// same CREATE / add-missing-columns / indexes / FK-indexes sequence,
+        /// but it hard-coded `Backend::Sqlite` instead of reading
+        /// `Self::BACKEND`, and it did not invalidate the schema cache on the
+        /// error path (harmless here only because this backend has no cache —
+        /// a fact the copy did not state and could not enforce).
+        ///
+        /// What stays browser-specific is the one flush: the whole sequence is
+        /// several `run_execute` calls and they share a single write to OPFS.
+        async fn ensure_schema_table(&self, table: &Table) -> Result<(), DatabaseError> {
+            self.with_flush(DbExec::ensure_schema_table(self, table))
+                .await
+        }
 
-    async fn count(&self, collection: &str, filters: &[Filter]) -> Result<i64, DatabaseError> {
-        DbExec::count(self, collection, filters).await
-    }
-
-    async fn sum(
-        &self,
-        collection: &str,
-        field: &str,
-        filters: &[Filter],
-    ) -> Result<f64, DatabaseError> {
-        DbExec::sum(self, collection, field, filters).await
-    }
-
-    async fn query_raw(
-        &self,
-        query: &str,
-        args: &[serde_json::Value],
-    ) -> Result<Vec<Record>, DatabaseError> {
-        DbExec::query_raw(self, query, args).await
-    }
-
-    async fn exec_raw(
-        &self,
-        query: &str,
-        args: &[serde_json::Value],
-    ) -> Result<i64, DatabaseError> {
-        self.with_flush(DbExec::exec_raw(self, query, args)).await
-    }
-
-    async fn delete_where(
-        &self,
-        collection: &str,
-        filters: &[Filter],
-    ) -> Result<(), DatabaseError> {
-        self.with_flush(DbExec::delete_where(self, collection, filters))
-            .await
-    }
-
-    async fn delete_where_count(
-        &self,
-        collection: &str,
-        filters: &[Filter],
-    ) -> Result<i64, DatabaseError> {
-        self.with_flush(DbExec::delete_where_count(self, collection, filters))
-            .await
-    }
-
-    async fn take_where(
-        &self,
-        collection: &str,
-        filters: &[Filter],
-    ) -> Result<Vec<Record>, DatabaseError> {
-        self.with_flush(DbExec::take_where(self, collection, filters))
-            .await
-    }
-
-    async fn update_where(
-        &self,
-        collection: &str,
-        filters: &[Filter],
-        data: HashMap<String, serde_json::Value>,
-    ) -> Result<(), DatabaseError> {
-        self.with_flush(DbExec::update_where(self, collection, filters, data))
-            .await
-    }
-
-    async fn increment_field_where(
-        &self,
-        collection: &str,
-        col: &str,
-        delta: i64,
-        filters: &[Filter],
-    ) -> Result<i64, DatabaseError> {
-        self.with_flush(DbExec::increment_field_where(
-            self, collection, col, delta, filters,
-        ))
-        .await
-    }
-
-    async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
-        self.with_flush(DbExec::upsert(self, collection, spec))
-            .await
-    }
-
-    async fn aggregate(
-        &self,
-        collection: &str,
-        spec: AggregateSpec,
-    ) -> Result<Vec<Record>, DatabaseError> {
-        DbExec::aggregate(self, collection, spec).await
-    }
-
-    async fn update_where_count(
-        &self,
-        collection: &str,
-        filters: &[Filter],
-        data: HashMap<String, serde_json::Value>,
-    ) -> Result<i64, DatabaseError> {
-        self.with_flush(DbExec::update_where_count(self, collection, filters, data))
-            .await
-    }
-
-    // --- Schema management ---
-
-    async fn ensure_schema_table(&self, table: &Table) -> Result<(), DatabaseError> {
-        self.with_flush(async {
-            // Blocks own their schema via migration files; runtime callers
-            // may still ask for a one-off table. Build the DDL via the
-            // shared ddl builders and run it through the execution
-            // primitive.
-            let create = wafer_sql_utils::ddl::build_create_table(table, Backend::Sqlite)
-                .map_err(|e| DatabaseError::Internal(format!("build create table: {e}")))?;
-            self.run_execute(&create.sql, &[]).await?;
-
-            let existing = DbExec::get_columns(self, &table.name).await?;
-            for col in &table.columns {
-                if !existing.contains(&col.name.to_lowercase()) {
-                    let alter =
-                        wafer_sql_utils::ddl::build_add_column(&table.name, col, Backend::Sqlite);
-                    // `add_column_checked` (the shared `DbExec` default that
-                    // every other backend's lazy column-add path already
-                    // goes through — see `ensure_data_columns`) runs the
-                    // ALTER and, only on failure, re-queries the table's
-                    // actual columns: if `col` is now present, a concurrent
-                    // writer raced us to add the same column and the
-                    // failure is benign; otherwise the failure is real
-                    // (quota exceeded, malformed DDL, an OPFS write error
-                    // surfacing through `run_execute`, a flush error, …) and
-                    // propagates instead of being silently swallowed like
-                    // every `run_execute` error here used to be.
-                    DbExec::add_column_checked(self, &table.name, &col.name, &alter).await?;
-                }
-            }
-
-            for idx in &table.indexes {
-                let stmt =
-                    wafer_sql_utils::ddl::build_create_index(&table.name, idx, Backend::Sqlite)
-                        .map_err(|e| DatabaseError::Internal(format!("build create index: {e}")))?;
+        async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
+            self.with_flush(async {
+                let stmt = wafer_sql_utils::ddl::build_drop_table(name, Self::BACKEND);
                 self.run_execute(&stmt.sql, &[]).await?;
-            }
-            for stmt in wafer_sql_utils::ddl::build_fk_indexes(table, Backend::Sqlite)
-                .map_err(|e| DatabaseError::Internal(format!("build FK indexes: {e}")))?
-            {
+                Ok(())
+            })
+            .await
+        }
+
+        async fn schema_add_column(
+            &self,
+            table: &str,
+            column: &Column,
+        ) -> Result<(), DatabaseError> {
+            self.with_flush(async {
+                let stmt = wafer_sql_utils::ddl::build_add_column(table, column, Self::BACKEND);
                 self.run_execute(&stmt.sql, &[]).await?;
-            }
-            Ok(())
-        })
-        .await
-    }
+                Ok(())
+            })
+            .await
+        }
 
-    async fn schema_table_exists(&self, name: &str) -> Result<bool, DatabaseError> {
-        DbExec::schema_table_exists(self, name).await
-    }
-
-    async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
-        self.with_flush(async {
-            let stmt = wafer_sql_utils::ddl::build_drop_table(name, Backend::Sqlite);
-            self.run_execute(&stmt.sql, &[]).await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn schema_add_column(&self, table: &str, column: &Column) -> Result<(), DatabaseError> {
-        self.with_flush(async {
-            let stmt = wafer_sql_utils::ddl::build_add_column(table, column, Backend::Sqlite);
-            self.run_execute(&stmt.sql, &[]).await?;
-            Ok(())
-        })
-        .await
+        /// Record the resolved STRICT_SCHEMA verdict so [`DbExec::strict_schema`]
+        /// can read it. The trait default is a silent no-op, which is the
+        /// wrong answer for a backend that DOES run through `DbExec`: the
+        /// shared `DatabaseBlock` advertises
+        /// `WAFER_RUN__DATABASE__STRICT_SCHEMA` as a config key and applies it
+        /// at `Init` on every backend, so inheriting the no-op meant this
+        /// target offered an operator a switch that did nothing.
+        fn set_strict_schema(&self, enabled: bool) {
+            STRICT_SCHEMA.store(enabled, Ordering::Relaxed);
+        }
     }
 }
 
@@ -583,5 +641,175 @@ mod codec_policy {
     fn an_absent_scalar_row_is_zero() {
         assert_eq!(scalar_i64(None), 0);
         assert!(scalar_f64(None).abs() < f64::EPSILON);
+    }
+}
+
+/// STRICT_SCHEMA is applied, not silently dropped. `database.rs` is
+/// wasm32-only, so these run under `wasm-pack test --node`; they read and
+/// write the flag and touch no bridge.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod strict_schema_policy {
+    use wafer_core::interfaces::database::{exec::DbExec, service::DatabaseService};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::BrowserDatabaseService;
+
+    /// **Fails on the pre-change tree**, where `set_strict_schema` was the
+    /// trait's silent no-op default and `DbExec::strict_schema` therefore
+    /// always answered `false`. `DatabaseBlock`'s `Init` reads
+    /// `WAFER_RUN__DATABASE__STRICT_SCHEMA` and calls the setter on every
+    /// backend, so the browser advertised the config key (through the shared
+    /// block's `config_keys`) and then ignored whatever an operator set.
+    #[wasm_bindgen_test]
+    fn setting_strict_schema_is_observed_by_the_shared_executor() {
+        let svc = BrowserDatabaseService;
+        // The default the shared executor starts from.
+        assert!(!DbExec::strict_schema(&svc));
+
+        DatabaseService::set_strict_schema(&svc, true);
+        assert!(
+            DbExec::strict_schema(&svc),
+            "the shared orchestration must see the flag, or the table-exists \
+             probe and the lazy ADD COLUMN path stay on the hot path"
+        );
+
+        // A second handle sees it too: the service is a unit struct over one
+        // global sql.js database, so the flag is a property of that database
+        // and not of a handle. `impresspress-web` holds a second handle for
+        // its boot hook.
+        assert!(DbExec::strict_schema(&BrowserDatabaseService));
+
+        DatabaseService::set_strict_schema(&svc, false);
+        assert!(!DbExec::strict_schema(&svc));
+    }
+}
+
+/// The flush precedence every mutating path in this crate shares, and the
+/// unconditional flush underneath it. No bridge, no OPFS.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod flush_precedence {
+    use std::{cell::Cell, rc::Rc};
+
+    use wafer_core::interfaces::database::service::DatabaseError;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{resolve_flush_outcome, with_flush_through};
+
+    /// A FAILED operation must still flush. The headline of the durability
+    /// change was exactly this: four vector-service sites ran the flush with
+    /// `?`, so a failed mutation skipped it and left whatever statements had
+    /// already applied (a lazy column-add ALTER before a rejected INSERT) in
+    /// memory only, until some unrelated later mutation happened to write them
+    /// out. `resolve_flush_outcome` cannot see this — it is handed both
+    /// outcomes — so the assertion has to be on the wrapper.
+    #[wasm_bindgen_test]
+    async fn a_failed_operation_still_flushes() {
+        let flushes = Rc::new(Cell::new(0u32));
+        let counter = flushes.clone();
+
+        let out: Result<u8, DatabaseError> = with_flush_through(
+            async { Err(DatabaseError::NotFound) },
+            move || {
+                counter.set(counter.get() + 1);
+                async { Ok(()) }
+            },
+            DatabaseError::Internal,
+        )
+        .await;
+
+        assert_eq!(
+            flushes.get(),
+            1,
+            "the flush was skipped because the operation failed"
+        );
+        assert!(matches!(out, Err(DatabaseError::NotFound)));
+    }
+
+    /// …and a successful one flushes exactly once, not once per statement the
+    /// operation ran. That coalescing is the other half of the contract.
+    #[wasm_bindgen_test]
+    async fn a_successful_operation_flushes_exactly_once() {
+        let flushes = Rc::new(Cell::new(0u32));
+        let counter = flushes.clone();
+
+        let out: Result<u8, DatabaseError> = with_flush_through(
+            async { Ok(7) },
+            move || {
+                counter.set(counter.get() + 1);
+                async { Ok(()) }
+            },
+            DatabaseError::Internal,
+        )
+        .await;
+
+        assert_eq!(flushes.get(), 1);
+        assert_eq!(out.expect("ok"), 7);
+    }
+
+    /// The flush's own failure reaches the caller through `map_flush`, in the
+    /// caller's error type — the only thing that ever differed between this
+    /// helper's two callers.
+    #[wasm_bindgen_test]
+    async fn a_flush_failure_is_mapped_into_the_callers_error_type() {
+        let out: Result<u8, DatabaseError> = with_flush_through(
+            async { Ok(7) },
+            || async { Err("quota exceeded".to_string()) },
+            DatabaseError::Internal,
+        )
+        .await;
+
+        match out {
+            Err(DatabaseError::Internal(msg)) => assert_eq!(msg, "quota exceeded"),
+            other => panic!("expected the mapped flush error, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn a_durable_success_is_a_success() {
+        let out: Result<u8, DatabaseError> = resolve_flush_outcome(Ok(7), Ok(()));
+        assert_eq!(out.expect("ok"), 7);
+    }
+
+    /// A mutation that only reached memory must not be reported as done: a
+    /// Service Worker eviction would lose it.
+    #[wasm_bindgen_test]
+    fn a_failed_flush_beats_a_successful_operation() {
+        let out: Result<u8, DatabaseError> =
+            resolve_flush_outcome(Ok(7), Err(DatabaseError::Internal("quota".into())));
+        match out {
+            Err(DatabaseError::Internal(msg)) => assert_eq!(msg, "quota"),
+            other => panic!("expected the flush error, got {other:?}"),
+        }
+    }
+
+    /// …but the operation's own error is the more actionable of the two, so it
+    /// wins even when the flush also failed.
+    #[wasm_bindgen_test]
+    fn the_operations_error_beats_the_flushs() {
+        let out: Result<u8, DatabaseError> = resolve_flush_outcome(
+            Err(DatabaseError::NotFound),
+            Err(DatabaseError::Internal("quota".into())),
+        );
+        assert!(matches!(out, Err(DatabaseError::NotFound)));
+    }
+
+    /// The same three answers for the vector service's error type — the point
+    /// of sharing the helper is that the two callers cannot drift.
+    #[wasm_bindgen_test]
+    fn the_vector_services_error_type_gets_the_same_precedence() {
+        use wafer_core::interfaces::vector::service::VectorError;
+
+        let ok: Result<(), VectorError> = resolve_flush_outcome(Ok(()), Ok(()));
+        assert!(ok.is_ok());
+
+        let flush_failed: Result<(), VectorError> =
+            resolve_flush_outcome(Ok(()), Err(VectorError::Internal("quota".into())));
+        assert!(matches!(flush_failed, Err(VectorError::Internal(_))));
+
+        let both_failed: Result<(), VectorError> = resolve_flush_outcome(
+            Err(VectorError::IndexNotFound("idx".into())),
+            Err(VectorError::Internal("quota".into())),
+        );
+        assert!(matches!(both_failed, Err(VectorError::IndexNotFound(_))));
     }
 }

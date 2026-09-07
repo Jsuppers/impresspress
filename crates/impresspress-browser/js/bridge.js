@@ -294,12 +294,16 @@ export async function storageGet(folder, key) {
     const data = new Uint8Array(buffer);
 
     // Read metadata
+    // Merged over the defaults rather than replacing them: a sidecar that
+    // parses but is missing a field would otherwise hand Rust an object it
+    // cannot decode (`GetMeta` has no optional fields), and on the streaming
+    // path that decode failure used to strand a registered reader.
     let meta = { content_type: 'application/octet-stream', size: data.length };
     try {
         const metaHandle = await parent.getFileHandle(metaName(leaf));
         const metaFile = await metaHandle.getFile();
         const metaText = await metaFile.text();
-        meta = JSON.parse(metaText);
+        meta = { ...meta, ...JSON.parse(metaText) };
     } catch (_e) {
         // No metadata file — use defaults
     }
@@ -943,11 +947,21 @@ export async function readCookieHeader() {
  *   `Set-Cookie` is not an alternative: its own grammar uses commas (in
  *   `Expires` dates, among others), so a joined value cannot be split back.
  */
-export async function httpFetch(method, url, headersJson, body, maxResponseBytes) {
-    const headersObj = JSON.parse(headersJson);
+/**
+ * The `init` every outbound request is issued with — buffered (`httpFetch`)
+ * and streaming (`httpFetchStream`) alike. One function because
+ * `redirect: 'error'` is a security property and two copies of it are two
+ * chances to lose one.
+ *
+ * @param {string} method
+ * @param {string} headersJson
+ * @param {Uint8Array} body
+ * @returns {RequestInit}
+ */
+function fetchInit(method, headersJson, body) {
     const init = {
         method,
-        headers: headersObj,
+        headers: JSON.parse(headersJson),
         // The SSRF gate in `network.rs` inspects the URL the caller asked for
         // and nothing else. `fetch` defaults to `redirect: 'follow'`, so a
         // `302 Location: http://169.254.169.254/…` from a public-looking host
@@ -968,8 +982,11 @@ export async function httpFetch(method, url, headersJson, body, maxResponseBytes
     if (body && body.length > 0) {
         init.body = body;
     }
+    return init;
+}
 
-    const response = await fetch(url, init);
+export async function httpFetch(method, url, headersJson, body, maxResponseBytes) {
+    const response = await fetch(url, fetchInit(method, headersJson, body));
 
     const responseHeaders = [];
     response.headers.forEach((value, name) => {
@@ -1028,4 +1045,343 @@ async function readCappedBody(response, cap) {
         offset += chunk.byteLength;
     }
     return out;
+}
+
+// ─── Chunked byte reads ──────────────────────────────────────────────────────
+//
+// wasm-bindgen cannot hand a live JS `ReadableStreamDefaultReader` to Rust as
+// anything it can hold across awaits, so a chunked read is expressed the same
+// way the LLM and image streams already are: start the read, get an opaque id
+// back, then pull one chunk at a time by id. `storageGetStream` and
+// `httpFetchStream` both register here, so there is one reader registry and
+// one pull/cancel pair rather than one of each per producer.
+//
+// EVERY registered reader must be either drained to `null` or cancelled.
+// `readerNextChunk` deletes the entry when the source reports `done`, so a
+// fully-read stream cleans itself up; a Rust consumer that stops early (a
+// dropped response, a cap breach) calls `readerCancel`, which also releases
+// the underlying OPFS file handle or HTTP connection.
+
+const _byteReaders = new Map();
+let _nextByteReaderId = 1;
+
+/**
+ * @param {ReadableStreamDefaultReader<Uint8Array>} reader
+ * @returns {string} the id `readerNextChunk`/`readerCancel` take.
+ */
+function registerByteReader(reader) {
+    const id = `bytes-${_nextByteReaderId++}`;
+    _byteReaders.set(id, reader);
+    return id;
+}
+
+/**
+ * Pull the next chunk of a registered byte stream.
+ *
+ * @param {string} id
+ * @returns {Promise<Uint8Array|null>} `null` once the source is exhausted —
+ *   the one signal Rust treats as end-of-stream. An unknown id THROWS rather
+ *   than answering `null`: "this stream is finished" and "you are asking about
+ *   a stream that does not exist" are different facts, and reporting the
+ *   second as the first would turn a bookkeeping bug into a silently truncated
+ *   response body.
+ */
+export async function readerNextChunk(id) {
+    const reader = _byteReaders.get(id);
+    if (!reader) {
+        throw new Error(`readerNextChunk: unknown stream id ${JSON.stringify(id)}`);
+    }
+    let result;
+    try {
+        result = await reader.read();
+    } catch (e) {
+        _byteReaders.delete(id);
+        throw e;
+    }
+    if (result.done) {
+        _byteReaders.delete(id);
+        return null;
+    }
+    return result.value;
+}
+
+/**
+ * Release a registered byte stream that will not be drained. Idempotent, and
+ * never throws — it is called from Rust drop/cancel paths, which have nowhere
+ * to report a failure to.
+ *
+ * @param {string} id
+ */
+export async function readerCancel(id) {
+    const reader = _byteReaders.get(id);
+    if (!reader) {
+        return;
+    }
+    _byteReaders.delete(id);
+    try {
+        await reader.cancel();
+    } catch (_e) {
+        // The source is already gone; there is nothing left to release.
+    }
+}
+
+/**
+ * Streaming counterpart of `storageGet`: resolve the object's metadata
+ * eagerly and hand back a reader id for its body instead of the bytes.
+ *
+ * OPFS gives a real `ReadableStream` (`File.stream()`), so this is a genuine
+ * chunked read — the file is never held whole in the Service Worker's memory,
+ * which is the same linear memory the whole runtime is using.
+ *
+ * `size` comes from the same `File` snapshot the body is read from, so a
+ * concurrent writer cannot make the advertised length disagree with the bytes
+ * that actually stream.
+ *
+ * @param {string} folder
+ * @param {string} key
+ * @returns {{stream_id: string, meta: {content_type: string, size: number}}}
+ */
+export async function storageGetStream(folder, key) {
+    const storageRoot = await getStorageRoot();
+    const folderHandle = await getFolderHandle(storageRoot, folder, false);
+    const { dirs, leaf } = splitKey(key);
+    const parent = await getKeyParent(folderHandle, dirs, false);
+
+    const fileHandle = await parent.getFileHandle(leaf);
+    const file = await fileHandle.getFile();
+
+    // Merged over the defaults, exactly as `storageGet` does and for the same
+    // reason: a sidecar missing a field must not erase that field's default.
+    let meta = { content_type: 'application/octet-stream', size: file.size };
+    try {
+        const metaHandle = await parent.getFileHandle(metaName(leaf));
+        const metaFile = await metaHandle.getFile();
+        meta = { ...meta, ...JSON.parse(await metaFile.text()) };
+    } catch (_e) {
+        // No metadata sidecar — use defaults, exactly as `storageGet` does.
+    }
+    // The sidecar's `size` was written at upload time; the file itself is the
+    // authority for what is about to stream.
+    meta.size = file.size;
+
+    return { stream_id: registerByteReader(file.stream().getReader()), meta };
+}
+
+// ─── Chunked object writes ───────────────────────────────────────────────────
+//
+// The write half of the same pattern. OPFS `createWritable()` accepts
+// incremental `write()` calls, so a large upload is never assembled in memory
+// first.
+//
+// An open writer holds an exclusive lock on the file, so a start with no
+// matching finish or abort leaves the object unwritable until the Service
+// Worker restarts. Rust's `put_streaming` aborts on every error path.
+//
+// `createWritable()` needs a file handle, so opening a writer for a key that
+// does not exist yet has to CREATE that key first — and an empty file is listed
+// by `storageList` and served by both read paths, which fall back to a default
+// content type when the sidecar is missing. Discarding a write is routine here
+// (any upstream stream error takes that path), so a discarded write of a new
+// key removes the file it created; an overwrite keeps the previous object,
+// whose bytes the swap file never touched.
+
+const _fileWriters = new Map();
+let _nextFileWriterId = 1;
+
+/**
+ * Open `folder/key` for a chunked write.
+ *
+ * @param {string} folder
+ * @param {string} key
+ * @returns {Promise<string>} the id the chunk/finish/abort calls take.
+ */
+export async function storagePutStreamStart(folder, key) {
+    const storageRoot = await getStorageRoot();
+    const folderHandle = await getFolderHandle(storageRoot, folder, true);
+    const { dirs, leaf } = splitKey(key);
+    const parent = await getKeyParent(folderHandle, dirs, true);
+
+    // Whether this write is what brings the key into existence decides what a
+    // discard has to clean up; see `discardWriter`.
+    let created = false;
+    let fileHandle;
+    try {
+        fileHandle = await parent.getFileHandle(leaf);
+    } catch (e) {
+        if (e && e.name !== 'NotFoundError') {
+            throw e;
+        }
+        fileHandle = await parent.getFileHandle(leaf, { create: true });
+        created = true;
+    }
+    const writable = await fileHandle.createWritable();
+
+    const id = `write-${_nextFileWriterId++}`;
+    _fileWriters.set(id, { writable, parent, leaf, size: 0, created });
+    return id;
+}
+
+/**
+ * Append one chunk. Throws on an unknown id for the same reason
+ * `readerNextChunk` does: silently dropping bytes would produce a short object
+ * that reports success.
+ *
+ * @param {string} id
+ * @param {Uint8Array} chunk
+ */
+export async function storagePutStreamChunk(id, chunk) {
+    const entry = _fileWriters.get(id);
+    if (!entry) {
+        throw new Error(`storagePutStreamChunk: unknown writer id ${JSON.stringify(id)}`);
+    }
+    await entry.writable.write(chunk);
+    entry.size += chunk.byteLength;
+}
+
+/**
+ * Close the file and write its metadata sidecar — the same sidecar
+ * `storagePut` writes, with the size counted from the chunks that actually
+ * arrived.
+ *
+ * There is no OPFS transaction across those two files, so this rejects rather
+ * than leaving a half-finished object wherever it can: a failed `close()`
+ * discards the writer (and, for a key this write created, the file itself), and
+ * a failed sidecar write removes a created key's body. The one residual is an
+ * OVERWRITE whose sidecar write fails — the previous bytes are already gone by
+ * then, so the new body stays under the previous sidecar. `storage.rs`'s
+ * `put_streaming` doc states all three cases.
+ *
+ * @param {string} id
+ * @param {string} contentType
+ */
+export async function storagePutStreamFinish(id, contentType) {
+    const entry = _fileWriters.get(id);
+    if (!entry) {
+        throw new Error(`storagePutStreamFinish: unknown writer id ${JSON.stringify(id)}`);
+    }
+
+    // `close()` is what commits the swap file, so it is exactly where a quota
+    // failure surfaces — and it is the one step here that can fail while the
+    // exclusive lock is still held. The bookkeeping entry therefore survives
+    // until it resolves, and this discards the writer itself rather than
+    // relying on the caller's abort: dropping the entry first left the writable
+    // un-aborted and the file locked for the life of the Service Worker, which
+    // is the failure the note above this registry warns about.
+    try {
+        await entry.writable.close();
+    } catch (e) {
+        await discardWriter(id);
+        throw e;
+    }
+
+    // The body is committed and the lock is gone; only the two files can still
+    // need cleaning up.
+    _fileWriters.delete(id);
+
+    const meta = { content_type: contentType, size: entry.size };
+    try {
+        const metaHandle = await entry.parent.getFileHandle(metaName(entry.leaf), { create: true });
+        const metaWritable = await metaHandle.createWritable();
+        await metaWritable.write(JSON.stringify(meta));
+        await metaWritable.close();
+    } catch (e) {
+        // A committed body with no sidecar would be listed and served as a
+        // valid object while this call reports failure. That is removable for a
+        // key this write created; for an overwrite the previous bytes are
+        // already gone, so the new body stays under the previous sidecar and
+        // `storage.rs::put_streaming` documents that residual.
+        await removeCreatedFiles(entry);
+        throw e;
+    }
+}
+
+/**
+ * Abandon a chunked write: release the file lock and remove the target file if
+ * this write is what created it, so an interrupted upload of a NEW key leaves
+ * nothing listed or gettable. Idempotent and non-throwing — every Rust error
+ * path calls it, and a failure to clean up must not replace the error that
+ * caused the abort.
+ *
+ * @param {string} id
+ */
+export async function storagePutStreamAbort(id) {
+    await discardWriter(id);
+}
+
+/**
+ * Release a writer and undo whatever it brought into existence: abort the
+ * writable (which releases the exclusive lock and discards the swap file), then
+ * remove the target file if this write is what created it.
+ *
+ * Never throws — every caller either has an error to report already or is a
+ * Rust cleanup path with nowhere to report one.
+ *
+ * @param {string} id
+ */
+async function discardWriter(id) {
+    const entry = _fileWriters.get(id);
+    if (!entry) {
+        return;
+    }
+    _fileWriters.delete(id);
+    try {
+        await entry.writable.abort();
+    } catch (_e) {
+        // Already closed or the handle is gone; the lock is released either way.
+    }
+    await removeCreatedFiles(entry);
+}
+
+/**
+ * Remove the object and sidecar a discarded write created. A no-op for an
+ * overwrite: that key's previous object is still the right answer, and the swap
+ * file never touched it.
+ *
+ * @param {{parent: FileSystemDirectoryHandle, leaf: string, created: boolean}} entry
+ */
+async function removeCreatedFiles(entry) {
+    if (!entry.created) {
+        return;
+    }
+    for (const name of [entry.leaf, metaName(entry.leaf)]) {
+        try {
+            await entry.parent.removeEntry(name);
+        } catch (_e) {
+            // Never written, or already gone.
+        }
+    }
+}
+
+/**
+ * Streaming counterpart of `httpFetch`: resolve the response head eagerly and
+ * hand back a reader id for the body instead of the bytes.
+ *
+ * The request `init` is `httpFetch`'s, `redirect: 'error'` included — see that
+ * function for why refusing a redirect is half of the outbound SSRF gate. The
+ * two must not drift, so the init is built once in `fetchInit`.
+ *
+ * Unlike `httpFetch` this takes no byte cap: the cap on a streamed response is
+ * a running total the Rust consumer keeps, because it is the side that decides
+ * what to do with the bytes already delivered.
+ *
+ * @param {string} method
+ * @param {string} url
+ * @param {string} headersJson
+ * @param {Uint8Array} body
+ * @returns {{status: number, headers: [string, string][], stream_id: string|null}}
+ *   `stream_id` is `null` for a bodyless response (204, HEAD).
+ */
+export async function httpFetchStream(method, url, headersJson, body) {
+    const response = await fetch(url, fetchInit(method, headersJson, body));
+
+    const responseHeaders = [];
+    response.headers.forEach((value, name) => {
+        responseHeaders.push([name, value]);
+    });
+
+    return {
+        status: response.status,
+        headers: responseHeaders,
+        stream_id: response.body ? registerByteReader(response.body.getReader()) : null,
+    };
 }

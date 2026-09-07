@@ -14,7 +14,7 @@ use wafer_core::interfaces::vector::{
     },
 };
 
-use crate::{bridge, db_codec, vector::sql};
+use crate::{bridge, database, db_codec, vector::sql};
 
 fn js_err(e: wasm_bindgen::JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
@@ -136,58 +136,15 @@ impl BrowserVectorService {
 #[async_trait::async_trait(?Send)]
 impl VectorService for BrowserVectorService {
     async fn create_index(&self, config: VectorIndexConfig) -> VResult<()> {
-        // Idempotent — ensures the registry table exists before the select
-        // and upsert below, on the very first index ever created in this DB.
-        bridge::db_exec_raw(&sql::build_registry_ddl(), db_codec::empty_params())
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        // Everything from the first DDL statement to the last is one logical
+        // mutation with one OPFS flush at the end — including the
+        // config-mismatch refusal below, which is reached only AFTER the
+        // registry DDL has already run. The hand-written `dbFlush()?` this
+        // replaced returned early on that path and left the registry table
+        // in memory only.
+        database::with_flush_mapped(self.create_index_statements(&config), VectorError::Internal)
+            .await?;
 
-        // Guard against a silent config-mismatched overwrite: the
-        // `_vectors`/`_meta`/`_fts` DDL below is `IF NOT EXISTS` (idempotent,
-        // to support the SW-restart recovery path — see `IndexState`'s doc
-        // comment), so without this check, re-calling `create_index` for an
-        // EXISTING name with different dimensions/metric/keyword_search
-        // would overwrite the registry row and in-memory cache while
-        // leaving the already-created tables (and any stored rows) on the
-        // old config — bricking the index for subsequent `query`/`upsert`.
-        // Only a genuine name collision (mismatched config) is rejected;
-        // an identical re-create is the legitimate recovery case and must
-        // stay a no-op (matches native's `IndexAlreadyExists` contract for
-        // the collision case, see `wafer-block-sqlite`'s
-        // `create_index_duplicate_fails`).
-        if let Some(existing) = self.read_registry_row(&config.name)? {
-            let existing_tuple = (
-                existing.dimensions,
-                existing.metric,
-                existing.keyword_search,
-            );
-            let incoming_tuple = (config.dimensions, config.metric, config.keyword_search);
-            if sql::classify_registry_conflict(Some(existing_tuple), incoming_tuple)
-                == sql::RegistryConflict::Mismatch
-            {
-                return Err(VectorError::IndexAlreadyExists(config.name));
-            }
-        }
-
-        let stmts = sql::build_create_index_sql(&config.name, config.keyword_search);
-        for s in stmts {
-            bridge::db_exec_raw(&s, db_codec::empty_params())
-                .map_err(|e| VectorError::Internal(js_err(e)))?;
-        }
-
-        // Persist the config so a future cold cache (post-SW-restart) can
-        // hydrate this index instead of returning `IndexNotFound`.
-        let reg = sql::build_registry_upsert_sql(
-            &config.name,
-            config.dimensions,
-            config.metric,
-            config.keyword_search,
-        );
-        let reg_params = db_codec::params_to_js(&reg.params).map_err(VectorError::Internal)?;
-        bridge::db_exec_raw(&reg.sql, reg_params).map_err(|e| VectorError::Internal(js_err(e)))?;
-
-        bridge::dbFlush()
-            .await
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
         self.indexes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -203,27 +160,18 @@ impl VectorService for BrowserVectorService {
     }
 
     async fn delete_index(&self, name: &str) -> VResult<()> {
+        // Read-only, so it stays outside the flush: a miss must not cost a
+        // whole-database write to OPFS.
         let state = self
             .lookup(name)?
             .ok_or_else(|| VectorError::IndexNotFound(name.into()))?;
-        let stmts = sql::build_delete_index_sql(name, state.keyword_search);
-        for s in stmts {
-            bridge::db_exec_raw(&s, db_codec::empty_params())
-                .map_err(|e| VectorError::Internal(js_err(e)))?;
-        }
 
-        // Clear the registry row too — otherwise a later `lookup` miss
-        // would hydrate a phantom `IndexState` for tables that no longer
-        // exist, turning what should be `IndexNotFound` into an
-        // `Internal` "no such table" error on the next call.
-        let (del_sql, del_params) = sql::build_registry_delete_sql(name);
-        let del_params_js = db_codec::params_to_js(&del_params).map_err(VectorError::Internal)?;
-        bridge::db_exec_raw(&del_sql, del_params_js)
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        database::with_flush_mapped(
+            self.delete_index_statements(name, state.keyword_search),
+            VectorError::Internal,
+        )
+        .await?;
 
-        bridge::dbFlush()
-            .await
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
         self.indexes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -262,17 +210,23 @@ impl VectorService for BrowserVectorService {
                 })
             })
             .collect();
+        // Validation is pure and rejects the whole batch, so it too stays
+        // outside the flush — nothing has been written yet.
         let prepared = prepared?;
 
-        for stmt in sql::build_upsert_sql_stmts(index, state.keyword_search, &prepared) {
-            let params_js = db_codec::params_to_js(&stmt.params).map_err(VectorError::Internal)?;
-            bridge::db_exec_raw(&stmt.sql, params_js)
-                .map_err(|e| VectorError::Internal(js_err(e)))?;
-        }
-        bridge::dbFlush()
-            .await
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
-        Ok(())
+        database::with_flush_mapped(
+            async {
+                for stmt in sql::build_upsert_sql_stmts(index, state.keyword_search, &prepared) {
+                    let params_js =
+                        db_codec::params_to_js(&stmt.params).map_err(VectorError::Internal)?;
+                    bridge::db_exec_raw(&stmt.sql, params_js)
+                        .map_err(|e| VectorError::Internal(js_err(e)))?;
+                }
+                Ok(())
+            },
+            VectorError::Internal,
+        )
+        .await
     }
 
     async fn query(
@@ -403,23 +357,28 @@ impl VectorService for BrowserVectorService {
         let state = self
             .lookup(index)?
             .ok_or_else(|| VectorError::IndexNotFound(index.into()))?;
+        // Nothing to write, so nothing to flush.
         if ids.is_empty() {
             return Ok(());
         }
-        let (stmts, id_params) = sql::build_delete_ids_sql(index, &ids, state.keyword_search);
-        let params: Vec<serde_json::Value> = id_params
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect();
-        let params_js = db_codec::params_to_js(&params).map_err(VectorError::Internal)?;
-        for s in stmts {
-            bridge::db_exec_raw(&s, params_js.clone())
-                .map_err(|e| VectorError::Internal(js_err(e)))?;
-        }
-        bridge::dbFlush()
-            .await
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
-        Ok(())
+        database::with_flush_mapped(
+            async {
+                let (stmts, id_params) =
+                    sql::build_delete_ids_sql(index, &ids, state.keyword_search);
+                let params: Vec<serde_json::Value> = id_params
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect();
+                let params_js = db_codec::params_to_js(&params).map_err(VectorError::Internal)?;
+                for s in stmts {
+                    bridge::db_exec_raw(&s, params_js.clone())
+                        .map_err(|e| VectorError::Internal(js_err(e)))?;
+                }
+                Ok(())
+            },
+            VectorError::Internal,
+        )
+        .await
     }
 
     async fn count(&self, index: &str) -> VResult<u64> {
@@ -436,6 +395,83 @@ impl VectorService for BrowserVectorService {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         Ok(n)
+    }
+}
+
+impl BrowserVectorService {
+    /// Every statement `create_index` writes, as one future so the caller can
+    /// wrap it in a single flush. Returns without touching the in-memory
+    /// index cache — that update belongs after the write is durable.
+    async fn create_index_statements(&self, config: &VectorIndexConfig) -> VResult<()> {
+        // Idempotent — ensures the registry table exists before the select
+        // and upsert below, on the very first index ever created in this DB.
+        bridge::db_exec_raw(&sql::build_registry_ddl(), db_codec::empty_params())
+            .map_err(|e| VectorError::Internal(js_err(e)))?;
+
+        // Guard against a silent config-mismatched overwrite: the
+        // `_vectors`/`_meta`/`_fts` DDL below is `IF NOT EXISTS` (idempotent,
+        // to support the SW-restart recovery path — see `IndexState`'s doc
+        // comment), so without this check, re-calling `create_index` for an
+        // EXISTING name with different dimensions/metric/keyword_search
+        // would overwrite the registry row and in-memory cache while
+        // leaving the already-created tables (and any stored rows) on the
+        // old config — bricking the index for subsequent `query`/`upsert`.
+        // Only a genuine name collision (mismatched config) is rejected;
+        // an identical re-create is the legitimate recovery case and must
+        // stay a no-op (matches native's `IndexAlreadyExists` contract for
+        // the collision case, see `wafer-block-sqlite`'s
+        // `create_index_duplicate_fails`).
+        if let Some(existing) = self.read_registry_row(&config.name)? {
+            let existing_tuple = (
+                existing.dimensions,
+                existing.metric,
+                existing.keyword_search,
+            );
+            let incoming_tuple = (config.dimensions, config.metric, config.keyword_search);
+            if sql::classify_registry_conflict(Some(existing_tuple), incoming_tuple)
+                == sql::RegistryConflict::Mismatch
+            {
+                return Err(VectorError::IndexAlreadyExists(config.name.clone()));
+            }
+        }
+
+        let stmts = sql::build_create_index_sql(&config.name, config.keyword_search);
+        for s in stmts {
+            bridge::db_exec_raw(&s, db_codec::empty_params())
+                .map_err(|e| VectorError::Internal(js_err(e)))?;
+        }
+
+        // Persist the config so a future cold cache (post-SW-restart) can
+        // hydrate this index instead of returning `IndexNotFound`.
+        let reg = sql::build_registry_upsert_sql(
+            &config.name,
+            config.dimensions,
+            config.metric,
+            config.keyword_search,
+        );
+        let reg_params = db_codec::params_to_js(&reg.params).map_err(VectorError::Internal)?;
+        bridge::db_exec_raw(&reg.sql, reg_params).map_err(|e| VectorError::Internal(js_err(e)))?;
+        Ok(())
+    }
+
+    /// Every statement `delete_index` writes, as one future. The in-memory
+    /// cache eviction happens in the caller, after the write is durable.
+    async fn delete_index_statements(&self, name: &str, keyword_search: bool) -> VResult<()> {
+        let stmts = sql::build_delete_index_sql(name, keyword_search);
+        for s in stmts {
+            bridge::db_exec_raw(&s, db_codec::empty_params())
+                .map_err(|e| VectorError::Internal(js_err(e)))?;
+        }
+
+        // Clear the registry row too — otherwise a later `lookup` miss
+        // would hydrate a phantom `IndexState` for tables that no longer
+        // exist, turning what should be `IndexNotFound` into an
+        // `Internal` "no such table" error on the next call.
+        let (del_sql, del_params) = sql::build_registry_delete_sql(name);
+        let del_params_js = db_codec::params_to_js(&del_params).map_err(VectorError::Internal)?;
+        bridge::db_exec_raw(&del_sql, del_params_js)
+            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        Ok(())
     }
 }
 
@@ -625,6 +661,74 @@ mod rrf_tests {
         assert_eq!(
             fused.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             vec!["a", "z"]
+        );
+    }
+}
+
+/// The vector service does not own a second durability contract.
+///
+/// It writes the same sql.js database `database.rs` does, through the same
+/// bridge, so the flush policy has to be one policy. Before this, four sites
+/// here ran `bridge::dbFlush()` with `?`, which meant a failed mutation
+/// skipped the flush entirely and left already-applied statements in memory
+/// only — the opposite of what `with_flush` promises three lines away.
+///
+/// What the shared helper actually DOES on a failed operation is asserted in
+/// `database::flush_precedence` (`a_failed_operation_still_flushes`); this
+/// module only has to say that these four sites go through it. That is a
+/// source-text property — "no flush of its own, and the shared one at every
+/// mutating site" — and there is nothing else to assert it against without a
+/// live OPFS.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod one_durability_contract {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// The four `VectorService` methods that mutate the database:
+    /// `create_index`, `delete_index`, `upsert` and `delete`. A fifth would
+    /// have to come here and say which contract it uses.
+    const MUTATING_SITES: usize = 4;
+
+    /// Code lines only: a comment may name what the code may not.
+    fn code_lines(src: &str) -> impl Iterator<Item = (usize, &str)> {
+        src.lines()
+            .enumerate()
+            .map(|(n, line)| (n + 1, line))
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+    }
+
+    #[wasm_bindgen_test]
+    fn this_module_calls_no_flush_of_its_own() {
+        // Assembled rather than written out, so this test is not itself an
+        // occurrence of what it is looking for. Matched WITHOUT a module
+        // prefix, so `use crate::bridge::dbFlush;` followed by a bare call is
+        // caught too — the spelling the previous needle missed.
+        let needle = ["db", "Flush"].concat();
+        for (n, line) in code_lines(include_str!("service.rs")) {
+            assert!(
+                !line.contains(&needle),
+                "line {n}: flush through `database::with_flush_mapped`, which \
+                 owns the crate's one durability contract, not through the \
+                 bridge directly"
+            );
+        }
+    }
+
+    /// The other half, and the one the needle above cannot express: a file
+    /// that flushes NOWHERE passes an assertion about what it must not call.
+    /// Every mutating method here has to route through the shared helper.
+    #[wasm_bindgen_test]
+    fn every_mutating_site_routes_through_the_shared_contract() {
+        // Assembled for the same reason the needle above is: this line is
+        // itself a code line in the file being scanned.
+        let call = ["with_flush", "_mapped("].concat();
+        let calls = code_lines(include_str!("service.rs"))
+            .filter(|(_, line)| line.contains(&call))
+            .count();
+
+        assert_eq!(
+            calls, MUTATING_SITES,
+            "expected {MUTATING_SITES} `with_flush_mapped` call sites, found {calls}: a \
+             mutating method was added or removed without deciding what flushes it"
         );
     }
 }
