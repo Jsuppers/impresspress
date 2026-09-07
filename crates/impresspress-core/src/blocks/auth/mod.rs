@@ -13,7 +13,8 @@
 //! - Module decls for the supporting layers (`bootstrap`, `config`,
 //!   `maintenance`, `migrations`, `repo`, `service`).
 //! - Constants other blocks still reference (`AUTH_BLOCK_ID`,
-//!   `JWT_SECRET_KEY`, `DUMMY_HASH`). Every auth table is reached through
+//!   `JWT_SECRET_KEY`) and the login timing-equalization hash
+//!   (`timing_equalization_hash`). Every auth table is reached through
 //!   its own `repo::<table>` module; there are no table-name re-exports
 //!   here for a caller to build a query around.
 //! - `helpers` — token/cookie/role utilities consumed by `auth_ui::api::*`.
@@ -42,10 +43,213 @@ pub const AUTH_BLOCK_ID: &str = "wafer-run/auth";
 /// crypto service.
 pub const JWT_SECRET_KEY: &str = "WAFER_RUN__AUTH__JWT_SECRET";
 
-/// Pre-computed Argon2id hash used for timing equalization when user is not found.
-pub(crate) const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
 use crate::platform_state::user_roles;
+
+// ---------------------------------------------------------------------------
+// Timing equalization for password login
+// ---------------------------------------------------------------------------
+//
+// `auth_ui::api::login` must take the same time whether the email is unknown,
+// the account carries no local-credentials row, or the password is simply
+// wrong; otherwise the response time is a user-enumeration oracle. It gets
+// that by verifying a password against a throwaway hash whenever there is no
+// real credential to verify against.
+//
+// That only equalizes anything if the throwaway hash is in the scheme THIS
+// deployment's crypto service actually writes, which is why it cannot be a
+// constant in this file. Native and Cloudflare hash with argon2id; the browser
+// hashes with PBKDF2-SHA256, because argon2id's ~19 MiB memory cost is
+// unaffordable in a Service Worker whose linear memory is shared with sql.js
+// and the rest of the runtime (see `impresspress-browser`'s `crypto` module).
+//
+// The constant this replaced was an argon2id string, so it was wrong in both
+// directions:
+//
+// - on the browser it did not equalize anything. `compare_hash` used to reject
+//   any non-PBKDF2 string as an unsupported format in microseconds, while a
+//   real verification ran a full PBKDF2 — so the timings were wildly
+//   asymmetric and the defence this exists to provide had never worked there.
+// - once the browser's verifier learned to dispatch on the stored scheme (so
+//   an argon2id credential written by another target against the same
+//   workspace verifies), that same constant started RUNNING argon2id in the
+//   Service Worker on every failed login: ~19.9 MiB of linear memory per
+//   mistyped email, permanently, because wasm memory never shrinks.
+//
+// Sourcing it from `crypto::hash` closes both. One hash is computed per
+// process/isolate and cached, so a failed login costs exactly one
+// verification, the same as a successful one.
+
+/// The password [`timing_equalization_hash`] hashes. Its value is irrelevant
+/// and deliberately public: no comparison against the resulting hash can ever
+/// authenticate anybody, because `login` only reaches that comparison when it
+/// has no credential to authenticate against and discards the result (pinned
+/// by `login::tests::the_timing_equalization_password_cannot_log_anyone_in`).
+pub(crate) const TIMING_EQUALIZATION_PASSWORD: &str =
+    "impresspress timing-equalization placeholder; never a credential";
+
+/// Cached for the life of the process (native) or isolate (Cloudflare /
+/// Service Worker): the scheme and cost the crypto service writes cannot
+/// change under a running runtime, and re-hashing per failed login would make
+/// a failed login cost twice what a successful one does — the asymmetry this
+/// whole mechanism exists to remove.
+static TIMING_EQUALIZATION_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// A password hash in whatever scheme this deployment's crypto service writes,
+/// for `login` to burn a verification against when it has no real credential.
+///
+/// `None` means the crypto service could not produce one at all — a broken or
+/// unregistered `wafer-run/crypto` block. The caller then skips the
+/// equalization rather than substituting something in the wrong scheme, which
+/// would reintroduce exactly the asymmetry described above.
+pub(crate) async fn timing_equalization_hash(
+    ctx: &dyn wafer_run::context::Context,
+) -> Option<&'static str> {
+    timing_equalization_hash_in(&TIMING_EQUALIZATION_HASH, ctx).await
+}
+
+/// [`timing_equalization_hash`] against a caller-supplied cache. The cache is
+/// a parameter only so a test can hold its own: the production cell is filled
+/// once per process, which would otherwise make "what does this crypto service
+/// write?" answerable only by whichever test ran first.
+async fn timing_equalization_hash_in<'a>(
+    cache: &'a std::sync::OnceLock<String>,
+    ctx: &dyn wafer_run::context::Context,
+) -> Option<&'a str> {
+    if let Some(hash) = cache.get() {
+        return Some(hash.as_str());
+    }
+    match crypto::hash(ctx, TIMING_EQUALIZATION_PASSWORD).await {
+        Ok(hash) => {
+            let _ = cache.set(hash);
+            cache.get().map(String::as_str)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "could not derive the login timing-equalization hash; failed logins \
+                 for unknown accounts will answer faster than wrong-password ones: {e}"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod timing_equalization_tests {
+    use std::sync::{Arc, OnceLock};
+
+    use wafer_block_crypto::service::{Argon2JwtCryptoService, PasswordScheme};
+
+    use super::{timing_equalization_hash, timing_equalization_hash_in};
+    use crate::test_support::TestContext;
+
+    /// The `$name$` segment of a PHC-style hash string: `argon2id` natively
+    /// and on Cloudflare, `pbkdf2-sha256` in the browser.
+    fn scheme_of(hash: &str) -> &str {
+        hash.split('$')
+            .nth(1)
+            .unwrap_or_else(|| panic!("not a PHC-style hash: {hash}"))
+    }
+
+    /// A context whose `wafer-run/crypto` block WRITES `scheme`, so the
+    /// browser's choice is exercisable on the native test lane.
+    async fn ctx_writing(scheme: PasswordScheme) -> TestContext {
+        let mut ctx = TestContext::with_auth().await;
+        let svc = Arc::new(
+            Argon2JwtCryptoService::new("test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string())
+                .expect("test secret is long enough")
+                .with_password_scheme(scheme),
+        );
+        let block: Arc<dyn wafer_run::Block> =
+            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
+        ctx.register_block("wafer-run/crypto", block);
+        ctx
+    }
+
+    /// The equalization hash has to be in the scheme the crypto service
+    /// actually WRITES, or it equalizes nothing: verifying a hash the platform
+    /// never produces takes a different amount of work than verifying one it
+    /// does — instantly, if the verifier rejects the scheme outright.
+    ///
+    /// The PBKDF2 case is the browser's, and the one the constant this
+    /// replaced got wrong in both directions: an argon2id string that the
+    /// browser's old PBKDF2-only verifier rejected in microseconds (so failed
+    /// logins there were never equalized at all), and that its scheme-
+    /// dispatching successor now *runs*, allocating ~19.9 MiB of the Service
+    /// Worker's linear memory per mistyped email, permanently.
+    #[tokio::test]
+    async fn the_equalization_hash_names_the_scheme_the_service_writes() {
+        for scheme in [
+            PasswordScheme::default(),
+            PasswordScheme::Pbkdf2Sha256 { iterations: 10_000 },
+        ] {
+            let ctx = ctx_writing(scheme).await;
+            let cache = OnceLock::new();
+
+            let written = wafer_core::clients::crypto::hash(&ctx, "some real password")
+                .await
+                .expect("crypto block hashes");
+            let equalizer = timing_equalization_hash_in(&cache, &ctx)
+                .await
+                .expect("crypto block is registered, so the equalizer is derivable");
+
+            assert_eq!(
+                scheme_of(equalizer),
+                scheme_of(&written),
+                "the timing-equalization hash ({equalizer}) must name the same scheme \
+                 this platform writes ({written}), or a failed login costs a different \
+                 amount of work than a successful one"
+            );
+        }
+    }
+
+    /// Derived once per process, not once per failed login: hashing on every
+    /// miss would make a failed login cost a hash PLUS a verification, which is
+    /// the asymmetry the equalizer exists to remove — and on the browser it
+    /// would double the per-miss cost of the most expensive thing that runs
+    /// there. A second `crypto::hash` carries a fresh random salt, so an
+    /// identical string is proof the cache was used.
+    #[tokio::test]
+    async fn the_equalization_hash_is_derived_once_and_reused() {
+        let ctx = ctx_writing(PasswordScheme::default()).await;
+        let cache = OnceLock::new();
+
+        let first = timing_equalization_hash_in(&cache, &ctx)
+            .await
+            .expect("first")
+            .to_string();
+        let second = timing_equalization_hash_in(&cache, &ctx)
+            .await
+            .expect("second");
+
+        assert_eq!(
+            first, second,
+            "each call re-hashed; a fresh hash would carry a different salt"
+        );
+    }
+
+    /// A crypto service that cannot hash yields no equalizer rather than a
+    /// wrong-scheme stand-in; `login` then skips the comparison entirely.
+    #[tokio::test]
+    async fn no_crypto_block_yields_no_equalizer() {
+        let ctx = TestContext::with_auth().await;
+        let cache = OnceLock::new();
+
+        assert!(timing_equalization_hash_in(&cache, &ctx).await.is_none());
+        assert!(
+            cache.get().is_none(),
+            "a failure must not be cached as an answer"
+        );
+    }
+
+    /// The production entry point uses the process-wide cell. Kept separate
+    /// from the tests above precisely because that cell is shared across every
+    /// test in this binary.
+    #[tokio::test]
+    async fn the_process_wide_entry_point_answers() {
+        let ctx = ctx_writing(PasswordScheme::default()).await;
+        assert!(timing_equalization_hash(&ctx).await.is_some());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // auth_version — invalidates already-issued access JWTs on account/role

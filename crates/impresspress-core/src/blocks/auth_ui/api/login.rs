@@ -8,7 +8,7 @@ use crate::{
         auth::{
             helpers::{ensure_admin_role, issue_tokens_and_cookie},
             repo::{local_credentials, users},
-            DUMMY_HASH,
+            timing_equalization_hash,
         },
         auth_ui::{
             contracts::{AuthenticatedUser, LoginRequest, LoginResponse, TokenType},
@@ -37,23 +37,42 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Err(e) => return err_internal("User lookup failed", e),
     };
 
-    // Always run Argon2 verification to prevent timing-based user enumeration.
-    // If user not found or no local credentials, compare against a dummy hash
-    // so the response time is indistinguishable from a wrong-password attempt.
+    // The real stored credential, if this login has one at all.
     let stored_hash_owned: String;
-    let stored_hash: &str = match &user_row {
+    let stored_hash: Option<&str> = match &user_row {
         Some(u) => match local_credentials::find_by_user_id(ctx, &u.id).await {
             Ok(Some(cred)) => {
                 stored_hash_owned = cred.password_hash;
-                &stored_hash_owned
+                Some(&stored_hash_owned)
             }
-            _ => DUMMY_HASH,
+            _ => None,
         },
-        None => DUMMY_HASH,
+        None => None,
     };
-    let password_ok = crypto::compare_hash(ctx, &body.password, stored_hash)
-        .await
-        .is_ok();
+
+    // With no credential to verify, burn one verification against a hash in
+    // the scheme this platform writes, so "no such user" and "wrong password"
+    // cost the same and the response time is not a user-enumeration oracle.
+    // See `auth::timing_equalization_hash` for why that hash is derived rather
+    // than a constant.
+    //
+    // The equalization comparison's OUTCOME is deliberately discarded: this
+    // arm is reached precisely when there is nothing to authenticate against,
+    // so it can never be a successful login however it returns. (The
+    // placeholder password is a public constant; treating a match as a login
+    // would sign the caller in as any account whose local-credentials row is
+    // missing.)
+    let password_ok = match stored_hash {
+        Some(hash) => crypto::compare_hash(ctx, &body.password, hash)
+            .await
+            .is_ok(),
+        None => {
+            if let Some(equalizer) = timing_equalization_hash(ctx).await {
+                let _ = crypto::compare_hash(ctx, &body.password, equalizer).await;
+            }
+            false
+        }
+    };
 
     // Use the typed UserRow we already have. `disabled` and `email_verified`
     // ride on the row, so no second `db::get` is needed.
@@ -147,30 +166,18 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 /// path production uses).
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::{
-        blocks::auth_ui::api::signup,
+        blocks::{auth::TIMING_EQUALIZATION_PASSWORD, auth_ui::api::signup},
         test_support::{collect_or_panic, output_json, TestContext},
     };
 
-    /// Register a real crypto block — login verifies passwords via
+    /// A context with a real crypto block — login verifies passwords via
     /// `crypto::compare_hash` and mints tokens via `crypto::sign`/
-    /// `random_bytes`. Without this the handler trips on
+    /// `random_bytes`. Without one the handler trips on
     /// `block 'wafer-run/crypto' not registered`.
     async fn ctx_with_crypto() -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
-        let svc = Arc::new(
-            wafer_block_crypto::service::Argon2JwtCryptoService::new(
-                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-            )
-            .expect("test secret is long enough"),
-        );
-        let crypto_block: Arc<dyn wafer_run::Block> =
-            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
-        ctx.register_block("wafer-run/crypto", crypto_block);
-        ctx
+        TestContext::with_auth_and_crypto().await
     }
 
     /// Sign a new user up through the real signup handler (REQUIRE_VERIFICATION
@@ -244,5 +251,48 @@ mod tests {
         let resp = login(&ctx, "admin@example.com", "correct-horse-battery").await;
 
         assert_eq!(resp["default_redirect"], "/b/admin/reports");
+    }
+
+    /// The equalization password is a public constant in this repository, and
+    /// a user row whose `local_credentials` row is missing (an interrupted
+    /// signup, a half-restored backup) takes the equalization arm. If that
+    /// comparison's result were treated as a login, anyone could sign in as
+    /// such an account by typing the constant.
+    #[tokio::test]
+    async fn the_timing_equalization_password_cannot_log_anyone_in() {
+        use crate::blocks::auth::repo::users;
+
+        let ctx = ctx_with_crypto().await;
+        users::insert(
+            &ctx,
+            users::NewUser {
+                email: "credentialless@example.com".into(),
+                display_name: "No Credentials".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: true,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed a user with no local-credentials row");
+
+        let body = serde_json::json!({
+            "email": "credentialless@example.com",
+            "password": TIMING_EQUALIZATION_PASSWORD,
+        })
+        .to_string();
+        let out = handle(&ctx, InputStream::from_bytes(body.into_bytes())).await;
+
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(err)) => assert_eq!(
+                err.detail_code(),
+                Some("invalid_credentials"),
+                "expected the generic invalid-credentials answer, got {err:?}"
+            ),
+            other => panic!(
+                "the timing-equalization password signed a credential-less user in: {other:?}"
+            ),
+        }
     }
 }

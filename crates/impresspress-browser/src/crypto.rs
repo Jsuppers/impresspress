@@ -15,6 +15,16 @@
 //! dev-sandbox export, or one workspace opened under two runtimes, keep
 //! working.
 //!
+//! One consequence, because it is a real cost and not only a capability: this
+//! target will now RUN argon2id if a stored hash names it, at whatever cost
+//! that hash declares — about 19.9 MiB of linear memory for the default
+//! `m=19456`, permanently, since wasm memory never shrinks. That is the right
+//! answer for verifying a credential someone actually owns, and the wrong
+//! answer for anything synthetic. It is why the login timing-equalization hash
+//! (`impresspress_core::blocks::auth::timing_equalization_hash`) is derived
+//! from `crypto::hash` rather than hardcoded: a constant argon2id string would
+//! have made every mistyped email pay that price.
+//!
 //! **JWTs.** Signing, verification and the per-block HKDF key derivation for
 //! `sign_for`/`verify_for` delegate to [`Argon2JwtCryptoService`], the same
 //! HS256 engine the native runtime and the Cloudflare Worker use, so tokens
@@ -28,7 +38,8 @@
 //! than 32 bytes and this service is constructed with an **empty** one:
 //! `impresspress-web` cannot read `WAFER_RUN__AUTH__JWT_SECRET` until admin's
 //! `Init` has created the variables table, so it builds the service first and
-//! rotates the secret in `seed_after_admin_init` (see [`Self::set_jwt_secret`]).
+//! rotates the secret in `seed_after_admin_init` (see
+//! [`BrowserCryptoService::set_jwt_secret`]).
 //! Routing `hash` through the engine would make password hashing fail whenever
 //! that secret is absent or short — and the auth block's own `Init` hashes the
 //! bootstrap admin's password, so a missing secret would stop meaning "nobody
