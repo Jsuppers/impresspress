@@ -1,8 +1,8 @@
 //! Isolate-local "config tables were written" counter.
 //!
 //! Exists because a runtime build both READS config and WRITES it, in that
-//! order, within one pass. `builder::boot` and `strict_init_all_blocks`
-//! initialize the admin block first; admin's `Init` runs its migrations and
+//! order, within one pass. `builder::boot` initializes the admin block
+//! first, under every `InitPolicy`; admin's `Init` runs its migrations and
 //! then `settings::seed_defaults`, and the Cloudflare boot hook follows with
 //! `platform_state::variables::seed_auto_generated`. Every one of those inserts rows into the
 //! variables table AFTER some other block has already resolved its config —

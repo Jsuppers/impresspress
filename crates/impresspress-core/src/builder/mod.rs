@@ -9,8 +9,10 @@
 //!   the fluent config/setter methods.
 //! - [`registration`] — the `build()` block-registration method (a second
 //!   `impl ImpresspressBuilder` block).
-//! - [`boot`] — the post-build lifecycle: [`boot`], [`post_start`],
-//!   [`BootHooks`], and the native-embedding `register_vector_block` helper.
+//! - [`boot`] — the one post-build lifecycle: [`boot`], [`InitPolicy`],
+//!   [`GrantSource`], [`BootHooks`], and the native-embedding
+//!   `register_vector_block` helper.
+//! - [`config`] — [`RuntimeConfig`], the one owner of both config surfaces.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -25,16 +27,25 @@ use wafer_run::Block;
 use crate::{features::BlockSettings, ExtraRoute, RouteAccess};
 
 mod boot;
+mod config;
 mod prepared;
 mod registration;
 
-pub use boot::{boot, post_start, strict_init_all_blocks, BootHooks};
+pub use boot::{
+    boot, BlockInitOutcome, BootHooks, BootReport, GrantSource, InitPolicy, StepOutcome,
+    PREPARE_RUNTIME_PLAN_KEY,
+};
+pub use config::{fill_config_service, RuntimeConfig, ServiceOnlyKey};
 pub use prepared::PreparedPlanExporter;
 
 pub struct ImpresspressBuilder {
     database: Option<Arc<dyn DatabaseService>>,
     storage: Option<Arc<dyn StorageService>>,
     config: Option<Arc<dyn ConfigService>>,
+    /// The synchronous `ctx.config_get` surface, installed on the `Wafer` at
+    /// the end of `build()`. Set together with `config` by
+    /// [`RuntimeConfig::install`] — never separately.
+    config_snapshot: HashMap<String, String>,
     crypto: Option<Arc<dyn CryptoService>>,
     network: Option<Arc<dyn NetworkService>>,
     logger: Option<Arc<dyn LoggerService>>,
@@ -111,6 +122,7 @@ impl ImpresspressBuilder {
             database: None,
             storage: None,
             config: None,
+            config_snapshot: HashMap::new(),
             crypto: None,
             network: None,
             logger: None,
@@ -143,8 +155,16 @@ impl ImpresspressBuilder {
         self
     }
 
-    pub fn config(mut self, svc: Arc<dyn ConfigService>) -> Self {
+    /// Both config surfaces at once. Private on purpose: the only way in is
+    /// [`RuntimeConfig::install`], which cannot hand over one surface without
+    /// the other.
+    fn with_config_surfaces(
+        mut self,
+        svc: Arc<dyn ConfigService>,
+        snapshot: HashMap<String, String>,
+    ) -> Self {
         self.config = Some(svc);
+        self.config_snapshot = snapshot;
         self
     }
 
@@ -184,9 +204,10 @@ impl ImpresspressBuilder {
     /// Use this when block_settings can only be loaded *after* the wafer is
     /// built and `init_block(admin)` has created the backing table. Writes
     /// through the handle are visible to the router's `FeatureConfig`
-    /// (which holds the same `Arc<RwLock<BlockSettings>>`), so a follow-up
-    /// `init_all_blocks()` sees enablement state that matches the loaded
-    /// rows. The handle remains valid for the lifetime of the wafer.
+    /// (which holds the same `Arc<RwLock<BlockSettings>>`), so the blocks
+    /// [`boot`] initializes after the seed hook see enablement state that
+    /// matches the loaded rows. The handle remains valid for the lifetime of
+    /// the wafer.
     pub fn block_settings_handle(&self) -> Arc<std::sync::RwLock<BlockSettings>> {
         self.block_settings.clone()
     }

@@ -14,7 +14,6 @@ pub mod config_source;
 pub mod config_vars;
 pub mod crypto;
 pub mod csrf;
-pub mod deploy_init;
 pub mod endpoint_match;
 pub mod features;
 pub mod flows;

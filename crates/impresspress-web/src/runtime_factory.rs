@@ -360,11 +360,32 @@ impl RuntimeFactory {
         #[cfg_attr(not(feature = "browser-devtools"), allow(unused_mut))]
         let mut security_headers = serde_json::json!({ "csp": self.csp() });
 
+        // Both config surfaces, empty today. The browser is the one target that
+        // cannot know a single key at build time: the `variables` table does
+        // not exist until admin's migration runs, so every value arrives
+        // through `BrowserBootHooks::seed_after_admin_init`, which publishes
+        // it onto both surfaces at once via `RuntimeConfig::republish`.
+        // Going through `install` even with nothing to install is what keeps
+        // the async `ConfigService` and the synchronous snapshot in one
+        // owner's hands — the builder has no other way to receive a
+        // `ConfigService`.
+        //
+        // `fill_config_service` rather than a closure that ignores its
+        // argument: this handle is filled by `set`, so the map must be written
+        // through it. Discarding the map was correct only for as long as the
+        // `RuntimeConfig` above stayed empty — the first `both()` added here
+        // would otherwise reach the snapshot and be dropped from the async
+        // surface, silently.
+        let config_svc = self.config_svc.clone();
+        let (with_config, ()) = builder::RuntimeConfig::new().install(
+            ImpresspressBuilder::new()
+                .database(impresspress_browser::make_database_service())
+                .storage(impresspress_browser::make_storage_service()),
+            |map| (builder::fill_config_service(config_svc, map), ()),
+        );
+
         #[cfg_attr(not(feature = "browser-devtools"), allow(unused_mut))]
-        let mut builder = ImpresspressBuilder::new()
-            .database(impresspress_browser::make_database_service())
-            .storage(impresspress_browser::make_storage_service())
-            .config(self.config_svc.clone())
+        let mut builder = with_config
             .crypto(crypto_svc)
             .network(impresspress_browser::make_network_service())
             .logger(impresspress_browser::make_console_logger())
@@ -509,8 +530,8 @@ impl RuntimeFactory {
         wafer.set_asset_loader(&impresspress_browser::make_sw_asset_loader());
 
         // ── Phase 2 ─────────────────────────────────────────────────────────
-        // Run the shared boot funnel: seal → init_block(admin) →
-        // seed_after_admin_init → init_all_blocks → post_start.
+        // Run the shared boot funnel: grants → seal → init_block(admin) →
+        // seed_after_admin_init → the remaining blocks → post_start.
         //
         // admin's `lifecycle(Init)` runs FIRST so its migrations create the
         // canonical `impresspress__admin__variables` + `block_settings` tables
@@ -519,8 +540,9 @@ impl RuntimeFactory {
         // then seeds + publishes into the services the wafer already holds (see
         // `BrowserBootHooks`), all over `BrowserDatabaseService` rather than
         // the old bridge raw-SQL strings.
+        let db = impresspress_browser::make_database_service();
         let hooks = crate::BrowserBootHooks {
-            db: impresspress_browser::make_database_service(),
+            db: db.clone(),
             config_svc: self.config_svc.clone(),
             config_source: self.config_source.clone(),
             block_settings_handle,
@@ -528,9 +550,23 @@ impl RuntimeFactory {
             crypto: self.crypto.clone(),
             mode: self.mode,
         };
-        builder::boot(&mut wafer, &storage_block, &hooks)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("boot: {e}")))?;
+        builder::boot(
+            &mut wafer,
+            &storage_block,
+            &hooks,
+            // The admin permissions page is served in the browser too, so the
+            // rows it writes are this runtime's deployment-owned grants. The
+            // browser used to be the one target that never read them — not by
+            // decision, but because the grant call was a separate statement
+            // every caller had to remember. On a fresh profile the table does
+            // not exist yet and `load` degrades to no grants.
+            builder::GrantSource::Database(&db),
+            // A browser runtime is long-lived and inspectable (and rebuilt on
+            // demand), so one broken block must not wedge the whole page.
+            builder::InitPolicy::Tolerant,
+        )
+        .await
+        .map_err(|e| JsValue::from_str(&format!("boot: {e}")))?;
 
         Ok((wafer, storage_block))
     }

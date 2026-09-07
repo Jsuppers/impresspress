@@ -62,6 +62,18 @@ impl ImpresspressStorageBlock {
         let mut g = self.wrap_grants.write().unwrap_or_else(|e| e.into_inner());
         *g = grants.to_vec();
     }
+
+    /// The grants [`Self::update_wrap_grants`] last installed. Test-only: it
+    /// exists so `builder::boot`'s tests can pin that the closing step of the
+    /// funnel actually ran, which is the step a target used to be able to
+    /// forget.
+    #[cfg(test)]
+    pub(crate) fn installed_wrap_grants(&self) -> Vec<ResourceGrant> {
+        self.wrap_grants
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// Validate that a block name is safe for use as a storage path prefix.

@@ -58,8 +58,8 @@ pub struct D1ConfigSource {
     overlay: HashMap<String, String>,
     /// The whole variables table, fetched at most once per source.
     ///
-    /// `wafer-run` calls `load_for_block` once per registered block during
-    /// `strict_init_all_blocks`, and the previous per-block query made that
+    /// `wafer-run` calls `load_for_block` once per registered block while
+    /// `builder::boot` initializes them, and the previous per-block query made that
     /// one KV-cached read EACH — 22 on the production deployment, every cold
     /// hydration, and (measured 2026-09-01) all 22 returning zero rows,
     /// because only one block has block-scoped rows at all and its own

@@ -546,7 +546,10 @@ pub fn init_isolate() {
     });
 }
 
-use impresspress_core::builder::ImpresspressBuilder;
+use impresspress_core::builder::{
+    BootReport, GrantSource, ImpresspressBuilder, InitPolicy, RuntimeConfig,
+    PREPARE_RUNTIME_PLAN_KEY,
+};
 
 /// Worker entry shim: load D1 vars, wire services, run the consumer's
 /// block registrations, dispatch the request through WAFER.
@@ -926,10 +929,7 @@ where
     }
 
     if prepare_plan {
-        request_config.insert(
-            impresspress_core::deploy_init::PREPARE_RUNTIME_PLAN_KEY.to_string(),
-            "1".to_string(),
-        );
+        request_config.insert(PREPARE_RUNTIME_PLAN_KEY.to_string(), "1".to_string());
     }
 
     // Fresh runtime (never the request cache) with run_migrations forced on,
@@ -948,21 +948,7 @@ where
             },
         )
         .await?;
-        let services = built.services.clone();
-        let report = request_services::scope(services, async {
-            apply_db_wrap_grants(&mut built).await;
-            impresspress_core::deploy_init::deploy_init(
-                &mut built.wafer,
-                &built.storage_block,
-                &CfBootHooks {
-                    db: built.db.clone(),
-                    block_settings_handle: built.block_settings_handle.clone(),
-                },
-            )
-            .await
-            .map_err(|e| format!("deploy_init: {e}"))
-        })
-        .await?;
+        let report = boot_deploy_runtime(&mut built).await?;
         let plan_draft = if prepare_plan && report.ok {
             let final_settings =
                 impresspress_core::platform_state::block_settings::load(&built.db).await?;
@@ -1077,15 +1063,124 @@ struct BuiltRuntime {
     block_settings_handle: Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>>,
 }
 
-/// Register any admin-created WRAP grants loaded from D1 onto the built
-/// runtime. MUST run BEFORE `wafer.seal()` — grants added after seal are
-/// ignored. Shared by the request-path per-isolate cache
-/// (`runtime_cache::get_or_build`) and the `/_deploy/init` boot funnel.
-pub(crate) async fn apply_db_wrap_grants(built: &mut BuiltRuntime) {
-    let db_grants = impresspress_core::platform_state::wrap_grants::load(&built.db).await;
-    if !db_grants.is_empty() {
-        built.wafer.add_wrap_grants(db_grants);
-    }
+/// Run the post-build lifecycle over the **deploy funnel's** dynamically built
+/// runtime (`/_deploy/init`, reached by a production deploy and by local
+/// `impresspress serve --target cloudflare`).
+///
+/// Everything that used to be three hand-copied statement sequences — load the
+/// D1 grants, seal, init admin, init the rest, inject the grants into the
+/// storage block — is now `impresspress_core::builder::boot`'s ordering, with
+/// this function supplying only the Cloudflare-specific answers:
+///
+/// - **Grants come from D1.** `runtime_cache::get_or_build`'s stored build
+///   remembered to load them and `hydrate_transient_dynamic_runtime` had to
+///   repeat the call; nothing but a comment recorded that the prepared path's
+///   omission was deliberate. `GrantSource` makes it an argument the compiler
+///   demands.
+/// - **The seeding hook runs here and only here.** Seeding — structural
+///   `block_settings` rows and auto-generated secrets — is a deploy-time
+///   mutation, and this is the deploy. Its cost is two D1 reads plus, on a
+///   first deploy only, one insert per seeded block.
+/// - **`InitPolicy::Reported`**, because a deploy funnel's whole product is
+///   the per-step report; it captures every outcome instead of aborting on
+///   the first failure.
+async fn boot_deploy_runtime(built: &mut BuiltRuntime) -> Result<BootReport, String> {
+    let hooks = CfDeployBootHooks {
+        db: built.db.clone(),
+        block_settings_handle: built.block_settings_handle.clone(),
+        config: request_services::config_proxy(),
+        seed_defaults: impresspress_core::blocks::block_enabled_defaults(),
+    };
+    boot_dynamic(built, &hooks, InitPolicy::Reported).await
+}
+
+/// Run the same lifecycle over a **dynamically built request-path** runtime —
+/// the stored per-isolate build and the request-local transient one.
+///
+/// Same grant source as the deploy funnel, and a deliberately different hook:
+/// [`CfRequestBootHooks`] re-reads `block_settings` and republishes it, and
+/// **writes nothing**. A request is not a deploy; see that type for the three
+/// failure modes a seeding hook has here that it does not have in the funnel.
+///
+/// - **`InitPolicy::Strict`**, so a failure fails the build rather than
+///   publishing a Wafer with a failed lazy-init slot (concurrent requests
+///   would then wait on one another's init future, which is not a valid
+///   execution model for a request-isolated platform).
+/// - **A hook failure is fatal, deliberately.** `Strict` couples the two, and
+///   for this hook that is the right coupling rather than an accident of the
+///   policy: the only way [`CfRequestBootHooks`] can fail is a genuine
+///   operational failure of the same `block_settings` read `build_runtime`
+///   already performed and already treats as fatal a few hundred lines above
+///   (a missing table is `Ok(empty)` inside `DatabaseService::list`, never an
+///   `Err`). Serving requests off a half-known enablement map is exactly what
+///   that read fails closed to prevent, and the hook is the authoritative
+///   post-admin-init read of it.
+async fn boot_dynamic_request_runtime(built: &mut BuiltRuntime) -> Result<BootReport, String> {
+    let hooks = CfRequestBootHooks {
+        db: built.db.clone(),
+        block_settings_handle: built.block_settings_handle.clone(),
+        config: request_services::config_proxy(),
+    };
+    boot_dynamic(built, &hooks, InitPolicy::Strict).await
+}
+
+/// The shared body of the two dynamic paths: D1 grants, the caller's hook,
+/// the caller's policy. Private, so the choice of hook is made by picking one
+/// of the two functions above rather than by passing an argument — the two
+/// paths are not interchangeable and the type system now says so.
+async fn boot_dynamic(
+    built: &mut BuiltRuntime,
+    hooks: &dyn impresspress_core::builder::BootHooks,
+    policy: InitPolicy,
+) -> Result<BootReport, String> {
+    let db = built.db.clone();
+    request_services::scope(built.services.clone(), async {
+        impresspress_core::builder::boot(
+            &mut built.wafer,
+            &built.storage_block,
+            hooks,
+            GrantSource::Database(&db),
+            policy,
+        )
+        .await
+        .map_err(|error| format!("boot: {error}"))
+    })
+    .await
+}
+
+/// Run the same lifecycle over a runtime **hydrated from a verified prepared
+/// plan**, which is the one path that answers both questions differently.
+///
+/// - Grants are `PreInstalled`: `ImpresspressBuilder::apply_prepared_plan`
+///   copies `structure.wrap_grants` and `structure.deployment_wrap_grants` out
+///   of the plan into the builder, and `build()` registers them before this
+///   function is reached. Reading D1 here would answer the same question a
+///   second time, over the network.
+/// - The seed hook is [`PreparedPlanBootHooks`], a written no-op. Even the
+///   read-only [`CfRequestBootHooks`] the two dynamic request builds carry
+///   would be wrong here: they re-read `block_settings` because their own
+///   pre-`build()` read predates admin's migration, whereas this path takes
+///   its settings from the plan and performs **no** D1 structural read at
+///   all. Adding one would put back exactly what the plan exists to remove
+///   (~132us hydration versus a measured up-to-8.4s dynamic build), on every
+///   cold isolate, to re-derive state the deploy funnel already sealed into
+///   the plan.
+async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<BootReport, String> {
+    request_services::scope(built.services.clone(), async {
+        impresspress_core::builder::boot(
+            &mut built.wafer,
+            &built.storage_block,
+            &PreparedPlanBootHooks,
+            GrantSource::PreInstalled(
+                "ImpresspressBuilder::apply_prepared_plan installs the verified \
+                 plan's wrap_grants and deployment_wrap_grants before build()",
+            ),
+            InitPolicy::Strict,
+        )
+        .await
+        .map_err(|error| format!("boot: {error}"))
+    })
+    .await
 }
 
 /// Build (but do not seal or boot) the WAFER runtime for a request: wire the
@@ -1102,12 +1197,13 @@ pub(crate) async fn apply_db_wrap_grants(built: &mut BuiltRuntime) {
 /// this runtime's DB handle.
 ///
 /// Missing-table tolerance is an invariant here: on a first-ever deploy
-/// `/_deploy/init` builds this runtime BEFORE any migration has run, so every
-/// eager D1 read in this function MUST tolerate a not-yet-created table
-/// (`block_settings` → default map; `wrap_grants` → empty vec, applied in the
-/// callers via [`apply_db_wrap_grants`]). A non-tolerant eager read would
-/// error out and deadlock first deploys before migrations can create the
-/// tables.
+/// `/_deploy/init` builds this runtime BEFORE any migration has run, so the
+/// one eager D1 read in this function — `block_settings` → default map — MUST
+/// tolerate a not-yet-created table. A non-tolerant eager read would error out
+/// and deadlock first deploys before migrations can create the tables. The
+/// same tolerance is owed by the `wrap_grants` read the callers make, which is
+/// now `GrantSource::Database` inside `impresspress_core::builder::boot`
+/// rather than a call in this crate.
 async fn build_runtime<F, G>(
     env: &worker::Env,
     request_config: &HashMap<String, String>,
@@ -1164,89 +1260,48 @@ where
         impresspress_core::platform_state::block_settings::load(&db).await?
     };
 
-    // 3. Build the ConfigService map. After dropping the D1 env_vars
-    //    pre-load, this map only carries:
-    //    - PROTECTED_ENV_KEYS pulled from worker::Env bindings (e.g.
-    //      JWT secret managed via `wrangler secret put`). These never
-    //      live in D1.
-    //    - builder-time shared Worker vars such as CSP/CORS additions. The
-    //      middleware flow is constructed before lazy block config exists,
-    //      so these must be present in ConfigService before `builder.build()`.
-    //    - The synthetic BLOCK_SETTINGS_CONFIG_KEY → JSON entry so
-    //      consumer blocks (userportal, migration_helper) can read
-    //      block enablement / migration state via `ctx.config_get`
-    //      without a separate D1 query per request.
-    let mut cfg_svc_map: HashMap<String, String> = HashMap::new();
-    let mut overlay: HashMap<String, String> = HashMap::new();
-    for key in PROTECTED_ENV_KEYS {
-        if let Ok(secret) = env.secret(key) {
-            let v = secret.to_string();
-            cfg_svc_map.insert((*key).to_string(), v.clone());
-            overlay.insert((*key).to_string(), v);
-        }
-    }
-    for key in BUILDER_WORKER_VAR_KEYS {
-        if let Ok(var) = env.var(key) {
-            cfg_svc_map.insert((*key).to_string(), var.to_string());
-        }
-    }
-    // STRICT_SCHEMA (`WAFER_RUN__DATABASE__STRICT_SCHEMA`): thread the worker
-    // var (wrangler.toml `[vars]`) into the config map so the shared
-    // `wafer-run/database` block's Init lifecycle resolves it via
-    // `ctx.config_get` — the sync snapshot surface — and calls
-    // `set_strict_schema` on the DB service before it serves any query. Native
-    // env-filters *every* declared config key into its snapshot; CF's snapshot
-    // is deliberately minimal (secrets + block settings), so this one
-    // operational knob is threaded explicitly rather than living in the D1
-    // `variables` table (it's a deploy-time decision, not an admin-editable
-    // runtime toggle). Absent var ⇒ key absent ⇒ default `false`.
-    if let Ok(strict) = env.var(wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY)
-    {
-        cfg_svc_map.insert(
-            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY.to_string(),
-            strict.to_string(),
-        );
-    }
-    cfg_svc_map.insert(
-        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY.to_string(),
-        block_settings.to_config_json(),
+    // 3. The structural half of both config surfaces — see
+    //    `structural_runtime_config`, which is where every key and its reason
+    //    now lives.
+    let (mut runtime_config, mut overlay) = structural_runtime_config(
+        read_structural_config_inputs(env, block_settings.to_config_json(), force_run_migrations),
     );
-    // Migrations on CF run exclusively through the `/_deploy/init` funnel —
-    // a production deploy and local `impresspress serve --target cloudflare`
-    // both POST it (see `cli/flows/embed_cloudflare.rs`), which builds this
-    // runtime with `force_run_migrations = true`. Request-path builds never
-    // migrate; there is no worker env var to honor here (unlike native
-    // `server.rs`'s `--run-migrations` flag, which is a real per-boot CLI
-    // choice).
-    if force_run_migrations {
-        cfg_svc_map.insert(
-            impresspress_core::migration_helper::RUN_MIGRATIONS_KEY.to_string(),
-            "1".to_string(),
-        );
-    }
 
-    // This is the only map retained by the cached Wafer. Explicit application
-    // request config is added to the service map below, after this clone, so
-    // secret A from one request can never become request B's sync snapshot.
-    // JWT remains here as a bounded compatibility exception: CSRF currently
-    // reads it synchronously through `Context::config_get`; Worker-version
-    // identity forces a rebuild on rotation.
-    let mut snapshot = cfg_svc_map.clone();
-    retain_prepare_runtime_plan_flag(&mut snapshot, request_config);
-
-    extend_with_request_config(&mut cfg_svc_map, &mut overlay, request_config);
+    // Explicit application request config reaches the async service surface
+    // (and the ConfigSource overlay) but NOT the snapshot the cached Wafer
+    // retains, so secret A from one request can never become request B's sync
+    // read. The JWT secret above is a bounded exception that IS on both: CSRF
+    // currently reads it synchronously through `Context::config_get`, and
+    // Worker-version identity forces a rebuild on rotation.
+    add_request_config(&mut runtime_config, &mut overlay, request_config);
+    retain_prepare_runtime_plan_flag(&mut runtime_config, request_config);
 
     // 4. Construct remaining services.
     let bucket: Arc<dyn StorageService> = make_r2_storage_service(env, runner::R2_BINDING)
         .map_err(|e| format!("R2 binding {:?}: {e}", runner::R2_BINDING))?;
-    let jwt_secret = cfg_svc_map
-        .get(impresspress_core::blocks::auth::JWT_SECRET_KEY)
-        .cloned()
-        .unwrap_or_default();
+    let jwt_secret = runtime_config
+        .service_get(impresspress_core::blocks::auth::JWT_SECRET_KEY)
+        .unwrap_or_default()
+        .to_string();
     let crypto = make_jwt_crypto_service(jwt_secret);
     let network = make_fetch_network_service();
     let logger = make_console_logger(env);
-    let cfg_svc = make_config_service(cfg_svc_map);
+
+    // Hand both surfaces over at once. The concrete map-backed service is what
+    // THIS request reads through; the builder receives the stateless forwarder,
+    // because the isolate-cached Wafer must never retain a request's concrete
+    // service (see 6a below). `install` is the only way in, so a target cannot
+    // fill the service map and forget the snapshot.
+    //
+    // The concrete service comes back as `install`'s second return value —
+    // that this path builds a service the builder does not get is a fact about
+    // Cloudflare, so it is in the types rather than in an `Option` captured by
+    // the closure and unwrapped with an `expect` for a panic that could not
+    // happen.
+    let (config_installed, cfg_svc) = runtime_config.install(ImpresspressBuilder::new(), |map| {
+        let concrete = make_config_service(map);
+        (request_services::config_proxy(), concrete)
+    });
 
     // 5. ConfigSource: D1-backed lazy per-block fetch. The overlay layers
     //    worker::Env secrets (PROTECTED_ENV_KEYS) on top of D1 rows so
@@ -1275,7 +1330,6 @@ where
     // runs under the same request scope as async dispatch.
     let database_proxy = request_services::database_proxy();
     let storage_proxy = request_services::storage_proxy();
-    let config_proxy = request_services::config_proxy();
     let crypto_proxy = request_services::crypto_proxy();
     let network_proxy = request_services::network_proxy();
     let logger_proxy = request_services::logger_proxy();
@@ -1287,10 +1341,9 @@ where
         request_services::scope_sync(
             services.clone(),
             || -> Result<_, Box<dyn std::error::Error>> {
-                let builder = ImpresspressBuilder::new()
+                let builder = config_installed
                     .database(database_proxy)
                     .storage(storage_proxy.clone())
-                    .config(config_proxy)
                     .crypto(crypto_proxy)
                     .network(network_proxy)
                     .logger(logger_proxy)
@@ -1313,18 +1366,17 @@ where
                 let plan_exporter = builder.prepared_plan_exporter()?;
                 let block_settings_handle = builder.block_settings_handle();
 
-                // 6. Build runtime.
+                // 6. Build runtime. `build()` installs the synchronous
+                // `ctx.config_get` snapshot that `RuntimeConfig::install`
+                // handed over alongside the service map, so blocks can read
+                // embedder-provided keys with no I/O. That is immutable
+                // configuration data, not a request-derived service handle;
+                // Worker-version identity still forces a rebuild when it
+                // changes.
                 let (mut wafer, storage_block) =
                     builder.build().map_err(|e| format!("builder.build: {e}"))?;
 
-                // 6a. Wire the env-var snapshot into `RuntimeContext.config` so
-                // blocks can read embedder-provided keys synchronously. This is
-                // immutable configuration data, not a request-derived service
-                // handle; Worker-version identity still forces a rebuild when it
-                // changes.
-                wafer.set_config_snapshot(snapshot);
-
-                // 6b. The consumer receives the scoped storage proxy, never the
+                // 6a. The consumer receives the scoped storage proxy, never the
                 // request's concrete R2 Bucket. A block may safely retain this
                 // proxy in the isolate-cached runtime.
                 register_post_build(&mut wafer, storage_proxy)
@@ -1478,6 +1530,117 @@ where
     Ok(response)
 }
 
+/// Every value the structural config pass takes out of `worker::Env`, read in
+/// one place so the pass itself is a pure function.
+///
+/// The split exists for testability and pays for itself: a `wasm_bindgen_test`
+/// has no `worker::Env`, so before it the only thing a test could do about the
+/// two config surfaces was build its own `RuntimeConfig` and assert that
+/// `both()` works — which is a `builder::config` unit test wearing a
+/// Cloudflare hat, and would not have noticed a structural key here being
+/// switched to `service_only`.
+struct StructuralConfigInputs {
+    /// [`PROTECTED_ENV_KEYS`] that are actually bound as worker secrets.
+    secrets: Vec<(&'static str, String)>,
+    /// [`BUILDER_WORKER_VAR_KEYS`] plus `STRICT_SCHEMA_CONFIG_KEY`, for those
+    /// actually bound as worker vars.
+    worker_vars: Vec<(&'static str, String)>,
+    /// `BlockSettings::to_config_json` for this build.
+    block_settings_json: String,
+    /// Set only by the `/_deploy/init` funnel.
+    run_migrations: bool,
+}
+
+/// Read [`StructuralConfigInputs`] out of the worker environment.
+///
+/// STRICT_SCHEMA (`WAFER_RUN__DATABASE__STRICT_SCHEMA`) is a worker var
+/// (wrangler.toml `[vars]`) threaded into the config map so the shared
+/// `wafer-run/database` block's Init lifecycle resolves it via `ctx.config_get`
+/// — the sync snapshot surface — and calls `set_strict_schema` on the DB
+/// service before it serves any query. Native env-filters *every* declared
+/// config key into its snapshot; CF's snapshot is deliberately minimal
+/// (secrets + block settings), so this one operational knob is threaded
+/// explicitly rather than living in the D1 `variables` table (it's a
+/// deploy-time decision, not an admin-editable runtime toggle). Absent var ⇒
+/// key absent ⇒ default `false`.
+fn read_structural_config_inputs(
+    env: &worker::Env,
+    block_settings_json: String,
+    run_migrations: bool,
+) -> StructuralConfigInputs {
+    let secrets = PROTECTED_ENV_KEYS
+        .iter()
+        .filter_map(|key| env.secret(key).ok().map(|s| (*key, s.to_string())))
+        .collect();
+    let worker_vars = BUILDER_WORKER_VAR_KEYS
+        .iter()
+        .copied()
+        .chain(std::iter::once(
+            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
+        ))
+        .filter_map(|key| env.var(key).ok().map(|var| (key, var.to_string())))
+        .collect();
+    StructuralConfigInputs {
+        secrets,
+        worker_vars,
+        block_settings_json,
+        run_migrations,
+    }
+}
+
+/// Build the ConfigService map. After dropping the D1 env_vars pre-load, this
+/// map only carries:
+///
+/// - `PROTECTED_ENV_KEYS` pulled from `worker::Env` bindings (e.g. the JWT
+///   secret managed via `wrangler secret put`). These never live in D1.
+/// - builder-time shared Worker vars such as CSP/CORS additions and
+///   STRICT_SCHEMA. The middleware flow is constructed before lazy block
+///   config exists, so these must be present in ConfigService before
+///   `builder.build()`.
+/// - the synthetic `BLOCK_SETTINGS_CONFIG_KEY` → JSON entry so consumer blocks
+///   (userportal, migration_helper) can read block enablement / migration
+///   state via `ctx.config_get` without a separate D1 query per request.
+/// - `IMPRESSPRESS_RUN_MIGRATIONS`, on the deploy funnel only. Migrations on
+///   CF run exclusively through `/_deploy/init` — a production deploy and
+///   local `impresspress serve --target cloudflare` both POST it (see
+///   `cli/flows/embed_cloudflare.rs`). Request-path builds never migrate;
+///   there is no worker env var to honor here, unlike native `server.rs`'s
+///   `--run-migrations` flag, which is a real per-boot CLI choice.
+///
+/// Both surfaces are assembled in ONE `RuntimeConfig`: the async
+/// `ConfigService` map and the synchronous `ctx.config_get` snapshot used to be
+/// two literals kept in step by a comment. Every key here is written with
+/// `both`, so it lands on each; the one deliberate divergence
+/// (`service_only`) belongs to request config, which
+/// [`add_request_config`] adds afterwards and which carries its reason as an
+/// argument.
+///
+/// Returns the config alongside the `ConfigSource` overlay: the secrets are
+/// layered over the D1 `variables` rows so a secret never has to be mirrored
+/// into that table. Worker vars are not — they are builder-time middleware
+/// input, not per-block config.
+fn structural_runtime_config(
+    inputs: StructuralConfigInputs,
+) -> (RuntimeConfig, HashMap<String, String>) {
+    let mut config = RuntimeConfig::new();
+    let mut overlay: HashMap<String, String> = HashMap::new();
+    for (key, value) in inputs.secrets {
+        config.both(key, value.clone());
+        overlay.insert(key.to_string(), value);
+    }
+    for (key, value) in inputs.worker_vars {
+        config.both(key, value);
+    }
+    config.both(
+        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
+        inputs.block_settings_json,
+    );
+    if inputs.run_migrations {
+        config.both(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1");
+    }
+    (config, overlay)
+}
+
 /// Worker `Env` bindings that override D1 variables (set via
 /// `wrangler secret put`). Most config belongs in D1 so admins can
 /// manage it through the dashboard — this list stays short.
@@ -1511,15 +1674,62 @@ fn extend_with_request_config(
     }
 }
 
-/// Retain the one non-secret request value lifecycle code must read from the
-/// synchronous config snapshot while preparing an isolated deploy candidate.
-fn retain_prepare_runtime_plan_flag(
-    snapshot: &mut HashMap<String, String>,
+/// Add consumer-declared request config to a runtime's async service surface
+/// and to the `ConfigSource` overlay, and to neither snapshot: one request's
+/// secret must never be baked into the isolate-cached synchronous surface.
+///
+/// `RuntimeConfig::service_only` takes that reason as an argument, so the
+/// divergence is stated where it is created rather than inferred from a
+/// missing line.
+///
+/// A key the structural pass has already installed is skipped outright, and
+/// that rule is derived rather than listed: `service_only` REMOVES its key
+/// from the snapshot, so a collision does not shadow the structural value, it
+/// deletes it. Before `RuntimeConfig` the snapshot was cloned ahead of this
+/// merge and a collision was harmless by construction; the two name lists
+/// `extend_with_request_config` checks (`PROTECTED_ENV_KEYS`,
+/// `BUILDER_WORKER_VAR_KEYS`) cover the Env-owned families but not the keys
+/// this pass installs itself — `IMPRESSPRESS_BLOCK_SETTINGS`,
+/// `IMPRESSPRESS_RUN_MIGRATIONS`, `WAFER_RUN__DATABASE__STRICT_SCHEMA`. Asking
+/// the `RuntimeConfig` what it already holds covers all of them, and covers
+/// the next structural key without anyone remembering to add it to a list.
+fn add_request_config(
+    config: &mut RuntimeConfig,
+    overlay: &mut HashMap<String, String>,
     request_config: &HashMap<String, String>,
 ) {
-    let key = impresspress_core::deploy_init::PREPARE_RUNTIME_PLAN_KEY;
-    if request_config.get(key).map(String::as_str) == Some("1") {
-        snapshot.insert(key.to_string(), "1".to_string());
+    let consumer_owned: HashMap<String, String> = request_config
+        .iter()
+        .filter(|(key, _)| !config.snapshot_contains(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let mut service_map = HashMap::new();
+    extend_with_request_config(&mut service_map, overlay, &consumer_owned);
+    for (key, value) in service_map {
+        config.service_only(
+            key,
+            value,
+            "consumer request config is request-current: the isolate-cached \
+             snapshot must not carry one request's values into the next",
+        );
+    }
+}
+
+/// Promote the one non-secret request value lifecycle code must read from the
+/// synchronous config snapshot while preparing an isolated deploy candidate.
+/// Runs after [`add_request_config`], which has already put it on the async
+/// surface as a service-only key; `both` moves it onto the snapshot as well
+/// and retracts the recorded divergence.
+fn retain_prepare_runtime_plan_flag(
+    config: &mut RuntimeConfig,
+    request_config: &HashMap<String, String>,
+) {
+    if request_config
+        .get(PREPARE_RUNTIME_PLAN_KEY)
+        .map(String::as_str)
+        == Some("1")
+    {
+        config.both(PREPARE_RUNTIME_PLAN_KEY, "1");
     }
 }
 
@@ -1820,46 +2030,506 @@ async fn prepared_verify_endpoint(
     }
 }
 
-/// [`BootHooks`](impresspress_core::builder::BootHooks) impl for the Cloudflare
-/// target. Ordinary request builds load block_settings read-only before build
-/// (the router needs its enablement map up front). Deploy init additionally
-/// seeds structural defaults after admin migration has created the table, then
-/// publishes the resulting snapshot before any other block initializes. The
-/// shared auto-generated-secret pass also belongs after admin migration 002 has
-/// added the `variables.block` column.
+/// [`BootHooks`](impresspress_core::builder::BootHooks) impl for the
+/// `/_deploy/init` funnel's dynamically built runtime — the one Cloudflare
+/// path that **seeds**.
 ///
-/// Not constructed on the request path — the per-isolate cache seals without a
-/// boot funnel. Constructed by `deploy_init_endpoint` (`/_deploy/init`), which
-/// runs the full boot (migrations + seeds) on demand at deploy time.
-struct CfBootHooks {
+/// Every build loads block_settings read-only before `build()` (the router
+/// needs its enablement map up front); this hook additionally seeds structural
+/// defaults after admin migration has created the table, then publishes the
+/// resulting settings onto both config surfaces before any other block
+/// initializes. The shared auto-generated-secret pass also belongs after admin
+/// migration 002 has added the `variables.block` column.
+///
+/// Only the deploy funnel gets this. See [`CfRequestBootHooks`] for what the
+/// request paths get instead and why the difference is load-bearing.
+struct CfDeployBootHooks {
     db: Arc<dyn DatabaseService>,
     block_settings_handle: Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>>,
+    /// The request-scoped forwarder, so the seeded settings are published onto
+    /// the async surface as well as the snapshot. Cloudflare's concrete
+    /// `ConfigService` is map-backed and its `set` is a documented no-op, so
+    /// only the snapshot actually moves — that is a property of the service,
+    /// not a reason to write one surface and skip the other.
+    config: Arc<dyn ConfigService>,
+    /// The `(block_name, default_enabled)` set this funnel seeds towards, held
+    /// as data rather than called for inline. [`CfRequestBootHooks`] has no
+    /// such field and that is the point: the seeding path is the one that has
+    /// something to seed towards, so re-introducing a request-path seed means
+    /// visibly giving the request hook a defaults set, not quietly swapping
+    /// one function call for another.
+    seed_defaults: Vec<(String, bool)>,
+}
+
+impl CfDeployBootHooks {
+    /// The database half of [`Self::seed_after_admin_init`]: the auto-generated
+    /// secret pass and the hash-gated structural seed, both of which write.
+    /// Split out because `seed_after_admin_init` needs a `&mut Wafer` that no
+    /// wasm unit test can produce, and what the tests are about is the writes.
+    async fn seed_and_load(&self) -> Result<impresspress_core::features::BlockSettings, String> {
+        impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
+
+        impresspress_core::platform_state::block_settings::load_and_seed(
+            &self.db,
+            &self.seed_defaults,
+        )
+        .await
+        .map_err(|e| format!("seed block_settings after admin init: {e}"))
+    }
 }
 
 #[wafer_block::wafer_async_trait]
-impl impresspress_core::builder::BootHooks for CfBootHooks {
+impl impresspress_core::builder::BootHooks for CfDeployBootHooks {
     async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
-        impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
-
-        let block_settings = impresspress_core::platform_state::block_settings::load_and_seed(
-            &self.db,
-            &impresspress_core::blocks::block_enabled_defaults(),
-        )
-        .await
-        .map_err(|e| format!("seed block_settings after admin init: {e}"))?;
-        *self
-            .block_settings_handle
-            .write()
-            .expect("BlockSettings RwLock poisoned during Cloudflare deploy init") =
-            block_settings.clone();
-
-        let mut snapshot = (**wafer.config_snapshot()).clone();
-        snapshot.insert(
-            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY.to_string(),
-            block_settings.to_config_json(),
+        let block_settings = self.seed_and_load().await?;
+        publish_block_settings(
+            wafer,
+            &self.config,
+            &self.block_settings_handle,
+            block_settings,
         );
-        wafer.set_config_snapshot(snapshot);
         Ok(())
+    }
+}
+
+/// [`BootHooks`](impresspress_core::builder::BootHooks) impl for the two
+/// **dynamically built request-path** runtimes: read `block_settings`,
+/// republish it, write nothing.
+///
+/// # Why it re-reads at all
+///
+/// `build_runtime` reads `block_settings` before `build()`, but that read
+/// happens before `init_block(admin)`, and on a database that has never seen
+/// `/_deploy/init` admin's `Init` is a *fresh install* — `apply_if_blessed`
+/// bootstraps a fresh install without operator consent, so the table can come
+/// into existence, and gain rows, between the pre-build read and this hook.
+/// Re-reading here and republishing onto both surfaces is what makes the
+/// enablement map every later block's `Init` consults the post-admin-init one.
+/// On a settled deployment it returns exactly what `build_runtime` installed,
+/// at the cost of one KV-cached list.
+///
+/// # Why it must not seed
+///
+/// It is physically write-free, which is an invariant of this path and not a
+/// missing feature (`platform_state::block_settings::load` states the same
+/// thing at its own definition). Seeding here — as ruling 5.5 originally asked
+/// — has three failure modes the deploy funnel does not have, all of them
+/// under `InitPolicy::Strict`, where a hook error is a 500 on every request:
+///
+/// 1. **Missing tables 500 every request.** `read_rows` tolerates a missing
+///    table, so the seed planner plans an `Insert` for every block; `db.create`
+///    does not tolerate one. Production is shielded by preview 404s and by
+///    promotion following `/_deploy/init`, but `impresspress serve --target
+///    cloudflare` deliberately keeps serving when the local funnel is
+///    unreachable (`flows/embed_cloudflare.rs`: "local /_deploy/init not
+///    reachable …; serving anyway"), and that stops working.
+/// 2. **A successful seed self-invalidates the fleet.** `block_settings` is in
+///    `cache_key::bumps_config_version` and both request paths run with
+///    `bump_on_write: true`, so the write rewrites `cfg:v1:config_version` in
+///    KV and every *other* isolate takes the multi-second full dynamic rebuild
+///    this module's own comments flag for Cloudflare error 1102.
+/// 3. **Concurrent isolates race the insert.** `block_name` is `TEXT NOT NULL
+///    UNIQUE`; `load_and_seed` is read-then-write with no conflict tolerance,
+///    and `hydrate_transient_dynamic_runtime` fires fleet-wide on a generation
+///    bump, so the losing isolate answers a unique-constraint 500.
+///
+/// Auto-generated secrets are seeding too, and are likewise the funnel's job:
+/// this hook does not call `variables::seed_auto_generated`.
+struct CfRequestBootHooks {
+    db: Arc<dyn DatabaseService>,
+    block_settings_handle: Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>>,
+    /// See [`CfDeployBootHooks::config`].
+    config: Arc<dyn ConfigService>,
+}
+
+impl CfRequestBootHooks {
+    /// The database half of [`Self::seed_after_admin_init`]: one read, and
+    /// there is no second half. Split out for the same reason as
+    /// [`CfDeployBootHooks::seed_and_load`] — see
+    /// `boot_hook_tests::the_request_path_hook_writes_nothing_to_the_database`,
+    /// which asserts against the database this touches, not against which
+    /// function it called.
+    async fn load(&self) -> Result<impresspress_core::features::BlockSettings, String> {
+        impresspress_core::platform_state::block_settings::load(&self.db)
+            .await
+            .map_err(|e| format!("read block_settings after admin init: {e}"))
+    }
+}
+
+#[wafer_block::wafer_async_trait]
+impl impresspress_core::builder::BootHooks for CfRequestBootHooks {
+    async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
+        let block_settings = self.load().await?;
+        publish_block_settings(
+            wafer,
+            &self.config,
+            &self.block_settings_handle,
+            block_settings,
+        );
+        Ok(())
+    }
+}
+
+/// Publish a freshly loaded `BlockSettings` everywhere the rest of the boot
+/// reads it from: the router's shared handle, and both config surfaces (via
+/// `RuntimeConfig`, so neither can be filled without the other).
+fn publish_block_settings(
+    wafer: &mut wafer_run::Wafer,
+    config: &Arc<dyn ConfigService>,
+    handle: &Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>>,
+    block_settings: impresspress_core::features::BlockSettings,
+) {
+    let published_json = block_settings.to_config_json();
+    *handle
+        .write()
+        .expect("BlockSettings RwLock poisoned during Cloudflare boot") = block_settings;
+
+    let mut published = RuntimeConfig::new();
+    published.both(
+        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
+        published_json,
+    );
+    published.republish(wafer, config);
+}
+
+/// [`BootHooks`](impresspress_core::builder::BootHooks) impl for a runtime
+/// hydrated from a verified prepared plan: deliberately nothing to do.
+///
+/// The plan carries the block settings and WRAP grants `/_deploy/init` sealed
+/// into it after seeding, and `build_runtime` installs them without touching
+/// D1. Re-running [`CfDeployBootHooks`]'s seed here would answer questions the plan
+/// has already answered, over the network, on the one path whose entire
+/// purpose is to have no D1 structural reads — see [`boot_prepared_runtime`].
+///
+/// A no-op impl rather than a `None` argument: `BootHooks` is not an `Option`
+/// precisely so a target that seeds nothing has to say why, in a place a
+/// reader can find.
+struct PreparedPlanBootHooks;
+
+#[wafer_block::wafer_async_trait]
+impl impresspress_core::builder::BootHooks for PreparedPlanBootHooks {
+    async fn seed_after_admin_init(&self, _wafer: &mut wafer_run::Wafer) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Tests for the two Cloudflare boot hooks' database behaviour.
+///
+/// `seed_after_admin_init` takes `&mut wafer_run::Wafer`, which no wasm unit
+/// test can produce, so these exercise the hooks' database halves —
+/// [`request_path_block_settings`] and the `load_and_seed` call
+/// [`CfDeployBootHooks`] makes — through the real
+/// [`kv_cached_db::KvCachedD1DatabaseService`] wrapper the request path runs
+/// with, over a database that records every mutation.
+///
+/// The assertions are about writes that did or did not reach the database and
+/// the KV config-version stamp, never about which function was called: a test
+/// that asserts a call was not made passes just as happily when the call moves
+/// somewhere else.
+#[cfg(test)]
+mod boot_hook_tests {
+    use std::{cell::RefCell, collections::HashMap, sync::Arc};
+
+    use impresspress_core::{cache_key, features::FeatureConfig, kv::KvBackend};
+    use wafer_block::db::{Filter, ListOptions};
+    use wafer_core::interfaces::database::service::{
+        AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table,
+        UpsertSpec,
+    };
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    /// A `DatabaseService` over an EMPTY `block_settings` table — the state a
+    /// first-ever deploy is in, and the one where the seed planner plans an
+    /// `Insert` for every block. Records every mutation it is asked to make.
+    #[derive(Default)]
+    struct RecordingDb {
+        writes: RefCell<Vec<String>>,
+    }
+
+    impl RecordingDb {
+        fn note(&self, write: String) {
+            self.writes.borrow_mut().push(write);
+        }
+    }
+
+    #[wafer_block::wafer_async_trait]
+    impl DatabaseService for RecordingDb {
+        async fn get(&self, _collection: &str, _id: &str) -> Result<Record, DatabaseError> {
+            Err(DatabaseError::NotFound)
+        }
+
+        async fn list(
+            &self,
+            _collection: &str,
+            _opts: &ListOptions,
+        ) -> Result<RecordList, DatabaseError> {
+            Ok(RecordList {
+                records: Vec::new(),
+                total_count: 0,
+                page: 1,
+                page_size: 500,
+            })
+        }
+
+        async fn create(
+            &self,
+            collection: &str,
+            _data: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            self.note(format!("create {collection}"));
+            Ok(Record {
+                id: "created".to_string(),
+                data: HashMap::new(),
+            })
+        }
+
+        async fn update(
+            &self,
+            collection: &str,
+            id: &str,
+            _data: HashMap<String, serde_json::Value>,
+        ) -> Result<Record, DatabaseError> {
+            self.note(format!("update {collection}/{id}"));
+            Ok(Record {
+                id: id.to_string(),
+                data: HashMap::new(),
+            })
+        }
+
+        async fn delete(&self, collection: &str, id: &str) -> Result<(), DatabaseError> {
+            self.note(format!("delete {collection}/{id}"));
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _collection: &str,
+            _filters: &[Filter],
+        ) -> Result<i64, DatabaseError> {
+            Ok(0)
+        }
+
+        async fn sum(
+            &self,
+            _collection: &str,
+            _field: &str,
+            _filters: &[Filter],
+        ) -> Result<f64, DatabaseError> {
+            Ok(0.0)
+        }
+
+        async fn query_raw(
+            &self,
+            _query: &str,
+            _args: &[serde_json::Value],
+        ) -> Result<Vec<Record>, DatabaseError> {
+            unreachable!("block_settings never goes through raw SQL")
+        }
+
+        async fn exec_raw(
+            &self,
+            query: &str,
+            _args: &[serde_json::Value],
+        ) -> Result<i64, DatabaseError> {
+            self.note(format!("exec_raw {query}"));
+            Ok(0)
+        }
+
+        async fn upsert(&self, collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
+            self.note(format!("upsert {collection}"));
+            Ok(0)
+        }
+
+        async fn aggregate(
+            &self,
+            _collection: &str,
+            _spec: AggregateSpec,
+        ) -> Result<Vec<Record>, DatabaseError> {
+            Ok(Vec::new())
+        }
+
+        async fn ensure_schema_table(&self, table: &Table) -> Result<(), DatabaseError> {
+            self.note(format!("ensure_schema_table {}", table.name));
+            Ok(())
+        }
+
+        async fn schema_table_exists(&self, _name: &str) -> Result<bool, DatabaseError> {
+            Ok(true)
+        }
+
+        async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
+            self.note(format!("schema_drop_table {name}"));
+            Ok(())
+        }
+
+        async fn schema_add_column(
+            &self,
+            table: &str,
+            column: &Column,
+        ) -> Result<(), DatabaseError> {
+            self.note(format!("schema_add_column {table}.{}", column.name));
+            Ok(())
+        }
+    }
+
+    /// KV backend that records every key it is asked to write, so the
+    /// config-generation bump is observable.
+    #[derive(Default)]
+    struct RecordingKv {
+        puts: RefCell<Vec<String>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl KvBackend for RecordingKv {
+        async fn get(&self, _key: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn put_with_ttl(
+            &self,
+            key: &str,
+            _value: &str,
+            _ttl_secs: u64,
+        ) -> Result<(), String> {
+            self.puts.borrow_mut().push(key.to_string());
+            Ok(())
+        }
+
+        async fn put(&self, key: &str, _value: &str) -> Result<(), String> {
+            self.puts.borrow_mut().push(key.to_string());
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The request path's exact database wiring: the KV row cache in front of
+    /// D1 with `bump_on_write` ON, which is what turns any write to
+    /// `block_settings` into a fleet-wide config-generation bump.
+    fn request_path_db() -> (Arc<dyn DatabaseService>, Arc<RecordingDb>, Arc<RecordingKv>) {
+        let inner = Arc::new(RecordingDb::default());
+        let kv = Arc::new(RecordingKv::default());
+        let service = kv_cached_db::KvCachedD1DatabaseService::with_mode(
+            inner.clone() as Arc<dyn DatabaseService>,
+            kv.clone() as Arc<dyn KvBackend>,
+            kv_cached_db::CacheMode {
+                read_through: true,
+                bump_on_write: true,
+            },
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let service: Arc<dyn DatabaseService> = Arc::new(service);
+        (service, inner, kv)
+    }
+
+    fn settings_handle() -> Arc<std::sync::RwLock<impresspress_core::features::BlockSettings>> {
+        Arc::new(std::sync::RwLock::new(
+            impresspress_core::features::BlockSettings::default(),
+        ))
+    }
+
+    /// One block that ships enabled. Held here rather than taken from
+    /// `blocks::block_enabled_defaults()` so the fixture proves the same thing
+    /// in every feature build: this crate's default feature set has no
+    /// `can_disable` block at all, so the real defaults list is empty there and
+    /// a seeding call over it would write nothing for a reason that has nothing
+    /// to do with the property under test.
+    fn seed_defaults_fixture() -> Vec<(String, bool)> {
+        vec![("impresspress/fixture".to_string(), true)]
+    }
+
+    /// **The request path is physically write-free.** On the empty table a
+    /// database that has never seen `/_deploy/init` is in — the state where
+    /// the seed planner plans an `Insert` for every block — the request-path
+    /// hook must issue none of them.
+    ///
+    /// Asserted as the absence of a database write and of a KV
+    /// config-generation bump, not as the absence of a call. Those writes are
+    /// what 500s a `serve --target cloudflare` session on a missing table,
+    /// what makes every other isolate take a full dynamic rebuild, and what
+    /// two concurrent isolates race into a unique-constraint failure; a test
+    /// that only checked "the seeder was not called" would keep passing the
+    /// moment the write arrived by another route.
+    ///
+    /// The second half is the anti-vacuity control: the SAME fixture, asked to
+    /// seed, records writes. So "no writes" above is a fact about the request
+    /// path, not about a fixture that cannot see one.
+    ///
+    /// Note which build catches a regression here. This crate's DEFAULT
+    /// feature set enables no `can_disable` block, so
+    /// `blocks::block_enabled_defaults()` is empty and a seeding hook wired
+    /// back onto the request path would write nothing in that build and keep
+    /// this green. The `--features full` lane is where it fails, which is why
+    /// CI now runs this suite twice.
+    #[wasm_bindgen_test]
+    async fn the_request_path_hook_writes_nothing_to_the_database() {
+        let (db, inner, kv) = request_path_db();
+        let hooks = CfRequestBootHooks {
+            db: db.clone(),
+            block_settings_handle: settings_handle(),
+            config: request_services::config_proxy(),
+        };
+
+        let settings = hooks
+            .load()
+            .await
+            .expect("an empty block_settings table is not an error");
+
+        assert!(
+            inner.writes.borrow().is_empty(),
+            "the request path must not write to the database during boot; it issued {:?}",
+            inner.writes.borrow(),
+        );
+        assert!(
+            !kv.puts
+                .borrow()
+                .iter()
+                .any(|key| key == cache_key::CONFIG_VERSION_KEY),
+            "a request-path boot must not bump the config generation: every other \
+             isolate would take a full dynamic rebuild. KV writes: {:?}",
+            kv.puts.borrow(),
+        );
+        // It still answers with usable settings: a block with no row reads as
+        // enabled, which is why not seeding here is safe.
+        assert!(
+            settings.is_block_enabled(impresspress_core::blocks::admin::ADMIN_BLOCK_ID),
+            "a block with no row must read as enabled",
+        );
+
+        // The control. Same database, same wrapper, the deploy funnel's hook.
+        let deploy = CfDeployBootHooks {
+            db,
+            block_settings_handle: settings_handle(),
+            config: request_services::config_proxy(),
+            seed_defaults: seed_defaults_fixture(),
+        };
+        deploy
+            .seed_and_load()
+            .await
+            .expect("seeding an empty table succeeds");
+        let seeded = format!(
+            "create {}",
+            impresspress_core::platform_state::block_settings::TABLE
+        );
+        assert!(
+            inner.writes.borrow().contains(&seeded),
+            "the fixture must be able to observe the structural seed write, or \
+             the assertion above proves nothing; it saw {:?}",
+            inner.writes.borrow(),
+        );
+        assert!(
+            kv.puts
+                .borrow()
+                .iter()
+                .any(|key| key == cache_key::CONFIG_VERSION_KEY),
+            "and it must be able to observe the config-generation bump that \
+             write causes: {:?}",
+            kv.puts.borrow(),
+        );
     }
 }
 
@@ -1968,52 +2638,229 @@ mod request_config_tests {
         assert_eq!(loads.get(), 2);
     }
 
+    /// The structural half of Cloudflare's fill: every key `build_runtime`
+    /// installs reaches BOTH surfaces with the same value.
+    ///
+    /// Goes through the production assembly [`structural_runtime_config`]
+    /// rather than building a `RuntimeConfig` of its own — an earlier version
+    /// of this test did the latter and was a `builder::config` unit test
+    /// wearing a Cloudflare hat: it asserted that `both()` works, which
+    /// `config.rs` already pins, and would have kept passing if a key here
+    /// were switched to `service_only` and dropped off the isolate-cached
+    /// snapshot. `build_runtime` itself needs a `worker::Env` no wasm test can
+    /// produce, which is why the env reads are one function
+    /// (`read_structural_config_inputs`) and the assembly another.
+    #[wasm_bindgen_test]
+    fn structural_keys_reach_both_config_surfaces() {
+        let strict_schema = wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY;
+        let (config, overlay) = structural_runtime_config(StructuralConfigInputs {
+            secrets: vec![(
+                impresspress_core::blocks::auth::JWT_SECRET_KEY,
+                "jwt".to_string(),
+            )],
+            worker_vars: vec![
+                (
+                    impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+                    "*".to_string(),
+                ),
+                (
+                    impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
+                    "default-src 'self'".to_string(),
+                ),
+                (strict_schema, "true".to_string()),
+            ],
+            block_settings_json: "{}".to_string(),
+            run_migrations: true,
+        });
+
+        for (key, value) in [
+            (impresspress_core::blocks::auth::JWT_SECRET_KEY, "jwt"),
+            (
+                impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+                "*",
+            ),
+            (
+                impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
+                "default-src 'self'",
+            ),
+            (strict_schema, "true"),
+            (impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY, "{}"),
+            (impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1"),
+        ] {
+            assert_eq!(
+                config.service_get(key),
+                Some(value),
+                "{key} on the service map"
+            );
+            assert!(config.snapshot_contains(key), "{key} on the snapshot");
+        }
+        assert!(
+            config.service_only_keys().is_empty(),
+            "no structural key diverges",
+        );
+        // Secrets are also layered over the D1 `variables` rows the per-block
+        // `ConfigSource` resolves; worker vars are builder-time middleware
+        // input and deliberately are not.
+        assert_eq!(
+            overlay
+                .get(impresspress_core::blocks::auth::JWT_SECRET_KEY)
+                .map(String::as_str),
+            Some("jwt"),
+        );
+        assert!(!overlay.contains_key(impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY));
+    }
+
+    /// The `run_migrations` flag is the funnel's alone: a request-path build
+    /// passes `false` and the key must be absent, not present-and-empty —
+    /// `migration_helper` gates on `== Some("1")`, but an absent key is also
+    /// what keeps the two builds' config identity distinct.
+    #[wasm_bindgen_test]
+    fn a_request_path_build_carries_no_run_migrations_key() {
+        let (config, _overlay) = structural_runtime_config(StructuralConfigInputs {
+            secrets: Vec::new(),
+            worker_vars: Vec::new(),
+            block_settings_json: "{}".to_string(),
+            run_migrations: false,
+        });
+
+        assert_eq!(
+            config.service_get(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY),
+            None,
+        );
+        assert!(!config.snapshot_contains(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY),);
+    }
+
+    /// A consumer request key that collides with a framework structural key
+    /// must not DELETE that key from the snapshot.
+    ///
+    /// `RuntimeConfig::service_only` is a `remove` on the snapshot surface, so
+    /// a collision is not "the request value shadows the structural one" — it
+    /// is "the structural one is gone". On `main` the snapshot was cloned
+    /// before the request merge and a collision left the structural value
+    /// intact; the guard list that replaced that accident covered
+    /// `PROTECTED_ENV_KEYS` and `BUILDER_WORKER_VAR_KEYS` but not the three
+    /// keys the structural pass installs itself. Any key the structural pass
+    /// already put on the snapshot is now framework-owned, whatever its name.
+    #[wasm_bindgen_test]
+    fn request_config_cannot_delete_a_structural_key_from_the_snapshot() {
+        let structural = [
+            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
+            impresspress_core::migration_helper::RUN_MIGRATIONS_KEY,
+            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
+            impresspress_core::blocks::auth::JWT_SECRET_KEY,
+            impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+        ];
+
+        let mut config = RuntimeConfig::new();
+        for key in structural {
+            config.both(key, "structural");
+        }
+
+        let mut overlay = HashMap::new();
+        let hostile: HashMap<String, String> = structural
+            .iter()
+            .map(|key| ((*key).to_string(), "from-the-request".to_string()))
+            .chain([("APP_SECRET".to_string(), "secret".to_string())])
+            .collect();
+        add_request_config(&mut config, &mut overlay, &hostile);
+
+        for key in structural {
+            assert!(
+                config.snapshot_contains(key),
+                "{key} must survive a colliding request key on the snapshot",
+            );
+            assert_eq!(
+                config.service_get(key),
+                Some("structural"),
+                "{key} must keep its structural value on the async surface too",
+            );
+            assert!(
+                !overlay.contains_key(key),
+                "{key} must not be shadowed in the ConfigSource overlay either",
+            );
+        }
+        // The consumer's own key still gets through, service-only as before.
+        assert_eq!(config.service_get("APP_SECRET"), Some("secret"));
+        assert!(!config.snapshot_contains("APP_SECRET"));
+        let declared: Vec<&str> = config
+            .service_only_keys()
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(declared, vec!["APP_SECRET"]);
+    }
+
     #[wasm_bindgen_test]
     fn explicit_request_secret_never_enters_cached_structural_snapshot() {
-        let structural = HashMap::from([("ROUTES".to_string(), "v1".to_string())]);
-        let cached_snapshot = structural.clone();
-
-        let mut request_a_config = structural.clone();
+        let mut request_a = RuntimeConfig::new();
+        request_a.both("ROUTES", "v1");
         let mut request_a_overlay = HashMap::new();
-        extend_with_request_config(
-            &mut request_a_config,
+        add_request_config(
+            &mut request_a,
             &mut request_a_overlay,
             &HashMap::from([("APP_SECRET".to_string(), "secret-a".to_string())]),
         );
 
-        let mut request_b_config = cached_snapshot.clone();
+        let mut request_b = RuntimeConfig::new();
+        request_b.both("ROUTES", "v1");
         let mut request_b_overlay = HashMap::new();
-        extend_with_request_config(
-            &mut request_b_config,
+        add_request_config(
+            &mut request_b,
             &mut request_b_overlay,
             &HashMap::from([("APP_SECRET".to_string(), "secret-b".to_string())]),
         );
 
-        assert_eq!(cached_snapshot.get("APP_SECRET"), None);
+        assert_eq!(request_a.service_get("APP_SECRET"), Some("secret-a"));
+        assert_eq!(request_b.service_get("APP_SECRET"), Some("secret-b"));
+        assert!(
+            !request_a.snapshot_contains("APP_SECRET"),
+            "the snapshot the isolate caches must not carry a request value",
+        );
+        assert!(!request_b.snapshot_contains("APP_SECRET"));
+        assert!(request_a.snapshot_contains("ROUTES"));
+        // The divergence is declared, with its reason, not inferred.
+        let declared: Vec<&str> = request_a
+            .service_only_keys()
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(declared, vec!["APP_SECRET"]);
+        assert!(request_a.service_only_keys()[0]
+            .because
+            .contains("request-current"));
+        // And the overlay the D1 ConfigSource layers over its rows gets it too.
         assert_eq!(
-            request_a_config.get("APP_SECRET").map(String::as_str),
+            request_a_overlay.get("APP_SECRET").map(String::as_str),
             Some("secret-a")
         );
-        assert_eq!(
-            request_b_config.get("APP_SECRET").map(String::as_str),
-            Some("secret-b")
-        );
-        assert!(!request_b_config.values().any(|value| value == "secret-a"));
     }
 
     #[wasm_bindgen_test]
     fn deploy_prepare_flag_is_the_only_request_value_retained_for_lifecycle() {
-        let mut snapshot = HashMap::from([("ROUTES".to_string(), "v1".to_string())]);
-        let prepare_key = impresspress_core::deploy_init::PREPARE_RUNTIME_PLAN_KEY;
+        let mut config = RuntimeConfig::new();
+        config.both("ROUTES", "v1");
         let request = HashMap::from([
-            (prepare_key.to_string(), "1".to_string()),
+            (PREPARE_RUNTIME_PLAN_KEY.to_string(), "1".to_string()),
             ("APP_SECRET".to_string(), "do-not-retain".to_string()),
         ]);
 
-        retain_prepare_runtime_plan_flag(&mut snapshot, &request);
+        let mut overlay = HashMap::new();
+        add_request_config(&mut config, &mut overlay, &request);
+        retain_prepare_runtime_plan_flag(&mut config, &request);
 
-        assert_eq!(snapshot.get(prepare_key).map(String::as_str), Some("1"));
-        assert_eq!(snapshot.get("APP_SECRET"), None);
+        assert_eq!(config.service_get(PREPARE_RUNTIME_PLAN_KEY), Some("1"));
+        assert!(config.snapshot_contains(PREPARE_RUNTIME_PLAN_KEY));
+        assert!(!config.snapshot_contains("APP_SECRET"));
+        let declared: Vec<&str> = config
+            .service_only_keys()
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(
+            declared,
+            vec!["APP_SECRET"],
+            "promoting the prepare flag to both surfaces retracts its divergence",
+        );
     }
 
     #[wasm_bindgen_test]

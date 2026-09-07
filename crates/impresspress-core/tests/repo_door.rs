@@ -19,7 +19,7 @@
 //! dozen doc comments describe these tables by name. Trailing comments on
 //! code lines are kept, so nothing hides behind a `//` on the same line as
 //! code. What this gate still does NOT cover, stated so it is not mistaken
-//! for more than it is: other workspace crates (the CLI's `deploy_init` and
+//! for more than it is: other workspace crates (the CLI's `boot_lifecycle` and
 //! `native_wrap_grants` tests seed fixtures through `DatabaseService`, and
 //! the Cloudflare adapter's `D1ConfigSource` reads the variables table on
 //! its production config path; all of them name `platform_state::*::TABLE`

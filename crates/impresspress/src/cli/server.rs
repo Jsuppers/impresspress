@@ -10,7 +10,7 @@
 //! with the integration tests in `tests/` so the runtime they exercise is the
 //! one the binary builds.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use impresspress_core::{
@@ -21,7 +21,7 @@ use impresspress_native::{
     collect_app_env_vars, init_tracing, load_dotenv, register_http_listener,
     register_observability_hooks, serve_until_shutdown, InfraConfig,
 };
-use wafer_core::interfaces::{config::service::ConfigService, database::service::DatabaseService};
+use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::Wafer;
 
 use crate::cli::server_config::filter_to_declared_keys;
@@ -93,7 +93,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 
     // 11. Boot through the shared funnel, then run the native-only Start
     //     lifecycle + socket bind. `builder::boot` owns the invariant
-    //     seal → init_block(admin) → seed-hook → init_all_blocks → post_start
+    //     grants → seal → init_block(admin) → seed-hook → the rest → post_start
     //     ordering shared with the Cloudflare/browser targets, replacing the
     //     bespoke `start_with_priority(&[admin])`. Admin-first init guarantees
     //     admin's migrations (which create impresspress__admin__block_settings +
@@ -109,9 +109,23 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     //     steps `boot` deliberately omits because the stateless targets
     //     dispatch per-request instead of binding (wafer-run #239 exposed them
     //     as `run_start_lifecycle` + `bind_all`).
-    builder::boot(&mut wafer, &storage_block, &NativeBootHooks)
-        .await
-        .context("boot WAFER runtime")?;
+    builder::boot(
+        &mut wafer,
+        &storage_block,
+        &NativeBootHooks,
+        // `build_native_runtime` reads the admin-created grants from the
+        // platform database and hands them to `ImpresspressBuilder::wrap_grants`
+        // before `build()`, because native seeds and reads everything pre-wafer.
+        builder::GrantSource::PreInstalled(
+            "build_native_runtime loads them from the platform database into \
+             ImpresspressBuilder::wrap_grants before build()",
+        ),
+        // A long-lived server can be inspected and fixed in place, so one
+        // broken block must not wedge the whole process.
+        builder::InitPolicy::Tolerant,
+    )
+    .await
+    .context("boot WAFER runtime")?;
     wafer.run_start_lifecycle().await;
     let wafer = wafer.bind_all();
     tracing::info!("WAFER runtime started — all blocks resolved");
@@ -126,8 +140,8 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 }
 
 /// What [`build_native_runtime`] produces: the runtime, built but not yet
-/// sealed or booted, and the storage block `builder::boot` / `deploy_init`
-/// need to run the lifecycle.
+/// sealed or booted, and the storage block [`builder::boot`] needs to run the
+/// lifecycle.
 pub struct NativeRuntime {
     pub wafer: Wafer,
     pub storage_block: Arc<ImpresspressStorageBlock>,
@@ -209,49 +223,30 @@ pub async fn build_native_runtime(
     let strict_schema =
         std::env::var(wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY).ok();
 
-    // 7. Build WAFER runtime via ImpresspressBuilder
-    let config_service = wafer_core::service_blocks::config::EnvConfigService::new();
-    for (key, value) in &vars {
-        config_service.set(key, value);
-    }
-    // Fan-out block_settings into the config snapshot so consumer blocks
-    // (e.g. userportal) can read enablement state via `ctx.config_get`
-    // without re-querying the `block_settings` SQLite table per request.
-    config_service.set(
-        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
-        &features.to_config_json(),
-    );
-    if run_migrations {
-        config_service.set(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1");
-    }
-    if let Some(v) = &strict_schema {
-        config_service.set(
-            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
-            v,
-        );
-    }
-
-    // Build the parallel snapshot map fed to `Wafer::set_config_snapshot`.
-    // `EnvConfigService` is the async (`wafer-run/config`) read surface;
-    // the snapshot is the synchronous `ctx.config_get` surface. Both must
-    // carry the same data so `migration_helper::apply_if_blessed` (which
-    // reads `BLOCK_SETTINGS_CONFIG_KEY` + `IMPRESSPRESS_RUN_MIGRATIONS` via
-    // `config_get`) sees the boot values without a per-call D1 hop. See
+    // 7. Assemble both config surfaces once. `EnvConfigService` is the async
+    // (`wafer-run/config`) read surface; the snapshot the builder installs is
+    // the synchronous `ctx.config_get` surface. They must carry the same data
+    // so `migration_helper::apply_if_blessed` (which reads
+    // `BLOCK_SETTINGS_CONFIG_KEY` + `IMPRESSPRESS_RUN_MIGRATIONS` via
+    // `config_get`) sees the boot values without a per-call DB hop. See
     // `docs/superpowers/specs/2026-05-14-config-snapshot-and-migration-gate-design.md`.
-    let mut snapshot: HashMap<String, String> = vars.clone();
-    snapshot.insert(
-        impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY.to_string(),
-        features.to_config_json(),
-    );
-    if run_migrations {
-        snapshot.insert(
-            impresspress_core::migration_helper::RUN_MIGRATIONS_KEY.to_string(),
-            "1".to_string(),
+    // Native has no divergence: every key below is `both`.
+    let mut runtime_config = builder::RuntimeConfig::new();
+    runtime_config
+        .extend_both(vars.clone())
+        // Fan-out block_settings so consumer blocks (e.g. userportal) can read
+        // enablement state via `ctx.config_get` without re-querying the
+        // `block_settings` table per request.
+        .both(
+            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
+            features.to_config_json(),
         );
+    if run_migrations {
+        runtime_config.both(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1");
     }
     if let Some(v) = strict_schema {
-        snapshot.insert(
-            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY.to_string(),
+        runtime_config.both(
+            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
             v,
         );
     }
@@ -279,10 +274,17 @@ pub async fn build_native_runtime(
         );
     }
 
-    let (mut wafer, storage_block) = ImpresspressBuilder::new()
-        .database(database)
-        .storage(storage)
-        .config(Arc::new(config_service))
+    let (with_config, ()) = runtime_config.install(
+        ImpresspressBuilder::new()
+            .database(database)
+            .storage(storage),
+        |map| {
+            let svc = wafer_core::service_blocks::config::EnvConfigService::new();
+            (builder::fill_config_service(Arc::new(svc), map), ())
+        },
+    );
+
+    let (wafer, storage_block) = with_config
         .config_source(Arc::new(wafer_run::StaticConfigSource::new(vars.clone())))
         .crypto(impresspress_native::make_jwt_crypto_service(jwt_secret)?)
         .network(
@@ -299,12 +301,6 @@ pub async fn build_native_runtime(
         .build()
         .context("build impresspress runtime")?;
 
-    // 7b. Wire the env-var snapshot into `RuntimeContext.config` so blocks
-    //     can read embedder-provided keys via `ctx.config_get` synchronously.
-    //     Mirrors the cloudflare embedder; both surfaces carry identical
-    //     data (see snapshot construction above).
-    wafer.set_config_snapshot(snapshot);
-
     Ok(NativeRuntime {
         wafer,
         storage_block,
@@ -316,9 +312,11 @@ pub async fn build_native_runtime(
 /// snapshot need the values at `build()` time), so — like the Cloudflare hook
 /// after its eager pre-build config reads — there is nothing left to seed once
 /// admin's `Init` has run. The shared `boot` funnel still owns the admin-first
-/// ordering and `post_start`; native only needs an empty hook to satisfy the
-/// signature, plus the native-only `run_start_lifecycle` + `bind_all` steps
-/// it runs after `boot` returns.
+/// ordering and the WRAP-grant injection that closes it; native only needs an
+/// empty hook — [`builder::BootHooks`] is deliberately not an `Option`, so a
+/// target with nothing to seed says so here rather than by omission — plus the
+/// native-only `run_start_lifecycle` + `bind_all` steps it runs after `boot`
+/// returns.
 pub struct NativeBootHooks;
 
 #[wafer_block::wafer_async_trait]

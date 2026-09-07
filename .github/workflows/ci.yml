@@ -396,6 +396,19 @@ jobs:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: cargo test --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --lib
 
+      # The default feature set enables no `can_disable` block at all, so
+      # `blocks::block_enabled_defaults()` is EMPTY there and any test about
+      # structural block-settings seeding passes without exercising a single
+      # write (`boot_hook_tests::the_request_path_hook_writes_nothing_to_the_
+      # database` is the one that matters: with a seeding hook wired back onto
+      # the request path it stays green in the lean build and fails here).
+      # `full` is also the shape a block-carrying consumer deploys.
+      - name: Run impresspress-cloudflare wasm tests, full block set (Node)
+        if: steps.cloudflare-changes.outputs.skip != 'true'
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked -p impresspress-cloudflare --features full --target wasm32-unknown-unknown --lib
+
   browser-wasm-test:
     name: Browser WASM tests (impresspress-browser)
     runs-on: ubuntu-latest

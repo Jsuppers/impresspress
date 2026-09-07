@@ -125,7 +125,7 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
 ///    block's declared `ConfigVar`s from at its first `lifecycle(Init)`.
 ///  - `block_settings_handle` — the same `Arc<RwLock<BlockSettings>>` the
 ///    router's `FeatureConfig` reads, so the write is visible to the
-///    subsequent `init_all_blocks()` and every later request.
+///    remaining blocks' `Init` and every later request.
 ///  - `crypto` — the concrete `BrowserCryptoService`, rotated to the real JWT
 ///    secret so any not-yet-initialised block signs/verifies with it.
 ///
@@ -159,46 +159,36 @@ impl builder::BootHooks for BrowserBootHooks {
         );
         let features = config::load_block_settings(&self.db).await?;
 
-        for (key, value) in &vars {
-            self.config_svc.set(key, value);
-        }
         // The runtime resolves every block's DECLARED `ConfigVar`s through the
         // config source before it calls that block's `lifecycle(Init)` — a
         // required key it cannot resolve is `InitError::Permanent`, and the
         // block is then dead for the life of the runtime however well its
         // handlers would have coped with the value being absent. So the
-        // seeded map goes here as well as into the ConfigService: this is the
-        // half `init_all_blocks()` below actually consults.
+        // seeded map goes here as well as onto the two config surfaces: this
+        // is the half the remaining blocks' Init actually consults.
         self.config_source.publish(vars.clone());
-        // This adapter executes inside an end user's browser. Set the marker
-        // after persisted variables are published so a database/admin value
-        // cannot accidentally enable Stripe secret-key operations locally.
-        // Static pages may still use a remote trusted commerce API or
-        // pre-created Payment Links.
-        self.config_svc.set(
-            impresspress_core::blocks::products::RUNTIME_KIND_CONFIG_KEY,
-            "browser",
-        );
-        self.config_svc.set(
-            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
-            &features.to_config_json(),
-        );
 
-        // `ctx.config_get` reads Wafer's synchronous snapshot, not the config
-        // service block. Publish the same post-migration values there before
-        // `init_all_blocks()` so migration/feature gates observe the seeded
-        // browser state rather than the empty pre-admin snapshot.
-        let mut snapshot = (**wafer.config_snapshot()).clone();
-        snapshot.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
-        snapshot.insert(
-            impresspress_core::blocks::products::RUNTIME_KIND_CONFIG_KEY.to_string(),
-            "browser".to_string(),
-        );
-        snapshot.insert(
-            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY.to_string(),
-            features.to_config_json(),
-        );
-        wafer.set_config_snapshot(snapshot);
+        // Both config surfaces, published together. `ctx.config_get` reads
+        // Wafer's synchronous snapshot and the config client reads the async
+        // service block; a value seeded here that reached only one of them
+        // would be visible to half the runtime.
+        let mut published = builder::RuntimeConfig::new();
+        published
+            .extend_both(vars.clone())
+            // This adapter executes inside an end user's browser. Set the
+            // marker after persisted variables so a database/admin value
+            // cannot accidentally enable Stripe secret-key operations locally.
+            // Static pages may still use a remote trusted commerce API or
+            // pre-created Payment Links.
+            .both(
+                impresspress_core::blocks::products::RUNTIME_KIND_CONFIG_KEY,
+                "browser",
+            )
+            .both(
+                impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
+                features.to_config_json(),
+            );
+        published.republish(wafer, &self.config_svc);
 
         *self
             .block_settings_handle

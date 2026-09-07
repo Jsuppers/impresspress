@@ -798,28 +798,18 @@ where
         }
     };
 
-    // Dynamic WRAP grants must be registered before seal. Strictly initialize
-    // every slot under the build owner's concrete services before publishing
-    // the Wafer: Workers requests must never wait on another request's shared
-    // lazy-init mutex/future. The concrete services are dropped instead of
-    // entering ReadyRuntime.
-    if let Err(e) = crate::request_services::scope(built.services.clone(), async {
-        crate::apply_db_wrap_grants(&mut built).await;
-        built.wafer.seal().await.map_err(|e| format!("seal: {e}"))?;
-        impresspress_core::builder::strict_init_all_blocks(&built.wafer)
-            .await
-            .map_err(|error| format!("strict cached-runtime Init: {error}"))
-    })
-    .await
-    {
+    // One lifecycle: D1 grants before seal, seal, admin first, the request
+    // path's read-only hook, every remaining slot, then the grants into the
+    // storage block. Strict, because publishing a Wafer with a failed
+    // lazy-init slot would let concurrent requests wait on one another's init
+    // future, which is not a valid execution model here. The concrete services
+    // are dropped instead of entering ReadyRuntime.
+    if let Err(e) = crate::boot_dynamic_request_runtime(&mut built).await {
         if dirty_consumed {
             mark_dirty();
         }
-        return Err(e.into());
+        return Err(format!("cached-runtime boot: {e}").into());
     }
-    crate::request_services::scope_sync(built.services.clone(), || {
-        impresspress_core::builder::post_start(&built.wafer, &built.storage_block);
-    });
 
     let build_ordinal = BUILD_COUNT.with(|c| {
         let n = c.get() + 1;
@@ -915,21 +905,15 @@ where
     )
     .await?;
 
-    // Grants and settings were imported from the verified plan. Seal and
-    // strictly initialize every slot under this request's services before the
-    // Wafer can be dispatched or published. ConfigSource may still perform
-    // per-block reads; keeping them here prevents cross-request lazy-init
-    // waiters.
-    crate::request_services::scope(built.services.clone(), async {
-        built.wafer.seal().await.map_err(|e| format!("seal: {e}"))?;
-        impresspress_core::builder::strict_init_all_blocks(&built.wafer)
-            .await
-            .map_err(|error| format!("strict prepared-runtime Init: {error}"))
-    })
-    .await?;
-    crate::request_services::scope_sync(built.services.clone(), || {
-        impresspress_core::builder::post_start(&built.wafer, &built.storage_block);
-    });
+    // Grants and settings were imported from the verified plan, so this is the
+    // one path whose `GrantSource` is `PreInstalled` and whose seed hook is a
+    // written no-op — see `crate::boot_prepared_runtime`. Everything else is
+    // the shared ordering, under this request's services: ConfigSource may
+    // still perform per-block reads, and keeping them here prevents
+    // cross-request lazy-init waiters.
+    crate::boot_prepared_runtime(&mut built)
+        .await
+        .map_err(|e| format!("prepared-runtime boot: {e}"))?;
 
     let build_ordinal = BUILD_COUNT.with(|count| {
         let next = count.get() + 1;
@@ -1056,20 +1040,15 @@ where
     )
     .await?;
 
-    // Same ordering the stored dynamic build uses: WRAP grants before seal, then
-    // strictly initialize every slot so no request can wait on another's
-    // lazy-init future.
-    crate::request_services::scope(built.services.clone(), async {
-        crate::apply_db_wrap_grants(&mut built).await;
-        built.wafer.seal().await.map_err(|e| format!("seal: {e}"))?;
-        impresspress_core::builder::strict_init_all_blocks(&built.wafer)
-            .await
-            .map_err(|error| format!("strict transient-runtime Init: {error}"))
-    })
-    .await?;
-    crate::request_services::scope_sync(built.services.clone(), || {
-        impresspress_core::builder::post_start(&built.wafer, &built.storage_block);
-    });
+    // Literally the same call the stored dynamic build makes — the two request
+    // paths are one decision, not two. It used to be that build's five
+    // statements copied, and a copy is how two paths drift: both remembered
+    // the grant load, neither passed a `BootHooks`, and no reader could tell
+    // which of those was a decision. The deploy funnel is the one that differs
+    // (it seeds), and it says so by calling `boot_deploy_runtime` instead.
+    crate::boot_dynamic_request_runtime(&mut built)
+        .await
+        .map_err(|e| format!("transient-runtime boot: {e}"))?;
 
     let build_ordinal = BUILD_COUNT.with(|count| {
         let next = count.get() + 1;
