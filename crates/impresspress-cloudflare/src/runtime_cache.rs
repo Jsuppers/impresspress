@@ -598,8 +598,9 @@ where
     // ceiling — Cloudflare error 1102, per-request CPU exhausted, because a full
     // dynamic build does not fit in a request's CPU budget alongside its own
     // work. Prepared hydration is ~132us. That gap is why the plan exists.
-    if let Some(plan) = crate::packaged_prepared_runtime_plan(env)? {
-        let environment_identity = crate::runtime_environment_identity(env, request_config);
+    if let Some(plan) = crate::environment::packaged_prepared_runtime_plan(env)? {
+        let environment_identity =
+            crate::environment::runtime_environment_identity(env, request_config);
         let prepared_identity = prepared_cache_identity(&plan.plan_hash, &environment_identity);
         if !prepared_is_bypassed(&prepared_identity) {
             return get_or_build_prepared(
@@ -613,7 +614,8 @@ where
         }
     }
 
-    let environment_identity = crate::runtime_environment_identity(env, request_config);
+    let environment_identity =
+        crate::environment::runtime_environment_identity(env, request_config);
 
     // Hooks are FnOnce because only the request that acquires the build slot
     // consumes them. Waiters retain their own hooks while sleeping, then drop
@@ -713,7 +715,7 @@ where
 
             // Always derive the probe handle from THIS request's Env. The
             // immutable cached runtime intentionally retains no KV binding.
-            let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
+            let probe_kv = match crate::services::make_kv_backend(env, crate::runner::KV_BINDING) {
                 Ok(kv) => kv,
                 Err(e) => {
                     // Same reasoning as the build-failure paths below: this
@@ -751,7 +753,7 @@ where
         } else {
             // Cold isolate: probe before build so the finished runtime is
             // tagged with a version no newer than the config it loaded.
-            let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+            let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
             (
                 probe_version(&kv).await.into_dynamic_version(),
                 false,
@@ -771,7 +773,7 @@ where
     // Gated on `dirty_consumed` so a cold build failure (which never took the
     // flag) cannot manufacture a dirty signal and charge the next runtime a
     // full dynamic rebuild it does not need.
-    let mut built = match crate::build_runtime(
+    let mut built = match crate::runtime_build::build_runtime(
         env,
         request_config,
         None,
@@ -804,7 +806,7 @@ where
     // lazy-init slot would let concurrent requests wait on one another's init
     // future, which is not a valid execution model here. The concrete services
     // are dropped instead of entering ReadyRuntime.
-    if let Err(e) = crate::boot_dynamic_request_runtime(&mut built).await {
+    if let Err(e) = crate::runtime_build::boot_dynamic_request_runtime(&mut built).await {
         if dirty_consumed {
             mark_dirty();
         }
@@ -894,7 +896,7 @@ where
         Arc<dyn wafer_core::interfaces::storage::service::StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let mut built = crate::build_runtime(
+    let mut built = crate::runtime_build::build_runtime(
         env,
         request_config,
         Some(plan),
@@ -907,11 +909,11 @@ where
 
     // Grants and settings were imported from the verified plan, so this is the
     // one path whose `GrantSource` is `PreInstalled` and whose seed hook is a
-    // written no-op — see `crate::boot_prepared_runtime`. Everything else is
+    // written no-op — see `crate::runtime_build::boot_prepared_runtime`. Everything else is
     // the shared ordering, under this request's services: ConfigSource may
     // still perform per-block reads, and keeping them here prevents
     // cross-request lazy-init waiters.
-    crate::boot_prepared_runtime(&mut built)
+    crate::runtime_build::boot_prepared_runtime(&mut built)
         .await
         .map_err(|e| format!("prepared-runtime boot: {e}"))?;
 
@@ -999,7 +1001,7 @@ where
     let probe = match known_probe {
         Some(probe) => probe,
         None => {
-            let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+            let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
             probe_version(&kv).await
         }
     };
@@ -1019,7 +1021,7 @@ where
     }
     let probed_version = probe.into_dynamic_version();
 
-    let mut built = crate::build_runtime(
+    let mut built = crate::runtime_build::build_runtime(
         env,
         request_config,
         None,
@@ -1046,7 +1048,7 @@ where
     // the grant load, neither passed a `BootHooks`, and no reader could tell
     // which of those was a decision. The deploy funnel is the one that differs
     // (it seeds), and it says so by calling `boot_deploy_runtime` instead.
-    crate::boot_dynamic_request_runtime(&mut built)
+    crate::runtime_build::boot_dynamic_request_runtime(&mut built)
         .await
         .map_err(|e| format!("transient-runtime boot: {e}"))?;
 
@@ -1095,7 +1097,8 @@ where
         Arc<dyn wafer_core::interfaces::storage::service::StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let environment_identity = crate::runtime_environment_identity(env, request_config);
+    let environment_identity =
+        crate::environment::runtime_environment_identity(env, request_config);
     let plan_generation = plan.plan_hash.clone();
     let prepared_identity = prepared_cache_identity(&plan_generation, &environment_identity);
     let now = impresspress_core::util::now_millis();
@@ -1130,7 +1133,7 @@ where
         // a transient prepared runtime. A transient runtime is complete and
         // request-scoped, so it can serve safely without touching the owner's
         // build slot or replacing the isolate cache.
-        let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+        let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
         let probe = probe_version(&kv).await;
         if !prepared_generation_matches(&plan.config_generation, &probe) {
             // The plan is stale AND the slot is busy — the post-deploy window,
@@ -1239,18 +1242,19 @@ where
                     return Ok((rt, CacheOutcome::Hit));
                 }
 
-                let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
-                    Ok(kv) => kv,
-                    Err(e) => {
-                        // `dirty` was consumed above; losing it here would
-                        // strand the isolate on pre-write state for a full
-                        // probe window.
-                        if dirty {
-                            mark_dirty();
+                let probe_kv =
+                    match crate::services::make_kv_backend(env, crate::runner::KV_BINDING) {
+                        Ok(kv) => kv,
+                        Err(e) => {
+                            // `dirty` was consumed above; losing it here would
+                            // strand the isolate on pre-write state for a full
+                            // probe window.
+                            if dirty {
+                                mark_dirty();
+                            }
+                            return Err(e.into());
                         }
-                        return Err(e.into());
-                    }
-                };
+                    };
                 let probe = probe_version(&probe_kv).await;
                 if !prepared_probe_requires_fallback(dirty, cached_config_version, &probe) {
                     if matches!(probe, VersionProbe::Unavailable) {
@@ -1288,7 +1292,7 @@ where
     // A plan/Worker identity change supersedes dirty state belonging to the
     // prior runtime. The new plan is tagged with the current KV generation.
     let _ = take_dirty();
-    let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+    let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
     let probe = probe_version(&kv).await;
     if !prepared_generation_matches(&plan.config_generation, &probe) {
         tracing::info!(
