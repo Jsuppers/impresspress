@@ -1,26 +1,10 @@
 use std::collections::HashMap;
 
+use impresspress_core::streaming::MAX_NETWORK_RESPONSE_BYTES;
 use serde::Deserialize;
 use wafer_core::interfaces::network::service::{NetworkError, NetworkService, Request, Response};
 
 use crate::bridge;
-
-/// Response-body cap for the browser fetch path, in bytes.
-///
-/// Mirrors `impresspress-cloudflare`'s `network_service::DEFAULT_MAX_RESPONSE_BYTES`
-/// and the native `wafer-block-network` SEC-020 default
-/// (`HttpNetworkService::DEFAULT_MAX_RESPONSE_BYTES`, 50 MiB), so a hostile or
-/// runaway upstream cannot read unbounded into the isolate. A fixed constant
-/// rather than a config read: the unit-shaped `BrowserNetworkService` has no
-/// config plumbing, and this is a security floor, not an operator knob.
-///
-/// A Service Worker shares one linear memory with everything else the page's
-/// runtime is doing, so the ceiling matters more here than on a server, not
-/// less. It is enforced on the JS side (`bridge.js`'s `httpFetch`) because
-/// that is where the bytes are read: an advertised `Content-Length` over the
-/// cap is refused before the body is touched, and the running total is checked
-/// per chunk for a chunked response that advertises nothing.
-pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 pub struct BrowserNetworkService;
 
@@ -75,12 +59,36 @@ impl NetworkService for BrowserNetworkService {
     /// internet can reach. That is a wider blast radius than the same bug on a
     /// server, not a narrower one.
     ///
+    /// The gate sees the URL the caller asked for and nothing else, so a
+    /// followed `3xx` would reach a second URL it never inspected. That half is
+    /// closed on the JS side: `bridge.js`'s `httpFetch` issues every request
+    /// with `redirect: 'error'` instead of the Fetch API's default `'follow'`,
+    /// so `https://evil.example/x` answering `302 Location:
+    /// http://169.254.169.254/…` fails the request rather than fetching the
+    /// metadata service. `'manual'` would not do: a cross-origin redirect
+    /// response is opaque, with no readable `Location` to revalidate. The
+    /// native path revalidates per hop instead (reqwest's
+    /// `ssrf_revalidating_redirect_policy`) because it has a hook for it; here
+    /// a legitimate redirect surfaces as a request error, which is the right
+    /// trade against a silent fetch of an internal address.
+    ///
+    /// Response bytes are capped at
+    /// [`MAX_NETWORK_RESPONSE_BYTES`](impresspress_core::streaming::MAX_NETWORK_RESPONSE_BYTES),
+    /// the cap shared with the Cloudflare adapter, and enforced on the JS side
+    /// because that is where the bytes are read — an advertised
+    /// `Content-Length` over the cap is refused before the body is touched, and
+    /// the running total is checked per chunk for a chunked response that
+    /// advertises nothing. A Service Worker shares one linear memory with
+    /// everything else the page's runtime is doing, so the ceiling matters more
+    /// here than on a server, not less.
+    ///
     /// Honest boundary: this is a URL/host-literal precheck. Like the Worker
     /// path, it does NOT defend against DNS rebinding — a public-looking
     /// hostname that resolves to a private address at connect time still
     /// reaches `fetch`, because the Fetch API exposes no resolve-before-connect
     /// hook. The native backend closes that with an SSRF-filtering resolver;
-    /// here it is the browser's own network partitioning that has to.
+    /// here it is the browser's own network partitioning that has to. With the
+    /// initial URL gated and redirects refused, that is the sole residual.
     async fn do_request(&self, req: &Request) -> Result<Response, NetworkError> {
         if impresspress_core::ssrf::is_ssrf_blocked_url(&req.url) {
             return Err(NetworkError::RequestError(format!(
@@ -99,7 +107,7 @@ impl NetworkService for BrowserNetworkService {
             &req.url,
             &headers_json,
             body_bytes,
-            DEFAULT_MAX_RESPONSE_BYTES as f64,
+            MAX_NETWORK_RESPONSE_BYTES as f64,
         )
         .await
         .map_err(|e| NetworkError::RequestError(bridge::describe(&e)))?;
@@ -296,6 +304,13 @@ mod tests {
         for url in [
             "http://localhost/admin",
             "http://localhost:8080/admin",
+            // The RFC 6761 pseudo-domain, which resolves to loopback in Chrome
+            // and Firefox: in a browser-hosted runtime `app.localhost:3000` is
+            // a live dev server and `api.localhost` an internal service. The
+            // upstream classifier matches the bare string only.
+            "http://api.localhost:8080/admin",
+            "http://app.localhost:3000/",
+            "http://localhost./",
             "http://169.254.169.254/latest/meta-data/",
             "http://127.0.0.1/",
             "http://192.168.1.1/",

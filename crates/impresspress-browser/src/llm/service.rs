@@ -111,7 +111,11 @@ impl LlmService for BrowserLlmService {
                     // JSON per message, so this is the decoder's frame-level
                     // entry point rather than its SSE one. A malformed chunk is
                     // logged and skipped (the shared policy for both providers)
-                    // instead of killing the turn.
+                    // instead of killing the turn — and "logged" is literal
+                    // here only because `logger::init_console_tracing` is
+                    // installed at startup; with no subscriber the skip was
+                    // silent, and a truncated answer looked like a complete
+                    // one.
                     StreamFrame::Chunk(s) => {
                         for chunk in decoder.push_frame(&s).chunks {
                             if tx.send(Ok(chunk)).await.is_err() {

@@ -21,8 +21,9 @@ extern "C" {
 
     /// Execute a SELECT SQL query. `params` as above.
     /// Returns a JS array of plain row objects — NOT a JSON string. Decode
-    /// with `db_codec::parse_rows`/`rows_from_js`
-    /// (`serde_wasm_bindgen::from_value`).
+    /// with `db_codec::rows_from_js` (`serde_wasm_bindgen::from_value`), then
+    /// turn each row into a `Record` with the shared
+    /// `wafer_core::interfaces::database::codec::record_from_json_row`.
     #[wasm_bindgen(catch, js_name = dbQueryRaw)]
     pub fn db_query_raw(sql: &str, params: JsValue) -> Result<JsValue, JsValue>;
 
@@ -105,7 +106,8 @@ extern "C" {
     /// `Content-Length` above it is refused before a byte is read, and the
     /// running total is checked per chunk for a response that advertises
     /// nothing. Passed in rather than hardcoded on the JS side so
-    /// `network::DEFAULT_MAX_RESPONSE_BYTES` stays the single definition.
+    /// `impresspress_core::streaming::MAX_NETWORK_RESPONSE_BYTES` stays the
+    /// single definition, shared with the Cloudflare adapter.
     /// Returns a plain JS object
     /// `{ status, headers: [[name, value], ...], body: Uint8Array }` —
     /// NOT a JSON string, and headers are an array of PAIRS so a repeated

@@ -14,6 +14,14 @@ use wafer_core::interfaces::llm::service::ChatChunk;
 /// `data:` lines joined with `\n` (empty when the frame carried none — e.g. a
 /// comment or keepalive).
 pub struct SseFrame {
+    /// Read only by the Anthropic decoder, which is gated on `feature = "llm"`
+    /// (reqwest + tokio, neither of which builds for wasm32). OpenAI's wire
+    /// ignores `event:` entirely, so in a build that carries only the OpenAI
+    /// consumer — `impresspress-browser` takes this crate with no default
+    /// features — the field is parsed and never read. The `allow` is scoped to
+    /// exactly that configuration so a genuinely dead field still warns in the
+    /// build that has both readers.
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
     pub event: Option<String>,
     pub data: String,
 }

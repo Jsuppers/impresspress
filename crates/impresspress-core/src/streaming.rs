@@ -4,9 +4,9 @@
 //! A block declares that its response should stream — bytes flowing to the
 //! client while the producer is still working — by emitting its response
 //! headers as **leading `Meta` events** before the first body `Chunk`.
-//! [`wants_streaming`] is the single decision both the pipeline and the
-//! Cloudflare adapter consult, so they can never disagree about whether a
-//! given response streams or buffers.
+//! [`wants_streaming`] is the single decision the pipeline and BOTH wasm
+//! adapters consult — Cloudflare and the browser — so they can never disagree
+//! about whether a given response streams or buffers.
 //!
 //! Two streaming signals are honored:
 //! - A streaming `resp.content_type` (SSE / generic byte streams), matched by
@@ -62,9 +62,31 @@ pub const STREAM_MARKER_VALUE: &str = "1";
 /// bodies are orders of magnitude smaller — chosen to catch a runaway buffered
 /// body before the Worker runtime rejects an oversized `Response`. It is
 /// independent of the outbound-fetch response cap
-/// (`network_service::DEFAULT_MAX_RESPONSE_BYTES`), which bounds a *streamed*
-/// upstream body on a different axis.
+/// ([`MAX_NETWORK_RESPONSE_BYTES`]), which bounds an *upstream* body on a
+/// different axis.
 pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+
+/// Maximum body size a `NetworkService` reads from an *upstream* response, in
+/// bytes. SEC-020 — a hostile or runaway upstream cannot read unbounded into
+/// the isolate.
+///
+/// Both wasm adapters enforce this: `impresspress-cloudflare`'s
+/// `WorkerFetchService` and `impresspress-browser`'s `BrowserNetworkService`
+/// (which passes it across the bridge to `bridge.js`'s `httpFetch`, where the
+/// bytes are actually read). It is the same 50 MiB the native backend defaults
+/// to — `wafer_block_network::service::DEFAULT_MAX_RESPONSE_BYTES`, a **free**
+/// constant on that crate, not the method-scoped one the adapters' comments
+/// used to name — and it lives here rather than being re-declared per adapter,
+/// which is how it came to have three copies kept in step by comment.
+///
+/// It is not re-exported from the native crate: `wafer-block-network` pulls in
+/// reqwest and does not build for `wasm32-unknown-unknown`.
+///
+/// Unlike the native default this is **fixed**, not operator-tunable. Native
+/// reads `WAFER_RUN__NETWORK__MAX_RESPONSE_BYTES` from the process env at
+/// service construction; neither wasm adapter's unit-shaped service has config
+/// plumbing to read it from, and this is a security floor rather than a knob.
+pub const MAX_NETWORK_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 /// True for content-types that should stream body chunks to the client as
 /// they're produced rather than buffer the entire response. Today: SSE and

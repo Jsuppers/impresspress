@@ -10,7 +10,7 @@
 //! WebLLM service, which speaks OpenAI chunk JSON over a postMessage bridge
 //! with no `block-*` feature enabled at all. It used to be copied into the
 //! browser adapter for exactly that reason, and the copies had drifted; the
-//! three divergences are settled on [`OpenAiSseDecoder`].
+//! four divergences are settled on [`OpenAiSseDecoder`].
 //!
 //! See <https://platform.openai.com/docs/api-reference/chat/create> for the
 //! reference request/response shapes.
@@ -414,6 +414,17 @@ impl OpenAiSseDecoder {
             }
             for tc in choice.delta.tool_calls.into_iter() {
                 // First sighting of this index with id + name ⇒ ToolCallStart.
+                //
+                // This block does NOT `continue`: the start and the arguments
+                // are two independent readings of the same delta, because a
+                // provider may put both in one frame. OpenAI streams them
+                // apart (`{"id","function":{"name","arguments":""}}` then a run
+                // of argument fragments), but a provider that derives the whole
+                // call from a completed generation — WebLLM, which is what the
+                // browser adapter feeds this decoder — emits the id, the name
+                // and the complete `arguments` in a single delta. Skipping the
+                // arguments block for that frame ran the tool with no
+                // arguments at all.
                 if let (Some(id), Some(name)) = (
                     tc.id.clone(),
                     tc.function.as_ref().and_then(|f| f.name.clone()),
@@ -423,18 +434,37 @@ impl OpenAiSseDecoder {
                     {
                         slot.insert(id.clone());
                         out.push(ChatChunk::tool_call_start(id, name));
-                        continue;
                     }
                 }
-                // Subsequent frames carry argument deltas. OpenAI omits the id
-                // after the first frame but always supplies the index, so the
-                // index is what resolves the id; `tc.id` is the fallback for a
-                // provider that repeats it and never sent a start frame.
+                // Argument deltas. OpenAI omits the id after the first frame
+                // but always supplies the index, so the index is what resolves
+                // the id; `tc.id` is the fallback for a provider that repeats
+                // it and never sent a start frame.
+                //
+                // Empty fragments are not forwarded. OpenAI's own start frame
+                // carries `"arguments":""`, and now that the start block falls
+                // through, every one of them would otherwise become an empty
+                // `ToolCallArguments` chunk that a consumer accumulating
+                // fragments has to filter itself.
                 if let Some(f) = tc.function {
-                    if let Some(args) = f.arguments {
-                        let id = self.started.get(&tc.index).cloned().or(tc.id);
-                        if let Some(id) = id {
-                            out.push(ChatChunk::tool_call_arguments(id, args));
+                    if let Some(args) = f.arguments.filter(|a| !a.is_empty()) {
+                        match self.started.get(&tc.index).cloned().or(tc.id) {
+                            Some(id) => out.push(ChatChunk::tool_call_arguments(id, args)),
+                            // No start for this index and no id on the frame:
+                            // the fragment belongs to no call this decoder can
+                            // name, so there is nothing to emit. Dropped with a
+                            // warning rather than failing the turn — the same
+                            // policy `push_frame` applies to a malformed frame,
+                            // and for the same reason: one unusable fragment
+                            // from a non-conformant provider must not destroy a
+                            // generation the rest of which decoded. (The
+                            // deleted browser codec failed the whole stream
+                            // here.)
+                            None => tracing::warn!(
+                                index = tc.index,
+                                "openai sse: tool-call arguments before start and \
+                                 with no id; fragment dropped"
+                            ),
                         }
                     }
                 }
@@ -652,7 +682,7 @@ mod tests {
     }
 }
 
-/// The three points on which the two OpenAI codecs in this repository had
+/// The four points on which the two OpenAI codecs in this repository had
 /// drifted before they became one. Each test names the copy it fails against.
 ///
 /// The copies were `impresspress-core`'s `OpenAiSseDecoder` (this one) and
@@ -694,6 +724,16 @@ mod divergences {
             .iter()
             .filter_map(|c| match &c.delta {
                 ChunkDelta::ToolCallComplete { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn started_calls(chunks: &[ChatChunk]) -> Vec<(&str, &str)> {
+        chunks
+            .iter()
+            .filter_map(|c| match &c.delta {
+                ChunkDelta::ToolCallStart { id, name } => Some((id.as_str(), name.as_str())),
                 _ => None,
             })
             .collect()
@@ -870,6 +910,114 @@ mod divergences {
         };
 
         assert_eq!(framed, direct);
+    }
+
+    // ── Divergence 4: a start and its arguments in the SAME delta ────────────
+
+    /// **Fails against the pre-fix `impresspress-core` copy.** The start block
+    /// ended in `continue`, so a delta that carried the id, the name *and* the
+    /// arguments produced a `ToolCallStart` and nothing else — the tool ran
+    /// with empty arguments. The deleted browser codec had no `continue`: its
+    /// start and arguments blocks were two independent `if`s, so a combined
+    /// delta produced both chunks.
+    ///
+    /// This is the shape most likely on the browser path, because WebLLM
+    /// derives its tool calls from the completed generation rather than
+    /// streaming argument fragments, so the whole call arrives in one frame.
+    #[test]
+    fn a_start_and_its_arguments_in_one_delta_keep_the_arguments() {
+        let chunks = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+
+        assert_eq!(
+            started_calls(&chunks),
+            vec![("call_1", "get_weather")],
+            "{chunks:?}"
+        );
+        assert_eq!(
+            argument_deltas(&chunks),
+            vec![("call_1", "{\"city\":\"Paris\"}")],
+            "arguments on the start delta must not be dropped: {chunks:?}"
+        );
+        assert_eq!(completed_ids(&chunks), vec!["call_1"], "{chunks:?}");
+    }
+
+    /// The reason the start block cannot simply fall through unguarded:
+    /// OpenAI's own first tool-call frame carries `"arguments":""`, and an
+    /// empty argument delta is noise on the wire that a consumer accumulating
+    /// fragments would have to filter itself.
+    #[test]
+    fn an_empty_arguments_string_on_the_start_delta_emits_no_argument_chunk() {
+        let chunks = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":""}}]}}]}"#,
+        ]);
+
+        assert_eq!(started_calls(&chunks), vec![("call_1", "f")], "{chunks:?}");
+        assert!(
+            argument_deltas(&chunks).is_empty(),
+            "an empty `arguments` on the start frame is not an argument delta: {chunks:?}"
+        );
+    }
+
+    /// The same guard on a *continuation* frame: a provider that pads the
+    /// stream with empty argument fragments must not turn each one into a
+    /// chunk.
+    #[test]
+    fn an_empty_arguments_fragment_on_a_later_delta_emits_no_argument_chunk() {
+        let chunks = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+        ]);
+
+        assert_eq!(
+            argument_deltas(&chunks),
+            vec![("call_1", "{}")],
+            "{chunks:?}"
+        );
+    }
+
+    // ── The unattributable fragment (decided, not accidental) ────────────────
+
+    /// An argument fragment for an index that never started and that carries no
+    /// `id` of its own cannot be attributed to any call, so there is nothing to
+    /// emit and it is dropped with a `warn!`. The deleted browser codec failed
+    /// the whole turn here; the decoder does not, for the same reason a
+    /// malformed frame does not — one unusable fragment from a non-conformant
+    /// provider must not destroy a generation the rest of which decoded.
+    #[test]
+    fn an_unattributable_argument_fragment_is_dropped_not_forwarded() {
+        let chunks = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"content":"the rest of the turn survives"}}]}"#,
+        ]);
+
+        assert!(argument_deltas(&chunks).is_empty(), "{chunks:?}");
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|c| matches!(&c.delta, ChunkDelta::Text(_)))
+                .count(),
+            1,
+            "the rest of the stream must still decode: {chunks:?}"
+        );
+    }
+
+    /// A fragment with no prior start but with an `id` of its own IS
+    /// attributable, and is forwarded under that id rather than dropped.
+    #[test]
+    fn an_argument_fragment_that_repeats_its_own_id_is_attributable() {
+        let chunks = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","function":{"arguments":"{}"}}]}}]}"#,
+        ]);
+
+        assert_eq!(
+            argument_deltas(&chunks),
+            vec![("call_z", "{}")],
+            "{chunks:?}"
+        );
     }
 }
 

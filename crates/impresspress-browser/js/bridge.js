@@ -75,8 +75,9 @@ export function dbExecRaw(sql, params) {
  * @param {unknown[]} params - bind values, positional (see `dbExecRaw`)
  * @returns {Record<string, unknown>[]} row objects — a plain JS array, NOT a
  *   JSON string. Decoded on the Rust side with `serde_wasm_bindgen`
- *   (`db_codec::parse_rows`/`rows_from_js`) rather than
- *   `JSON.stringify` + `serde_json::from_str`.
+ *   (`db_codec::rows_from_js`) rather than `JSON.stringify` +
+ *   `serde_json::from_str`, then mapped to `Record`s by the shared
+ *   `wafer_core::interfaces::database::codec::record_from_json_row`.
  */
 export function dbQueryRaw(sql, params) {
     const results = _db.exec(sql, params);
@@ -921,7 +922,8 @@ export async function readCookieHeader() {
  * @param {string} headersJson - JSON object of header key/value pairs
  * @param {Uint8Array|null} body
  * @param {number} maxResponseBytes - response-body ceiling, from
- *   `network::DEFAULT_MAX_RESPONSE_BYTES`. Enforced here rather than in Rust
+ *   `impresspress_core::streaming::MAX_NETWORK_RESPONSE_BYTES` (the cap the
+ *   Cloudflare adapter enforces too). Enforced here rather than in Rust
  *   because this is where the bytes are read: an advertised `Content-Length`
  *   over the cap is refused before the body is touched, and the running total
  *   is checked per chunk for a chunked response that advertises nothing.
@@ -946,6 +948,21 @@ export async function httpFetch(method, url, headersJson, body, maxResponseBytes
     const init = {
         method,
         headers: headersObj,
+        // The SSRF gate in `network.rs` inspects the URL the caller asked for
+        // and nothing else. `fetch` defaults to `redirect: 'follow'`, so a
+        // `302 Location: http://169.254.169.254/…` from a public-looking host
+        // would reach an address that gate never saw and hand its body back to
+        // the block. `'error'` fails the request closed instead.
+        //
+        // `'manual'` is not an alternative here: a cross-origin redirect
+        // response is opaque, with no readable `Location`, so there is nothing
+        // to revalidate. The native path can revalidate per hop (reqwest's
+        // `ssrf_revalidating_redirect_policy`) and does; a Fetch-API caller
+        // cannot, so it declines to follow at all. The cost is that a
+        // legitimate redirect surfaces to the caller as a request error rather
+        // than being followed silently — the right trade against a silent
+        // fetch of an internal address.
+        redirect: 'error',
     };
 
     if (body && body.length > 0) {

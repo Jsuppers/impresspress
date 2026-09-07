@@ -47,6 +47,11 @@ wafer-block-crypto = { workspace = true }
 # crate and `impresspress-core`, so the only shipping bundle sees no new crate.
 impresspress-core = { path = "../impresspress-core", default-features = false }
 async-trait = "0.1"
+# The `tracing` facade, for `logger::init_console_tracing` — the subscriber that
+# routes framework events to the browser console. Without one installed,
+# `tracing`'s default dispatcher drops every event `impresspress-core` and
+# `wafer-run` emit, so "logged and skipped" means "silently skipped" here.
+tracing = { workspace = true }
 futures = "0.3"
 tokio-util = { version = "0.7", default-features = false }
 serde-wasm-bindgen = "0.6"

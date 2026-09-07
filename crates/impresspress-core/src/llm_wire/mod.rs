@@ -14,4 +14,10 @@
 //! Nothing here reaches back into `blocks::`; the dependency runs one way.
 
 pub mod openai;
-pub mod sse;
+/// SSE transport framing, shared by the OpenAI and Anthropic decoders.
+///
+/// Crate-private: the out-of-crate consumer is `impresspress-browser`, which
+/// reaches [`openai::OpenAiSseDecoder`] and never the framing beneath it (its
+/// bridge hands over one already-de-framed chunk at a time). Publish it when
+/// something outside the crate frames its own SSE.
+pub(crate) mod sse;

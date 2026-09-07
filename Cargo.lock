@@ -2575,6 +2575,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "tokio-util",
+ "tracing",
  "uuid",
  "wafer-block",
  "wafer-block-crypto",

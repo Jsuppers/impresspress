@@ -478,7 +478,6 @@ async fn collect_capped(
 fn finalise_capped(collected: CappedCollect) -> Result<web_sys::Response, JsValue> {
     match collected {
         CappedCollect::Terminal(result) => finalise_buffered(result),
-        #[allow(unreachable_patterns)]
         CappedCollect::OverLimit => {
             let headers = Headers::new()?;
             headers.set("Content-Type", "text/plain; charset=utf-8")?;

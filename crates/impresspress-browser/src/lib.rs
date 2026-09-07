@@ -60,7 +60,7 @@ pub use crypto::make_crypto_service;
 #[cfg(target_arch = "wasm32")]
 pub use database::make_database_service;
 #[cfg(target_arch = "wasm32")]
-pub use logger::make_console_logger;
+pub use logger::{init_console_tracing, make_console_logger};
 #[cfg(target_arch = "wasm32")]
 pub use network::make_network_service;
 #[cfg(target_arch = "wasm32")]
