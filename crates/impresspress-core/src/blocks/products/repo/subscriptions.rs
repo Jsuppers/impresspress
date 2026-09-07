@@ -187,7 +187,8 @@ async fn get_by_stripe_sub(
 /// subscription id. Unlike [`find_user_by_stripe_sub`], database failures
 /// surface as `Err` instead of collapsing into "not found", because the
 /// webhook uses this answer to decide between sealing an event as processed
-/// and scheduling a retry.
+/// and scheduling a retry. Every neighbouring lookup follows the same rule
+/// now; this one got there first.
 pub(crate) async fn platform_subscription_exists(
     ctx: &dyn Context,
     stripe_subscription_id: &str,
@@ -487,12 +488,19 @@ pub(crate) async fn set_addon_totals(
     .await
 }
 
-/// Look up the user_id owning a Stripe subscription. Errors collapse to `None`
-/// (preserves the original `get_user_for_stripe_sub` behaviour).
+/// Look up the user_id owning a Stripe subscription. `Ok(None)` is "no row
+/// references this Stripe subscription".
+///
+/// Errors used to collapse into that same `None`, which the two webhook
+/// callers read as "this subscription is unowned": a database blip skipped
+/// the addon-total sync and the outbound `products.subscription.updated`
+/// while the delivery still reported success to Stripe, so nothing was
+/// retried and nothing was logged. Same rule as
+/// [`platform_subscription_exists`], right above.
 pub(crate) async fn find_user_by_stripe_sub(
     ctx: &dyn Context,
     stripe_subscription_id: &str,
-) -> Option<String> {
+) -> Result<Option<String>, WaferError> {
     let rows = db::list(
         ctx,
         SUBSCRIPTIONS_TABLE,
@@ -508,18 +516,25 @@ pub(crate) async fn find_user_by_stripe_sub(
             ..Default::default()
         },
     )
-    .await
-    .ok()?;
-    rows.records
-        .first()?
-        .data
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    .await?;
+    Ok(rows
+        .records
+        .first()
+        .and_then(|record| record.data.get("user_id"))
+        .and_then(|value| value.as_str())
+        .map(String::from))
 }
 
 /// Whether the user has an `active` subscription whose `plan` equals `plan`.
-pub(crate) async fn active_plan_exists(ctx: &dyn Context, user_id: &str, plan: &str) -> bool {
+///
+/// `Ok(false)` is "no such subscription". A failed read is `Err`, because the
+/// answer gates a purchase: it used to end in `matches!(rows, Ok(..))`, so an
+/// outage told the buyer they did not own the product their checkout required.
+pub(crate) async fn active_plan_exists(
+    ctx: &dyn Context,
+    user_id: &str,
+    plan: &str,
+) -> Result<bool, WaferError> {
     let rows = db::list(
         ctx,
         SUBSCRIPTIONS_TABLE,
@@ -547,8 +562,8 @@ pub(crate) async fn active_plan_exists(ctx: &dyn Context, user_id: &str, plan: &
             ..Default::default()
         },
     )
-    .await;
-    matches!(rows, Ok(rows) if !rows.records.is_empty())
+    .await?;
+    Ok(!rows.records.is_empty())
 }
 
 /// Fetch a user's subscription row with addon columns coalesced to 0 for the

@@ -977,6 +977,41 @@ fn build_offer_checkout_form(
     Ok(pairs)
 }
 
+/// Mark a claimed checkout order failed after the provider call could not be
+/// completed, so it can never be claimed for another checkout.
+///
+/// The caller still returns the *original* failure — that is what a
+/// compensation is, and reporting the rollback's error instead would hide the
+/// reason the checkout stopped. What it must not do is drop it: an order this
+/// could not mark stays `checkout_started` and claimed forever, and without
+/// its id in the log there is nothing to search for. All four checkout
+/// failure paths route through here so the reason and the id are recorded the
+/// same way at each of them.
+async fn record_checkout_failure(ctx: &dyn Context, order_id: &str, reason: &str) {
+    if let Err(error) = repo::purchases::mark_checkout_failed(ctx, order_id, reason).await {
+        tracing::error!(
+            order_id = %order_id,
+            reason = %reason,
+            error = %error,
+            "could not mark a failed checkout order; it stays claimed"
+        );
+    }
+}
+
+/// The Payment Link half of [`record_checkout_failure`]: the same
+/// compensation, on the managed-link row, with the same reason for logging a
+/// rollback that could not be written.
+async fn record_payment_link_failure(ctx: &dyn Context, link_id: &str, reason: &str) {
+    if let Err(error) = repo::payment_links::mark_error(ctx, link_id, reason).await {
+        tracing::error!(
+            link_id = %link_id,
+            reason = %reason,
+            error = %error,
+            "could not mark a failed payment link; it stays pending"
+        );
+    }
+}
+
 async fn handle_offer_checkout(
     ctx: &dyn Context,
     msg: &Message,
@@ -1065,12 +1100,28 @@ async fn handle_offer_checkout(
     preview.amounts.platform_fee_minor = fee_minor;
 
     let requires = product.str_field("requires");
-    if !requires.is_empty()
-        && (msg.user_id().is_empty() || !user_owns_product(ctx, msg.user_id(), requires).await)
-    {
-        return err_bad_request(
-            "You must sign in and own the required product before purchasing this item.",
-        );
+    if !requires.is_empty() {
+        let owns = if msg.user_id().is_empty() {
+            // An anonymous caller cannot own anything, and asking the
+            // database would only be a chance to fail for the wrong reason.
+            false
+        } else {
+            match user_owns_product(ctx, msg.user_id(), requires).await {
+                Ok(owns) => owns,
+                // "We could not check" is not "you do not own it": that
+                // refusal names the buyer as the problem and no retry clears
+                // it, while a 500 says what actually happened and makes the
+                // storefront retryable.
+                Err(error) => {
+                    return crud::db_error_internal(error, "Could not verify product ownership")
+                }
+            }
+        };
+        if !owns {
+            return err_bad_request(
+                "You must sign in and own the required product before purchasing this item.",
+            );
+        }
     }
 
     let base_url = config::get_default(
@@ -1178,7 +1229,7 @@ async fn handle_offer_checkout(
     let country = match platform_country(ctx).await {
         Ok(country) => country,
         Err(error) => {
-            let _ = repo::purchases::mark_checkout_failed(ctx, &order.id, &error.message).await;
+            record_checkout_failure(ctx, &order.id, &error.message).await;
             return err_internal("Platform country is misconfigured", error);
         }
     };
@@ -1197,7 +1248,7 @@ async fn handle_offer_checkout(
     ) {
         Ok(body) => body,
         Err(error) => {
-            let _ = repo::purchases::mark_checkout_failed(ctx, &order.id, &error).await;
+            record_checkout_failure(ctx, &order.id, &error).await;
             return err_bad_request(&error);
         }
     };
@@ -1215,7 +1266,7 @@ async fn handle_offer_checkout(
     {
         Ok(session) => session,
         Err(error) => {
-            let _ = repo::purchases::mark_checkout_failed(ctx, &order.id, &error.message).await;
+            record_checkout_failure(ctx, &order.id, &error.message).await;
             return err_internal("Stripe API error", error);
         }
     };
@@ -1238,7 +1289,7 @@ async fn handle_offer_checkout(
             CheckoutPresentation::PaymentLink => false,
         };
     if !response_is_usable {
-        let _ = repo::purchases::mark_checkout_failed(
+        record_checkout_failure(
             ctx,
             &order.id,
             "Stripe response was missing required Checkout Session fields",
@@ -2170,7 +2221,7 @@ pub(crate) async fn create_payment_link(
     {
         Ok(response) => response,
         Err(error) => {
-            let _ = repo::payment_links::mark_error(ctx, &pending.managed.id, &error.message).await;
+            record_payment_link_failure(ctx, &pending.managed.id, &error.message).await;
             return Err(error);
         }
     };
@@ -2183,7 +2234,7 @@ pub(crate) async fn create_payment_link(
         .and_then(|value| value.as_str())
         .unwrap_or("");
     if stripe_id.is_empty() || url.is_empty() {
-        let _ = repo::payment_links::mark_error(
+        record_payment_link_failure(
             ctx,
             &pending.managed.id,
             "Stripe Payment Link response was incomplete",
@@ -3297,7 +3348,18 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             // Each addon subscription item has metadata fields: extra_projects,
             // extra_requests, extra_r2_bytes, extra_d1_bytes (set when creating
             // the subscription item via Stripe API).
-            let user_id = repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await;
+            let user_id =
+                match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await {
+                    Ok(user_id) => user_id,
+                    // The two things this answer gates — the addon-total sync and
+                    // the outbound `products.subscription.updated` — were both
+                    // skipped silently when the read failed, and the delivery
+                    // still told Stripe it had succeeded, so nothing retried them.
+                    Err(error) => fail_webhook!(
+                        err_internal("Failed to resolve Stripe subscription owner", error),
+                        "subscription owner lookup failed"
+                    ),
+                };
             if let Some(ref uid) = user_id {
                 if let Some(items) = data_object.get("items") {
                     sync_addon_totals_from_items(ctx, uid, items).await;
@@ -3430,7 +3492,19 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
 
         Some(StripeEventType::CustomerSubscriptionDeleted) => {
             let stripe_sub_id = data_object.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let user_id = repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await;
+            // Read before the cancellation writes, as it always was — the row
+            // this names is about to have its addons zeroed. A failed read is
+            // the whole delivery's failure: the outbound
+            // `products.subscription.deleted` is the only thing that tells
+            // the platform a paid user has lapsed.
+            let user_id =
+                match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await {
+                    Ok(user_id) => user_id,
+                    Err(error) => fail_webhook!(
+                        err_internal("Failed to resolve Stripe subscription owner", error),
+                        "subscription owner lookup failed"
+                    ),
+                };
 
             if !stripe_sub_id.is_empty() {
                 let canceled_at = stripe_timestamp(data_object.get("canceled_at"));
@@ -4090,21 +4164,29 @@ pub(crate) fn is_stable_stripe_api_version(value: &str) -> bool {
 
 /// Check if a user owns a product — either via an active subscription that
 /// references it, or a completed purchase containing it as a line item.
-async fn user_owns_product(ctx: &dyn Context, user_id: &str, product_id: &str) -> bool {
+///
+/// All three reads propagate. This answer gates a purchase, and every one of
+/// them used to collapse a failure into `false` (the middle one literally as
+/// `Err(_) => false`), so a database outage told a buyer "you must sign in
+/// and own the required product" for a product they had already bought — a
+/// refusal that looks like their fault and that no retry can clear.
+async fn user_owns_product(
+    ctx: &dyn Context,
+    user_id: &str,
+    product_id: &str,
+) -> Result<bool, WaferError> {
     // Active subscription whose plan references the product.
-    if repo::subscriptions::active_plan_exists(ctx, user_id, product_id).await {
-        return true;
+    if repo::subscriptions::active_plan_exists(ctx, user_id, product_id).await? {
+        return Ok(true);
     }
     // Completed purchase containing this product as a line item.
     let purchase_ids: Vec<serde_json::Value> =
-        match repo::purchases::completed_purchase_ids(ctx, user_id).await {
-            Ok(rows) => rows
-                .into_iter()
-                .filter_map(|r| r.data.get("id").and_then(|v| v.as_str()).map(String::from))
-                .map(serde_json::Value::String)
-                .collect(),
-            Err(_) => return false,
-        };
+        repo::purchases::completed_purchase_ids(ctx, user_id)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.data.get("id").and_then(|v| v.as_str()).map(String::from))
+            .map(serde_json::Value::String)
+            .collect();
     repo::purchases::line_item_exists_for_product(ctx, purchase_ids, product_id).await
 }
 

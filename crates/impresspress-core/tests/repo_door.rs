@@ -1026,13 +1026,26 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/handlers/types.rs",
         ],
     ),
+    // The two template doors carry a fault injector each, the same category
+    // as the `llm_settings` entry below: `handler_tests` names the table so
+    // `FailingDbOpContext` lands on the default-template lookup a create makes
+    // and on nothing else — the point of that test is that the *other* reads
+    // in the same create still work.
     (
         "group_templates",
-        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+        ],
     ),
     (
         "product_templates",
-        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/handler_tests.rs",
+        ],
     ),
     // The llm settings door. One entry, and it is a fault injector: the
     // block's `config_tests` name the table so `FailingDbOpContext` lands on

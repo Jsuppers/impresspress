@@ -125,17 +125,33 @@ where
 
         // Natural end-of-stream: persist the assistant turn before
         // signalling `[DONE]`, so a client that refetches history on
-        // `[DONE]` already sees the new message. Persistence failure is
-        // non-fatal here, exactly as in `handle_chat` (`messages_create`
-        // logs and returns `None`).
-        let _ = messages_create(
+        // `[DONE]` already sees the new message.
+        //
+        // Which is exactly why a failed write cannot still send `[DONE]`: the
+        // refetch it triggers would replace a complete answer on screen with
+        // a conversation that never contained it. `handle_chat` answers the
+        // same failure with a status, but by this point the status line and
+        // every content frame are already on the wire, so the terminal frame
+        // is the only channel left — the same `event: error` a mid-stream
+        // service failure emits.
+        if let Err(error) = messages_create(
             ctx.as_ref(),
             &msg,
             &thread_id,
             EntryRole::Assistant,
             &content,
         )
-        .await;
+        .await
+        {
+            tracing::error!(
+                thread_id = %thread_id,
+                reply_bytes = content.len(),
+                error = %error,
+                "llm streamed assistant turn was delivered but could not be stored"
+            );
+            let _ = sink.send_chunk(SSE_ERROR_FRAME.to_vec()).await;
+            return;
+        }
 
         let _ = sink.send_chunk(SSE_DONE_FRAME.to_vec()).await;
     })
@@ -265,6 +281,48 @@ mod tests {
         assert!(
             ctx.calls().is_empty(),
             "an errored stream must not persist an assistant turn (mirrors handle_chat)"
+        );
+    }
+
+    /// An assistant turn the store refused ends the stream with an error
+    /// frame, not `[DONE]`.
+    ///
+    /// The persistence was `let _ =`, and `[DONE]` is precisely the signal a
+    /// client refetches history on — so the refetch replaced a complete
+    /// answer on screen with a conversation that never contained it. The
+    /// content frames are already on the wire and the status line is long
+    /// since committed, so unlike `handle_chat` this path has no status left
+    /// to change: the in-band error frame is the only channel it still has,
+    /// and it is the same frame a mid-stream service failure emits.
+    #[tokio::test]
+    async fn sse_chat_response_reports_a_failed_persist_instead_of_done() {
+        use crate::blocks::llm::routes::test_support::MessagesWriteFails;
+
+        let ctx = MessagesWriteFails::after(RecordingCtx::default().clone_arc(), 0);
+        let msg = Message::new("create:/b/llm/api/chat/stream");
+        let chunks: Vec<Result<ChatChunk, wafer_run::WaferError>> =
+            vec![Ok(ChatChunk::text("Hel")), Ok(ChatChunk::text("lo"))];
+
+        let out = sse_chat_response(
+            futures::stream::iter(chunks),
+            ctx.clone_arc(),
+            msg,
+            "thread-1".to_string(),
+        );
+        let buf = out.collect_buffered().await.expect("stream completes");
+        let body = String::from_utf8(buf.body).expect("SSE body is utf8");
+
+        assert!(
+            body.contains("Hel") && body.contains("lo"),
+            "the frames already delivered are still delivered, got: {body}"
+        );
+        assert!(
+            body.ends_with("event: error\ndata: {}\n\n"),
+            "a turn the store refused must not end in [DONE], got: {body}"
+        );
+        assert!(
+            !body.contains("[DONE]"),
+            "[DONE] is what a client refetches history on, got: {body}"
         );
     }
 

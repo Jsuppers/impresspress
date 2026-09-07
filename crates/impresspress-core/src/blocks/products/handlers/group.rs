@@ -163,11 +163,21 @@ pub(super) async fn handle_user_create_group(
         .get("group_template_id")
         .is_none_or(|v| v.as_str().is_some_and(str::is_empty))
     {
-        if let Some(default_id) = repo::group_templates::default_id(ctx).await {
-            body.insert(
-                "group_template_id".to_string(),
-                serde_json::Value::String(default_id),
-            );
+        match repo::group_templates::default_id(ctx).await {
+            Ok(Some(default_id)) => {
+                body.insert(
+                    "group_template_id".to_string(),
+                    serde_json::Value::String(default_id),
+                );
+            }
+            // No default template seeded: proceed without one, as this create
+            // always has.
+            Ok(None) => {}
+            // A read that failed is not "there is no default": writing the
+            // row anyway persists exactly the template-less group the default
+            // exists to prevent, and it outlives the outage looking
+            // deliberate.
+            Err(error) => return crud::db_error_internal(error, "Could not load group template"),
         }
     }
 

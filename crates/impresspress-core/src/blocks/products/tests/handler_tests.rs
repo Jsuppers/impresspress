@@ -5385,3 +5385,81 @@ async fn a_seller_cannot_open_another_sellers_close_manager() {
         "the owner must reach the page the assertions above deny: {html}"
     );
 }
+
+/// A template lookup that could not run must not write a template-less row.
+///
+/// Both `default_id` twins returned `Option<String>` and folded a failed read
+/// into `None`, and both creates read that as "there is no default template"
+/// and wrote the row anyway. The row outlives the outage looking like a
+/// deliberate choice, which is precisely what the seeded default exists to
+/// prevent — and neither create logged a thing.
+#[tokio::test]
+async fn a_create_whose_template_lookup_fails_writes_no_row() {
+    use crate::{blocks::products::repo, test_support::FailingDbOpContext};
+
+    let ctx = user_products_ctx().await;
+
+    // The positive control first: both creates land against a healthy
+    // database, so the refusals below cannot pass for an unrelated reason.
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "Healthy"}),
+    );
+    let group = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert!(group["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+    let (msg, input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({"name": "Healthy", "group_id": group["id"]}),
+    );
+    let product = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert!(product["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+    let groups_before = repo::groups::count(&ctx, &[]).await.expect("count groups");
+    let products_before = repo::products::count(&ctx, &[])
+        .await
+        .expect("count products");
+
+    let failing = FailingDbOpContext::new(
+        ctx.clone(),
+        vec![
+            ("database.list", repo::group_templates::TABLE),
+            ("database.list", repo::product_templates::TABLE),
+        ],
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "During the outage"}),
+    );
+    assert!(
+        output_is_error(dispatch(&failing, msg, input).await, ErrorCode::Internal).await,
+        "a group create whose template lookup failed must refuse"
+    );
+
+    let (msg, input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({"name": "During the outage", "group_id": group["id"]}),
+    );
+    assert!(
+        output_is_error(dispatch(&failing, msg, input).await, ErrorCode::Internal).await,
+        "a product create whose template lookup failed must refuse"
+    );
+
+    assert_eq!(
+        repo::groups::count(&ctx, &[]).await.expect("count groups"),
+        groups_before,
+        "the refused group create must leave no row behind"
+    );
+    assert_eq!(
+        repo::products::count(&ctx, &[])
+            .await
+            .expect("count products"),
+        products_before,
+        "the refused product create must leave no row behind"
+    );
+}
