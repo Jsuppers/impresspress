@@ -941,6 +941,12 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             "blocks/products/tests/purchase_tests.rs",
+            // Test-fixture setup: `refund_reconciliation_keeps_the_raw_provider_response`
+            // stages the `provider_succeeded` state an interrupted reconcile
+            // leaves behind. No product path parks a row there across requests,
+            // and `record_provider_response` refuses once the reconcile has
+            // stamped `stripe_event_created`.
+            "blocks/products/tests/provider_tests.rs",
         ],
     ),
     (

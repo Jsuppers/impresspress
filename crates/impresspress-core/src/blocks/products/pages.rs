@@ -3405,13 +3405,20 @@ async fn order_detail(
                         components::TableCol { label: "Total", width: None },
                         components::TableCol { label: "Configuration", width: None },
                     ];
-                    @let rows: Vec<Vec<Markup>> = line_items.iter().map(|item| vec![
-                        html! { strong { (item.str_field("product_name")) } },
-                        html! { (item.i64_field("quantity")) },
-                        html! { (display_money(item.i64_field("unit_amount_minor"), currency)) },
-                        html! { strong { (display_money(item.i64_field("total_minor"), currency)) } },
-                        html! { @if item.str_field("input_snapshot").is_empty() || item.str_field("input_snapshot") == "{}" { span .text-muted { "—" } } @else { details { summary { "View" } code .text-sm { (item.str_field("input_snapshot")) } } } },
-                    ]).collect();
+                    @let rows: Vec<Vec<Markup>> = line_items.iter().map(|item| {
+                        // `input_snapshot` is a JSON-object column, so it
+                        // arrives structured on the backends that re-parse
+                        // JSON-shaped text and as the raw string on the ones
+                        // that do not. `json_text_field` renders both.
+                        let snapshot = item.json_text_field("input_snapshot");
+                        vec![
+                            html! { strong { (item.str_field("product_name")) } },
+                            html! { (item.i64_field("quantity")) },
+                            html! { (display_money(item.i64_field("unit_amount_minor"), currency)) },
+                            html! { strong { (display_money(item.i64_field("total_minor"), currency)) } },
+                            html! { @if snapshot.is_empty() || snapshot == "{}" { span .text-muted { "—" } } @else { details { summary { "View" } code .text-sm { (snapshot) } } } },
+                        ]
+                    }).collect();
                     (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {}))
                 }
             }
