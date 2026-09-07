@@ -37,10 +37,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         return error_response(code, &msg);
     }
 
-    // Verify user exists
+    // Verify user exists. The credential lookup four lines below has always
+    // separated "no row" from "the read failed"; this probe folded both into
+    // a 404, so an outage told a signed-in caller their account was gone and
+    // left the password unchanged.
     match users::find_by_id(ctx, user_id).await {
         Ok(Some(_)) => {}
-        Ok(None) | Err(_) => return err_not_found("User not found"),
+        Ok(None) => return err_not_found("User not found"),
+        Err(e) => return err_internal("Could not load the signed-in user", e),
     };
 
     // Fetch existing credential row — must have one to change password.
@@ -233,6 +237,32 @@ mod tests {
             users::auth_version(&ctx, &user_id).await.unwrap(),
             1,
             "password change must bump auth_version"
+        );
+    }
+
+    /// The existence probe folded `Ok(None)` and `Err` into one
+    /// `404 User not found`, four lines above a credential lookup that has
+    /// always three-way branched. An outage told a signed-in caller their
+    /// account was gone and their password was left unchanged.
+    #[tokio::test]
+    async fn an_unreadable_user_row_is_an_outage_not_a_missing_account() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "dana@example.com", "original-horse-battery1").await;
+        // The existence probe is the handler's first database read; the
+        // password policy above it reads configuration only.
+        let failing = ctx.break_reads();
+
+        let msg = auth_msg("update", "/b/auth/api/change-password", &user_id);
+        let out = handle(
+            &failing,
+            &msg,
+            body("original-horse-battery1", "new-horse-battery-2026"),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed existence probe must not answer 404"
         );
     }
 }

@@ -114,8 +114,14 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // raw `db::get`.
     let user = match users::find_by_id(ctx, &user_id).await {
         Ok(Some(u)) => u,
+        // The row is genuinely gone: the account was deleted while a refresh
+        // token was still live. That is a revoked session.
         Ok(None) => return error_response(ErrorCode::NotAuthenticated, "User not found"),
-        Err(_) => return error_response(ErrorCode::NotAuthenticated, "User not found"),
+        // A read that could not run is not a revoked session. Answering 401
+        // signs the client out — the SDK discards its refresh token on that
+        // status — so a database blip logged every session out and the only
+        // trace of the outage was in this deployment's own logs.
+        Err(e) => return err_internal("Refresh could not load the account", e),
     };
 
     if !user.is_active() {
@@ -288,6 +294,28 @@ mod tests {
             output_is_error(out, "Internal").await,
             "a failed family revoke leaves the attacker's token live; \
              it must surface as an error, not as an ordinary 401"
+        );
+    }
+
+    /// The account-state read answered `Unauthenticated: User not found` for
+    /// both `Ok(None)` and `Err`, so a database outage signed every client
+    /// out: the SDK discards its refresh token on a 401 and the user is back
+    /// at the login form, with the deployment's own logs the only place the
+    /// outage appears. A live token whose user row could not be read is an
+    /// error, not a revocation.
+    #[tokio::test]
+    async fn an_unreadable_user_row_does_not_sign_a_live_token_out() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        // The token row is a `database.list` on the tokens table and is left
+        // alone; only the account-state read of the users table fails.
+        let failing = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let out = handle(&failing, refresh_with(&token)).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed account-state read must not be answered as a revoked session"
         );
     }
 }

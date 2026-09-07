@@ -176,9 +176,13 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let user_id = msg.user_id();
 
-    // Verify ownership
-    let Ok(Some(key)) = api_keys::find_by_id(ctx, id).await else {
-        return err_not_found("API key not found");
+    // Verify ownership. A read that could not run is not a missing key: the
+    // key is still live, and answering 404 tells its owner it has already
+    // been removed while the revoke they came to perform did not happen.
+    let key = match api_keys::find_by_id(ctx, id).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return err_not_found("API key not found"),
+        Err(e) => return err_internal("Could not load the API key", e),
     };
     if key.user_id != user_id && !crate::util::is_admin(msg) {
         return err_forbidden("Cannot revoke another user's API key");
@@ -199,9 +203,12 @@ pub async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let user_id = msg.user_id();
 
-    // Verify ownership
-    let Ok(Some(key)) = api_keys::find_by_id(ctx, id).await else {
-        return err_not_found("API key not found");
+    // Verify ownership. Same rule as `handle_revoke`: a failed read is an
+    // outage, not a key that has already gone.
+    let key = match api_keys::find_by_id(ctx, id).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return err_not_found("API key not found"),
+        Err(e) => return err_internal("Could not load the API key", e),
     };
     if key.user_id != user_id && !crate::util::is_admin(msg) {
         return err_forbidden("Cannot delete another user's API key");
@@ -297,5 +304,42 @@ mod tests {
         let through_table = handle_delete(&ctx, &routed(auth_msg("delete", &path, &owner))).await;
         assert_eq!(output_json(through_table).await["deleted"], true);
         assert!(api_keys::find_by_id(&ctx, &key_id).await.unwrap().is_none());
+    }
+
+    /// The ownership lookup is the only thing standing between the caller and
+    /// someone else's key, and its failure used to answer `404 API key not
+    /// found`. The owner was told their key had already been removed, and the
+    /// revoke they came to perform silently did not happen.
+    #[tokio::test]
+    async fn revoke_reports_an_unreadable_key_row_as_an_outage() {
+        let ctx = TestContext::with_auth().await;
+        let (owner, key_id) = seed_user_with_key(&ctx).await;
+        let path = format!("/b/auth/api/api-keys/{key_id}");
+        // The ownership lookup is the handler's first read, so a database
+        // whose reads all fail lands on it and on nothing earlier.
+        let failing = ctx.break_reads();
+
+        let out = handle_revoke(&failing, &routed(auth_msg("update", &path, &owner))).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed ownership lookup must not answer 404: the key is still there"
+        );
+    }
+
+    /// Same contract for `handle_delete`.
+    #[tokio::test]
+    async fn delete_reports_an_unreadable_key_row_as_an_outage() {
+        let ctx = TestContext::with_auth().await;
+        let (owner, key_id) = seed_user_with_key(&ctx).await;
+        let path = format!("/b/auth/api/api-keys/{key_id}");
+        let failing = ctx.break_reads();
+
+        let out = handle_delete(&failing, &routed(auth_msg("delete", &path, &owner))).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed ownership lookup must not answer 404: the key is still there"
+        );
     }
 }

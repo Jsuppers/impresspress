@@ -708,6 +708,16 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // through a generic `db::list_all(ctx, table, ..)` over the
             // allowlist and its import through `seed::import`
             "blocks/dev/data_snapshot.rs",
+            // A fault injector, the established second category: refresh
+            // reads the tokens table and THEN the users table, and the branch
+            // under test is the second read, so `TestContext::break_reads`
+            // cannot reach it — it fails the token lookup first and the
+            // handler returns before the users read happens. Only
+            // `FailingDbOpContext` can fail one table, and it has to be
+            // named. The other seven handlers in the same sweep reach their
+            // branch on their first read and use `break_reads`, which names
+            // no table at all.
+            "blocks/auth_ui/api/refresh.rs",
         ],
     ),
     // The auth doors B12 adds. Two categories, both already established

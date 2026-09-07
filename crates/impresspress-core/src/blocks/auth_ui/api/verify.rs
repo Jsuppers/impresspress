@@ -56,18 +56,28 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     // Find user by verification token. The DB column stores
     // `sha256_hex(raw)`; hash the supplied token the same way before
     // comparing.
-    let Ok(Some(user)) =
-        users::find_by_verification_token(ctx, &sha256_hex(token.as_bytes())).await
-    else {
-        return html_respond(
-            "Invalid Link",
-            "This verification link is invalid or has expired. Please request a new one.",
-            false,
-            &logo_url,
-            &app_name,
-            &auth_headline,
-            &auth_tagline,
-        );
+    let user = match users::find_by_verification_token(ctx, &sha256_hex(token.as_bytes())).await {
+        Ok(Some(user)) => user,
+        // No row carries this digest: the token was already used, rotated
+        // away, or never minted. That is the real invalid-or-expired link.
+        Ok(None) => {
+            return html_respond(
+                "Invalid Link",
+                "This verification link is invalid or has expired. Please request a new one.",
+                false,
+                &logo_url,
+                &app_name,
+                &auth_headline,
+                &auth_tagline,
+            )
+        }
+        // A read that could not run is not a bad link. This endpoint is not
+        // an enumeration surface — the caller already holds the token — so
+        // there is nothing to protect by lying, and the page's own advice
+        // ("request a new one") sends the holder of a good token to
+        // `resend-verification`, which reads the same table and replaces the
+        // token they were holding.
+        Err(e) => return err_internal("Could not check the verification token", e),
     };
 
     if user.email_verified {
@@ -117,8 +127,20 @@ pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStrea
     let safe_msg = "If that email is registered, a verification link has been sent.";
     let constant = || ok_json(&serde_json::json!({"message": safe_msg}));
 
-    let Ok(Some(user)) = users::find_by_email(ctx, &email_lower).await else {
-        return constant();
+    // DELIBERATE, do not "fix": the `Err` arm is folded into the constant
+    // response on purpose. It is the same collapse the T4 sweep removes
+    // everywhere else, and here it is the feature — an answer that varied
+    // with the submitted address, for any reason, is the enumeration oracle
+    // the paragraph above closes. The response stays constant; the failure
+    // is logged so an outage on this endpoint is still findable, which is
+    // the part that was missing.
+    let user = match users::find_by_email(ctx, &email_lower).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return constant(),
+        Err(e) => {
+            tracing::error!(error = %e, "resend-verification: user lookup failed");
+            return constant();
+        }
     };
 
     if user.email_verified {
@@ -210,6 +232,95 @@ fn html_respond(
 }
 
 #[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::{
+        blocks::auth::repo::users::{self, NewUser},
+        test_support::{anon_msg, output_html, output_is_error, TestContext},
+    };
+
+    /// A user carrying `token`'s digest in `verification_token`.
+    async fn seed_unverified(ctx: &TestContext, token: &str) -> String {
+        let user = users::insert(
+            ctx,
+            NewUser {
+                email: "pending@example.com".into(),
+                display_name: "Pending".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: false,
+                verification_token_hash: Some(sha256_hex(token.as_bytes())),
+            },
+        )
+        .await
+        .expect("insert user");
+        user.id
+    }
+
+    fn verify_msg(token: &str) -> Message {
+        let mut msg = anon_msg("retrieve", "/b/auth/api/verify");
+        msg.set_meta("req.query.token", token);
+        msg
+    }
+
+    /// Unlike `resend`, this endpoint is not an enumeration surface: the
+    /// caller already holds the token. A failed lookup used to render the
+    /// same "This verification link is invalid or has expired" page as a
+    /// genuinely bad token — a 200 that tells the holder of a good link to
+    /// throw it away, and whose advice sends them to `resend-verification`,
+    /// which reads the same table and replaces the token they were holding.
+    #[tokio::test]
+    async fn an_unreadable_verification_token_is_an_outage_not_a_bad_link() {
+        let ctx = TestContext::with_auth().await;
+        let token = "raw-verification-token-0123456789";
+        let user_id = seed_unverified(&ctx, token).await;
+
+        // The positive control first, on the same fixture: this token really
+        // does verify, so the assertion below is about the outage and not
+        // about a token the handler would have refused anyway.
+        let verified = output_html(
+            handle(
+                &ctx,
+                &verify_msg(token),
+                InputStream::from_bytes(Vec::new()),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            verified.contains("Email Verified"),
+            "the seeded token must verify on a healthy database: {verified}"
+        );
+        assert!(
+            users::find_by_id(&ctx, &user_id)
+                .await
+                .expect("read back")
+                .expect("the row is there")
+                .email_verified
+        );
+
+        // The same fixture again, with a database whose reads all fail. The
+        // token lookup is the handler's first read, so it is the one that
+        // fails.
+        let ctx = TestContext::with_auth().await;
+        seed_unverified(&ctx, token).await;
+        let failing = ctx.break_reads();
+
+        let out = handle(
+            &failing,
+            &verify_msg(token),
+            InputStream::from_bytes(Vec::new()),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed token lookup must not render the invalid-link page"
+        );
+    }
+}
+
+#[cfg(test)]
 mod resend_tests {
     use wafer_run::InputStream;
 
@@ -294,6 +405,26 @@ mod resend_tests {
                 .await
                 .expect("read cooldown"),
             sent_at
+        );
+    }
+
+    /// The one place in this sweep where a failed read must NOT be
+    /// distinguishable from a negative answer. An error here would vary the
+    /// response by the submitted address, which is the enumeration oracle
+    /// the constant body exists to close. Pinned so a later sweep cannot
+    /// "fix" it back into an oracle.
+    #[tokio::test]
+    async fn resend_answers_the_constant_body_even_when_the_lookup_fails() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        seed(&ctx, "known@example.com", false).await;
+        let expected = output_json(handle_resend(&ctx, body("known@example.com")).await).await;
+        let failing = ctx.break_reads();
+
+        let outage = output_json(handle_resend(&failing, body("known@example.com")).await).await;
+
+        assert_eq!(
+            outage, expected,
+            "a failed lookup must answer the same constant body as any other state"
         );
     }
 }
