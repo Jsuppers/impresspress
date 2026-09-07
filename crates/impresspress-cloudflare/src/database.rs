@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
+    codec::{record_from_json_row, scalar_f64, scalar_i64},
     exec::{BatchOp, BatchResult, DbExec},
     schema_cache::SchemaCache,
     service::{
@@ -225,7 +226,7 @@ impl DbExec for D1DatabaseService {
         let stmt = self.prepare_bind(sql, params)?;
         let results = stmt.all().await.map_err(db_err)?;
         let rows: Vec<serde_json::Value> = results.results().map_err(db_err)?;
-        Ok(rows.into_iter().map(json_to_record).collect())
+        Ok(rows.into_iter().map(record_from_json_row).collect())
     }
 
     async fn run_fetch_one(
@@ -241,7 +242,7 @@ impl DbExec for D1DatabaseService {
             Err(e) if is_no_such_table(&e.to_string()) => return Err(DatabaseError::NotFound),
             Err(e) => return Err(db_err(e)),
         };
-        row.map(json_to_record).ok_or(DatabaseError::NotFound)
+        row.map(record_from_json_row).ok_or(DatabaseError::NotFound)
     }
 
     async fn run_execute(
@@ -308,9 +309,9 @@ impl DbExec for D1DatabaseService {
     /// decoded positionally into the [`BatchResult`] variant its op names,
     /// reusing the very helpers the single-statement primitives use:
     ///
-    /// - [`BatchOp::Rows`] → `results()` → [`json_to_record`] per row (as
+    /// - [`BatchOp::Rows`] → `results()` → [`record_from_json_row`] per row (as
     ///   [`run_fetch`](DbExec::run_fetch)).
-    /// - [`BatchOp::FetchOne`] → first of `results()` → `json_to_record`,
+    /// - [`BatchOp::FetchOne`] → first of `results()` → `record_from_json_row`,
     ///   empty ⇒ [`DatabaseError::NotFound`] (as
     ///   [`run_fetch_one`](DbExec::run_fetch_one)).
     /// - [`BatchOp::Execute`] → `meta().changes` (as
@@ -381,12 +382,12 @@ impl DbExec for D1DatabaseService {
             let decoded = match op {
                 BatchOp::Rows { .. } => {
                     let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
-                    BatchResult::Rows(rows.into_iter().map(json_to_record).collect())
+                    BatchResult::Rows(rows.into_iter().map(record_from_json_row).collect())
                 }
                 BatchOp::FetchOne { .. } => {
                     let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
                     let row = rows.into_iter().next().ok_or(DatabaseError::NotFound)?;
-                    BatchResult::FetchOne(json_to_record(row))
+                    BatchResult::FetchOne(record_from_json_row(row))
                 }
                 BatchOp::Execute { .. } => {
                     // Same source as `run_execute`: D1Result meta's `changes`.
@@ -647,61 +648,83 @@ pub(crate) fn is_no_such_table(msg: &str) -> bool {
     msg.contains("no such table")
 }
 
-/// Extract the single scalar column of a `COUNT`/aggregate row as i64.
-/// The shared builders alias the scalar column (`build_count` → its own
-/// alias), so we take the first numeric value present rather than a fixed key.
-fn scalar_i64(row: Option<serde_json::Value>) -> i64 {
-    row.and_then(first_scalar)
-        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-        .unwrap_or(0)
-}
-
-/// Extract the single scalar column of a `SUM`/aggregate row as f64.
-fn scalar_f64(row: Option<serde_json::Value>) -> f64 {
-    row.and_then(first_scalar)
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
-        .unwrap_or(0.0)
-}
-
-/// The first value of a single-column result object, regardless of its alias.
-fn first_scalar(row: serde_json::Value) -> Option<serde_json::Value> {
-    match row {
-        serde_json::Value::Object(map) => map.into_iter().next().map(|(_, v)| v),
-        other => Some(other),
-    }
-}
-
-/// Convert a D1 result row (as JSON) into a Record.
-///
-/// `id` is copied into [`Record::id`] and retained in [`Record::data`],
-/// matching the native SQLite and browser adapters. Auth repositories and
-/// other row decoders consume the complete row map from `data`.
-fn json_to_record(val: serde_json::Value) -> Record {
-    if let serde_json::Value::Object(map) = val {
-        let id = map
-            .get("id")
-            .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        Record {
-            id,
-            data: map.into_iter().collect(),
-        }
-    } else {
-        Record {
-            id: String::new(),
-            data: std::collections::HashMap::new(),
-        }
-    }
-}
-
 // Note: unit tests for the pure SQL-planning layer live in `wafer-sql-utils`
 // and `wafer-core::interfaces::database::exec` (shared across all SQL
 // backends). `impresspress-cloudflare` only compiles on `wasm32-unknown-unknown`
 // (the R2/D1 services hold `!Send` JsFutures), so `cargo test
-// -p impresspress-cloudflare` errors before reaching any test module. End-to-end
-// validation comes from a real CF deploy.
+// -p impresspress-cloudflare` errors before reaching any test module. The
+// `wasm_bindgen_test`s below run under Node in CI's `cloudflare-wasm-test` job;
+// end-to-end validation of the live D1 path comes from a real CF deploy.
+
+#[cfg(test)]
+mod tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    /// B25. SQLite — and therefore D1 — has no array/object storage class, so
+    /// the shared write path serialises a structured value to JSON text and
+    /// binds it as TEXT. A backend that does not parse it back hands block code
+    /// a `Value::String` where the same block gets a `Value::Object` everywhere
+    /// else.
+    ///
+    /// This is the row decoder every D1 read goes through: `run_fetch`,
+    /// `run_fetch_one` and the `BatchOp::Rows`/`FetchOne` arms of `run_batch`
+    /// all map their rows with it. Before this test D1 stored each value exactly
+    /// as it arrived, while `wafer-block-sqlite` and the browser's sql.js bridge
+    /// both re-parsed with a byte-identical predicate — so a block reading its
+    /// own JSON column got an object on native and in the browser, and a string
+    /// on Cloudflare.
+    ///
+    /// The end-to-end pin is
+    /// `wafer_core::interfaces::database::conformance::run_conformance`'s
+    /// `check_json_value_round_trip`, which this crate can only *typecheck*
+    /// (see `conformance.rs`: a live run needs a workerd D1 binding CI does not
+    /// have). This is the closest a runnable test gets to it.
+    #[wasm_bindgen_test]
+    fn a_json_looking_text_column_decodes_back_into_the_value_that_was_written() {
+        let record = record_from_json_row(serde_json::json!({
+            "id": "r1",
+            "meta": "{\"k\":[1,2],\"nested\":{\"b\":true}}",
+            "tags": "[\"a\",\"b\"]",
+            "note": "hello world",
+            "braced_prose": "{not json at all",
+            "count": 3,
+        }));
+
+        assert_eq!(record.id, "r1");
+        assert_eq!(
+            record.data.get("meta"),
+            Some(&serde_json::json!({"k": [1, 2], "nested": {"b": true}})),
+            "a serialised JSON object in a TEXT column must decode back to the \
+             object, as it does on native sqlite and in the browser",
+        );
+        assert_eq!(
+            record.data.get("tags"),
+            Some(&serde_json::json!(["a", "b"])),
+            "a serialised JSON array must decode back to the array",
+        );
+        assert_eq!(
+            record.data.get("note"),
+            Some(&serde_json::json!("hello world")),
+            "plain text must stay text, or the decode is not narrow enough",
+        );
+        assert_eq!(
+            record.data.get("braced_prose"),
+            Some(&serde_json::json!("{not json at all")),
+            "braced text that does not parse must be returned verbatim",
+        );
+        assert_eq!(record.data.get("count"), Some(&serde_json::json!(3)));
+    }
+
+    /// The scalar decoders the aggregate paths use: `run_scalar_i64` /
+    /// `run_scalar_f64` read a one-column row whose column the shared builders
+    /// alias themselves, so the value has to be taken positionally.
+    #[wasm_bindgen_test]
+    fn an_aggregate_row_yields_its_single_column_whatever_it_is_aliased_as() {
+        assert_eq!(scalar_i64(Some(serde_json::json!({"cnt": 7}))), 7);
+        assert_eq!(scalar_i64(None), 0);
+        assert_eq!(scalar_f64(Some(serde_json::json!({"total": 2.5}))), 2.5);
+        assert_eq!(scalar_f64(None), 0.0);
+    }
+}
