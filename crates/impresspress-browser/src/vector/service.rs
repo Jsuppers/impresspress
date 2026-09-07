@@ -20,26 +20,6 @@ fn js_err(e: wasm_bindgen::JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
 }
 
-fn matches_filter(metadata: Option<&serde_json::Value>, filter: &MetadataFilter) -> bool {
-    if filter.equals.is_empty() {
-        return true;
-    }
-    let Some(meta) = metadata else { return false };
-    for (path, expected) in &filter.equals {
-        let mut cursor = meta;
-        for segment in path.split('.') {
-            cursor = match cursor.get(segment) {
-                Some(v) => v,
-                None => return false,
-            };
-        }
-        if cursor != expected {
-            return false;
-        }
-    }
-    true
-}
-
 /// Per-index config: cached in memory for the lifetime of this
 /// `BrowserVectorService`, and persisted (`dimensions`/`metric`/
 /// `keyword_search`) in the `sql::REGISTRY_TABLE` table inside the same
@@ -354,7 +334,7 @@ impl VectorService for BrowserVectorService {
                     .enumerate()
                     .filter_map(|(rank, id)| {
                         let m = metadata.get(&id).cloned().flatten();
-                        if !matches_filter(m.as_ref(), &f) {
+                        if !f.matches(m.as_ref()) {
                             return None;
                         }
                         Some(VectorMatch {
@@ -494,7 +474,7 @@ fn load_all_vectors(index: &str, dims: u32, f: &MetadataFilter) -> VResult<Vec<V
         let (id, vector, metadata) =
             sql::decode_vector_row(r.id, &r.vector, r.metadata.as_deref(), dims)
                 .map_err(VectorError::Internal)?;
-        if !matches_filter(metadata.as_ref(), f) {
+        if !f.matches(metadata.as_ref()) {
             continue;
         }
         out.push((id, vector, metadata));
