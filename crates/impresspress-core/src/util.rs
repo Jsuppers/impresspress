@@ -54,6 +54,14 @@ pub fn json_as_u64(v: &serde_json::Value) -> Option<u64> {
 /// (see [`json_as_i64`]) so TEXT-stored values never silently collapse
 /// to the zero default.
 pub trait RecordExt {
+    /// A `TEXT` column as the string it holds, `""` when missing or when the
+    /// value is not a JSON string.
+    ///
+    /// A JSON-encoded column is *not* one of these: the SQLite and browser
+    /// backends re-parse JSON-shaped text on read, so such a column arrives as
+    /// a `Value::Object` and this accessor answers `""` for a payload that is
+    /// plainly there. Reach for [`Self::json_value_field`],
+    /// [`Self::json_object_field`] or [`Self::json_text_field`] instead.
     fn str_field(&self, key: &str) -> &str;
     /// Field as `i64`, defaulting to `0` when missing/non-numeric.
     fn i64_field(&self, key: &str) -> i64;
@@ -89,6 +97,17 @@ pub trait RecordExt {
     /// A JSON-encoded `TEXT` column that holds an array, or empty when it
     /// holds anything else.
     fn json_array_field(&self, key: &str) -> Vec<serde_json::Value>;
+
+    /// A JSON-encoded `TEXT` column as its JSON *text*, for a caller that
+    /// carries the payload onward rather than inspecting it — re-persisting it
+    /// on another row, or rendering it.
+    ///
+    /// A backend that handed back the raw string returns it verbatim (it is
+    /// already the encoded text); a backend that re-parsed it gets the value
+    /// re-encoded, which can reorder object keys but never loses a field. `""`
+    /// when the column is absent, so an `is_empty()` guard still means
+    /// "nothing stored".
+    fn json_text_field(&self, key: &str) -> String;
 
     /// A JSON-encoded `TEXT` column that holds an array of strings. Elements
     /// that are not strings are dropped; a column holding anything but an
@@ -160,6 +179,14 @@ impl RecordExt for HashMap<String, serde_json::Value> {
         }
     }
 
+    fn json_text_field(&self, key: &str) -> String {
+        match self.get(key) {
+            Some(serde_json::Value::String(raw)) => raw.clone(),
+            Some(serde_json::Value::Null) | None => String::new(),
+            Some(value) => value.to_string(),
+        }
+    }
+
     fn string_list_field(&self, key: &str) -> Vec<String> {
         self.json_array_field(key)
             .into_iter()
@@ -206,6 +233,10 @@ impl RecordExt for Record {
 
     fn json_array_field(&self, key: &str) -> Vec<serde_json::Value> {
         self.data.json_array_field(key)
+    }
+
+    fn json_text_field(&self, key: &str) -> String {
+        self.data.json_text_field(key)
     }
 
     fn string_list_field(&self, key: &str) -> Vec<String> {
@@ -901,6 +932,30 @@ mod tests {
             );
             assert_eq!(r.json_value_field("snap"), serde_json::json!({"x": [1]}));
         }
+    }
+
+    /// The accessor a caller reaches for when it carries a JSON column onward
+    /// instead of inspecting it. `str_field` cannot do this job: it answers
+    /// `""` for the decoded arm, which is how a payments audit trail was being
+    /// blanked on two of the three adapters.
+    #[test]
+    fn json_text_field_answers_the_encoded_text_on_both_arms() {
+        let decoded = record(serde_json::json!({"resp": {"id": "re_1"}, "blank": {}}));
+        let literal = record(serde_json::json!({"resp": "{\"id\":\"re_1\"}", "blank": "{}"}));
+        for r in [&decoded, &literal] {
+            assert_eq!(r.json_text_field("resp"), "{\"id\":\"re_1\"}");
+            assert_eq!(r.json_text_field("blank"), "{}");
+        }
+        // The trap this replaces: on the decoded arm — SQLite and the browser
+        // — `str_field` answers `""` for a payload that is plainly there,
+        // while the same read is correct against D1 and Postgres.
+        assert_eq!(decoded.str_field("resp"), "");
+        assert_eq!(literal.str_field("resp"), "{\"id\":\"re_1\"}");
+        // Absent and SQL NULL stay empty, so an `is_empty()` guard on the
+        // result still means "nothing stored".
+        let sparse = record(serde_json::json!({"null": null}));
+        assert_eq!(sparse.json_text_field("null"), "");
+        assert_eq!(sparse.json_text_field("absent"), "");
     }
 
     #[test]

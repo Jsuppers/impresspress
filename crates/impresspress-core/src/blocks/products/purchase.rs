@@ -726,7 +726,7 @@ async fn refund_purchase(
             ctx,
             &provider_operation.id,
             true,
-            refund.str_field("response_json"),
+            &refund.json_text_field("response_json"),
             "",
         )
         .await
@@ -760,7 +760,7 @@ async fn refund_purchase(
             ctx,
             &provider_operation.id,
             true,
-            refund.str_field("response_json"),
+            &refund.json_text_field("response_json"),
             "",
         )
         .await

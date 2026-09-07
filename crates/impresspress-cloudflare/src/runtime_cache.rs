@@ -97,6 +97,23 @@ pub(crate) struct ReadyRuntime {
 }
 
 impl ReadyRuntime {
+    /// The `kind` field every runtime-lifecycle log line carries, derived from
+    /// the runtime itself rather than typed at each site.
+    ///
+    /// All four sites that announce a finished runtime — the two that publish
+    /// it as the isolate's cached one and the two that serve it request-locally
+    /// — spell this field the same way, so one dashboard filter sees them all.
+    /// Two of them used to emit `prepared = true` instead, which no filter
+    /// matching `kind` could find. `config_version.is_some()` is already what
+    /// the rest of this file switches on to tell the two paths apart.
+    fn kind_label(&self) -> &'static str {
+        if self.config_version.is_some() {
+            "prepared"
+        } else {
+            "dynamic"
+        }
+    }
+
     /// A probe reached KV: reset the failure streak and re-arm the normal
     /// jittered window.
     fn note_probe_success(&self, now: u64) {
@@ -563,6 +580,197 @@ async fn probe_version(kv: &Arc<dyn impresspress_core::kv::KvBackend>) -> Versio
     }
 }
 
+/// Which of the two request-path lifecycles a finished runtime belongs to, and
+/// the version identity that goes with it.
+///
+/// This is deliberately **not** a `(grants, hooks, policy)` triple a caller
+/// composes. Ruling 5.5 (as amended) makes the boot hook a property of the
+/// *path*, not an argument: the deploy funnel seeds, a dynamic request build
+/// reads and republishes without writing, and a prepared hydration does
+/// neither. `runtime_build` expresses that as three named funnels, and this
+/// enum is what lets [`finish_runtime`] share everything *around* the funnel
+/// without letting a fourth caller invent a fourth combination.
+enum RuntimeKind {
+    /// A dynamically built runtime — the stored per-isolate build and the
+    /// request-local transient one. `version` is the KV config-version stamp
+    /// probed before the build, so a runtime is never tagged with a version
+    /// newer than the config it loaded.
+    ///
+    /// `stored` says which of the two: `true` for the build that holds the
+    /// isolate's build slot and becomes the cached runtime, `false` for the
+    /// request-local one. Nothing about the finished runtime differs — the
+    /// flag exists so a *boot failure* can name its blast radius, which is the
+    /// one place the two lifecycles are not interchangeable. See
+    /// [`RuntimeKind::lifecycle`].
+    Dynamic { version: String, stored: bool },
+    /// A runtime hydrated from a verified prepared plan. Its `version` is the
+    /// plan hash, and it additionally carries the config generation the plan
+    /// was sealed at — the `Some`/`None` on `ReadyRuntime::config_version` is
+    /// what tells the two paths apart everywhere else in this file.
+    Prepared {
+        plan_hash: String,
+        config_generation: String,
+    },
+}
+
+impl RuntimeKind {
+    /// How a *boot failure* names itself, which is a finer distinction than
+    /// the `kind` log field ([`ReadyRuntime::kind_label`]) because the
+    /// consequences differ.
+    ///
+    /// A `cached` failure is the isolate-owning build: every subsequent
+    /// request in that isolate keeps failing until a version or config change
+    /// forces a rebuild. A `transient` failure is the per-request fallback,
+    /// which self-heals on the next request. Both answer an opaque 500, so
+    /// this string is the only thing that tells an operator reading Workers
+    /// logs a poisoned isolate from a lost race.
+    fn lifecycle(&self) -> &'static str {
+        match self {
+            Self::Dynamic { stored: true, .. } => "cached",
+            Self::Dynamic { stored: false, .. } => "transient",
+            Self::Prepared { .. } => "prepared",
+        }
+    }
+
+    fn version_and_config_version(self) -> (String, Option<String>) {
+        match self {
+            Self::Dynamic { version, .. } => (version, None),
+            Self::Prepared {
+                plan_hash,
+                config_generation,
+            } => (plan_hash, Some(config_generation)),
+        }
+    }
+
+    /// Everything a finished runtime carries except its `Wafer`.
+    ///
+    /// Split out for the same reason the boot hooks' database halves are:
+    /// `ReadyRuntime` holds a `wafer_run::Wafer`, which no wasm unit test can
+    /// produce, and what a test needs to see here is that the two request paths
+    /// arm an identical probe window from an identical clock reading. A fourth
+    /// copy of this tail measuring against `now_millis()` instead of
+    /// `started_at` would have been invisible.
+    fn tag(self, environment_identity: String, started_at: u64) -> RuntimeTag {
+        let (version, config_version) = self.version_and_config_version();
+        RuntimeTag {
+            version,
+            config_version,
+            environment_identity,
+            probe_deadline_ms: next_probe_deadline_ms(started_at),
+        }
+    }
+}
+
+/// The non-`Wafer` half of a [`ReadyRuntime`], as [`RuntimeKind::tag`] computes
+/// it.
+struct RuntimeTag {
+    version: String,
+    config_version: Option<String>,
+    environment_identity: String,
+    probe_deadline_ms: u64,
+}
+
+/// This isolate's next runtime-build ordinal.
+///
+/// Surfaced via `Server-Timing` (`CacheOutcome::build_ordinal`) as a
+/// zero-plumbing proxy for "D1 statements per logical request" — see
+/// `impresspress_core::metrics`'s module doc. Written three times verbatim
+/// before [`finish_runtime`] took it over.
+fn next_build_ordinal() -> u32 {
+    BUILD_COUNT.with(|count| {
+        let next = count.get() + 1;
+        count.set(next);
+        next
+    })
+}
+
+/// Boot a built runtime and wrap it as a [`ReadyRuntime`], with this isolate's
+/// next build ordinal and the elapsed build time.
+///
+/// The three sites that produced a `ReadyRuntime` — the stored dynamic build,
+/// the transient dynamic build, and `hydrate_prepared_runtime` (already one
+/// function serving three prepared branches) — used to repeat this same tail
+/// verbatim: pick a boot funnel, mint the `BUILD_COUNT` ordinal, measure
+/// against `started_at`, and construct the struct with a fresh jittered probe
+/// deadline and a zero failure streak. Three copies of a tail is how two paths
+/// drift; one of them measuring against `now_millis()` instead of
+/// `started_at`, or arming its probe window differently, would have been
+/// invisible.
+async fn finish_runtime(
+    built: crate::runtime_build::BuiltRuntime,
+    kind: RuntimeKind,
+    environment_identity: String,
+    started_at: u64,
+) -> Result<(Rc<ReadyRuntime>, u32, u64), String> {
+    let mut built = built;
+    let lifecycle = kind.lifecycle();
+    let booted = match &kind {
+        RuntimeKind::Dynamic { .. } => {
+            crate::runtime_build::boot_dynamic_request_runtime(&mut built).await
+        }
+        RuntimeKind::Prepared { .. } => {
+            crate::runtime_build::boot_prepared_runtime(&mut built).await
+        }
+    };
+    booted.map_err(|error| format!("{lifecycle}-runtime boot: {error}"))?;
+
+    let build_ordinal = next_build_ordinal();
+    let duration_ms = impresspress_core::util::now_millis().saturating_sub(started_at);
+    let tag = kind.tag(environment_identity, started_at);
+    let rt = Rc::new(ReadyRuntime {
+        wafer: built.wafer,
+        version: tag.version,
+        config_version: tag.config_version,
+        environment_identity: tag.environment_identity,
+        probe_deadline_ms: Cell::new(tag.probe_deadline_ms),
+        probe_failures: Cell::new(0),
+    });
+    Ok((rt, build_ordinal, duration_ms))
+}
+
+/// Publish a finished runtime as this isolate's cached one, and report the
+/// cache outcome — the second half both *slot-owning* paths share.
+///
+/// Losing the right to publish is not an error: the runtime is complete and
+/// internally consistent, and on Workers the build was charged against this
+/// request's CPU budget, so discarding it to answer 503 throws away the
+/// expensive part. It is served request-locally instead and the winning owner's
+/// runtime becomes the cached one.
+fn publish_runtime(
+    guard: &BuildGuard,
+    rt: &Rc<ReadyRuntime>,
+    build_ordinal: u32,
+    duration_ms: u64,
+    is_cold: bool,
+) -> CacheOutcome {
+    let label = rt.kind_label();
+    if !store_if_current(guard, rt.clone()) {
+        tracing::warn!(
+            build_ordinal,
+            kind = label,
+            "serving un-storable runtime request-locally; a newer owner superseded this build"
+        );
+    }
+    tracing::info!(
+        build_ordinal,
+        duration_ms,
+        cold = is_cold,
+        kind = label,
+        "runtime build complete"
+    );
+    if is_cold {
+        CacheOutcome::ColdBuilt {
+            build_ordinal,
+            duration_ms,
+        }
+    } else {
+        CacheOutcome::Rebuilt {
+            build_ordinal,
+            duration_ms,
+        }
+    }
+}
+
 /// Return the per-isolate cached runtime, rebuilding it if the KV
 /// config-version stamp has moved (or if nothing is cached yet), alongside
 /// the [`CacheOutcome`] this call resolved to — a free byproduct of the
@@ -573,6 +781,7 @@ async fn probe_version(kv: &Arc<dyn impresspress_core::kv::KvBackend>) -> Versio
 /// consumed only on the build path; on a cache hit they are dropped unused.
 pub(crate) async fn get_or_build<F, G>(
     env: &worker::Env,
+    environment: &crate::environment::CfEnvironment,
     request_config: &std::collections::HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -598,12 +807,13 @@ where
     // ceiling — Cloudflare error 1102, per-request CPU exhausted, because a full
     // dynamic build does not fit in a request's CPU budget alongside its own
     // work. Prepared hydration is ~132us. That gap is why the plan exists.
-    if let Some(plan) = crate::packaged_prepared_runtime_plan(env)? {
-        let environment_identity = crate::runtime_environment_identity(env, request_config);
+    if let Some(plan) = crate::environment::packaged_prepared_runtime_plan(environment)? {
+        let environment_identity = environment.identity(request_config);
         let prepared_identity = prepared_cache_identity(&plan.plan_hash, &environment_identity);
         if !prepared_is_bypassed(&prepared_identity) {
             return get_or_build_prepared(
                 env,
+                environment,
                 request_config,
                 plan,
                 register_blocks,
@@ -613,7 +823,7 @@ where
         }
     }
 
-    let environment_identity = crate::runtime_environment_identity(env, request_config);
+    let environment_identity = environment.identity(request_config);
 
     // Hooks are FnOnce because only the request that acquires the build slot
     // consumes them. Waiters retain their own hooks while sleeping, then drop
@@ -628,7 +838,11 @@ where
     // own comments flag for Cloudflare 1102 risk).
     let mut dirty_consumed = false;
 
-    let (probed_version, read_through, is_cold, built_at, build_guard) = loop {
+    // A block, not a loop: every path below either returns or produces the
+    // resolution. It was written as `loop { … break resolution; }`, which
+    // `clippy::never_loop` denies — and did deny, unnoticed, because no CI job
+    // runs `clippy --target wasm32-unknown-unknown` for this crate.
+    let (probed_version, read_through, is_cold, built_at, build_guard) = {
         let now = impresspress_core::util::now_millis();
 
         // Preserve the zero-await warm path. A dirty or probe-due runtime
@@ -662,6 +876,7 @@ where
             Err(RuntimeBuildBusy) => {
                 return hydrate_transient_dynamic_runtime(
                     env,
+                    environment,
                     request_config,
                     register_blocks
                         .take()
@@ -682,6 +897,7 @@ where
         let Some(build_guard) = BuildGuard::try_acquire(now) else {
             return hydrate_transient_dynamic_runtime(
                 env,
+                environment,
                 request_config,
                 register_blocks
                     .take()
@@ -713,7 +929,7 @@ where
 
             // Always derive the probe handle from THIS request's Env. The
             // immutable cached runtime intentionally retains no KV binding.
-            let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
+            let probe_kv = match crate::services::make_kv_backend(env, crate::runner::KV_BINDING) {
                 Ok(kv) => kv,
                 Err(e) => {
                     // Same reasoning as the build-failure paths below: this
@@ -751,7 +967,7 @@ where
         } else {
             // Cold isolate: probe before build so the finished runtime is
             // tagged with a version no newer than the config it loaded.
-            let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+            let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
             (
                 probe_version(&kv).await.into_dynamic_version(),
                 false,
@@ -760,7 +976,7 @@ where
                 build_guard,
             )
         };
-        break resolution;
+        resolution
     };
 
     // This build already CONSUMED the dirty flag (`take_dirty` above). If it
@@ -771,8 +987,9 @@ where
     // Gated on `dirty_consumed` so a cold build failure (which never took the
     // flag) cannot manufacture a dirty signal and charge the next runtime a
     // full dynamic rebuild it does not need.
-    let mut built = match crate::build_runtime(
+    let built = match crate::runtime_build::build_runtime(
         env,
+        environment,
         request_config,
         None,
         register_blocks
@@ -804,60 +1021,29 @@ where
     // lazy-init slot would let concurrent requests wait on one another's init
     // future, which is not a valid execution model here. The concrete services
     // are dropped instead of entering ReadyRuntime.
-    if let Err(e) = crate::boot_dynamic_request_runtime(&mut built).await {
-        if dirty_consumed {
-            mark_dirty();
-        }
-        return Err(format!("cached-runtime boot: {e}").into());
-    }
-
-    let build_ordinal = BUILD_COUNT.with(|c| {
-        let n = c.get() + 1;
-        c.set(n);
-        n
-    });
-    let duration_ms = impresspress_core::util::now_millis().saturating_sub(built_at);
-
-    let rt = Rc::new(ReadyRuntime {
-        wafer: built.wafer,
-        version: probed_version,
-        config_version: None,
+    let finished = finish_runtime(
+        built,
+        RuntimeKind::Dynamic {
+            version: probed_version,
+            stored: true,
+        },
         environment_identity,
-        probe_deadline_ms: Cell::new(next_probe_deadline_ms(built_at)),
-        probe_failures: Cell::new(0),
-    });
-    if !store_if_current(&build_guard, rt.clone()) {
-        // The runtime is complete and internally consistent; only the right to
-        // PUBLISH it was lost, because the guard expired or a newer owner
-        // superseded it. Discarding it to return a 503 throws away a build this
-        // request already paid for in full — and on Workers that build is
-        // charged against the per-request CPU budget, so it is the expensive
-        // part. Serve it request-locally; the winning owner's runtime becomes
-        // the cached one.
-        tracing::warn!(
-            build_ordinal,
-            "serving un-storable runtime request-locally; a newer owner superseded this build"
-        );
-    }
-    tracing::info!(
-        build_ordinal,
-        duration_ms,
-        cold = is_cold,
-        "runtime build complete"
-    );
-    // `build_guard` remains alive through `store`, so waiters cannot observe
-    // BUILDING=false before the completed runtime is visible.
-    let outcome = if is_cold {
-        CacheOutcome::ColdBuilt {
-            build_ordinal,
-            duration_ms,
-        }
-    } else {
-        CacheOutcome::Rebuilt {
-            build_ordinal,
-            duration_ms,
+        built_at,
+    )
+    .await;
+    let (rt, build_ordinal, duration_ms) = match finished {
+        Ok(finished) => finished,
+        Err(e) => {
+            if dirty_consumed {
+                mark_dirty();
+            }
+            return Err(e.into());
         }
     };
+
+    // `build_guard` remains alive through `store`, so waiters cannot observe
+    // BUILDING=false before the completed runtime is visible.
+    let outcome = publish_runtime(&build_guard, &rt, build_ordinal, duration_ms, is_cold);
     Ok((rt, outcome))
 }
 
@@ -878,6 +1064,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_prepared_runtime<F, G>(
     env: &worker::Env,
+    environment: &crate::environment::CfEnvironment,
     request_config: &std::collections::HashMap<String, String>,
     plan: &impresspress_core::PreparedRuntimePlan,
     register_blocks: F,
@@ -894,8 +1081,9 @@ where
         Arc<dyn wafer_core::interfaces::storage::service::StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let mut built = crate::build_runtime(
+    let built = crate::runtime_build::build_runtime(
         env,
+        environment,
         request_config,
         Some(plan),
         register_blocks,
@@ -907,29 +1095,20 @@ where
 
     // Grants and settings were imported from the verified plan, so this is the
     // one path whose `GrantSource` is `PreInstalled` and whose seed hook is a
-    // written no-op — see `crate::boot_prepared_runtime`. Everything else is
-    // the shared ordering, under this request's services: ConfigSource may
-    // still perform per-block reads, and keeping them here prevents
-    // cross-request lazy-init waiters.
-    crate::boot_prepared_runtime(&mut built)
-        .await
-        .map_err(|e| format!("prepared-runtime boot: {e}"))?;
-
-    let build_ordinal = BUILD_COUNT.with(|count| {
-        let next = count.get() + 1;
-        count.set(next);
-        next
-    });
-    let duration_ms = impresspress_core::util::now_millis().saturating_sub(started_at);
-    let rt = Rc::new(ReadyRuntime {
-        wafer: built.wafer,
-        version: plan.plan_hash.clone(),
-        config_version: Some(plan.config_generation.clone()),
+    // written no-op — see `crate::runtime_build::boot_prepared_runtime`, which
+    // `RuntimeKind::Prepared` selects. Everything else is the shared ordering,
+    // under this request's services: ConfigSource may still perform per-block
+    // reads, and keeping them here prevents cross-request lazy-init waiters.
+    Ok(finish_runtime(
+        built,
+        RuntimeKind::Prepared {
+            plan_hash: plan.plan_hash.clone(),
+            config_generation: plan.config_generation.clone(),
+        },
         environment_identity,
-        probe_deadline_ms: Cell::new(next_probe_deadline_ms(started_at)),
-        probe_failures: Cell::new(0),
-    });
-    Ok((rt, build_ordinal, duration_ms))
+        started_at,
+    )
+    .await?)
 }
 
 /// Build a complete runtime for THIS request only, without touching the build
@@ -966,8 +1145,12 @@ where
 /// at 33 subrequests and `/search` at 39, so the headroom is real but not large.
 /// Exceeding it surfaces as `Too many subrequests`, NOT as a hang or a 503 —
 /// distinct enough to diagnose from the deploy gate's output.
+// Eight arguments, for the same reason `build_runtime` has eight: the captured
+// environment travels rather than being re-read here.
+#[allow(clippy::too_many_arguments)]
 async fn hydrate_transient_dynamic_runtime<F, G>(
     env: &worker::Env,
+    environment: &crate::environment::CfEnvironment,
     request_config: &std::collections::HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -999,7 +1182,7 @@ where
     let probe = match known_probe {
         Some(probe) => probe,
         None => {
-            let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+            let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
             probe_version(&kv).await
         }
     };
@@ -1019,8 +1202,9 @@ where
     }
     let probed_version = probe.into_dynamic_version();
 
-    let mut built = crate::build_runtime(
+    let built = crate::runtime_build::build_runtime(
         env,
+        environment,
         request_config,
         None,
         register_blocks,
@@ -1040,33 +1224,26 @@ where
     )
     .await?;
 
-    // Literally the same call the stored dynamic build makes — the two request
-    // paths are one decision, not two. It used to be that build's five
-    // statements copied, and a copy is how two paths drift: both remembered
-    // the grant load, neither passed a `BootHooks`, and no reader could tell
-    // which of those was a decision. The deploy funnel is the one that differs
-    // (it seeds), and it says so by calling `boot_deploy_runtime` instead.
-    crate::boot_dynamic_request_runtime(&mut built)
-        .await
-        .map_err(|e| format!("transient-runtime boot: {e}"))?;
-
-    let build_ordinal = BUILD_COUNT.with(|count| {
-        let next = count.get() + 1;
-        count.set(next);
-        next
-    });
-    let duration_ms = impresspress_core::util::now_millis().saturating_sub(started_at);
-    let rt = Rc::new(ReadyRuntime {
-        wafer: built.wafer,
-        version: probed_version,
-        config_version: None,
+    // Literally the same tail the stored dynamic build takes — the two request
+    // paths are one decision, not two. It used to be that build's statements
+    // copied, and a copy is how two paths drift: both remembered the grant
+    // load, neither passed a `BootHooks`, and no reader could tell which of
+    // those was a decision. The deploy funnel is the one that differs (it
+    // seeds), and it says so by calling `boot_deploy_runtime` instead.
+    let (rt, build_ordinal, duration_ms) = finish_runtime(
+        built,
+        RuntimeKind::Dynamic {
+            version: probed_version,
+            stored: false,
+        },
         environment_identity,
-        probe_deadline_ms: Cell::new(next_probe_deadline_ms(started_at)),
-        probe_failures: Cell::new(0),
-    });
+        started_at,
+    )
+    .await?;
     tracing::info!(
         build_ordinal,
         duration_ms,
+        kind = rt.kind_label(),
         transient = true,
         "request-local dynamic runtime build complete"
     );
@@ -1081,6 +1258,7 @@ where
 
 async fn get_or_build_prepared<F, G>(
     env: &worker::Env,
+    environment: &crate::environment::CfEnvironment,
     request_config: &std::collections::HashMap<String, String>,
     plan: Rc<impresspress_core::PreparedRuntimePlan>,
     register_blocks: F,
@@ -1095,7 +1273,7 @@ where
         Arc<dyn wafer_core::interfaces::storage::service::StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let environment_identity = crate::runtime_environment_identity(env, request_config);
+    let environment_identity = environment.identity(request_config);
     let plan_generation = plan.plan_hash.clone();
     let prepared_identity = prepared_cache_identity(&plan_generation, &environment_identity);
     let now = impresspress_core::util::now_millis();
@@ -1130,7 +1308,7 @@ where
         // a transient prepared runtime. A transient runtime is complete and
         // request-scoped, so it can serve safely without touching the owner's
         // build slot or replacing the isolate cache.
-        let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+        let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
         let probe = probe_version(&kv).await;
         if !prepared_generation_matches(&plan.config_generation, &probe) {
             // The plan is stale AND the slot is busy — the post-deploy window,
@@ -1144,6 +1322,7 @@ where
             // cannot justify.)
             return hydrate_transient_dynamic_runtime(
                 env,
+                environment,
                 request_config,
                 register_blocks,
                 register_post_build,
@@ -1172,6 +1351,7 @@ where
 
         let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
             env,
+            environment,
             request_config,
             plan.as_ref(),
             register_blocks,
@@ -1183,7 +1363,7 @@ where
         tracing::info!(
             build_ordinal,
             duration_ms,
-            prepared = true,
+            kind = rt.kind_label(),
             transient = true,
             "request-local prepared runtime hydration complete"
         );
@@ -1208,6 +1388,7 @@ where
     let Some(build_guard) = BuildGuard::try_acquire(now) else {
         let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
             env,
+            environment,
             request_config,
             plan.as_ref(),
             register_blocks,
@@ -1219,7 +1400,7 @@ where
         tracing::info!(
             build_ordinal,
             duration_ms,
-            prepared = true,
+            kind = rt.kind_label(),
             transient = true,
             "request-local prepared hydration complete (lost the build-slot race)"
         );
@@ -1239,18 +1420,19 @@ where
                     return Ok((rt, CacheOutcome::Hit));
                 }
 
-                let probe_kv = match crate::make_kv_backend(env, crate::runner::KV_BINDING) {
-                    Ok(kv) => kv,
-                    Err(e) => {
-                        // `dirty` was consumed above; losing it here would
-                        // strand the isolate on pre-write state for a full
-                        // probe window.
-                        if dirty {
-                            mark_dirty();
+                let probe_kv =
+                    match crate::services::make_kv_backend(env, crate::runner::KV_BINDING) {
+                        Ok(kv) => kv,
+                        Err(e) => {
+                            // `dirty` was consumed above; losing it here would
+                            // strand the isolate on pre-write state for a full
+                            // probe window.
+                            if dirty {
+                                mark_dirty();
+                            }
+                            return Err(e.into());
                         }
-                        return Err(e.into());
-                    }
-                };
+                    };
                 let probe = probe_version(&probe_kv).await;
                 if !prepared_probe_requires_fallback(dirty, cached_config_version, &probe) {
                     if matches!(probe, VersionProbe::Unavailable) {
@@ -1276,6 +1458,7 @@ where
                 mark_dirty();
                 return Box::pin(get_or_build(
                     env,
+                    environment,
                     request_config,
                     register_blocks,
                     register_post_build,
@@ -1288,7 +1471,7 @@ where
     // A plan/Worker identity change supersedes dirty state belonging to the
     // prior runtime. The new plan is tagged with the current KV generation.
     let _ = take_dirty();
-    let kv = crate::make_kv_backend(env, crate::runner::KV_BINDING)?;
+    let kv = crate::services::make_kv_backend(env, crate::runner::KV_BINDING)?;
     let probe = probe_version(&kv).await;
     if !prepared_generation_matches(&plan.config_generation, &probe) {
         tracing::info!(
@@ -1301,6 +1484,7 @@ where
         drop(build_guard);
         return Box::pin(get_or_build(
             env,
+            environment,
             request_config,
             register_blocks,
             register_post_build,
@@ -1310,6 +1494,7 @@ where
 
     let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
         env,
+        environment,
         request_config,
         plan.as_ref(),
         register_blocks,
@@ -1318,34 +1503,9 @@ where
         now,
     )
     .await?;
-    if !store_if_current(&build_guard, rt.clone()) {
-        // Same reasoning as the dynamic path: the hydrated runtime is complete,
-        // only the right to publish it was lost. Serve it request-locally rather
-        // than converting a superseded owner into a user-visible 503.
-        tracing::warn!(
-            build_ordinal,
-            prepared = true,
-            "serving un-storable runtime request-locally; a newer owner superseded this build"
-        );
-    }
-    tracing::info!(
-        build_ordinal,
-        duration_ms,
-        cold = is_cold,
-        prepared = true,
-        "prepared runtime hydration complete"
-    );
-    let outcome = if is_cold {
-        CacheOutcome::ColdBuilt {
-            build_ordinal,
-            duration_ms,
-        }
-    } else {
-        CacheOutcome::Rebuilt {
-            build_ordinal,
-            duration_ms,
-        }
-    };
+    // Same publish-and-report tail as the dynamic path, including the reason a
+    // lost publish is served request-locally rather than turned into a 503.
+    let outcome = publish_runtime(&build_guard, &rt, build_ordinal, duration_ms, is_cold);
     Ok((rt, outcome))
 }
 
@@ -1468,6 +1628,98 @@ mod tests {
         assert!(BuildGuard::try_acquire(100 + BUILD_LEASE_MS - 1).is_none());
         let recovered = BuildGuard::try_acquire(100 + BUILD_LEASE_MS).unwrap();
         assert!(recovered.is_current());
+    }
+
+    /// The shared build tail: whatever a finished runtime's kind, the fields
+    /// that are not about the kind must come out identical for identical
+    /// inputs.
+    ///
+    /// This is what three verbatim copies of that tail could not guarantee. The
+    /// probe deadline is jittered, so the assertion is on the window rather
+    /// than the value — a copy that armed it from `now_millis()` instead of the
+    /// build's own `started_at`, or from a different floor, lands outside it.
+    #[wasm_bindgen_test]
+    fn both_request_paths_tag_a_finished_runtime_the_same_way() {
+        let started_at = 1_000_000_u64;
+        let dynamic = RuntimeKind::Dynamic {
+            version: "cfg-v1".to_string(),
+            stored: true,
+        }
+        .tag("env-a".to_string(), started_at);
+        let prepared = RuntimeKind::Prepared {
+            plan_hash: "plan-hash".to_string(),
+            config_generation: "cfg-v1".to_string(),
+        }
+        .tag("env-a".to_string(), started_at);
+
+        assert_eq!(dynamic.environment_identity, prepared.environment_identity);
+        for tag in [&dynamic, &prepared] {
+            assert!(
+                tag.probe_deadline_ms >= started_at + PROBE_INTERVAL_FLOOR_MS
+                    && tag.probe_deadline_ms
+                        <= started_at + PROBE_INTERVAL_FLOOR_MS + PROBE_INTERVAL_JITTER_MS,
+                "probe window must be armed from this build's own start time",
+            );
+        }
+
+        // The kind decides exactly two fields, and `config_version` is what the
+        // rest of this file switches on to tell a prepared runtime from a
+        // dynamic one.
+        assert_eq!(dynamic.version, "cfg-v1");
+        assert_eq!(dynamic.config_version, None);
+        assert_eq!(prepared.version, "plan-hash");
+        assert_eq!(prepared.config_version.as_deref(), Some("cfg-v1"));
+    }
+
+    /// A boot failure returns before any log line and answers an opaque 500,
+    /// so its message is the only thing that separates a poisoned isolate
+    /// (the cached build; every later request in that isolate keeps failing)
+    /// from a lost race (the transient build, which self-heals). Sharing one
+    /// tail must not cost that distinction — the `kind` field, which is about
+    /// the hydration mechanism rather than the blast radius, deliberately does
+    /// not draw it.
+    #[wasm_bindgen_test]
+    fn a_boot_failure_names_the_lifecycle_it_poisoned() {
+        let cached = RuntimeKind::Dynamic {
+            version: "cfg-v1".to_string(),
+            stored: true,
+        };
+        let transient = RuntimeKind::Dynamic {
+            version: "cfg-v1".to_string(),
+            stored: false,
+        };
+        let prepared = RuntimeKind::Prepared {
+            plan_hash: "plan-hash".to_string(),
+            config_generation: "cfg-v1".to_string(),
+        };
+
+        assert_eq!(cached.lifecycle(), "cached");
+        assert_eq!(transient.lifecycle(), "transient");
+        assert_eq!(prepared.lifecycle(), "prepared");
+        assert_ne!(
+            cached.lifecycle(),
+            transient.lifecycle(),
+            "a poisoned isolate and a lost race must not read the same"
+        );
+
+        // The `kind` log field is coarser and is derived from the finished
+        // runtime instead (`ReadyRuntime::kind_label`), so it cannot be typed
+        // differently at one of the four sites that emit it. Only the tag it
+        // switches on is assertable without a `Wafer`.
+        assert_eq!(
+            cached.tag("env".to_string(), 0).config_version,
+            transient.tag("env".to_string(), 0).config_version
+        );
+        assert!(prepared.tag("env".to_string(), 0).config_version.is_some());
+    }
+
+    /// The build ordinal is a per-isolate counter surfaced through
+    /// `Server-Timing`; three copies used to increment it.
+    #[wasm_bindgen_test]
+    fn every_finished_runtime_takes_the_next_build_ordinal() {
+        let first = next_build_ordinal();
+        assert_eq!(next_build_ordinal(), first + 1);
+        assert_eq!(next_build_ordinal(), first + 2);
     }
 
     #[wasm_bindgen_test]

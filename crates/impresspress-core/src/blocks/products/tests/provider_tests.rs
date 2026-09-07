@@ -1238,3 +1238,218 @@ async fn refund_validation_rejects_over_refund_and_unknown_fields_before_stripe(
             .is_empty()
     );
 }
+
+/// Re-read an operation row and hand back its `response_json` column as the
+/// value it encodes, whichever way the adapter decoded it.
+async fn operation_response_json(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+) -> serde_json::Value {
+    let operation = wafer_core::clients::database::get(ctx, repo::provider_operations::TABLE, id)
+        .await
+        .unwrap();
+    match operation.data.get("response_json") {
+        Some(serde_json::Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or(serde_json::Value::Null)
+        }
+        Some(value) => value.clone(),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Put a settled operation back on the queue, the way a lost lease leaves it.
+async fn reset_operation_to_pending(ctx: &crate::test_support::TestContext, id: &str) {
+    wafer_core::clients::database::update(
+        ctx,
+        repo::provider_operations::TABLE,
+        id,
+        std::collections::HashMap::from([
+            ("status".to_string(), serde_json::json!("pending")),
+            ("processing_owner".to_string(), serde_json::json!("")),
+            ("processing_started_at".to_string(), serde_json::Value::Null),
+            ("next_attempt_at".to_string(), serde_json::Value::Null),
+            ("attempts".to_string(), serde_json::json!(0)),
+        ]),
+    )
+    .await
+    .unwrap();
+}
+
+/// `response_json` is the raw provider response: a JSON-object column written
+/// as `serde_json::json!({..}).to_string()` and declared `TEXT NOT NULL
+/// DEFAULT '{}'`. Native SQLite and the browser re-parse a JSON-shaped TEXT
+/// column on read, so it arrives as a `Value::Object` — for which `str_field`,
+/// having no structured arm, answers `""`. Every reader that carries the
+/// payload from the refund ledger onto the provider-operation row therefore
+/// persisted an empty string, silently discarding the raw Stripe response from
+/// a payments audit trail. Nothing reads it back, so nothing failed loudly.
+///
+/// The three carrying reads are exercised here in the order a real refund
+/// meets them: the reconcile worker settling a pending refund
+/// (`stripe_provider::reconcile_refund_operation` → `mark_completed`), a
+/// second reconcile of an already-settled ledger row (its early return), and
+/// a retried delivery of the original refund request
+/// (`purchase::refund_purchase`'s `Succeeded` arm → `resolve_unleased`).
+#[tokio::test]
+async fn refund_reconciliation_keeps_the_raw_provider_response() {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_refunds",
+    )])
+    .await;
+    seed_stripe_refund_order(
+        &ctx,
+        "purchase_audit_trail",
+        "completed",
+        5000,
+        0,
+        "",
+        false,
+    )
+    .await;
+    let requests = register_sequence(
+        &mut ctx,
+        vec![
+            serde_json::json!({
+                "id": "re_audit_trail",
+                "status": "pending",
+                "amount": 1250,
+                "payment_intent": "pi_purchase_audit_trail",
+                "livemode": false
+            }),
+            serde_json::json!({
+                "id": "re_audit_trail",
+                "status": "succeeded",
+                "amount": 1250,
+                "payment_intent": "pi_purchase_audit_trail",
+                "livemode": false
+            }),
+        ],
+    );
+
+    let (msg, input) = admin_refund_msg(
+        "purchase_audit_trail",
+        serde_json::json!({"amount_minor": 1250, "idempotency_key": "audit_trail"}),
+    );
+    let pending = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(pending["status"], "pending");
+
+    let operation = wafer_core::clients::database::get_by_field(
+        &ctx,
+        repo::provider_operations::TABLE,
+        "aggregate_type",
+        serde_json::json!("refund"),
+    )
+    .await
+    .unwrap();
+
+    // 1. The reconcile worker settles the refund against Stripe and completes
+    //    the operation with the response it just recorded on the ledger.
+    reset_operation_to_pending(&ctx, &operation.id).await;
+    let (mut reconcile, input) = admin_create_msg(
+        "/b/products/api/admin/provider-operations/reconcile",
+        serde_json::json!({}),
+    );
+    reconcile.set_meta("req.query.limit", "1");
+    let reconciled = output_to_json(dispatch(&ctx, reconcile, input).await).await;
+    assert_eq!(reconciled["succeeded"], 1);
+    assert_eq!(
+        operation_response_json(&ctx, &operation.id).await,
+        serde_json::json!({
+            "id": "re_audit_trail",
+            "status": "succeeded",
+            "amount_minor": 1250,
+            "livemode": false,
+            "source": "provider_reconciliation"
+        }),
+        "the settled operation must keep the raw provider response"
+    );
+
+    // 2. A second reconcile of an already-settled ledger row takes the early
+    //    return and must republish the same payload, not blank it.
+    reset_operation_to_pending(&ctx, &operation.id).await;
+    let (mut reconcile, input) = admin_create_msg(
+        "/b/products/api/admin/provider-operations/reconcile",
+        serde_json::json!({}),
+    );
+    reconcile.set_meta("req.query.limit", "1");
+    let again = output_to_json(dispatch(&ctx, reconcile, input).await).await;
+    assert_eq!(again["succeeded"], 1);
+    assert_eq!(
+        operation_response_json(&ctx, &operation.id).await["id"],
+        "re_audit_trail",
+        "an already-settled refund must not lose its provider response"
+    );
+
+    // 3. A retried delivery of the original request resolves the operation
+    //    from the ledger row, and must carry the payload across too.
+    wafer_core::clients::database::update(
+        &ctx,
+        repo::provider_operations::TABLE,
+        &operation.id,
+        std::collections::HashMap::from([("response_json".to_string(), serde_json::json!("{}"))]),
+    )
+    .await
+    .unwrap();
+    let (msg, input) = admin_refund_msg(
+        "purchase_audit_trail",
+        serde_json::json!({"amount_minor": 1250, "idempotency_key": "audit_trail"}),
+    );
+    let retried = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(retried["status"], "succeeded");
+    assert_eq!(
+        operation_response_json(&ctx, &operation.id).await["id"],
+        "re_audit_trail",
+        "a retried refund delivery must not blank the provider response"
+    );
+
+    // 4. The same retry against a ledger row Stripe has settled but this side
+    //    has not (`provider_succeeded`, what an interrupted reconcile leaves)
+    //    takes the other arm of `refund_purchase`, which carries the payload
+    //    across too.
+    let ledger = repo::refunds::get_by_idempotency_key(
+        &ctx,
+        "impresspress_refund_purchase_audit_trail_audit_trail",
+    )
+    .await
+    .unwrap()
+    .expect("the refund ledger row this test just drove to succeeded");
+    // No product path parks a row here for longer than one request —
+    // `refund_purchase` writes `provider_succeeded` and settles it a few lines
+    // later — so the state an interrupted reconcile leaves behind is staged
+    // directly. `record_provider_response` cannot do it once the reconcile has
+    // stamped `stripe_event_created`, which it has by now.
+    wafer_core::clients::database::update(
+        &ctx,
+        repo::refunds::TABLE,
+        &ledger.id,
+        std::collections::HashMap::from([(
+            "status".to_string(),
+            serde_json::json!("provider_succeeded"),
+        )]),
+    )
+    .await
+    .unwrap();
+    wafer_core::clients::database::update(
+        &ctx,
+        repo::provider_operations::TABLE,
+        &operation.id,
+        std::collections::HashMap::from([("response_json".to_string(), serde_json::json!("{}"))]),
+    )
+    .await
+    .unwrap();
+    let (msg, input) = admin_refund_msg(
+        "purchase_audit_trail",
+        serde_json::json!({"amount_minor": 1250, "idempotency_key": "audit_trail"}),
+    );
+    let settled = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(settled["status"], "succeeded");
+    assert_eq!(
+        operation_response_json(&ctx, &operation.id).await["id"],
+        "re_audit_trail",
+        "settling a provider-succeeded refund must not blank the provider response"
+    );
+
+    // Stripe was asked exactly twice: the create and the one reconcile GET.
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}

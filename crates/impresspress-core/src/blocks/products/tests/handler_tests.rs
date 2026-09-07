@@ -3832,6 +3832,81 @@ async fn order_pages_use_exact_currency_and_enforce_buyer_seller_actions() {
     );
 }
 
+/// A line item's `input_snapshot` is a JSON-object column: written by
+/// `serde_json::to_string(&preview.inputs)`, declared `TEXT NOT NULL DEFAULT
+/// '{}'`. Two of the three database adapters (native SQLite and the browser)
+/// re-parse a JSON-shaped TEXT column on read, so the column arrives as a
+/// `Value::Object`, and `str_field` — which has no structured arm — answers
+/// `""` for it. The order-detail Configuration column then took its
+/// "nothing selected" branch and rendered a dash for every configured item,
+/// on the buyer, seller and admin views alike.
+#[tokio::test]
+async fn order_detail_renders_a_line_item_configuration_snapshot() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "order_snapshot",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("buyer_snapshot")),
+            (
+                "buyer_user_id".to_string(),
+                serde_json::json!("buyer_snapshot"),
+            ),
+            ("status".to_string(), serde_json::json!("completed")),
+            ("currency".to_string(), serde_json::json!("NZD")),
+            ("total_cents".to_string(), serde_json::json!(2500)),
+            ("subtotal_cents".to_string(), serde_json::json!(2500)),
+        ]),
+    )
+    .await;
+    seed(
+        &ctx,
+        "impresspress__products__line_items",
+        "order_snapshot_line",
+        HashMap::from([
+            (
+                "purchase_id".to_string(),
+                serde_json::json!("order_snapshot"),
+            ),
+            ("product_id".to_string(), serde_json::json!("engraved_pen")),
+            (
+                "product_name".to_string(),
+                serde_json::json!("Engraved pen"),
+            ),
+            ("quantity".to_string(), serde_json::json!(1)),
+            ("unit_amount_minor".to_string(), serde_json::json!(2500)),
+            ("total_minor".to_string(), serde_json::json!(2500)),
+            // Exactly what `stripe.rs` writes: the encoded object, as text.
+            (
+                "input_snapshot".to_string(),
+                serde_json::json!(r#"{"engraving":"For Ada"}"#),
+            ),
+        ]),
+    )
+    .await;
+
+    let (buyer_msg, _) = get_msg("/b/products/my-purchases/order_snapshot", "buyer_snapshot");
+    let buyer_html = output_to_html(
+        super::super::pages::my_purchase_detail(&ctx, &buyer_msg, "order_snapshot").await,
+    )
+    .await;
+    assert!(
+        buyer_html.contains("For Ada"),
+        "the buyer's Configuration cell must show the selected options: {buyer_html}"
+    );
+
+    let (admin_msg, _) = admin_get_msg("/b/products/admin/purchases/order_snapshot");
+    let admin_html = output_to_html(
+        super::super::pages::admin_purchase_detail(&ctx, &admin_msg, "order_snapshot").await,
+    )
+    .await;
+    assert!(
+        admin_html.contains("For Ada"),
+        "the seller-side Configuration cell must show the selected options: {admin_html}"
+    );
+}
+
 #[tokio::test]
 async fn seller_dashboard_renders_only_own_currency_stats() {
     let ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;

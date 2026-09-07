@@ -678,7 +678,7 @@ async fn reconcile_refund_operation(
     .await?;
     if repo::refunds::status_of(&refund)? == RefundStatus::Succeeded {
         return Ok(RefundReconcileOutcome::Succeeded(
-            refund.str_field("response_json").to_string(),
+            refund.json_text_field("response_json"),
         ));
     }
     let purchase = repo::purchases::get(ctx, refund.str_field("purchase_id")).await?;
@@ -752,7 +752,7 @@ async fn reconcile_refund_operation(
             .await?;
             ledger = repo::refunds::mark_succeeded(ctx, &ledger.id).await?;
             Ok(RefundReconcileOutcome::Succeeded(
-                ledger.str_field("response_json").to_string(),
+                ledger.json_text_field("response_json"),
             ))
         }
         "failed" | "canceled" => {
