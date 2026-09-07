@@ -7,7 +7,10 @@ use wafer_core::interfaces::network::service::{
     NetworkError, NetworkService, Request, Response, ResponseHead,
 };
 
-use crate::{bridge, storage::drain_reader_into};
+use crate::{
+    bridge,
+    storage::{drain_reader_into, release_reader_in},
+};
 
 pub struct BrowserNetworkService;
 
@@ -37,7 +40,9 @@ struct FetchResponse {
     status: u16,
     #[serde(default)]
     headers: Vec<(String, String)>,
-    #[serde(default)]
+    /// One bulk copy out of the real `Uint8Array`; see the `serde_bytes` note
+    /// in `Cargo.toml` for why the adapter is not optional here.
+    #[serde(default, with = "serde_bytes")]
     body: Vec<u8>,
 }
 
@@ -137,13 +142,16 @@ impl NetworkService for BrowserNetworkService {
         .map_err(|e| NetworkError::RequestError(bridge::describe(&e)))?;
 
         // The bridge resolves a JS object `{ status, headers, body:
-        // Uint8Array }` — decode it directly. `serde_wasm_bindgen`
-        // deserializes the JS object into `FetchResponse` and the
-        // `Uint8Array` body straight into `Vec<u8>` in one step, with no
-        // JSON round-trip (previously this called `JSON::stringify` on the
-        // resolved value and fed the result to `serde_json::from_str`,
-        // which double-encoded every response into a JSON string literal
-        // and failed with "invalid type: string, expected struct").
+        // Uint8Array }` — decode it directly, with no JSON round-trip
+        // (previously this called `JSON::stringify` on the resolved value and
+        // fed the result to `serde_json::from_str`, which double-encoded every
+        // response into a JSON string literal and failed with "invalid type:
+        // string, expected struct").
+        //
+        // The body is NOT a one-step decode by default: `serde_wasm_bindgen`'s
+        // bulk byte path is `deserialize_byte_buf`, which serde's `Vec<u8>`
+        // never asks for. `FetchResponse::body` carries the `serde_bytes`
+        // adapter for exactly that reason.
         let fetch_resp: FetchResponse = serde_wasm_bindgen::from_value(js_val).map_err(|e| {
             NetworkError::RequestError(format!("failed to decode fetch response: {e}"))
         })?;
@@ -191,29 +199,31 @@ impl NetworkService for BrowserNetworkService {
             .await
             .map_err(|e| NetworkError::RequestError(bridge::describe(&e)))?;
 
-        let started: FetchStreamStart = serde_wasm_bindgen::from_value(js_val).map_err(|e| {
-            NetworkError::RequestError(format!("failed to decode fetch response head: {e}"))
-        })?;
+        let started: FetchStreamStart = match serde_wasm_bindgen::from_value(js_val.clone()) {
+            Ok(started) => started,
+            Err(e) => {
+                // The reader id is inside the value that just failed to
+                // decode, so without this the HTTP connection it holds could
+                // be neither drained nor cancelled for the life of the Service
+                // Worker.
+                release_reader_in(&js_val).await;
+                return Err(NetworkError::RequestError(format!(
+                    "failed to decode fetch response head: {e}"
+                )));
+            }
+        };
 
         let headers = group_headers(started.headers);
         let cap = MAX_NETWORK_RESPONSE_BYTES;
 
-        // Refuse an over-large advertised length before any byte streams. The
-        // header name is matched lowercase because `bridge.js` builds the pair
-        // list from the Fetch API's own iteration, which lowercases names.
-        if let Some(advertised) = headers
-            .get("content-length")
-            .and_then(|values| values.first())
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            if advertised > cap {
-                if let Some(id) = &started.stream_id {
-                    bridge::reader_cancel(id).await;
-                }
-                return Err(NetworkError::RequestError(format!(
-                    "response body {advertised} bytes exceeds cap of {cap} bytes"
-                )));
+        // Refuse an over-large advertised length before any byte streams.
+        if let Some(advertised) = advertised_length_over_cap(&headers, cap) {
+            if let Some(id) = &started.stream_id {
+                bridge::reader_cancel(id).await;
             }
+            return Err(NetworkError::RequestError(format!(
+                "response body {advertised} bytes exceeds cap of {cap} bytes"
+            )));
         }
 
         let head = ResponseHead {
@@ -236,6 +246,23 @@ impl NetworkService for BrowserNetworkService {
 
         Ok((head, body_stream))
     }
+}
+
+/// The advertised body length when it is over `cap`, or `None` when the
+/// response advertises nothing, advertises something unparseable, or advertises
+/// a length that fits.
+///
+/// Pure, so the first of the two cap enforcement points is testable without a
+/// live `fetch` — the second is the running total in
+/// `storage::drain_into`. The header name is matched lowercase because
+/// `bridge.js` builds the pair list from the Fetch API's own header iteration,
+/// which lowercases names.
+fn advertised_length_over_cap(headers: &HashMap<String, Vec<String>>, cap: usize) -> Option<usize> {
+    headers
+        .get("content-length")
+        .and_then(|values| values.first())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|advertised| *advertised > cap)
 }
 
 /// Group the wire's `(name, value)` pairs into the `name → [values]` map
@@ -523,5 +550,53 @@ mod tests {
             serde_wasm_bindgen::from_value(bodyless.into()).expect("decode bodyless head");
         assert_eq!(decoded.status, 204);
         assert!(decoded.stream_id.is_none());
+    }
+
+    /// The first of the two `MAX_NETWORK_RESPONSE_BYTES` enforcement points:
+    /// an advertised length over the cap is refused before a byte streams (the
+    /// second is the running total, exercised in `storage::drain_loop`).
+    ///
+    /// A Service Worker shares one linear memory with everything else the
+    /// page's runtime is doing, so nothing here may fall open on a header the
+    /// server chose: an absent, unparseable or hostile `Content-Length` has to
+    /// leave the running total as the guard rather than skip the check
+    /// silently and admit the body.
+    #[wasm_bindgen_test]
+    fn an_advertised_length_over_the_cap_is_refused_before_the_body() {
+        use super::advertised_length_over_cap;
+
+        let headers = |value: &str| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("content-length".to_string(), vec![value.to_string()]);
+            map
+        };
+
+        assert_eq!(advertised_length_over_cap(&headers("101"), 100), Some(101));
+        assert_eq!(advertised_length_over_cap(&headers("100"), 100), None);
+        assert_eq!(advertised_length_over_cap(&headers("0"), 100), None);
+
+        // Nothing advertised: a chunked response. Only the running total can
+        // stop it, and it must not be refused up front either.
+        assert_eq!(
+            advertised_length_over_cap(&std::collections::HashMap::new(), 100),
+            None
+        );
+
+        // Unparseable, negative, or overflowing values are not lengths. The
+        // running total still bounds what actually arrives.
+        for hostile in ["not-a-number", "-1", "99999999999999999999999999", ""] {
+            assert_eq!(
+                advertised_length_over_cap(&headers(hostile), 100),
+                None,
+                "unparseable Content-Length {hostile:?} must not be read as a length"
+            );
+        }
+
+        // `bridge.js` builds the pair list from the Fetch API's own header
+        // iteration, which lowercases names — so only the lowercase spelling
+        // can appear, and matching the capitalized one would be dead code.
+        let mut capitalized = std::collections::HashMap::new();
+        capitalized.insert("Content-Length".to_string(), vec!["101".to_string()]);
+        assert_eq!(advertised_length_over_cap(&capitalized, 100), None);
     }
 }

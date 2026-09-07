@@ -30,6 +30,13 @@ js-sys = "0.3"
 # instead of buffering the entire response.
 wasm-streams = "0.4"
 serde = { version = "1", features = ["derive"] }
+# Byte-buffer adapter for the two response bodies that arrive as a JS
+# `Uint8Array`. `serde_wasm_bindgen`'s bulk path lives in `deserialize_byte_buf`,
+# and serde's blanket `Vec<u8>` impl never reaches it — it goes through
+# `deserialize_seq`, whose fast path covers a JavaScript `Array` only, so a byte
+# array decoded one element at a time with an iterator-result object allocated
+# per byte. `#[serde(with = "serde_bytes")]` is what asks for the bulk path.
+serde_bytes = "0.11"
 serde_json = "1"
 chrono = { workspace = true }
 wafer-run = { workspace = true }

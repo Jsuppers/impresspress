@@ -673,31 +673,62 @@ mod rrf_tests {
 /// skipped the flush entirely and left already-applied statements in memory
 /// only — the opposite of what `with_flush` promises three lines away.
 ///
-/// A source-text assertion because there is nothing else to assert against
-/// without a live OPFS: the property is "this file names no flush of its own",
-/// and that is exactly what the check reads.
+/// What the shared helper actually DOES on a failed operation is asserted in
+/// `database::flush_precedence` (`a_failed_operation_still_flushes`); this
+/// module only has to say that these four sites go through it. That is a
+/// source-text property — "no flush of its own, and the shared one at every
+/// mutating site" — and there is nothing else to assert it against without a
+/// live OPFS.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod one_durability_contract {
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    /// The four `VectorService` methods that mutate the database:
+    /// `create_index`, `delete_index`, `upsert` and `delete`. A fifth would
+    /// have to come here and say which contract it uses.
+    const MUTATING_SITES: usize = 4;
+
+    /// Code lines only: a comment may name what the code may not.
+    fn code_lines(src: &str) -> impl Iterator<Item = (usize, &str)> {
+        src.lines()
+            .enumerate()
+            .map(|(n, line)| (n + 1, line))
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+    }
+
     #[wasm_bindgen_test]
     fn this_module_calls_no_flush_of_its_own() {
         // Assembled rather than written out, so this test is not itself an
-        // occurrence of what it is looking for.
-        let needle = ["bridge::db", "Flush"].concat();
-        let src = include_str!("service.rs");
-        for (n, line) in src.lines().enumerate() {
-            // Comments may name it; only code may not.
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
+        // occurrence of what it is looking for. Matched WITHOUT a module
+        // prefix, so `use crate::bridge::dbFlush;` followed by a bare call is
+        // caught too — the spelling the previous needle missed.
+        let needle = ["db", "Flush"].concat();
+        for (n, line) in code_lines(include_str!("service.rs")) {
             assert!(
                 !line.contains(&needle),
-                "line {}: flush through `database::with_flush_mapped`, which \
+                "line {n}: flush through `database::with_flush_mapped`, which \
                  owns the crate's one durability contract, not through the \
-                 bridge directly",
-                n + 1
+                 bridge directly"
             );
         }
+    }
+
+    /// The other half, and the one the needle above cannot express: a file
+    /// that flushes NOWHERE passes an assertion about what it must not call.
+    /// Every mutating method here has to route through the shared helper.
+    #[wasm_bindgen_test]
+    fn every_mutating_site_routes_through_the_shared_contract() {
+        // Assembled for the same reason the needle above is: this line is
+        // itself a code line in the file being scanned.
+        let call = ["with_flush", "_mapped("].concat();
+        let calls = code_lines(include_str!("service.rs"))
+            .filter(|(_, line)| line.contains(&call))
+            .count();
+
+        assert_eq!(
+            calls, MUTATING_SITES,
+            "expected {MUTATING_SITES} `with_flush_mapped` call sites, found {calls}: a \
+             mutating method was added or removed without deciding what flushes it"
+        );
     }
 }

@@ -294,12 +294,16 @@ export async function storageGet(folder, key) {
     const data = new Uint8Array(buffer);
 
     // Read metadata
+    // Merged over the defaults rather than replacing them: a sidecar that
+    // parses but is missing a field would otherwise hand Rust an object it
+    // cannot decode (`GetMeta` has no optional fields), and on the streaming
+    // path that decode failure used to strand a registered reader.
     let meta = { content_type: 'application/octet-stream', size: data.length };
     try {
         const metaHandle = await parent.getFileHandle(metaName(leaf));
         const metaFile = await metaHandle.getFile();
         const metaText = await metaFile.text();
-        meta = JSON.parse(metaText);
+        meta = { ...meta, ...JSON.parse(metaText) };
     } catch (_e) {
         // No metadata file — use defaults
     }
@@ -1146,11 +1150,13 @@ export async function storageGetStream(folder, key) {
     const fileHandle = await parent.getFileHandle(leaf);
     const file = await fileHandle.getFile();
 
+    // Merged over the defaults, exactly as `storageGet` does and for the same
+    // reason: a sidecar missing a field must not erase that field's default.
     let meta = { content_type: 'application/octet-stream', size: file.size };
     try {
         const metaHandle = await parent.getFileHandle(metaName(leaf));
         const metaFile = await metaHandle.getFile();
-        meta = JSON.parse(await metaFile.text());
+        meta = { ...meta, ...JSON.parse(await metaFile.text()) };
     } catch (_e) {
         // No metadata sidecar — use defaults, exactly as `storageGet` does.
     }
@@ -1170,6 +1176,14 @@ export async function storageGetStream(folder, key) {
 // An open writer holds an exclusive lock on the file, so a start with no
 // matching finish or abort leaves the object unwritable until the Service
 // Worker restarts. Rust's `put_streaming` aborts on every error path.
+//
+// `createWritable()` needs a file handle, so opening a writer for a key that
+// does not exist yet has to CREATE that key first — and an empty file is listed
+// by `storageList` and served by both read paths, which fall back to a default
+// content type when the sidecar is missing. Discarding a write is routine here
+// (any upstream stream error takes that path), so a discarded write of a new
+// key removes the file it created; an overwrite keeps the previous object,
+// whose bytes the swap file never touched.
 
 const _fileWriters = new Map();
 let _nextFileWriterId = 1;
@@ -1187,11 +1201,23 @@ export async function storagePutStreamStart(folder, key) {
     const { dirs, leaf } = splitKey(key);
     const parent = await getKeyParent(folderHandle, dirs, true);
 
-    const fileHandle = await parent.getFileHandle(leaf, { create: true });
+    // Whether this write is what brings the key into existence decides what a
+    // discard has to clean up; see `discardWriter`.
+    let created = false;
+    let fileHandle;
+    try {
+        fileHandle = await parent.getFileHandle(leaf);
+    } catch (e) {
+        if (e && e.name !== 'NotFoundError') {
+            throw e;
+        }
+        fileHandle = await parent.getFileHandle(leaf, { create: true });
+        created = true;
+    }
     const writable = await fileHandle.createWritable();
 
     const id = `write-${_nextFileWriterId++}`;
-    _fileWriters.set(id, { writable, parent, leaf, size: 0 });
+    _fileWriters.set(id, { writable, parent, leaf, size: 0, created });
     return id;
 }
 
@@ -1215,7 +1241,15 @@ export async function storagePutStreamChunk(id, chunk) {
 /**
  * Close the file and write its metadata sidecar — the same sidecar
  * `storagePut` writes, with the size counted from the chunks that actually
- * arrived. Only after this does the object become visible to `storageGet`.
+ * arrived.
+ *
+ * There is no OPFS transaction across those two files, so this rejects rather
+ * than leaving a half-finished object wherever it can: a failed `close()`
+ * discards the writer (and, for a key this write created, the file itself), and
+ * a failed sidecar write removes a created key's body. The one residual is an
+ * OVERWRITE whose sidecar write fails — the previous bytes are already gone by
+ * then, so the new body stays under the previous sidecar. `storage.rs`'s
+ * `put_streaming` doc states all three cases.
  *
  * @param {string} id
  * @param {string} contentType
@@ -1225,24 +1259,66 @@ export async function storagePutStreamFinish(id, contentType) {
     if (!entry) {
         throw new Error(`storagePutStreamFinish: unknown writer id ${JSON.stringify(id)}`);
     }
+
+    // `close()` is what commits the swap file, so it is exactly where a quota
+    // failure surfaces — and it is the one step here that can fail while the
+    // exclusive lock is still held. The bookkeeping entry therefore survives
+    // until it resolves, and this discards the writer itself rather than
+    // relying on the caller's abort: dropping the entry first left the writable
+    // un-aborted and the file locked for the life of the Service Worker, which
+    // is the failure the note above this registry warns about.
+    try {
+        await entry.writable.close();
+    } catch (e) {
+        await discardWriter(id);
+        throw e;
+    }
+
+    // The body is committed and the lock is gone; only the two files can still
+    // need cleaning up.
     _fileWriters.delete(id);
-    await entry.writable.close();
 
     const meta = { content_type: contentType, size: entry.size };
-    const metaHandle = await entry.parent.getFileHandle(metaName(entry.leaf), { create: true });
-    const metaWritable = await metaHandle.createWritable();
-    await metaWritable.write(JSON.stringify(meta));
-    await metaWritable.close();
+    try {
+        const metaHandle = await entry.parent.getFileHandle(metaName(entry.leaf), { create: true });
+        const metaWritable = await metaHandle.createWritable();
+        await metaWritable.write(JSON.stringify(meta));
+        await metaWritable.close();
+    } catch (e) {
+        // A committed body with no sidecar would be listed and served as a
+        // valid object while this call reports failure. That is removable for a
+        // key this write created; for an overwrite the previous bytes are
+        // already gone, so the new body stays under the previous sidecar and
+        // `storage.rs::put_streaming` documents that residual.
+        await removeCreatedFiles(entry);
+        throw e;
+    }
 }
 
 /**
- * Abandon a chunked write, releasing the file lock. Idempotent and
- * non-throwing: every Rust error path calls it, and a failure to clean up must
- * not replace the error that caused the abort.
+ * Abandon a chunked write: release the file lock and remove the target file if
+ * this write is what created it, so an interrupted upload of a NEW key leaves
+ * nothing listed or gettable. Idempotent and non-throwing — every Rust error
+ * path calls it, and a failure to clean up must not replace the error that
+ * caused the abort.
  *
  * @param {string} id
  */
 export async function storagePutStreamAbort(id) {
+    await discardWriter(id);
+}
+
+/**
+ * Release a writer and undo whatever it brought into existence: abort the
+ * writable (which releases the exclusive lock and discards the swap file), then
+ * remove the target file if this write is what created it.
+ *
+ * Never throws — every caller either has an error to report already or is a
+ * Rust cleanup path with nowhere to report one.
+ *
+ * @param {string} id
+ */
+async function discardWriter(id) {
     const entry = _fileWriters.get(id);
     if (!entry) {
         return;
@@ -1252,6 +1328,27 @@ export async function storagePutStreamAbort(id) {
         await entry.writable.abort();
     } catch (_e) {
         // Already closed or the handle is gone; the lock is released either way.
+    }
+    await removeCreatedFiles(entry);
+}
+
+/**
+ * Remove the object and sidecar a discarded write created. A no-op for an
+ * overwrite: that key's previous object is still the right answer, and the swap
+ * file never touched it.
+ *
+ * @param {{parent: FileSystemDirectoryHandle, leaf: string, created: boolean}} entry
+ */
+async function removeCreatedFiles(entry) {
+    if (!entry.created) {
+        return;
+    }
+    for (const name of [entry.leaf, metaName(entry.leaf)]) {
+        try {
+            await entry.parent.removeEntry(name);
+        } catch (_e) {
+            // Never written, or already gone.
+        }
     }
 }
 

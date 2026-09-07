@@ -94,11 +94,36 @@ pub(crate) async fn with_flush_mapped<T, E>(
     op: impl std::future::Future<Output = Result<T, E>>,
     map_flush: impl FnOnce(String) -> E,
 ) -> Result<T, E> {
-    let result = op.await;
-    let flush = bridge::dbFlush()
+    with_flush_through(op, flush_through_bridge, map_flush).await
+}
+
+/// The one flush this crate performs: hand the sql.js database to `bridge.js`
+/// to write out to OPFS.
+async fn flush_through_bridge() -> Result<(), String> {
+    bridge::dbFlush()
         .await
         .map(|_| ())
-        .map_err(|e| map_flush(format!("flush to OPFS: {}", bridge::describe(&e))));
+        .map_err(|e| format!("flush to OPFS: {}", bridge::describe(&e)))
+}
+
+/// [`with_flush_mapped`] with the flush supplied by the caller.
+///
+/// `flush` is a closure, not a future, so it cannot be started before `op`
+/// finishes — and so the ONE property the whole contract rests on, that the
+/// flush runs whatever `op` returned, is assertable without a bridge or an
+/// OPFS. That property is the regression this shape exists to prevent: the
+/// vector service used to run `bridge::dbFlush()` with `?`, which skipped the
+/// flush entirely whenever the mutating operation failed.
+async fn with_flush_through<T, E, Fut>(
+    op: impl std::future::Future<Output = Result<T, E>>,
+    flush: impl FnOnce() -> Fut,
+    map_flush: impl FnOnce(String) -> E,
+) -> Result<T, E>
+where
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let result = op.await;
+    let flush = flush().await.map_err(map_flush);
     resolve_flush_outcome(result, flush)
 }
 
@@ -659,14 +684,85 @@ mod strict_schema_policy {
     }
 }
 
-/// The flush precedence every mutating path in this crate shares. Pure — no
-/// bridge, no OPFS.
+/// The flush precedence every mutating path in this crate shares, and the
+/// unconditional flush underneath it. No bridge, no OPFS.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod flush_precedence {
+    use std::{cell::Cell, rc::Rc};
+
     use wafer_core::interfaces::database::service::DatabaseError;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use super::resolve_flush_outcome;
+    use super::{resolve_flush_outcome, with_flush_through};
+
+    /// A FAILED operation must still flush. The headline of the durability
+    /// change was exactly this: four vector-service sites ran the flush with
+    /// `?`, so a failed mutation skipped it and left whatever statements had
+    /// already applied (a lazy column-add ALTER before a rejected INSERT) in
+    /// memory only, until some unrelated later mutation happened to write them
+    /// out. `resolve_flush_outcome` cannot see this — it is handed both
+    /// outcomes — so the assertion has to be on the wrapper.
+    #[wasm_bindgen_test]
+    async fn a_failed_operation_still_flushes() {
+        let flushes = Rc::new(Cell::new(0u32));
+        let counter = flushes.clone();
+
+        let out: Result<u8, DatabaseError> = with_flush_through(
+            async { Err(DatabaseError::NotFound) },
+            move || {
+                counter.set(counter.get() + 1);
+                async { Ok(()) }
+            },
+            DatabaseError::Internal,
+        )
+        .await;
+
+        assert_eq!(
+            flushes.get(),
+            1,
+            "the flush was skipped because the operation failed"
+        );
+        assert!(matches!(out, Err(DatabaseError::NotFound)));
+    }
+
+    /// …and a successful one flushes exactly once, not once per statement the
+    /// operation ran. That coalescing is the other half of the contract.
+    #[wasm_bindgen_test]
+    async fn a_successful_operation_flushes_exactly_once() {
+        let flushes = Rc::new(Cell::new(0u32));
+        let counter = flushes.clone();
+
+        let out: Result<u8, DatabaseError> = with_flush_through(
+            async { Ok(7) },
+            move || {
+                counter.set(counter.get() + 1);
+                async { Ok(()) }
+            },
+            DatabaseError::Internal,
+        )
+        .await;
+
+        assert_eq!(flushes.get(), 1);
+        assert_eq!(out.expect("ok"), 7);
+    }
+
+    /// The flush's own failure reaches the caller through `map_flush`, in the
+    /// caller's error type — the only thing that ever differed between this
+    /// helper's two callers.
+    #[wasm_bindgen_test]
+    async fn a_flush_failure_is_mapped_into_the_callers_error_type() {
+        let out: Result<u8, DatabaseError> = with_flush_through(
+            async { Ok(7) },
+            || async { Err("quota exceeded".to_string()) },
+            DatabaseError::Internal,
+        )
+        .await;
+
+        match out {
+            Err(DatabaseError::Internal(msg)) => assert_eq!(msg, "quota exceeded"),
+            other => panic!("expected the mapped flush error, got {other:?}"),
+        }
+    }
 
     #[wasm_bindgen_test]
     fn a_durable_success_is_a_success() {

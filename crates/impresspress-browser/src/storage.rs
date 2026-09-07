@@ -6,6 +6,7 @@ use wafer_core::interfaces::storage::service::{
     FolderInfo, ListOptions, ObjectInfo, ObjectList, StorageError, StorageService,
 };
 use wafer_run::{ErrorCode, WaferError};
+use wasm_bindgen::JsCast;
 
 use crate::bridge;
 // Pure, host-testable opaque list-cursor codec (envelope shared with the
@@ -80,8 +81,12 @@ async fn await_bridge(
 
 #[derive(Deserialize)]
 struct GetResponse {
-    /// Deserializes straight from the JS object's real `Uint8Array` field —
-    /// no `Array<number>`/JSON round trip.
+    /// One bulk copy out of the JS object's real `Uint8Array` field. The
+    /// `serde_bytes` adapter is what routes this through
+    /// `serde_wasm_bindgen`'s `deserialize_byte_buf`; a bare `Vec<u8>` goes
+    /// through `deserialize_seq` instead and crosses the boundary once per
+    /// byte (see `BridgeReader::next_chunk`).
+    #[serde(with = "serde_bytes")]
     data: Vec<u8>,
     meta: GetMeta,
 }
@@ -100,6 +105,68 @@ struct GetStreamStart {
     meta: GetMeta,
 }
 
+/// Where [`drain_into`] pulls bytes from.
+///
+/// A trait rather than the bridge call inlined, because every rule the drain
+/// loop enforces — the running cap, an `Error` terminal instead of a silent
+/// truncation, releasing the source when the consumer stops early — is
+/// unreachable from a `wasm_bindgen_test` otherwise: the one production
+/// implementation is a `bridge.js` reader id backed by a real OPFS file handle
+/// or a live HTTP connection, and `wasm-pack test --node` has neither.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub(crate) trait ChunkSource {
+    /// The next chunk, or `Ok(None)` at end of stream. An `Err` is terminal:
+    /// [`drain_into`] reports it and releases the source.
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String>;
+
+    /// Release the underlying resource. Idempotent, and cannot fail — it is
+    /// called from paths that already have an error to report.
+    async fn release(&mut self);
+}
+
+/// The production [`ChunkSource`]: a byte reader registered by `bridge.js`
+/// (`storageGetStream`, `httpFetchStream`), pulled by id.
+struct BridgeReader {
+    stream_id: String,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl ChunkSource for BridgeReader {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let value = bridge::reader_next_chunk(&self.stream_id)
+            .await
+            .map_err(|e| bridge::describe(&e))?;
+
+        // `null` — and only `null` — is end of stream. An unknown id rejects
+        // above rather than answering `null`, so a bookkeeping bug cannot
+        // present as a cleanly-finished body.
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+
+        // Taken off the `Uint8Array` directly (one bulk copy) rather than
+        // through `serde_wasm_bindgen`, whose `Vec<u8>` impl always routes
+        // through `deserialize_seq`: its fast path covers a JavaScript `Array`
+        // only, and the bulk path lives in `deserialize_byte_buf`, which
+        // `Vec<u8>` never reaches. A byte array therefore fell back to
+        // iterating element by element, allocating an iterator-result object
+        // per byte — about 65,536 boundary crossings per 64 KiB chunk.
+        match value.dyn_ref::<js_sys::Uint8Array>() {
+            Some(bytes) => Ok(Some(bytes.to_vec())),
+            None => Err(format!(
+                "expected a Uint8Array chunk, got {}",
+                bridge::describe(&value)
+            )),
+        }
+    }
+
+    async fn release(&mut self) {
+        bridge::reader_cancel(&self.stream_id).await;
+    }
+}
+
 /// Drain a registered byte reader into `sink`, chunk by chunk.
 ///
 /// Shared by `get_streaming` here and `network::do_request_streaming`, because
@@ -108,12 +175,25 @@ struct GetStreamStart {
 /// that stops early must release the reader instead of leaving it holding an
 /// OPFS file handle (or an HTTP connection) for the life of the Service
 /// Worker.
+pub(crate) async fn drain_reader_into(
+    stream_id: String,
+    cap: Option<usize>,
+    what: &str,
+    sink: wafer_block::OutputSink,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    drain_into(BridgeReader { stream_id }, cap, what, sink, cancel).await
+}
+
+/// Pump `source` into `sink` until it ends, breaches `cap`, fails, or the
+/// consumer goes away — releasing `source` on every path but the clean one,
+/// which releases itself when the source reports end of stream.
 ///
 /// A read failure surfaces as an `Error` terminal AFTER the bytes already
 /// forwarded — never a silent truncation reported as a clean `Complete`.
 /// `cap` bounds the running total; `None` means no cap.
-pub(crate) async fn drain_reader_into(
-    stream_id: String,
+pub(crate) async fn drain_into<S: ChunkSource>(
+    mut source: S,
     cap: Option<usize>,
     what: &str,
     sink: wafer_block::OutputSink,
@@ -123,42 +203,25 @@ pub(crate) async fn drain_reader_into(
     loop {
         // Race the pull against cancellation so a dropped consumer stops the
         // read promptly rather than after the next chunk resolves.
-        let Some(next) = cancel
-            .run_until_cancelled(bridge::reader_next_chunk(&stream_id))
-            .await
-        else {
-            bridge::reader_cancel(&stream_id).await;
+        let pulled = cancel.run_until_cancelled(source.next_chunk()).await;
+        let Some(next) = pulled else {
+            source.release().await;
             return;
         };
-        let chunk: Option<Vec<u8>> = match next {
-            Ok(value) => match serde_wasm_bindgen::from_value(value) {
-                Ok(chunk) => chunk,
-                Err(e) => {
-                    let _ = sink
-                        .error(WaferError::new(
-                            ErrorCode::Internal,
-                            format!("{what}: decode chunk: {e}"),
-                        ))
-                        .await;
-                    bridge::reader_cancel(&stream_id).await;
-                    return;
-                }
-            },
+
+        let chunk = match next {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
             Err(e) => {
                 let _ = sink
-                    .error(WaferError::new(
-                        ErrorCode::Internal,
-                        format!("{what}: {}", bridge::describe(&e)),
-                    ))
+                    .error(WaferError::new(ErrorCode::Internal, format!("{what}: {e}")))
                     .await;
                 // The JS side already dropped the entry on a read rejection,
                 // and `readerCancel` is idempotent, so this is safe either way.
-                bridge::reader_cancel(&stream_id).await;
+                source.release().await;
                 return;
             }
         };
-        // `null` — and only `null` — is end of stream.
-        let Some(chunk) = chunk else { break };
 
         if let Some(cap) = cap {
             received = received.saturating_add(chunk.len());
@@ -169,7 +232,7 @@ pub(crate) async fn drain_reader_into(
                         format!("{what}: body exceeds cap of {cap} bytes"),
                     ))
                     .await;
-                bridge::reader_cancel(&stream_id).await;
+                source.release().await;
                 return;
             }
         }
@@ -177,11 +240,28 @@ pub(crate) async fn drain_reader_into(
         if sink.send_chunk(chunk).await.is_err() {
             // Consumer dropped the stream — stop reading and release the
             // source.
-            bridge::reader_cancel(&stream_id).await;
+            source.release().await;
             return;
         }
     }
     let _ = sink.complete(vec![]).await;
+}
+
+/// Release the byte reader `bridge.js` registered inside `value` when `value`
+/// itself fails to decode.
+///
+/// The id is *inside* the value, so a failed decode would otherwise strand a
+/// reader that can be neither drained nor cancelled — an OPFS file handle or
+/// an HTTP connection held for the life of the Service Worker, which is
+/// exactly what `bridge.js`'s reader registry says must never happen. Best
+/// effort by construction: if the id is not there either, there is nothing to
+/// release.
+pub(crate) async fn release_reader_in(value: &wasm_bindgen::JsValue) {
+    if let Ok(id) = js_sys::Reflect::get(value, &wasm_bindgen::JsValue::from_str("stream_id")) {
+        if let Some(id) = id.as_string() {
+            bridge::reader_cancel(&id).await;
+        }
+    }
 }
 
 /// `storageList`'s resolved shape: the requested page of keys plus the
@@ -263,9 +343,20 @@ impl StorageService for BrowserStorageService {
             .await
             .map_err(map_rejection)?;
 
-        let started: GetStreamStart = serde_wasm_bindgen::from_value(val).map_err(|e| {
-            StorageError::Internal(format!("decode storage get-stream response: {e}"))
-        })?;
+        let started: GetStreamStart = match serde_wasm_bindgen::from_value(val.clone()) {
+            Ok(started) => started,
+            Err(e) => {
+                // The reader id is inside the value that just failed to decode,
+                // so without this the OPFS file handle it holds could be
+                // neither drained nor cancelled for the life of the Service
+                // Worker. Reachable: a metadata sidecar that parses as JSON but
+                // carries no `content_type` fails this decode.
+                release_reader_in(&val).await;
+                return Err(StorageError::Internal(format!(
+                    "decode storage get-stream response: {e}"
+                )));
+            }
+        };
 
         let info = ObjectInfo {
             key: key.to_string(),
@@ -294,10 +385,25 @@ impl StorageService for BrowserStorageService {
     /// linear memory with the runtime.
     ///
     /// The OPFS writable holds an exclusive lock on the file, so every path
-    /// out of a started write ends in a `finish` or an abort; the object does
-    /// not become visible to `get` until `finish` has also written the
-    /// metadata sidecar, so a failed upload leaves no half-written object with
-    /// plausible metadata.
+    /// out of a started write ends in a `finish` or an abort.
+    ///
+    /// What an interrupted upload leaves behind, precisely — OPFS has no
+    /// multi-file transaction, so this is a statement about two files, not one:
+    ///
+    /// - A NEW key that is aborted, or whose `close()` fails (which is where a
+    ///   quota failure surfaces, because `close` is what commits the swap
+    ///   file), leaves nothing: `storagePutStreamAbort` removes the target file
+    ///   it created along with any sidecar. The key is not listed and not
+    ///   gettable.
+    /// - An OVERWRITE that is aborted leaves the previous object and its
+    ///   sidecar untouched: `createWritable()` writes to a swap file, so the
+    ///   original bytes are only replaced by a successful `close()`.
+    /// - If `close()` succeeds and the sidecar write then fails, the new body
+    ///   IS committed while this call returns an error. For a new key the body
+    ///   is removed again; for an overwrite the new bytes stay under the
+    ///   previous sidecar, so the content type can be stale until the object is
+    ///   rewritten. `get`/`get_streaming` both take the object's real length
+    ///   from the file rather than the sidecar, so the size cannot disagree.
     async fn put_streaming(
         &self,
         folder: &str,
@@ -310,6 +416,13 @@ impl StorageService for BrowserStorageService {
         let id = bridge::storage_put_stream_start(folder, key)
             .await
             .map_err(map_rejection)?;
+        // No abort here, deliberately: the writer id IS the only handle to the
+        // open writable, so a resolved value that is not a string leaves
+        // nothing to abort with. `storagePutStreamStart` resolves a string by
+        // construction and `js/test/storage_stream.test.mjs` pins that, which
+        // is where the invariant belongs — this arm exists so a bridge that
+        // broke it fails loudly instead of writing to a `JsValue::UNDEFINED`
+        // id.
         let id = id.as_string().ok_or_else(|| {
             StorageError::Internal("storagePutStreamStart did not resolve a writer id".to_string())
         })?;
@@ -635,5 +748,187 @@ mod tests {
 
         assert!(decoded.keys.is_empty());
         assert_eq!(decoded.total, 0);
+    }
+}
+
+/// The drain loop that both streaming reads share, driven against a scripted
+/// [`ChunkSource`] instead of a `bridge.js` reader id.
+///
+/// The rules under test are the ones a real OPFS file or HTTP connection makes
+/// unreachable from a test: the running byte cap (the only guard a
+/// chunked/unknown-length response has, and one of the two enforcement points
+/// for `MAX_NETWORK_RESPONSE_BYTES`), an `Error` terminal AFTER the bytes
+/// already forwarded rather than a silent truncation reported as `Complete`,
+/// and releasing the source on every path that stops early.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod drain_loop {
+    use std::{cell::Cell, rc::Rc};
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use wafer_block::{OutputStream, StreamEvent};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{drain_into, ChunkSource};
+
+    /// A scripted source: each `next_chunk` pops the front of `script`.
+    struct Scripted {
+        script: Vec<Result<Option<Vec<u8>>, String>>,
+        at: usize,
+        released: Rc<Cell<u32>>,
+    }
+
+    impl Scripted {
+        fn new(script: Vec<Result<Option<Vec<u8>>, String>>) -> (Self, Rc<Cell<u32>>) {
+            let released = Rc::new(Cell::new(0));
+            (
+                Self {
+                    script,
+                    at: 0,
+                    released: released.clone(),
+                },
+                released,
+            )
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl ChunkSource for Scripted {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+            let next = self
+                .script
+                .get(self.at)
+                .cloned()
+                .unwrap_or_else(|| panic!("drain pulled past the end of the script"));
+            self.at += 1;
+            next
+        }
+
+        async fn release(&mut self) {
+            self.released.set(self.released.get() + 1);
+        }
+    }
+
+    fn chunks(events: &[StreamEvent]) -> Vec<Vec<u8>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Chunk(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run the drain to completion, then collect what the consumer sees. The
+    /// channel is wider than any script here, so the drain never blocks on it.
+    async fn run(
+        script: Vec<Result<Option<Vec<u8>>, String>>,
+        cap: Option<usize>,
+    ) -> (Vec<StreamEvent>, u32) {
+        let (source, released) = Scripted::new(script);
+        let (stream, sink, cancel) = OutputStream::new_streaming_with_capacity(32);
+        drain_into(source, cap, "test read", sink, cancel).await;
+        (stream.collect::<Vec<_>>().await, released.get())
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_clean_stream_forwards_every_chunk_and_completes() {
+        let (events, released) = run(
+            vec![Ok(Some(vec![1, 2])), Ok(Some(vec![3])), Ok(None)],
+            None,
+        )
+        .await;
+
+        assert_eq!(chunks(&events), vec![vec![1, 2], vec![3]]);
+        assert!(matches!(events.last(), Some(StreamEvent::Complete { .. })));
+        assert_eq!(
+            released, 0,
+            "a source that reported end of stream has already released itself"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_read_failure_is_an_error_terminal_after_the_bytes_already_sent() {
+        let (events, released) = run(
+            vec![Ok(Some(vec![1, 2])), Err("connection reset".to_string())],
+            None,
+        )
+        .await;
+
+        assert_eq!(chunks(&events), vec![vec![1, 2]]);
+        match events.last() {
+            Some(StreamEvent::Error(e)) => assert!(
+                e.message.contains("connection reset"),
+                "the underlying failure must survive into the terminal: {}",
+                e.message
+            ),
+            other => panic!("a truncated body must not report a clean finish: {other:?}"),
+        }
+        assert_eq!(released, 1, "the reader was left holding its source");
+    }
+
+    /// The running total is the ONLY cap a chunked response has: it advertises
+    /// no length, so `advertised_length_over_cap` never fires for it.
+    #[wasm_bindgen_test]
+    async fn the_running_total_stops_a_body_that_grows_past_the_cap() {
+        let (events, released) = run(
+            vec![
+                Ok(Some(vec![0; 4])),
+                Ok(Some(vec![0; 4])),
+                Ok(Some(vec![0; 4])),
+                Ok(None),
+            ],
+            Some(10),
+        )
+        .await;
+
+        assert_eq!(
+            chunks(&events).len(),
+            2,
+            "the chunk that breached the cap must not be forwarded"
+        );
+        match events.last() {
+            Some(StreamEvent::Error(e)) => assert!(
+                e.message.contains("exceeds cap of 10 bytes"),
+                "unexpected terminal message: {}",
+                e.message
+            ),
+            other => panic!("expected an Error terminal, got {other:?}"),
+        }
+        assert_eq!(released, 1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_body_exactly_at_the_cap_is_delivered_whole() {
+        let (events, released) = run(vec![Ok(Some(vec![0; 10])), Ok(None)], Some(10)).await;
+
+        assert_eq!(chunks(&events), vec![vec![0; 10]]);
+        assert!(matches!(events.last(), Some(StreamEvent::Complete { .. })));
+        assert_eq!(released, 0);
+    }
+
+    /// A dropped consumer must release the source rather than leave it holding
+    /// an OPFS file handle or an HTTP connection for the life of the Service
+    /// Worker.
+    #[wasm_bindgen_test]
+    async fn a_cancelled_consumer_releases_the_source() {
+        let (source, released) = Scripted::new(vec![Ok(Some(vec![1]))]);
+        let (_stream, sink, cancel) = OutputStream::new_streaming_with_capacity(4);
+        cancel.cancel();
+
+        drain_into(source, None, "test read", sink, cancel).await;
+
+        assert_eq!(released.get(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_vanished_consumer_releases_the_source() {
+        let (source, released) = Scripted::new(vec![Ok(Some(vec![1])), Ok(Some(vec![2]))]);
+        let (stream, sink, cancel) = OutputStream::new_streaming_with_capacity(4);
+        drop(stream);
+
+        drain_into(source, None, "test read", sink, cancel).await;
+
+        assert_eq!(released.get(), 1);
     }
 }
