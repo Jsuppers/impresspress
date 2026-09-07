@@ -35,7 +35,7 @@ impl ConsoleLoggerService {
     ///
     /// `level` is read at construction from the `IMPRESSPRESS_CF_LOG_LEVEL`
     /// worker var (`env.var`, set via `wrangler.toml` `[vars]` or the
-    /// dashboard — see `lib.rs::make_console_logger`), so an operator can
+    /// dashboard — see `services.rs::make_console_logger`), so an operator can
     /// raise or lower verbosity per deployment without rebuilding. `None`
     /// (var unset) or an unparseable value falls back to [`DEFAULT_LEVEL`].
     /// Resolved once, at construction — the per-isolate runtime is built at

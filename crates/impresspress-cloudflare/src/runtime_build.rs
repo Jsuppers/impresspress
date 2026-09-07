@@ -781,8 +781,11 @@ mod tests {
     /// `config.rs` already pins, and would have kept passing if a key here
     /// were switched to `service_only` and dropped off the isolate-cached
     /// snapshot. `build_runtime` itself needs a `worker::Env` no wasm test can
-    /// produce, which is why the env reads are one function
-    /// (`read_structural_config_inputs`) and the assembly another.
+    /// produce, which is why the env reads are
+    /// [`CfEnvironment::capture`](crate::environment::CfEnvironment::capture)'s
+    /// and the assembly is this pure function
+    /// ([`structural_config_inputs`] only selects from an already-captured
+    /// environment and reads nothing itself).
     #[wasm_bindgen_test]
     fn structural_keys_reach_both_config_surfaces() {
         let strict_schema = wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY;

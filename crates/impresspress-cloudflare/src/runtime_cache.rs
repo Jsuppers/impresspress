@@ -97,6 +97,23 @@ pub(crate) struct ReadyRuntime {
 }
 
 impl ReadyRuntime {
+    /// The `kind` field every runtime-lifecycle log line carries, derived from
+    /// the runtime itself rather than typed at each site.
+    ///
+    /// All four sites that announce a finished runtime — the two that publish
+    /// it as the isolate's cached one and the two that serve it request-locally
+    /// — spell this field the same way, so one dashboard filter sees them all.
+    /// Two of them used to emit `prepared = true` instead, which no filter
+    /// matching `kind` could find. `config_version.is_some()` is already what
+    /// the rest of this file switches on to tell the two paths apart.
+    fn kind_label(&self) -> &'static str {
+        if self.config_version.is_some() {
+            "prepared"
+        } else {
+            "dynamic"
+        }
+    }
+
     /// A probe reached KV: reset the failure streak and re-arm the normal
     /// jittered window.
     fn note_probe_success(&self, now: u64) {
@@ -578,7 +595,14 @@ enum RuntimeKind {
     /// request-local transient one. `version` is the KV config-version stamp
     /// probed before the build, so a runtime is never tagged with a version
     /// newer than the config it loaded.
-    Dynamic { version: String },
+    ///
+    /// `stored` says which of the two: `true` for the build that holds the
+    /// isolate's build slot and becomes the cached runtime, `false` for the
+    /// request-local one. Nothing about the finished runtime differs — the
+    /// flag exists so a *boot failure* can name its blast radius, which is the
+    /// one place the two lifecycles are not interchangeable. See
+    /// [`RuntimeKind::lifecycle`].
+    Dynamic { version: String, stored: bool },
     /// A runtime hydrated from a verified prepared plan. Its `version` is the
     /// plan hash, and it additionally carries the config generation the plan
     /// was sealed at — the `Some`/`None` on `ReadyRuntime::config_version` is
@@ -590,16 +614,27 @@ enum RuntimeKind {
 }
 
 impl RuntimeKind {
-    fn label(&self) -> &'static str {
+    /// How a *boot failure* names itself, which is a finer distinction than
+    /// the `kind` log field ([`ReadyRuntime::kind_label`]) because the
+    /// consequences differ.
+    ///
+    /// A `cached` failure is the isolate-owning build: every subsequent
+    /// request in that isolate keeps failing until a version or config change
+    /// forces a rebuild. A `transient` failure is the per-request fallback,
+    /// which self-heals on the next request. Both answer an opaque 500, so
+    /// this string is the only thing that tells an operator reading Workers
+    /// logs a poisoned isolate from a lost race.
+    fn lifecycle(&self) -> &'static str {
         match self {
-            Self::Dynamic { .. } => "dynamic",
+            Self::Dynamic { stored: true, .. } => "cached",
+            Self::Dynamic { stored: false, .. } => "transient",
             Self::Prepared { .. } => "prepared",
         }
     }
 
     fn version_and_config_version(self) -> (String, Option<String>) {
         match self {
-            Self::Dynamic { version } => (version, None),
+            Self::Dynamic { version, .. } => (version, None),
             Self::Prepared {
                 plan_hash,
                 config_generation,
@@ -652,12 +687,13 @@ fn next_build_ordinal() -> u32 {
 /// Boot a built runtime and wrap it as a [`ReadyRuntime`], with this isolate's
 /// next build ordinal and the elapsed build time.
 ///
-/// The four sites that produce a `ReadyRuntime` — the stored dynamic build, the
-/// transient dynamic build, and the two prepared hydrations — used to repeat
-/// this same tail verbatim: pick a boot funnel, mint the `BUILD_COUNT` ordinal,
-/// measure against `started_at`, and construct the struct with a fresh jittered
-/// probe deadline and a zero failure streak. Four copies of a tail is how two
-/// paths drift; one of them measuring against `now_millis()` instead of
+/// The three sites that produced a `ReadyRuntime` — the stored dynamic build,
+/// the transient dynamic build, and `hydrate_prepared_runtime` (already one
+/// function serving three prepared branches) — used to repeat this same tail
+/// verbatim: pick a boot funnel, mint the `BUILD_COUNT` ordinal, measure
+/// against `started_at`, and construct the struct with a fresh jittered probe
+/// deadline and a zero failure streak. Three copies of a tail is how two paths
+/// drift; one of them measuring against `now_millis()` instead of
 /// `started_at`, or arming its probe window differently, would have been
 /// invisible.
 async fn finish_runtime(
@@ -667,7 +703,7 @@ async fn finish_runtime(
     started_at: u64,
 ) -> Result<(Rc<ReadyRuntime>, u32, u64), String> {
     let mut built = built;
-    let label = kind.label();
+    let lifecycle = kind.lifecycle();
     let booted = match &kind {
         RuntimeKind::Dynamic { .. } => {
             crate::runtime_build::boot_dynamic_request_runtime(&mut built).await
@@ -676,7 +712,7 @@ async fn finish_runtime(
             crate::runtime_build::boot_prepared_runtime(&mut built).await
         }
     };
-    booted.map_err(|error| format!("{label}-runtime boot: {error}"))?;
+    booted.map_err(|error| format!("{lifecycle}-runtime boot: {error}"))?;
 
     let build_ordinal = next_build_ordinal();
     let duration_ms = impresspress_core::util::now_millis().saturating_sub(started_at);
@@ -706,8 +742,8 @@ fn publish_runtime(
     build_ordinal: u32,
     duration_ms: u64,
     is_cold: bool,
-    label: &'static str,
 ) -> CacheOutcome {
+    let label = rt.kind_label();
     if !store_if_current(guard, rt.clone()) {
         tracing::warn!(
             build_ordinal,
@@ -989,6 +1025,7 @@ where
         built,
         RuntimeKind::Dynamic {
             version: probed_version,
+            stored: true,
         },
         environment_identity,
         built_at,
@@ -1006,14 +1043,7 @@ where
 
     // `build_guard` remains alive through `store`, so waiters cannot observe
     // BUILDING=false before the completed runtime is visible.
-    let outcome = publish_runtime(
-        &build_guard,
-        &rt,
-        build_ordinal,
-        duration_ms,
-        is_cold,
-        "dynamic",
-    );
+    let outcome = publish_runtime(&build_guard, &rt, build_ordinal, duration_ms, is_cold);
     Ok((rt, outcome))
 }
 
@@ -1204,6 +1234,7 @@ where
         built,
         RuntimeKind::Dynamic {
             version: probed_version,
+            stored: false,
         },
         environment_identity,
         started_at,
@@ -1212,6 +1243,7 @@ where
     tracing::info!(
         build_ordinal,
         duration_ms,
+        kind = rt.kind_label(),
         transient = true,
         "request-local dynamic runtime build complete"
     );
@@ -1331,7 +1363,7 @@ where
         tracing::info!(
             build_ordinal,
             duration_ms,
-            prepared = true,
+            kind = rt.kind_label(),
             transient = true,
             "request-local prepared runtime hydration complete"
         );
@@ -1368,7 +1400,7 @@ where
         tracing::info!(
             build_ordinal,
             duration_ms,
-            prepared = true,
+            kind = rt.kind_label(),
             transient = true,
             "request-local prepared hydration complete (lost the build-slot race)"
         );
@@ -1473,14 +1505,7 @@ where
     .await?;
     // Same publish-and-report tail as the dynamic path, including the reason a
     // lost publish is served request-locally rather than turned into a 503.
-    let outcome = publish_runtime(
-        &build_guard,
-        &rt,
-        build_ordinal,
-        duration_ms,
-        is_cold,
-        "prepared",
-    );
+    let outcome = publish_runtime(&build_guard, &rt, build_ordinal, duration_ms, is_cold);
     Ok((rt, outcome))
 }
 
@@ -1609,7 +1634,7 @@ mod tests {
     /// that are not about the kind must come out identical for identical
     /// inputs.
     ///
-    /// This is what four verbatim copies of that tail could not guarantee. The
+    /// This is what three verbatim copies of that tail could not guarantee. The
     /// probe deadline is jittered, so the assertion is on the window rather
     /// than the value — a copy that armed it from `now_millis()` instead of the
     /// build's own `started_at`, or from a different floor, lands outside it.
@@ -1618,6 +1643,7 @@ mod tests {
         let started_at = 1_000_000_u64;
         let dynamic = RuntimeKind::Dynamic {
             version: "cfg-v1".to_string(),
+            stored: true,
         }
         .tag("env-a".to_string(), started_at);
         let prepared = RuntimeKind::Prepared {
@@ -1643,6 +1669,48 @@ mod tests {
         assert_eq!(dynamic.config_version, None);
         assert_eq!(prepared.version, "plan-hash");
         assert_eq!(prepared.config_version.as_deref(), Some("cfg-v1"));
+    }
+
+    /// A boot failure returns before any log line and answers an opaque 500,
+    /// so its message is the only thing that separates a poisoned isolate
+    /// (the cached build; every later request in that isolate keeps failing)
+    /// from a lost race (the transient build, which self-heals). Sharing one
+    /// tail must not cost that distinction — the `kind` field, which is about
+    /// the hydration mechanism rather than the blast radius, deliberately does
+    /// not draw it.
+    #[wasm_bindgen_test]
+    fn a_boot_failure_names_the_lifecycle_it_poisoned() {
+        let cached = RuntimeKind::Dynamic {
+            version: "cfg-v1".to_string(),
+            stored: true,
+        };
+        let transient = RuntimeKind::Dynamic {
+            version: "cfg-v1".to_string(),
+            stored: false,
+        };
+        let prepared = RuntimeKind::Prepared {
+            plan_hash: "plan-hash".to_string(),
+            config_generation: "cfg-v1".to_string(),
+        };
+
+        assert_eq!(cached.lifecycle(), "cached");
+        assert_eq!(transient.lifecycle(), "transient");
+        assert_eq!(prepared.lifecycle(), "prepared");
+        assert_ne!(
+            cached.lifecycle(),
+            transient.lifecycle(),
+            "a poisoned isolate and a lost race must not read the same"
+        );
+
+        // The `kind` log field is coarser and is derived from the finished
+        // runtime instead (`ReadyRuntime::kind_label`), so it cannot be typed
+        // differently at one of the four sites that emit it. Only the tag it
+        // switches on is assertable without a `Wafer`.
+        assert_eq!(
+            cached.tag("env".to_string(), 0).config_version,
+            transient.tag("env".to_string(), 0).config_version
+        );
+        assert!(prepared.tag("env".to_string(), 0).config_version.is_some());
     }
 
     /// The build ordinal is a per-isolate counter surfaced through
