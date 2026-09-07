@@ -2512,10 +2512,13 @@ impl GroupTemplateListResponse {
 pub struct PurchaseView {
     /// Stable order identifier.
     pub id: String,
-    /// Legacy owner column; equals `buyer_user_id` for orders placed while
-    /// signed in and is empty for guest orders.
-    pub user_id: String,
-    /// Signed-in buyer's user id, or empty for a guest order.
+    // The row also carries a `user_id` column holding the same value — one
+    // writer sets both — and this view used to publish it too, so a drifted
+    // row put two answers to one question on the wire. `buyer_user_id` is
+    // the one per-row ownership is decided on, so it is the one published.
+    // The column stays; it is simply not a field.
+    /// Signed-in buyer's user id, or empty for a guest order. The order's
+    /// single buyer identity.
     pub buyer_user_id: String,
     /// Buyer's email address as captured at checkout, or empty.
     pub buyer_email: String,
@@ -2545,14 +2548,16 @@ pub struct PurchaseView {
     pub livemode: bool,
     /// ISO 4217 currency of every amount on the order.
     pub currency: String,
-    /// Legacy amount column, in minor units. Prefer `total_cents`.
-    pub amount_cents: i64,
     pub subtotal_cents: i64,
     pub discount_cents: i64,
     pub tax_cents: i64,
     pub shipping_cents: i64,
     pub platform_fee_cents: i64,
-    /// Final charged amount in minor units.
+    // The row also carries an `amount_cents` column holding the same value —
+    // one writer sets both — and this view used to publish it too, under a
+    // field whose own description said to prefer this one. The column stays;
+    // it is simply not a field.
+    /// Final charged amount in minor units. The order's single amount.
     pub total_cents: i64,
     /// Sum of succeeded refunds in minor units.
     pub refunded_total_cents: i64,
@@ -2998,7 +3003,6 @@ impl PurchaseView {
     pub fn from_record(record: &Record) -> Result<Self, WaferError> {
         Ok(Self {
             id: record.id.clone(),
-            user_id: record.str_field("user_id").to_string(),
             buyer_user_id: record.str_field("buyer_user_id").to_string(),
             buyer_email: record.str_field("buyer_email").to_string(),
             seller_account_id: record.str_field("seller_account_id").to_string(),
@@ -3010,7 +3014,6 @@ impl PurchaseView {
             provider: record.str_field("provider").to_string(),
             livemode: record.bool_field("livemode"),
             currency: record.str_field("currency").to_string(),
-            amount_cents: record.i64_field("amount_cents"),
             subtotal_cents: record.i64_field("subtotal_cents"),
             discount_cents: record.i64_field("discount_cents"),
             tax_cents: record.i64_field("tax_cents"),
