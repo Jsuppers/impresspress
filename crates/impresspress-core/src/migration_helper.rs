@@ -14,6 +14,22 @@
 //! The statement splitter handles `;` outside `--` comments. Block comments
 //! `/* ... */` and `;` inside string literals are not supported — the
 //! canonical .sql files don't use either.
+//!
+//! # A shipped .sql file is immutable, comments included
+//!
+//! Step 2 hashes the file's **whole text**, so editing a `--` comment in a
+//! migration that has already shipped changes its hash exactly as much as
+//! editing a statement does. On every deployment that already applied it,
+//! `current_hash` and `blessed_hash` then both differ from the code hash,
+//! step 5 logs `schema drift` on every boot, and clearing that requires a
+//! redeploy with `--run-migrations` — which re-runs that block's migrations
+//! from 001.
+//!
+//! So do not tidy prose in a shipped migration, even to fix a comment that
+//! names a since-renamed Rust item. Put the explanation in the block's
+//! `migrations/mod.rs` beside the test that covers the migration, where it is
+//! not hash-addressed and a reader is more likely to find it. Products'
+//! `slug_collision_cannot_fail_020` is the worked example.
 
 use wafer_core::clients::{config, database as db};
 use wafer_run::{context::Context, ErrorCode, LifecycleEvent, LifecycleType, WaferError};
