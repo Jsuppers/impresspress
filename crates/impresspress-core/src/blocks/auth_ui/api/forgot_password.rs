@@ -23,8 +23,20 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     let email_lower = body.email.trim().to_lowercase();
     let safe_msg = "If that email is registered, a password reset link has been sent.";
 
-    let Ok(Some(user)) = users::find_by_email(ctx, &email_lower).await else {
-        return ok_json(&serde_json::json!({"message": safe_msg}));
+    // DELIBERATE, do not "fix": like `verify::handle_resend`, this endpoint
+    // is public and answers one constant body for every account state, so a
+    // failed lookup must answer it too. Separating "no such account" from
+    // "the lookup failed" would hand an anonymous caller a signal that
+    // varies with the address they submitted — the account-enumeration
+    // oracle `safe_msg` exists to close. The response stays constant; the
+    // failure is logged so an outage on this endpoint is still findable.
+    let user = match users::find_by_email(ctx, &email_lower).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return ok_json(&serde_json::json!({"message": safe_msg})),
+        Err(e) => {
+            tracing::error!(error = %e, "forgot-password: user lookup failed");
+            return ok_json(&serde_json::json!({"message": safe_msg}));
+        }
     };
 
     // Generate reset token (expires in 1 hour). The raw token goes in the
@@ -46,4 +58,51 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     super::send_template_email(ctx, "password_reset", &email_lower, &reset_token).await;
 
     ok_json(&serde_json::json!({"message": safe_msg}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::auth::repo::users::{self, NewUser},
+        test_support::{output_json, TestContext},
+    };
+
+    fn body(email: &str) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({ "email": email })).expect("serialize body"),
+        )
+    }
+
+    /// The deliberate counterpart to the rest of this sweep: a failed lookup
+    /// must NOT be distinguishable from "no such account". Anything that
+    /// varied with the submitted address would be the account-enumeration
+    /// oracle the constant body exists to close. Pinned so a later sweep
+    /// cannot "fix" it back into one.
+    #[tokio::test]
+    async fn the_constant_body_survives_a_failed_lookup() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        users::insert(
+            &ctx,
+            NewUser {
+                email: "known@example.com".into(),
+                display_name: "Known".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: true,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("insert user");
+
+        let unregistered = output_json(handle(&ctx, body("nobody@example.com")).await).await;
+        let failing = ctx.break_reads();
+        let outage = output_json(handle(&failing, body("known@example.com")).await).await;
+
+        assert_eq!(
+            outage, unregistered,
+            "a failed lookup must answer the same constant body as an unregistered address"
+        );
+    }
 }

@@ -4528,6 +4528,77 @@ async fn seller_suspension_fails_closed_until_connected_catalog_archival_succeed
     assert_eq!(retry_requests.lock().unwrap().len(), 2);
 }
 
+/// The two duplicated columns on the orders table are written together, by
+/// one writer, from one value each — and nothing in the tree compares them.
+///
+/// `amount_cents` mirrors `total_cents` and `user_id` mirrors
+/// `buyer_user_id`. Neither duplicate is published any more (`PurchaseView`
+/// carries `total_cents` and `buyer_user_id` only, and this is the PR that
+/// stopped it publishing both), and neither column can be dropped without a
+/// migration this phase deliberately defers. What is left is the risk that a
+/// future writer sets one of a pair and forgets the other, which nothing
+/// would notice: the internal read sets differ, so an order would list under
+/// one identity and access-check under another. This pins the invariant on
+/// the writer that creates the row.
+#[tokio::test]
+async fn a_created_order_writes_the_same_value_into_both_duplicated_columns() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+    ])
+    .await;
+    register_stripe_network(
+        &mut ctx,
+        serde_json::json!({
+            "id": "cs_test_mirror",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_mirror"
+        }),
+    );
+    let offer_id = seed_active_offer(&ctx, "product_mirror_checkout", "").await;
+
+    // A SIGNED-IN buyer, so both identity columns are non-empty and the
+    // assertion has something to compare. A guest order writes `""` into
+    // both, which would pass whatever the writer did.
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "user_mirror",
+        serde_json::json!({
+            "offer_id": offer_id,
+            "inputs": {"pages": 2},
+            "presentation": "hosted"
+        }),
+    );
+    let body = output_to_json(stripe::handle_checkout(&ctx, &msg, input).await).await;
+    let order_id = body["order_id"].as_str().expect("order id");
+
+    let order = db::get(&ctx, "impresspress__products__purchases", order_id)
+        .await
+        .expect("order row");
+    assert_eq!(
+        order.data["buyer_user_id"],
+        serde_json::json!("user_mirror"),
+        "the fixture must produce a signed-in order, or the mirror assertions \
+         below compare two empty strings"
+    );
+    assert_eq!(
+        order.data["user_id"], order.data["buyer_user_id"],
+        "`user_id` mirrors `buyer_user_id`; a writer that sets one and not the \
+         other makes an order list under one identity and access-check under \
+         another"
+    );
+    assert!(
+        order.data["total_cents"].as_i64().is_some_and(|v| v > 0),
+        "the fixture must charge something, or the amount assertion below \
+         compares two absent fields: {:?}",
+        order.data["total_cents"]
+    );
+    assert_eq!(
+        order.data["amount_cents"], order.data["total_cents"],
+        "`amount_cents` mirrors `total_cents`; a writer that sets one and not \
+         the other stores two answers for what the buyer was charged"
+    );
+}
+
 #[tokio::test]
 async fn embedded_offer_checkout_returns_client_secret_and_uses_return_url() {
     let mut ctx = ctx_with(&[

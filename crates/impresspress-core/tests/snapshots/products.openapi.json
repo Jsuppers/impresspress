@@ -5558,11 +5558,6 @@
                     "items": {
                       "description": "An order row: `impresspress__products__purchases`, as published to the\nbuyer, the seller and administrators.",
                       "properties": {
-                        "amount_cents": {
-                          "description": "Legacy amount column, in minor units. Prefer `total_cents`.",
-                          "format": "int64",
-                          "type": "integer"
-                        },
                         "approved_at": {
                           "description": "RFC 3339 timestamp the order was approved, or `null`.",
                           "format": "date-time",
@@ -5576,7 +5571,7 @@
                           "type": "string"
                         },
                         "buyer_user_id": {
-                          "description": "Signed-in buyer's user id, or empty for a guest order.",
+                          "description": "Signed-in buyer's user id, or empty for a guest order. The order's\nsingle buyer identity.",
                           "type": "string"
                         },
                         "checkout_mode": {
@@ -5792,7 +5787,7 @@
                           "type": "integer"
                         },
                         "total_cents": {
-                          "description": "Final charged amount in minor units.",
+                          "description": "Final charged amount in minor units. The order's single amount.",
                           "format": "int64",
                           "type": "integer"
                         },
@@ -5800,15 +5795,10 @@
                           "description": "RFC 3339 timestamp of the last modification.",
                           "format": "date-time",
                           "type": "string"
-                        },
-                        "user_id": {
-                          "description": "Legacy owner column; equals `buyer_user_id` for orders placed while\nsigned in and is empty for guest orders.",
-                          "type": "string"
                         }
                       },
                       "required": [
                         "id",
-                        "user_id",
                         "buyer_user_id",
                         "buyer_email",
                         "seller_account_id",
@@ -5820,7 +5810,6 @@
                         "provider",
                         "livemode",
                         "currency",
-                        "amount_cents",
                         "subtotal_cents",
                         "discount_cents",
                         "tax_cents",
@@ -6131,11 +6120,6 @@
                   "purchase": {
                     "description": "An order row: `impresspress__products__purchases`, as published to the\nbuyer, the seller and administrators.",
                     "properties": {
-                      "amount_cents": {
-                        "description": "Legacy amount column, in minor units. Prefer `total_cents`.",
-                        "format": "int64",
-                        "type": "integer"
-                      },
                       "approved_at": {
                         "description": "RFC 3339 timestamp the order was approved, or `null`.",
                         "format": "date-time",
@@ -6149,7 +6133,7 @@
                         "type": "string"
                       },
                       "buyer_user_id": {
-                        "description": "Signed-in buyer's user id, or empty for a guest order.",
+                        "description": "Signed-in buyer's user id, or empty for a guest order. The order's\nsingle buyer identity.",
                         "type": "string"
                       },
                       "checkout_mode": {
@@ -6365,7 +6349,7 @@
                         "type": "integer"
                       },
                       "total_cents": {
-                        "description": "Final charged amount in minor units.",
+                        "description": "Final charged amount in minor units. The order's single amount.",
                         "format": "int64",
                         "type": "integer"
                       },
@@ -6373,15 +6357,10 @@
                         "description": "RFC 3339 timestamp of the last modification.",
                         "format": "date-time",
                         "type": "string"
-                      },
-                      "user_id": {
-                        "description": "Legacy owner column; equals `buyer_user_id` for orders placed while\nsigned in and is empty for guest orders.",
-                        "type": "string"
                       }
                     },
                     "required": [
                       "id",
-                      "user_id",
                       "buyer_user_id",
                       "buyer_email",
                       "seller_account_id",
@@ -6393,7 +6372,6 @@
                       "provider",
                       "livemode",
                       "currency",
-                      "amount_cents",
                       "subtotal_cents",
                       "discount_cents",
                       "tax_cents",

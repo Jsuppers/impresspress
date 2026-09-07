@@ -35,9 +35,19 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // Find user by reset token. The DB column stores `sha256_hex(raw)`;
     // hash the supplied token the same way before comparing.
-    let Ok(Some(user)) = users::find_by_reset_token(ctx, &sha256_hex(body.token.as_bytes())).await
-    else {
-        return error_response(ErrorCode::InvalidToken, "Invalid or expired reset token");
+    let user = match users::find_by_reset_token(ctx, &sha256_hex(body.token.as_bytes())).await {
+        Ok(Some(user)) => user,
+        // No row carries this digest: the token was already spent or never
+        // minted. That is the real invalid token.
+        Ok(None) => {
+            return error_response(ErrorCode::InvalidToken, "Invalid or expired reset token")
+        }
+        // A read that could not run is not a bad token. Unlike
+        // `forgot_password`, this endpoint is not an enumeration surface —
+        // the caller already holds the token — so nothing is protected by
+        // calling an outage an expired link, and the advice that follows
+        // ("request a new one") destroys the token they are holding.
+        Err(e) => return err_internal("Could not check the reset token", e),
     };
 
     // Check expiry — reject if missing or malformed (tokens must have an expiry)
@@ -213,6 +223,29 @@ mod tests {
         assert!(
             output_is_error(out, "Internal").await,
             "a revocation failure must not be reported as success"
+        );
+    }
+
+    /// The token lookup collapsed a failed read into "Invalid or expired
+    /// reset token". A user holding a link that is valid for another 59
+    /// minutes was told it had expired; the advice that follows is to
+    /// request a new one, which lands on the same outage — and the old token
+    /// is destroyed by the new request. This is not an anti-enumeration
+    /// answer: the caller already holds the token, so nothing is disclosed
+    /// by saying the lookup failed.
+    #[tokio::test]
+    async fn an_unreadable_reset_token_is_an_outage_not_an_expired_link() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "frank@example.com", "original-horse-battery1").await;
+        let token = issue_reset_token(&ctx, &user_id).await;
+        // The token lookup is the handler's first database read.
+        let failing = ctx.break_reads();
+
+        let out = handle(&failing, body(&token, "new-horse-battery-2026")).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed token lookup must not be answered as an invalid token"
         );
     }
 }

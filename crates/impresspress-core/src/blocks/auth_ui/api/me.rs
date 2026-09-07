@@ -37,8 +37,15 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if user_id.is_empty() {
         return error_response(ErrorCode::NotAuthenticated, "Not authenticated");
     }
-    let Ok(Some(user)) = users::find_by_id(ctx, user_id).await else {
-        return err_not_found("User not found");
+    let user = match users::find_by_id(ctx, user_id).await {
+        Ok(Some(user)) => user,
+        // A valid token whose row is gone: the account was deleted while the
+        // access token was still live.
+        Ok(None) => return err_not_found("User not found"),
+        // A read that could not run is not a deleted account. 404 is the one
+        // answer a signed-in caller must never get from an outage — no
+        // client retries it, and it reads as "you no longer exist".
+        Err(e) => return err_internal("Could not load the signed-in user", e),
     };
     let roles = match get_user_roles(ctx, user_id).await {
         Ok(r) => r,
@@ -174,5 +181,26 @@ mod tests {
         )
         .await;
         assert!(output_is_error(out, "Unauthenticated").await);
+    }
+
+    /// A read that could not run is not "your account does not exist".
+    /// `handle_get` collapsed both into `404 User not found`, so a database
+    /// outage told a signed-in caller their account was gone — on a status
+    /// no client retries and with nothing anywhere near the response to say
+    /// an outage had happened.
+    #[tokio::test]
+    async fn an_unreadable_user_row_is_an_outage_not_a_missing_account() {
+        let ctx = TestContext::with_auth().await;
+        let user = seed_user(&ctx).await;
+        // The lookup under test is the handler's first read, so a database
+        // whose reads all fail lands on it and on nothing earlier.
+        let failing = ctx.break_reads();
+
+        let out = handle_get(&failing, &auth_msg("retrieve", "/b/auth/api/me", &user.id)).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed lookup of the caller's own row must not answer 404"
+        );
     }
 }

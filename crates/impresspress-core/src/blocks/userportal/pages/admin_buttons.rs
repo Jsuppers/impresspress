@@ -14,6 +14,7 @@ use super::super::load_buttons;
 // to this block's table.
 use crate::blocks::userportal::TABLE;
 use crate::{
+    blocks::crud,
     http::{err_bad_request, err_internal, err_not_found},
     ui::{self, components, icons, sidebar::nav_icon},
     util::{json_map, parse_form_body, stamp_created, stamp_updated, RecordExt},
@@ -249,8 +250,14 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
     if !is_safe_dom_id(id) {
         return err_not_found("Button not found");
     }
-    let Ok(record) = db::get(ctx, TABLE, id).await else {
-        return err_not_found("Button not found");
+    // A read that could not run is not a deleted button. Answering 404 for a
+    // row that is still there invites the obvious next move — recreate it —
+    // which duplicates the button once the read works again. `crud::db_error`
+    // is the one mapping: `NotFound` is the 404 above, a WRAP refusal is a
+    // 403, everything else is a sealed 500 with the cause logged.
+    let record = match db::get(ctx, TABLE, id).await {
+        Ok(record) => record,
+        Err(e) => return crud::db_error(e, "Button not found", "Could not load the button"),
     };
 
     let current_icon = record.str_field("icon");
@@ -340,7 +347,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::userportal::UserPortalBlock,
-        test_support::{output_html, TestContext},
+        test_support::{output_html, output_is_error, TestContext},
     };
 
     async fn ctx_with_userportal() -> TestContext {
@@ -405,6 +412,26 @@ mod tests {
         assert!(
             !html.contains("style.display"),
             "modal must not be toggled via a plain inline style.display assignment:\n{html}"
+        );
+    }
+
+    /// A read that could not run is not a deleted button. The `let Ok(record)
+    /// = … else { err_not_found }` answered the admin `404 Button not found`
+    /// for a row that is still there, so the obvious next move — recreate it
+    /// — duplicates the button once the database comes back.
+    #[tokio::test]
+    async fn an_unreadable_button_row_is_an_outage_not_a_missing_button() {
+        let ctx = ctx_with_userportal().await;
+        let record = db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let failing = ctx.break_reads();
+
+        let out = handle_edit_button_form(&failing, &record.id).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a failed row read must not answer 404"
         );
     }
 }

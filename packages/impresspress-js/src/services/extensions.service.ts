@@ -757,7 +757,10 @@ export interface Dispute {
  */
 export interface Purchase {
   id: string;
-  user_id: string;
+  /**
+   * The single published buyer identity. The row also carries a `user_id`
+   * column holding the same value, but the server publishes one answer.
+   */
   buyer_user_id: string;
   buyer_email: string;
   seller_account_id: string;
@@ -769,12 +772,15 @@ export interface Purchase {
   provider: string;
   livemode: boolean;
   currency: string;
-  amount_cents: number;
   subtotal_cents: number;
   discount_cents: number;
   tax_cents: number;
   shipping_cents: number;
   platform_fee_cents: number;
+  /**
+   * The single published amount, in minor units. The row also carries an
+   * `amount_cents` column holding the same value; the server publishes one.
+   */
   total_cents: number;
   refunded_total_cents: number;
   metadata: Record<string, unknown>;

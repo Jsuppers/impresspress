@@ -860,3 +860,62 @@ async fn order_rows_outside_the_state_contract_never_reach_the_wire() {
         "a 200 would publish `shipped`, which is not an order state"
     );
 }
+
+/// One order, one identity, one amount.
+///
+/// `PurchaseView` — the admin projection, the only one of the three that
+/// published either — carried `user_id` beside `buyer_user_id` and
+/// `amount_cents` beside `total_cents`. Each pair is two columns holding one
+/// value, written together by one writer and never compared, so a row where
+/// they drift ships two answers to one question. The duplicate half of each
+/// pair is also the half nothing else reads: `amount_cents` had exactly one
+/// reader in the tree — this projection — on a field whose own published
+/// description said to prefer `total_cents`, and `user_id`'s description
+/// claimed it is empty for guest orders while the writer mirrors `""` into
+/// both. Ownership is decided on `buyer_user_id`; that is what is published.
+///
+/// The columns are untouched: this is the publication half, and it needs no
+/// migration because every order view is hand-projected.
+#[tokio::test]
+async fn an_order_publishes_one_identity_and_one_amount() {
+    let ctx = ctx().await;
+    seed(
+        &ctx,
+        "impresspress__products__purchases",
+        "pur_drift",
+        HashMap::from([
+            // The two pairs, deliberately disagreeing: no writer produces
+            // this, which is the point — nothing in the tree would notice.
+            ("user_id".to_string(), serde_json::json!("user_legacy")),
+            ("buyer_user_id".to_string(), serde_json::json!("user_1")),
+            ("amount_cents".to_string(), serde_json::json!(111)),
+            ("total_cents".to_string(), serde_json::json!(5000)),
+            ("status".to_string(), serde_json::json!("completed")),
+            (
+                "reconciliation_status".to_string(),
+                serde_json::json!("reconciled"),
+            ),
+        ]),
+    )
+    .await;
+
+    let (msg, _input) = get_msg("/b/products/api/admin/purchases/pur_drift", "admin_1");
+    let admin = output_to_json(purchase::handle_get_admin(&ctx, &routed(msg)).await).await;
+    let purchase = &admin["purchase"];
+    assert!(
+        purchase.is_object(),
+        "the admin detail must carry a `purchase` object, or the absence \
+         assertions below assert nothing: {admin}"
+    );
+
+    assert_eq!(purchase["buyer_user_id"], "user_1");
+    assert_eq!(purchase["total_cents"], 5000);
+    assert!(
+        purchase.get("user_id").is_none(),
+        "an order publishes one buyer identity, and it is `buyer_user_id`: {purchase}"
+    );
+    assert!(
+        purchase.get("amount_cents").is_none(),
+        "an order publishes one amount, and it is `total_cents`: {purchase}"
+    );
+}
