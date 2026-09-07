@@ -5892,7 +5892,7 @@ async fn a_gated_checkout_reports_an_outage_instead_of_denying_ownership() {
     let ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
     seed(
         &ctx,
-        "impresspress__products__products",
+        repo::products::TABLE,
         "prereq",
         HashMap::from([
             ("name".to_string(), serde_json::json!("Prerequisite")),
@@ -5921,7 +5921,7 @@ async fn a_gated_checkout_reports_an_outage_instead_of_denying_ownership() {
     // Now the subscription read — the first of the three — cannot answer.
     let failing = crate::test_support::FailingDbOpContext::new(
         ctx.clone(),
-        vec![("database.list", "impresspress__products__subscriptions")],
+        vec![("database.list", repo::subscriptions::SUBSCRIPTIONS_TABLE)],
     );
     let (msg, input) = create_msg(
         "/b/products/checkout",
@@ -5956,7 +5956,7 @@ async fn a_gated_checkout_reports_an_outage_instead_of_denying_ownership() {
     .await;
     let failing = crate::test_support::FailingDbOpContext::new(
         ctx.clone(),
-        vec![("database.list", repo::purchases::LINE_ITEMS_TABLE)],
+        vec![("database.list", "impresspress__products__line_items")],
     );
     let (msg, input) = create_msg(
         "/b/products/checkout",
@@ -5981,7 +5981,7 @@ async fn seed_gated_offer(
 ) -> String {
     seed(
         ctx,
-        "impresspress__products__products",
+        repo::products::TABLE,
         product_id,
         HashMap::from([
             ("name".to_string(), serde_json::json!("Gated product")),
@@ -6032,7 +6032,7 @@ async fn a_subscription_update_whose_owner_lookup_fails_does_not_report_success(
     .await;
     seed(
         &ctx,
-        "impresspress__products__subscriptions",
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
         "sub_owner_probe",
         HashMap::from([
             ("user_id".to_string(), serde_json::json!("owner_1")),
@@ -6074,7 +6074,7 @@ async fn a_subscription_update_whose_owner_lookup_fails_does_not_report_success(
     retry["id"] = serde_json::json!("evt_owner_probe_2");
     let failing = crate::test_support::FailingDbOpContext::new(
         ctx.clone(),
-        vec![("database.list", "impresspress__products__subscriptions")],
+        vec![("database.list", repo::subscriptions::SUBSCRIPTIONS_TABLE)],
     )
     .after_passing(2);
     let (msg, input) = webhook_msg(&retry, WEBHOOK_SECRET);

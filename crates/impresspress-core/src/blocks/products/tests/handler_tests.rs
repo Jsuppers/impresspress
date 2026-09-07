@@ -5395,17 +5395,7 @@ async fn a_seller_cannot_open_another_sellers_close_manager() {
 /// prevent — and neither create logged a thing.
 #[tokio::test]
 async fn a_create_whose_template_lookup_fails_writes_no_row() {
-    use wafer_core::clients::database as db;
-
     use crate::{blocks::products::repo, test_support::FailingDbOpContext};
-
-    /// How many rows the table holds right now.
-    async fn row_count(ctx: &crate::test_support::TestContext, table: &str) -> usize {
-        db::list_all(ctx, table, vec![])
-            .await
-            .expect("count rows")
-            .len()
-    }
 
     let ctx = user_products_ctx().await;
 
@@ -5427,8 +5417,10 @@ async fn a_create_whose_template_lookup_fails_writes_no_row() {
     let product = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert!(product["id"].as_str().is_some_and(|id| !id.is_empty()));
 
-    let groups_before = row_count(&ctx, repo::groups::TABLE).await;
-    let products_before = row_count(&ctx, repo::products::TABLE).await;
+    let groups_before = repo::groups::count(&ctx, &[]).await.expect("count groups");
+    let products_before = repo::products::count(&ctx, &[])
+        .await
+        .expect("count products");
 
     let failing = FailingDbOpContext::new(
         ctx.clone(),
@@ -5459,12 +5451,14 @@ async fn a_create_whose_template_lookup_fails_writes_no_row() {
     );
 
     assert_eq!(
-        row_count(&ctx, repo::groups::TABLE).await,
+        repo::groups::count(&ctx, &[]).await.expect("count groups"),
         groups_before,
         "the refused group create must leave no row behind"
     );
     assert_eq!(
-        row_count(&ctx, repo::products::TABLE).await,
+        repo::products::count(&ctx, &[])
+            .await
+            .expect("count products"),
         products_before,
         "the refused product create must leave no row behind"
     );
