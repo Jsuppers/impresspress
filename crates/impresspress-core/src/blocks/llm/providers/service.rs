@@ -22,9 +22,9 @@ use wafer_core::interfaces::llm::service::{
 use super::{
     anthropic,
     config::{ProviderConfig, ProviderProtocol},
-    openai, openai_compatible, sse,
+    openai, openai_compatible,
 };
-use crate::blocks::llm::provider_admin::ProviderAdmin;
+use crate::{blocks::llm::provider_admin::ProviderAdmin, llm_wire::sse};
 
 /// Unwrap a `RwLock` read/write guard, recovering from poisoning rather than
 /// panicking. A poisoned lock means a prior writer panicked while holding it;

@@ -6,35 +6,18 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use wafer_core::interfaces::vector::service::{
-    DistanceMetric, MetadataFilter, Result as VResult, SearchMode, VectorEntry, VectorError,
-    VectorIndexConfig, VectorMatch, VectorService,
+use wafer_core::interfaces::vector::{
+    self as vector_rrf,
+    service::{
+        DistanceMetric, MetadataFilter, Result as VResult, SearchMode, VectorEntry, VectorError,
+        VectorIndexConfig, VectorMatch, VectorService,
+    },
 };
 
 use crate::{bridge, db_codec, vector::sql};
 
 fn js_err(e: wasm_bindgen::JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
-}
-
-fn matches_filter(metadata: Option<&serde_json::Value>, filter: &MetadataFilter) -> bool {
-    if filter.equals.is_empty() {
-        return true;
-    }
-    let Some(meta) = metadata else { return false };
-    for (path, expected) in &filter.equals {
-        let mut cursor = meta;
-        for segment in path.split('.') {
-            cursor = match cursor.get(segment) {
-                Some(v) => v,
-                None => return false,
-            };
-        }
-        if cursor != expected {
-            return false;
-        }
-    }
-    true
 }
 
 /// Per-index config: cached in memory for the lifetime of this
@@ -351,7 +334,7 @@ impl VectorService for BrowserVectorService {
                     .enumerate()
                     .filter_map(|(rank, id)| {
                         let m = metadata.get(&id).cloned().flatten();
-                        if !matches_filter(m.as_ref(), &f) {
+                        if !f.matches(m.as_ref()) {
                             return None;
                         }
                         Some(VectorMatch {
@@ -376,19 +359,20 @@ impl VectorService for BrowserVectorService {
                 );
                 let kw_top = fts_search(index, &kq, fetch_n)?;
 
-                // Inline RRF fusion. We need per-id scores in the response,
-                // so we don't use wafer_core::rrf::fuse (which discards scores).
-                const RRF_K: f32 = 60.0;
-                let mut rrf: std::collections::HashMap<String, f32> =
-                    std::collections::HashMap::new();
-                for (rank, (id, _)) in vec_top.iter().enumerate() {
-                    *rrf.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
-                }
-                for (rank, id) in kw_top.iter().enumerate() {
-                    *rrf.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
-                }
-                let mut fused: Vec<(String, f32)> = rrf.into_iter().collect();
-                fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                // Reciprocal Rank Fusion, from the shared implementation the
+                // native sqlite-vec backend also fuses with. `fuse_scored`
+                // keeps the real RRF value (the inline copy this replaced
+                // existed because of a comment claiming only the
+                // score-discarding `fuse` was available), truncates to
+                // `top_k` itself, and breaks score ties by id — so two ids
+                // that fuse to the same score come back in a stable order
+                // instead of whatever the old `HashMap` iteration produced.
+                let vec_ids: Vec<String> = vec_top.iter().map(|(id, _)| id.clone()).collect();
+                let fused = vector_rrf::fuse_scored(
+                    &[vec_ids, kw_top.clone()],
+                    top_k,
+                    vector_rrf::DEFAULT_RRF_K,
+                );
 
                 // Hydrate metadata from both sources: vector candidates carry it
                 // already, FTS-only ids need a separate meta lookup.
@@ -405,7 +389,6 @@ impl VectorService for BrowserVectorService {
 
                 Ok(fused
                     .into_iter()
-                    .take(top_k)
                     .map(|(id, score)| VectorMatch {
                         metadata: by_id.get(&id).cloned().flatten(),
                         id,
@@ -491,7 +474,7 @@ fn load_all_vectors(index: &str, dims: u32, f: &MetadataFilter) -> VResult<Vec<V
         let (id, vector, metadata) =
             sql::decode_vector_row(r.id, &r.vector, r.metadata.as_deref(), dims)
                 .map_err(VectorError::Internal)?;
-        if !matches_filter(metadata.as_ref(), f) {
+        if !f.matches(metadata.as_ref()) {
             continue;
         }
         out.push((id, vector, metadata));
@@ -556,4 +539,92 @@ fn attach_metadata(
             score,
         })
         .collect()
+}
+
+/// The hybrid-search fusion pin. `service.rs` is wasm32-only (it drives the
+/// sql.js bridge), so these run under `wasm-pack test --node`; the fusion
+/// itself is pure and needs no bridge.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod rrf_tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::vector_rrf;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The inline RRF this file used to carry computed
+    /// `sum over lists of 1 / (60 + rank_1based)` and sorted descending.
+    /// `fuse_scored` must reproduce those scores exactly for a fixture, or the
+    /// hybrid `VectorMatch::score` values every consumer reads would move.
+    #[wasm_bindgen_test]
+    fn fuse_scored_reproduces_the_inline_rrf_scores() {
+        let vector_ranking = ids(&["a", "b", "c"]);
+        let keyword_ranking = ids(&["c", "a", "d"]);
+
+        let fused = vector_rrf::fuse_scored(
+            &[vector_ranking, keyword_ranking],
+            10,
+            vector_rrf::DEFAULT_RRF_K,
+        );
+
+        // Hand-computed with k = 60, ranks 1-based, exactly as the inline
+        // `1.0 / (RRF_K + (rank + 1) as f32)` accumulation did.
+        let k = 60.0_f32;
+        let expect_a = 1.0 / (k + 1.0) + 1.0 / (k + 2.0);
+        let expect_c = 1.0 / (k + 3.0) + 1.0 / (k + 1.0);
+        let expect_b = 1.0 / (k + 2.0);
+        let expect_d = 1.0 / (k + 3.0);
+
+        let got: Vec<(&str, f32)> = fused.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+        assert_eq!(got.len(), 4, "every id in either list survives: {got:?}");
+        // `a` (ranks 1 and 2) narrowly outscores `c` (ranks 3 and 1); both are
+        // ahead of the ids that appear in only one list.
+        assert_eq!(got[0].0, "a", "{got:?}");
+        assert_eq!(got[1].0, "c", "{got:?}");
+
+        for (id, expected) in [
+            ("a", expect_a),
+            ("b", expect_b),
+            ("c", expect_c),
+            ("d", expect_d),
+        ] {
+            let actual = got
+                .iter()
+                .find(|(got_id, _)| *got_id == id)
+                .map(|(_, s)| *s)
+                .unwrap_or_else(|| panic!("{id} missing from {got:?}"));
+            assert!(
+                (actual - expected).abs() < 1e-7,
+                "{id}: fuse_scored gave {actual}, inline RRF gave {expected}"
+            );
+        }
+    }
+
+    /// `fuse_scored` truncates to `top_k` itself — the `.take(top_k)` the
+    /// inline copy needed after sorting is gone, so this is what keeps the
+    /// hybrid result length honest.
+    #[wasm_bindgen_test]
+    fn fuse_scored_truncates_to_top_k() {
+        let fused =
+            vector_rrf::fuse_scored(&[ids(&["a", "b", "c", "d"])], 2, vector_rrf::DEFAULT_RRF_K);
+        assert_eq!(
+            fused.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    /// Two ids that fuse to the same score come back in a stable (id) order.
+    /// The `HashMap` + tie-break-free sort this replaced could return either
+    /// order from run to run.
+    #[wasm_bindgen_test]
+    fn equal_scores_break_ties_by_id() {
+        let fused =
+            vector_rrf::fuse_scored(&[ids(&["z"]), ids(&["a"])], 10, vector_rrf::DEFAULT_RRF_K);
+        assert_eq!(
+            fused.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "z"]
+        );
+    }
 }

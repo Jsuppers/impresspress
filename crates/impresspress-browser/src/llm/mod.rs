@@ -5,7 +5,6 @@
 #[cfg(target_arch = "wasm32")]
 pub mod bridge;
 pub mod catalog;
-pub mod openai_codec;
 #[cfg(target_arch = "wasm32")]
 pub mod service;
 

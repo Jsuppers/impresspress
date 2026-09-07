@@ -1,6 +1,10 @@
-// Node module-customization hook used ONLY by `node --test` (see
-// `storage_paths.test.mjs` in this directory and the `browser-wasm-test`
-// CI step). bridge.js is a wasm-bindgen snippet module — it has a
+// Node module-customization hook for every Node-hosted run of this crate's
+// tests: the `node --test` suites in this directory (`storage_paths.test.mjs`,
+// `http_fetch.test.mjs`) AND `wasm-pack test --node`, whose generated test
+// module imports bridge.js through wasm-bindgen's snippet loader and fails to
+// load without it — see the `browser-wasm-test` CI job, which passes it to
+// both via `--import` and `NODE_OPTIONS` respectively.
+// bridge.js is a wasm-bindgen snippet module — it has a
 // top-level `import initSqlJs from '/vendor/sql-wasm-esm.js'` that a
 // browser/Service Worker resolves from the site root, but which plain
 // Node can't resolve at all (no such path exists on disk). bridge.js's

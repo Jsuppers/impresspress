@@ -21,8 +21,9 @@ extern "C" {
 
     /// Execute a SELECT SQL query. `params` as above.
     /// Returns a JS array of plain row objects — NOT a JSON string. Decode
-    /// with `db_codec::parse_rows`/`rows_from_js`
-    /// (`serde_wasm_bindgen::from_value`).
+    /// with `db_codec::rows_from_js` (`serde_wasm_bindgen::from_value`), then
+    /// turn each row into a `Record` with the shared
+    /// `wafer_core::interfaces::database::codec::record_from_json_row`.
     #[wasm_bindgen(catch, js_name = dbQueryRaw)]
     pub fn db_query_raw(sql: &str, params: JsValue) -> Result<JsValue, JsValue>;
 
@@ -101,17 +102,27 @@ extern "C" {
     /// Execute an HTTP fetch request.
     /// `headers_json` is a JSON object of header key/value pairs.
     /// `body` is the request body bytes (pass empty slice for no body).
-    /// Returns a plain JS object `{ status, headers, body: Uint8Array }` —
-    /// NOT a JSON string. Decode directly with `serde_wasm_bindgen::from_value`.
+    /// `max_response_bytes` caps the response body: an advertised
+    /// `Content-Length` above it is refused before a byte is read, and the
+    /// running total is checked per chunk for a response that advertises
+    /// nothing. Passed in rather than hardcoded on the JS side so
+    /// `impresspress_core::streaming::MAX_NETWORK_RESPONSE_BYTES` stays the
+    /// single definition, shared with the Cloudflare adapter.
+    /// Returns a plain JS object
+    /// `{ status, headers: [[name, value], ...], body: Uint8Array }` —
+    /// NOT a JSON string, and headers are an array of PAIRS so a repeated
+    /// name (`Set-Cookie`) keeps every value. Decode directly with
+    /// `serde_wasm_bindgen::from_value`.
     /// Rejects on a transport-level failure (network error, CORS, invalid
-    /// URL, etc.) — the `fetch()` call itself throwing, not an HTTP error
-    /// status (those resolve normally with `status` set).
+    /// URL, over-cap body) — the `fetch()` call itself throwing, not an HTTP
+    /// error status (those resolve normally with `status` set).
     #[wasm_bindgen(catch, js_name = httpFetch)]
     pub async fn http_fetch(
         method: &str,
         url: &str,
         headers_json: &str,
         body: &[u8],
+        max_response_bytes: f64,
     ) -> Result<JsValue, JsValue>;
 
     // ─── Asset loader bridge (SW → main thread) ───────────────────────────────

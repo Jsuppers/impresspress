@@ -38,7 +38,20 @@ wafer-block = { workspace = true }
 # Shared SQL planning (DbExec primitives call introspect/ddl builders).
 wafer-sql-utils = { workspace = true }
 wafer-block-crypto = { workspace = true }
+# Shared platform logic this adapter must not re-implement: the streaming
+# decision + capped buffered collect (`impresspress_core::streaming`), the
+# URL-level SSRF precheck (`impresspress_core::ssrf`) and the OpenAI wire
+# codec (`impresspress_core::llm_wire::openai`). Same shape
+# `impresspress-web/Cargo.toml` already uses — `default-features = false` and
+# no `block-*` feature — and `impresspress-web` already depends on both this
+# crate and `impresspress-core`, so the only shipping bundle sees no new crate.
+impresspress-core = { path = "../impresspress-core", default-features = false }
 async-trait = "0.1"
+# The `tracing` facade, for `logger::init_console_tracing` — the subscriber that
+# routes framework events to the browser console. Without one installed,
+# `tracing`'s default dispatcher drops every event `impresspress-core` and
+# `wafer-run` emit, so "logged and skipped" means "silently skipped" here.
+tracing = { workspace = true }
 futures = "0.3"
 tokio-util = { version = "0.7", default-features = false }
 serde-wasm-bindgen = "0.6"

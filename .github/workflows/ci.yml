@@ -366,10 +366,14 @@ jobs:
       # against: a pin bump changes what these tests compile and run without
       # touching a file under `crates/impresspress-cloudflare/`, and skipping
       # them there is exactly the coverage hole this job exists to close.
+      # `crates/impresspress-core/` is in it for the same reason at closer
+      # range: this crate depends on core by path, and these tests assert on
+      # core's code directly (the SSRF gate, the shared response cap), so a
+      # change confined to core is a change to what this job checks.
       - name: Check for impresspress-cloudflare changes
         id: cloudflare-changes
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/ Cargo.toml Cargo.lock)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/ crates/impresspress-core/ Cargo.toml Cargo.lock)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -422,10 +426,14 @@ jobs:
       # `Cargo.lock` join the filter for the same reason as the cloudflare job
       # above: a wafer-run pin bump moves this crate's dependencies without
       # touching a file under `crates/impresspress-browser/`.
+      # `crates/impresspress-core/` joins it because the browser depends on core
+      # by path — the streaming decision, the SSRF gate and the OpenAI wire
+      # codec all live there now, so a change confined to core is a change to
+      # this crate's behaviour with no file of its own touched.
       - name: Check for impresspress-browser changes
         id: browser-changes
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-browser/ Cargo.toml Cargo.lock)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-browser/ crates/impresspress-core/ Cargo.toml Cargo.lock)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -450,12 +458,44 @@ jobs:
         with:
           version: 'v0.15.0'
 
-      - name: Run storage_paths.mjs unit tests (node --test)
+      # Pinned rather than left to the runner image's default because the
+      # `node --test` step below passes a GLOB, and glob expansion by the test
+      # runner itself only exists from Node 21. On an older default the pattern
+      # would be taken as a literal path and the step would fail; on a default
+      # that silently moves, the wasm suite below would change Node version
+      # under it too. 22 is the version the rest of these workflows pin.
+      - name: Setup Node
         if: steps.browser-changes.outputs.skip != 'true'
-        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
+      # The pure-JS unit tests for `js/bridge.js`: the OPFS storage-key helpers
+      # and the `httpFetch` request shape, whose `redirect: 'error'` is half of
+      # the outbound-request SSRF gate and cannot be asserted from Rust (the
+      # Rust side is a wasm-bindgen extern import). Globbed rather than named
+      # file by file so a new `*.test.mjs` is picked up without a CI edit.
+      - name: Run bridge.js unit tests (node --test)
+        if: steps.browser-changes.outputs.skip != 'true'
+        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test 'crates/impresspress-browser/js/test/*.test.mjs'
+
+      # `--import ./js/test/node-hooks.mjs` is what makes this step able to
+      # pass at all. `js/bridge.js` is a wasm-bindgen snippet module with a
+      # top-level `import initSqlJs from '/vendor/sql-wasm-esm.js'` — an
+      # absolute site-root path a Service Worker resolves and plain Node cannot,
+      # so without the hook the generated test module fails to load with
+      # ERR_MODULE_NOT_FOUND and the job FAILS before a single wasm test in the
+      # crate runs — it is not a silent skip. The hook (the same one the
+      # `node --test` step above passes via `--import`) stubs that one
+      # specifier and passes everything else through.
+      # NODE_OPTIONS rather than an argument because wasm-bindgen-test-runner
+      # builds the `node` command line itself; the path is relative to
+      # `crates/impresspress-browser`, which is where `wasm-pack` runs `cargo
+      # test` from.
       - name: Run impresspress-browser wasm tests (Node)
         if: steps.browser-changes.outputs.skip != 'true'
+        env:
+          NODE_OPTIONS: --import ./js/test/node-hooks.mjs
         run: wasm-pack test --node crates/impresspress-browser
 
   # E2E is split into a single build stage plus two independent test stages so

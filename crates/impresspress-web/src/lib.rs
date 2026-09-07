@@ -51,6 +51,15 @@ const IMPRESSPRESS_CSP: &str = concat!(
 /// same seeded variables, same CSP, same routes as `{ dev: false }`.
 #[wasm_bindgen]
 pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
+    // Before anything that can log. `tracing`'s default dispatcher discards
+    // every event, so until this is installed each `warn!`/`error!` in
+    // `impresspress-core`, `wafer-run` and the browser adapter goes nowhere —
+    // and a framework failure the code deliberately survives (a malformed LLM
+    // chunk, a refused subrequest) leaves a console with nothing in it.
+    // Idempotent, and a `false` here only means someone installed a subscriber
+    // first, which is their prerogative.
+    let _ = impresspress_browser::init_console_tracing();
+
     if impresspress_browser::is_initialized() {
         return Ok(());
     }

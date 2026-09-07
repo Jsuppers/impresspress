@@ -274,14 +274,50 @@ jobs:
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
 
-      # Pure path-helper unit tests for the hierarchical OPFS storage keys
-      # (`storage.rs`'s `storagePut`/`storageGet`/`storageDelete`/`storageList`
-      # bridge functions). Unconditional here for the same reason as the
-      # conformance-wiring check above: the path-filtered `browser-wasm-test`
-      # job (ci.yml) would skip this on a wafer-run pin bump that doesn't
-      # touch crates/impresspress-browser/.
-      - name: Run storage_paths.mjs unit tests (node --test)
-        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test crates/impresspress-browser/js/test/storage_paths.test.mjs
+      # Pinned rather than left to the runner image's default because the
+      # `node --test` step below passes a GLOB, and glob expansion by the test
+      # runner itself only exists from Node 21. On an older default the pattern
+      # would be taken as a literal path and the step would fail; on a default
+      # that silently moves, the wasm suite below would change Node version
+      # under it too. 22 is the version the rest of these workflows pin.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The pure-JS unit tests for `js/bridge.js`: the hierarchical OPFS
+      # storage-key helpers (`storage.rs`'s `storagePut`/`storageGet`/
+      # `storageDelete`/`storageList` bridge functions) and the `httpFetch`
+      # request shape, whose `redirect: 'error'` is half of the outbound-request
+      # SSRF gate and cannot be asserted from Rust. Globbed rather than named
+      # file by file so a new `*.test.mjs` is picked up without a CI edit.
+      # Unconditional here for the same reason as the conformance-wiring check
+      # above: the path-filtered `browser-wasm-test` job (ci.yml) would skip
+      # this on a wafer-run pin bump that doesn't touch
+      # crates/impresspress-browser/.
+      - name: Run bridge.js unit tests (node --test)
+        run: node --import ./crates/impresspress-browser/js/test/node-hooks.mjs --test 'crates/impresspress-browser/js/test/*.test.mjs'
+
+      # The browser adapter's own wasm tests. `ci.yml` runs these in a
+      # dedicated `browser-wasm-test` job, but that job is path-filtered to
+      # crates/impresspress-browser/ + Cargo.{toml,lock} and exists only on the
+      # PR workflow — so nothing has ever run them on a merge to `main`. The
+      # response-shaping, SSRF and row-codec behaviour they pin lives only in
+      # wasm (a host `cargo test` compiles none of it), which makes this the
+      # only place on this workflow where that behaviour is checked at all.
+      #
+      # See the ci.yml step for why NODE_OPTIONS is required: bridge.js's
+      # top-level `/vendor/sql-wasm-esm.js` import does not resolve under Node
+      # without the hook, and the whole suite fails to load.
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
+        with:
+          version: 'v0.15.0'
+
+      - name: Run impresspress-browser wasm tests (Node)
+        env:
+          NODE_OPTIONS: --import ./js/test/node-hooks.mjs
+        run: wasm-pack test --node crates/impresspress-browser
 
   # The only job that compiles, boots and exercises the browser development
   # sandbox. `impresspress-web/src/dev_runtime.rs` — wasmi `inspect`/`probe`,

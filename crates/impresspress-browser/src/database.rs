@@ -3,7 +3,10 @@
 //! The browser backend implements only the [`DbExec`] execution *primitives*
 //! (synchronous `bridge::db_query_raw` / `bridge::db_exec_raw`, marshaling
 //! params/rows across the bridge as structured `JsValue`s via
-//! `db_codec`/`serde_wasm_bindgen` — no JSON-string round trip). All
+//! `db_codec`/`serde_wasm_bindgen` — no JSON-string round trip) and then
+//! decoding each row with the shared
+//! [`wafer_core::interfaces::database::codec`], the same policy the native
+//! SQLite and Cloudflare D1 backends decode with. All
 //! `get/list/count/sum/create/update/delete` orchestration — filter/IN
 //! expansion, sorted-key INSERT/UPDATE construction, lazy column-add,
 //! table-exists guards — is inherited from the shared `wafer-core` [`DbExec`]
@@ -31,6 +34,7 @@ use std::collections::HashMap;
 
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
+    codec::{record_from_json_row, scalar_f64, scalar_i64},
     exec::DbExec,
     service::{
         AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table,
@@ -88,6 +92,35 @@ impl BrowserDatabaseService {
             (Err(op_err), _) => Err(op_err),
         }
     }
+
+    /// Run `sql` and hand back the raw per-column JSON row objects sql.js
+    /// resolved, undecoded.
+    ///
+    /// The only browser-specific step in a read is crossing the bridge; what
+    /// a row *means* is [`wafer_core::interfaces::database::codec`]'s job, and
+    /// every caller below feeds these rows straight into it. `bridge::
+    /// db_query_raw` is synchronous, so this is not `async`.
+    fn query_json_rows(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, DatabaseError> {
+        let params_js = db_codec::params_to_js(params).map_err(DatabaseError::Internal)?;
+        let value = bridge::db_query_raw(sql, params_js)
+            .map_err(|e| DatabaseError::Internal(format!("sql exec: {e:?}")))?;
+        db_codec::rows_from_js(value).map_err(DatabaseError::Internal)
+    }
+
+    /// The first row of a single-row query (the scalar-aggregate shape), or
+    /// `None` for an empty result — the argument shape
+    /// [`scalar_i64`]/[`scalar_f64`] take.
+    fn query_first_json_row(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Option<serde_json::Value>, DatabaseError> {
+        Ok(self.query_json_rows(sql, params)?.into_iter().next())
+    }
 }
 
 // ─── DbExec primitives — the only backend-specific execution code ─────────────
@@ -97,15 +130,33 @@ impl BrowserDatabaseService {
 impl DbExec for BrowserDatabaseService {
     const BACKEND: Backend = Backend::Sqlite;
 
+    /// Decoding is [`record_from_json_row`], the one policy every SQL-family
+    /// backend now shares — the private `db_codec::build_records` this
+    /// replaced was the last of the three copies.
+    ///
+    /// **Behaviour difference, taken deliberately:** `build_records` returned
+    /// `Err("expected row object")` for a row that was not a JSON object,
+    /// where `record_from_json_row` returns an empty `Record`. The shared
+    /// answer is the right one. The bridge cannot produce a non-object row —
+    /// `bridge.js`'s `dbQueryRaw` builds every row from sql.js's column-name
+    /// array, so the error arm was unreachable in production and only ever
+    /// diverged the browser from the other two adapters. Where it *could*
+    /// fire it is also the worse answer: it fails the whole query (every row,
+    /// including the well-formed ones) with a message that names no table, no
+    /// column and no row, and it makes one platform report a hard error for a
+    /// shape the other two report as an empty record. A decode policy that
+    /// three backends share is only worth anything if all three answer the
+    /// same; keeping a fourth answer here is what unification is for.
     async fn run_fetch(
         &self,
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<Vec<Record>, DatabaseError> {
-        let params_js = db_codec::params_to_js(params).map_err(DatabaseError::Internal)?;
-        let value = bridge::db_query_raw(sql, params_js)
-            .map_err(|e| DatabaseError::Internal(format!("sql exec: {e:?}")))?;
-        db_codec::parse_rows(value).map_err(DatabaseError::Internal)
+        Ok(self
+            .query_json_rows(sql, params)?
+            .into_iter()
+            .map(record_from_json_row)
+            .collect())
     }
 
     async fn run_fetch_one(
@@ -136,10 +187,7 @@ impl DbExec for BrowserDatabaseService {
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<i64, DatabaseError> {
-        let records = self.run_fetch(sql, params).await?;
-        Ok(db_codec::first_scalar(records)
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-            .unwrap_or(0))
+        Ok(scalar_i64(self.query_first_json_row(sql, params)?))
     }
 
     async fn run_scalar_f64(
@@ -147,10 +195,7 @@ impl DbExec for BrowserDatabaseService {
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<f64, DatabaseError> {
-        let records = self.run_fetch(sql, params).await?;
-        Ok(db_codec::first_scalar(records)
-            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
-            .unwrap_or(0.0))
+        Ok(scalar_f64(self.query_first_json_row(sql, params)?))
     }
 
     async fn dbx_table_exists(&self, table: &str) -> Result<bool, DatabaseError> {
@@ -460,5 +505,83 @@ mod conformance {
     #[allow(dead_code)]
     async fn _browser_adapter_is_conformable(svc: &BrowserDatabaseService) {
         run_conformance(svc as &dyn DatabaseService).await;
+    }
+}
+
+/// The row-decode policy this adapter now shares with native SQLite and
+/// Cloudflare D1. `database.rs` is wasm32-only, so these run under
+/// `wasm-pack test --node`; the codec itself is pure and needs no bridge.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod codec_policy {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{record_from_json_row, scalar_f64, scalar_i64};
+
+    /// sql.js stores JSON columns as TEXT; the shared codec restores the
+    /// structure the writer put in, so a block reading this column sees a
+    /// `Value::Object` on all three adapters.
+    #[wasm_bindgen_test]
+    fn json_text_columns_are_reparsed() {
+        let rec = record_from_json_row(
+            serde_json::json!({"id": "1", "meta": "{\"k\":\"v\"}", "tags": "[1,2]"}),
+        );
+        assert_eq!(rec.id, "1");
+        assert_eq!(rec.data.get("meta").unwrap(), &serde_json::json!({"k":"v"}));
+        assert_eq!(rec.data.get("tags").unwrap(), &serde_json::json!([1, 2]));
+    }
+
+    /// A plain string that does not look like JSON stays a string, and one
+    /// that looks like JSON but does not parse stays a string too.
+    #[wasm_bindgen_test]
+    fn non_json_text_is_left_alone() {
+        let rec = record_from_json_row(
+            serde_json::json!({"id": "1", "note": "hello world", "broken": "{not json"}),
+        );
+        assert_eq!(
+            rec.data.get("note").unwrap(),
+            &serde_json::json!("hello world")
+        );
+        assert_eq!(
+            rec.data.get("broken").unwrap(),
+            &serde_json::json!("{not json")
+        );
+    }
+
+    /// An integer primary key is stringified into `Record::id` and kept in
+    /// `data` — the row decoders in block repositories read the whole column
+    /// map.
+    #[wasm_bindgen_test]
+    fn numeric_id_is_stringified_and_retained() {
+        let rec = record_from_json_row(serde_json::json!({"id": 7, "v": "x"}));
+        assert_eq!(rec.id, "7");
+        assert_eq!(rec.data.get("id").unwrap(), &serde_json::json!(7));
+    }
+
+    /// The one behaviour the private copy did differently: a non-object row.
+    /// `db_codec::build_records` returned `Err("expected row object")`, which
+    /// failed the whole query on one platform for a shape the other two
+    /// report as an empty record. See `run_fetch`'s doc for why the shared
+    /// answer wins. This fails against the pre-unification tree.
+    #[wasm_bindgen_test]
+    fn a_non_object_row_is_an_empty_record_not_an_error() {
+        let rec = record_from_json_row(serde_json::json!(42));
+        assert_eq!(rec.id, "");
+        assert!(rec.data.is_empty());
+    }
+
+    /// `SELECT COUNT(*) AS "cnt"` — the shared builders alias their scalar
+    /// column themselves, so the scalar accessors must not look it up by name.
+    #[wasm_bindgen_test]
+    fn scalars_read_the_aliased_aggregate_column() {
+        assert_eq!(scalar_i64(Some(serde_json::json!({"cnt": 5}))), 5);
+        assert!((scalar_f64(Some(serde_json::json!({"total": 12.5}))) - 12.5).abs() < f64::EPSILON);
+    }
+
+    /// An absent row counts as zero — the same answer the SQL aggregate gives
+    /// for an empty table, so "no row" can never be mistaken for a count.
+    #[wasm_bindgen_test]
+    fn an_absent_scalar_row_is_zero() {
+        assert_eq!(scalar_i64(None), 0);
+        assert!(scalar_f64(None).abs() < f64::EPSILON);
     }
 }

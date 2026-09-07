@@ -13,9 +13,8 @@
 //! crate, so this crate stays a pure wasm32 cdylib that the native `impresspress`
 //! CLI never has to compile.
 
-// Pure-Rust modules — available on all targets (native + wasm32).
-// openai_codec is pure Rust and tested on native; the rest of `llm` is too
-// (stubs today, real impls later behind wasm32 cfg inside the module).
+// Pure-Rust modules — available on all targets (native + wasm32). The
+// wasm32-only halves are cfg-gated inside each module.
 pub mod image;
 pub mod llm;
 pub mod vector;
@@ -61,7 +60,7 @@ pub use crypto::make_crypto_service;
 #[cfg(target_arch = "wasm32")]
 pub use database::make_database_service;
 #[cfg(target_arch = "wasm32")]
-pub use logger::make_console_logger;
+pub use logger::{init_console_tracing, make_console_logger};
 #[cfg(target_arch = "wasm32")]
 pub use network::make_network_service;
 #[cfg(target_arch = "wasm32")]
