@@ -149,8 +149,10 @@ pub async fn release_asset_object_key(
     r2_binding: &str,
     logical_key: &str,
 ) -> worker::Result<Option<String>> {
-    let Some(identity) =
-        request_services::ReleaseAssetIdentity::from_env(env).map_err(worker::Error::RustError)?
+    let Some(identity) = request_services::ReleaseAssetIdentity::from_environment(
+        &crate::environment::CfEnvironment::capture(env),
+    )
+    .map_err(worker::Error::RustError)?
     else {
         return Ok(None);
     };
@@ -190,27 +192,25 @@ pub fn make_fetch_network_service() -> Arc<dyn NetworkService> {
 
 /// Construct a [`LoggerService`] that writes to `worker::console_log`.
 ///
-/// The minimum emitted level is read at construction from the
-/// `IMPRESSPRESS_CF_LOG_LEVEL` worker var (set via `wrangler.toml [vars]` or
-/// the dashboard) — a runtime knob, unlike the previous `option_env!`
-/// compile-time read, so an operator can raise/lower verbosity per
-/// deployment without rebuilding. Falls back to the compile-time default
-/// (Debug in dev builds, Info in release) when the var is unset or
-/// unparseable. Resolved once per logger construction, which happens at
-/// most once per per-isolate runtime build
-/// (`runtime_cache::get_or_build`) — never on the request hot path.
+/// The minimum emitted level comes from the `IMPRESSPRESS_CF_LOG_LEVEL` worker
+/// var (set via `wrangler.toml [vars]` or the dashboard) — a runtime knob,
+/// unlike the previous `option_env!` compile-time read, so an operator can
+/// raise/lower verbosity per deployment without rebuilding. Falls back to the
+/// compile-time default (Debug in dev builds, Info in release) when the var is
+/// unset or unparseable.
+///
+/// This is the public entry for a consumer that holds only a `worker::Env`; it
+/// captures one. The crate's own request path already has a
+/// [`CfEnvironment`](crate::environment::CfEnvironment) and calls
+/// [`console_logger`] directly, so `IMPRESSPRESS_CF_LOG_LEVEL` is still read
+/// once per request there.
 pub fn make_console_logger(env: &worker::Env) -> Arc<dyn LoggerService> {
-    Arc::new(logger_service::ConsoleLoggerService::new(
-        cf_log_level_var(env).as_deref(),
-    ))
+    console_logger(crate::environment::CfEnvironment::capture(env).cf_log_level())
 }
 
-/// Raw `IMPRESSPRESS_CF_LOG_LEVEL` worker var value, if set. Shared by
-/// [`make_console_logger`] (logger construction) and [`resolved_log_level`]
-/// (Server-Timing gating in `run_inner`) so both resolve from the same read
-/// instead of two independent env lookups that could disagree.
-pub(crate) fn cf_log_level_var(env: &worker::Env) -> Option<String> {
-    env.var(CF_LOG_LEVEL_KEY).ok().map(|v| v.to_string())
+/// [`make_console_logger`] over an already-resolved level.
+pub(crate) fn console_logger(level: Option<&str>) -> Arc<dyn LoggerService> {
+    Arc::new(logger_service::ConsoleLoggerService::new(level))
 }
 
 /// Resolve the Cloudflare console logger's minimum level without needing to
@@ -222,16 +222,11 @@ pub(crate) fn cf_log_level_var(env: &worker::Env) -> Option<String> {
 /// build counter, a signal for when a config bump landed — to every
 /// anonymous client, which is a production fingerprinting concern, not a
 /// dev debugging aid.
-pub(crate) fn resolved_log_level(env: &worker::Env) -> impresspress_core::log_level::LogLevel {
-    logger_service::resolve_level(cf_log_level_var(env).as_deref())
+pub(crate) fn resolved_log_level(
+    environment: &crate::environment::CfEnvironment,
+) -> impresspress_core::log_level::LogLevel {
+    logger_service::resolve_level(environment.cf_log_level())
 }
-
-/// Worker var (`env.var`) that sets the Cloudflare console logger's minimum
-/// emitted level at runtime (`debug`/`info`/`warn`/`error`, case-insensitive
-/// — see [`impresspress_core::log_level::LogLevel::parse`]). Unset or
-/// unparseable falls back to the compile-time default. See
-/// [`make_console_logger`].
-pub(crate) const CF_LOG_LEVEL_KEY: &str = "IMPRESSPRESS_CF_LOG_LEVEL";
 
 /// Construct a [`ConfigService`] from a pre-loaded key/value map.
 ///

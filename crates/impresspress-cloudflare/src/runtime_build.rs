@@ -28,12 +28,11 @@ use wafer_core::interfaces::{
 use crate::{
     boot_hooks::{CfDeployBootHooks, CfRequestBootHooks, PreparedPlanBootHooks},
     config_source,
-    environment::prepared_runtime_identity,
+    environment::{CfEnvironment, BUILDER_WORKER_VAR_KEYS, PROTECTED_ENV_KEYS},
     kv_cached_db, request_services, runner,
     services::{
-        make_config_service, make_console_logger, make_fetch_network_service,
-        make_jwt_crypto_service, make_kv_cached_database_service_with_backend,
-        make_r2_storage_service,
+        console_logger, make_config_service, make_fetch_network_service, make_jwt_crypto_service,
+        make_kv_cached_database_service_with_backend, make_r2_storage_service,
     },
 };
 
@@ -201,8 +200,14 @@ pub(crate) async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<Bo
 /// same tolerance is owed by the `wrap_grants` read the callers make, which is
 /// now `GrantSource::Database` inside `impresspress_core::builder::boot`
 /// rather than a call in this crate.
+// Eight arguments. The captured environment is deliberately a parameter rather
+// than something re-derived from `env` here: reading a var twice per request is
+// exactly what `CfEnvironment` exists to stop, and a function that could reach
+// for `env.var` on its own would put that back.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_runtime<F, G>(
     env: &worker::Env,
+    environment: &CfEnvironment,
     request_config: &HashMap<String, String>,
     prepared_plan: Option<&impresspress_core::PreparedRuntimePlan>,
     register_blocks: F,
@@ -260,9 +265,11 @@ where
     // 3. The structural half of both config surfaces — see
     //    `structural_runtime_config`, which is where every key and its reason
     //    now lives.
-    let (mut runtime_config, mut overlay) = structural_runtime_config(
-        read_structural_config_inputs(env, block_settings.to_config_json(), force_run_migrations),
-    );
+    let (mut runtime_config, mut overlay) = structural_runtime_config(structural_config_inputs(
+        environment,
+        block_settings.to_config_json(),
+        force_run_migrations,
+    ));
 
     // Explicit application request config reaches the async service surface
     // (and the ConfigSource overlay) but NOT the snapshot the cached Wafer
@@ -282,7 +289,7 @@ where
         .to_string();
     let crypto = make_jwt_crypto_service(jwt_secret);
     let network = make_fetch_network_service();
-    let logger = make_console_logger(env);
+    let logger = console_logger(environment.cf_log_level());
 
     // Hand both surfaces over at once. The concrete map-backed service is what
     // THIS request reads through; the builder receives the stateless forwarder,
@@ -312,7 +319,7 @@ where
         config_source::D1ConfigSource::with_overlay(db.clone(), overlay),
     );
     let services = request_services::RequestServices::new(
-        env,
+        environment,
         db.clone(),
         bucket,
         cfg_svc,
@@ -332,7 +339,7 @@ where
     let logger_proxy = request_services::logger_proxy();
     let config_source_proxy = request_services::config_source_proxy();
     let prepared_identity = prepared_plan
-        .map(|_| prepared_runtime_identity(env))
+        .map(|_| environment.prepared_runtime_identity())
         .transpose()?;
     let (wafer, storage_block, block_settings_handle, plan_exporter) =
         request_services::scope_sync(
@@ -400,12 +407,13 @@ where
 /// two config surfaces was build its own `RuntimeConfig` and assert that
 /// `both()` works — which is a `builder::config` unit test wearing a
 /// Cloudflare hat, and would not have noticed a structural key here being
-/// switched to `service_only`.
+/// switched to `service_only`. The reads themselves are now
+/// [`CfEnvironment::capture`]'s, so the split is between "what the environment
+/// holds" and "what this build makes of it".
 struct StructuralConfigInputs {
     /// [`PROTECTED_ENV_KEYS`] that are actually bound as worker secrets.
     secrets: Vec<(&'static str, String)>,
-    /// [`BUILDER_WORKER_VAR_KEYS`] plus `STRICT_SCHEMA_CONFIG_KEY`, for those
-    /// actually bound as worker vars.
+    /// [`BUILDER_WORKER_VAR_KEYS`], for those actually bound as worker vars.
     worker_vars: Vec<(&'static str, String)>,
     /// `BlockSettings::to_config_json` for this build.
     block_settings_json: String,
@@ -413,7 +421,7 @@ struct StructuralConfigInputs {
     run_migrations: bool,
 }
 
-/// Read [`StructuralConfigInputs`] out of the worker environment.
+/// Split [`StructuralConfigInputs`] out of an already-captured environment.
 ///
 /// STRICT_SCHEMA (`WAFER_RUN__DATABASE__STRICT_SCHEMA`) is a worker var
 /// (wrangler.toml `[vars]`) threaded into the config map so the shared
@@ -425,26 +433,23 @@ struct StructuralConfigInputs {
 /// explicitly rather than living in the D1 `variables` table (it's a
 /// deploy-time decision, not an admin-editable runtime toggle). Absent var ⇒
 /// key absent ⇒ default `false`.
-fn read_structural_config_inputs(
-    env: &worker::Env,
+fn structural_config_inputs(
+    environment: &CfEnvironment,
     block_settings_json: String,
     run_migrations: bool,
 ) -> StructuralConfigInputs {
-    let secrets = PROTECTED_ENV_KEYS
-        .iter()
-        .filter_map(|key| env.secret(key).ok().map(|s| (*key, s.to_string())))
-        .collect();
-    let worker_vars = BUILDER_WORKER_VAR_KEYS
-        .iter()
-        .copied()
-        .chain(std::iter::once(
-            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
-        ))
-        .filter_map(|key| env.var(key).ok().map(|var| (key, var.to_string())))
-        .collect();
+    let bound = |keys: &'static [&'static str]| -> Vec<(&'static str, String)> {
+        keys.iter()
+            .filter_map(|key| {
+                environment
+                    .config_value(key)
+                    .map(|value| (*key, value.to_string()))
+            })
+            .collect()
+    };
     StructuralConfigInputs {
-        secrets,
-        worker_vars,
+        secrets: bound(PROTECTED_ENV_KEYS),
+        worker_vars: bound(BUILDER_WORKER_VAR_KEYS),
         block_settings_json,
         run_migrations,
     }
@@ -503,22 +508,104 @@ fn structural_runtime_config(
     (config, overlay)
 }
 
-/// Worker `Env` bindings that override D1 variables (set via
-/// `wrangler secret put`). Most config belongs in D1 so admins can
-/// manage it through the dashboard — this list stays short.
-pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth::JWT_SECRET_KEY];
+/// The config surfaces a **warm** request's services read through: the map
+/// behind this request's `ConfigService`, and the `ConfigSource` overlay
+/// layered over the D1 `variables` rows.
+///
+/// There is no third surface here. A warm request has no snapshot to write —
+/// the isolate-cached runtime already carries one, and one request's values
+/// must never be baked into it — so this is a pair of maps rather than a
+/// [`RuntimeConfig`], whose whole purpose is to couple the async surface to a
+/// snapshot.
+///
+/// Every key [`CfEnvironment`] owns is taken from THIS request's capture and
+/// from nowhere else; the cached runtime's structural snapshot contributes only
+/// the keys the environment does *not* own, which today is the D1-derived
+/// `IMPRESSPRESS_BLOCK_SETTINGS`. A binding removed since the runtime was built
+/// is therefore absent from the map by construction.
+///
+/// That last part used to be a removal branch. The previous code cloned the
+/// whole snapshot and then deleted `PROTECTED_ENV_KEYS` and
+/// `BUILDER_WORKER_VAR_KEYS` back out of it by name when their bindings were
+/// gone — the right answer for the keys somebody had listed, and no answer at
+/// all for `WAFER_RUN__DATABASE__STRICT_SCHEMA`, which was on neither list: a
+/// deployment that dropped that var kept serving with strict schema on until
+/// something else forced a rebuild. Deriving the owned set from the struct that
+/// captured it removes the class instead of the instance.
+fn request_config_surfaces(
+    environment: &CfEnvironment,
+    structural_snapshot: &HashMap<String, String>,
+    request_config: &HashMap<String, String>,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut config_map: HashMap<String, String> = structural_snapshot
+        .iter()
+        .filter(|(key, _)| !CfEnvironment::owns_config_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    config_map.extend(environment.config_map());
 
-/// Shared configuration consumed synchronously while the builder constructs
-/// middleware. Unlike block-scoped values, these cannot be deferred to the
-/// D1-backed `ConfigSource` because the flow already exists by then.
-pub(crate) const BUILDER_WORKER_VAR_KEYS: &[&str] = &[
-    impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
-    impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
-];
+    let mut overlay = HashMap::new();
+    extend_with_request_config(&mut config_map, &mut overlay, request_config);
+    // Secrets are layered over the D1 `variables` rows for the same reason the
+    // cold fill does it: a secret then never has to be mirrored into that table.
+    for key in PROTECTED_ENV_KEYS {
+        if let Some(value) = environment.config_value(key) {
+            overlay.insert((*key).to_string(), value.to_string());
+        }
+    }
+    (config_map, overlay)
+}
+
+/// Construct concrete services for one warm request without performing I/O.
+/// Binding lookup and service allocation are cheap; D1/KV/R2 operations stay
+/// lazy until a block actually calls them.
+///
+/// The cold path's equivalent is [`build_runtime`], which builds the same six
+/// services and then a Wafer around them. Both take their Env-derived config
+/// from the same [`CfEnvironment`] method, so the two paths cannot disagree
+/// about what the environment currently says.
+pub(crate) fn warm_request_services(
+    env: &worker::Env,
+    environment: &CfEnvironment,
+    structural_snapshot: &HashMap<String, String>,
+    request_config: &HashMap<String, String>,
+) -> Result<std::rc::Rc<request_services::RequestServices>, Box<dyn std::error::Error>> {
+    let (db, _kv, _batch_db) = make_kv_cached_database_service_with_backend(
+        env,
+        runner::D1_BINDING,
+        runner::KV_BINDING,
+        kv_cached_db::CacheMode::default(),
+    )?;
+    let storage = make_r2_storage_service(env, runner::R2_BINDING)?;
+
+    let (config_map, overlay) =
+        request_config_surfaces(environment, structural_snapshot, request_config);
+
+    let config = make_config_service(config_map);
+    let crypto = make_jwt_crypto_service(environment.jwt_secret().to_string());
+    let network = make_fetch_network_service();
+    let logger = console_logger(environment.cf_log_level());
+    #[allow(clippy::arc_with_non_send_sync)]
+    let config_source: Arc<dyn wafer_run::ConfigSource> = Arc::new(
+        config_source::D1ConfigSource::with_overlay(db.clone(), overlay),
+    );
+
+    Ok(request_services::RequestServices::new(
+        environment,
+        db,
+        storage,
+        config,
+        crypto,
+        network,
+        logger,
+        config_source,
+    ))
+}
 
 /// Add consumer-declared request config to the async service surfaces only.
-/// Callers clone the structural Wafer snapshot before invoking this helper.
-pub(crate) fn extend_with_request_config(
+/// Both fills call this: the cold one through [`add_request_config`], the warm
+/// one through [`request_config_surfaces`].
+fn extend_with_request_config(
     config: &mut HashMap<String, String>,
     overlay: &mut HashMap<String, String>,
     request_config: &HashMap<String, String>,
@@ -526,9 +613,7 @@ pub(crate) fn extend_with_request_config(
     for (key, value) in request_config {
         // Framework-owned protected/builder keys come from Env and must not be
         // shadowed by a consumer-provided duplicate.
-        if PROTECTED_ENV_KEYS.contains(&key.as_str())
-            || BUILDER_WORKER_VAR_KEYS.contains(&key.as_str())
-        {
+        if CfEnvironment::owns_config_key(key) {
             continue;
         }
         config.insert(key.clone(), value.clone());
@@ -600,6 +685,91 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
+    use crate::environment::test_support::empty_environment;
+
+    /// The warm-request fill takes every Env-owned key from THIS request's
+    /// capture, so a binding removed since the runtime was built cannot survive
+    /// in the map the request's `ConfigService` reads.
+    ///
+    /// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is the case that used to survive.
+    /// The old code cloned the cached runtime's snapshot and then deleted
+    /// `PROTECTED_ENV_KEYS` and `BUILDER_WORKER_VAR_KEYS` back out of it by
+    /// name; strict schema was on neither list, so a deployment that dropped
+    /// the var kept serving with strict schema on — skipping the table-exists
+    /// probe and the lazy column-add — until something else forced a rebuild.
+    #[wasm_bindgen_test]
+    fn a_removed_worker_binding_cannot_survive_in_a_warm_requests_config() {
+        let strict_schema = wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY;
+        let jwt = impresspress_core::blocks::auth::JWT_SECRET_KEY;
+        let block_settings = impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY;
+
+        // What the isolate-cached runtime was built with.
+        let snapshot = HashMap::from([
+            (jwt.to_string(), "old-secret".to_string()),
+            (strict_schema.to_string(), "1".to_string()),
+            (
+                impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY.to_string(),
+                "https://old.test".to_string(),
+            ),
+            (block_settings.to_string(), "{}".to_string()),
+        ]);
+
+        // What the Worker's bindings say NOW: the secret rotated, strict schema
+        // and CORS were removed.
+        let mut environment = empty_environment();
+        environment.set_jwt_secret_for_test("new-secret");
+
+        let (config, overlay) = request_config_surfaces(&environment, &snapshot, &HashMap::new());
+
+        assert_eq!(
+            config.get(jwt).map(String::as_str),
+            Some("new-secret"),
+            "a rotated secret must reach this request",
+        );
+        assert!(
+            !config.contains_key(strict_schema),
+            "a removed worker var must not be inherited from the cached snapshot",
+        );
+        assert!(
+            !config.contains_key(impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY),
+            "a removed worker var must not be inherited from the cached snapshot",
+        );
+        assert_eq!(
+            config.get(block_settings).map(String::as_str),
+            Some("{}"),
+            "the D1-derived key the environment does NOT own still comes from \
+             the runtime that loaded it",
+        );
+        assert_eq!(
+            overlay.get(jwt).map(String::as_str),
+            Some("new-secret"),
+            "secrets are layered over the D1 variables rows, as on the cold path",
+        );
+    }
+
+    /// Consumer request config reaches the warm surfaces, and cannot shadow a
+    /// framework-owned key.
+    #[wasm_bindgen_test]
+    fn warm_request_config_reaches_both_surfaces_but_never_shadows_a_worker_key() {
+        let jwt = impresspress_core::blocks::auth::JWT_SECRET_KEY;
+        let mut environment = empty_environment();
+        environment.set_jwt_secret_for_test("real");
+
+        let request_config = HashMap::from([
+            ("APP_TOKEN".to_string(), "t".to_string()),
+            (jwt.to_string(), "forged".to_string()),
+        ]);
+        let (config, overlay) =
+            request_config_surfaces(&environment, &HashMap::new(), &request_config);
+
+        assert_eq!(config.get("APP_TOKEN").map(String::as_str), Some("t"));
+        assert_eq!(overlay.get("APP_TOKEN").map(String::as_str), Some("t"));
+        assert_eq!(
+            config.get(jwt).map(String::as_str),
+            Some("real"),
+            "consumer request config must not shadow an Env-owned key",
+        );
+    }
 
     /// The structural half of Cloudflare's fill: every key `build_runtime`
     /// installs reaches BOTH surfaces with the same value.

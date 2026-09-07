@@ -72,12 +72,10 @@ use crate::{
         deploy_init_endpoint, deploy_token_authorized, prepared_status_endpoint,
         prepared_verify_endpoint,
     },
-    host_policy::{host_is_version_preview, host_is_workers_dev, ALLOW_WORKERS_DEV_KEY},
-    runtime_build::{extend_with_request_config, BUILDER_WORKER_VAR_KEYS, PROTECTED_ENV_KEYS},
-    services::{
-        make_d1_database_service_concrete, make_kv_backend,
-        make_kv_cached_database_service_with_backend, resolved_log_level,
-    },
+    environment::CfEnvironment,
+    host_policy::{host_is_version_preview, host_is_workers_dev},
+    runtime_build::warm_request_services,
+    services::{make_d1_database_service_concrete, make_kv_backend, resolved_log_level},
 };
 
 thread_local! {
@@ -225,31 +223,33 @@ where
         Arc<dyn StorageService>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
+    // Every `worker::Env` var and secret this request needs, read once, here.
+    // `worker::Env` keeps travelling alongside it for the D1/KV/R2 *bindings*,
+    // which are not var reads. See `environment`'s module doc.
+    let environment = CfEnvironment::capture(&env);
+
     // `std::env` is stubbed to always-empty on `wasm32-unknown-unknown`, so
     // `impresspress_core::ui::assets::base_url()` can never observe
     // `IMPRESSPRESS_ASSET_BASE_URL` through it here. `worker::Env::var` is
-    // the one channel that does carry a Worker `[vars]` entry, so read it
-    // and push it into `base_url()`'s platform override before any code
+    // the one channel that does carry a Worker `[vars]` entry, so push the
+    // captured value into `base_url()`'s platform override before any code
     // path below can render a page (and therefore call `base_url()`).
     // Idempotent (see `set_base_url_override`'s doc) — safe to call on
     // every request, including the fresh-runtime `/_deploy/*` funnels.
-    impresspress_core::ui::assets::set_base_url_override(
-        env.var(impresspress_core::ui::assets::ASSET_BASE_URL_VAR)
-            .ok()
-            .map(|v| v.to_string()),
-    );
+    impresspress_core::ui::assets::set_base_url_override(environment.asset_base_url());
 
     if req.path() == "/_deploy/verify" {
-        return prepared_verify_endpoint(&req, &env).await;
+        return prepared_verify_endpoint(&req, &env, &environment).await;
     }
     if req.path() == "/_deploy/prepared" {
-        return prepared_status_endpoint(&req, &env);
+        return prepared_status_endpoint(&req, &environment);
     }
     if req.path() == "/_deploy/init" || req.path() == "/_deploy/prepare" {
         let prepare_plan = req.path() == "/_deploy/prepare";
         return deploy_init_endpoint(
             req,
             env,
+            environment,
             request_config,
             prepare_plan,
             register_blocks,
@@ -273,16 +273,11 @@ where
     // (`smoke_preview_lockdown`), and an opt-in that opened previews would
     // make the atomic deploy impossible for exactly the consumers it exists
     // for. `wrangler dev` (localhost) is unaffected.
-    if host_is_workers_dev(&req)? && !deploy_token_authorized(&req, &env) {
-        let allowed = env
-            .var(ALLOW_WORKERS_DEV_KEY)
-            .ok()
-            .map(|v| v.to_string())
-            .as_deref()
-            == Some("1");
-        if !allowed || host_is_version_preview(&req, &env)? {
-            return worker::Response::error("not found", 404);
-        }
+    if host_is_workers_dev(&req)?
+        && !deploy_token_authorized(&req, &environment)
+        && (!environment.allows_workers_dev() || host_is_version_preview(&req, &environment)?)
+    {
+        return worker::Response::error("not found", 404);
     }
 
     // Serve `/b/static/` assets straight from the R2 bucket binding,
@@ -304,6 +299,7 @@ where
     let result = run_inner(
         req,
         &env,
+        &environment,
         &request_config,
         register_blocks,
         register_post_build,
@@ -438,76 +434,10 @@ async fn dispatch(
     .await
 }
 
-/// Construct concrete services for one warm request without performing I/O.
-/// Binding lookup and service allocation are cheap; D1/KV/R2 operations stay
-/// lazy until a block actually calls them.
-fn request_services_for_dispatch(
-    env: &worker::Env,
-    structural_snapshot: &HashMap<String, String>,
-    request_config: &HashMap<String, String>,
-) -> Result<std::rc::Rc<request_services::RequestServices>, Box<dyn std::error::Error>> {
-    let (db, _kv, _batch_db) = make_kv_cached_database_service_with_backend(
-        env,
-        runner::D1_BINDING,
-        runner::KV_BINDING,
-        kv_cached_db::CacheMode::default(),
-    )?;
-    let storage = make_r2_storage_service(env, runner::R2_BINDING)?;
-
-    // Start from the runtime's structural snapshot, then overwrite every
-    // framework-owned request-current Env value. The remaining snapshot is
-    // pure data; no binding/client is retained in ReadyRuntime.
-    let mut config_map = structural_snapshot.clone();
-    let mut overlay = HashMap::new();
-    extend_with_request_config(&mut config_map, &mut overlay, request_config);
-    for key in PROTECTED_ENV_KEYS {
-        if let Ok(secret) = env.secret(key) {
-            let value = secret.to_string();
-            config_map.insert((*key).to_string(), value.clone());
-            overlay.insert((*key).to_string(), value);
-        } else {
-            config_map.remove(*key);
-        }
-    }
-    for key in BUILDER_WORKER_VAR_KEYS {
-        match env.var(key) {
-            Ok(var) => {
-                config_map.insert((*key).to_string(), var.to_string());
-            }
-            Err(_) => {
-                config_map.remove(*key);
-            }
-        }
-    }
-
-    let jwt_secret = config_map
-        .get(impresspress_core::blocks::auth::JWT_SECRET_KEY)
-        .cloned()
-        .unwrap_or_default();
-    let config = make_config_service(config_map);
-    let crypto = make_jwt_crypto_service(jwt_secret);
-    let network = make_fetch_network_service();
-    let logger = make_console_logger(env);
-    #[allow(clippy::arc_with_non_send_sync)]
-    let config_source: Arc<dyn wafer_run::ConfigSource> = Arc::new(
-        config_source::D1ConfigSource::with_overlay(db.clone(), overlay),
-    );
-
-    Ok(request_services::RequestServices::new(
-        env,
-        db,
-        storage,
-        config,
-        crypto,
-        network,
-        logger,
-        config_source,
-    ))
-}
-
 async fn run_inner<F, G>(
     req: worker::Request,
     env: &worker::Env,
+    environment: &CfEnvironment,
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -522,10 +452,16 @@ where
     // Reuse the per-isolate runtime; rebuild only when the KV config-version
     // stamp has moved. No boot funnel here — migrations/seeds run at deploy
     // time via `/_deploy/init`, not on the request path.
-    let (rt, cache_outcome) =
-        runtime_cache::get_or_build(env, request_config, register_blocks, register_post_build)
-            .await?;
-    let services = request_services_for_dispatch(env, rt.wafer.config_snapshot(), request_config)?;
+    let (rt, cache_outcome) = runtime_cache::get_or_build(
+        env,
+        environment,
+        request_config,
+        register_blocks,
+        register_post_build,
+    )
+    .await?;
+    let services =
+        warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
     let mut response = dispatch(&rt.wafer, req, services).await?;
 
     // Cheap observability signal (2026-07-16 audit follow-up): one header
@@ -534,7 +470,7 @@ where
     // unconditional header doesn't disclose per-request cache/rebuild state
     // to anonymous clients on production deployments (which default to
     // Info). A failure to set it never fails the request.
-    if resolved_log_level(env) == impresspress_core::log_level::LogLevel::Debug {
+    if resolved_log_level(environment) == impresspress_core::log_level::LogLevel::Debug {
         let server_timing = impresspress_core::metrics::server_timing_header(cache_outcome);
         if let Err(e) = response.headers_mut().set("Server-Timing", &server_timing) {
             worker::console_log!(

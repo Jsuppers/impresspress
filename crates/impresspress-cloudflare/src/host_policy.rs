@@ -7,12 +7,7 @@
 //! `workers.dev` host a consumer has not explicitly opted into with
 //! [`ALLOW_WORKERS_DEV_KEY`].
 
-use crate::environment::VERSION_METADATA_BINDING;
-
-/// Worker var (`env.var`) that opts a consumer out of the `*.workers.dev`
-/// preview-host lockdown in [`run`]. Set to `"1"` to serve the full app on a
-/// `workers.dev` host (e.g. consumers with no custom domain).
-pub(crate) const ALLOW_WORKERS_DEV_KEY: &str = "IMPRESSPRESS_ALLOW_WORKERS_DEV";
+use crate::environment::CfEnvironment;
 
 /// True when the request's host is a `*.workers.dev` host (ASCII
 /// case-insensitive). Drives the preview-host lockdown in [`run`]. Two
@@ -37,21 +32,15 @@ pub(crate) fn host_is_workers_dev(req: &worker::Request) -> worker::Result<bool>
 /// dash.
 pub(crate) fn host_is_version_preview(
     req: &worker::Request,
-    env: &worker::Env,
+    environment: &CfEnvironment,
 ) -> worker::Result<bool> {
     let host = req.url()?.host_str().unwrap_or("").to_ascii_lowercase();
-    // `.filter(|id| !id.is_empty())` matters, and matches what the two other
-    // readers of this binding already do: an empty id is `Some("")`, and
-    // `"".starts_with(prefix)` is false for every prefix, so the host would
-    // be judged NOT a version preview and the lockdown would fail OPEN — the
-    // opposite of the conservative fallback below. Dropping it to `None`
-    // falls back to the hex-prefix pattern, which locks.
-    let version_id = env
-        .get_binding::<worker::WorkerVersionMetadata>(VERSION_METADATA_BINDING)
-        .ok()
-        .map(|metadata| metadata.id())
-        .filter(|id| !id.is_empty());
-    Ok(is_version_preview_host(&host, version_id.as_deref()))
+    // `CfEnvironment::capture` normalises an empty version id to `None`, and
+    // that matters here: `"".starts_with(prefix)` is false for every prefix, so
+    // an empty id would make the host read as NOT a version preview and the
+    // lockdown would fail OPEN — the opposite of the conservative fallback
+    // below, which locks on the hex-prefix pattern alone.
+    Ok(is_version_preview_host(&host, environment.worker_version()))
 }
 
 /// The pure half of [`host_is_version_preview`].

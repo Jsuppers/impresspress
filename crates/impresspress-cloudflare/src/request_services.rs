@@ -87,20 +87,20 @@ thread_local! {
 }
 
 impl ReleaseAssetIdentity {
-    pub(crate) fn from_env(env: &worker::Env) -> Result<Option<Arc<Self>>, String> {
-        let id = env.var(RELEASE_ASSET_ID_VAR).ok().map(|v| v.to_string());
-        let prefix = env
-            .var(RELEASE_ASSET_PREFIX_VAR)
-            .ok()
-            .map(|v| v.to_string());
-        let manifest_key = env
-            .var(RELEASE_ASSET_MANIFEST_VAR)
-            .ok()
-            .map(|v| v.to_string());
-        let keys_sha256 = env
-            .var(impresspress_core::RELEASE_ASSET_KEYS_SHA256_VAR)
-            .ok()
-            .map(|v| v.to_string());
+    /// Parse the release-routing contract out of an already-captured
+    /// environment. The four vars are read once, by
+    /// [`CfEnvironment::capture`](crate::environment::CfEnvironment::capture);
+    /// this is the only thing that interprets them.
+    pub(crate) fn from_environment(
+        environment: &crate::environment::CfEnvironment,
+    ) -> Result<Option<Arc<Self>>, String> {
+        let vars = environment.release_asset_vars();
+        let (id, prefix, manifest_key, keys_sha256) = (
+            vars.id.map(str::to_string),
+            vars.prefix.map(str::to_string),
+            vars.manifest_key.map(str::to_string),
+            vars.keys_sha256.map(str::to_string),
+        );
 
         if id.is_none() && prefix.is_none() && manifest_key.is_none() && keys_sha256.is_none() {
             return Ok(None);
@@ -242,7 +242,7 @@ pub(crate) struct RequestServices {
 impl RequestServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        env: &worker::Env,
+        environment: &crate::environment::CfEnvironment,
         database: Arc<dyn DatabaseService>,
         storage: Arc<dyn StorageService>,
         config: Arc<dyn ConfigService>,
@@ -259,7 +259,7 @@ impl RequestServices {
             network: Some(network),
             logger: Some(logger),
             config_source: Some(config_source),
-            release_assets: ReleaseAssetIdentity::from_env(env),
+            release_assets: ReleaseAssetIdentity::from_environment(environment),
             #[cfg(test)]
             marker: 0,
         })

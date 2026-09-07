@@ -14,7 +14,7 @@ use impresspress_core::builder::{ImpresspressBuilder, PREPARE_RUNTIME_PLAN_KEY};
 use wafer_core::interfaces::storage::service::StorageService;
 
 use crate::{
-    environment::{packaged_prepared_runtime_plan, prepared_runtime_identity},
+    environment::{packaged_prepared_runtime_plan, CfEnvironment},
     kv_cached_db,
     release_manifest::{RuntimeReleaseManifest, RuntimeReleaseManifestIdentity},
     request_services, runner,
@@ -30,6 +30,7 @@ use crate::{
 pub(crate) async fn deploy_init_endpoint<F, G>(
     req: worker::Request,
     env: worker::Env,
+    environment: CfEnvironment,
     mut request_config: HashMap<String, String>,
     prepare_plan: bool,
     register_blocks: F,
@@ -45,22 +46,18 @@ where
     if req.method() != worker::Method::Post {
         return worker::Response::error("method not allowed", 405);
     }
-    if env
-        .secret(impresspress_core::config_vars::DEPLOY_TOKEN_KEY)
-        .is_err()
-    {
+    if environment.deploy_token().is_none() {
         // Secret unset ⇒ endpoint disabled entirely.
         return worker::Response::error("not found", 404);
     }
-    if !deploy_token_authorized(&req, &env) {
+    if !deploy_token_authorized(&req, &environment) {
         return worker::Response::error("unauthorized", 401);
     }
 
     // Deploy-time JWT guard: fail fast with an actionable error when the
     // JWT secret is missing or too short, rather than letting the funnel
-    // run and every downstream auth op start failing. Read the secret the
-    // same way `build_runtime` does (`env.secret(JWT_SECRET_KEY)`, empty
-    // default on error).
+    // run and every downstream auth op start failing. Reads the same captured
+    // value `build_runtime` uses, which is empty when the secret is unbound.
     //
     // This is deliberately narrower than the request path: `crypto_service`'s
     // `jwt()` surfaces a missing/short secret per-operation instead of at
@@ -70,10 +67,7 @@ where
     // funnel (a production deploy or `impresspress serve --target cloudflare`),
     // where the operator is watching and fail-fast is the native-parity
     // point; it never runs on the request path.
-    let jwt_secret_len = env
-        .secret(impresspress_core::blocks::auth::JWT_SECRET_KEY)
-        .map(|s| s.to_string().len())
-        .unwrap_or(0);
+    let jwt_secret_len = environment.jwt_secret().len();
     if jwt_secret_len < wafer_block_crypto::primitives::MIN_JWT_SECRET_LEN {
         return worker::Response::error(
             format!(
@@ -96,6 +90,7 @@ where
     let out = async {
         let mut built = build_runtime(
             &env,
+            &environment,
             &request_config,
             None,
             register_blocks,
@@ -115,7 +110,7 @@ where
                 impresspress_core::platform_state::wrap_grants::load(&built.db).await;
             built.plan_exporter.publish_block_settings(final_settings)?;
             built.plan_exporter.publish_wrap_grants(&final_grants)?;
-            let identity = prepared_runtime_identity(&env)?;
+            let identity = environment.prepared_runtime_identity()?;
             Some((built.plan_exporter.clone(), identity))
         } else {
             None
@@ -206,17 +201,14 @@ where
 /// and the workers.dev preview bypass. The bypass applies to any normal route
 /// only when the exact secret is supplied; unauthenticated preview traffic
 /// remains a plain 404.
-pub(crate) fn deploy_token_authorized(req: &worker::Request, env: &worker::Env) -> bool {
+pub(crate) fn deploy_token_authorized(req: &worker::Request, environment: &CfEnvironment) -> bool {
     let presented = req
         .headers()
         .get("X-Deploy-Token")
         .ok()
         .flatten()
         .unwrap_or_default();
-    let expected = env
-        .secret(impresspress_core::config_vars::DEPLOY_TOKEN_KEY)
-        .map(|secret| secret.to_string())
-        .unwrap_or_default();
+    let expected = environment.deploy_token().unwrap_or_default();
     if presented.is_empty() || expected.is_empty() {
         return false;
     }
@@ -227,18 +219,18 @@ pub(crate) fn deploy_token_authorized(req: &worker::Request, env: &worker::Env) 
 
 pub(crate) fn prepared_status_endpoint(
     req: &worker::Request,
-    env: &worker::Env,
+    environment: &CfEnvironment,
 ) -> worker::Result<worker::Response> {
     if req.method() != worker::Method::Get {
         return worker::Response::error("method not allowed", 405);
     }
-    if !deploy_token_authorized(req, env) {
+    if !deploy_token_authorized(req, environment) {
         return worker::Response::error("not found", 404);
     }
     let result = (|| -> Result<_, Box<dyn std::error::Error>> {
-        let plan = packaged_prepared_runtime_plan(env)?
+        let plan = packaged_prepared_runtime_plan(environment)?
             .ok_or("prepared runtime plan Text module is not installed")?;
-        let identity = prepared_runtime_identity(env)?;
+        let identity = environment.prepared_runtime_identity()?;
         plan.verify_compatibility(
             &identity.application_id,
             &identity.application_build_sha256,
@@ -259,17 +251,18 @@ pub(crate) fn prepared_status_endpoint(
 pub(crate) async fn prepared_verify_endpoint(
     req: &worker::Request,
     env: &worker::Env,
+    environment: &CfEnvironment,
 ) -> worker::Result<worker::Response> {
     if req.method() != worker::Method::Post {
         return worker::Response::error("method not allowed", 405);
     }
-    if !deploy_token_authorized(req, env) {
+    if !deploy_token_authorized(req, environment) {
         return worker::Response::error("not found", 404);
     }
     let result = async {
-        let plan = packaged_prepared_runtime_plan(env)?
+        let plan = packaged_prepared_runtime_plan(environment)?
             .ok_or("prepared runtime plan Text module is not installed")?;
-        let identity = prepared_runtime_identity(env)?;
+        let identity = environment.prepared_runtime_identity()?;
         plan.verify_compatibility(
             &identity.application_id,
             &identity.application_build_sha256,
@@ -292,7 +285,7 @@ pub(crate) async fn prepared_verify_endpoint(
         // Parse the O(1) release routing identity bound into the Worker
         // version. The key inventory itself is fetched and digest-verified
         // from R2 further below.
-        let release_routing = request_services::ReleaseAssetIdentity::from_env(env)
+        let release_routing = request_services::ReleaseAssetIdentity::from_environment(environment)
             .map_err(|error| format!("release routing identity: {error}"))?;
         match (&identity.release_assets, release_routing.as_deref()) {
             (impresspress_core::PreparedReleaseAssets::Absent, None) => {}

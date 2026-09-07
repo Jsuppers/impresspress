@@ -1,18 +1,408 @@
-//! Every `worker::Env` var and secret this crate reads, captured once.
+//! [`CfEnvironment`] — every `worker::Env` var and secret this crate reads,
+//! captured once.
 //!
 //! Cloudflare hands a Worker its configuration as a JS object with no
-//! enumeration API, so each value has to be asked for by name. Before
-//! `CfEnvironment` the crate asked for the same names from five different
-//! functions, and the runtime-identity hash — the value that decides whether an
-//! isolate may keep serving its cached runtime after the deployment's
-//! configuration changed — was a hand-written list of ten of them.
+//! enumeration API, so every value has to be asked for by name. That made the
+//! reads spread out: the JWT secret was read from four functions, the five
+//! release-asset vars from three, and each reader decided independently what to
+//! do when a binding was absent.
+//!
+//! The expensive consequence was the **runtime identity hash** — the value that
+//! decides whether an isolate may keep serving its cached runtime after the
+//! deployment's configuration changed. It was assembled from a hand-written
+//! list of ten names living beside, but separate from, the reads themselves.
+//! Eight of the eighteen keys the crate reads were missing from it, so rotating
+//! the deploy token, moving the asset base URL, flipping the workers.dev opt-in
+//! or re-pointing any of the five prepared-runtime vars changed the Worker's
+//! behaviour while every warm isolate kept serving a runtime built from the old
+//! values. (In practice a real deployment is covered by the
+//! `CF_VERSION_METADATA` fast path below, which is why this was a latent hole
+//! rather than a live outage: the hand list is only its fallback, for local
+//! development and hand-written Wrangler configs that predate the binding.)
+//!
+//! Now there is one struct with one field per key, one [`capture`] that
+//! performs every read, and an [`identity`] derived from the struct's own
+//! fields by `serde`'s field enumeration. Adding a key is adding a field, and a
+//! field cannot be left out of the identity because nobody writes the identity
+//! list.
+//!
+//! # Security
+//!
+//! This struct holds raw secret material (`jwt_secret`, `deploy_token`). It
+//! deliberately derives neither `Debug` nor `Deserialize`; the one thing that
+//! serialises it is [`identity`], which hashes the bytes and drops them. Do not
+//! log a `CfEnvironment`, and do not put one in a `ReadyRuntime` — the hash is
+//! what is safe to keep.
+//!
+//! [`capture`]: CfEnvironment::capture
+//! [`identity`]: CfEnvironment::identity
 
 use std::collections::HashMap;
 
-use crate::{request_services, services::cf_log_level_var};
+use crate::request_services;
 
 /// Name emitted by the generated Wrangler `[version_metadata]` binding.
 pub(crate) const VERSION_METADATA_BINDING: &str = "CF_VERSION_METADATA";
+
+/// Worker var (`env.var`) that opts a consumer out of the `*.workers.dev`
+/// preview-host lockdown in [`run`](crate::run). Set to `"1"` to serve the full
+/// app on a `workers.dev` host (e.g. consumers with no custom domain).
+pub(crate) const ALLOW_WORKERS_DEV_KEY: &str = "IMPRESSPRESS_ALLOW_WORKERS_DEV";
+
+/// Worker var (`env.var`) that sets the Cloudflare console logger's minimum
+/// emitted level at runtime (`debug`/`info`/`warn`/`error`, case-insensitive —
+/// see [`impresspress_core::log_level::LogLevel::parse`]). Unset or unparseable
+/// falls back to the compile-time default. See
+/// [`make_console_logger`](crate::make_console_logger).
+pub(crate) const CF_LOG_LEVEL_KEY: &str = "IMPRESSPRESS_CF_LOG_LEVEL";
+
+/// Worker `Env` bindings that override D1 variables (set via
+/// `wrangler secret put`). Most config belongs in D1 so admins can manage it
+/// through the dashboard — this list stays short.
+pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth::JWT_SECRET_KEY];
+
+/// Shared configuration consumed synchronously while the builder constructs
+/// middleware, plus the one operational database knob a deploy sets in
+/// `wrangler.toml`. Unlike block-scoped values these cannot be deferred to the
+/// D1-backed `ConfigSource`, because the flow (and the database service) already
+/// exist by the time per-block config is resolvable.
+pub(crate) const BUILDER_WORKER_VAR_KEYS: &[&str] = &[
+    impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+    impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
+    wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
+];
+
+/// Every `worker::Env` var and secret this crate reads, as one value.
+///
+/// One field per key, `None` when the binding is absent. The field order is
+/// load-bearing in exactly one place — [`identity`](Self::identity) hashes the
+/// serialised struct, so reordering or renaming fields changes the hash and
+/// costs every isolate one rebuild. That is the correct trade for the property
+/// it buys: a new key cannot be added to the Worker's surface without also
+/// entering the identity.
+///
+/// See the module docs for why this must not be logged.
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct CfEnvironment {
+    /// `CF_VERSION_METADATA`'s version id, and the one field that is not a
+    /// var/secret read: Cloudflare versions capture bindings, secrets, code and
+    /// compatibility settings together, so when it is present it *is* the
+    /// identity and nothing else needs hashing. Empty ids are normalised to
+    /// `None` — `"".starts_with(prefix)` is false for every prefix, which would
+    /// make the version-preview lockdown fail open.
+    worker_version: Option<String>,
+
+    // ── application config that reaches a runtime's config surfaces ──────────
+    jwt_secret: Option<String>,
+    cors_allowed_origins: Option<String>,
+    csp_directives: Option<String>,
+    strict_schema: Option<String>,
+
+    // ── operational knobs read by a service constructor or a request guard ───
+    cf_log_level: Option<String>,
+    asset_base_url: Option<String>,
+    allow_workers_dev: Option<String>,
+    deploy_token: Option<String>,
+
+    // ── the release-asset contract ──────────────────────────────────────────
+    release_asset_id: Option<String>,
+    release_asset_prefix: Option<String>,
+    release_asset_manifest: Option<String>,
+    release_asset_manifest_sha256: Option<String>,
+    release_asset_keys_sha256: Option<String>,
+
+    // ── the prepared-runtime contract ───────────────────────────────────────
+    prepared_application_id: Option<String>,
+    prepared_application_build_sha256: Option<String>,
+    prepared_wafer_lock_identity_json: Option<String>,
+    prepared_plan_hash: Option<String>,
+    prepared_plan_module_sha256: Option<String>,
+}
+
+fn var(env: &worker::Env, name: &str) -> Option<String> {
+    env.var(name).ok().map(|value| value.to_string())
+}
+
+fn secret(env: &worker::Env, name: &str) -> Option<String> {
+    env.secret(name).ok().map(|value| value.to_string())
+}
+
+impl CfEnvironment {
+    /// Read every var and secret this crate consumes, once.
+    ///
+    /// These are synchronous JS property lookups on the `Env` object — no I/O,
+    /// no subrequests — so reading the whole set costs what reading a handful
+    /// used to. Capture happens at each entry point that owns a `worker::Env`
+    /// ([`run_with_config`](crate::run_with_config) and the two public
+    /// constructors that take one) and the captured value travels from there;
+    /// `worker::Env` itself keeps travelling alongside it for the D1/KV/R2
+    /// *bindings*, which are not var reads.
+    pub(crate) fn capture(env: &worker::Env) -> Self {
+        Self {
+            worker_version: env
+                .get_binding::<worker::WorkerVersionMetadata>(VERSION_METADATA_BINDING)
+                .ok()
+                .map(|metadata| metadata.id())
+                .filter(|id| !id.is_empty()),
+
+            jwt_secret: secret(env, impresspress_core::blocks::auth::JWT_SECRET_KEY),
+            cors_allowed_origins: var(
+                env,
+                impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+            ),
+            csp_directives: var(env, impresspress_core::config_vars::CSP_DIRECTIVES_KEY),
+            strict_schema: var(
+                env,
+                wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
+            ),
+
+            cf_log_level: var(env, CF_LOG_LEVEL_KEY),
+            asset_base_url: var(env, impresspress_core::ui::assets::ASSET_BASE_URL_VAR),
+            allow_workers_dev: var(env, ALLOW_WORKERS_DEV_KEY),
+            deploy_token: secret(env, impresspress_core::config_vars::DEPLOY_TOKEN_KEY),
+
+            release_asset_id: var(env, request_services::RELEASE_ASSET_ID_VAR),
+            release_asset_prefix: var(env, request_services::RELEASE_ASSET_PREFIX_VAR),
+            release_asset_manifest: var(env, request_services::RELEASE_ASSET_MANIFEST_VAR),
+            release_asset_manifest_sha256: var(
+                env,
+                impresspress_core::RELEASE_ASSET_MANIFEST_SHA256_VAR,
+            ),
+            release_asset_keys_sha256: var(env, impresspress_core::RELEASE_ASSET_KEYS_SHA256_VAR),
+
+            prepared_application_id: var(env, impresspress_core::PREPARED_APPLICATION_ID_VAR),
+            prepared_application_build_sha256: var(
+                env,
+                impresspress_core::PREPARED_APPLICATION_BUILD_SHA256_VAR,
+            ),
+            prepared_wafer_lock_identity_json: var(
+                env,
+                impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR,
+            ),
+            prepared_plan_hash: var(env, impresspress_core::PREPARED_PLAN_HASH_VAR),
+            prepared_plan_module_sha256: var(
+                env,
+                impresspress_core::PREPARED_PLAN_MODULE_SHA256_VAR,
+            ),
+        }
+    }
+
+    /// Request-current identity for every environment value an isolate-cached
+    /// runtime was constructed from, plus this request's explicit config.
+    ///
+    /// The Worker version id is the deployed fast path: a Cloudflare version
+    /// captures bindings, secrets/config, code and compatibility settings
+    /// together, so an ordinary warm request needs no hashing at all. The
+    /// explicit value hash below is only a fallback for local development and
+    /// hand-written Wrangler configs that have not adopted the metadata
+    /// binding.
+    ///
+    /// The fallback hashes the serialised struct rather than a list of named
+    /// components: `serde`'s derive enumerates the fields, so the set that is
+    /// hashed is the set that exists. JSON's own quoting makes that half
+    /// unambiguous, which is what the previous length-prefixed hand encoding
+    /// was for, and the fixed-length request-config digest appended after it
+    /// cannot be confused with it. Raw secret material never leaves this
+    /// function.
+    pub(crate) fn identity(&self, request_config: &HashMap<String, String>) -> String {
+        let request_config_hash = config_identity_hash(request_config);
+        if let Some(version_id) = &self.worker_version {
+            return format!("worker-version:{version_id}:request-config:{request_config_hash}");
+        }
+
+        // Infallible: every field is an `Option<String>`, and `serde_json`
+        // cannot fail on those. `expect` rather than a silent default because a
+        // default here would give two different environments the same identity.
+        let mut encoded =
+            serde_json::to_vec(self).expect("CfEnvironment serialises to JSON infallibly");
+        encoded.extend_from_slice(request_config_hash.as_bytes());
+        impresspress_core::util::sha256_hex(&encoded)
+    }
+
+    /// The captured value of a config key this environment owns, or `None` when
+    /// the binding is absent.
+    ///
+    /// "Owns" is [`PROTECTED_ENV_KEYS`] plus [`BUILDER_WORKER_VAR_KEYS`]: those
+    /// two lists are what makes a key Env-derived rather than D1-derived, and
+    /// they are checked in three places (the structural fill, the warm-request
+    /// fill, and the guard that stops consumer request config shadowing a
+    /// framework key). `environment_owned_config_keys_all_resolve` pins that
+    /// every key on them reaches a field here.
+    pub(crate) fn config_value(&self, key: &str) -> Option<&str> {
+        let field = if key == impresspress_core::blocks::auth::JWT_SECRET_KEY {
+            &self.jwt_secret
+        } else if key == impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY {
+            &self.cors_allowed_origins
+        } else if key == impresspress_core::config_vars::CSP_DIRECTIVES_KEY {
+            &self.csp_directives
+        } else if key == wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY {
+            &self.strict_schema
+        } else {
+            return None;
+        };
+        field.as_deref()
+    }
+
+    /// Whether a config key comes from the Worker environment rather than from
+    /// the D1 `variables` table.
+    pub(crate) fn owns_config_key(key: &str) -> bool {
+        PROTECTED_ENV_KEYS.contains(&key) || BUILDER_WORKER_VAR_KEYS.contains(&key)
+    }
+
+    /// Every config key this environment owns that is actually bound, at the
+    /// value THIS request sees.
+    ///
+    /// Both the cold fill (`structural_config_inputs`) and the warm fill
+    /// (`request_config_surfaces`) build their Env-derived half from this, so a
+    /// binding that has been removed since a runtime was built is absent from
+    /// both by construction rather than deleted back out by name.
+    pub(crate) fn config_map(&self) -> HashMap<String, String> {
+        PROTECTED_ENV_KEYS
+            .iter()
+            .chain(BUILDER_WORKER_VAR_KEYS)
+            .filter_map(|key| {
+                self.config_value(key)
+                    .map(|value| ((*key).to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Bind the JWT secret. Test-only: production code fills every field
+    /// through [`capture`](Self::capture) and nowhere else.
+    #[cfg(test)]
+    pub(crate) fn set_jwt_secret_for_test(&mut self, value: &str) {
+        self.jwt_secret = Some(value.to_string());
+    }
+
+    /// The deployed Worker version id, when the `[version_metadata]` binding is
+    /// configured and non-empty.
+    pub(crate) fn worker_version(&self) -> Option<&str> {
+        self.worker_version.as_deref()
+    }
+
+    /// Raw `IMPRESSPRESS_CF_LOG_LEVEL` value, if set.
+    pub(crate) fn cf_log_level(&self) -> Option<&str> {
+        self.cf_log_level.as_deref()
+    }
+
+    /// `IMPRESSPRESS_ASSET_BASE_URL`, the platform override for
+    /// [`impresspress_core::ui::assets::base_url`]. `std::env` is stubbed to
+    /// always-empty on `wasm32-unknown-unknown`, so `worker::Env` is the only
+    /// channel that carries it.
+    pub(crate) fn asset_base_url(&self) -> Option<String> {
+        self.asset_base_url.clone()
+    }
+
+    /// Whether this consumer has opted out of the `*.workers.dev` lockdown for
+    /// its canonical worker host. A *version preview* host stays locked either
+    /// way — see [`host_policy`](crate::host_policy).
+    pub(crate) fn allows_workers_dev(&self) -> bool {
+        self.allow_workers_dev.as_deref() == Some("1")
+    }
+
+    /// The deploy-token secret. `None` disables the `/_deploy/*` control plane
+    /// outright.
+    pub(crate) fn deploy_token(&self) -> Option<&str> {
+        self.deploy_token.as_deref()
+    }
+
+    /// The JWT signing secret, empty when unbound — the same "empty default on
+    /// error" shape every reader of it used before, so a missing secret
+    /// surfaces per-operation from `crypto_service` rather than at Worker boot.
+    pub(crate) fn jwt_secret(&self) -> &str {
+        self.jwt_secret.as_deref().unwrap_or_default()
+    }
+
+    /// The four vars that make up the release-asset routing contract, if any of
+    /// them is bound.
+    pub(crate) fn release_asset_vars(&self) -> ReleaseAssetVars<'_> {
+        ReleaseAssetVars {
+            id: self.release_asset_id.as_deref(),
+            prefix: self.release_asset_prefix.as_deref(),
+            manifest_key: self.release_asset_manifest.as_deref(),
+            keys_sha256: self.release_asset_keys_sha256.as_deref(),
+        }
+    }
+
+    /// The immutable identity a prepared runtime plan is verified against.
+    ///
+    /// Every var here is *required*: a Worker carrying a packaged plan and a
+    /// half-configured identity must fail verification rather than hydrate
+    /// against a contract it cannot check.
+    pub(crate) fn prepared_runtime_identity(
+        &self,
+    ) -> Result<PreparedRuntimeIdentity, Box<dyn std::error::Error>> {
+        let required = |name: &str,
+                        value: Option<&String>|
+         -> Result<String, Box<dyn std::error::Error>> {
+            let value = value
+                .ok_or_else(|| format!("required prepared-runtime Worker var {name} is not set"))?;
+            if value.trim().is_empty() {
+                return Err(format!("required prepared-runtime Worker var {name} is empty").into());
+            }
+            Ok(value.clone())
+        };
+
+        let application_id = required(
+            impresspress_core::PREPARED_APPLICATION_ID_VAR,
+            self.prepared_application_id.as_ref(),
+        )?;
+        let application_build_sha256 = required(
+            impresspress_core::PREPARED_APPLICATION_BUILD_SHA256_VAR,
+            self.prepared_application_build_sha256.as_ref(),
+        )?;
+        let dependency_lock = serde_json::from_str(&required(
+            impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR,
+            self.prepared_wafer_lock_identity_json.as_ref(),
+        )?)?;
+
+        let release_assets = match self.release_asset_id.as_deref() {
+            Some(asset_id) if !asset_id.is_empty() => {
+                let asset_set_sha256 = if asset_id.starts_with("sha256:") {
+                    asset_id.to_string()
+                } else {
+                    format!("sha256:{asset_id}")
+                };
+                impresspress_core::PreparedReleaseAssets::present(
+                    asset_set_sha256,
+                    required(
+                        request_services::RELEASE_ASSET_PREFIX_VAR,
+                        self.release_asset_prefix.as_ref(),
+                    )?,
+                    required(
+                        request_services::RELEASE_ASSET_MANIFEST_VAR,
+                        self.release_asset_manifest.as_ref(),
+                    )?,
+                    required(
+                        impresspress_core::RELEASE_ASSET_MANIFEST_SHA256_VAR,
+                        self.release_asset_manifest_sha256.as_ref(),
+                    )?,
+                    required(
+                        impresspress_core::RELEASE_ASSET_KEYS_SHA256_VAR,
+                        self.release_asset_keys_sha256.as_ref(),
+                    )?,
+                )?
+            }
+            _ => impresspress_core::PreparedReleaseAssets::absent(),
+        };
+
+        Ok(PreparedRuntimeIdentity {
+            application_id,
+            application_build_sha256,
+            dependency_lock,
+            release_assets,
+        })
+    }
+}
+
+/// The four release-routing vars, borrowed out of a [`CfEnvironment`] so
+/// `request_services` can parse them without a second set of reads.
+pub(crate) struct ReleaseAssetVars<'a> {
+    pub(crate) id: Option<&'a str>,
+    pub(crate) prefix: Option<&'a str>,
+    pub(crate) manifest_key: Option<&'a str>,
+    pub(crate) keys_sha256: Option<&'a str>,
+}
 
 #[derive(Clone)]
 pub(crate) struct PreparedRuntimeIdentity {
@@ -42,58 +432,11 @@ thread_local! {
         const { impresspress_core::IdentityCache::new() };
 }
 
-pub(crate) fn prepared_runtime_identity(
-    env: &worker::Env,
-) -> Result<PreparedRuntimeIdentity, Box<dyn std::error::Error>> {
-    let required_var = |name: &str| -> Result<String, Box<dyn std::error::Error>> {
-        let value = env
-            .var(name)
-            .map_err(|e| format!("required prepared-runtime Worker var {name}: {e}"))?
-            .to_string();
-        if value.trim().is_empty() {
-            return Err(format!("required prepared-runtime Worker var {name} is empty").into());
-        }
-        Ok(value)
-    };
-    let application_id = required_var(impresspress_core::PREPARED_APPLICATION_ID_VAR)?;
-    let application_build_sha256 =
-        required_var(impresspress_core::PREPARED_APPLICATION_BUILD_SHA256_VAR)?;
-    let dependency_lock = serde_json::from_str(&required_var(
-        impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR,
-    )?)?;
-
-    let release_assets = match env.var(request_services::RELEASE_ASSET_ID_VAR) {
-        Ok(asset_id) if !asset_id.to_string().is_empty() => {
-            let asset_id = asset_id.to_string();
-            let asset_set_sha256 = if asset_id.starts_with("sha256:") {
-                asset_id
-            } else {
-                format!("sha256:{asset_id}")
-            };
-            impresspress_core::PreparedReleaseAssets::present(
-                asset_set_sha256,
-                required_var(request_services::RELEASE_ASSET_PREFIX_VAR)?,
-                required_var(request_services::RELEASE_ASSET_MANIFEST_VAR)?,
-                required_var(impresspress_core::RELEASE_ASSET_MANIFEST_SHA256_VAR)?,
-                required_var(impresspress_core::RELEASE_ASSET_KEYS_SHA256_VAR)?,
-            )?
-        }
-        _ => impresspress_core::PreparedReleaseAssets::absent(),
-    };
-
-    Ok(PreparedRuntimeIdentity {
-        application_id,
-        application_build_sha256,
-        dependency_lock,
-        release_assets,
-    })
-}
-
 /// Read the immutable Text-module payload installed by the final Worker shim.
 /// The candidate upload intentionally has no such global and returns `None`.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn packaged_prepared_runtime_plan(
-    env: &worker::Env,
+    environment: &CfEnvironment,
 ) -> Result<Option<std::rc::Rc<impresspress_core::PreparedRuntimePlan>>, Box<dyn std::error::Error>>
 {
     let value = js_sys::Reflect::get(
@@ -107,25 +450,23 @@ pub(crate) fn packaged_prepared_runtime_plan(
     if !value.is_string() {
         return Ok(None);
     }
-    let expected_module_sha256 = env
-        .var(impresspress_core::PREPARED_PLAN_MODULE_SHA256_VAR)
-        .map_err(|e| format!("prepared plan module digest Worker var: {e}"))?
+    let expected_module_sha256 = environment
+        .prepared_plan_module_sha256
+        .clone()
+        .ok_or("prepared plan module digest Worker var is not set")?;
+    let expected_plan_hash = environment
+        .prepared_plan_hash
+        .clone()
+        .ok_or("prepared plan hash Worker var is not set")?;
+    let worker_version = environment
+        .worker_version()
+        .unwrap_or("no-version-metadata")
         .to_string();
-    let expected_plan_hash = env
-        .var(impresspress_core::PREPARED_PLAN_HASH_VAR)
-        .map_err(|e| format!("prepared plan hash Worker var: {e}"))?
-        .to_string();
-    let worker_version = env
-        .get_binding::<worker::WorkerVersionMetadata>(VERSION_METADATA_BINDING)
-        .ok()
-        .map(|metadata| metadata.id())
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| "no-version-metadata".to_string());
     let cache_key = format!("{worker_version}\n{expected_plan_hash}\n{expected_module_sha256}");
     // Decode OUTSIDE the cache's critical section, exactly as
-    // `ReleaseAssetIdentity::from_env` does: look up, release, verify, store.
-    // The integrity checks below are unchanged and unconditional — a cache
-    // hit is only ever a value that already passed them under this same
+    // `ReleaseAssetIdentity::from_environment` does: look up, release, verify,
+    // store. The integrity checks below are unchanged and unconditional — a
+    // cache hit is only ever a value that already passed them under this same
     // Worker version, plan hash, and module digest.
     let plan = PREPARED_PLAN_CACHE.with(|cache| {
         cache.get_or_try_insert_with(cache_key, || {
@@ -146,99 +487,13 @@ pub(crate) fn packaged_prepared_runtime_plan(
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn packaged_prepared_runtime_plan(
-    _env: &worker::Env,
+    _environment: &CfEnvironment,
 ) -> Result<Option<std::rc::Rc<impresspress_core::PreparedRuntimePlan>>, Box<dyn std::error::Error>>
 {
     Ok(None)
 }
 
-/// Request-current identity for every environment value captured while
-/// constructing an isolate-cached runtime.
-///
-/// The Worker version ID is the deployed fast path: Cloudflare versions
-/// capture bindings, secrets/config, code, and compatibility settings, so no
-/// secret reads or hashing are needed on an ordinary warm request. The
-/// explicit value hash is only a fallback for local development and
-/// hand-written Wrangler configs that have not adopted the metadata binding
-/// yet. Raw secret material never leaves this function.
-pub(crate) fn runtime_environment_identity(
-    env: &worker::Env,
-    request_config: &HashMap<String, String>,
-) -> String {
-    let request_config_hash = config_identity_hash(request_config);
-    if let Ok(metadata) = env.get_binding::<worker::WorkerVersionMetadata>(VERSION_METADATA_BINDING)
-    {
-        let version_id = metadata.id();
-        if !version_id.is_empty() {
-            return format!("worker-version:{version_id}:request-config:{request_config_hash}");
-        }
-    }
-
-    let jwt_secret = env
-        .secret(impresspress_core::blocks::auth::JWT_SECRET_KEY)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let strict_schema = env
-        .var(wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let log_level = cf_log_level_var(env).unwrap_or_default();
-    let cors = env
-        .var(impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let csp = env
-        .var(impresspress_core::config_vars::CSP_DIRECTIVES_KEY)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let release_id = env
-        .var(request_services::RELEASE_ASSET_ID_VAR)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let release_prefix = env
-        .var(request_services::RELEASE_ASSET_PREFIX_VAR)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let release_manifest = env
-        .var(request_services::RELEASE_ASSET_MANIFEST_VAR)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let release_manifest_hash = env
-        .var(impresspress_core::RELEASE_ASSET_MANIFEST_SHA256_VAR)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let release_keys_hash = env
-        .var(impresspress_core::RELEASE_ASSET_KEYS_SHA256_VAR)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-
-    // Length prefixes make the encoding unambiguous even if values contain
-    // separators. Hashing also keeps the JWT secret out of ReadyRuntime and
-    // diagnostics.
-    let components = [
-        ("jwt-secret", jwt_secret.as_str()),
-        ("strict-schema", strict_schema.as_str()),
-        ("log-level", log_level.as_str()),
-        ("cors", cors.as_str()),
-        ("csp", csp.as_str()),
-        ("release-id", release_id.as_str()),
-        ("release-prefix", release_prefix.as_str()),
-        ("release-manifest", release_manifest.as_str()),
-        ("release-manifest-hash", release_manifest_hash.as_str()),
-        ("release-keys-hash", release_keys_hash.as_str()),
-        ("request-config", request_config_hash.as_str()),
-    ];
-    let mut encoded = Vec::new();
-    for (name, value) in components {
-        encoded.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        encoded.extend_from_slice(name.as_bytes());
-        encoded.extend_from_slice(&(value.len() as u64).to_le_bytes());
-        encoded.extend_from_slice(value.as_bytes());
-    }
-    impresspress_core::util::sha256_hex(&encoded)
-}
-
-fn config_identity_hash(config: &HashMap<String, String>) -> String {
+pub(crate) fn config_identity_hash(config: &HashMap<String, String>) -> String {
     let mut entries: Vec<_> = config.iter().collect();
     entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
     let mut encoded = Vec::new();
@@ -252,10 +507,405 @@ fn config_identity_hash(config: &HashMap<String, String>) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::CfEnvironment;
+
+    /// A [`CfEnvironment`] with every field unbound, for tests that set one
+    /// field at a time. Not `Default`: production code must obtain one from
+    /// [`CfEnvironment::capture`] and nowhere else.
+    pub(crate) fn empty_environment() -> CfEnvironment {
+        CfEnvironment {
+            worker_version: None,
+            jwt_secret: None,
+            cors_allowed_origins: None,
+            csp_directives: None,
+            strict_schema: None,
+            cf_log_level: None,
+            asset_base_url: None,
+            allow_workers_dev: None,
+            deploy_token: None,
+            release_asset_id: None,
+            release_asset_prefix: None,
+            release_asset_manifest: None,
+            release_asset_manifest_sha256: None,
+            release_asset_keys_sha256: None,
+            prepared_application_id: None,
+            prepared_application_build_sha256: None,
+            prepared_wafer_lock_identity_json: None,
+            prepared_plan_hash: None,
+            prepared_plan_module_sha256: None,
+        }
+    }
+
+    /// Every captured field, as a setter that stores a distinguishable value.
+    ///
+    /// This is the list `identity_changes_when_any_captured_field_changes`
+    /// walks. It is written out by hand *on purpose*: it is the test's
+    /// independent statement of what the struct holds, so a field added to
+    /// `CfEnvironment` and forgotten here fails
+    /// `every_captured_field_is_covered_by_the_identity_table` on the field
+    /// count rather than passing silently.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn mutators() -> Vec<(&'static str, fn(&mut CfEnvironment))> {
+        vec![
+            ("worker_version", |e| {
+                e.worker_version = Some("v".to_string())
+            }),
+            ("jwt_secret", |e| e.jwt_secret = Some("v".to_string())),
+            ("cors_allowed_origins", |e| {
+                e.cors_allowed_origins = Some("v".to_string())
+            }),
+            ("csp_directives", |e| {
+                e.csp_directives = Some("v".to_string())
+            }),
+            ("strict_schema", |e| e.strict_schema = Some("v".to_string())),
+            ("cf_log_level", |e| e.cf_log_level = Some("v".to_string())),
+            ("asset_base_url", |e| {
+                e.asset_base_url = Some("v".to_string())
+            }),
+            ("allow_workers_dev", |e| {
+                e.allow_workers_dev = Some("v".to_string())
+            }),
+            ("deploy_token", |e| e.deploy_token = Some("v".to_string())),
+            ("release_asset_id", |e| {
+                e.release_asset_id = Some("v".to_string())
+            }),
+            ("release_asset_prefix", |e| {
+                e.release_asset_prefix = Some("v".to_string())
+            }),
+            ("release_asset_manifest", |e| {
+                e.release_asset_manifest = Some("v".to_string())
+            }),
+            ("release_asset_manifest_sha256", |e| {
+                e.release_asset_manifest_sha256 = Some("v".to_string())
+            }),
+            ("release_asset_keys_sha256", |e| {
+                e.release_asset_keys_sha256 = Some("v".to_string())
+            }),
+            ("prepared_application_id", |e| {
+                e.prepared_application_id = Some("v".to_string())
+            }),
+            ("prepared_application_build_sha256", |e| {
+                e.prepared_application_build_sha256 = Some("v".to_string())
+            }),
+            ("prepared_wafer_lock_identity_json", |e| {
+                e.prepared_wafer_lock_identity_json = Some("v".to_string())
+            }),
+            ("prepared_plan_hash", |e| {
+                e.prepared_plan_hash = Some("v".to_string())
+            }),
+            ("prepared_plan_module_sha256", |e| {
+                e.prepared_plan_module_sha256 = Some("v".to_string())
+            }),
+        ]
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use super::*;
+    use super::{test_support::*, *};
+
+    /// A `worker::Env` fake: a JS `Proxy` over an object of string bindings
+    /// whose `get` trap counts every property lookup by name.
+    ///
+    /// `worker::Env` is a `#[wasm_bindgen] extern "C"` type — a `JsValue`
+    /// newtype — and both `env.var` and `env.secret` resolve through
+    /// `js_sys::Reflect::get`, so a `Proxy` sees every read this crate makes.
+    struct RecordingEnv {
+        env: worker::Env,
+        reads: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        // Kept alive for as long as the Proxy can call it.
+        _trap: wasm_bindgen::closure::Closure<
+            dyn FnMut(js_sys::Object, wasm_bindgen::JsValue) -> wasm_bindgen::JsValue,
+        >,
+    }
+
+    impl RecordingEnv {
+        fn new(bindings: &[(&str, &str)]) -> Self {
+            let target = js_sys::Object::new();
+            for (name, value) in bindings {
+                js_sys::Reflect::set(
+                    &target,
+                    &wasm_bindgen::JsValue::from_str(name),
+                    &wasm_bindgen::JsValue::from_str(value),
+                )
+                .expect("set a property on a plain object");
+            }
+
+            let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let recorded = reads.clone();
+            let trap = wasm_bindgen::closure::Closure::new(
+                move |obj: js_sys::Object, key: wasm_bindgen::JsValue| -> wasm_bindgen::JsValue {
+                    if let Some(name) = key.as_string() {
+                        recorded.borrow_mut().push(name);
+                    }
+                    js_sys::Reflect::get(&obj, &key).unwrap_or(wasm_bindgen::JsValue::UNDEFINED)
+                },
+            );
+
+            let handler = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &handler,
+                &wasm_bindgen::JsValue::from_str("get"),
+                trap.as_ref(),
+            )
+            .expect("install the get trap");
+
+            let proxy = js_sys::Proxy::new(&target, &handler);
+            Self {
+                env: wasm_bindgen::JsValue::from(proxy).unchecked_into::<worker::Env>(),
+                reads,
+                _trap: trap,
+            }
+        }
+
+        fn reads_of(&self, name: &str) -> usize {
+            self.reads
+                .borrow()
+                .iter()
+                .filter(|read| read.as_str() == name)
+                .count()
+        }
+    }
+
+    /// Every key the Worker reads, and a value to bind it to. The point of the
+    /// list is that `capture` asks for each name EXACTLY once: the reads used
+    /// to be spread over five functions, and the JWT secret alone was read four
+    /// times on a cold `/_deploy/init`.
+    fn every_key() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (impresspress_core::blocks::auth::JWT_SECRET_KEY, "jwt"),
+            (
+                impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+                "https://example.test",
+            ),
+            (
+                impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
+                "default-src 'self'",
+            ),
+            (
+                wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
+                "1",
+            ),
+            (CF_LOG_LEVEL_KEY, "debug"),
+            (
+                impresspress_core::ui::assets::ASSET_BASE_URL_VAR,
+                "https://cdn.example.test",
+            ),
+            (ALLOW_WORKERS_DEV_KEY, "1"),
+            (impresspress_core::config_vars::DEPLOY_TOKEN_KEY, "token"),
+            (
+                request_services::RELEASE_ASSET_ID_VAR,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                request_services::RELEASE_ASSET_PREFIX_VAR,
+                ".impresspress/releases/v1/immutable/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                request_services::RELEASE_ASSET_MANIFEST_VAR,
+                ".impresspress/releases/v1/immutable/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/manifest.json",
+            ),
+            (
+                impresspress_core::RELEASE_ASSET_MANIFEST_SHA256_VAR,
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            (
+                impresspress_core::RELEASE_ASSET_KEYS_SHA256_VAR,
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+            (impresspress_core::PREPARED_APPLICATION_ID_VAR, "app"),
+            (
+                impresspress_core::PREPARED_APPLICATION_BUILD_SHA256_VAR,
+                "sha256:d",
+            ),
+            (
+                impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR,
+                r#"{"state":"absent"}"#,
+            ),
+            (impresspress_core::PREPARED_PLAN_HASH_VAR, "planhash"),
+            (
+                impresspress_core::PREPARED_PLAN_MODULE_SHA256_VAR,
+                "modhash",
+            ),
+        ]
+    }
+
+    #[wasm_bindgen_test]
+    fn capture_reads_every_key_exactly_once() {
+        let bindings = every_key();
+        let env = RecordingEnv::new(&bindings);
+        let captured = CfEnvironment::capture(&env.env);
+
+        for (name, _) in &bindings {
+            assert_eq!(
+                env.reads_of(name),
+                1,
+                "{name} must be read exactly once per capture",
+            );
+        }
+        assert_eq!(
+            env.reads_of(VERSION_METADATA_BINDING),
+            1,
+            "the version-metadata binding is also read once",
+        );
+
+        // Every read landed in a field: capture is what makes the struct the
+        // single source, so a key read and then dropped would be worse than not
+        // reading it.
+        assert_eq!(captured.jwt_secret(), "jwt");
+        assert_eq!(captured.cf_log_level(), Some("debug"));
+        assert_eq!(
+            captured.asset_base_url().as_deref(),
+            Some("https://cdn.example.test")
+        );
+        assert!(captured.allows_workers_dev());
+        assert_eq!(captured.deploy_token(), Some("token"));
+        assert_eq!(
+            captured.release_asset_vars().prefix,
+            Some(".impresspress/releases/v1/immutable/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let prepared = captured
+            .prepared_runtime_identity()
+            .expect("a fully bound prepared-runtime contract parses");
+        assert_eq!(prepared.application_id, "app");
+    }
+
+    /// An absent binding is `None`, not an empty string, and reading it still
+    /// costs exactly one lookup.
+    #[wasm_bindgen_test]
+    fn an_unbound_key_is_absent_rather_than_empty() {
+        let env = RecordingEnv::new(&[]);
+        let captured = CfEnvironment::capture(&env.env);
+
+        assert_eq!(captured.cf_log_level(), None);
+        assert_eq!(captured.deploy_token(), None);
+        assert!(!captured.allows_workers_dev());
+        assert_eq!(
+            captured.config_map(),
+            HashMap::new(),
+            "no binding means no config key, so nothing stale can be inherited",
+        );
+        assert_eq!(
+            env.reads_of(impresspress_core::blocks::auth::JWT_SECRET_KEY),
+            1
+        );
+    }
+
+    /// The whole point of the struct: a field that changes must move the
+    /// identity, or an isolate keeps serving a runtime built from the old
+    /// value.
+    ///
+    /// Eight rows of this table failed against the hand-written ten-component
+    /// list this replaced: `deploy_token`, `asset_base_url`,
+    /// `allow_workers_dev` and the five `prepared_*` vars.
+    #[wasm_bindgen_test]
+    fn identity_changes_when_any_captured_field_changes() {
+        let request_config = HashMap::new();
+        let base = empty_environment();
+        let baseline = base.identity(&request_config);
+
+        for (field, mutate) in mutators() {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                changed.identity(&request_config),
+                baseline,
+                "changing `{field}` must change the runtime identity, or a warm \
+                 isolate keeps serving a runtime built from the old value",
+            );
+        }
+    }
+
+    /// The table above is only as good as its coverage, and it is written by
+    /// hand. `serde` enumerates the real fields, so compare the two.
+    #[wasm_bindgen_test]
+    fn every_captured_field_is_covered_by_the_identity_table() {
+        let serialised = serde_json::to_value(empty_environment()).expect("serialise");
+        let fields: Vec<String> = serialised
+            .as_object()
+            .expect("CfEnvironment serialises as an object")
+            .keys()
+            .cloned()
+            .collect();
+        let covered: Vec<String> = mutators()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+
+        let mut fields_sorted = fields;
+        fields_sorted.sort();
+        let mut covered_sorted = covered;
+        covered_sorted.sort();
+        assert_eq!(
+            fields_sorted, covered_sorted,
+            "every CfEnvironment field must appear in the identity table",
+        );
+    }
+
+    /// The `CF_VERSION_METADATA` fast path stays exactly as it was: with a
+    /// version id present the identity is the version plus the request-config
+    /// hash, and nothing else is hashed. A version capture already covers every
+    /// binding and secret, so this is the correct optimisation and the field
+    /// hash is only its fallback.
+    #[wasm_bindgen_test]
+    fn a_worker_version_short_circuits_the_field_hash() {
+        let request_config = HashMap::new();
+        let mut versioned = empty_environment();
+        versioned.worker_version = Some("abc123".to_string());
+
+        let identity = versioned.identity(&request_config);
+        assert!(
+            identity.starts_with("worker-version:abc123:request-config:"),
+            "got {identity}",
+        );
+
+        // A field that would move the fallback hash cannot move this one.
+        let mut with_secret = versioned;
+        with_secret.jwt_secret = Some("rotated".to_string());
+        assert_eq!(with_secret.identity(&request_config), identity);
+    }
+
+    /// Request config is not a captured field, so it is folded in separately —
+    /// and it must still be part of the identity on both branches.
+    #[wasm_bindgen_test]
+    fn request_config_moves_the_identity_on_both_branches() {
+        let empty = HashMap::new();
+        let one = HashMap::from([("A".to_string(), "1".to_string())]);
+
+        let plain = empty_environment();
+        assert_ne!(plain.identity(&empty), plain.identity(&one));
+
+        let mut versioned = empty_environment();
+        versioned.worker_version = Some("abc123".to_string());
+        assert_ne!(versioned.identity(&empty), versioned.identity(&one));
+    }
+
+    /// `config_value` is an if-chain over key constants; a key added to either
+    /// list without a matching arm would silently stop reaching the runtime.
+    #[wasm_bindgen_test]
+    fn environment_owned_config_keys_all_resolve() {
+        let mut all_set = empty_environment();
+        all_set.jwt_secret = Some("jwt".to_string());
+        all_set.cors_allowed_origins = Some("cors".to_string());
+        all_set.csp_directives = Some("csp".to_string());
+        all_set.strict_schema = Some("1".to_string());
+
+        for key in PROTECTED_ENV_KEYS.iter().chain(BUILDER_WORKER_VAR_KEYS) {
+            assert!(
+                all_set.config_value(key).is_some(),
+                "{key} is declared Env-owned but reaches no CfEnvironment field",
+            );
+            assert!(CfEnvironment::owns_config_key(key));
+        }
+        assert_eq!(all_set.config_map().len(), 4);
+        assert!(!CfEnvironment::owns_config_key(
+            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY
+        ));
+    }
 
     #[wasm_bindgen_test]
     fn verified_identity_cache_loads_once_and_invalidates_on_identity_change() {
