@@ -115,10 +115,13 @@ async fn network_inbound_tab(
 /// Render one inbound-summary row: the clickable row plus its lazily-loaded
 /// detail row. `method`/`path` come from the request log and are
 /// attacker-controlled (any HTTP request with a crafted path is logged), so
-/// they appear only in maud-escaped attribute/text contexts. The row carries
-/// `data-detail-target`/`data-detail-url` that the delegated click handler
-/// reads — never an `onclick` JS-string literal (maud doesn't escape JS-string
-/// context, which was a stored-XSS sink).
+/// they appear only in maud-escaped attribute/text contexts. The `<tr>` itself
+/// carries no attribute the handler reads — `components::data_table` owns the
+/// row element and takes no caller attributes — so the detail URL lives on the
+/// pane inside the detail row this function writes, in a maud-escaped
+/// `data-detail-url`, and the delegated click handler reaches it by walking to
+/// `nextElementSibling`. Never an `onclick` JS-string literal (maud doesn't
+/// escape JS-string context, which was a stored-XSS sink).
 ///
 /// `avg_ms` and `last_seen` are per-run values — a latency measured by the
 /// running deployment and the wall-clock time of a request it served — so
@@ -159,7 +162,7 @@ fn inbound_row(
     .classes("expand-row")
     .after(html! {
         tr .detail-rows hidden {
-            td colspan="7" .p-0 {
+            td colspan=(INBOUND_COLUMNS.len()) .p-0 {
                 div id=(row_id) data-detail-url=(detail_url) {}
             }
         }

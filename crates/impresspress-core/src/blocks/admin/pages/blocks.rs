@@ -520,11 +520,6 @@ fn custom_tab_content() -> maud::Markup {
     }
 }
 
-/// Regression coverage for the swallowed-failure finding: block enable/disable
-/// must check the persistence result instead of discarding it
-/// (`let _ = set_enabled(..)`), and must only write the audit-log row after a
-/// confirmed successful write — a failed persist must not report success or
-/// log "block.enable"/"block.disable" as if it happened.
 /// The block-detail modal's two tables' columns. Declared once each so the
 /// `<td data-label>` the component stamps on every cell names the same column
 /// its header does; the two widths are the ones the old `th .w-70` / `.w-80`
@@ -563,6 +558,11 @@ const CONFIG_KEY_COLUMNS: [components::TableCol<'static>; 3] = [
     },
 ];
 
+/// Regression coverage for the swallowed-failure finding: block enable/disable
+/// must check the persistence result instead of discarding it
+/// (`let _ = set_enabled(..)`), and must only write the audit-log row after a
+/// confirmed successful write — a failed persist must not report success or
+/// log "block.enable"/"block.disable" as if it happened.
 #[cfg(test)]
 mod toggle_feature_tests {
     use wafer_core::clients::database as db;
