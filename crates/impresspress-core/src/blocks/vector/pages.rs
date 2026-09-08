@@ -657,6 +657,29 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
         Err(e) => return crud::db_error_internal(e, "load index metadata failed"),
     };
 
+    // Resolve the embedding block BEFORE anything destructive runs. It needs
+    // only the context and `model_id`, both already in hand, and it is the
+    // last thing that can refuse this request outright — a deployment with no
+    // embedding block cannot finish an ingest at all.
+    //
+    // It used to sit below the prior-chunk delete, so an operator who dropped
+    // the embedding block (or whose injected `EmbeddingService` went away) lost
+    // every stored chunk of the next document re-ingested and got a 503 for it:
+    // the document fell out of search until an embedder returned AND someone
+    // re-ingested, with nothing to restore it in between. Same rule as the
+    // `list_ids` error handling below — a step that destroys must not run ahead
+    // of a check that can refuse.
+    //
+    // A document whose text is whitespace-only is refused here too, even
+    // though it would never reach `vclient::embed`. Refusing the whole request
+    // and leaving the index untouched is the point; answering 200 for an empty
+    // re-ingest while a non-empty one is refused would make "did my chunks get
+    // cleared?" depend on the body.
+    let embedding_block = match embedding_block_for_model(ctx, &model_id) {
+        Ok(b) => b,
+        Err(e) => return OutputStream::error(e),
+    };
+
     // Re-ingestion safety: wipe any chunks we previously wrote for this
     // document_id before we add the new ones, via the typed `vector.list_ids`
     // metadata-equality op. If the index isn't there yet (first-ever ingest,
@@ -685,10 +708,10 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     // return early rather than inventing an empty entry. `ingestion::chunk`
     // yields nothing exactly when the document has no whitespace-separated
     // words, so answering the zero-chunk contract here is the same reply the
-    // `chunks.is_empty()` branch below gives — and it keeps a document with
-    // nothing to embed from demanding an embedding block. The prior-chunk
-    // cleanup above has already run, so re-ingesting a document that was
-    // emptied still clears its old chunks.
+    // `chunks.is_empty()` branch below gives. The prior-chunk cleanup above
+    // has already run, so re-ingesting a document that was emptied still
+    // clears its old chunks — an emptied document IS a request to drop it
+    // from the index.
     let whitespace_tokens = body.text.split_whitespace().count() as u64;
     if whitespace_tokens == 0 {
         return ok_json(&IngestResponse { chunks_created: 0 });
@@ -703,11 +726,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     // boundary. Falls back to DEFAULT_CHUNK_TOKENS if the embedder's
     // count_tokens returns 0 or the call errors — chunks may run slightly
     // over BPE-budget, which is the same approximation in use before this
-    // change.
-    let embedding_block = match embedding_block_for_model(ctx, &model_id) {
-        Ok(b) => b,
-        Err(e) => return OutputStream::error(e),
-    };
+    // change. `embedding_block` was resolved above the cleanup step.
     let effective_chunk_tokens =
         match vclient::count_tokens(ctx, embedding_block, body.text.clone()).await {
             Ok(bpe) if bpe > 0 => {
@@ -901,6 +920,46 @@ mod ingest_cleanup_tests {
         .expect("seed registry row");
     }
 
+    /// Register an embedding block so `ingest` gets past its resolver.
+    ///
+    /// `embedding_block_for_model` runs above the prior-chunk cleanup — a
+    /// deployment that cannot embed must not have its index modified — so
+    /// every ingest test needs one registered, whatever it is really about.
+    /// It is never called here: these tests send whitespace-only text, which
+    /// returns the zero-chunk response before `count_tokens`.
+    fn register_embedder(ctx: &mut TestContext) {
+        ctx.register_block(
+            "impresspress/transformers-embed",
+            Arc::new(
+                crate::blocks::transformers_embed::TransformersEmbedBlock::new(Arc::new(
+                    RefusingEmbeddingService,
+                )),
+            ),
+        );
+    }
+
+    /// The service behind [`register_embedder`]. Every method that would
+    /// actually embed panics: reaching one means an ingest test stopped being
+    /// short-circuited by its whitespace-only body and is now exercising a
+    /// path it does not describe.
+    struct RefusingEmbeddingService;
+
+    #[wafer_block::wafer_async_trait]
+    impl wafer_core::interfaces::vector::service::EmbeddingService for RefusingEmbeddingService {
+        fn model(&self) -> &str {
+            DEFAULT_MODEL
+        }
+        fn dimensions(&self) -> u32 {
+            384
+        }
+        async fn embed(
+            &self,
+            _texts: Vec<String>,
+        ) -> wafer_core::interfaces::vector::service::Result<Vec<Vec<f32>>> {
+            panic!("an ingest cleanup test reached a real embed call")
+        }
+    }
+
     /// Body for `ingest` with whitespace-only `text`, so `ingestion::chunk`
     /// produces zero chunks and the handler returns success right after the
     /// prior-chunk cleanup step — no embed/upsert vector call needed.
@@ -920,6 +979,7 @@ mod ingest_cleanup_tests {
         let mut ctx = TestContext::with_vector().await;
         let prefixed = service::prefixed_index_name("cleanup_test_idx_denied");
         seed_registry_row(&ctx, &prefixed).await;
+        register_embedder(&mut ctx);
         ctx.register_block(
             "wafer-run/vector",
             Arc::new(StubVectorBlock {
@@ -952,6 +1012,7 @@ mod ingest_cleanup_tests {
         let mut ctx = TestContext::with_vector().await;
         let prefixed = service::prefixed_index_name("cleanup_test_idx_missing");
         seed_registry_row(&ctx, &prefixed).await;
+        register_embedder(&mut ctx);
         ctx.register_block(
             "wafer-run/vector",
             Arc::new(StubVectorBlock {
@@ -1745,6 +1806,112 @@ mod embedding_block_resolution_tests {
         )
         .await
         .expect("seed registry row");
+    }
+
+    /// A `wafer-run/vector` stub that records every op it is asked for, so a
+    /// test can assert about calls that were **not** made.
+    struct RecordingVectorBlock {
+        ops: Arc<std::sync::Mutex<Vec<String>>>,
+        prior_ids: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::Block for RecordingVectorBlock {
+        fn info(&self) -> wafer_run::BlockInfo {
+            wafer_run::BlockInfo::new(
+                "wafer-run/vector",
+                "0.0.1",
+                "vector@v1",
+                "recording stub vector block",
+            )
+            .category(wafer_run::BlockCategory::Service)
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            self.ops
+                .lock()
+                .expect("ops mutex poisoned")
+                .push(msg.kind.clone());
+            match msg.kind.as_str() {
+                wafer_block::common::ServiceOp::VECTOR_LIST_IDS => {
+                    let resp = wafer_block::wire::vector::ListIdsResponse {
+                        ids: self.prior_ids.clone(),
+                    };
+                    OutputStream::respond(wafer_block::codec::encode(&resp).expect("encode"))
+                }
+                wafer_block::common::ServiceOp::VECTOR_DELETE => OutputStream::respond(Vec::new()),
+                other => OutputStream::error(WaferError::new(
+                    ErrorCode::Unimplemented,
+                    format!("RecordingVectorBlock: unhandled op {other}"),
+                )),
+            }
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn Context,
+            _e: wafer_run::LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
+    /// Re-ingesting a document on a deployment that has lost its embedder
+    /// must not destroy what is already indexed.
+    ///
+    /// `ingest` listed and deleted the document's prior chunks and only then
+    /// resolved the embedding block, so an operator who dropped the embedding
+    /// block (or whose injected `EmbeddingService` went away) lost every
+    /// stored chunk of the next document re-ingested and got a 503 for it.
+    /// Search silently stopped returning that document until an embedder came
+    /// back *and* someone re-ingested; nothing restored it in the meantime.
+    ///
+    /// Same class as the ingest cleanup rule above — a destructive step must
+    /// not run ahead of a check that can refuse the request — and the
+    /// resolver needs nothing the delete does not already have.
+    #[tokio::test]
+    async fn a_reingest_without_an_embedding_block_does_not_delete_the_prior_chunks() {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut ctx = TestContext::with_vector().await;
+        let prefixed = service::prefixed_index_name("docs");
+        seed_registry_row(&ctx, &prefixed).await;
+        ctx.register_block(
+            "wafer-run/vector",
+            Arc::new(RecordingVectorBlock {
+                ops: ops.clone(),
+                prior_ids: vec!["doc-1:0".into(), "doc-1:1".into()],
+            }),
+        );
+        // No embedding block: this deployment cannot embed.
+
+        let out = ingest(
+            &ctx,
+            json_input(serde_json::json!({
+                "index": "docs",
+                "document_id": "doc-1",
+                "text": "a document with real words in it",
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            output_http_status(out).await,
+            503,
+            "no embedding block is registered, so the ingest is refused"
+        );
+        let seen = ops.lock().expect("ops mutex poisoned").clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|op| op == wafer_block::common::ServiceOp::VECTOR_DELETE),
+            "the refused ingest must not have deleted the document's existing \
+             chunks — ops seen: {seen:?}"
+        );
     }
 
     /// A runtime with no embedding block registered cannot embed, and the
