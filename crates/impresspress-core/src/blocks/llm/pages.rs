@@ -75,9 +75,9 @@ fn render_page_body(
         style { "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}} @keyframes blink{0%,100%{opacity:1}50%{opacity:0}} .typing-cursor{display:inline-block;width:0.5em;height:1.1em;background:var(--text-primary,#333);vertical-align:text-bottom;margin-left:2px;animation:blink 0.8s step-end infinite}" }
         // DOMPurify must load before marked.js/llm-chat.js so `window.DOMPurify`
         // exists when renderMarkdown() sanitizes marked's output (P0 stored-XSS fix).
-        script src=(crate::ui::assets::purify_js_url()) {}
+        script src=(super::assets::purify_js_url()) {}
         // marked.js for markdown rendering — self-hosted (vendored), content-hashed.
-        script src=(crate::ui::assets::marked_js_url()) {}
+        script src=(super::assets::marked_js_url()) {}
 
         // Server-rendered initial state for the chat module. `messages_json_str`
         // has every literal `<` replaced with the JSON escape sequence
@@ -161,7 +161,7 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
 
-    let llm_chat_js_url = crate::ui::assets::llm_chat_js_url();
+    let llm_chat_js_url = super::assets::llm_chat_js_url();
     let content = render_page_body(
         &threads,
         &entries,
@@ -382,7 +382,7 @@ fn render_right_rail(
                         // `var(--primary, #3b82f6)` referenced a nonexistent
                         // var, so the blue fallback ALWAYS won. `.model-progress-fill`'s
                         // width starts at 0% and is updated at runtime by
-                        // `bar.style.width = pct + '%'` in ui/assets/llm-chat.js.
+                        // `bar.style.width = pct + '%'` in blocks/llm/assets/llm-chat.js.
                         div #model-progress-bar .model-progress-fill {}
                     }
                     div #model-progress-text .text-muted .text-xs .mt-1 { "" }
@@ -904,8 +904,8 @@ mod tests {
         let url = "/b/static/llm-chat-deadbeef.js";
         let html = render_page_body(&[], &[], &[], false, "", None, url).into_string();
 
-        let purify_url = crate::ui::assets::purify_js_url();
-        let marked_url = crate::ui::assets::marked_js_url();
+        let purify_url = crate::blocks::llm::assets::purify_js_url();
+        let marked_url = crate::blocks::llm::assets::marked_js_url();
         assert!(
             html.contains(&format!(r#"src="{purify_url}""#)),
             "missing external purify.js script tag (expected src={purify_url}): {html}"

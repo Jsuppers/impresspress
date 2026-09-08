@@ -55,7 +55,7 @@ fn render_bootstrap_script(bucket: &str, current_prefix: &str) -> Markup {
     let bootstrap_json = serde_json::to_string(&bootstrap)
         .unwrap_or_else(|_| "{}".to_string())
         .replace('<', "\\u003c");
-    let js_url = crate::ui::assets::files_browser_js_url();
+    let js_url = crate::blocks::files::assets::files_browser_js_url();
     html! {
         script type="application/json" id="files-browser-bootstrap" {
             (PreEscaped(bootstrap_json))

@@ -173,6 +173,38 @@ feature_block_manifest! {
     fastembed::FastembedBlock,
 }
 
+/// Bytes for a block-owned entry of the shared `/b/static/` asset manifest,
+/// or `None` if no block in this build owns that key.
+///
+/// The counterpart to `ui::assets::shared_bytes`: `ui::assets::bytes` tries
+/// the shared chrome's own files first and falls through to here, so the
+/// shared asset module names no block and carries no `block-*` gate. This is
+/// the one place that enumerates which blocks own manifest assets, next to
+/// the manifest that already enumerates which blocks exist — a block is
+/// added to the build in exactly one place, and to the asset set in exactly
+/// one more.
+///
+/// Each block's own `assets` module holds the `include_str!` and the URL
+/// accessors, so an asset's declaration and its owner are the same file.
+/// The manifest itself is unconditional (`build.rs` hashes every file on
+/// disk whatever the feature set), which is what keeps `/b/static/{filename}`
+/// resolving identically for a Worker that streams these bytes from R2
+/// without compiling any of them in.
+#[cfg(feature = "embed-assets")]
+pub fn static_asset_bytes(logical: &str) -> Option<&'static [u8]> {
+    #[cfg(feature = "block-llm")]
+    if let Some(b) = llm::assets::bytes(logical) {
+        return Some(b);
+    }
+    #[cfg(feature = "block-files")]
+    if let Some(b) = files::assets::bytes(logical) {
+        return Some(b);
+    }
+    // Bound so a build with neither block still uses the parameter.
+    let _ = logical;
+    None
+}
+
 /// The `(block_name, default_enabled)` pairs the boot-time enablement seed
 /// writes into `impresspress__admin__block_settings`.
 ///

@@ -182,7 +182,7 @@ pub async fn bucket_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream 
 
     // The table cell carries the modal markup + JS so it lives inside the
     // shelled response without needing a new template parameter.
-    let js_url = crate::ui::assets::files_browser_js_url();
+    let js_url = crate::blocks::files::assets::files_browser_js_url();
     let table_with_modal = html! {
         (render_buckets_table(&rows))
         (render_new_bucket_modal())

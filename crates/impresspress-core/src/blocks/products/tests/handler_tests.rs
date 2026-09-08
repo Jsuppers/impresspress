@@ -3089,7 +3089,7 @@ fn rendered_hx_post(html: &str) -> Option<String> {
 /// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — renders as
 /// nothing happening at all: no reload, no message, on the only door out of
 /// soft delete. Pin that the button feeds the failure into the shared toast
-/// channel `ui::assets::toast_js` already listens on.
+/// channel `ui/assets/chrome.js`'s toast section already listens on.
 #[tokio::test]
 async fn manage_products_deleted_view_reports_a_failed_restore() {
     let ctx = ctx().await;

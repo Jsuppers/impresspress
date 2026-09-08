@@ -116,7 +116,7 @@ mod tests {
     #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     async fn system_handle_serves_llm_chat_js() {
         let block = SystemBlock::new();
-        let url = assets::llm_chat_js_url();
+        let url = crate::blocks::llm::assets::llm_chat_js_url();
         let mut msg = Message::new(format!("retrieve:{url}"));
         msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
         msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
@@ -144,7 +144,7 @@ mod tests {
     #[cfg(all(feature = "block-files", feature = "embed-assets"))]
     async fn system_handle_serves_files_browser_js() {
         let block = SystemBlock::new();
-        let url = assets::files_browser_js_url();
+        let url = crate::blocks::files::assets::files_browser_js_url();
         let mut msg = Message::new(format!("retrieve:{url}"));
         msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
         msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
@@ -172,7 +172,7 @@ mod tests {
     #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     async fn system_handle_serves_marked_js() {
         let block = SystemBlock::new();
-        let url = assets::marked_js_url();
+        let url = crate::blocks::llm::assets::marked_js_url();
         let mut msg = Message::new(format!("retrieve:{url}"));
         msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
         msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
@@ -200,7 +200,7 @@ mod tests {
     #[cfg(all(feature = "block-llm", feature = "embed-assets"))]
     async fn system_handle_serves_purify_js() {
         let block = SystemBlock::new();
-        let url = assets::purify_js_url();
+        let url = crate::blocks::llm::assets::purify_js_url();
         let mut msg = Message::new(format!("retrieve:{url}"));
         msg.set_meta(wafer_run::META_REQ_ACTION, "retrieve");
         msg.set_meta(wafer_run::META_REQ_RESOURCE, url);
