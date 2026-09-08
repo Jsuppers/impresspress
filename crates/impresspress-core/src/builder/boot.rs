@@ -107,12 +107,19 @@ pub struct BlockInitOutcome {
 /// error anywhere, and both twins carried `deny_unknown_fields`, so the
 /// producer could not add a step without breaking every CLI already built.
 ///
-/// **No `deny_unknown_fields`, deliberately.** The report is a status document
-/// nested inside an envelope that carries
-/// [`DEPLOY_RESPONSE_SCHEMA_VERSION`], and that version is what gates a skew
-/// the consumer cannot survive. An added step cannot change the meaning of the
-/// four flags the deploy is gated on, so refusing it would force a lockstep CLI
-/// upgrade for a purely additive change. The envelope itself stays strict.
+/// **No `deny_unknown_fields`, deliberately.** The only place this type is
+/// *deserialized* is the `init_report` field of the `/_deploy/prepare`
+/// envelope, and that envelope carries [`DEPLOY_RESPONSE_SCHEMA_VERSION`],
+/// which is what gates a skew the consumer cannot survive. An added step
+/// cannot change the meaning of the four flags the deploy is gated on, so
+/// refusing it would force a lockstep CLI upgrade for a purely additive
+/// change. The envelope itself stays strict.
+///
+/// `/_deploy/init` serializes the report as the whole body, with no envelope
+/// and no version — but nothing parses that body: `impresspress serve
+/// --target cloudflare` reads it as text and prints it for the operator. If a
+/// consumer of that shape ever appears it needs the envelope, not a relaxed
+/// argument.
 ///
 /// [`InitPolicy::Tolerant`] and [`InitPolicy::Strict`] callers may ignore it:
 /// under `Strict` a failure is an `Err` instead, and under `Tolerant` the same

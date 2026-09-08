@@ -23,15 +23,20 @@ async fn fetch_main(
     impresspress_cloudflare::run(req, env, ctx, Ok, |_wafer, _storage| Ok(())).await
 }
 
-/// Cloudflare Worker `scheduled` entrypoint, for the `[triggers] crons`
-/// schedule `impresspress deploy` writes into `wrangler.toml`. Defers to
+/// Cloudflare Worker `scheduled` entrypoint. Defers to
 /// [`impresspress_cloudflare::run_scheduled`], which runs the auth retention
 /// sweep and nothing else.
 ///
-/// The two registration hooks are the same ones `fetch_main` passes — both
-/// entry points share one per-isolate runtime cache, so a `scheduled` handler
-/// that registered a different block set would leave the wrong runtime cached
-/// for the next request.
+/// This export is step 1 of 2; step 2 is `[cloudflare].crons` in
+/// `impresspress.toml` (this demo sets `17 3 * * *`). The sweep is opt-in
+/// precisely because this half cannot be supplied by the adapter — it needs
+/// the consumer's own registration hooks — so a default schedule would give a
+/// consumer without this export a daily failed invocation.
+///
+/// The two registration hooks are the same ones `fetch_main` passes. They are
+/// not part of runtime identity, so both entry points share one per-isolate
+/// runtime cache and a `scheduled` handler that registered a different block
+/// set would publish the wrong runtime for the next request to serve.
 #[cfg(feature = "target-cloudflare")]
 #[worker::event(scheduled)]
 async fn scheduled_main(

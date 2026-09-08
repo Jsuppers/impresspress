@@ -99,7 +99,7 @@ impl ReleaseManifest {
     /// established once, at construction, and re-checked on parse.
     pub fn from_entries(mut files: Vec<ReleaseAssetEntry>) -> Result<Self, ReleaseManifestError> {
         files.sort_by(|left, right| left.logical_key.cmp(&right.logical_key));
-        let asset_set_sha256 = asset_set_digest(&files)?;
+        let asset_set_sha256 = asset_set_digest(RELEASE_MANIFEST_SCHEMA_VERSION, &files)?;
         let immutable_prefix = format!("{RELEASES_ROOT}/{asset_set_sha256}");
         Ok(Self {
             schema_version: RELEASE_MANIFEST_SCHEMA_VERSION,
@@ -164,8 +164,15 @@ impl ReleaseManifest {
     /// Re-derive `asset_set_sha256` from the parsed entries. `/_deploy/verify`
     /// compares this against the stored field, so a manifest cannot vouch for
     /// itself.
+    /// Re-derives from `self.schema_version`, not from
+    /// [`RELEASE_MANIFEST_SCHEMA_VERSION`]: the whole point is to hash what
+    /// was parsed. `/_deploy/verify` refuses a version mismatch before
+    /// reaching here, so today the two are always equal — but this is a public
+    /// method on a public type, and handed a manifest from a future contract
+    /// it must derive that manifest's digest and disagree, not silently derive
+    /// a digest for a document nobody wrote.
     pub fn recomputed_asset_set_sha256(&self) -> Result<String, ReleaseManifestError> {
-        asset_set_digest(&self.files)
+        asset_set_digest(self.schema_version, &self.files)
     }
 
     pub fn canonical_asset_set_sha256(&self) -> String {
@@ -198,9 +205,12 @@ impl ReleaseManifest {
     }
 }
 
-fn asset_set_digest(files: &[ReleaseAssetEntry]) -> Result<String, ReleaseManifestError> {
+fn asset_set_digest(
+    schema_version: u32,
+    files: &[ReleaseAssetEntry],
+) -> Result<String, ReleaseManifestError> {
     let canonical = serde_json::to_vec(&ManifestIdentity {
-        schema_version: RELEASE_MANIFEST_SCHEMA_VERSION,
+        schema_version,
         files,
     })
     .map_err(|source| ReleaseManifestError::Serialize {
@@ -382,6 +392,32 @@ mod tests {
         assert_eq!(
             reparsed.logical_keys(),
             vec!["content/index.md", "public/app.css"]
+        );
+    }
+
+    /// The recompute hashes the *parsed* schema version. A manifest written
+    /// under a later contract must fail to vouch for itself here rather than
+    /// be handed a digest derived under this build's version — which is what
+    /// hashing the constant would produce, and which would look like agreement
+    /// only because the verify endpoint happens to reject the version first.
+    #[test]
+    fn recomputing_follows_the_parsed_schema_version_not_this_builds_constant() {
+        let manifest =
+            ReleaseManifest::from_entries(vec![entry("public/app.css", b"body{}")]).unwrap();
+        assert_eq!(
+            manifest.recomputed_asset_set_sha256().unwrap(),
+            manifest.asset_set_sha256
+        );
+
+        let future = ReleaseManifest {
+            schema_version: RELEASE_MANIFEST_SCHEMA_VERSION + 1,
+            ..manifest
+        };
+        assert_ne!(
+            future.recomputed_asset_set_sha256().unwrap(),
+            future.asset_set_sha256,
+            "a manifest from a later contract must not be handed this \
+             contract's digest"
         );
     }
 

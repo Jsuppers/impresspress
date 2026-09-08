@@ -399,9 +399,11 @@ where
 /// kind auth-ui already routes, so this adds an entry point rather than a code
 /// path. Its counts are logged. Nothing else runs on the schedule.
 ///
-/// The schedule itself comes from `[triggers] crons` in the generated
-/// `wrangler.toml` (`impresspress deploy`'s `DEFAULT_CRONS`). A deployment
-/// that sets `crons = []` never reaches this function.
+/// The schedule itself is **opt-in and empty by default**: exporting this
+/// entry point is one of the two steps, and setting `[cloudflare].crons` in
+/// `impresspress.toml` is the other (`impresspress deploy`'s `DEFAULT_CRONS`
+/// is `&[]`; `examples/webmcp-demo` does both). A deployment that sets neither,
+/// or sets `crons = []`, never reaches this function.
 pub async fn run_scheduled<F, G>(
     event: worker::ScheduledEvent,
     env: worker::Env,
@@ -429,10 +431,17 @@ pub async fn run_scheduled<F, G>(
 /// Variant of [`run_scheduled`] with explicit request-current Worker
 /// configuration, for consumers that use [`run_with_config`] on the fetch side.
 ///
-/// Pass the same map: `request_config` is part of runtime identity
-/// (`CfEnvironment::identity`), so a cron passing an empty map into an isolate
-/// whose fetches pass a populated one would rebuild the runtime on every
-/// invocation and leave the wrong one cached behind it.
+/// Pass the same map. `request_config` *is* part of runtime identity
+/// (`CfEnvironment::identity`), which is what makes this survivable rather
+/// than silent: the cache compares identities before serving, so a cron
+/// passing an empty map into an isolate whose fetches pass a populated one
+/// cannot hand the wrong runtime to a request. What it does instead is make
+/// the two identities disagree permanently, so the cron rebuilds on every
+/// invocation and the next fetch rebuilds again — a rebuild storm, each one
+/// paying the full D1 read set, on an isolate that was already warm.
+///
+/// Contrast the registration hooks above, which are *not* part of the
+/// identity: differing there really does publish the wrong runtime.
 pub async fn run_scheduled_with_config<F, G>(
     event: worker::ScheduledEvent,
     env: worker::Env,
@@ -455,6 +464,20 @@ pub async fn run_scheduled_with_config<F, G>(
     impresspress_core::ui::assets::set_base_url_override(environment.asset_base_url());
     init_isolate();
 
+    // WHY THERE IS NO `drain_queued_request_logs` HERE, unlike `run`.
+    //
+    // `init_isolate` selects `RequestLogMode::Queued` for the whole isolate,
+    // so both entry points arrive with queueing on — but only the request
+    // pipeline enqueues, and the one thing that runs on this path
+    // (`auth.maintenance`, dispatched by `run_block`) does not go through it.
+    // The queue is therefore always empty here, and a drain would be dead
+    // code that reads as if it were load-bearing.
+    //
+    // It stops being empty the day anything on the scheduled path dispatches
+    // through the pipeline: at that point the rows accumulate in a
+    // thread-local nothing empties, on an isolate that may serve fetches for
+    // hours. Add the drain (through `ctx.wait_until`, exactly as `run` does)
+    // in the same change that adds such a dispatch.
     let cron = event.cron();
     match run_scheduled_inner(
         &env,
@@ -553,18 +576,25 @@ where
     let services =
         warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
 
-    let output = request_services::scope(services, async {
-        rt.wafer
+    request_services::scope(services, async {
+        let output = rt
+            .wafer
             .run_block(
                 impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID,
                 impresspress_core::blocks::auth_ui::maintenance_message(),
                 wafer_run::InputStream::empty(),
             )
-            .await
+            .await;
+        // Decoding stays inside the poll scope, for the reason `dispatch`
+        // states on the fetch path: an output stream may be consumed lazily
+        // and reach back into a request service. Today the sweep's answer is a
+        // fully materialised buffer, so this is not a live bug — but decoding
+        // outside would turn "a service was touched after the scope closed"
+        // into "the sweep returned a malformed answer", which is a diagnosis
+        // pointing at the wrong half of the system.
+        Ok(impresspress_core::blocks::auth_ui::sweep_result_from_output(output).await?)
     })
-    .await;
-
-    Ok(impresspress_core::blocks::auth_ui::sweep_result_from_output(output).await?)
+    .await
 }
 
 /// Re-attempt a config-version KV PUT that failed earlier in this invocation
