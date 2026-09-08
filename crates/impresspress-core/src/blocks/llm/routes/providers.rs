@@ -3,9 +3,26 @@
 //! These endpoints back the LLM admin UI's provider management. All writes
 //! reload the in-memory `ProviderLlmService` from the DB so chat requests
 //! pick up the new configuration without restarting the process.
+//!
+//! ## A deployment that cannot manage providers says so
+//!
+//! Whether provider management works is a property of the *handle the block
+//! was constructed with*, not of the build: a runtime holding a
+//! [`NoopProviderAdmin`] has no router to configure. The four mutating
+//! handlers therefore ask
+//! [`ProviderAdmin::manages_providers`] before they touch the database and
+//! answer 501, so a refusal never leaves a provider row behind that nothing
+//! will load. The routes stay declared either way — see
+//! [`NoopProviderAdmin`]'s own documentation for why the published surface
+//! must not depend on which handle a deployment holds.
+//!
+//! [`NoopProviderAdmin`]: crate::blocks::llm::provider_admin::NoopProviderAdmin
 
-use wafer_core::clients::{config, database as db};
-use wafer_run::{context::Context, InputStream, Message, OutputStream};
+use wafer_core::{
+    clients::{config, database as db},
+    interfaces::llm::service::LlmError,
+};
+use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::{
@@ -24,6 +41,61 @@ use crate::{
     http::{err_bad_request, err_internal, ok_json},
 };
 
+/// Refuse, before any database work, when this runtime's provider router
+/// cannot be configured.
+///
+/// Returns the 501 as an `Err` so a handler can `?`-shaped early-return it.
+/// The message names the capability rather than the handle type: an operator
+/// reading it needs to know that this deployment does not do provider
+/// management, not which Rust struct is standing in.
+fn require_provider_management(block: &LlmBlock) -> Result<(), OutputStream> {
+    if block.provider_admin.manages_providers() {
+        return Ok(());
+    }
+    Err(OutputStream::error(WaferError::new(
+        ErrorCode::Unimplemented,
+        "provider management is not supported on this deployment: it has no \
+         configurable provider router",
+    )))
+}
+
+/// Render an [`LlmError`] from the provider-admin surface as the response its
+/// cause deserves.
+///
+/// Mirrors `wafer_core::interfaces::llm::handler::llm_error_to_block_error`,
+/// which maps the same enum for the *service block's* wire and is private to
+/// that module (it is a candidate to make public upstream). The classified
+/// arms agree deliberately; the difference is what happens to the two
+/// internal ones, which go through [`err_internal`] so the cause is logged
+/// with a correlation id and the client gets the sanitized message instead of
+/// a provider's raw transport text.
+///
+/// `context` is the fixed log label for those arms — no interpolated error
+/// text, per [`err_internal`]'s contract.
+///
+/// The classified arms render `e` through `Display`. `discover_models` used
+/// to hand `format!("{e:?}")` to `err_internal`, which put a Rust enum
+/// spelling into a log line and answered 500 for every one of them —
+/// including `NotSupported`, which is a 501, and `Unauthorized`, which is the
+/// admin's own provider credential being wrong.
+fn llm_error_response(context: &str, e: LlmError) -> OutputStream {
+    let code = match &e {
+        LlmError::NotSupported => ErrorCode::Unimplemented,
+        LlmError::InvalidRequest(_) => ErrorCode::InvalidArgument,
+        LlmError::ModelNotFound(_) => ErrorCode::NotFound,
+        LlmError::RateLimited => ErrorCode::Unavailable,
+        LlmError::Unauthorized => ErrorCode::Unauthenticated,
+        LlmError::Cancelled => ErrorCode::Cancelled,
+        // `BackendError` and `Network` carry a provider's own transport text,
+        // which is deployment topology and must not reach the client. The
+        // wildcard is required — `LlmError` is `#[non_exhaustive]` upstream —
+        // and lands on the sanitizing arm deliberately: an error shape this
+        // repo has not classified yet is not one to echo.
+        _ => return err_internal(context, e),
+    };
+    OutputStream::error(WaferError::new(code, e.to_string()))
+}
+
 /// Reload all enabled providers from the DB and push the snapshot into the
 /// in-memory provider router via [`ProviderAdmin::configure`].
 ///
@@ -41,6 +113,13 @@ use crate::{
 /// Errors are returned to the caller; callers translate to 500. We do not
 /// silently swallow — a failure here means the in-memory service is stale
 /// and the admin needs to know.
+///
+/// A handle with no router to configure ([`ProviderAdmin::manages_providers`]
+/// false) fails here too. The mutating handlers never see that, because they
+/// refuse at [`require_provider_management`] before writing; `lifecycle(Init)`
+/// does not call this at all on such a runtime. It stays an error rather than
+/// a silent success so a caller that grew past those two cannot inherit the
+/// green-200-over-an-inert-router bug a second time.
 pub(in crate::blocks::llm) async fn reload_provider_service(
     ctx: &dyn Context,
     provider_admin: &dyn ProviderAdmin,
@@ -63,7 +142,9 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
             }
         }
     }
-    provider_admin.configure(configs);
+    provider_admin
+        .configure(configs)
+        .map_err(|e| format!("provider configure failed: {e}"))?;
     Ok(())
 }
 
@@ -123,6 +204,12 @@ pub(in crate::blocks::llm) async fn create_provider(
     _msg: &Message,
     input: InputStream,
 ) -> OutputStream {
+    // Before the body is even read: a runtime that cannot configure a
+    // provider router must not store a provider row.
+    if let Err(refusal) = require_provider_management(block) {
+        return refusal;
+    }
+
     let raw = input.collect_to_bytes().await;
     let body: CreateProviderRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
@@ -177,6 +264,10 @@ pub(in crate::blocks::llm) async fn update_provider(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
+    if let Err(refusal) = require_provider_management(block) {
+        return refusal;
+    }
+
     let id = match crud::path_id(msg, "Provider") {
         Ok(value) => value.to_string(),
         Err(response) => return response,
@@ -243,6 +334,10 @@ pub(in crate::blocks::llm) async fn delete_provider(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
+    if let Err(refusal) = require_provider_management(block) {
+        return refusal;
+    }
+
     let id = match crud::path_id(msg, "Provider") {
         Ok(value) => value.to_string(),
         Err(response) => return response,
@@ -266,6 +361,12 @@ pub(in crate::blocks::llm) async fn discover_models(
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
+    // Discovery writes the discovered list back to the row, so it is a
+    // mutating handler and refuses on the same terms as the other three.
+    if let Err(refusal) = require_provider_management(block) {
+        return refusal;
+    }
+
     let id = match crud::path_id(msg, "Provider") {
         Ok(value) => value.to_string(),
         Err(response) => return response,
@@ -292,7 +393,7 @@ pub(in crate::blocks::llm) async fn discover_models(
 
     let models = match block.provider_admin.discover_models(&cfg.name).await {
         Ok(m) => m,
-        Err(e) => return err_internal("discover_models failed", format!("{e:?}")),
+        Err(e) => return llm_error_response("discover_models failed", e),
     };
     cfg.models = models.into_iter().map(|m| m.model_id).collect();
 
@@ -852,5 +953,349 @@ mod tests {
             None,
             "unresolvable key_var degrades to no key, not a reload failure"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: provider management over a router that cannot be configured.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod inert_router_tests {
+    use std::sync::Arc;
+
+    use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
+
+    use super::*;
+    use crate::{
+        blocks::llm::{
+            provider_admin::NoopProviderAdmin,
+            providers::config::ProviderProtocol,
+            routes::test_support::{admin_msg, routed},
+            LlmBlock,
+        },
+        test_support::{output_json, TestContext},
+    };
+
+    fn json_input(value: serde_json::Value) -> InputStream {
+        InputStream::from_bytes(serde_json::to_vec(&value).expect("serialize body"))
+    }
+
+    fn create_body() -> InputStream {
+        json_input(serde_json::json!({
+            "name": "openai-main",
+            "protocol": "open_ai",
+            "endpoint": "https://api.openai.com/v1",
+        }))
+    }
+
+    /// A block holding the no-op provider admin — every wasm32 build, and
+    /// `test_support::real_block_infos()`.
+    fn inert_block() -> LlmBlock {
+        LlmBlock::new(Arc::new(NoopProviderAdmin))
+    }
+
+    /// The rows the providers table currently holds.
+    async fn provider_rows(ctx: &dyn Context) -> Vec<wafer_core::clients::database::Record> {
+        db::list_all(ctx, PROVIDERS_TABLE, vec![])
+            .await
+            .expect("list providers")
+    }
+
+    /// Creating a provider on a runtime whose router cannot be configured
+    /// answered a green 200 and left a row behind that nothing would ever
+    /// load: `NoopProviderAdmin::configure` was infallible and inert, so the
+    /// reload after the write reported success. It now refuses — and refuses
+    /// *before* the write, because a 501 that still persisted the row would
+    /// be the same lie in a different status code.
+    #[tokio::test]
+    async fn create_on_an_inert_router_refuses_and_writes_no_row() {
+        let ctx = TestContext::with_llm().await;
+        let block = inert_block();
+
+        let out = create_provider(
+            &block,
+            &ctx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            create_body(),
+        )
+        .await;
+
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::Unimplemented, "got {e:?}")
+            }
+            other => panic!("expected 501, got {other:?}"),
+        }
+        assert!(
+            provider_rows(&ctx).await.is_empty(),
+            "a refused create must not leave an orphan provider row"
+        );
+    }
+
+    /// Same for update and delete: both used to mutate the row and then
+    /// report success over a router that never saw the change.
+    #[tokio::test]
+    async fn update_and_delete_on_an_inert_router_refuse_and_change_nothing() {
+        let ctx = TestContext::with_llm().await;
+        // Seeded through `config_to_row`, the same encoder the create
+        // handler writes with, so the row the refused update and delete are
+        // asked to change is one the block itself could have stored.
+        let seeded = db::create(
+            &ctx,
+            PROVIDERS_TABLE,
+            config_to_row(&ProviderConfig::new(
+                "openai-main",
+                ProviderProtocol::OpenAi,
+                "https://api.openai.com/v1",
+            )),
+        )
+        .await
+        .expect("seed provider row");
+        let block = inert_block();
+
+        let updated = update_provider(
+            &block,
+            &ctx,
+            &routed(admin_msg(
+                "update",
+                &format!("/b/llm/api/providers/{}", seeded.id),
+            )),
+            json_input(serde_json::json!({ "name": "renamed" })),
+        )
+        .await;
+        match updated.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::Unimplemented, "update: got {e:?}")
+            }
+            other => panic!("update: expected 501, got {other:?}"),
+        }
+
+        let deleted = delete_provider(
+            &block,
+            &ctx,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/llm/api/providers/{}", seeded.id),
+            )),
+        )
+        .await;
+        match deleted.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::Unimplemented, "delete: got {e:?}")
+            }
+            other => panic!("delete: expected 501, got {other:?}"),
+        }
+
+        let rows = provider_rows(&ctx).await;
+        assert_eq!(rows.len(), 1, "the refused delete must not remove the row");
+        assert_eq!(
+            rows[0].data.get("name").and_then(|v| v.as_str()),
+            Some("openai-main"),
+            "the refused update must not rename the row"
+        );
+    }
+
+    /// `discover-models` writes the discovered list back to the row, so it
+    /// is provider management and refuses on the same terms as the other
+    /// three — before it looks the row up, which is why a runtime that
+    /// cannot discover says so instead of answering 404 for a row it never
+    /// asked about.
+    ///
+    /// What a *capable* router's own `LlmError` renders as is pinned
+    /// separately, in `discovery_error_shape_tests`.
+    #[tokio::test]
+    async fn discover_models_on_an_inert_router_reports_not_supported() {
+        let ctx = TestContext::with_llm().await;
+        let block = inert_block();
+
+        let out = discover_models(
+            &block,
+            &ctx,
+            &routed(admin_msg(
+                "create",
+                "/b/llm/api/providers/row-1/discover-models",
+            )),
+        )
+        .await;
+
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::Unimplemented, "got {e:?}");
+                assert!(
+                    !e.message.contains("NotSupported"),
+                    "the message is a Display render, not a Debug one: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected 501, got {other:?}"),
+        }
+    }
+
+    /// Reading the stored rows is not provider *management* — the rows are
+    /// real configuration and an admin must still be able to see them.
+    #[tokio::test]
+    async fn listing_providers_still_works_on_an_inert_router() {
+        let ctx = TestContext::with_llm().await;
+        let block = inert_block();
+
+        let body = output_json(
+            list_providers(&block, &ctx, &admin_msg("retrieve", "/b/llm/api/providers")).await,
+        )
+        .await;
+
+        assert_eq!(body, serde_json::json!({ "providers": [] }));
+    }
+
+    /// The two answers must not drift: a handle that says it cannot manage
+    /// providers must refuse `configure`. The gate the handlers above use and
+    /// the reload's own failure would otherwise be two independent opinions
+    /// about what this runtime supports.
+    #[test]
+    fn the_no_op_handle_refuses_configure_and_says_so() {
+        let noop = NoopProviderAdmin;
+        assert!(!noop.manages_providers());
+        assert!(noop.configure(Vec::new()).is_err());
+    }
+
+    /// And the real provider router says it can, and accepts.
+    #[cfg(feature = "llm")]
+    #[test]
+    fn the_real_router_accepts_configure_and_says_so() {
+        let svc = crate::blocks::llm::providers::ProviderLlmService::try_new()
+            .expect("build provider service");
+        assert!(svc.manages_providers());
+        assert!(svc.configure(Vec::new()).is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: what a provider's own failure looks like on the wire.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod discovery_error_shape_tests {
+    use std::sync::Arc;
+
+    use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
+
+    use super::*;
+    use crate::{
+        blocks::llm::{
+            providers::config::ProviderProtocol,
+            routes::test_support::{admin_msg, routed},
+            LlmBlock,
+        },
+        test_support::TestContext,
+    };
+
+    /// A router that manages providers and whose discovery fails with a
+    /// scripted [`LlmError`]. `RecordingProviderAdmin` always succeeds, so
+    /// nothing in the tree could reach `discover_models`'s error arm before.
+    struct FailingDiscovery(fn() -> LlmError);
+
+    #[async_trait::async_trait]
+    impl ProviderAdmin for FailingDiscovery {
+        fn manages_providers(&self) -> bool {
+            true
+        }
+        fn configure(&self, _providers: Vec<ProviderConfig>) -> Result<(), LlmError> {
+            Ok(())
+        }
+        fn providers_snapshot(&self) -> Vec<ProviderConfig> {
+            Vec::new()
+        }
+        async fn discover_models(
+            &self,
+            _provider_name: &str,
+        ) -> Result<Vec<wafer_core::interfaces::llm::service::ModelInfo>, LlmError> {
+            Err((self.0)())
+        }
+    }
+
+    /// Seed one provider row and run discovery against a router whose
+    /// discovery fails with `error`.
+    async fn discover_against(error: fn() -> LlmError) -> WaferError {
+        let ctx = TestContext::with_llm().await;
+        let seeded = db::create(
+            &ctx,
+            PROVIDERS_TABLE,
+            config_to_row(&ProviderConfig::new(
+                "openai-main",
+                ProviderProtocol::OpenAi,
+                "https://api.openai.com/v1",
+            )),
+        )
+        .await
+        .expect("seed provider row");
+        let block = LlmBlock::new(Arc::new(FailingDiscovery(error)));
+
+        let out = discover_models(
+            &block,
+            &ctx,
+            &routed(admin_msg(
+                "create",
+                &format!("/b/llm/api/providers/{}/discover-models", seeded.id),
+            )),
+        )
+        .await;
+
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => e,
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
+
+    /// The admin typed a provider name the router does not know: that is the
+    /// admin's own input, a 400, and the message says which name.
+    ///
+    /// Every one of these used to be `err_internal("discover_models failed",
+    /// format!("{e:?}"))` — a 500 whose body was the sanitized
+    /// `"Internal server error (ref: …)"` and whose *log line* carried a Rust
+    /// enum spelling (`InvalidRequest("unknown provider: openai-main")`)
+    /// rather than the error's own sentence.
+    #[tokio::test]
+    async fn an_unknown_provider_is_the_callers_mistake_not_an_internal_error() {
+        let e = discover_against(|| LlmError::InvalidRequest("unknown provider: x".into())).await;
+
+        assert_eq!(e.code, ErrorCode::InvalidArgument, "got {e:?}");
+        assert_eq!(e.message, "invalid request: unknown provider: x");
+    }
+
+    /// A protocol with no discovery endpoint (Anthropic) is 501, and it does
+    /// not read as a bug in this deployment.
+    #[tokio::test]
+    async fn a_protocol_without_discovery_is_not_supported() {
+        let e = discover_against(|| LlmError::NotSupported).await;
+
+        assert_eq!(e.code, ErrorCode::Unimplemented, "got {e:?}");
+        assert_eq!(e.message, "not supported by this backend");
+    }
+
+    /// The provider rejected the configured credential. That is 401 and the
+    /// admin can act on it; collapsing it into a 500 told them nothing.
+    #[tokio::test]
+    async fn a_rejected_credential_is_reported_as_such() {
+        let e = discover_against(|| LlmError::Unauthorized).await;
+
+        assert_eq!(e.code, ErrorCode::Unauthenticated, "got {e:?}");
+        assert_eq!(e.message, "unauthorized");
+    }
+
+    /// A transport failure keeps the sanitized 500: the text is the
+    /// provider's own and names deployment topology, so it is logged with a
+    /// correlation id and never echoed.
+    #[tokio::test]
+    async fn a_transport_failure_stays_a_sanitized_internal_error() {
+        let e =
+            discover_against(|| LlmError::Network("dns failure for internal.corp".into())).await;
+
+        assert_eq!(e.code, ErrorCode::Internal, "got {e:?}");
+        assert!(
+            e.message.starts_with("Internal server error (ref: "),
+            "the provider's own text must not reach the client: {}",
+            e.message
+        );
+        assert!(!e.message.contains("internal.corp"), "{}", e.message);
     }
 }

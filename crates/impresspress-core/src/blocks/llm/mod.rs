@@ -771,13 +771,29 @@ impl Block for LlmBlock {
         )
         .await?;
         if matches!(event.event_type, LifecycleType::Init) {
-            // Always load enabled providers into the in-memory service on
-            // startup so chat dispatch finds them without waiting for an
-            // admin CRUD write. Non-fatal if it fails — admins can trigger
-            // a reload via any provider write.
-            if let Err(e) = routes::reload_provider_service(ctx, self.provider_admin.as_ref()).await
-            {
-                tracing::warn!("initial provider reload failed: {e}");
+            // Load enabled providers into the in-memory service on startup
+            // so chat dispatch finds them without waiting for an admin CRUD
+            // write. Non-fatal if it fails — admins can trigger a reload via
+            // any provider write.
+            //
+            // Skipped entirely on a runtime with no configurable provider
+            // router (a `NoopProviderAdmin` handle: browser and any other
+            // build without the native provider backend). There, "no reload
+            // happened" is the correct state and not a degradation, so it
+            // must not be reported as one — `configure` now answers
+            // `NotSupported` rather than silently accepting, and warning on
+            // every boot about a capability the deployment never had would
+            // be noise an operator has to learn to ignore.
+            if self.provider_admin.manages_providers() {
+                if let Err(e) =
+                    routes::reload_provider_service(ctx, self.provider_admin.as_ref()).await
+                {
+                    tracing::warn!("initial provider reload failed: {e}");
+                }
+            } else {
+                tracing::debug!(
+                    "provider reload skipped: this runtime has no configurable provider router"
+                );
             }
         }
         Ok(())

@@ -15,9 +15,7 @@ use wafer_run::{
 };
 
 use crate::blocks::llm::{
-    provider_admin::{NoopProviderAdmin, ProviderAdmin},
-    providers::config::ProviderConfig,
-    LlmBlock,
+    provider_admin::ProviderAdmin, providers::config::ProviderConfig, LlmBlock,
 };
 
 /// Minimal Context that panics on `call_block` — the bad-request tests must
@@ -46,10 +44,20 @@ impl Context for PanicCtx {
     }
 }
 
-/// The parse-error tests reject before reaching the provider-admin surface,
-/// so the no-op handle suffices.
+/// A block whose provider-admin handle is deliberately not what the test is
+/// about — it manages providers, holds nothing, and records what it is told.
+///
+/// It used to be a
+/// [`NoopProviderAdmin`](crate::blocks::llm::provider_admin::NoopProviderAdmin)
+/// on the grounds that the parse-error
+/// tests reject before reaching the provider-admin surface. That stopped
+/// being true when the provider CRUD handlers started refusing outright on a
+/// runtime that cannot manage providers: an inert handle here would answer
+/// 501 to every one of them, and a test asserting 400 for a malformed body
+/// would be asserting nothing about the body. The capability question has its
+/// own fixture (`providers::inert_router_tests::inert_block`).
 pub(super) fn stub_block() -> LlmBlock {
-    LlmBlock::new(Arc::new(NoopProviderAdmin))
+    LlmBlock::new(Arc::new(RecordingProviderAdmin::default()))
 }
 
 /// One recorded `call_block` invocation on a [`RecordingCtx`].
@@ -260,8 +268,13 @@ pub(super) struct RecordingProviderAdmin {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl ProviderAdmin for RecordingProviderAdmin {
-    fn configure(&self, providers: Vec<ProviderConfig>) {
+    fn manages_providers(&self) -> bool {
+        true
+    }
+
+    fn configure(&self, providers: Vec<ProviderConfig>) -> Result<(), LlmError> {
         *self.configured.lock().expect("configured lock") = providers;
+        Ok(())
     }
 
     fn providers_snapshot(&self) -> Vec<ProviderConfig> {

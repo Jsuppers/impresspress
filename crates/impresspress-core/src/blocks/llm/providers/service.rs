@@ -174,13 +174,23 @@ impl ProviderLlmService {
 
 #[async_trait]
 impl ProviderAdmin for ProviderLlmService {
+    /// This is the router provider management exists for, so `true`.
+    fn manages_providers(&self) -> bool {
+        true
+    }
+
     /// Replace the provider set. Called on feature block startup and again
     /// whenever the admin UI adds / edits / deletes a provider.
     ///
     /// For each provider, seeds `cached_models` from its explicit `models`
     /// list. Callers that want to refresh via `/v1/models` discovery should
     /// subsequently call `discover_models(name)` per provider.
-    fn configure(&self, providers: Vec<ProviderConfig>) {
+    ///
+    /// Always `Ok`: the write is to an in-process map behind a lock that
+    /// `recover_lock!` un-poisons, so there is no failure to report. The
+    /// `Result` is the trait's, and it is what lets an inert handle say it
+    /// cannot do this at all.
+    fn configure(&self, providers: Vec<ProviderConfig>) -> Result<(), LlmError> {
         let mut inner = recover_lock!(self.inner.write(), "provider svc write");
         inner.providers.clear();
         inner.cached_models.clear();
@@ -194,6 +204,7 @@ impl ProviderAdmin for ProviderLlmService {
             inner.cached_models.insert(name.clone(), seeded);
             inner.providers.insert(name, p);
         }
+        Ok(())
     }
 
     /// Read-only snapshot of the configured providers. Used by route handlers
@@ -498,7 +509,8 @@ mod tests {
     #[tokio::test]
     async fn configure_populates_cached_models() {
         let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![openai_cfg(), local_cfg()]);
+        svc.configure(vec![openai_cfg(), local_cfg()])
+            .expect("the provider router accepts configuration");
 
         let models = svc.list_models().await.unwrap();
         assert_eq!(models.len(), 3, "2 openai + 1 local");
@@ -511,7 +523,8 @@ mod tests {
         let mut cfg = openai_cfg();
         cfg.enabled = false;
         let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![cfg, local_cfg()]);
+        svc.configure(vec![cfg, local_cfg()])
+            .expect("the provider router accepts configuration");
 
         let models = svc.list_models().await.unwrap();
         assert_eq!(models.len(), 1);
@@ -521,7 +534,8 @@ mod tests {
     #[tokio::test]
     async fn claims_backend_matches_configured_names() {
         let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![openai_cfg()]);
+        svc.configure(vec![openai_cfg()])
+            .expect("the provider router accepts configuration");
         assert!(svc.claims_backend("openai-main"));
         assert!(!svc.claims_backend("local"));
     }
@@ -529,7 +543,8 @@ mod tests {
     #[tokio::test]
     async fn status_ready_for_enabled_provider() {
         let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![openai_cfg()]);
+        svc.configure(vec![openai_cfg()])
+            .expect("the provider router accepts configuration");
         let s = svc.status("openai-main", "gpt-4o").await.unwrap();
         assert_eq!(s.state, ModelState::Ready);
     }
@@ -539,7 +554,8 @@ mod tests {
         let mut cfg = openai_cfg();
         cfg.enabled = false;
         let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![cfg]);
+        svc.configure(vec![cfg])
+            .expect("the provider router accepts configuration");
         let s = svc.status("openai-main", "gpt-4o").await.unwrap();
         assert!(matches!(s.state, ModelState::Error { .. }));
     }
@@ -574,7 +590,8 @@ mod tests {
             ProviderProtocol::OpenAi,
             "https://api.openai.com/v1",
         );
-        svc.configure(vec![cfg]);
+        svc.configure(vec![cfg])
+            .expect("the provider router accepts configuration");
         let req = ChatRequest::new("openai-main", "gpt-4o", vec![ChatMessage::user("hi")]);
         let stream = svc.chat_stream(req, CancellationToken::new()).await;
         let items: Vec<_> = stream.collect().await;
@@ -585,10 +602,12 @@ mod tests {
     #[tokio::test]
     async fn reconfigure_replaces_previous_providers() {
         let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![openai_cfg()]);
+        svc.configure(vec![openai_cfg()])
+            .expect("the provider router accepts configuration");
         assert!(svc.claims_backend("openai-main"));
 
-        svc.configure(vec![local_cfg()]);
+        svc.configure(vec![local_cfg()])
+            .expect("the provider router accepts configuration");
         assert!(svc.claims_backend("local"));
         assert!(!svc.claims_backend("openai-main"));
     }
