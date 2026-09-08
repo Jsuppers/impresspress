@@ -10,7 +10,7 @@ use crate::{
         components::{self, badge, BadgeVariant},
         icons,
         shell::Topbar,
-        templates::{list_page, PageHeader},
+        templates::list_page,
     },
 };
 
@@ -45,16 +45,7 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
     };
 
-    let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
-        None,
-        tabs_and_body,
-        None,
-    );
+    let body = list_page(None, tabs_and_body, None);
 
     admin_page(
         ctx,

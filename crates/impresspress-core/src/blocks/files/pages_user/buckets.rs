@@ -10,7 +10,7 @@ use crate::{
         self,
         components::{button, BtnVariant, CtrlSize},
         shell::Crumb,
-        templates::{list_page, PageHeader},
+        templates::list_page,
     },
     util::url_path_encode,
 };
@@ -189,16 +189,7 @@ pub async fn bucket_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream 
         script src=(js_url) defer {}
     };
 
-    let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
-        None,
-        table_with_modal,
-        None,
-    );
+    let body = list_page(None, table_with_modal, None);
 
     ui::shell_page(
         ctx,

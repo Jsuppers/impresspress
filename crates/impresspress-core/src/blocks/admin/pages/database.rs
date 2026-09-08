@@ -22,7 +22,7 @@ use crate::{
         components::{self, Badge, BadgeVariant},
         html_response, icons,
         shell::Topbar,
-        templates::{list_page, PageHeader},
+        templates::list_page,
     },
     util::{now_millis, parse_form_body, url_path_encode as pct_encode},
 };
@@ -391,11 +391,6 @@ pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let tab = Tab::from_query(msg.query("tab"));
 
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         None,
         html! {
             div .db-layout {

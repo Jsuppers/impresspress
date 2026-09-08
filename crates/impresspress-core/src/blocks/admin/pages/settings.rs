@@ -21,7 +21,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::{admin_page, crumb, email, network, permissions, variables};
 use crate::ui::{
     shell::Topbar,
-    templates::{tabbed_page, FormSection, PageHeader},
+    templates::{tabbed_page, FormSection},
 };
 
 /// Render the settings page for the given tab. `tab` is one of
@@ -78,11 +78,6 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
     };
 
     let form_body = tabbed_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         tabs,
         vec![FormSection {
             title: tab_title(active),

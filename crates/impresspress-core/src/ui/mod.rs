@@ -2219,4 +2219,71 @@ mod tests {
             "exception list entries no longer both used and undefined -- remove them: {stale:?}"
         );
     }
+
+    /// The page header had two renderers. `templates::render_header` emitted
+    /// `header.page-header > div.page-header__text > h2.page-header__title`;
+    /// `components::page_header` emits `div.flex > div > h2.page-title`. The
+    /// first one is gone, and it went for free rather than by a cutover:
+    /// every one of its 15 production call sites passed
+    /// `PageHeader { title: "", subtitle: None, primary_action: None }`, which
+    /// `render_header` answered with empty markup, so the `.page-header*`
+    /// family reached no page in any deployment and its stylesheet rules
+    /// styled nothing.
+    ///
+    /// This guard keeps it deleted from both halves. A `.page-header` or
+    /// `.page-header__*` class appearing in maud markup means the second
+    /// renderer is back; the same name appearing in `ui/styles/**` means a
+    /// rule is waiting for it. `pages_use_only_classes_defined_in_the_
+    /// stylesheet` above cannot see either case — it only asserts that markup
+    /// is a subset of the stylesheet, so a class in neither passes it, and a
+    /// class in the stylesheet alone passes it too.
+    #[test]
+    fn the_first_generation_page_header_stays_deleted() {
+        fn is_gen1_header(class: &str) -> bool {
+            class == "page-header" || class.starts_with("page-header__")
+        }
+
+        let mut used: std::collections::BTreeMap<String, (String, usize, String)> =
+            Default::default();
+        for root in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+        ] {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+            {
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                collect_markup_classes(&src, &entry.path().display().to_string(), &mut used);
+            }
+        }
+        let in_markup: Vec<String> = used
+            .iter()
+            .filter(|(class, _)| is_gen1_header(class))
+            .map(|(class, (file, line, _))| format!("{file}:{line}: .{class}"))
+            .collect();
+        assert!(
+            in_markup.is_empty(),
+            "the first-generation page header is being rendered again; \
+             use components::page_header:\n{}",
+            in_markup.join("\n")
+        );
+
+        let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in walkdir::WalkDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/styles"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
+        {
+            let css = std::fs::read_to_string(entry.path()).unwrap();
+            collect_css_classes(&strip_css_comments(&css), &mut defined);
+        }
+        let mut in_styles: Vec<&String> = defined.iter().filter(|c| is_gen1_header(c)).collect();
+        in_styles.sort();
+        assert!(
+            in_styles.is_empty(),
+            "ui/styles still carries first-generation page-header rules: {in_styles:?}"
+        );
+    }
 }

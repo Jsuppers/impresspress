@@ -459,4 +459,99 @@ mod tests {
         assert!(!s.contains("<thead>"), "{s}");
         assert!(s.contains(r#"data-label="Email""#), "{s}");
     }
+
+    /// Every file that still writes a first-generation `table .table` by hand
+    /// rather than through this module, with the number it writes. Same
+    /// ratchet as `only_the_declared_files_still_hand_write_badge_markup`: an
+    /// unlisted file must render none, and a listed file's count must be
+    /// exact, so a migration cannot half-land and a new raw table cannot
+    /// appear unrecorded.
+    ///
+    /// **This list is what blocks the deletion of the first-generation table
+    /// stylesheet.** `ui/styles/components/table.css` still carries
+    /// `.table-container`, `.table`, `.table th`, `.table td`,
+    /// `.table tbody tr:hover`, and the `max-width: 720px`
+    /// `white-space: nowrap` rule, for these ten tables and nothing else —
+    /// administration's 19 moved to `.data-table` in the pull request before
+    /// this one. (`.table th.sortable` went in the same change as this test:
+    /// the sortable header was a `components.rs` affordance that the phase-3a
+    /// administration port deleted, and its two rules outlived it.) `pages_use_only_classes_defined_in_the_stylesheet`
+    /// (`ui/mod.rs`) fails the build if those rules are deleted while any
+    /// entry below survives, which is why the deletion could not ship here.
+    ///
+    /// When the last entry goes, delete those rules with it and delete this
+    /// test. Migrating one is not free: `.data-table` is a different chrome
+    /// (rounded, bordered, sticky `thead`, dashed row rules, a `data-label`
+    /// per cell that collapses to cards below 720px), so each entry is a
+    /// rendered change. Six of the ten sit on pages with no visual baseline
+    /// at all — `blocks/legalpages` and `blocks/tickets` have none — so the
+    /// gate there is a Rust render test, not a screenshot.
+    ///
+    /// The scope is maud's bare `.table` class shorthand, the form all ten are
+    /// written in. `.table-container` and `.data-table` are excluded by
+    /// construction (the character after `.table` continues the class name, or
+    /// the `.` is not there at all). Comments are masked, since a comment
+    /// renders nothing.
+    const HAND_WRITTEN_TABLES: &[(&str, usize)] = &[
+        ("blocks/legalpages/pages.rs", 3),
+        ("blocks/llm/pages.rs", 1),
+        ("blocks/llm/ui.rs", 2),
+        ("blocks/tickets/pages.rs", 3),
+        ("blocks/userportal/pages/admin_buttons.rs", 1),
+    ];
+
+    /// Count maud's bare `.table` class shorthand in `src`: preceded by
+    /// whitespace, and not the start of `.table-container`. `src` is expected
+    /// comment-masked.
+    fn hand_written_tables(src: &str) -> usize {
+        let bytes = src.as_bytes();
+        let mut count = 0;
+        for (i, _) in src.match_indices(".table") {
+            let preceded_by_space = i
+                .checked_sub(1)
+                .is_some_and(|p| bytes[p].is_ascii_whitespace());
+            let next = bytes.get(i + ".table".len()).copied();
+            let continues_class =
+                next.is_some_and(|c| c == b'-' || c == b'_' || c.is_ascii_alphanumeric());
+            if preceded_by_space && !continues_class {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn only_the_declared_files_still_hand_write_a_first_generation_table() {
+        let src_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let expected: std::collections::BTreeMap<&str, usize> =
+            HAND_WRITTEN_TABLES.iter().copied().collect();
+        let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+        for entry in walkdir::WalkDir::new(src_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+        {
+            let rel = entry
+                .path()
+                .strip_prefix(src_root)
+                .unwrap()
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let src = crate::ui::test_support::mask_rust_comments(
+                &std::fs::read_to_string(entry.path()).unwrap(),
+            );
+            let count = hand_written_tables(&src);
+            if count > 0 {
+                found.insert(rel, count);
+            }
+        }
+        let found_refs: std::collections::BTreeMap<&str, usize> =
+            found.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        assert_eq!(
+            found_refs, expected,
+            "first-generation table markup moved; update HAND_WRITTEN_TABLES only to \
+             remove entries or lower counts, and when it empties delete the \
+             `.table`/`.table-container` rules from ui/styles/components/table.css"
+        );
+    }
 }

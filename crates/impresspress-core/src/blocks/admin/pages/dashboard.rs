@@ -11,7 +11,7 @@ use crate::{
         components::{self, Badge, BadgeVariant},
         icons,
         shell::Topbar,
-        templates::{dashboard_page, PageHeader, StatTile},
+        templates::dashboard_page,
     },
 };
 
@@ -227,36 +227,36 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let errors_spark = spark(&errors_daily, "var(--accent-danger)");
 
     let stats = vec![
-        StatTile {
-            label: "Total Users",
-            value: tile_value(&user_count_str),
-            icon: icons::users(),
-            spark: new_users_spark.clone(),
-        },
-        StatTile {
-            label: "New Today",
-            value: tile_value(&new_users_str),
-            icon: icons::user_plus(),
-            spark: new_users_spark,
-        },
-        StatTile {
-            label: "Requests Today",
-            value: tile_value(&requests_str),
-            icon: icons::file_text(),
-            spark: requests_spark,
-        },
-        StatTile {
-            label: "Errors Today",
-            value: tile_value(&errors_str),
-            icon: icons::triangle_alert(),
-            spark: errors_spark,
-        },
-        StatTile {
-            label: "Avg Response",
-            value: tile_value(&avg_ms_str),
-            icon: icons::activity(),
-            spark: None,
-        },
+        components::stat_card(
+            "Total Users",
+            tile_value(&user_count_str),
+            icons::users(),
+            new_users_spark.clone(),
+        ),
+        components::stat_card(
+            "New Today",
+            tile_value(&new_users_str),
+            icons::user_plus(),
+            new_users_spark,
+        ),
+        components::stat_card(
+            "Requests Today",
+            tile_value(&requests_str),
+            icons::file_text(),
+            requests_spark,
+        ),
+        components::stat_card(
+            "Errors Today",
+            tile_value(&errors_str),
+            icons::triangle_alert(),
+            errors_spark,
+        ),
+        components::stat_card(
+            "Avg Response",
+            tile_value(&avg_ms_str),
+            icons::activity(),
+            None,
+        ),
     ];
 
     let recent_users_card = html! {
@@ -364,11 +364,6 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let body = dashboard_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         stats,
         recent_users_card,
         recent_errors_card,
@@ -441,17 +436,12 @@ mod tests {
     #[test]
     fn dashboard_renders_stats_before_charts() {
         let m = crate::ui::templates::dashboard_page(
-            crate::ui::templates::PageHeader {
-                title: "Dashboard",
-                subtitle: None,
-                primary_action: None,
-            },
-            vec![crate::ui::templates::StatTile {
-                label: "TOTAL USERS",
-                value: "1",
-                icon: maud::html! { span .probe-icon {} },
-                spark: None,
-            }],
+            vec![crate::ui::components::stat_card(
+                "TOTAL USERS",
+                "1",
+                maud::html! { span .probe-icon {} },
+                None,
+            )],
             maud::html! { div .probe-primary {} },
             maud::html! {},
             None,
@@ -609,9 +599,9 @@ mod outage_tests {
     /// "Avg Response" is a latency measured during the run that screenshots
     /// this page, so the visual-baseline suite masks it. It has to be masked
     /// by its label text (`.stat-card:has-text("Avg Response") .stat-value`)
-    /// rather than by an attribute, because `StatTile::value` is a plain
-    /// `&str` and `components::stat_card` offers no markup slot to hang one
-    /// on. That makes the label part of the mask's contract: rename it and
+    /// rather than by an attribute, because `components::stat_card` takes its
+    /// value as a plain `&str` and offers no markup slot to hang one on. That
+    /// makes the label part of the mask's contract: rename it and
     /// the mask silently stops matching, and the tile is compared pixel by
     /// pixel again with nothing announcing the change.
     #[tokio::test]

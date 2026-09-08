@@ -9,7 +9,7 @@ use crate::{
         components::{self, empty_state, tab_navigation, Badge, BadgeVariant, Tab},
         icons,
         shell::Topbar,
-        templates::{list_page, PageHeader},
+        templates::list_page,
     },
 };
 
@@ -237,16 +237,7 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         script { (maud::PreEscaped(RUNTIME_FILTER_JS)) }
     };
 
-    let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
-        None,
-        tabs_and_body,
-        None,
-    );
+    let body = list_page(None, tabs_and_body, None);
 
     admin_page(
         ctx,

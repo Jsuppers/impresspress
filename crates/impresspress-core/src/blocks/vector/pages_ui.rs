@@ -11,7 +11,7 @@ use super::service::{display_index_name, vector_backend_available, IndexRow};
 use crate::ui::{
     self,
     shell::Crumb,
-    templates::{detail_page, list_page, DetailHero, DetailMeta, PageHeader},
+    templates::{detail_page, list_page, DetailHero, DetailMeta},
 };
 
 /// htmx-friendly success render for `POST /b/vector/api/indexes` — re-loads
@@ -176,11 +176,6 @@ pub async fn index_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let backend_available = vector_backend_available(ctx);
 
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         None,
         html! {
             @if !backend_available {

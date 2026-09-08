@@ -135,7 +135,7 @@ pub fn render_admin_overview_quotas_hint(quotas_count: i64) -> Markup {
 }
 
 pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    use crate::ui::templates::{list_page, PageHeader};
+    use crate::ui::templates::list_page;
 
     let stats = match load_admin_stats(ctx).await {
         Ok(stats) => stats,
@@ -150,11 +150,6 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // slots prevents `.page-filters` (display:flex) from putting tabs
     // and the stats-grid side-by-side at wide viewports.
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         Some(admin_tabs("Overview")),
         html! {
             (render_admin_overview_stats(&stats))
@@ -277,7 +272,7 @@ pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
 }
 
 pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    use crate::ui::templates::{list_page, PageHeader};
+    use crate::ui::templates::list_page;
 
     let rows: Vec<AdminBucketRow> = match repo::buckets::list_recent(ctx, 100).await {
         Ok(page) => page.rows.iter().map(AdminBucketRow::from).collect(),
@@ -293,11 +288,6 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // the "+ New bucket" trigger; without it the JS bails on init.
     let js_url = crate::blocks::files::assets::files_browser_js_url();
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         Some(admin_tabs("Buckets")),
         html! {
             (render_admin_buckets_table(&rows))
@@ -408,7 +398,7 @@ pub fn render_admin_shares_table(rows: &[AdminShareRow]) -> Markup {
 }
 
 pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    use crate::ui::templates::{list_page, PageHeader};
+    use crate::ui::templates::list_page;
 
     let rows: Vec<AdminShareRow> = match repo::shares::list_recent(ctx, 100, 0).await {
         Ok(page) => page.rows.iter().map(AdminShareRow::from).collect(),
@@ -419,11 +409,6 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         Some(admin_tabs("Shares")),
         render_admin_shares_table(&rows),
         None,
@@ -501,7 +486,7 @@ pub fn render_admin_quotas_table(rows: &[AdminQuotaRow]) -> Markup {
 }
 
 pub async fn quotas(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    use crate::ui::templates::{list_page, PageHeader};
+    use crate::ui::templates::list_page;
 
     let rows: Vec<AdminQuotaRow> = match repo::quota::list_recent(ctx, 100).await {
         Ok(page) => page.rows.iter().map(AdminQuotaRow::from).collect(),
@@ -512,11 +497,6 @@ pub async fn quotas(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         Some(admin_tabs("Quotas")),
         render_admin_quotas_table(&rows),
         None,
