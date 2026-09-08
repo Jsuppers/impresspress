@@ -62,7 +62,7 @@ pub(crate) const RELEASE_ASSET_ID_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_ID";
 pub(crate) const RELEASE_ASSET_PREFIX_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_PREFIX";
 pub(crate) const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST";
 
-const RELEASES_ROOT: &str = ".impresspress/releases/v1";
+use impresspress_core::release_inventory::RELEASES_ROOT;
 
 /// Pure, Worker-version-bound release identity. This contains no R2 handle
 /// and no key inventory — the inventory itself is fetched lazily (and

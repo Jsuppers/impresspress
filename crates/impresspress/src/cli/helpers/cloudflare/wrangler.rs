@@ -32,6 +32,36 @@ pub const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFES
 pub const PREPARED_WAFER_LOCK_IDENTITY_VAR: &str =
     impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR;
 
+/// Default `[triggers] crons` for a generated Worker config: **none**.
+///
+/// The scheduled sweep is opt-in, in two steps a consumer takes together:
+///
+/// 1. export a `scheduled` Worker entry point that calls
+///    `impresspress_cloudflare::run_scheduled` (see
+///    `examples/webmcp-demo/src/lib.rs`), and
+/// 2. set `[cloudflare].crons` in `impresspress.toml`.
+///
+/// A default schedule would be a configuration-driven break of every existing
+/// consumer: `run_scheduled` cannot be supplied by the adapter (it needs the
+/// consumer's own registration hooks) and the CLI scaffolds no consumer source
+/// file, so a Worker that changed no code of its own would take a daily failed
+/// invocation the day the schedule started being applied. A sweep that does not
+/// run by default is the smaller harm — every deployment already prunes
+/// opportunistically on login, and the schedule only covers a deployment with
+/// no logins.
+///
+/// [`SUGGESTED_SWEEP_CRON`] is the value to copy when turning it on.
+pub const DEFAULT_CRONS: &[&str] = &[];
+
+/// The schedule to copy into `[cloudflare].crons` when enabling the sweep.
+///
+/// One invocation a day, at an off-peak minute that is not `:00` — Cloudflare
+/// schedules every account's `0 * * * *` at the same instant, and this work is
+/// not urgent enough to join that queue. What runs on it is the auth retention
+/// sweep (`auth.maintenance`), which is throttled to at most one pass an hour
+/// anyway.
+pub const SUGGESTED_SWEEP_CRON: &str = "17 3 * * *";
+
 #[derive(Debug, Clone)]
 pub struct CloudflareConfig {
     pub account_id: String,
@@ -50,6 +80,14 @@ pub struct CloudflareConfig {
     /// deployment that outgrows 100%-capture traffic doesn't have to reach
     /// for a `wrangler_overrides_path` file to dial it down.
     pub head_sampling_rate: f64,
+    /// Cloudflare cron expressions the Worker's `scheduled` handler runs on,
+    /// resolved by [`super::env::RawCloudflareConfig::resolve`] from
+    /// `impresspress.toml`'s `[cloudflare].crons`, defaulting to
+    /// [`DEFAULT_CRONS`] (empty — the sweep is opt-in).
+    ///
+    /// Empty still emits `crons = []`, which is not the same as omitting the
+    /// section: see [`ConfigRole`].
+    pub crons: Vec<String>,
     /// Ordinary routes exercised by the bounded mixed-concurrency gate after
     /// final-version verification and before promotion. Resolution guarantees
     /// a non-empty collection of path-only values.
@@ -88,7 +126,7 @@ pub fn generate(cfg: &CloudflareConfig, repo_root: &Path, out_dir: &Path) -> Res
         repo_root,
         out_dir,
         "wrangler.toml",
-        BuildHook::Include,
+        ConfigRole::Build,
         None,
         None,
         None,
@@ -124,7 +162,7 @@ pub fn generate_upload_with_release(
         repo_root,
         out_dir,
         "wrangler-upload.toml",
-        BuildHook::Omit,
+        ConfigRole::Upload,
         release,
         None,
         None,
@@ -146,7 +184,7 @@ pub fn generate_candidate_upload(
         repo_root,
         out_dir,
         "wrangler-candidate.toml",
-        BuildHook::Omit,
+        ConfigRole::Upload,
         Some(release),
         Some(identity),
         None,
@@ -169,17 +207,82 @@ pub fn generate_final_upload(
         repo_root,
         out_dir,
         "wrangler-final.toml",
-        BuildHook::Omit,
+        ConfigRole::Upload,
         Some(release),
         Some(identity),
         Some(prepared),
     )
 }
 
-#[derive(Clone, Copy)]
-enum BuildHook {
-    Include,
-    Omit,
+/// Generate the configuration handed to `wrangler triggers deploy` after the
+/// final version has been promoted.
+///
+/// Carries no release identity, artifact identity, or prepared plan: those are
+/// *versioned* settings, already bound into the promoted version by
+/// [`generate_final_upload`], and `triggers deploy` uploads no code. What it
+/// does carry is the worker-level surface — the worker name, any routes or
+/// custom domains from a consumer override file, `preview_urls`, and the
+/// `[triggers]` section that is the whole reason this config exists.
+pub fn generate_triggers(
+    cfg: &CloudflareConfig,
+    repo_root: &Path,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    generate_named(
+        cfg,
+        repo_root,
+        out_dir,
+        "wrangler-triggers.toml",
+        ConfigRole::WorkerSettings,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Which wrangler command a generated config is written for. Three commands,
+/// three roles, and the role decides both of the things that differ between
+/// them: whether wrangler compiles the crate, and whether the file carries the
+/// `[triggers]` section.
+///
+/// The triggers half is the load-bearing one. Cron triggers are a
+/// **worker-level** (unversioned) setting. `wrangler versions upload` accepts
+/// the key without complaint — it is a first-class configuration field, not an
+/// unknown one — and simply does not apply it; the command's own closing note
+/// says so verbatim: *"Changes to triggers (routes, custom domains, cron
+/// schedules, etc) must be applied with the command `wrangler triggers
+/// deploy`"* (wrangler 4.72.0). So an upload config that carried `[triggers]`
+/// would be a lie about what the upload does, which is exactly the shape of
+/// bug the section exists to prevent: an operator editing the schedule, seeing
+/// it in the generated file, and watching the live Worker never change.
+///
+/// The two roles that do emit it emit it **always**, an empty schedule list
+/// included. That is not cosmetic: `wrangler triggers deploy` PUTs the schedule
+/// set only when the config defines `triggers.crons` at all, so an absent
+/// section leaves whatever schedules the Worker already has in place, while
+/// `crons = []` clears them. A deployment that turns the sweep off has to be
+/// able to actually turn it off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigRole {
+    /// `wrangler dev`, and the one-time first `wrangler deploy` that creates
+    /// the Worker. Compiles the crate; applies worker-level settings.
+    Build,
+    /// `wrangler versions upload`. Consumes an already-built artifact and
+    /// applies no worker-level setting.
+    Upload,
+    /// `wrangler triggers deploy`, run after promotion. Uploads no code and
+    /// applies nothing but worker-level settings.
+    WorkerSettings,
+}
+
+impl ConfigRole {
+    fn runs_the_build_hook(self) -> bool {
+        self == Self::Build
+    }
+
+    fn applies_worker_level_settings(self) -> bool {
+        self != Self::Upload
+    }
 }
 
 fn generate_named(
@@ -187,12 +290,12 @@ fn generate_named(
     repo_root: &Path,
     out_dir: &Path,
     file_name: &str,
-    build_hook: BuildHook,
+    role: ConfigRole,
     release: Option<&ReleaseManifest>,
     identity: Option<&ApplicationArtifactIdentity>,
     prepared: Option<&PreparedModule>,
 ) -> Result<PathBuf> {
-    let mut value = base_toml(cfg);
+    let mut value = base_toml(cfg, role);
 
     if let Some(rel) = cfg.wrangler_overrides_path.as_ref() {
         let abs = repo_root.join(rel);
@@ -299,7 +402,7 @@ fn generate_named(
     // Remove the hook *after* applying consumer overrides. An upload-only
     // config is an invariant of the deploy pipeline, not something an
     // override file may accidentally undo.
-    if matches!(build_hook, BuildHook::Omit) {
+    if !role.runs_the_build_hook() {
         value
             .as_table_mut()
             .expect("base wrangler config is a table")
@@ -307,15 +410,20 @@ fn generate_named(
     }
 
     let body = toml::to_string_pretty(&value).context("serialize wrangler.toml")?;
-    let header = match build_hook {
-        BuildHook::Include => {
+    let header = match role {
+        ConfigRole::Build => {
             "# Generated by `impresspress build --target cloudflare`. \
              Do not edit. Regenerated each build.\n\n"
         }
-        BuildHook::Omit => {
+        ConfigRole::Upload => {
             "# Generated by `impresspress deploy --target cloudflare`. \
              Upload-only: consumes the already-built worker artifact. \
              Do not edit.\n\n"
+        }
+        ConfigRole::WorkerSettings => {
+            "# Generated by `impresspress deploy --target cloudflare`. \
+             Worker-level settings only, applied by `wrangler triggers deploy` \
+             after promotion; uploads no code. Do not edit.\n\n"
         }
     };
     let path = out_dir.join(file_name);
@@ -353,7 +461,7 @@ fn install_prepared_text_rule(root: &mut toml::map::Map<String, toml::Value>) ->
     Ok(())
 }
 
-fn base_toml(cfg: &CloudflareConfig) -> toml::Value {
+fn base_toml(cfg: &CloudflareConfig, role: ConfigRole) -> toml::Value {
     use toml::Value;
 
     let mut root = toml::map::Map::new();
@@ -477,6 +585,30 @@ fn base_toml(cfg: &CloudflareConfig) -> toml::Value {
         Value::Float(cfg.head_sampling_rate),
     );
     root.insert("observability".into(), Value::Table(obs));
+
+    // Cron triggers. Cloudflare invokes the Worker's `scheduled` handler on
+    // each of these; the adapter dispatches the auth retention sweep there and
+    // nothing else (`impresspress_cloudflare::run_scheduled`).
+    //
+    // Written whenever this config is one a worker-level command reads (see
+    // [`ConfigRole`]), including when the list is empty — `crons = []` and an
+    // absent `[triggers]` do NOT mean the same thing to `wrangler triggers
+    // deploy`: it PUTs the schedule set only when the config defines
+    // `triggers.crons` at all, so the absent form would leave a schedule
+    // registered by an earlier deploy running forever.
+    if role.applies_worker_level_settings() {
+        let mut section = toml::map::Map::new();
+        section.insert(
+            "crons".into(),
+            Value::Array(
+                cfg.crons
+                    .iter()
+                    .map(|cron| Value::String(cron.clone()))
+                    .collect(),
+            ),
+        );
+        root.insert("triggers".into(), Value::Table(section));
+    }
 
     Value::Table(root)
 }

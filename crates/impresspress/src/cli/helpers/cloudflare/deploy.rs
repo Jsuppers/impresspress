@@ -198,9 +198,19 @@ fn free_plan_ten_ms_compatible_config(
     Ok(Some(compatible_toml))
 }
 
-/// Apply worker-level settings (routes, `preview_urls`, observability) from
-/// the generated toml to the live worker without uploading code.
-fn wrangler_triggers_deploy(wrangler_toml: &Path) -> Result<()> {
+/// Apply worker-level settings from the generated toml to the live worker
+/// without uploading code: routes and custom domains, the `workers.dev` /
+/// `preview_urls` subdomain state, cron schedules, queue consumers, and
+/// workflow bindings.
+///
+/// These are exactly the settings `wrangler versions upload` and `wrangler
+/// versions deploy` do **not** touch — versioned settings travel with a Worker
+/// version, worker-level ones do not — which is why the upload closes with
+/// "Changes to triggers (routes, custom domains, cron schedules, etc) must be
+/// applied with the command `wrangler triggers deploy`". `impresspress deploy`
+/// is those two commands, so without this call the `[triggers] crons` an
+/// operator configured would never reach the live Worker.
+pub fn wrangler_triggers_deploy(wrangler_toml: &Path) -> Result<()> {
     let status = Command::new("wrangler")
         .args(["triggers", "deploy", "--config"])
         .arg(wrangler_toml)
@@ -1155,9 +1165,9 @@ mod tests {
         R2ObjectClient, CONCURRENT_SMOKE_MAX_IN_FLIGHT, CONCURRENT_SMOKE_TOTAL_REQUESTS,
         FREE_PLAN_CPU_LIMIT_ERROR, FREE_PLAN_CPU_LIMIT_ERROR_CODE,
     };
+    use crate::cli::helpers::cloudflare::assets::release_manifest_from_staged_dir;
     #[cfg(feature = "embed-assets")]
     use crate::cli::helpers::cloudflare::assets::ui_asset_entries;
-    use crate::cli::helpers::cloudflare::assets::ReleaseManifest;
 
     fn configured_smoke_paths() -> Vec<String> {
         [
@@ -1549,7 +1559,7 @@ mod tests {
         std::fs::create_dir_all(staged.path().join("site/media")).unwrap();
         std::fs::write(staged.path().join("site/media/hero.webp"), b"hero").unwrap();
         std::fs::write(staged.path().join("site/app.js"), b"app").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let mut r2 = MemoryR2::default();
         r2.objects
             .insert("site/media/hero.webp".into(), b"legacy-hero".to_vec());
@@ -1604,7 +1614,7 @@ mod tests {
     fn final_deployment_record_binds_second_worker_to_plan_without_reuploading_assets() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let mut r2 = MemoryR2::default();
         let plan_hash = format!("sha256:{}", "c".repeat(64));
 
@@ -1636,7 +1646,7 @@ mod tests {
     fn release_upload_preflights_local_bytes_before_remote_mutation() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"v1").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"v2").unwrap();
         let mut r2 = MemoryR2::default();
 
@@ -1660,7 +1670,7 @@ mod tests {
     fn release_upload_aborts_on_remote_byte_mismatch() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let immutable_key = release.immutable_key("hero.webp");
         let mut r2 = MemoryR2 {
             corrupt_on_get: Some(immutable_key.clone()),
@@ -1711,7 +1721,7 @@ mod tests {
     fn release_upload_retries_a_transient_verify_failure() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let immutable_key = release.immutable_key("hero.webp");
         let mut r2 = FlakyOnceR2 {
             inner: MemoryR2::default(),

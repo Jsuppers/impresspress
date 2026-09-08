@@ -45,7 +45,7 @@ pub const AUTH_UI_BLOCK_ID: &str = "impresspress/auth-ui";
 ///
 /// Mirrors `tickets.maintenance`. The sweep already runs on its own, throttled
 /// from token issuance, so this exists for an operator who wants a pass now and
-/// for the Worker `scheduled` handler Phase 4 adds — not because anything
+/// for the Cloudflare Worker's `scheduled` handler — not because anything
 /// depends on it.
 ///
 /// It is handled here rather than on the framework `wafer-run/auth` block
@@ -53,6 +53,34 @@ pub const AUTH_UI_BLOCK_ID: &str = "impresspress/auth-ui";
 /// handler, and wafer-run is pinned. auth-ui already holds the WRAP grants for
 /// every auth table, so this is also where the pass can actually run.
 pub const MAINTENANCE_MESSAGE_KIND: &str = "auth.maintenance";
+
+/// The exact message a scheduler sends to run one retention pass.
+///
+/// A constructor rather than a documented recipe because the sender lives in
+/// another crate (`impresspress-cloudflare`'s `scheduled` handler) and there
+/// is no route, schema or snapshot gate covering a bare message kind: spelled
+/// at the call site, a typo would be a silent no-op that answers `NotFound`
+/// once a day forever.
+pub fn maintenance_message() -> Message {
+    Message::new(MAINTENANCE_MESSAGE_KIND)
+}
+
+/// Decode the [`SweepResult`](crate::blocks::auth::maintenance::SweepResult)
+/// out of what the handler answered.
+///
+/// The pair to [`maintenance_message`], for the same reason: the caller that
+/// needs this is in another crate, and a `SweepResult` that failed to decode
+/// must not be reported as a pass that removed nothing.
+pub async fn sweep_result_from_output(
+    output: OutputStream,
+) -> Result<crate::blocks::auth::maintenance::SweepResult, String> {
+    let buffered = output
+        .collect_buffered()
+        .await
+        .map_err(|terminal| format!("auth maintenance did not answer a response: {terminal:?}"))?;
+    serde_json::from_slice(&buffered.body)
+        .map_err(|error| format!("auth maintenance answer is not a SweepResult: {error}"))
+}
 
 /// Handler for one row of [`ROUTES`]. `Verify` serves both the `GET` and the
 /// `POST` row of `/b/auth/api/verify` (the token arrives in the query string
@@ -484,6 +512,100 @@ mod test_support {
             msg.path()
         );
         msg
+    }
+}
+
+/// The scheduler-facing half of this block: the message a cron sends and the
+/// answer it reads back.
+///
+/// There is no route, no schema and no snapshot covering a bare message kind,
+/// so nothing else notices if the kind, the block id or the answer's shape
+/// moves. The Cloudflare `scheduled` handler is a `worker::Env` away from any
+/// test lane; what it does that is testable is exactly this pair, and it is
+/// tested here over the retention sweep's own four-table fixture.
+#[cfg(test)]
+mod scheduled_maintenance_tests {
+    use wafer_run::{Block, InputStream};
+
+    use super::*;
+    use crate::{
+        blocks::auth::repo::{sessions, sessions::NewSession, tokens},
+        test_support::TestContext,
+    };
+
+    fn iso(offset_secs: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::seconds(offset_secs))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_scheduled_message_runs_a_sweep_and_its_answer_decodes_to_the_counts() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("user-a").await;
+        for (family, expires_at) in [("fam-dead", iso(-60)), ("fam-live", iso(3600))] {
+            sessions::insert(
+                &ctx,
+                NewSession {
+                    family: family.into(),
+                    user_id: "user-a".into(),
+                    auth_method: "password".into(),
+                    expires_at,
+                },
+            )
+            .await
+            .expect("seed session");
+        }
+        tokens::insert(&ctx, "user-a", "tok-dead", "tok-dead", 0, &iso(-60))
+            .await
+            .expect("seed token");
+
+        let output = AuthUiBlock::new()
+            .handle(&ctx, maintenance_message(), InputStream::empty())
+            .await;
+        let result = sweep_result_from_output(output)
+            .await
+            .expect("the scheduled message answers a SweepResult");
+
+        assert_eq!(
+            result,
+            crate::blocks::auth::maintenance::SweepResult {
+                complete: true,
+                sessions_deleted: 1,
+                tokens_deleted: 1,
+                jwt_blocklist_deleted: 0,
+                oauth_pkce_deleted: 0,
+                errors: Vec::new(),
+            },
+            "the cron's message must reach the sweep, not fall through to routing"
+        );
+        assert_eq!(
+            sessions::list_for_user(&ctx, "user-a").await.unwrap().len(),
+            1,
+            "the live session survives"
+        );
+    }
+
+    /// The handler answers a `SweepResult` and only a `SweepResult`. An
+    /// unroutable message — which is what a mistyped kind becomes — must be
+    /// reported as a failure, never decoded into a pass that removed nothing.
+    #[tokio::test]
+    async fn an_answer_that_is_not_a_sweep_result_is_a_failure_not_an_empty_pass() {
+        let ctx = TestContext::with_auth().await;
+        let mut mistyped = Message::new("auth.maintenence");
+        mistyped.set_meta("req.action", "retrieve");
+        mistyped.set_meta("req.resource", "/b/auth/api/whatever");
+
+        let output = AuthUiBlock::new()
+            .handle(&ctx, mistyped, InputStream::empty())
+            .await;
+        let error = sweep_result_from_output(output)
+            .await
+            .expect_err("a non-response terminal must not decode");
+        assert!(
+            error.contains("did not answer a response"),
+            "unexpected error: {error}"
+        );
     }
 }
 

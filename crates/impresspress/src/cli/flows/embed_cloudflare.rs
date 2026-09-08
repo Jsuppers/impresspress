@@ -226,7 +226,7 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     // that build through a second, upload-only config. This prevents
     // either `versions upload` from compiling the Rust worker a second time.
     let assets_root = out_dir.join("assets");
-    let release_assets = assets::ReleaseManifest::from_staged_dir(&assets_root)?;
+    let release_assets = assets::release_manifest_from_staged_dir(&assets_root)?;
     let wasm_path = repo_root.join("build/index_bg.wasm");
     let wasm_sha256 = cf_deploy::artifact_sha256(&wasm_path)?;
     let application_identity =
@@ -415,6 +415,23 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     deployment_gate.authorize_promotion()?;
     cf_deploy::wrangler_versions_promote(&final_upload.version_id, &final_upload.wrangler_toml)?;
     println!("-> promoted {}", final_upload.version_id);
+
+    // 7. Worker-level settings last. Neither `wrangler versions upload` nor
+    //    `wrangler versions deploy` applies them — they are not part of a
+    //    Worker version — so the `[triggers] crons` schedule reaches the live
+    //    Worker only here. After promotion, deliberately: the schedule points
+    //    at whatever code is serving, and until this line runs that is still
+    //    the previous version.
+    let triggers_toml = wrangler::generate_triggers(&cfg, repo_root, &out_dir)?;
+    cf_deploy::wrangler_triggers_deploy(&triggers_toml)?;
+    println!(
+        "-> applied worker-level settings ({})",
+        if cfg.crons.is_empty() {
+            "no cron schedule".to_string()
+        } else {
+            format!("crons {}", cfg.crons.join(", "))
+        }
+    );
 
     println!();
     println!("deploy complete");

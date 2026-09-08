@@ -517,8 +517,13 @@ async fn write_request_log(ctx: &dyn Context, row: NewRequestLog<'_>) {
     }
     match request_log_mode() {
         RequestLogMode::Inline => {
-            // Best-effort: don't fail the request if logging fails.
-            let _ = request_logs::insert(ctx, &row).await;
+            // Best-effort: don't fail the request if logging fails — but say
+            // so. The row being optional is the deliberate part; the silence
+            // was not, and a deployment whose audit log has quietly stopped
+            // recording looks exactly like one with no traffic.
+            if let Err(error) = request_logs::insert(ctx, &row).await {
+                tracing::warn!(%error, "request audit row not written");
+            }
         }
         RequestLogMode::Queued => {
             enqueue_request_log(request_logs::TABLE, row.to_data());

@@ -10,10 +10,13 @@
 //!
 //! # Where things are
 //!
-//! This file is the Worker entry surface and nothing else: [`run`],
-//! [`run_with_config`], `run_inner`, `dispatch`, the `/b/static/` R2
-//! read-through and the error mapping that turns a failed dispatch into a
-//! response. Everything a request funnel *calls* lives beside it:
+//! This file is the Worker entry surface and nothing else — both entry
+//! points. [`run`] / [`run_with_config`] are the `fetch` shim (`run_inner`,
+//! `dispatch`, the `/b/static/` R2 read-through, and the error mapping that
+//! turns a failed dispatch into a response); [`run_scheduled`] /
+//! [`run_scheduled_with_config`] are the `scheduled` shim, which hydrates a
+//! runtime through the same cache and runs the auth retention sweep on it.
+//! Everything either funnel *calls* lives beside them:
 //!
 //! | module | what it owns |
 //! |---|---|
@@ -24,7 +27,10 @@
 //! | [`runtime_cache`] | the per-isolate runtime cache and its probe policy |
 //! | [`deploy_endpoints`] | `/_deploy/init`, `/_deploy/prepare`, `/_deploy/prepared`, `/_deploy/verify` |
 //! | [`host_policy`] | the `*.workers.dev` preview lockdown |
-//! | [`release_manifest`] | the release manifest wire types `/_deploy/verify` checks |
+//!
+//! The release manifest `/_deploy/verify` re-reads is not one of them: it is
+//! `impresspress_core::release_inventory::ReleaseManifest`, the same type
+//! `impresspress deploy` writes.
 
 mod boot_hooks;
 pub mod config_service;
@@ -45,7 +51,6 @@ mod host_policy;
 pub mod kv_cached_db;
 pub mod logger_service;
 pub mod network_service;
-mod release_manifest;
 mod request_services;
 mod runner;
 mod runtime_build;
@@ -351,38 +356,7 @@ where
         }
     }
 
-    // A config-version KV PUT failed earlier in this dispatch (most likely
-    // KV's 1-write/sec/key throttle). Retry through this request's Env.
-    if let Some(stamp) = kv_cached_db::take_pending_version_retry() {
-        match make_kv_backend(&env, runner::KV_BINDING) {
-            Ok(kv) => {
-                ctx.wait_until(async move {
-                    worker::Delay::from(std::time::Duration::from_millis(1_100)).await;
-                    if let Err(e) = kv
-                        .put(impresspress_core::cache_key::CONFIG_VERSION_KEY, &stamp)
-                        .await
-                    {
-                        // `e` here is already a `String` (KvBackend::put's error
-                        // type) — no `.to_string()` clone needed.
-                        worker::console_log!(
-                            "{}",
-                            impresspress_core::metrics::metric_line(
-                                "config_version_retry_failed",
-                                &[("error", &e)],
-                            )
-                        );
-                    }
-                });
-            }
-            Err(e) => worker::console_log!(
-                "{}",
-                impresspress_core::metrics::metric_line(
-                    "config_version_retry_failed",
-                    &[("error", &e.to_string())],
-                )
-            ),
-        }
-    }
+    retry_pending_config_version(&env, |task| ctx.wait_until(task));
 
     match result {
         Ok(response) => Ok(response),
@@ -410,6 +384,264 @@ where
         }
     }
 }
+
+/// Worker `scheduled` entry shim: the cron counterpart of [`run`].
+///
+/// Consumers call this from their `#[event(scheduled)]` handler, passing the
+/// **same two registration hooks they pass to [`run`]**. That is not a style
+/// preference: both entry points share one per-isolate runtime cache, so a
+/// `scheduled` handler that registered a different block set would build a
+/// runtime under this deployment's own identity and publish it for the next
+/// fetch to serve.
+///
+/// One thing runs here — the auth retention sweep
+/// (`impresspress_core::blocks::auth_ui::MAINTENANCE_MESSAGE_KIND`), a message
+/// kind auth-ui already routes, so this adds an entry point rather than a code
+/// path. Its counts are logged. Nothing else runs on the schedule.
+///
+/// The schedule itself is **opt-in and empty by default**: exporting this
+/// entry point is one of the two steps, and setting `[cloudflare].crons` in
+/// `impresspress.toml` is the other (`impresspress deploy`'s `DEFAULT_CRONS`
+/// is `&[]`; `examples/webmcp-demo` does both). A deployment that sets neither,
+/// or sets `crons = []`, never reaches this function.
+pub async fn run_scheduled<F, G>(
+    event: worker::ScheduledEvent,
+    env: worker::Env,
+    ctx: worker::ScheduleContext,
+    register_blocks: F,
+    register_post_build: G,
+) where
+    F: FnOnce(ImpresspressBuilder) -> Result<ImpresspressBuilder, Box<dyn std::error::Error>>,
+    G: FnOnce(
+        &mut wafer_run::Wafer,
+        Arc<dyn StorageService>,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+{
+    run_scheduled_with_config(
+        event,
+        env,
+        ctx,
+        HashMap::new(),
+        register_blocks,
+        register_post_build,
+    )
+    .await
+}
+
+/// Variant of [`run_scheduled`] with explicit request-current Worker
+/// configuration, for consumers that use [`run_with_config`] on the fetch side.
+///
+/// Pass the same map. `request_config` *is* part of runtime identity
+/// (`CfEnvironment::identity`), which is what makes this survivable rather
+/// than silent: the cache compares identities before serving, so a cron
+/// passing an empty map into an isolate whose fetches pass a populated one
+/// cannot hand the wrong runtime to a request. What it does instead is make
+/// the two identities disagree permanently, so the cron rebuilds on every
+/// invocation and the next fetch rebuilds again — a rebuild storm, each one
+/// paying the full D1 read set, on an isolate that was already warm.
+///
+/// Contrast the registration hooks above, which are *not* part of the
+/// identity: differing there really does publish the wrong runtime.
+pub async fn run_scheduled_with_config<F, G>(
+    event: worker::ScheduledEvent,
+    env: worker::Env,
+    ctx: worker::ScheduleContext,
+    request_config: HashMap<String, String>,
+    register_blocks: F,
+    register_post_build: G,
+) where
+    F: FnOnce(ImpresspressBuilder) -> Result<ImpresspressBuilder, Box<dyn std::error::Error>>,
+    G: FnOnce(
+        &mut wafer_run::Wafer,
+        Arc<dyn StorageService>,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let environment = CfEnvironment::capture(&env);
+    // Same reason as `run_with_config`: `std::env` is stubbed empty on wasm32,
+    // so the Worker var is the only channel carrying an asset base URL. The
+    // sweep renders no page, but the runtime this builds is published into the
+    // isolate cache for the next fetch, which does.
+    impresspress_core::ui::assets::set_base_url_override(environment.asset_base_url());
+    init_isolate();
+
+    // WHY THERE IS NO `drain_queued_request_logs` HERE, unlike `run`.
+    //
+    // `init_isolate` selects `RequestLogMode::Queued` for the whole isolate,
+    // so both entry points arrive with queueing on — but only the request
+    // pipeline enqueues, and the one thing that runs on this path
+    // (`auth.maintenance`, dispatched by `run_block`) does not go through it.
+    // The queue is therefore always empty here, and a drain would be dead
+    // code that reads as if it were load-bearing.
+    //
+    // It stops being empty the day anything on the scheduled path dispatches
+    // through the pipeline: at that point the rows accumulate in a
+    // thread-local nothing empties, on an isolate that may serve fetches for
+    // hours. Add the drain (through `ctx.wait_until`, exactly as `run` does)
+    // in the same change that adds such a dispatch.
+    let cron = event.cron();
+    match run_scheduled_inner(
+        &env,
+        &environment,
+        &request_config,
+        register_blocks,
+        register_post_build,
+    )
+    .await
+    {
+        Ok(sweep) => worker::console_log!(
+            "{}",
+            impresspress_core::metrics::metric_line(
+                "auth_maintenance_sweep",
+                &[
+                    ("cron", &cron),
+                    ("complete", &sweep.complete.to_string()),
+                    ("sessions_deleted", &sweep.sessions_deleted.to_string()),
+                    ("tokens_deleted", &sweep.tokens_deleted.to_string()),
+                    (
+                        "jwt_blocklist_deleted",
+                        &sweep.jwt_blocklist_deleted.to_string()
+                    ),
+                    ("oauth_pkce_deleted", &sweep.oauth_pkce_deleted.to_string()),
+                    ("errors", &sweep.errors.join(",")),
+                ],
+            )
+        ),
+        // A cron has no client to answer, so a failure that a fetch would turn
+        // into a 500 can only be logged. It is logged in full rather than
+        // behind a correlation id: nobody is receiving this text but the
+        // operator reading the isolate's own log.
+        Err(error) => worker::console_log!(
+            "{}",
+            impresspress_core::metrics::metric_line(
+                "auth_maintenance_sweep_failed",
+                &[("cron", &cron), ("error", &error.to_string())],
+            )
+        ),
+    }
+
+    retry_pending_config_version(&env, |task| ctx.wait_until(task));
+}
+
+/// Hydrate a runtime and run one retention pass on it.
+async fn run_scheduled_inner<F, G>(
+    env: &worker::Env,
+    environment: &CfEnvironment,
+    request_config: &HashMap<String, String>,
+    register_blocks: F,
+    register_post_build: G,
+) -> Result<impresspress_core::blocks::auth::maintenance::SweepResult, Box<dyn std::error::Error>>
+where
+    F: FnOnce(ImpresspressBuilder) -> Result<ImpresspressBuilder, Box<dyn std::error::Error>>,
+    G: FnOnce(
+        &mut wafer_run::Wafer,
+        Arc<dyn StorageService>,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+{
+    // WHICH BOOT FUNNEL A CRON TAKES, and why it is this one.
+    //
+    // `get_or_build` is the request path's entry, and it picks between two of
+    // the three funnels `runtime_build` declares: `boot_prepared_runtime` when
+    // this Worker version carries a packaged plan, `boot_dynamic_request_
+    // runtime` otherwise. Going through it puts a scheduled invocation on
+    // whichever of those two this deployment's fetches already take. That is
+    // the decision, made here, not a side effect of reusing a convenient
+    // function — and it is also why the build is not wasted: a cold cron warms
+    // the very cache the next fetch reads.
+    //
+    // The third funnel, `boot_deploy_runtime`, is the one a cron must NOT
+    // take, and it is the one that looks affordable — no client is waiting, so
+    // `InitPolicy::Reported` and the seeding hook seem free. They are not.
+    // Seeding is a deploy-time mutation performed with an operator present. On
+    // a schedule it would run migrations without consent on any database that
+    // has not seen `/_deploy/init`, bump the KV config generation whenever it
+    // did seed and so force a full dynamic rebuild across the fleet — daily —
+    // and race a UNIQUE insert against whatever isolates are serving. Those
+    // are exactly the three failure modes amended ruling 5.5 keeps off the
+    // request path, and a cron has all three plus nobody watching.
+    // `InitPolicy::Reported` is wrong for the same reason: nothing reads the
+    // report, so a "reported" failure would publish a half-initialized runtime
+    // into the isolate cache for the next fetch to serve. `Strict`, which is
+    // what the request funnels use, refuses instead.
+    //
+    // A cron is a serving-time invocation that happens to have no client. It
+    // belongs on the serving funnels.
+    let (rt, _cache_outcome) = runtime_cache::get_or_build(
+        env,
+        environment,
+        request_config,
+        register_blocks,
+        register_post_build,
+    )
+    .await?;
+    let services =
+        warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
+
+    request_services::scope(services, async {
+        let output = rt
+            .wafer
+            .run_block(
+                impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+                impresspress_core::blocks::auth_ui::maintenance_message(),
+                wafer_run::InputStream::empty(),
+            )
+            .await;
+        // Decoding stays inside the poll scope, for the reason `dispatch`
+        // states on the fetch path: an output stream may be consumed lazily
+        // and reach back into a request service. Today the sweep's answer is a
+        // fully materialised buffer, so this is not a live bug — but decoding
+        // outside would turn "a service was touched after the scope closed"
+        // into "the sweep returned a malformed answer", which is a diagnosis
+        // pointing at the wrong half of the system.
+        Ok(impresspress_core::blocks::auth_ui::sweep_result_from_output(output).await?)
+    })
+    .await
+}
+
+/// Re-attempt a config-version KV PUT that failed earlier in this invocation
+/// (most likely KV's 1-write/sec/key throttle), through this invocation's own
+/// `Env`.
+///
+/// Both entry points need it and neither can hold the other's context type:
+/// `fetch` has a `worker::Context`, `scheduled` a `worker::ScheduleContext`,
+/// and the two `wait_until` methods are inherent, not a shared trait. Hence
+/// the closure — the alternative was a second verbatim copy of the retry in
+/// [`run_scheduled_with_config`], which is exactly the shape that lets one
+/// path silently stop retrying.
+fn retry_pending_config_version(env: &worker::Env, defer: impl FnOnce(BoxedTask)) {
+    let Some(stamp) = kv_cached_db::take_pending_version_retry() else {
+        return;
+    };
+    match make_kv_backend(env, runner::KV_BINDING) {
+        Ok(kv) => defer(Box::pin(async move {
+            worker::Delay::from(std::time::Duration::from_millis(1_100)).await;
+            if let Err(e) = kv
+                .put(impresspress_core::cache_key::CONFIG_VERSION_KEY, &stamp)
+                .await
+            {
+                // `e` here is already a `String` (KvBackend::put's error
+                // type) — no `.to_string()` clone needed.
+                worker::console_log!(
+                    "{}",
+                    impresspress_core::metrics::metric_line(
+                        "config_version_retry_failed",
+                        &[("error", &e)],
+                    )
+                );
+            }
+        })),
+        Err(e) => worker::console_log!(
+            "{}",
+            impresspress_core::metrics::metric_line(
+                "config_version_retry_failed",
+                &[("error", &e.to_string())],
+            )
+        ),
+    }
+}
+
+/// Work handed to a `wait_until`. Boxed because the two entry points' contexts
+/// take it by different inherent methods and it has to cross a closure.
+type BoxedTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 
 /// Convert a worker request into a WAFER message (preserving the auth header)
 /// and dispatch it through the `"site-main"` flow.

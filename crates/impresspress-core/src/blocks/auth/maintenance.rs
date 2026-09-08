@@ -19,11 +19,13 @@
 //!    because that block routes every message through wafer-core's own
 //!    `auth@v1` handler, which impresspress cannot extend.
 //!
-//! A Worker `scheduled` handler and `[triggers] crons` in the generated
-//! wrangler config are adapter work, recorded for Phase 4. Nothing here needs
-//! them.
+//! On Cloudflare a third caller reaches entry point 2: the Worker's
+//! `scheduled` handler, on the `[triggers] crons` schedule the generated
+//! wrangler config carries. It adds no code path here — it sends the same
+//! message an operator does. Nothing in this module needs it; a deployment
+//! with logins prunes without it, and a deployment without logins does not.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wafer_run::context::Context;
 
 use super::repo::{jwt_blocklist, maintenance, oauth_pkce, sessions, tokens};
@@ -40,7 +42,12 @@ pub const SWEEP_INTERVAL_SECS: i64 = 3_600;
 /// pass still made progress, and `errors` names exactly which tables did not.
 /// `complete` is what an operator or scheduler reads to decide whether to
 /// retry.
-#[derive(Debug, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+/// `Deserialize` as well as `Serialize`: the pass runs inside a block and its
+/// answer is read back outside one — by an operator's HTTP client, and by the
+/// Cloudflare `scheduled` handler, which decodes it through
+/// [`auth_ui::sweep_result_from_output`](crate::blocks::auth_ui::sweep_result_from_output)
+/// to log the counts.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SweepResult {
     /// Whether every delete in the pass succeeded.
     pub complete: bool,

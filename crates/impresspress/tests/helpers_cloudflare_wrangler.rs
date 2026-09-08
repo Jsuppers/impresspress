@@ -1,16 +1,17 @@
 use std::fs;
 
 use impresspress::cli::helpers::cloudflare::{
-    assets::ReleaseManifest,
+    assets::release_manifest_from_staged_dir,
     build::WORKER_BUILD_VERSION,
     prepared::{stage_prepared_module, ApplicationArtifactIdentity, PREPARED_TEXT_GLOB},
     wrangler::{
-        generate, generate_candidate_upload, generate_final_upload, generate_upload,
-        generate_upload_with_release, CloudflareConfig, D1Config, R2Config, ASSET_BASE_URL_VAR,
-        PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR,
-        PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_WAFER_LOCK_IDENTITY_VAR, RELEASE_ASSET_ID_VAR,
-        RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
-        RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR,
+        generate, generate_candidate_upload, generate_final_upload, generate_triggers,
+        generate_upload, generate_upload_with_release, CloudflareConfig, D1Config, R2Config,
+        ASSET_BASE_URL_VAR, DEFAULT_CRONS, PREPARED_APPLICATION_BUILD_SHA256_VAR,
+        PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
+        PREPARED_WAFER_LOCK_IDENTITY_VAR, RELEASE_ASSET_ID_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
+        RELEASE_ASSET_MANIFEST_SHA256_VAR, RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR,
+        SUGGESTED_SWEEP_CRON,
     },
 };
 use impresspress_core::{PreparedRuntimePlan, PreparedRuntimeStructure, WaferLockIdentity};
@@ -35,8 +36,41 @@ fn sample_cfg() -> CloudflareConfig {
         },
         wrangler_overrides_path: None,
         head_sampling_rate: 1.0,
+        crons: DEFAULT_CRONS.iter().map(|s| s.to_string()).collect(),
         deploy_smoke_paths: vec!["/health".into()],
     }
+}
+
+fn sample_identity() -> ApplicationArtifactIdentity {
+    ApplicationArtifactIdentity {
+        application_id: "wafer-site".into(),
+        application_build_sha256: format!("sha256:{}", "a".repeat(64)),
+        dependency_lock: WaferLockIdentity::absent(),
+    }
+}
+
+fn sample_plan(
+    release: &impresspress::cli::helpers::cloudflare::assets::ReleaseManifest,
+    identity: &ApplicationArtifactIdentity,
+) -> PreparedRuntimePlan {
+    PreparedRuntimePlan::new_with_config_generation(
+        "wafer-site",
+        identity.application_build_sha256.clone(),
+        "3".repeat(32),
+        identity.dependency_lock.clone(),
+        release.prepared_identity().unwrap(),
+        PreparedRuntimeStructure {
+            application_blocks: Vec::new(),
+            routes: Vec::new(),
+            built_in_route_count: 0,
+            block_settings: Default::default(),
+            block_configs: Default::default(),
+            final_block_configs: Default::default(),
+            wrap_grants: Vec::new(),
+            deployment_wrap_grants: Vec::new(),
+        },
+    )
+    .unwrap()
 }
 
 #[test]
@@ -133,6 +167,114 @@ fn generate_writes_configured_head_sampling_rate() {
         "generated toml should reflect the configured sampling rate, not a \
          hardcoded 1.0:\n{body}"
     );
+}
+
+/// The scheduled sweep is opt-in. A generated config carries an *empty*
+/// schedule list by default, which is the shape that makes a deploy converge:
+/// `wrangler triggers deploy` PUTs the schedule set only when the config
+/// defines `triggers.crons`, so `crons = []` clears a schedule an earlier
+/// deploy registered while an absent section would leave it running.
+#[test]
+fn the_default_schedule_is_empty_and_still_writes_the_section() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    assert!(
+        DEFAULT_CRONS.is_empty(),
+        "the sweep must not be scheduled for a consumer that exported no \
+         `scheduled` handler; it is enabled by `[cloudflare].crons`"
+    );
+
+    for path in [
+        generate(&sample_cfg(), repo_root, &out).unwrap(),
+        generate_triggers(&sample_cfg(), repo_root, &out).unwrap(),
+    ] {
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("[triggers]\ncrons = []\n"),
+            "{} should say there is no schedule rather than stay silent \
+             about it:\n{body}",
+            path.display()
+        );
+    }
+}
+
+/// Golden for the generated `[triggers]` section. It is what makes the
+/// Worker's `scheduled` handler run at all, so the exact rendered text is the
+/// reviewed artifact — not "somewhere in the file there is a cron".
+#[test]
+fn generate_and_generate_triggers_write_the_configured_schedule_verbatim() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    let mut cfg = sample_cfg();
+    cfg.crons = vec![SUGGESTED_SWEEP_CRON.to_string()];
+    let body = fs::read_to_string(generate(&cfg, repo_root, &out).unwrap()).unwrap();
+    assert!(
+        body.contains("[triggers]\ncrons = [\"17 3 * * *\"]\n"),
+        "expected the suggested daily sweep verbatim:\n{body}"
+    );
+    assert_eq!(
+        SUGGESTED_SWEEP_CRON, "17 3 * * *",
+        "the golden above spells the suggested schedule out; keep them in step"
+    );
+
+    let mut cfg = sample_cfg();
+    cfg.crons = vec!["0 * * * *".into(), "30 4 * * 1".into()];
+    // `toml::to_string_pretty` breaks a multi-element array across lines; a
+    // single-element one stays inline. Both forms are in the golden so a
+    // change to either rendering is a reviewed diff.
+    let multi = "[triggers]\ncrons = [\n    \"0 * * * *\",\n    \"30 4 * * 1\",\n]\n";
+    let body = fs::read_to_string(generate(&cfg, repo_root, &out).unwrap()).unwrap();
+    assert!(
+        body.contains(multi),
+        "expected the configured schedules verbatim:\n{body}"
+    );
+    // The config actually handed to `wrangler triggers deploy` is the one that
+    // has to carry them — the build-time file is never passed to it.
+    let body = fs::read_to_string(generate_triggers(&cfg, repo_root, &out).unwrap()).unwrap();
+    assert!(
+        body.contains(multi),
+        "the triggers config is what applies the schedule:\n{body}"
+    );
+}
+
+/// Cron triggers are a worker-level setting. `wrangler versions upload` reads
+/// `[triggers]` without complaint and does not apply it — its own closing note
+/// says so — so an upload config that carried the section would be a lie about
+/// what the upload does. `impresspress deploy` is two `versions` commands, so
+/// none of the three upload configs may carry it.
+#[test]
+fn no_upload_config_carries_the_worker_level_triggers_section() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    let staged = out.join("assets");
+    fs::create_dir_all(&staged).unwrap();
+    fs::write(staged.join("app.js"), b"app").unwrap();
+    let release = release_manifest_from_staged_dir(&staged).unwrap();
+    let identity = sample_identity();
+    let prepared = stage_prepared_module(&out, &sample_plan(&release, &identity)).unwrap();
+
+    let mut cfg = sample_cfg();
+    cfg.crons = vec![SUGGESTED_SWEEP_CRON.to_string()];
+
+    for path in [
+        generate_upload_with_release(&cfg, repo_root, &out, Some(&release)).unwrap(),
+        generate_candidate_upload(&cfg, repo_root, &out, &release, &identity).unwrap(),
+        generate_final_upload(&cfg, repo_root, &out, &release, &identity, &prepared).unwrap(),
+    ] {
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            !body.contains("triggers"),
+            "{} must not claim to carry a schedule it cannot apply:\n{body}",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -282,7 +424,7 @@ fn generate_upload_binds_release_identity_and_exact_key_set_after_overrides() {
     fs::create_dir_all(staged.join("site/media")).unwrap();
     fs::write(staged.join("site/media/hero.webp"), b"hero").unwrap();
     fs::write(staged.join("site/app.js"), b"app").unwrap();
-    let release = ReleaseManifest::from_staged_dir(&staged).unwrap();
+    let release = release_manifest_from_staged_dir(&staged).unwrap();
 
     // A consumer override cannot detach this Worker version from the release
     // identity the deployer is about to upload and verify.
@@ -324,7 +466,7 @@ fn release_key_sets_larger_than_the_old_cap_are_accepted() {
     for i in 0..200 {
         fs::write(media.join(format!("image-{i:04}.webp")), b"x").unwrap();
     }
-    let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+    let release = release_manifest_from_staged_dir(staged.path()).unwrap();
     assert!(release.logical_keys_json().unwrap().len() > 4 * 1024);
 
     let tmp = tempdir().unwrap();
@@ -349,30 +491,9 @@ fn candidate_and_final_configs_reuse_identity_but_only_final_loads_text_plan() {
     let staged = out.join("assets");
     fs::create_dir_all(&staged).unwrap();
     fs::write(staged.join("app.js"), b"app").unwrap();
-    let release = ReleaseManifest::from_staged_dir(&staged).unwrap();
-    let identity = ApplicationArtifactIdentity {
-        application_id: "wafer-site".into(),
-        application_build_sha256: format!("sha256:{}", "a".repeat(64)),
-        dependency_lock: WaferLockIdentity::absent(),
-    };
-    let plan = PreparedRuntimePlan::new_with_config_generation(
-        "wafer-site",
-        identity.application_build_sha256.clone(),
-        "3".repeat(32),
-        identity.dependency_lock.clone(),
-        release.prepared_identity().unwrap(),
-        PreparedRuntimeStructure {
-            application_blocks: Vec::new(),
-            routes: Vec::new(),
-            built_in_route_count: 0,
-            block_settings: Default::default(),
-            block_configs: Default::default(),
-            final_block_configs: Default::default(),
-            wrap_grants: Vec::new(),
-            deployment_wrap_grants: Vec::new(),
-        },
-    )
-    .unwrap();
+    let release = release_manifest_from_staged_dir(&staged).unwrap();
+    let identity = sample_identity();
+    let plan = sample_plan(&release, &identity);
     let prepared = stage_prepared_module(&out, &plan).unwrap();
 
     let candidate_path =
