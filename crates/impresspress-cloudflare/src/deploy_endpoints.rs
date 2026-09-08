@@ -10,7 +10,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use impresspress_core::builder::{ImpresspressBuilder, PREPARE_RUNTIME_PLAN_KEY};
+use impresspress_core::builder::{
+    ImpresspressBuilder, DEPLOY_RESPONSE_SCHEMA_VERSION, PREPARE_RUNTIME_PLAN_KEY,
+};
 use wafer_core::interfaces::storage::service::StorageService;
 
 use crate::{
@@ -167,7 +169,7 @@ where
             let status = if report.ok { 200 } else { 500 };
             let body = if let Some(plan) = plan {
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": DEPLOY_RESPONSE_SCHEMA_VERSION,
                     "init_report": report,
                     "plan": plan,
                 }))
@@ -409,7 +411,7 @@ pub(crate) async fn prepared_verify_endpoint(
             }
         }
         Ok::<_, Box<dyn std::error::Error>>(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": DEPLOY_RESPONSE_SCHEMA_VERSION,
             "ok": true,
             "summary": summary,
             "release_asset_verified": true,

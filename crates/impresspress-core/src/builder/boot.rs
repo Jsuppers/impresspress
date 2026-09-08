@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::{RuntimeError, Wafer};
 
@@ -66,29 +66,58 @@ pub enum GrantSource<'a> {
     PreInstalled(&'static str),
 }
 
-#[derive(Debug, Serialize)]
+/// Schema version of the `/_deploy/*` control-plane response envelopes.
+///
+/// One number for `/_deploy/prepare` and `/_deploy/verify` together, because
+/// they are two halves of one deployment handshake: `impresspress deploy`
+/// cannot use a prepare response without the verify response that follows it,
+/// so a CLI that understands one version of either must understand that
+/// version of both. Splitting them would let a Worker advertise a pair the CLI
+/// can only half-read.
+///
+/// It lives here, beside [`BootReport`], because the report is the payload the
+/// version describes. It was previously three literals — two `serde_json::
+/// json!` `1`s in the Worker's deploy endpoints and one bare `1` in the CLI's
+/// verify parser — plus a fourth constant in the CLI, with nothing tying any
+/// of them together.
+pub const DEPLOY_RESPONSE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepOutcome {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockInitOutcome {
     pub block: String,
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Per-step outcome of one [`boot`] call. Serialized verbatim as the
-/// `/_deploy/init` response body, so its field names are a wire contract with
-/// `impresspress deploy` (`cli::helpers::cloudflare::prepared`).
+/// Per-step outcome of one [`boot`] call, and the `/_deploy/init` and
+/// `/_deploy/prepare` response body verbatim.
+///
+/// This type crosses the CLI/Worker boundary: `impresspress deploy`
+/// (`cli::helpers::cloudflare::prepared`) deserializes the very same struct
+/// the runtime serialized, rather than a hand-written twin of it. The twins
+/// were the defect — being separate types, a renamed field was not a compile
+/// error anywhere, and both twins carried `deny_unknown_fields`, so the
+/// producer could not add a step without breaking every CLI already built.
+///
+/// **No `deny_unknown_fields`, deliberately.** The report is a status document
+/// nested inside an envelope that carries
+/// [`DEPLOY_RESPONSE_SCHEMA_VERSION`], and that version is what gates a skew
+/// the consumer cannot survive. An added step cannot change the meaning of the
+/// four flags the deploy is gated on, so refusing it would force a lockstep CLI
+/// upgrade for a purely additive change. The envelope itself stays strict.
 ///
 /// [`InitPolicy::Tolerant`] and [`InitPolicy::Strict`] callers may ignore it:
 /// under `Strict` a failure is an `Err` instead, and under `Tolerant` the same
 /// failures are logged.
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootReport {
     pub sealed: bool,
     pub seed: StepOutcome,
@@ -807,8 +836,10 @@ mod tests {
     }
 
     /// The `/_deploy/init` response body is a wire contract with
-    /// `impresspress deploy`'s `PrepareInitReport`, which is
-    /// `deny_unknown_fields`.
+    /// `impresspress deploy`, which deserializes this very type. Field names
+    /// are therefore checked by the compiler; what still needs asserting is
+    /// the *shape* — the four keys and the `skip_serializing_if` that keeps a
+    /// successful step's `error` off the wire entirely.
     #[tokio::test]
     async fn report_serializes_the_deploy_wire_shape() {
         let order = Arc::new(Mutex::new(Vec::new()));
