@@ -8,7 +8,8 @@ use crate::{
     blocks::auth::repo::users::{self, DailySignups},
     platform_state::request_logs::{self, DailyCounts, TodayCounts},
     ui::{
-        components, icons,
+        components::{self, Badge, BadgeVariant},
+        icons,
         shell::Topbar,
         templates::{dashboard_page, PageHeader, StatTile},
     },
@@ -320,7 +321,8 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                     @let created = row.created_at.as_str();
                                     tr {
                                         td {
-                                            span .badge .(if code >= 500 { "badge-danger" } else { "badge-warning" }) { (code) }
+                                            @let variant = if code >= 500 { BadgeVariant::Danger } else { BadgeVariant::Warning };
+                                            (Badge::new(variant).render(html! { (code) }))
                                         }
                                         td .text-sm .font-medium { (method.to_uppercase()) }
                                         td .text-sm { (path) }

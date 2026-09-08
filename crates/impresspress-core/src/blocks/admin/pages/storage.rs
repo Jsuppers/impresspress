@@ -7,7 +7,8 @@ use super::{admin_page, crumb};
 use crate::{
     blocks::admin::STORAGE_ACCESS_LOGS_TABLE as STORAGE_ACCESS_LOGS,
     ui::{
-        components, icons,
+        components::{self, badge, BadgeVariant},
+        icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
     },
@@ -132,16 +133,16 @@ async fn storage_logs_tab(
                         tr {
                             td {
                                 @if !source.is_empty() {
-                                    span .badge .badge-info { (source) }
+                                    (badge(BadgeVariant::Info, source))
                                 }
                             }
                             td .text-sm .font-mono { (op) }
                             td .text-sm .font-mono { (path) }
                             td .text-sm {
                                 @if status.starts_with("BLOCKED") {
-                                    span .badge .badge-danger { (status) }
+                                    (badge(BadgeVariant::Danger, status))
                                 } @else if status.starts_with("ERROR") {
-                                    span .badge .badge-warning { (status) }
+                                    (badge(BadgeVariant::Warning, status))
                                 } @else {
                                     span .text-muted { (status) }
                                 }

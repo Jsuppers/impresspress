@@ -16,6 +16,11 @@ pub mod shell;
 pub mod sidebar;
 pub mod templates;
 
+/// Scanning helpers shared by this module's guards and `components::badge`'s.
+/// Private to `ui`, which is enough: every user is a descendant of `ui`.
+#[cfg(test)]
+mod test_support;
+
 /// Branding/site config loaded from environment variables.
 /// Passed through to layout and sidebar so every page renders consistently.
 pub struct SiteConfig {
@@ -570,7 +575,10 @@ mod tests {
     use maud::{html, Markup};
     use wafer_run::Message;
 
-    use super::*;
+    use super::{
+        test_support::{collect_css_classes, mask_rust_comments, strip_css_comments},
+        *,
+    };
     use crate::ui::shell::{Crumb, Topbar};
 
     fn site_config() -> SiteConfig {
@@ -1792,6 +1800,40 @@ mod tests {
         out
     }
 
+    /// Utility classes handed to a component builder as a string literal --
+    /// `Badge::new(..).classes("text-11 mr-1")`. They land in the rendered
+    /// `class` attribute exactly like a maud shorthand does, so this guard has
+    /// to see them; without this pass, moving a pill onto `components::Badge`
+    /// would quietly drop its utility classes out of the scan.
+    ///
+    /// Scanned over the whole file rather than inside an `html!` body, because
+    /// a component can be built outside one -- `admin::pages::database`'s
+    /// `backend_badge` returns a `Badge` with no surrounding `html!` at all.
+    /// The caller passes the *comment-masked* source (see
+    /// `test_support::mask_rust_comments`), so this call spelled out in running
+    /// prose -- as it is three lines above -- is not read as a real class list;
+    /// masking string literals as the `html!`-scoped scans do is not an option
+    /// here, since the value being read is itself a string literal.
+    fn find_component_class_literals(src: &[char]) -> Vec<(usize, String)> {
+        let needle: Vec<char> = ".classes(\"".chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + needle.len() <= src.len() {
+            if src[i..i + needle.len()] == needle[..] {
+                let val_start = i + needle.len();
+                let mut j = val_start;
+                while j < src.len() && src[j] != '"' {
+                    j += 1;
+                }
+                out.push((i, src[val_start..j].iter().collect()));
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Maud's dynamic `class={ ... }` attribute -- a mix of literal string
     /// fragments and interpolated/conditional pieces, e.g.
     /// `class={ "block-card" @if !is_enabled { " block-card--disabled" } }`.
@@ -1846,6 +1888,21 @@ mod tests {
         let chars: Vec<char> = src.chars().collect();
         let test_spans = find_test_mod_spans(&chars);
         let in_test = |pos: usize| test_spans.iter().any(|&(s, e)| pos >= s && pos < e);
+
+        let comment_masked: Vec<char> = mask_rust_comments(src).chars().collect();
+        for (idx, value) in find_component_class_literals(&comment_masked) {
+            if in_test(idx) {
+                continue;
+            }
+            let line = 1 + chars[..idx].iter().filter(|&&c| c == '\n').count();
+            for tok in value.split_whitespace() {
+                if tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    used.entry(tok.to_string()).or_insert_with(|| {
+                        (path.to_string(), line, format!(".classes(\"{value}\")"))
+                    });
+                }
+            }
+        }
 
         let needle: Vec<char> = "html!".chars().collect();
         let mut i = 0;
@@ -1904,74 +1961,6 @@ mod tests {
             }
 
             i = end;
-        }
-    }
-
-    /// Non-nested `/* ... */` stripper -- CSS comments never nest, so this
-    /// is exact, not a heuristic.
-    fn strip_css_comments_for_class_scan(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                while let Some(c2) = chars.next() {
-                    if c2 == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        break;
-                    }
-                }
-                continue;
-            }
-            out.push(c);
-        }
-        out
-    }
-
-    /// Every `.classname` token appearing in `text`. Used both for a CSS
-    /// selector (everything before a `{`) and it does not need to know the
-    /// selector's full grammar -- comma-separated lists, compound
-    /// selectors (`.foo.bar`), descendant combinators (`.foo .bar`),
-    /// pseudo-classes/elements, attribute selectors -- extracting every
-    /// `.ident` substring finds every class in all of them alike.
-    fn collect_class_tokens(text: &str, out: &mut std::collections::HashSet<String>) {
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '.'
-                && matches!(chars.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == '_')
-            {
-                let start = i + 1;
-                let mut j = start;
-                while j < chars.len()
-                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-')
-                {
-                    j += 1;
-                }
-                out.insert(chars[start..j].iter().collect());
-                i = j;
-                continue;
-            }
-            i += 1;
-        }
-    }
-
-    /// Every class any rule in a stylesheet defines -- selector text is
-    /// everything since the last `{`/`}`/`;` boundary, up to (not
-    /// including) the next `{`; this naturally covers rules nested inside
-    /// `@media`/`@supports` blocks too, since their inner rules' `{` are
-    /// found by the same scan.
-    fn collect_css_classes(css_no_comments: &str, out: &mut std::collections::HashSet<String>) {
-        let chars: Vec<char> = css_no_comments.chars().collect();
-        let mut last_boundary = 0usize;
-        for (i, &c) in chars.iter().enumerate() {
-            if c == '{' {
-                let selector: String = chars[last_boundary..i].iter().collect();
-                collect_class_tokens(&selector, out);
-                last_boundary = i + 1;
-            } else if c == '}' || c == ';' {
-                last_boundary = i + 1;
-            }
         }
     }
 
@@ -2088,7 +2077,7 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
         {
             let src = std::fs::read_to_string(entry.path()).unwrap();
-            collect_css_classes(&strip_css_comments_for_class_scan(&src), &mut defined);
+            collect_css_classes(&strip_css_comments(&src), &mut defined);
         }
 
         // Stylesheets a block owns and serves itself, kept PER BLOCK rather
@@ -2117,7 +2106,7 @@ mod tests {
             };
             let src = std::fs::read_to_string(entry.path()).unwrap();
             collect_css_classes(
-                &strip_css_comments_for_class_scan(&src),
+                &strip_css_comments(&src),
                 block_local.entry(owner).or_default(),
             );
         }

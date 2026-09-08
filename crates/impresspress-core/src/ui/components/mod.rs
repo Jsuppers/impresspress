@@ -16,7 +16,7 @@ mod table;
 
 pub use auth::{alert, auth_panel, oauth_button, AlertVariant};
 pub use avatar::{avatar, CtrlSize};
-pub use badge::{badge, status_badge, BadgeVariant};
+pub use badge::{badge, status_badge, Badge, BadgeVariant};
 pub use button::{button, tab_navigation, BtnVariant, Tab};
 pub use card::page_header;
 pub use chart::{bar_chart_card, line_chart_card, sparkline};

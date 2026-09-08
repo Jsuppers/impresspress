@@ -15,7 +15,7 @@ use crate::{
     http::ResponseBuilder,
     ui::{
         self,
-        components::{self, pagination},
+        components::{self, badge, pagination, Badge, BadgeVariant},
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
@@ -189,7 +189,7 @@ fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> Mar
             td { (email) }
             td {
                 @for role in roles {
-                    span .badge .badge-primary .mr-1 { (role) }
+                    (Badge::new(BadgeVariant::Primary).classes("mr-1").render(html! { (role) }))
                 }
                 @if roles.is_empty() {
                     span .text-muted { "\u{2014}" }
@@ -371,9 +371,9 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
                                     td .text-muted .text-sm { (description) }
                                     td {
                                         @if is_system {
-                                            span .badge .badge-info { "System" }
+                                            (badge(BadgeVariant::Info, "System"))
                                         } @else {
-                                            span .badge .badge-primary { "Custom" }
+                                            (badge(BadgeVariant::Primary, "Custom"))
                                         }
                                     }
                                     td {

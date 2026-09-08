@@ -5,7 +5,11 @@ use crate::{
     blocks::admin::ops,
     http::{err_internal, err_not_found},
     platform_state::variables,
-    ui::{self, components, icons},
+    ui::{
+        self,
+        components::{self, Badge, BadgeVariant},
+        icons,
+    },
     util::parse_form_body,
 };
 
@@ -172,7 +176,7 @@ fn var_row(row: &VarRow) -> Markup {
                     @match row.default {
                         Some(d) if !d.is_empty() => code .text-muted { (d) },
                         _ => @if row.auto_generate {
-                            span .badge .badge-info .text-11 { "auto-generated" }
+                            (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { "auto-generated" }))
                         },
                     }
                 }
@@ -375,7 +379,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                 html! {
                     div .card-header {
                         h3 .card-title {
-                            span .badge .badge-warning .mr-2 { "shared" }
+                            (Badge::new(BadgeVariant::Warning).classes("mr-2").render(html! { "shared" }))
                             " Shared Platform Config"
                         }
                         p .text-muted .text-xs {
@@ -398,7 +402,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                 html! {
                     div .card-header {
                         h3 .card-title {
-                            span .badge .badge-info .mr-2 { (block.name) }
+                            (Badge::new(BadgeVariant::Info).classes("mr-2").render(html! { (block.name) }))
                             " Configuration"
                         }
                         // Show WRAP access info for this block's config. The
@@ -413,10 +417,10 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                                     @if let Some(matches) = grants_by_resource.get(&resource) {
                                         @for (grantee, write) in matches {
                                             @if *grantee != block.name {
-                                                span .badge .badge-secondary .mr-1 .text-11 {
+                                                (Badge::new(BadgeVariant::Secondary).classes("mr-1 text-11").render(html! {
                                                     (grantee) ": "
                                                     @if *write { "read+write" } @else { "read" }
-                                                }
+                                                }))
                                             }
                                         }
                                     }
@@ -443,7 +447,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                 html! {
                     div .card-header {
                         h3 .card-title {
-                            span .badge .badge-secondary .mr-2 { "unowned" }
+                            (Badge::new(BadgeVariant::Secondary).classes("mr-2").render(html! { "unowned" }))
                             " Unowned Variables"
                         }
                         p .text-muted .text-xs {
