@@ -87,7 +87,7 @@ fn left_pane(tables: &[TableSummary], selected: Option<&str>, tab: Tab) -> Marku
                     placeholder="Filter tables…"
                     aria-label="Filter tables"
                     autocomplete="off"
-                    oninput="(function(e){var q=e.target.value.toLowerCase();var visible=0;document.querySelectorAll('[data-db-table]').forEach(function(li){var n=li.getAttribute('data-db-table');var show=n.indexOf(q)>=0;li.hidden=!show;if(show)visible++;});document.querySelectorAll('[data-db-group]').forEach(function(g){var anyVisible=g.querySelector('[data-db-table]:not([hidden])');g.hidden=!anyVisible;});var empty=document.getElementById('db-filter-empty');if(empty)empty.hidden=visible!==0;})(event)";
+                    data-action="db-table-filter";
             }
             div .db-table-groups {
                 @if tables.is_empty() {
@@ -158,9 +158,42 @@ fn left_pane(tables: &[TableSummary], selected: Option<&str>, tab: Tab) -> Marku
                 div #db-filter-empty .db-table-list__empty .text-muted .text-sm
                     hidden { "No tables match." }
             }
+            script { (maud::PreEscaped(TABLE_FILTER_JS)) }
         }
     }
 }
+
+/// The table-list filter, which used to be a 478-character minified `oninput`
+/// attribute: the longest LITERAL handler in the tree, though not the longest
+/// handler — `blocks/userportal/pages/security.rs:73` built a ~521-character
+/// one with `format!`. (The specification's figure of 430 was a miscount and
+/// is corrected here rather than copied.) Wherever it sat it was unreadable,
+/// unlintable and untestable. It hides `[data-db-table]` rows that do not match,
+/// collapses a `[data-db-group]` whose rows are all hidden, and reveals
+/// `#db-filter-empty` when nothing matches at all.
+const TABLE_FILTER_JS: &str = r#"
+(function () {
+  if (window.__dbTableFilterInit) return;
+  window.__dbTableFilterInit = true;
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (!(el instanceof Element)) return;
+    if (el.getAttribute('data-action') !== 'db-table-filter') return;
+    var query = el.value.toLowerCase();
+    var visible = 0;
+    document.querySelectorAll('[data-db-table]').forEach(function (row) {
+      var show = (row.getAttribute('data-db-table') || '').indexOf(query) >= 0;
+      row.hidden = !show;
+      if (show) visible++;
+    });
+    document.querySelectorAll('[data-db-group]').forEach(function (group) {
+      group.hidden = !group.querySelector('[data-db-table]:not([hidden])');
+    });
+    var empty = document.getElementById('db-filter-empty');
+    if (empty) empty.hidden = visible !== 0;
+  });
+})();
+"#;
 
 /// Split an `org__block` group key into a display-friendly `(org, block)`
 /// pair. `impresspress__admin` → `("impresspress", "admin")`. Leaves the value

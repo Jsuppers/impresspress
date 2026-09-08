@@ -151,6 +151,13 @@ async function oauthStart(provider){
     if(err){err.textContent=ex.message||'Failed to start OAuth flow';err.hidden=false;}
   }
 }
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action="oauth-start"]');
+  if(!el)return;
+  e.preventDefault();
+  oauthStart(el.getAttribute('data-provider')||'');
+});
 "#
 }
 
@@ -165,16 +172,17 @@ pub(super) fn pw_field(id: &str, placeholder: &str, minlength: Option<&str>) -> 
                 placeholder=(placeholder)
                 required
                 minlength=[minlength];
-            button type="button" class="pw-toggle" aria-label="Toggle password visibility" onclick={"togglePw(this)"} {
+            // The reveal is chrome's shared `reveal-toggle` verb (the modal
+            // section of `ui/assets/chrome.js`), which every auth page loads
+            // through `ui::layout::page`. With no `data-reveal-show`/`-hide`
+            // operands the button keeps its one static label for both states,
+            // which is what the `togglePw(this)` helper this replaced did.
+            button type="button" class="pw-toggle" aria-label="Toggle password visibility"
+                data-action="reveal-toggle" data-reveal-target=(id) {
                 (ui::icons::eye_off())
             }
         }
     }
-}
-
-/// JS for password visibility toggle.
-pub(super) fn pw_toggle_js() -> &'static str {
-    r#"function togglePw(b){var i=b.parentElement.querySelector('input');if(i.type==='password'){i.type='text'}else{i.type='password'}}"#
 }
 
 /// JS that drives the login + forgot-password forms.
@@ -222,6 +230,12 @@ async function handleForgot(){
   try{await fetch('/b/auth/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email})})}catch(e){}
   showInfo('If that email is registered, a password reset link has been sent.');
 }
+document.addEventListener('submit',function(e){if(e.target&&e.target.id==='form')handleLogin(e)});
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action="auth-forgot"]');
+  if(el){e.preventDefault();handleForgot()}
+});
 "#
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -250,6 +264,12 @@ async function handleForgot(){
   try{await fetch('/b/auth/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email})})}catch(e){}
   showInfo('If that email is registered, a password reset link has been sent.');
 }
+document.addEventListener('submit',function(e){if(e.target&&e.target.id==='form')handleLogin(e)});
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action="auth-forgot"]');
+  if(el){e.preventDefault();handleForgot()}
+});
 "#
     }
 }
@@ -307,6 +327,7 @@ async function handleSignup(ev){
   }catch(ex){showErr('Something went wrong');btn.disabled=false;btn.textContent='Create Account'}
   return false;
 }
+document.addEventListener('submit',function(e){if(e.target&&e.target.id==='form')handleSignup(e)});
 "#
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -336,6 +357,7 @@ async function handleSignup(ev){
   }catch(ex){showErr('Something went wrong');btn.disabled=false;btn.textContent='Create Account'}
   return false;
 }
+document.addEventListener('submit',function(e){if(e.target&&e.target.id==='form')handleSignup(e)});
 "#
     }
 }

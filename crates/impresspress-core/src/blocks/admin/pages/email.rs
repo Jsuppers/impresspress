@@ -151,7 +151,8 @@ mod tests {
         );
         assert!(
             html.contains(r#"aria-label="Reveal value""#)
-                && html.contains("i.type='text';this.title='Hide'"),
+                && html.contains(r#"data-action="reveal-toggle""#)
+                && html.contains(r#"data-reveal-hide="Hide""#),
             "the reveal/edit eye toggle must be present, with an accessible name: {html}"
         );
         assert!(

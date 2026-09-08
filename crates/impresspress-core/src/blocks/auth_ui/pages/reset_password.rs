@@ -64,7 +64,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     div #error .login-error hidden {}
                     div #success .login-success hidden {}
 
-                    form #form .login-form onsubmit="return handleReset(event)" {
+                    form #form .login-form {
                         input type="hidden" #reset-token name="token" value=(token);
 
                         div .form-group {
@@ -101,6 +101,7 @@ async function handleReset(e){
   btn.disabled=false;btn.textContent='Reset Password';
   return false;
 }
+document.addEventListener('submit',function(e){if(e.target&&e.target.id==='form')handleReset(e)});
 "#)) }
             },
         ),

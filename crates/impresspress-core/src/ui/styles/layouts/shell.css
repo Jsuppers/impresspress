@@ -47,9 +47,9 @@
 /* Profile Menu */
 .profile-menu {
 	/* Closed by default via the boolean `hidden` attribute (base.css:
-	   `[hidden] { display: none !important; }`) -- sidebar.rs's
-	   toggleProfileMenu()/outside-click handler flip `m.hidden` instead of
-	   writing an inline style. */
+	   `[hidden] { display: none !important; }`) -- sidebar.rs's delegated
+	   `profile-menu-toggle`/outside-click listener flips `m.hidden` instead
+	   of writing an inline style. */
 	position: absolute; bottom: 100%; left: 0.5rem; right: 0.5rem;
 	margin-bottom: var(--space-2); background: white;
 	border: 1px solid var(--border-color); border-radius: 0.75rem;

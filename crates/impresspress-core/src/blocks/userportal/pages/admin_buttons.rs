@@ -240,13 +240,15 @@ fn is_safe_dom_id(id: &str) -> bool {
 }
 
 pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStream {
-    // SEC-058: the modal auto-show script below uses `PreEscaped(format!(...))`
-    // to inject the record ID into inline JS. A record returned from
-    // `db::get` should always have a well-formed ID (UUIDv7), but defensively
-    // reject any caller-supplied path segment that isn't strict
-    // `[a-zA-Z0-9_-]{1,64}` so the JS string interpolation can never be
-    // poisoned even if a future code path looks the record up by a
-    // non-validated identifier.
+    // SEC-058 originally: the modal used to be revealed by a
+    // `PreEscaped(format!(...))` script with the record ID injected into inline
+    // JS. That script is gone — the id now travels as a `data-modal-target`
+    // attribute (maud-escaped) and in a `serde_json`-built response header —
+    // so the interpolation this guarded no longer exists. It stays because the
+    // id also becomes an HTML element id that `getElementById` has to find
+    // again: a record returned from `db::get` always has a well-formed ID
+    // (UUIDv7), and any caller-supplied path segment that is not strict
+    // `[a-zA-Z0-9_-]{1,64}` is still refused rather than rendered.
     if !is_safe_dom_id(id) {
         return err_not_found("Button not found");
     }
@@ -261,9 +263,10 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
     };
 
     let current_icon = record.str_field("icon");
+    let modal_id = format!("edit-btn-{id}");
 
     let markup = html! {
-        (components::modal(&format!("edit-btn-{id}"), "Edit Button", html! {
+        (components::modal(&modal_id, "Edit Button", html! {
             form
                 hx-put=(format!("/b/userportal/admin/buttons/{id}"))
                 hx-target="#buttons-table"
@@ -295,23 +298,22 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
                 }
                 div .flex .gap-2 .justify-end {
                     button .btn .btn--secondary type="button"
-                        onclick=(format!("closeModal('edit-btn-{id}')"))
+                        data-action="modal-close" data-modal-target=(&modal_id)
                     { "Cancel" }
                     button .btn .btn--primary type="submit" { "Save" }
                 }
             }
         }))
-        // Auto-show the modal. `components::modal()` renders the boolean
-        // `hidden` attribute (base.css: `[hidden] { display: none !important; }`),
-        // so revealing it needs `hidden = false` via the shared `openModal`
-        // helper (the modal section of `ui/assets/chrome.js`), not a plain `style.display`
-        // assignment -- that loses to `!important` and the modal never opens.
-        script { (maud::PreEscaped(format!(
-            "openModal('edit-btn-{id}');"
-        ))) }
     };
 
-    ui::html_response(markup)
+    // Reveal the modal once htmx has swapped it in. `components::modal()`
+    // renders the boolean `hidden` attribute (base.css:
+    // `[hidden] { display: none !important; }`), so revealing it means clearing
+    // `hidden` — a `style.display` assignment loses to that `!important` and
+    // the modal never opens. This used to be a `<script>` appended to the
+    // fragment with the record id interpolated into JavaScript source; it is
+    // now the `openModal` response-header channel.
+    ui::html_response_opening_modal(markup, &modal_id)
 }
 
 pub async fn handle_update_button(ctx: &dyn Context, input: InputStream, id: &str) -> OutputStream {
@@ -347,7 +349,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::userportal::UserPortalBlock,
-        test_support::{output_html, output_is_error, TestContext},
+        test_support::{output_header, output_html, output_is_error, TestContext},
     };
 
     async fn ctx_with_userportal() -> TestContext {
@@ -374,9 +376,13 @@ mod tests {
     /// A plain `el.style.display='flex'` inline-style toggle can never beat
     /// that `!important`, so the modal could never actually open even
     /// though the fragment rendered "successfully". This asserts the
-    /// fragment routes through the shared `openModal`/`closeModal` helpers
-    /// (which flip the `hidden` IDL property, not `style.display`) instead
-    /// of reintroducing a hand-rolled inline-style toggle.
+    /// fragment routes through the shared modal machinery in
+    /// `ui/assets/chrome.js` (which flips the `hidden` IDL property, not
+    /// `style.display`) instead of reintroducing a hand-rolled inline-style
+    /// toggle. The two controls used to be `onclick="openModal('…')"` /
+    /// `onclick="closeModal('…')"` strings with the record id interpolated
+    /// into JavaScript source; they are now a response header and a
+    /// `data-action` attribute, and the assertions below moved with them.
     #[tokio::test]
     async fn edit_button_form_opens_via_shared_modal_helpers_not_inline_style() {
         let ctx = ctx_with_userportal().await;
@@ -397,14 +403,18 @@ mod tests {
             html.contains(&format!(r#"id="edit-btn-{}" hidden"#, record.id)),
             "modal must render the boolean `hidden` attribute:\n{html}"
         );
-        // Auto-show and Cancel must route through the shared helpers.
+        // Cancel closes it declaratively, with the id as inert attribute text.
         assert!(
-            html.contains(&format!("openModal('edit-btn-{}')", record.id)),
-            "auto-show script must call the shared openModal helper:\n{html}"
+            html.contains(&format!(
+                r#"data-action="modal-close" data-modal-target="edit-btn-{}""#,
+                record.id
+            )),
+            "Cancel button must declare the shared modal-close action:\n{html}"
         );
+        // Nothing in the fragment is script at all any more.
         assert!(
-            html.contains(&format!("closeModal('edit-btn-{}')", record.id)),
-            "Cancel button must call the shared closeModal helper:\n{html}"
+            !html.contains("<script"),
+            "the fragment must carry no script:\n{html}"
         );
         // The exact bug: a plain inline `style.display` toggle always loses
         // to `[hidden] { display: none !important; }`, so the modal could
@@ -412,6 +422,19 @@ mod tests {
         assert!(
             !html.contains("style.display"),
             "modal must not be toggled via a plain inline style.display assignment:\n{html}"
+        );
+
+        // Auto-show is the response-header channel, fired after the swap so
+        // the overlay is not revealed before its contents land.
+        let resp = handle_edit_button_form(&ctx, &record.id).await;
+        let trigger = output_header(resp, "HX-Trigger-After-Swap").await;
+        assert_eq!(
+            trigger,
+            Some(format!(
+                r#"{{"openModal":{{"id":"edit-btn-{}"}}}}"#,
+                record.id
+            )),
+            "the fragment must ask chrome.js to open the modal after the swap"
         );
     }
 

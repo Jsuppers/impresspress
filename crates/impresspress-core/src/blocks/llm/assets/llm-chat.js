@@ -1,9 +1,11 @@
 // Impresspress LLM chat — extracted from inline SHARED_JS/CHAT_JS/THREAD_JS.
 // Entry point: impresspressLlmChat.init() — reads initial server-rendered
 // messages from <script type="application/json" id="llm-chat-bootstrap">.
-// All globals previously exposed (handleChatSubmit, selectThread, createNewThread,
-// onModelChange, unloadLocalModel) remain on window so existing onclick="" /
-// onsubmit="" attributes keep working.
+// Nothing here is exposed on `window` any more. The page's controls declare
+// `data-action` verbs (`llm-new-thread`, `llm-model-change`,
+// `llm-unload-model`) and the chat form is bound by its id, all read by the
+// delegated listeners in `bindPageControls()` at the bottom of this file --
+// see the rule written out in `ui/assets/chrome.js`.
 
 (function () {
   if (window.__impresspressLlmChatLoaded) return;
@@ -378,17 +380,29 @@
         if (list) {
           var placeholder = list.querySelector('.text-center.text-muted');
           if (placeholder) placeholder.remove();
-          var date = new Date().toISOString().slice(0, 10);
-          var html = '<div class="card" style="margin-bottom:0.375rem;cursor:pointer;padding:0.625rem 0.75rem;transition:box-shadow 0.15s" '
-            + 'data-thread-id="' + id + '" '
-            + 'onclick="selectThread(\'' + id + '\')" '
-            + 'onmouseover="this.style.boxShadow=\'0 2px 8px rgba(0,0,0,0.1)\'" '
-            + 'onmouseout="this.style.boxShadow=\'\'">'
-            + '<div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem">'
-            + '<span style="font-weight:500;font-size:0.875rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">New Chat</span>'
-            + '<span class="text-muted" style="font-size:0.75rem;flex-shrink:0">' + date + '</span>'
-            + '</div></div>';
-          list.insertAdjacentHTML('afterbegin', html);
+          // Built with the DOM API and the same classes the server
+          // renders (`thread_list_items` in blocks/llm/pages.rs), so the id
+          // is never concatenated into markup and the two spellings of a
+          // thread card cannot drift again. It used to be an HTML string
+          // with inline styles and three `on*` attributes, one of them
+          // duplicating the delegated `[data-thread-id]` handler below.
+          var card = document.createElement('a');
+          card.className = 'card thread-card';
+          card.href = '/b/llm/threads/' + encodeURIComponent(id);
+          card.dataset.threadId = id;
+          card.dataset.active = 'false';
+          var row = document.createElement('div');
+          row.className = 'thread-card__row';
+          var name = document.createElement('span');
+          name.className = 'thread-card__title';
+          name.textContent = 'New Chat';
+          var when = document.createElement('span');
+          when.className = 'text-muted thread-card__date';
+          when.textContent = new Date().toISOString().slice(0, 10);
+          row.appendChild(name);
+          row.appendChild(when);
+          card.appendChild(row);
+          list.insertBefore(card, list.firstChild);
         }
         selectThread(id);
       }
@@ -473,10 +487,34 @@
   }
 
   // -------------------------------------------------------------------------
-  // Public init entry point + global re-exports for inline handlers
+  // Public init entry point
   // -------------------------------------------------------------------------
 
+  // The page's own controls, delegated. `#chat-form` is bound by id because
+  // there is exactly one composer per page; the three buttons and the model
+  // picker declare verbs, because a `data-action` reads back as inert text
+  // where an `onclick` value is JavaScript source.
+  function bindPageControls() {
+    document.addEventListener('submit', function (e) {
+      if (e.target && e.target.id === 'chat-form') handleChatSubmit(e);
+    });
+    document.addEventListener('click', function (e) {
+      if (!(e.target instanceof Element)) return;
+      var el = e.target.closest('[data-action]');
+      if (!el) return;
+      var action = el.getAttribute('data-action');
+      if (action === 'llm-new-thread') createNewThread();
+      else if (action === 'llm-unload-model') unloadLocalModel();
+    });
+    document.addEventListener('change', function (e) {
+      var el = e.target;
+      if (!(el instanceof Element)) return;
+      if (el.getAttribute('data-action') === 'llm-model-change') onModelChange(el.value);
+    });
+  }
+
   function init() {
+    bindPageControls();
     renderInitialMessages();
     setTimeout(populateLocalModels, 1500);
     setTimeout(populateLocalModels, 5000);
@@ -498,10 +536,4 @@
   }
 
   window.impresspressLlmChat = { init: init };
-  // Re-export named handlers used by inline onclick="" / onsubmit="" attributes.
-  window.handleChatSubmit = handleChatSubmit;
-  window.createNewThread = createNewThread;
-  window.selectThread = selectThread;
-  window.onModelChange = onModelChange;
-  window.unloadLocalModel = unloadLocalModel;
 })();

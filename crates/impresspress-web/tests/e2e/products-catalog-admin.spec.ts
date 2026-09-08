@@ -29,10 +29,10 @@ function shell(body: string) {
 
 function groupsHtml() {
   return shell(`
-    <button type="button" onclick="productCatalogNew('group')">New group</button>
+    <button type="button" data-action="pc-new">New group</button>
     <section id="group-editor" hidden>
       <h2 id="group-editor-title">New group</h2>
-      <form onsubmit="productCatalogSaveGroup(event)">
+      <form data-action="pc-save-group">
         <input id="group-editor-id" type="hidden">
         <label for="group-editor-name">Name</label>
         <input id="group-editor-name" required maxlength="160">
@@ -43,8 +43,8 @@ function groupsHtml() {
         <button type="submit">Save group</button>
       </form>
     </section>
-    <button type="button" data-record-id="group/1" data-record-name="Consulting" data-record-description="Service packages" data-record-status="active" onclick="productCatalogEditGroup(this)">Edit Consulting</button>
-    <button type="button" data-record-id="group/1" data-record-name="Consulting" onclick="productCatalogDelete(this,'group')">Delete Consulting</button>
+    <button type="button" data-record-id="group/1" data-record-name="Consulting" data-record-description="Service packages" data-record-status="active" data-action="pc-edit-group">Edit Consulting</button>
+    <button type="button" data-record-id="group/1" data-record-name="Consulting" data-action="pc-delete">Delete Consulting</button>
   `);
 }
 

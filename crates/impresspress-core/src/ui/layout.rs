@@ -113,12 +113,7 @@ mod tests {
             )),
             "the chrome script must be linked, hashed and deferred: {rendered}"
         );
-        for marker in [
-            "__cmdkInit",
-            "__drawerInit",
-            "showToast",
-            "function openModal",
-        ] {
+        for marker in ["__cmdkInit", "__drawerInit", "showToast", "__modalInit"] {
             assert!(
                 !rendered.contains(marker),
                 "{marker} is still inlined into the page: {rendered}"

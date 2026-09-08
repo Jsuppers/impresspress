@@ -26,6 +26,30 @@ fn decode_block_name(encoded: &str) -> String {
     encoded.replace("--", "/")
 }
 
+/// The runtime-filter `<select>`'s behaviour, delegated.
+///
+/// It used to be an `onchange` attribute that concatenated the active tab
+/// straight into a URL inside a JavaScript string literal. `active_tab` is one
+/// of four literals so nothing could break out, but the shape is the one
+/// `blocks/admin/pages/network.rs` warns about, and it also skipped
+/// percent-encoding. The tab now travels as a `data-blocks-tab` operand and
+/// `URLSearchParams` builds the query.
+const RUNTIME_FILTER_JS: &str = r#"
+(function () {
+  if (window.__blocksRuntimeFilterInit) return;
+  window.__blocksRuntimeFilterInit = true;
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (!(el instanceof Element)) return;
+    if (el.getAttribute('data-action') !== 'blocks-runtime-filter') return;
+    var params = new URLSearchParams();
+    params.set('tab', el.getAttribute('data-blocks-tab') || '');
+    params.set('runtime', el.value);
+    window.location.href = '/b/admin/blocks?' + params.toString();
+  });
+})();
+"#;
+
 pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let tab = msg.query("tab");
     let active_tab = match tab {
@@ -146,7 +170,8 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 // Runtime filter dropdown
                 div .block-cards__filter {
                     select .form-input
-                        onchange={"window.location.href='/b/admin/blocks?tab=" (active_tab) "&runtime='+this.value"}
+                        data-action="blocks-runtime-filter"
+                        data-blocks-tab=(active_tab)
                     {
                         option value="" selected[runtime_filter.is_empty()] { "All runtimes" }
                         option value="native" selected[runtime_filter == "native"] { "Native only" }
@@ -191,7 +216,7 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                 @if is_enabled && !block.admin_url.is_empty() {
                                     a .btn .btn--sm .btn--primary .block-card__open
                                         href=(block.admin_url)
-                                        onclick="event.stopPropagation()"
+                                        data-stop-propagation
                                     { "Open" }
                                 }
                             }
@@ -202,13 +227,14 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
 
         // Block detail modal (content loaded via htmx)
-        div .modal-overlay #block-detail-modal-overlay hidden
-            onclick="if(event.target===this)closeModal('block-detail-modal-overlay')"
+        div .modal-overlay #block-detail-modal-overlay hidden data-modal-dismiss
         {
             div .modal .modal--lg {
                 div #block-detail-modal {}
             }
         }
+
+        script { (maud::PreEscaped(RUNTIME_FILTER_JS)) }
     };
 
     let body = list_page(
@@ -299,7 +325,7 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
         let markup = html! {
             div .modal-header {
                 h3 .modal-title { (block_name) }
-                button .modal-close onclick="closeModal('block-detail-modal-overlay')" {
+                button .modal-close data-action="modal-close" data-modal-target="block-detail-modal-overlay" {
                     (icons::x())
                 }
             }
@@ -328,9 +354,8 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
                     }
                 }
             }
-            script { (maud::PreEscaped("document.getElementById('block-detail-modal-overlay').removeAttribute('hidden');")) }
         };
-        return ui::html_response(markup);
+        return ui::html_response_opening_modal(markup, "block-detail-modal-overlay");
     };
 
     let markup = html! {
@@ -342,7 +367,7 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
                     span .badge .badge--tone-slate .text-11 { (format!("{:?}", block.category)) }
                 }
             }
-            button .modal-close onclick="closeModal('block-detail-modal-overlay')" {
+            button .modal-close data-action="modal-close" data-modal-target="block-detail-modal-overlay" {
                 (icons::x())
             }
         }
@@ -459,11 +484,9 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
                 }
             }
         }
-        // Auto-open
-        script { (maud::PreEscaped("document.getElementById('block-detail-modal-overlay').removeAttribute('hidden');")) }
     };
 
-    ui::html_response(markup)
+    ui::html_response_opening_modal(markup, "block-detail-modal-overlay")
 }
 
 /// Tone class for an endpoint's HTTP-method badge. Shares its colour set with

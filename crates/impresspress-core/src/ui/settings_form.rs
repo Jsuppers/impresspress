@@ -131,7 +131,10 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
                         input .form-input #(var.key) name=(var.key) type="password" value=(value)
                             placeholder=(if has_value { "******** (set)" } else { "Not configured" });
                         button type="button" .btn .btn--ghost .btn--icon .btn-icon-right
-                            onclick={"var i=document.getElementById('" (var.key) "');if(i.type==='password'){i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')}else{i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')}"}
+                            data-action="reveal-toggle"
+                            data-reveal-target=(var.key)
+                            data-reveal-show="Reveal"
+                            data-reveal-hide="Hide"
                             title="Reveal"
                             aria-label="Reveal value"
                         { (super::icons::eye()) }
@@ -149,7 +152,7 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
                     input .form-input #(var.key) name=(var.key) type="text" value=(value)
                         placeholder=(var.default);
                     input .color-swatch-input type="color" value=(value)
-                        onchange={"document.getElementById('" (var.key) "').value=this.value"};
+                        data-action="mirror-value" data-mirror-target=(var.key);
                 }
                 @if !var.description.is_empty() {
                     p .form-hint { (var.description) }
@@ -211,10 +214,21 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
 /// form as a JSON object to `post_url` and shows a toast with the result.
 /// `post_url` is interpolated via `serde_json` so it can't break out of the
 /// JS string literal.
+///
+/// The form binds this by being `#settings-form`, not by an `onsubmit`
+/// attribute — see the delegated-action rule in `ui/assets/chrome.js`. The
+/// listener is on `document`, so a form that arrives in an htmx swap is bound
+/// too, which an attribute-free direct `addEventListener` here would miss.
 fn submit_js(post_url: &str) -> String {
     let url = serde_json::to_string(post_url).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"
+if (!window.__settingsFormInit) {{
+    window.__settingsFormInit = true;
+    document.addEventListener('submit', function (e) {{
+        if (e.target && e.target.id === 'settings-form') submitSettings(e);
+    }});
+}}
 function submitSettings(e) {{
     e.preventDefault();
     var form = document.getElementById('settings-form');
@@ -300,7 +314,7 @@ pub async fn settings_form(
 ) -> Markup {
     let fields = render_sections(ctx, sections).await;
     html! {
-        form #settings-form onsubmit="return submitSettings(event)" {
+        form #settings-form {
             (fields)
             (extra)
             button .btn .btn--primary .mt-4 type="submit" { "Save settings" }
@@ -452,12 +466,13 @@ mod tests {
         // Eye toggle present, with an accessible name that the handler keeps
         // in sync with the shown/hidden state (2026-07-11 a11y review).
         assert!(set.contains(r#"aria-label="Reveal value""#));
-        assert!(set.contains(
-            "i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')"
-        ));
-        assert!(set.contains(
-            "i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')"
-        ));
+        // The two labels are operands now, not a hand-written `onclick`
+        // string: `reveal-toggle` in the modal section of
+        // `ui/assets/chrome.js` swaps `title` and `aria-label` from them.
+        assert!(set.contains(r#"data-action="reveal-toggle""#));
+        assert!(set.contains(r#"data-reveal-target="X__PW""#));
+        assert!(set.contains(r#"data-reveal-show="Reveal""#));
+        assert!(set.contains(r#"data-reveal-hide="Hide""#));
 
         let empty = render_field(&v, "").into_string();
         assert!(empty.contains("Not configured"));
@@ -488,7 +503,7 @@ mod tests {
         let s = render_field(&v, "#abcdef").into_string();
         assert!(s.contains(r#"type="color""#));
         assert!(s.contains("value=\"#abcdef\""));
-        assert!(s.contains("onchange="));
+        assert!(s.contains(r#"data-action="mirror-value" data-mirror-target="X__COLOR""#));
     }
 
     #[test]

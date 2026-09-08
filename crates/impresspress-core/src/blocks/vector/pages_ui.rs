@@ -27,8 +27,9 @@ pub async fn render_index_list_fragment(ctx: &dyn Context) -> Result<Markup, Str
 }
 
 /// Modal markup for creating a vector index. Always shipped pre-rendered
-/// next to the index list; opening it is a `openModal('create-vector-index')`
-/// onclick on the topbar action button.
+/// next to the index list; the topbar action button opens it by declaring
+/// `data-action="modal-open" data-modal-target="create-vector-index"`, which
+/// the delegated listener in `ui/assets/chrome.js` reads.
 pub fn render_create_index_modal() -> Markup {
     crate::ui::components::modal(
         "create-vector-index",
@@ -50,7 +51,7 @@ pub fn render_create_index_modal() -> Markup {
                     }
                 }
                 div .form-actions {
-                    button .btn .btn--secondary type="button" onclick="closeModal('create-vector-index')" { "Cancel" }
+                    button .btn .btn--secondary type="button" data-action="modal-close" data-modal-target="create-vector-index" { "Cancel" }
                     button .btn .btn--primary type="submit" { "Create" }
                 }
             }
@@ -208,7 +209,8 @@ pub async fn index_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             crate::ui::components::CtrlSize::Sm,
             "+ Create index",
             maud::PreEscaped(
-                r#"type="button" onclick="openModal('create-vector-index')""#.to_string(),
+                r#"type="button" data-action="modal-open" data-modal-target="create-vector-index""#
+                    .to_string(),
             ),
         ))
     } else {

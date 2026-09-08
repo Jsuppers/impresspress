@@ -62,13 +62,13 @@ function shell(title: string, body: string, nav = "") {
 
 function wizardHtml(template: "simple_product" | "simple_subscription", seller = false) {
   const radio = (value: string, label: string) =>
-    `<label><input type="radio" name="product_template" value="${value}" ${value === template ? "checked" : ""} onchange="productWizardTemplateChanged()"> ${label}</label>`;
+    `<label><input type="radio" name="product_template" value="${value}" ${value === template ? "checked" : ""} data-action="pw-template-changed"> ${label}</label>`;
   return shell(
     seller ? "Create seller product" : "Create product",
     `<nav aria-label="Product setup progress">${[1, 2, 3, 4, 5]
       .map((step) => `<span class="badge" data-wizard-indicator="${step}">${step}</span>`)
       .join("")}</nav>
-    <form id="product-wizard-form" novalidate onsubmit="return false">
+    <form id="product-wizard-form" novalidate>
       <p id="product-wizard-error" role="alert" aria-live="assertive" hidden></p>
       <section class="card" data-wizard-step="1"><fieldset><legend>Choose a template</legend>${radio("simple_product", "Simple product")}${radio("simple_subscription", "Simple subscription")}</fieldset></section>
       <section class="card" data-wizard-step="2" hidden><div class="grid">
@@ -88,12 +88,12 @@ function wizardHtml(template: "simple_product" | "simple_subscription", seller =
       </div><div id="wizard-advanced-pricing" hidden><div id="wizard-variables"></div><div id="wizard-components"></div></div></section>
       <section class="card" data-wizard-step="4" hidden><div class="grid">
         <label><input id="wizard-promotions" type="checkbox"> Allow promotions</label><label><input id="wizard-automatic-tax" type="checkbox"> Automatic tax</label>
-        <label><input id="wizard-billing-address" type="checkbox"> Billing address</label><label><input id="wizard-shipping-address" type="checkbox" onchange="productWizardShippingChanged()"> Shipping address</label>
+        <label><input id="wizard-billing-address" type="checkbox"> Billing address</label><label><input id="wizard-shipping-address" type="checkbox" data-action="pw-shipping-changed"> Shipping address</label>
         <label><input id="wizard-create-customer" type="checkbox"> Create customer</label><label><input id="wizard-terms" type="checkbox"> Terms consent</label>
         <div data-subscription-field><label for="wizard-trial-days">Trial days</label><input id="wizard-trial-days" type="number" value="0"></div>
       </div><div id="wizard-shipping-settings" hidden><label for="wizard-shipping-countries">Countries</label><input id="wizard-shipping-countries" value="NZ"><label for="wizard-shipping-options">Rates</label><textarea id="wizard-shipping-options"></textarea></div></section>
       <section class="card" data-wizard-step="5" hidden><h2>Review</h2><div id="wizard-review" aria-live="polite"></div></section>
-      <div class="actions"><button id="wizard-previous" type="button" onclick="productWizardPrevious()" hidden>Back</button><button id="wizard-next" type="button" onclick="productWizardNext()">Continue</button><button id="wizard-save-draft" type="button" onclick="submitProductWizard('draft')" hidden>Save draft</button><button id="wizard-publish" type="button" onclick="submitProductWizard('publish')" hidden>${seller ? "Submit for publication" : "Create and publish"}</button></div>
+      <div class="actions"><button id="wizard-previous" type="button" data-action="pw-previous" hidden>Back</button><button id="wizard-next" type="button" data-action="pw-next">Continue</button><button id="wizard-save-draft" type="button" data-action="pw-submit" data-wizard-intent="draft" hidden>Save draft</button><button id="wizard-publish" type="button" data-action="pw-submit" data-wizard-intent="publish" hidden>${seller ? "Submit for publication" : "Create and publish"}</button></div>
     </form><script>window.__productWizardConfig={admin:${!seller},product_collection:"/b/products/api/${seller ? "products" : "admin/products"}",return_url:"/b/products/${seller ? "my-products" : "admin/manage"}"};${productWizardScript};initProductWizard();</script>`,
     `<a href="/b/products/admin/manage">Products</a><a href="/b/products/admin/stripe">Stripe</a>`,
   );
@@ -118,12 +118,12 @@ function orderHtml(options: {
   const access = options.buyer ? "Your order" : "Order order_1";
   const refund =
     !options.buyer && !options.refunded
-      ? `<section class="card"><h2>Create refund</h2><div class="form-group"><label for="order-refund-amount">Amount (NZD)</label><input id="order-refund-amount"></div><div class="form-group"><label for="order-refund-note">Private note</label><textarea id="order-refund-note"></textarea></div><button class="danger" type="button" onclick="submitOrderRefund(this)">Create refund</button></section>`
+      ? `<section class="card"><h2>Create refund</h2><div class="form-group"><label for="order-refund-amount">Amount (NZD)</label><input id="order-refund-amount"></div><div class="form-group"><label for="order-refund-note">Private note</label><textarea id="order-refund-note"></textarea></div><button class="danger" type="button" data-action="po-submit-refund">Create refund</button></section>`
       : options.refunded
         ? `<section class="card"><h2>Refunds</h2><table><thead><tr><th>Status</th><th>Amount</th></tr></thead><tbody><tr><td>successful</td><td>NZD 49.00</td></tr></tbody></table></section>`
         : "";
   const portal = options.subscriptionStatus
-    ? `<section class="card"><h2>Subscription</h2><p>Status: <strong>${options.subscriptionStatus}</strong></p><button type="button" onclick="manageOrderBilling()">Manage billing in Stripe</button></section>`
+    ? `<section class="card"><h2>Subscription</h2><p>Status: <strong>${options.subscriptionStatus}</strong></p><button type="button" data-action="pp-order-billing">Manage billing in Stripe</button></section>`
     : "";
   return shell(
     access,
@@ -411,7 +411,7 @@ test.describe("products complete browser lifecycles", () => {
         "Commerce",
         `<p id="commerce-portal-error" role="alert" hidden></p><section class="card"><h2>Purchases</h2><p>Your receipts and subscriptions live here.</p></section>${
           sellingEnabled
-            ? `<section class="card" aria-label="Seller account"><h2>Stripe seller account</h2><p><span class="badge ${connected ? "badge-success" : "badge-warning"}">${connected ? "Ready to sell" : "Not connected"}</span></p>${connected ? `<a class="btn" href="/b/products/my-products/new">Create listing</a>` : `<button type="button" onclick="startSellerOnboarding()">Connect Stripe to sell</button>`}</section>${connected ? `<section class="card"><h2>Sales snapshot</h2><div class="grid"><div class="metric">Gross sales<strong>NZD 1,240.00</strong></div><div class="metric">Platform fees<strong>NZD 62.00</strong></div><div class="metric">Before Stripe fees<strong>NZD 1,178.00</strong></div></div><p>Exact payouts and provider fees are available in Stripe.</p>${productStatus !== "none" ? `<p>Listing: <span class="badge ${productStatus === "active" ? "badge-success" : "badge-warning"}">${productStatus.replaceAll("_", " ")}</span></p>` : ""}</section>` : ""}`
+            ? `<section class="card" aria-label="Seller account"><h2>Stripe seller account</h2><p><span class="badge ${connected ? "badge-success" : "badge-warning"}">${connected ? "Ready to sell" : "Not connected"}</span></p>${connected ? `<a class="btn" href="/b/products/my-products/new">Create listing</a>` : `<button type="button" data-action="pp-seller-onboarding">Connect Stripe to sell</button>`}</section>${connected ? `<section class="card"><h2>Sales snapshot</h2><div class="grid"><div class="metric">Gross sales<strong>NZD 1,240.00</strong></div><div class="metric">Platform fees<strong>NZD 62.00</strong></div><div class="metric">Before Stripe fees<strong>NZD 1,178.00</strong></div></div><p>Exact payouts and provider fees are available in Stripe.</p>${productStatus !== "none" ? `<p>Listing: <span class="badge ${productStatus === "active" ? "badge-success" : "badge-warning"}">${productStatus.replaceAll("_", " ")}</span></p>` : ""}</section>` : ""}`
             : `<section class="card"><h2>Selling is disabled</h2><p>An administrator must enable user products before seller tools appear.</p></section>`
         }<script>${commercePortalScript}</script>`,
         sellingEnabled

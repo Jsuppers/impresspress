@@ -63,6 +63,14 @@ async fn network_inbound_tab(
         // (maud-escaped) instead of an `onclick` JS-string literal, which maud
         // does NOT escape and so let an attacker-controlled request path break
         // out and run script in an admin's session. Bound once per document.
+        //
+        // This page stated that rule and was the only one applying it. It is
+        // now how every page in the tree is written: the shared vocabulary and
+        // the general argument live in `ui/assets/chrome.js`, and
+        // `ui::tests::pages_carry_no_event_handler_attributes` keeps the next
+        // page from reintroducing the sink. This handler keeps its own
+        // `data-detail-*` attributes rather than a `data-action` verb — the
+        // attribute IS the operand here, and there is only one behaviour.
         script { (maud::PreEscaped("
             if (!window.__networkDetailBound) {
                 window.__networkDetailBound = true;

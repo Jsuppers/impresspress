@@ -111,7 +111,7 @@ pub(super) fn editor_markup_for_test(
                 span #status-badge .badge .(badge_class) { (badge_text) }
                 span .badge .editor-status__version .text-xs .cursor-pointer
                     title="Click to change version"
-                    onclick="promptVersion()"
+                    data-action="legalpages-prompt-version"
                 { "v" span #version-display { (version) } }
                 @if !updated_at.is_empty() {
                     span .text-muted .text-xs {
@@ -126,10 +126,10 @@ pub(super) fn editor_markup_for_test(
                 {
                     "Open public page"
                 }
-                button #btn-save .btn .btn--sm .btn--secondary onclick="saveDocument(false)" {
+                button #btn-save .btn .btn--sm .btn--secondary data-action="legalpages-save" {
                     "Save Draft"
                 }
-                button #btn-publish .btn .btn--sm .btn--primary onclick="saveDocument(true)" {
+                button #btn-publish .btn .btn--sm .btn--primary data-action="legalpages-publish" {
                     "Publish"
                 }
             }
@@ -149,13 +149,16 @@ pub(super) fn editor_markup_for_test(
 
         // Tab strip
         div .editor-tabs {
+            // `data-tab` already names the pane; the delegated listener
+            // in EDITOR_JS reads it, so the tab needs no second spelling of
+            // its own name inside a JavaScript string.
             button .editor-tab .editor-tab--active type="button"
                 data-tab="edit"
-                onclick="setEditorTab('edit')"
+                data-action="legalpages-editor-tab"
             { "Edit" }
             button .editor-tab type="button"
                 data-tab="preview"
-                onclick="setEditorTab('preview')"
+                data-action="legalpages-editor-tab"
             { "Preview" }
         }
 
@@ -180,8 +183,16 @@ pub(super) fn editor_markup_for_test(
 
 const EDITOR_JS: &str = r#"
 (function() {
+    // Guarded: the editor is a `ui::shell_page`, so navigating to it can be an
+    // htmx partial swap, which returns the body verbatim (`ui/mod.rs:226`) and
+    // re-executes this script against a `document` that outlived the swap.
+    // Everything below is declarations and two registrations, so running it
+    // once is enough. The keydown listener predates the delegated click one
+    // and had the same accumulation bug; both are covered now.
+    if (window.__legalpagesEditorInit) return;
+    window.__legalpagesEditorInit = true;
     // Preview wiring: vanilla JS fetch (no json-enc htmx extension loaded)
-    window.setEditorTab = function(name) {
+    function setEditorTab(name) {
         document.querySelectorAll('.editor-tab').forEach(function(t) {
             t.classList.toggle('editor-tab--active', t.dataset.tab === name);
         });
@@ -204,9 +215,9 @@ const EDITOR_JS: &str = r#"
                     '<p class="text-danger">Preview failed: ' + err.message + '</p>';
             });
         }
-    };
+    }
 
-    window.promptVersion = function() {
+    function promptVersion() {
         var current = document.getElementById('doc-version').value;
         var v = prompt('Set version number:', current);
         if (v !== null && v.trim() !== '') {
@@ -216,7 +227,7 @@ const EDITOR_JS: &str = r#"
                 document.getElementById('version-display').textContent = num;
             }
         }
-    };
+    }
 
     // Ctrl+S / Cmd+S → save draft
     document.addEventListener('keydown', function(e) {
@@ -227,7 +238,7 @@ const EDITOR_JS: &str = r#"
     });
 
     // Save handler (reads textarea .value)
-    window.saveDocument = function(publish) {
+    function saveDocument(publish) {
         var title = document.getElementById('title-input').value;
         var content = document.getElementById('editor').value;
         var docType = document.getElementById('doc-type').value;
@@ -272,7 +283,21 @@ const EDITOR_JS: &str = r#"
             btn.disabled = false;
             btn.textContent = origText;
         });
-    };
+    }
+
+    // One delegated listener for the editor's four controls. They used to be
+    // `onclick` attributes, which is why the three helpers above had to be
+    // `window.*` globals; see the rule in `ui/assets/chrome.js`.
+    document.addEventListener('click', function(e) {
+        if (!(e.target instanceof Element)) return;
+        var el = e.target.closest('[data-action]');
+        if (!el) return;
+        var action = el.getAttribute('data-action');
+        if (action === 'legalpages-editor-tab') setEditorTab(el.dataset.tab);
+        else if (action === 'legalpages-save') saveDocument(false);
+        else if (action === 'legalpages-publish') saveDocument(true);
+        else if (action === 'legalpages-prompt-version') promptVersion();
+    });
 })();
 "#;
 
