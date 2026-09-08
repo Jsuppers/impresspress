@@ -113,7 +113,7 @@ mod typed_client_tests {
         // subject to the WRAP check (same pattern as sessions.rs seed helpers).
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        let ctx = ctx.with_wrap("wafer-run/auth", vec![], "impresspress/admin");
+        let ctx = ctx.with_wrap("wafer-run/auth", Vec::new(), vec![], "impresspress/admin");
         insert(&ctx, "user-a", "$argon2id$dummy", false)
             .await
             .unwrap();
@@ -127,6 +127,7 @@ mod typed_client_tests {
     async fn find_by_unknown_user_returns_none() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );

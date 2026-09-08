@@ -1324,6 +1324,7 @@ mod api_key_lifecycle_tests {
         let grants = AdminBlock::new().info().grants;
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             grants,
             "impresspress/admin",
         );
@@ -1338,6 +1339,7 @@ mod api_key_lifecycle_tests {
     async fn disabled_user_key_is_rejected() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1377,6 +1379,7 @@ mod get_user_roles_error_surfacing_tests {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
             Vec::new(),
+            Vec::new(),
             "impresspress/admin",
         );
 
@@ -1394,6 +1397,7 @@ mod get_user_roles_error_surfacing_tests {
         // — it must propagate the error and skip the insert entirely.
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             Vec::new(),
             "impresspress/admin",
         );

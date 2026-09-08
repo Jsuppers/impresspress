@@ -32,9 +32,12 @@ use crate::{
 /// and not a missing table — which is the whole point: the two used to be
 /// indistinguishable from outside.
 async fn denied() -> TestContext {
-    TestContext::with_products()
-        .await
-        .with_wrap("test/ungranted", Vec::new(), "impresspress/admin")
+    TestContext::with_products().await.with_wrap(
+        "test/ungranted",
+        Vec::new(),
+        Vec::new(),
+        "impresspress/admin",
+    )
 }
 
 /// [`denied`] for the checkout path, which reads its Stripe settings through
@@ -50,6 +53,7 @@ async fn denied_checkout(config: &[(&str, &str)]) -> TestContext {
     }
     ctx.with_wrap(
         "test/ungranted",
+        Vec::new(),
         vec![ResourceGrant::read("*", "*").typed(ResourceType::Config)],
         "impresspress/admin",
     )

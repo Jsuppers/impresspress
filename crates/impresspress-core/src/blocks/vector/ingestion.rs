@@ -278,6 +278,30 @@ mod contextual_retrieval_tests {
     use super::*;
     use crate::test_support::TestContext;
 
+    /// A fixture that runs `add_context` under the vector block's real
+    /// identity: its own declared `requires` allowlist, which
+    /// `Wafer::make_block_context` installs on every context this block's
+    /// code runs in and `RuntimeContext::dispatch_call` enforces above every
+    /// other permission check.
+    ///
+    /// Sourced from `VectorBlock::new().info()`, never re-listed here — the
+    /// whole point is that the test and the runtime read the same
+    /// declaration. A test that called `add_context` on a bare
+    /// `TestContext` would pass while production answered
+    /// `PermissionDenied`, which is exactly how this path shipped broken:
+    /// `add_context` reaches two blocks (`impresspress/llm` for the default
+    /// target, `wafer-run/llm` for the completion) and the allowlist named
+    /// neither, so the permission denial was swallowed at the `.ok()?` and
+    /// logged as "no default LLM model configured".
+    async fn vector_ctx() -> TestContext {
+        TestContext::with_vector().await.with_wrap(
+            "impresspress/vector",
+            wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new()).requires,
+            Vec::new(),
+            "impresspress/admin",
+        )
+    }
+
     /// Stub `impresspress/llm` feature block. `default_llm_target` reads one
     /// internal route off it and nothing else; anything else errors loudly so
     /// a test cannot silently exercise an unscripted path.
@@ -391,7 +415,7 @@ mod contextual_retrieval_tests {
     /// wasm32 ingests.
     #[tokio::test]
     async fn add_context_prepends_the_summary_to_every_chunk() {
-        let mut ctx = TestContext::with_vector().await;
+        let mut ctx = vector_ctx().await;
         ctx.register_block(
             "impresspress/llm",
             Arc::new(StubDefaultTargetBlock {
@@ -422,7 +446,7 @@ mod contextual_retrieval_tests {
     /// chunks and never fails.
     #[tokio::test]
     async fn add_context_degrades_when_no_default_model_is_configured() {
-        let mut ctx = TestContext::with_vector().await;
+        let mut ctx = vector_ctx().await;
         ctx.register_block(
             "impresspress/llm",
             Arc::new(StubDefaultTargetBlock { target: None }),
@@ -437,7 +461,7 @@ mod contextual_retrieval_tests {
 
     #[tokio::test]
     async fn add_context_degrades_when_the_llm_block_is_absent() {
-        let ctx = TestContext::with_vector().await;
+        let ctx = vector_ctx().await;
 
         let out = add_context(&ctx, "the document", vec!["one".into()])
             .await
@@ -448,7 +472,7 @@ mod contextual_retrieval_tests {
 
     #[tokio::test]
     async fn add_context_degrades_when_the_model_returns_no_text() {
-        let mut ctx = TestContext::with_vector().await;
+        let mut ctx = vector_ctx().await;
         ctx.register_block(
             "impresspress/llm",
             Arc::new(StubDefaultTargetBlock {
@@ -462,5 +486,28 @@ mod contextual_retrieval_tests {
             .expect("add_context never fails the ingest");
 
         assert_eq!(out, vec!["one".to_string()]);
+    }
+
+    /// The three degradation tests above cannot see this on their own: a
+    /// contextual ingest that is refused by the allowlist degrades to exactly
+    /// the same raw chunks a missing model produces, which is what made the
+    /// original defect invisible. So the allowlist is pinned directly.
+    ///
+    /// Both names are load-bearing and neither is a hard dependency —
+    /// `add_context` degrades when they are absent. What it must not do is be
+    /// refused when they are *present*.
+    #[test]
+    fn the_block_declares_every_target_contextual_retrieval_reaches() {
+        let requires = wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new()).requires;
+        for target in ["impresspress/llm", "wafer-run/llm"] {
+            assert!(
+                requires.iter().any(|r| r == target),
+                "`ingestion::add_context` calls `{target}`, so the block must \
+                 declare it — `RuntimeContext::dispatch_call` refuses an \
+                 undeclared target before any grant check, and the refusal is \
+                 swallowed into a 'no default LLM model configured' log. \
+                 Declared: {requires:?}"
+            );
+        }
     }
 }

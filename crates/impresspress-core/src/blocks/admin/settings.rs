@@ -955,6 +955,7 @@ mod wrap_denial_tests {
         TestContext::with_admin().await.with_wrap(
             "test/ungranted",
             Vec::new(),
+            Vec::new(),
             "impresspress/admin",
         )
     }

@@ -167,6 +167,24 @@ crate::impresspress_feature_block! {
             // target (the unused one is simply never called).
             "impresspress/fastembed".into(),
             "impresspress/transformers-embed".into(),
+            // Contextual retrieval (`ingestion::add_context`, reached from
+            // `POST /b/vector/api/ingest` with `contextual: true`) makes two
+            // calls: `impresspress/llm` for the deployment's default
+            // (provider, model) pair, and `wafer-run/llm` for the completion
+            // itself via `wafer_core::clients::llm::chat`. Both were missing,
+            // so every contextual ingest was refused here — above the grant
+            // check, unconditionally, on every target — and the refusal was
+            // swallowed at `default_llm_target`'s `.ok()?` and logged as "no
+            // default LLM model configured", naming the wrong cause. The
+            // ingest then returned raw chunks while reporting success.
+            //
+            // Neither is a hard dependency: `add_context` degrades to the raw
+            // chunks when they are absent, which is why `block-vector` can
+            // ship without an llm backend. `requires` is a call-time
+            // allowlist, not a load-time dependency, so naming them costs a
+            // deployment that has neither exactly nothing.
+            "impresspress/llm".into(),
+            "wafer-run/llm".into(),
         ])
         .category(wafer_run::BlockCategory::Feature)
         .endpoints(endpoint_match::declare(ROUTES))

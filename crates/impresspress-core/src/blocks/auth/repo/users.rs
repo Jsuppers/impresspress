@@ -1228,6 +1228,7 @@ mod typed_client_tests {
     async fn insert_succeeds_under_wrap_for_auth_block() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1252,6 +1253,7 @@ mod typed_client_tests {
     async fn find_by_email_returns_inserted_row_under_wrap() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1277,6 +1279,7 @@ mod typed_client_tests {
     async fn count_reports_zero_then_one() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1318,6 +1321,7 @@ mod typed_client_tests {
     async fn verification_token_round_trip_and_mark_verified() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1350,6 +1354,7 @@ mod typed_client_tests {
     async fn reset_token_round_trip_and_clear() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1373,6 +1378,7 @@ mod typed_client_tests {
     async fn update_profile_dual_writes_name_and_avatar() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1411,6 +1417,7 @@ mod typed_client_tests {
     async fn fresh_user_is_active() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1425,6 +1432,7 @@ mod typed_client_tests {
     async fn disabled_user_is_not_active() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -1442,6 +1450,7 @@ mod typed_client_tests {
     async fn soft_deleted_user_is_not_active() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );

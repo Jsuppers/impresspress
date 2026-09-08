@@ -251,7 +251,12 @@ mod tests {
         .await
         .unwrap();
 
-        let ctx = ctx.with_wrap("impresspress/userportal", Vec::new(), "impresspress/admin");
+        let ctx = ctx.with_wrap(
+            "impresspress/userportal",
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
+            Vec::new(),
+            "impresspress/admin",
+        );
 
         use crate::blocks::auth::repo::provider_links;
         let err = provider_links::list_for_user(&ctx, "user-a")
@@ -284,6 +289,7 @@ mod tests {
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
             auth_grants(),
             "impresspress/admin",
         );
