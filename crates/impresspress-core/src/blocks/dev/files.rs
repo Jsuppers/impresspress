@@ -23,6 +23,75 @@
 //! requests, so editing never waits behind a runtime rebuild. Any handler
 //! added to this module that mutates `workspace.json` must take it.
 //!
+//! # Readers take it too
+//!
+//! A lock only writers take orders writers against each other and orders
+//! nothing against a read. Every storage call is a suspension point and the
+//! sandbox's fetch events dispatch concurrently, so an unlocked read really
+//! does interleave with a mutation — and both of a read's failure modes are
+//! that interleaving:
+//!
+//! * `workspace::load` takes a snapshot of `workspace.json` and then reads its
+//!   bytes. A save landing between those two steps replaces the file, the
+//!   snapshot no longer names anything, and the browser storage layer reports
+//!   that as an internal error rather than a miss — a sanitized `500` on a
+//!   read that asked for nothing unusual.
+//! * A read that loaded the manifest and has not yet fetched its blob holds a
+//!   *stale* manifest. A write to the same path repoints the entry, the
+//!   collector reclaims the blob the old entry named, and the blob fetch is a
+//!   `NotFound` the handler can only report as corruption — the manifest it is
+//!   holding names content that no longer exists.
+//!
+//! ## Every read of `workspace.json` is under the lock
+//!
+//! Without exception, and the list is short enough to state:
+//! [`handle_read`], [`handle_list`], `gc::storage_usage` (the `/b/dev` page's
+//! ~3 Hz status poll), `activation::workspace_site` and `export::assemble`,
+//! alongside the five mutators. `workspace_site` is the one that matters most
+//! and was the last to get it: [`handle_write`] and [`handle_delete`] release
+//! the guard before they publish, and `workspace_site` is what reads the
+//! manifest back inside the activation that publish asked for — so it backs
+//! **every ordinary site write and delete**, not a rare path, and an unlocked
+//! read there answers a `500` on a write whose content is already saved.
+//!
+//! ## Reading a file's CONTENT is a different question, answered twice
+//!
+//! There are two deliberate and opposite strategies in this block, and they
+//! are opposite because the two reads are not the same size:
+//!
+//! * [`handle_read`] holds the lock across the blob fetch as well as the load,
+//!   which is what makes an entry and the content it names one view. It can
+//!   afford to: one file is capped at [`paths::MAX_FILE_BYTES`].
+//! * `export::assemble` deliberately does **not**. An export is the whole
+//!   site, every block artifact and every block source — megabytes, uncapped —
+//!   and holding the mutex across it would block editing for the export's
+//!   duration. It admits the second failure mode above and maps it to a
+//!   retry-able `409` (`export::content_gone`) rather than to an internal
+//!   error, which is the honest answer for a read that can be repeated.
+//!
+//! So the rule is not "readers take the lock" but: *the manifest read is
+//! always locked; a content read is locked when it is bounded and mapped to a
+//! conflict when it is not.* `export`'s `content_gone` states the same pair
+//! from its side.
+//!
+//! ## What it costs
+//!
+//! A read paces behind a mutation instead of failing. The status poll pays the
+//! most for that: it runs on a fixed interval, so during a collector pass —
+//! which holds the lock across a loop of sequential deletes — a waiter accrues
+//! per interval and `futures::lock::Mutex` is first-in-first-out, which would
+//! queue the user's next save behind all of them. That is why the page's poll
+//! now carries an in-flight guard (`assets/dev.js`): at most one status
+//! request is outstanding, so the pass costs one waiter rather than one per
+//! tick.
+//!
+//! The deadlock rule is unchanged and the readers keep it: the lock is only
+//! ever held around `workspace.json` access, never across an
+//! `activation::request`, so nothing holding it waits on the queue that takes
+//! it in `activation::adopt_site` and in `activation::workspace_site` — the
+//! latter carries the full argument, being the only acquisition that happens
+//! inside the queue.
+//!
 //! # Refusal shapes
 //!
 //! * A hash mismatch is a real `409` *response* whose body is
@@ -59,11 +128,17 @@ use crate::{blocks::crud, http::err_internal};
 // ---------------------------------------------------------------------------
 
 /// `GET /b/dev/api/files` — the workspace manifest, optionally prefix-filtered.
-pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub async fn handle_list(ctx: &dyn Context, shared: &DevShared, msg: &Message) -> OutputStream {
     let query = FileListQuery::from_message(msg);
-    let ws = match workspace::load(ctx).await {
-        Ok(ws) => ws,
-        Err(e) => return err_internal("dev workspace load", e),
+    // Under the mutation lock: `workspace::load` snapshots the object and then
+    // reads it, and a save landing in between invalidates the snapshot (see
+    // this module's header).
+    let ws = {
+        let _serialized = shared.workspace.lock().await;
+        match workspace::load(ctx).await {
+            Ok(ws) => ws,
+            Err(e) => return err_internal("dev workspace load", e),
+        }
     };
     let prefix = query.prefix.unwrap_or_default();
     // `Workspace::files` is a `BTreeMap`, so this is already path-ordered.
@@ -77,7 +152,11 @@ pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 /// `POST /b/dev/api/files/read` — one file's content.
-pub async fn handle_read(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle_read(
+    ctx: &dyn Context,
+    shared: &DevShared,
+    input: InputStream,
+) -> OutputStream {
     let request: FileReadRequest = match read_body(input).await {
         Ok(request) => request,
         Err(refusal) => return refusal,
@@ -85,6 +164,11 @@ pub async fn handle_read(ctx: &dyn Context, input: InputStream) -> OutputStream 
     if let Err(e) = paths::validate_path(&request.path) {
         return no_store_error(ErrorCode::InvalidArgument, &e.to_string());
     }
+    // The lock spans the manifest load AND the blob fetch, which is the whole
+    // point: an entry and the content it names are one fact, and a read that
+    // released between them would be holding a manifest a mutation has since
+    // replaced — the blob it names is exactly what the collector reclaims.
+    let _serialized = shared.workspace.lock().await;
     let ws = match workspace::load(ctx).await {
         Ok(ws) => ws,
         Err(e) => return err_internal("dev workspace load", e),
@@ -98,7 +182,8 @@ pub async fn handle_read(ctx: &dyn Context, input: InputStream) -> OutputStream 
     let bytes = match blobs::get(ctx, &entry.sha256).await {
         Ok(bytes) => bytes,
         // A manifest entry naming a blob that is not there is corruption, not
-        // a missing file: the path exists, its content has gone.
+        // a missing file: the path exists, its content has gone. Under the
+        // lock this can no longer mean "a mutation moved underneath the read".
         Err(e) => return err_internal("dev workspace blob read", e),
     };
     let (encoding, content) = encode_content(&entry.content_type, bytes);
