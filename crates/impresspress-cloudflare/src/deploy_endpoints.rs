@@ -10,16 +10,15 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use impresspress_core::builder::{
-    ImpresspressBuilder, DEPLOY_RESPONSE_SCHEMA_VERSION, PREPARE_RUNTIME_PLAN_KEY,
+use impresspress_core::{
+    builder::{ImpresspressBuilder, DEPLOY_RESPONSE_SCHEMA_VERSION, PREPARE_RUNTIME_PLAN_KEY},
+    release_inventory::{ReleaseManifest, RELEASE_MANIFEST_SCHEMA_VERSION},
 };
 use wafer_core::interfaces::storage::service::StorageService;
 
 use crate::{
     environment::{packaged_prepared_runtime_plan, CfEnvironment},
-    kv_cached_db,
-    release_manifest::{RuntimeReleaseManifest, RuntimeReleaseManifestIdentity},
-    request_services, runner,
+    kv_cached_db, request_services, runner,
     runtime_build::{boot_deploy_runtime, build_runtime},
     services::{make_kv_backend, make_r2_storage_service},
 };
@@ -327,33 +326,20 @@ pub(crate) async fn prepared_verify_endpoint(
                 )
                 .into());
             }
-            let manifest: RuntimeReleaseManifest = serde_json::from_slice(&manifest_bytes)?;
-            if manifest.schema_version != 1
+            let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)?;
+            if manifest.schema_version != RELEASE_MANIFEST_SCHEMA_VERSION
                 || &manifest.immutable_prefix != immutable_prefix
-                || format!("sha256:{}", manifest.asset_set_sha256) != *asset_set_sha256
-                || manifest
-                    .files
-                    .windows(2)
-                    .any(|pair| pair[0].logical_key >= pair[1].logical_key)
+                || manifest.canonical_asset_set_sha256() != *asset_set_sha256
+                || !manifest.logical_keys_strictly_sorted()
             {
                 return Err("release manifest identity/order mismatch".into());
             }
-            let asset_set_material = serde_json::to_vec(&RuntimeReleaseManifestIdentity {
-                schema_version: manifest.schema_version,
-                files: &manifest.files,
-            })?;
-            let computed_asset_set = format!(
-                "sha256:{}",
-                impresspress_core::util::sha256_hex(&asset_set_material)
-            );
-            if &computed_asset_set != asset_set_sha256 {
+            // The manifest must not vouch for itself: re-derive the asset-set
+            // digest from the parsed entries and compare against the plan's.
+            if format!("sha256:{}", manifest.recomputed_asset_set_sha256()?) != *asset_set_sha256 {
                 return Err("release manifest asset-set digest mismatch".into());
             }
-            let logical_keys = manifest
-                .files
-                .iter()
-                .map(|entry| entry.logical_key.as_str())
-                .collect::<Vec<_>>();
+            let logical_keys = manifest.logical_keys();
             let routing = release_routing
                 .as_ref()
                 .ok_or("prepared release has no Worker routing identity")?;

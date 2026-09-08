@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn verify_accepts_verified_empty_present_release_set_with_null_asset() {
         let staged = tempfile::tempdir().unwrap();
-        let release = crate::cli::helpers::cloudflare::assets::ReleaseManifest::from_staged_dir(
+        let release = crate::cli::helpers::cloudflare::assets::release_manifest_from_staged_dir(
             staged.path(),
         )
         .unwrap();

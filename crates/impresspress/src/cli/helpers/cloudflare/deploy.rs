@@ -1155,9 +1155,9 @@ mod tests {
         R2ObjectClient, CONCURRENT_SMOKE_MAX_IN_FLIGHT, CONCURRENT_SMOKE_TOTAL_REQUESTS,
         FREE_PLAN_CPU_LIMIT_ERROR, FREE_PLAN_CPU_LIMIT_ERROR_CODE,
     };
+    use crate::cli::helpers::cloudflare::assets::release_manifest_from_staged_dir;
     #[cfg(feature = "embed-assets")]
     use crate::cli::helpers::cloudflare::assets::ui_asset_entries;
-    use crate::cli::helpers::cloudflare::assets::ReleaseManifest;
 
     fn configured_smoke_paths() -> Vec<String> {
         [
@@ -1549,7 +1549,7 @@ mod tests {
         std::fs::create_dir_all(staged.path().join("site/media")).unwrap();
         std::fs::write(staged.path().join("site/media/hero.webp"), b"hero").unwrap();
         std::fs::write(staged.path().join("site/app.js"), b"app").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let mut r2 = MemoryR2::default();
         r2.objects
             .insert("site/media/hero.webp".into(), b"legacy-hero".to_vec());
@@ -1604,7 +1604,7 @@ mod tests {
     fn final_deployment_record_binds_second_worker_to_plan_without_reuploading_assets() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let mut r2 = MemoryR2::default();
         let plan_hash = format!("sha256:{}", "c".repeat(64));
 
@@ -1636,7 +1636,7 @@ mod tests {
     fn release_upload_preflights_local_bytes_before_remote_mutation() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"v1").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"v2").unwrap();
         let mut r2 = MemoryR2::default();
 
@@ -1660,7 +1660,7 @@ mod tests {
     fn release_upload_aborts_on_remote_byte_mismatch() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let immutable_key = release.immutable_key("hero.webp");
         let mut r2 = MemoryR2 {
             corrupt_on_get: Some(immutable_key.clone()),
@@ -1711,7 +1711,7 @@ mod tests {
     fn release_upload_retries_a_transient_verify_failure() {
         let staged = tempfile::tempdir().unwrap();
         std::fs::write(staged.path().join("hero.webp"), b"hero").unwrap();
-        let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+        let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let immutable_key = release.immutable_key("hero.webp");
         let mut r2 = FlakyOnceR2 {
             inner: MemoryR2::default(),

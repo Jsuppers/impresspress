@@ -24,7 +24,10 @@
 //! | [`runtime_cache`] | the per-isolate runtime cache and its probe policy |
 //! | [`deploy_endpoints`] | `/_deploy/init`, `/_deploy/prepare`, `/_deploy/prepared`, `/_deploy/verify` |
 //! | [`host_policy`] | the `*.workers.dev` preview lockdown |
-//! | [`release_manifest`] | the release manifest wire types `/_deploy/verify` checks |
+//!
+//! The release manifest `/_deploy/verify` re-reads is not one of them: it is
+//! `impresspress_core::release_inventory::ReleaseManifest`, the same type
+//! `impresspress deploy` writes.
 
 mod boot_hooks;
 pub mod config_service;
@@ -45,7 +48,6 @@ mod host_policy;
 pub mod kv_cached_db;
 pub mod logger_service;
 pub mod network_service;
-mod release_manifest;
 mod request_services;
 mod runner;
 mod runtime_build;

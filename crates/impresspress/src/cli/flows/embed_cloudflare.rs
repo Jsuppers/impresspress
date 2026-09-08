@@ -226,7 +226,7 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     // that build through a second, upload-only config. This prevents
     // either `versions upload` from compiling the Rust worker a second time.
     let assets_root = out_dir.join("assets");
-    let release_assets = assets::ReleaseManifest::from_staged_dir(&assets_root)?;
+    let release_assets = assets::release_manifest_from_staged_dir(&assets_root)?;
     let wasm_path = repo_root.join("build/index_bg.wasm");
     let wasm_sha256 = cf_deploy::artifact_sha256(&wasm_path)?;
     let application_identity =

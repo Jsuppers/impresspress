@@ -1,7 +1,7 @@
 use std::fs;
 
 use impresspress::cli::helpers::cloudflare::{
-    assets::ReleaseManifest,
+    assets::release_manifest_from_staged_dir,
     build::WORKER_BUILD_VERSION,
     prepared::{stage_prepared_module, ApplicationArtifactIdentity, PREPARED_TEXT_GLOB},
     wrangler::{
@@ -282,7 +282,7 @@ fn generate_upload_binds_release_identity_and_exact_key_set_after_overrides() {
     fs::create_dir_all(staged.join("site/media")).unwrap();
     fs::write(staged.join("site/media/hero.webp"), b"hero").unwrap();
     fs::write(staged.join("site/app.js"), b"app").unwrap();
-    let release = ReleaseManifest::from_staged_dir(&staged).unwrap();
+    let release = release_manifest_from_staged_dir(&staged).unwrap();
 
     // A consumer override cannot detach this Worker version from the release
     // identity the deployer is about to upload and verify.
@@ -324,7 +324,7 @@ fn release_key_sets_larger_than_the_old_cap_are_accepted() {
     for i in 0..200 {
         fs::write(media.join(format!("image-{i:04}.webp")), b"x").unwrap();
     }
-    let release = ReleaseManifest::from_staged_dir(staged.path()).unwrap();
+    let release = release_manifest_from_staged_dir(staged.path()).unwrap();
     assert!(release.logical_keys_json().unwrap().len() > 4 * 1024);
 
     let tmp = tempdir().unwrap();
@@ -349,7 +349,7 @@ fn candidate_and_final_configs_reuse_identity_but_only_final_loads_text_plan() {
     let staged = out.join("assets");
     fs::create_dir_all(&staged).unwrap();
     fs::write(staged.join("app.js"), b"app").unwrap();
-    let release = ReleaseManifest::from_staged_dir(&staged).unwrap();
+    let release = release_manifest_from_staged_dir(&staged).unwrap();
     let identity = ApplicationArtifactIdentity {
         application_id: "wafer-site".into(),
         application_build_sha256: format!("sha256:{}", "a".repeat(64)),
