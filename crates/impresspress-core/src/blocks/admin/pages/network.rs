@@ -340,7 +340,7 @@ mod tests {
         last_seen: &str,
     ) -> String {
         inbound_row(method, path, cnt, avg_ms, errors, last_seen)
-            .render(&INBOUND_COLUMNS)
+            .render(&INBOUND_COLUMNS, None)
             .into_string()
     }
 
@@ -423,7 +423,7 @@ mod tests {
     fn detail_row_marks_the_values_the_baseline_run_itself_produces() {
         let html =
             components::TableRow::new(detail_row(200, 12, "127.0.0.1", "", "2026-01-01T00:00:00Z"))
-                .render(&DETAIL_COLUMNS)
+                .render(&DETAIL_COLUMNS, None)
                 .into_string();
 
         assert!(

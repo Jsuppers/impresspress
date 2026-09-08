@@ -265,7 +265,7 @@ async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
         .remove(user_id)
         .unwrap_or_default();
 
-    single_user_row(&record, &roles, "").render(&USER_COLUMNS)
+    single_user_row(&record, &roles, "").render(&USER_COLUMNS, None)
 }
 
 /// `POST /b/admin/users/{id}/disable`. `{id}` is read only as the route

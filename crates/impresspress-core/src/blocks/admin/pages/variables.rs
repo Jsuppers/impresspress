@@ -683,7 +683,7 @@ mod tests {
             show_default: false,
         });
         let s = components::TableRow::new(cells)
-            .render(&VAR_COLUMNS)
+            .render(&VAR_COLUMNS, None)
             .into_string();
         assert!(
             s.contains(r#"aria-label="Edit WAFER_RUN_SHARED__APP_NAME""#),

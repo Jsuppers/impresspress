@@ -72,22 +72,22 @@ impl TableRow {
         self
     }
 
-    /// Render this row on its own, against `columns`, with no surrounding
-    /// table — the `<tr>` plus whatever [`after`](TableRow::after) puts behind
-    /// it, exactly as [`DataTable::render`] would have emitted them.
+    /// Render this row against `columns`, with or without a surrounding table
+    /// — the `<tr>` plus whatever [`after`](TableRow::after) puts behind it.
+    /// `href`, when set, appends the row-link chevron cell and puts the row in
+    /// its `--linked` state, exactly as a [`DataTable`] whose
+    /// [`row_href`](DataTable::row_href) returned that destination for this
+    /// row would have emitted it.
     ///
-    /// This exists for the htmx `outerHTML` swap of a single row: the
-    /// administration users table replaces one row after an enable or a
+    /// The link target is a parameter rather than a default because the
+    /// standalone case exists for the htmx `outerHTML` swap of a single row:
+    /// the administration users table replaces one row after an enable or a
     /// disable, and the replacement has to carry the same classes and the same
     /// `data-label` cells as the row it replaces. Rendering it through the
-    /// component is what stops the two from drifting.
-    pub fn render(self, columns: &[TableCol<'_>]) -> Markup {
-        self.render_in(columns, None)
-    }
-
-    /// The one row renderer. `href`, when set, appends the row-link chevron
-    /// cell and puts the row in its `--linked` state.
-    fn render_in(self, columns: &[TableCol<'_>], href: Option<String>) -> Markup {
+    /// component is what stops the two from drifting — and a row swapped into
+    /// a *linked* table that defaulted to `None` would silently come back one
+    /// cell short and unclickable. Every caller states which it is.
+    pub fn render(self, columns: &[TableCol<'_>], href: Option<String>) -> Markup {
         let TableRow {
             cells,
             id,
@@ -200,7 +200,7 @@ impl<'a> DataTable<'a> {
                     }
                     tbody {
                         @for (i, row) in self.rows.into_iter().enumerate() {
-                            (row.render_in(columns, row_href.as_ref().and_then(|f| f(i))))
+                            (row.render(columns, row_href.as_ref().and_then(|f| f(i))))
                         }
                     }
                 }
@@ -410,13 +410,39 @@ mod tests {
             .rows(vec![row()])
             .render()
             .into_string();
-        let standalone = row().render(&cols).into_string();
+        let standalone = row().render(&cols, None).into_string();
         assert!(in_table.contains(&standalone), "{in_table} !⊇ {standalone}");
         assert!(
             standalone.starts_with(r#"<tr id="user-row-1" class="data-table__row">"#),
             "{standalone}"
         );
         assert!(standalone.ends_with("</tr>"), "{standalone}");
+    }
+
+    /// The same guarantee for a *linked* table. A row swapped into one has to
+    /// carry the trailing chevron cell and the `--linked` modifier, or the
+    /// replacement comes back one cell short and unclickable.
+    #[test]
+    fn standalone_row_matches_the_linked_row_the_table_emits() {
+        let cols = [TableCol {
+            label: "Name",
+            width: None,
+        }];
+        let row = || TableRow::new(vec![html! { "widget" }]);
+        let in_table = DataTable::new(&cols)
+            .rows(vec![row()])
+            .row_href(|_| Some("/b/products/admin/products/widget".to_string()))
+            .render()
+            .into_string();
+        let standalone = row()
+            .render(&cols, Some("/b/products/admin/products/widget".to_string()))
+            .into_string();
+        assert!(in_table.contains(&standalone), "{in_table} !⊇ {standalone}");
+        assert!(
+            standalone.contains("data-table__row--linked"),
+            "{standalone}"
+        );
+        assert!(standalone.contains("data-table__row-href"), "{standalone}");
     }
 
     #[test]
