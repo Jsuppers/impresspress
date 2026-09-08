@@ -16,9 +16,13 @@ pub struct ConsoleLoggerService {
     min_level: LogLevel,
 }
 
-// Safety: wasm32-unknown-unknown is single-threaded.
-unsafe impl Send for ConsoleLoggerService {}
-unsafe impl Sync for ConsoleLoggerService {}
+// No `unsafe impl Send/Sync` here: `LogLevel` is a plain `Copy` enum, so the
+// compiler derives both. The pair that used to sit here claimed
+// "wasm32-unknown-unknown is single-threaded" — true, but irrelevant to a type
+// that is already `Send + Sync`, and an unnecessary `unsafe impl` teaches the
+// next reader that the crate hands them out by habit. The three that remain
+// (`database`, `network_service`, `storage`) wrap real JS handles and keep
+// their SAFETY comments; new code uses `MaybeSend` and the lint allow instead.
 
 /// Minimum level emitted when no runtime level is configured. Debug builds
 /// keep `debug()` output; release (production deploy) builds default to
