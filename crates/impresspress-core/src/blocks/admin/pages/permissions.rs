@@ -84,52 +84,44 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                 }
             }
             div .card__body {
-                table .table {
-                    thead {
-                        tr {
-                            th { "Block (Owner)" }
-                            th { "Grantee" }
-                            th { "Type" }
-                            th { "Resource Pattern" }
-                            th { "Access" }
-                        }
-                    }
-                    tbody {
-                        @for block in blocks {
-                            @for grant in &block.grants {
-                                tr {
-                                    td {
-                                        (badge(BadgeVariant::Info, &block.name))
-                                    }
-                                    td {
-                                        @if grant.grantee == "*" {
-                                            (badge(BadgeVariant::Warning, "* (all blocks)"))
-                                        } @else {
-                                            code { (grant.grantee) }
-                                        }
-                                    }
-                                    td {
-                                        @if let Some(ref rt) = grant.resource_type {
-                                            (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
-                                        } @else {
-                                            (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
-                                        }
-                                    }
-                                    td {
-                                        code .text-xs { (grant.resource) }
-                                    }
-                                    td {
-                                        @if grant.write {
-                                            (badge(BadgeVariant::Danger, "read + write"))
-                                        } @else {
-                                            (badge(BadgeVariant::Success, "read only"))
-                                        }
-                                    }
-                                }
+                @let rows: Vec<Vec<Markup>> = blocks.iter().flat_map(|block| {
+                    block.grants.iter().map(move |grant| vec![
+                        badge(BadgeVariant::Info, &block.name),
+                        html! {
+                            @if grant.grantee == "*" {
+                                (badge(BadgeVariant::Warning, "* (all blocks)"))
+                            } @else {
+                                code { (grant.grantee) }
                             }
-                        }
-                    }
-                }
+                        },
+                        html! {
+                            @if let Some(ref rt) = grant.resource_type {
+                                (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
+                            } @else {
+                                (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
+                            }
+                        },
+                        html! { code .text-xs { (grant.resource) } },
+                        html! {
+                            @if grant.write {
+                                (badge(BadgeVariant::Danger, "read + write"))
+                            } @else {
+                                (badge(BadgeVariant::Success, "read only"))
+                            }
+                        },
+                    ])
+                }).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &CODE_GRANT_COLUMNS,
+                    rows,
+                    None,
+                    // The raw table this replaced rendered its header over an
+                    // empty body when no block declared a grant, which read as
+                    // a broken table. The component renders the empty slot in
+                    // place of the whole table, so the slot has to say it.
+                    html! { p .text-center .text-muted { "No grants are declared in block source code." } },
+                ))
             }
         }
     }
@@ -162,62 +154,49 @@ pub(crate) async fn grants_custom_tab(
                 @if grants.is_empty() {
                     p .text-muted { "No custom grants configured." }
                 } @else {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Grantee" }
-                                th { "Type" }
-                                th { "Resource Pattern" }
-                                th { "Access" }
-                                th { "Description" }
-                                th .w-60 {}
-                            }
-                        }
-                        tbody {
-                            @for grant in &grants {
-                                @let id = &grant.id;
-                                @let grantee = grant.grantee.as_str();
-                                @let resource = grant.resource.as_str();
-                                @let write = grant.write;
-                                @let rt = grant.resource_type.as_str();
-                                @let description = grant.description.as_str();
-                                tr {
-                                    td {
-                                        @if grantee == "*" {
-                                            (badge(BadgeVariant::Warning, "* (all blocks)"))
-                                        } @else {
-                                            code { (grantee) }
-                                        }
-                                    }
-                                    td {
-                                        @if rt.is_empty() {
-                                            (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
-                                        } @else {
-                                            (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
-                                        }
-                                    }
-                                    td {
-                                        code .text-xs { (resource) }
-                                    }
-                                    td {
-                                        @if write {
-                                            (badge(BadgeVariant::Danger, "read + write"))
-                                        } @else {
-                                            (badge(BadgeVariant::Success, "read only"))
-                                        }
-                                    }
-                                    td .text-13 { (description) }
-                                    td {
-                                        button .btn .btn--danger .btn--sm
-                                            hx-delete={"/b/admin/grants/rules/" (id)}
-                                            hx-target="#content"
-                                            hx-confirm="Delete this grant?"
-                                        { (icons::trash()) }
-                                    }
+                    @let rows: Vec<Vec<Markup>> = grants.iter().map(|grant| {
+                        let grantee = grant.grantee.as_str();
+                        let rt = grant.resource_type.as_str();
+                        vec![
+                            html! {
+                                @if grantee == "*" {
+                                    (badge(BadgeVariant::Warning, "* (all blocks)"))
+                                } @else {
+                                    code { (grantee) }
                                 }
-                            }
-                        }
-                    }
+                            },
+                            html! {
+                                @if rt.is_empty() {
+                                    (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
+                                } @else {
+                                    (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
+                                }
+                            },
+                            html! { code .text-xs { (grant.resource) } },
+                            html! {
+                                @if grant.write {
+                                    (badge(BadgeVariant::Danger, "read + write"))
+                                } @else {
+                                    (badge(BadgeVariant::Success, "read only"))
+                                }
+                            },
+                            html! { span .text-13 { (grant.description) } },
+                            html! {
+                                button .btn .btn--danger .btn--sm
+                                    hx-delete={"/b/admin/grants/rules/" (grant.id)}
+                                    hx-target="#content"
+                                    hx-confirm="Delete this grant?"
+                                { (icons::trash()) }
+                            },
+                        ]
+                    }).collect();
+
+                    (components::data_table::<fn(usize) -> Option<String>>(
+                        &CUSTOM_GRANT_COLUMNS,
+                        rows,
+                        None,
+                        html! {},
+                    ))
                 }
             }
         }
@@ -523,40 +502,34 @@ async fn permissions_all_tab(
                         "No permissions configured yet."
                     }
                 } @else {
-                    table .table {
-                        thead {
-                            tr {
-                                th .w-110 { "Type" }
-                                th { "Permission" }
-                                th .w-80 { "Origin" }
-                            }
-                        }
-                        tbody {
-                            @for row in &all_rows {
-                                tr {
-                                    td {
-                                        @let variant = match row.type_label.as_str() {
-                                            "DB" | "DB/Config" => BadgeVariant::Info,
-                                            "Config" => BadgeVariant::Info,
-                                            "Storage" => BadgeVariant::Warning,
-                                            "Network" => BadgeVariant::Success,
-                                            "Crypto" => BadgeVariant::Secondary,
-                                            _ => BadgeVariant::Secondary,
-                                        };
-                                        (Badge::new(variant).classes("text-11").render(html! { (row.type_label) }))
-                                    }
-                                    td .text-13 { (row.sentence) }
-                                    td {
-                                        @if row.origin == "code" {
-                                            (Badge::new(BadgeVariant::Secondary).classes("text-10").render(html! { "code" }))
-                                        } @else {
-                                            (Badge::new(BadgeVariant::Primary).classes("text-10").render(html! { "custom" }))
-                                        }
-                                    }
+                    @let rows: Vec<Vec<Markup>> = all_rows.iter().map(|row| {
+                        let variant = match row.type_label.as_str() {
+                            "DB" | "DB/Config" => BadgeVariant::Info,
+                            "Config" => BadgeVariant::Info,
+                            "Storage" => BadgeVariant::Warning,
+                            "Network" => BadgeVariant::Success,
+                            "Crypto" => BadgeVariant::Secondary,
+                            _ => BadgeVariant::Secondary,
+                        };
+                        vec![
+                            Badge::new(variant).classes("text-11").render(html! { (row.type_label) }),
+                            html! { span .text-13 { (row.sentence) } },
+                            html! {
+                                @if row.origin == "code" {
+                                    (Badge::new(BadgeVariant::Secondary).classes("text-10").render(html! { "code" }))
+                                } @else {
+                                    (Badge::new(BadgeVariant::Primary).classes("text-10").render(html! { "custom" }))
                                 }
-                            }
-                        }
-                    }
+                            },
+                        ]
+                    }).collect();
+
+                    (components::data_table::<fn(usize) -> Option<String>>(
+                        &PERMISSION_COLUMNS,
+                        rows,
+                        None,
+                        html! {},
+                    ))
                 }
             }
         }
@@ -574,6 +547,76 @@ async fn permissions_database_tab(
         (grants_code_tab(ctx))
     })
 }
+
+/// The three permission tables' columns. Declared once each so the
+/// `<td data-label>` the component stamps on every cell names the same column
+/// its header does; the widths are the ones the old `th .w-60` / `.w-80` /
+/// `.w-110` utility classes gave those headers, and the unlabelled column is
+/// the one that only carries the delete control.
+const CODE_GRANT_COLUMNS: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Block (Owner)",
+        width: None,
+    },
+    components::TableCol {
+        label: "Grantee",
+        width: None,
+    },
+    components::TableCol {
+        label: "Type",
+        width: None,
+    },
+    components::TableCol {
+        label: "Resource Pattern",
+        width: None,
+    },
+    components::TableCol {
+        label: "Access",
+        width: None,
+    },
+];
+
+const CUSTOM_GRANT_COLUMNS: [components::TableCol<'static>; 6] = [
+    components::TableCol {
+        label: "Grantee",
+        width: None,
+    },
+    components::TableCol {
+        label: "Type",
+        width: None,
+    },
+    components::TableCol {
+        label: "Resource Pattern",
+        width: None,
+    },
+    components::TableCol {
+        label: "Access",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "",
+        width: Some("60px"),
+    },
+];
+
+const PERMISSION_COLUMNS: [components::TableCol<'static>; 3] = [
+    components::TableCol {
+        label: "Type",
+        width: Some("110px"),
+    },
+    components::TableCol {
+        label: "Permission",
+        width: None,
+    },
+    components::TableCol {
+        label: "Origin",
+        width: Some("80px"),
+    },
+];
 
 #[cfg(test)]
 mod outage_tests {

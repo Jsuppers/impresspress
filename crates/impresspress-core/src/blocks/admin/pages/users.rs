@@ -144,33 +144,46 @@ async fn users_table(records: &[UserRow], ctx: &dyn Context, current_user_id: &s
     let user_ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
     let user_roles = ops::fetch_roles(ctx, &user_ids).await;
 
-    html! {
-        div .table-container {
-            table .table {
-                thead {
-                    tr {
-                        th { "Email" }
-                        th { "Roles" }
-                        th { "Status" }
-                        th { "Created" }
-                        th { "Actions" }
-                    }
-                }
-                tbody {
-                    @if records.is_empty() {
-                        tr {
-                            td colspan="5" .text-center .text-muted .p-8 { "No users found" }
-                        }
-                    }
-                    @for record in records {
-                        @let roles: &[String] = user_roles.get(&record.id).map(Vec::as_slice).unwrap_or(&[]);
-                        (single_user_row(record, roles, current_user_id))
-                    }
-                }
-            }
-        }
-    }
+    let rows: Vec<components::TableRow> = records
+        .iter()
+        .map(|record| {
+            let roles: &[String] = user_roles.get(&record.id).map(Vec::as_slice).unwrap_or(&[]);
+            single_user_row(record, roles, current_user_id)
+        })
+        .collect();
+
+    components::DataTable::new(&USER_COLUMNS)
+        .rows(rows)
+        .empty(html! { p .text-center .text-muted { "No users found" } })
+        .render()
 }
+
+/// The users table's columns. Declared once so the `<td data-label>` the
+/// component stamps on every cell names the same column the header does — and
+/// so the single-row htmx swap in [`user_row_fragment`] renders against the
+/// same list the table did.
+const USER_COLUMNS: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Email",
+        width: None,
+    },
+    components::TableCol {
+        label: "Roles",
+        width: None,
+    },
+    components::TableCol {
+        label: "Status",
+        width: None,
+    },
+    components::TableCol {
+        label: "Created",
+        width: None,
+    },
+    components::TableCol {
+        label: "Actions",
+        width: None,
+    },
+];
 
 /// Render one row of the users table. Shared between the multi-row table
 /// renderer and `user_row_fragment` (htmx outerHTML swap target for the
@@ -179,33 +192,32 @@ async fn users_table(records: &[UserRow], ctx: &dyn Context, current_user_id: &s
 /// `current_uid` is `""` when the caller is rendering a single-row update
 /// fragment (no "(you)" affordance) — the mutation endpoints reject
 /// self-disable before reaching this path.
-fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> Markup {
+fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> components::TableRow {
     let email = record.email.as_str();
     let disabled = record.disabled;
     let created = record.created_at.as_str();
     let is_self = !current_uid.is_empty() && record.id == current_uid;
-    html! {
-        tr #{"user-row-" (record.id)} {
-            td { (email) }
-            td {
-                @for role in roles {
-                    (Badge::new(BadgeVariant::Primary).classes("mr-1").render(html! { (role) }))
-                }
-                @if roles.is_empty() {
-                    span .text-muted { "\u{2014}" }
-                }
+    components::TableRow::new(vec![
+        html! { (email) },
+        html! {
+            @for role in roles {
+                (Badge::new(BadgeVariant::Primary).classes("mr-1").render(html! { (role) }))
             }
-            td {
-                @if disabled {
-                    (components::status_badge("disabled"))
-                } @else {
-                    (components::status_badge("active"))
-                }
+            @if roles.is_empty() {
+                span .text-muted { "\u{2014}" }
             }
-            td .text-muted .text-sm { (created.get(..10).unwrap_or(created)) }
-            td {
+        },
+        html! {
+            @if disabled {
+                (components::status_badge("disabled"))
+            } @else {
+                (components::status_badge("active"))
+            }
+        },
+        html! { span .text-muted { (created.get(..10).unwrap_or(created)) } },
+        html! {
                 @if is_self {
-                    span .text-muted .text-sm { "(you)" }
+                    span .text-muted { "(you)" }
                 } @else {
                     @if disabled {
                         button .btn .btn--sm .btn--success
@@ -232,12 +244,16 @@ fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> Mar
                         title="Delete user"
                     { (icons::trash()) }
                 }
-            }
-        }
-    }
+        },
+    ])
+    .id(format!("user-row-{}", record.id))
 }
 
 /// Render a single user table row (used by enable/disable mutations).
+///
+/// It goes back through the shared component against the same
+/// [`USER_COLUMNS`], so the row htmx swaps in carries the same classes and the
+/// same `data-label` cells as the row it replaces.
 async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
     let Ok(Some(record)) = users::find_by_id(ctx, user_id).await else {
         return html! {};
@@ -249,7 +265,7 @@ async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
         .remove(user_id)
         .unwrap_or_default();
 
-    single_user_row(&record, &roles, "")
+    single_user_row(&record, &roles, "").render(&USER_COLUMNS)
 }
 
 /// `POST /b/admin/users/{id}/disable`. `{id}` is read only as the route
@@ -351,45 +367,37 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
 
         @match &result {
             Ok(list) => {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Name" }
-                                th { "Description" }
-                                th { "Type" }
-                                th { "Actions" }
+                @let rows: Vec<Vec<Markup>> = list.records.iter().map(|record| {
+                    let name = record.str_field("name");
+                    let is_system = record.bool_field("is_system");
+                    vec![
+                        html! { span .font-medium { (name) } },
+                        html! { span .text-muted { (record.str_field("description")) } },
+                        html! {
+                            @if is_system {
+                                (badge(BadgeVariant::Info, "System"))
+                            } @else {
+                                (badge(BadgeVariant::Primary, "Custom"))
                             }
-                        }
-                        tbody {
-                            @for record in &list.records {
-                                @let name = record.str_field("name");
-                                @let description = record.str_field("description");
-                                @let is_system = record.bool_field("is_system");
-                                tr {
-                                    td .font-medium { (name) }
-                                    td .text-muted .text-sm { (description) }
-                                    td {
-                                        @if is_system {
-                                            (badge(BadgeVariant::Info, "System"))
-                                        } @else {
-                                            (badge(BadgeVariant::Primary, "Custom"))
-                                        }
-                                    }
-                                    td {
-                                        @if !is_system {
-                                            button .btn .btn--sm .btn--danger
-                                                hx-delete={"/b/admin/iam/roles/" (record.id)}
-                                                hx-target="#iam-content"
-                                                hx-confirm={"Delete role \"" (name) "\"?"}
-                                            { (icons::trash()) }
-                                        }
-                                    }
-                                }
+                        },
+                        html! {
+                            @if !is_system {
+                                button .btn .btn--sm .btn--danger
+                                    hx-delete={"/b/admin/iam/roles/" (record.id)}
+                                    hx-target="#iam-content"
+                                    hx-confirm={"Delete role \"" (name) "\"?"}
+                                { (icons::trash()) }
                             }
-                        }
-                    }
-                }
+                        },
+                    ]
+                }).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &ROLE_COLUMNS,
+                    rows,
+                    None,
+                    html! { p .text-center .text-muted { "No roles" } },
+                ))
             }
             Err(e) => {
                 div .login-error { "Failed to load roles: " (e.message) }
@@ -432,60 +440,44 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
 
         @match &result {
             Ok(list) => {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Prefix" }
-                                th { "Name" }
-                                th { "User" }
-                                th { "Created" }
-                                th { "Status" }
-                                th { "Actions" }
+                @let rows: Vec<Vec<Markup>> = list.iter().map(|record| {
+                    let user_id = record.user_id.as_str();
+                    let created = record.created_at.as_str();
+                    let revoked = record.revoked_at.as_deref().unwrap_or("");
+                    vec![
+                        html! { code { (record.key_prefix) "..." } },
+                        html! { (record.name) },
+                        html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
+                        html! { span .text-muted { (created.get(..10).unwrap_or(created)) } },
+                        html! {
+                            @if revoked.is_empty() {
+                                (components::status_badge("active"))
+                            } @else {
+                                (components::status_badge("disabled"))
                             }
-                        }
-                        tbody {
-                            @if list.is_empty() {
-                                tr {
-                                    td colspan="6" .text-center .text-muted .p-8 { "No API keys" }
-                                }
+                        },
+                        html! {
+                            @if revoked.is_empty() {
+                                // Revocation is auth-ui's
+                                // `PATCH /b/auth/api/api-keys/{id}`
+                                // (`Route::RevokeApiKey`); an admin
+                                // may revoke another user's key.
+                                button .btn .btn--sm .btn--secondary
+                                    hx-patch={"/b/auth/api/api-keys/" (record.id)}
+                                    hx-target="#users-tab-content"
+                                    hx-confirm="Revoke this API key?"
+                                { "Revoke" }
                             }
-                            @for record in list {
-                                @let prefix = record.key_prefix.as_str();
-                                @let name = record.name.as_str();
-                                @let user_id = record.user_id.as_str();
-                                @let created = record.created_at.as_str();
-                                @let revoked = record.revoked_at.as_deref().unwrap_or("");
-                                tr {
-                                    td { code { (prefix) "..." } }
-                                    td { (name) }
-                                    td .text-muted .text-sm { (user_id.get(..8).unwrap_or(user_id)) }
-                                    td .text-muted .text-sm { (created.get(..10).unwrap_or(created)) }
-                                    td {
-                                        @if revoked.is_empty() {
-                                            (components::status_badge("active"))
-                                        } @else {
-                                            (components::status_badge("disabled"))
-                                        }
-                                    }
-                                    td {
-                                        @if revoked.is_empty() {
-                                            // Revocation is auth-ui's
-                                            // `PATCH /b/auth/api/api-keys/{id}`
-                                            // (`Route::RevokeApiKey`); an admin
-                                            // may revoke another user's key.
-                                            button .btn .btn--sm .btn--secondary
-                                                hx-patch={"/b/auth/api/api-keys/" (record.id)}
-                                                hx-target="#users-tab-content"
-                                                hx-confirm="Revoke this API key?"
-                                            { "Revoke" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                        },
+                    ]
+                }).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &API_KEY_COLUMNS,
+                    rows,
+                    None,
+                    html! { p .text-center .text-muted { "No API keys" } },
+                ))
             }
             Err(e) => {
                 div .login-error { "Failed to load API keys: " (e) }
@@ -507,6 +499,55 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
         }))
     }
 }
+
+/// The roles and API-key tables' columns. Declared once each so the
+/// `<td data-label>` the component stamps on every cell names the same column
+/// its header does.
+const ROLE_COLUMNS: [components::TableCol<'static>; 4] = [
+    components::TableCol {
+        label: "Name",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "Type",
+        width: None,
+    },
+    components::TableCol {
+        label: "Actions",
+        width: None,
+    },
+];
+
+const API_KEY_COLUMNS: [components::TableCol<'static>; 6] = [
+    components::TableCol {
+        label: "Prefix",
+        width: None,
+    },
+    components::TableCol {
+        label: "Name",
+        width: None,
+    },
+    components::TableCol {
+        label: "User",
+        width: None,
+    },
+    components::TableCol {
+        label: "Created",
+        width: None,
+    },
+    components::TableCol {
+        label: "Status",
+        width: None,
+    },
+    components::TableCol {
+        label: "Actions",
+        width: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {

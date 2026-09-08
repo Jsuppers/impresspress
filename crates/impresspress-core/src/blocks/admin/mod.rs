@@ -1743,6 +1743,50 @@ mod page_link_tests {
         )
         .await
         .expect("seed request log");
+        // A failing request as well as a succeeding one: the dashboard's
+        // "Recent Errors" card reads `list_recent_errors`, whose filter is
+        // `status == "ERROR"` OR `status_code >= 400`, so the 200 above
+        // renders that card's empty state and nothing else. Without this row
+        // no render test ever exercises that card's table.
+        request_logs::insert(
+            &ctx,
+            &request_logs::NewRequestLog {
+                method: "POST",
+                path: "/probe/fail",
+                status_label: "ERROR",
+                status_code: 500,
+                error_message: "probe failure",
+                duration_ms: 9,
+                client_ip: "203.0.113.7",
+                user_id: "",
+            },
+        )
+        .await
+        .expect("seed error request log");
+        // One storage access row, so the storage page renders its table
+        // rather than its empty state. Written the way
+        // `blocks::storage::log_storage_access` writes it.
+        db::create(
+            &ctx,
+            STORAGE_ACCESS_LOGS_TABLE,
+            crate::util::json_map(serde_json::json!({
+                "source_block": PROBE_BLOCK,
+                "operation": "get",
+                "path": "probe/a.txt",
+                "status": "OK",
+            })),
+        )
+        .await
+        .expect("seed storage access log");
+        // One audit entry, for the same reason on the logs page's audit tab.
+        logs::audit_log(
+            &ctx,
+            "admin-1",
+            "user.disable",
+            "users/probe",
+            "203.0.113.7",
+        )
+        .await;
         // `can_disable` is what makes the detail fragment render the toggle.
         ctx.register_block_info(
             PROBE_BLOCK,

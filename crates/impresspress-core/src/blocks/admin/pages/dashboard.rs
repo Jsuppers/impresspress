@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use maud::html;
+use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
@@ -270,20 +270,16 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 @if recent_users.is_empty() {
                     p .text-muted .text-sm { "No users yet" }
                 } @else {
-                    div .table-container {
-                        table .table {
-                            tbody {
-                                @for record in recent_users {
-                                    @let email = record.email.as_str();
-                                    @let created = record.created_at.as_str();
-                                    tr {
-                                        td .text-sm { (email) }
-                                        td .text-muted .text-sm .text-right { (created.get(..10).unwrap_or(created)) }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    @let rows: Vec<components::TableRow> = recent_users.iter().map(|record| {
+                        let created = record.created_at.as_str();
+                        components::TableRow::new(vec![
+                            html! { (record.email) },
+                            // `.text-right` needs a block box to align against,
+                            // and the component owns the `<td>`.
+                            html! { div .text-muted .text-right { (created.get(..10).unwrap_or(created)) } },
+                        ])
+                    }).collect();
+                    (components::DataTable::new(&RECENT_USERS_COLUMNS).rows(rows).headless().render())
                 }
                 } @else {
                     p .text-muted .text-sm { (CARD_UNAVAILABLE) }
@@ -303,35 +299,23 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 @if recent_errors.is_empty() {
                     p .text-muted .text-sm { "No errors recently" }
                 } @else {
-                    div .table-container {
-                        table .table {
-                            thead {
-                                tr {
-                                    th { "Status" }
-                                    th { "Method" }
-                                    th { "Path" }
-                                    th { "Time" }
-                                }
-                            }
-                            tbody {
-                                @for row in recent_errors {
-                                    @let code = row.status_code;
-                                    @let method = row.method.as_str();
-                                    @let path = row.path.as_str();
-                                    @let created = row.created_at.as_str();
-                                    tr {
-                                        td {
-                                            @let variant = if code >= 500 { BadgeVariant::Danger } else { BadgeVariant::Warning };
-                                            (Badge::new(variant).render(html! { (code) }))
-                                        }
-                                        td .text-sm .font-medium { (method.to_uppercase()) }
-                                        td .text-sm { (path) }
-                                        td .text-muted .text-sm { (created.get(..19).unwrap_or(created)) }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    @let rows: Vec<Vec<Markup>> = recent_errors.iter().map(|row| {
+                        let code = row.status_code;
+                        let created = row.created_at.as_str();
+                        let variant = if code >= 500 { BadgeVariant::Danger } else { BadgeVariant::Warning };
+                        vec![
+                            Badge::new(variant).render(html! { (code) }),
+                            html! { span .font-medium { (row.method.to_uppercase()) } },
+                            html! { (row.path) },
+                            html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
+                        ]
+                    }).collect();
+                    (components::data_table::<fn(usize) -> Option<String>>(
+                        &RECENT_ERRORS_COLUMNS,
+                        rows,
+                        None,
+                        html! {},
+                    ))
                 }
                 } @else {
                     p .text-muted .text-sm { (CARD_UNAVAILABLE) }
@@ -406,6 +390,40 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     )
     .await
 }
+
+/// The dashboard cards' table columns. "Recent Users" renders headless — it
+/// reads as a two-column list, not a grid — but still declares its columns,
+/// because the `data-label` the component stamps on every `<td>` is what names
+/// the cells when the table collapses to cards on a narrow viewport.
+const RECENT_USERS_COLUMNS: [components::TableCol<'static>; 2] = [
+    components::TableCol {
+        label: "Email",
+        width: None,
+    },
+    components::TableCol {
+        label: "Created",
+        width: None,
+    },
+];
+
+const RECENT_ERRORS_COLUMNS: [components::TableCol<'static>; 4] = [
+    components::TableCol {
+        label: "Status",
+        width: None,
+    },
+    components::TableCol {
+        label: "Method",
+        width: None,
+    },
+    components::TableCol {
+        label: "Path",
+        width: None,
+    },
+    components::TableCol {
+        label: "Time",
+        width: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {

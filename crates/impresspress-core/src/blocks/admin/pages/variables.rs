@@ -152,10 +152,10 @@ struct VarRow<'a> {
 /// per SEC-060), optional default column, description (+ optional warning),
 /// and the edit button. Shared by all four variable tables so the masking
 /// policy and edit affordance can't drift between them.
-fn var_row(row: &VarRow) -> Markup {
-    html! {
-        tr {
-            td .font-medium .text-13 {
+fn var_row(row: &VarRow) -> Vec<Markup> {
+    let mut cells = vec![
+        html! {
+            span .font-medium .text-13 {
                 code { (row.key) }
                 @if let Some(name) = row.name {
                     @if !name.is_empty() {
@@ -164,42 +164,49 @@ fn var_row(row: &VarRow) -> Markup {
                     }
                 }
             }
-            td .text-13 {
+        },
+        html! {
+            span .text-13 {
                 @match &row.value {
                     ValueState::Masked => code { "********" },
                     ValueState::Plain(v) => code { (v) },
                     ValueState::NotSet => span .text-muted { "(not set)" },
                 }
             }
-            @if row.show_default {
-                td .text-xs {
-                    @match row.default {
-                        Some(d) if !d.is_empty() => code .text-muted { (d) },
-                        _ => @if row.auto_generate {
-                            (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { "auto-generated" }))
-                        },
-                    }
+        },
+    ];
+    if row.show_default {
+        cells.push(html! {
+            span .text-xs {
+                @match row.default {
+                    Some(d) if !d.is_empty() => code .text-muted { (d) },
+                    _ => @if row.auto_generate {
+                        (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { "auto-generated" }))
+                    },
                 }
             }
-            td .text-xs {
-                (row.description)
-                @if !row.warning.is_empty() {
-                    div .var-warning-note {
-                        "Warning: " (row.warning)
-                    }
+        });
+    }
+    cells.push(html! {
+        span .text-xs {
+            (row.description)
+            @if !row.warning.is_empty() {
+                div .var-warning-note {
+                    "Warning: " (row.warning)
                 }
-            }
-            td {
-                button .btn .btn--sm .btn--ghost
-                    hx-get={"/b/admin/variables/" (row.key) "/edit"}
-                    hx-target="#edit-var-modal"
-                    hx-swap="innerHTML"
-                    title="Edit"
-                    aria-label=(format!("Edit {}", row.key))
-                { (icons::edit()) }
             }
         }
-    }
+    });
+    cells.push(html! {
+        button .btn .btn--sm .btn--ghost
+            hx-get={"/b/admin/variables/" (row.key) "/edit"}
+            hx-target="#edit-var-modal"
+            hx-swap="innerHTML"
+            title="Edit"
+            aria-label=(format!("Edit {}", row.key))
+        { (icons::edit()) }
+    });
+    cells
 }
 
 /// Build and render one row for a declared [`ConfigVar`] (the shared + per-block
@@ -209,7 +216,7 @@ fn var_row(row: &VarRow) -> Markup {
 fn config_var_row(
     var: &wafer_run::ConfigVar,
     var_map: &std::collections::HashMap<String, (String, i64)>,
-) -> Markup {
+) -> Vec<Markup> {
     let (db_value, sensitive_flag) = var_map
         .get(&var.key)
         .map(|(v, s)| (v.as_str(), *s))
@@ -226,31 +233,94 @@ fn config_var_row(
     })
 }
 
-/// Render a titled card wrapping a variable table. `show_default` adds the
-/// "Default" column header to match [`var_row`]'s default cell.
-fn var_table(header: Markup, show_default: bool, body: Markup) -> Markup {
+/// Render a titled card wrapping a variable table. `show_default` selects the
+/// column list carrying the "Default" column, to match [`var_row`]'s cells.
+fn var_table(header: Markup, show_default: bool, rows: Vec<Vec<Markup>>) -> Markup {
+    let columns: &[components::TableCol<'static>] = if show_default {
+        &VAR_COLUMNS_WITH_DEFAULT
+    } else {
+        &VAR_COLUMNS
+    };
     html! {
         div .card .mt-4 {
             (header)
             div .card__body {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Key" }
-                                th { "Value" }
-                                @if show_default { th { "Default" } }
-                                th { "Description" }
-                                th .w-50 {}
-                            }
-                        }
-                        tbody { (body) }
-                    }
-                }
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    columns,
+                    rows,
+                    None,
+                    html! {},
+                ))
             }
         }
     }
 }
+
+/// The variable tables' columns, in the two shapes [`var_row`] emits. The
+/// last column is the one that only carries the edit control; it keeps the
+/// 50px width the old `th .w-50` gave it.
+const VAR_COLUMNS: [components::TableCol<'static>; 4] = [
+    components::TableCol {
+        label: "Key",
+        width: None,
+    },
+    components::TableCol {
+        label: "Value",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "",
+        width: Some("50px"),
+    },
+];
+
+const VAR_COLUMNS_WITH_DEFAULT: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Key",
+        width: None,
+    },
+    components::TableCol {
+        label: "Value",
+        width: None,
+    },
+    components::TableCol {
+        label: "Default",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "",
+        width: Some("50px"),
+    },
+];
+
+/// The "All Variables" tab's columns — a flatter listing than the per-block
+/// tables, with an explicitly labelled actions column.
+const ALL_VAR_COLUMNS: [components::TableCol<'static>; 4] = [
+    components::TableCol {
+        label: "Key",
+        width: None,
+    },
+    components::TableCol {
+        label: "Value",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "Actions",
+        width: None,
+    },
+];
 
 /// "All Variables" tab -- flat table of all config variables from the DB.
 async fn config_all_tab(ctx: &dyn Context) -> Markup {
@@ -259,58 +329,49 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
     html! {
         @match &settings {
             Ok(rows) => {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Key" }
-                                th { "Value" }
-                                th { "Description" }
-                                th { "Actions" }
+                @let table_rows: Vec<components::TableRow> = rows.iter().map(|row| {
+                    let key = row.key.as_str();
+                    let description = row.description.as_str();
+                    let warning = row.warning.as_str();
+                    // SEC-060: mask via the shared rule, not the `sensitive`
+                    // flag alone.
+                    let masked = ops::is_sensitive_key(key, i64::from(row.sensitive));
+                    components::TableRow::new(vec![
+                        html! { span .font-medium { (key) } },
+                        html! {
+                            @if masked {
+                                code { "********" }
+                            } @else {
+                                code { (row.value) }
                             }
-                        }
-                        tbody {
-                            @for row in rows {
-                                @let key = row.key.as_str();
-                                @let value = row.value.as_str();
-                                @let description = row.description.as_str();
-                                @let warning = row.warning.as_str();
-                                // SEC-060: mask via the shared rule, not the
-                                // `sensitive` flag alone.
-                                @let masked = ops::is_sensitive_key(key, i64::from(row.sensitive));
-                                tr #{"var-row-" (key)} {
-                                    td .font-medium { (key) }
-                                    td .text-sm {
-                                        @if masked {
-                                            code { "********" }
-                                        } @else {
-                                            code { (value) }
-                                        }
-                                    }
-                                    td .text-sm {
-                                        @if !description.is_empty() {
-                                            span .text-muted { (description) }
-                                        }
-                                        @if !warning.is_empty() {
-                                            div .text-warning-strong .text-xs .mt-1 {
-                                                (ui::icons::triangle_alert()) (warning)
-                                            }
-                                        }
-                                    }
-                                    td {
-                                        button .btn .btn--sm .btn--ghost
-                                            hx-get={"/b/admin/variables/" (key) "/edit"}
-                                            hx-target="#edit-var-modal"
-                                            hx-swap="innerHTML"
-                                            title="Edit"
-                                            aria-label=(format!("Edit {key}"))
-                                        { (icons::edit()) }
-                                    }
+                        },
+                        html! {
+                            @if !description.is_empty() {
+                                span .text-muted { (description) }
+                            }
+                            @if !warning.is_empty() {
+                                div .text-warning-strong .text-xs .mt-1 {
+                                    (ui::icons::triangle_alert()) (warning)
                                 }
                             }
-                        }
-                    }
-                }
+                        },
+                        html! {
+                            button .btn .btn--sm .btn--ghost
+                                hx-get={"/b/admin/variables/" (key) "/edit"}
+                                hx-target="#edit-var-modal"
+                                hx-swap="innerHTML"
+                                title="Edit"
+                                aria-label=(format!("Edit {key}"))
+                            { (icons::edit()) }
+                        },
+                    ])
+                    .id(format!("var-row-{key}"))
+                }).collect();
+
+                (components::DataTable::new(&ALL_VAR_COLUMNS)
+                    .rows(table_rows)
+                    .empty(html! { p .text-center .text-muted { "No variables are set." } })
+                    .render())
             }
             Err(e) => {
                 div .login-error { "Failed to load variables: " (e.message) }
@@ -388,11 +449,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                     }
                 },
                 true,
-                html! {
-                    @for var in &shared_vars {
-                        (config_var_row(var, &var_map))
-                    }
-                },
+                shared_vars.iter().map(|var| config_var_row(var, &var_map)).collect(),
             ))
         }
 
@@ -430,11 +487,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                     }
                 },
                 true,
-                html! {
-                    @for var in &block.config_keys {
-                        (config_var_row(var, &var_map))
-                    }
-                },
+                block.config_keys.iter().map(|var| config_var_row(var, &var_map)).collect(),
             ))
         }
 
@@ -456,29 +509,27 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                     }
                 },
                 false,
-                html! {
-                    @for row in &unowned_vars {
-                        @let key = row.key.as_str();
-                        // SEC-060: mask via the shared rule. `track_unset` is
-                        // false here so an empty value renders as an empty
-                        // `code` cell, matching the prior flat layout.
-                        (var_row(&VarRow {
+                unowned_vars.iter().map(|row| {
+                    let key = row.key.as_str();
+                    // SEC-060: mask via the shared rule. `track_unset` is
+                    // false here so an empty value renders as an empty
+                    // `code` cell, matching the prior flat layout.
+                    var_row(&VarRow {
+                        key,
+                        name: None,
+                        value: ValueState::resolve(
                             key,
-                            name: None,
-                            value: ValueState::resolve(
-                                key,
-                                &row.value,
-                                i64::from(row.sensitive),
-                                false,
-                            ),
-                            default: None,
-                            auto_generate: false,
-                            description: &row.description,
-                            warning: "",
-                            show_default: false,
-                        }))
-                    }
-                },
+                            &row.value,
+                            i64::from(row.sensitive),
+                            false,
+                        ),
+                        default: None,
+                        auto_generate: false,
+                        description: &row.description,
+                        warning: "",
+                        show_default: false,
+                    })
+                }).collect(),
             ))
         }
     }
@@ -620,7 +671,7 @@ mod tests {
     /// Variables page alone).
     #[test]
     fn var_row_edit_button_carries_accessible_name() {
-        let s = var_row(&VarRow {
+        let cells = var_row(&VarRow {
             key: "WAFER_RUN_SHARED__APP_NAME",
             name: None,
             value: ValueState::Plain("Impresspress".to_string()),
@@ -629,8 +680,10 @@ mod tests {
             description: "App name",
             warning: "",
             show_default: false,
-        })
-        .into_string();
+        });
+        let s = components::TableRow::new(cells)
+            .render(&VAR_COLUMNS)
+            .into_string();
         assert!(
             s.contains(r#"aria-label="Edit WAFER_RUN_SHARED__APP_NAME""#),
             "edit button must expose an aria-label with the row key: {s}"

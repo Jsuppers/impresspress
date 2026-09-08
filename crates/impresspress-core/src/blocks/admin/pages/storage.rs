@@ -98,6 +98,43 @@ async fn storage_logs_tab(
     .await?
     .records;
 
+    let rows: Vec<Vec<Markup>> = logs
+        .iter()
+        .map(|log| {
+            let field = |name: &str| {
+                log.data
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let source = field("source_block");
+            let op = field("operation");
+            let path = field("path");
+            let status = field("status");
+            let created = field("created_at");
+            vec![
+                html! {
+                    @if !source.is_empty() {
+                        (badge(BadgeVariant::Info, &source))
+                    }
+                },
+                html! { span .font-mono { (op) } },
+                html! { span .font-mono { (path) } },
+                html! {
+                    @if status.starts_with("BLOCKED") {
+                        (badge(BadgeVariant::Danger, &status))
+                    } @else if status.starts_with("ERROR") {
+                        (badge(BadgeVariant::Warning, &status))
+                    } @else {
+                        span .text-muted { (status) }
+                    }
+                },
+                html! { span .text-muted { (created.get(..19).unwrap_or(&created)) } },
+            ]
+        })
+        .collect();
+
     Ok(html! {
         p .text-muted .mb-4 {
             "Recent storage access by blocks. Each block is isolated to "
@@ -105,56 +142,39 @@ async fn storage_logs_tab(
             "."
         }
 
-        div .table-container {
-            table .table {
-                thead {
-                    tr {
-                        th { "Block" }
-                        th { "Operation" }
-                        th { "Path" }
-                        th { "Status" }
-                        th { "Time" }
-                    }
-                }
-                tbody {
-                    @if logs.is_empty() {
-                        tr {
-                            td colspan="5" .text-center .text-muted .p-8 {
-                                "No storage access logs yet."
-                            }
-                        }
-                    }
-                    @for log in &logs {
-                        @let source = log.data.get("source_block").and_then(|v| v.as_str()).unwrap_or("");
-                        @let op = log.data.get("operation").and_then(|v| v.as_str()).unwrap_or("");
-                        @let path = log.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        @let status = log.data.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        @let created = log.data.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-                        tr {
-                            td {
-                                @if !source.is_empty() {
-                                    (badge(BadgeVariant::Info, source))
-                                }
-                            }
-                            td .text-sm .font-mono { (op) }
-                            td .text-sm .font-mono { (path) }
-                            td .text-sm {
-                                @if status.starts_with("BLOCKED") {
-                                    (badge(BadgeVariant::Danger, status))
-                                } @else if status.starts_with("ERROR") {
-                                    (badge(BadgeVariant::Warning, status))
-                                } @else {
-                                    span .text-muted { (status) }
-                                }
-                            }
-                            td .text-muted .text-sm { (created.get(..19).unwrap_or(created)) }
-                        }
-                    }
-                }
-            }
-        }
+        (components::data_table::<fn(usize) -> Option<String>>(
+            &STORAGE_LOG_COLUMNS,
+            rows,
+            None,
+            html! { p .text-center .text-muted { "No storage access logs yet." } },
+        ))
     })
 }
+
+/// The access-log table's columns. Declared once so the `<td data-label>` the
+/// component stamps on every cell names the same column the header does.
+const STORAGE_LOG_COLUMNS: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Block",
+        width: None,
+    },
+    components::TableCol {
+        label: "Operation",
+        width: None,
+    },
+    components::TableCol {
+        label: "Path",
+        width: None,
+    },
+    components::TableCol {
+        label: "Status",
+        width: None,
+    },
+    components::TableCol {
+        label: "Time",
+        width: None,
+    },
+];
 
 #[cfg(test)]
 mod outage_tests {
