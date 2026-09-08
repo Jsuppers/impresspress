@@ -151,7 +151,7 @@ pub(crate) async fn grants_custom_tab(
                         "Add grants for third-party or WASM blocks. These are loaded at startup alongside code-declared grants."
                     }
                 }
-                button .btn .btn--primary .btn--sm onclick="openModal('add-grant-modal')" {
+                button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="add-grant-modal" {
                     (icons::plus()) " Add Grant"
                 }
             }
@@ -237,7 +237,7 @@ pub(crate) async fn grants_custom_tab(
                         })
                     })
                     .collect();
-                serde_json::to_string(&block_data).unwrap_or_default()
+                crate::ui::script_json_escape(&serde_json::to_string(&block_data).unwrap_or_default())
             }))
             (maud::PreEscaped(r#";
             function updateGrantForm() {
@@ -289,9 +289,13 @@ pub(crate) async fn grants_custom_tab(
                         specificSelect.appendChild(opt);
                     });
                     resourceEl.value = specificSelect.value;
-                    specificSelect.onchange = function() { resourceEl.value = this.value; };
                 }
             }
+            document.addEventListener('change', function (e) {
+                var el = e.target;
+                if (!(el instanceof Element)) return;
+                if (el.getAttribute('data-action') === 'grant-form-update') updateGrantForm();
+            });
             "#))
         }
 
@@ -313,7 +317,7 @@ pub(crate) async fn grants_custom_tab(
                 div .form-group {
                     label .form-label for="grant_owner" { "Access to which block's data?" }
                     select .form-input #grant_owner
-                        onchange="updateGrantForm()"
+                        data-action="grant-form-update"
                     {
                         option value="" disabled selected { "Select the data owner..." }
                         @for b in blocks.iter().filter(|b| b.name.contains('/')) {
@@ -327,7 +331,7 @@ pub(crate) async fn grants_custom_tab(
                 div .form-group {
                     label .form-label for="resource_type" { "What kind of data?" }
                     select .form-input #resource_type name="resource_type"
-                        onchange="updateGrantForm()"
+                        data-action="grant-form-update"
                     {
                         option value="" { "All (database + config + storage)" }
                         option value="db" { "Database tables" }
@@ -339,7 +343,7 @@ pub(crate) async fn grants_custom_tab(
                 div .form-group {
                     label .form-label for="grant_scope" { "How much access?" }
                     select .form-input #grant_scope
-                        onchange="updateGrantForm()"
+                        data-action="grant-form-update"
                     {
                         option value="all" { "All resources of this type" }
                         option value="specific" { "A specific resource" }
@@ -347,7 +351,12 @@ pub(crate) async fn grants_custom_tab(
                 }
                 div .form-group #specific_group hidden {
                     label .form-label for="specific_resource" { "Pick a resource" }
-                    select .form-input #specific_resource {}
+                    // Its value IS the computed resource pattern, so it mirrors
+                    // straight into the hidden `#resource` field below. That
+                    // used to be an `el.onchange = function() {…}` assignment
+                    // handed out each time the dropdown was repopulated.
+                    select .form-input #specific_resource
+                        data-action="mirror-value" data-mirror-target="resource" {}
                 }
                 // Hidden field that holds the computed resource pattern
                 input type="hidden" #resource name="resource";
@@ -366,7 +375,7 @@ pub(crate) async fn grants_custom_tab(
                         placeholder="e.g. Analytics block needs to read user profiles";
                 }
                 div .form-actions {
-                    button .btn .btn--secondary type="button" onclick="closeModal('add-grant-modal')" { "Cancel" }
+                    button .btn .btn--secondary type="button" data-action="modal-close" data-modal-target="add-grant-modal" { "Cancel" }
                     button .btn .btn--primary type="submit" { "Add Grant" }
                 }
             }

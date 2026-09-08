@@ -512,7 +512,7 @@ fn render_conversation_composer(post_url: &str) -> Markup {
                     placeholder="Type your message..."
                     rows="3"
                     required
-                    onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.closest('form').requestSubmit();}"
+                    data-submit-on-enter
                 {}
                 button .btn .btn--primary .h-fit type="submit" { "Send" }
             }

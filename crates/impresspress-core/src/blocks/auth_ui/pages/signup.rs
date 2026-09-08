@@ -3,7 +3,7 @@
 use maud::{html, PreEscaped};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{pw_field, pw_toggle_js, signup_script, site_config};
+use super::{pw_field, signup_script, site_config};
 use crate::{
     blocks::auth_ui::redirect::is_safe_local_redirect,
     ui::{self, components::auth_panel, templates::auth_split},
@@ -48,7 +48,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         }
                     }
 
-                    form #form .login-form onsubmit="return handleSignup(event)" {
+                    form #form .login-form {
                         input type="hidden" #redirect value=(redirect);
 
                         div .form-group {
@@ -70,7 +70,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     }
                 }
 
-                script { (PreEscaped(pw_toggle_js())) }
                 script { (PreEscaped(signup_script())) }
             },
         ),

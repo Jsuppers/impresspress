@@ -1235,18 +1235,52 @@ mod tests {
         assert!(js.contains("__drawerInit"));
     }
 
-    /// `openModal`/`closeModal` are called from `onclick` attributes and from
-    /// `components::modal`, so they must stay top-level function declarations
-    /// — wrapping the modal section in an IIFE while moving it into
-    /// `chrome.js` would have made them non-global and silently dead.
+    /// The inverse of the pin PR #46 shipped. That one required `openModal`
+    /// and `closeModal` to be top-level declarations, because pages reached
+    /// them from `onclick` attribute strings and an IIFE would have made them
+    /// silently dead. Those attributes are `data-action="modal-open"` /
+    /// `"modal-close"` now, read by the delegated listener in the same
+    /// section, and the htmx response-header channel covers the rest — so the
+    /// helpers are internal, and re-exposing them would be a global with no
+    /// caller. This is the same coverage pointed the other way, not coverage
+    /// dropped: what it guards is that the modal section still handles every
+    /// way a modal is opened or closed.
     #[cfg(feature = "embed-assets")]
     #[test]
-    fn chrome_js_keeps_the_modal_helpers_global() {
+    fn chrome_js_owns_the_modal_verbs_without_exposing_globals() {
         let js = super::chrome_js();
+        assert!(
+            js.contains("if (window.__modalInit) return;"),
+            "the modal section must be a guarded IIFE"
+        );
         for line in ["function openModal(id) {", "function closeModal(id) {"] {
             assert!(
-                js.lines().any(|l| l == line),
-                "{line} must be a top-level declaration in chrome.js"
+                !js.lines().any(|l| l == line),
+                "{line} must not be a top-level (global) declaration"
+            );
+        }
+        for verb in [
+            "\"modal-open\"",
+            "\"modal-close\"",
+            "\"reveal-toggle\"",
+            "\"copy-text\"",
+            "\"mirror-value\"",
+        ] {
+            assert!(js.contains(verb), "chrome must handle the {verb} verb");
+        }
+        for hook in [
+            ".modal-overlay[data-modal-dismiss]",
+            "data-stop-propagation",
+            "data-submit-on-enter",
+        ] {
+            assert!(js.contains(hook), "chrome must handle {hook}");
+        }
+        // Both directions of the htmx response-header channel: `closeModal`
+        // was already there, `openModal` replaced the four auto-show scripts.
+        for event in ["\"closeModal\"", "\"openModal\""] {
+            assert!(
+                js.contains(&format!("document.body.addEventListener({event}")),
+                "chrome must listen for the {event} htmx trigger"
             );
         }
     }

@@ -20,7 +20,7 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
 
     html! {
         div .mb-3 {
-            button .btn .btn--primary .btn--sm onclick="openModal('create-var')" {
+            button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-var" {
                 (icons::plus()) " Add Variable"
             }
         }
@@ -76,15 +76,14 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
                     }
                 }
                 div .form-actions {
-                    button .btn .btn--secondary type="button" onclick="closeModal('create-var')" { "Cancel" }
+                    button .btn .btn--secondary type="button" data-action="modal-close" data-modal-target="create-var" { "Cancel" }
                     button .btn .btn--primary type="submit" { "Create" }
                 }
             }
         }))
 
         // Edit variable modal (content loaded dynamically via htmx)
-        div .modal-overlay #edit-var-modal-overlay hidden
-            onclick="if(event.target===this)closeModal('edit-var-modal-overlay')"
+        div .modal-overlay #edit-var-modal-overlay hidden data-modal-dismiss
         {
             div .modal {
                 div #edit-var-modal {}
@@ -531,7 +530,7 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
     let markup = html! {
         div .modal-header {
             h3 .modal-title { "Edit Variable" }
-            button .modal-close onclick="closeModal('edit-var-modal-overlay')" {
+            button .modal-close data-action="modal-close" data-modal-target="edit-var-modal-overlay" {
                 (icons::x())
             }
         }
@@ -551,7 +550,10 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                                 value=(value);
                             button .btn .btn--ghost .btn--icon .btn-icon-right
                                 type="button"
-                                onclick="var i=document.getElementById('edit-value');if(i.type==='password'){i.type='text';this.title='Hide';this.setAttribute('aria-label','Hide value')}else{i.type='password';this.title='Reveal';this.setAttribute('aria-label','Reveal value')}"
+                                data-action="reveal-toggle"
+                                data-reveal-target="edit-value"
+                                data-reveal-show="Reveal"
+                                data-reveal-hide="Hide"
                                 title="Reveal"
                                 aria-label="Reveal value"
                             { (icons::eye()) }
@@ -570,16 +572,14 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                     }
                 }
                 div .form-actions {
-                    button .btn .btn--secondary type="button" onclick="closeModal('edit-var-modal-overlay')" { "Cancel" }
+                    button .btn .btn--secondary type="button" data-action="modal-close" data-modal-target="edit-var-modal-overlay" { "Cancel" }
                     button .btn .btn--primary type="submit" { "Save" }
                 }
             }
         }
-        // Auto-open the modal
-        script { (maud::PreEscaped("document.getElementById('edit-var-modal-overlay').removeAttribute('hidden');")) }
     };
 
-    ui::html_response(markup)
+    ui::html_response_opening_modal(markup, "edit-var-modal-overlay")
 }
 
 /// `PUT`/`PATCH /b/admin/variables/{key}` -- update variable value (the row

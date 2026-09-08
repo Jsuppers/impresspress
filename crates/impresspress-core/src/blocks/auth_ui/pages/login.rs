@@ -5,7 +5,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{
     login_script, oauth_button_script, oauth_provider_configured, oauth_provider_icon,
-    oauth_provider_label, pw_field, pw_toggle_js, site_config,
+    oauth_provider_label, pw_field, site_config,
 };
 use crate::{
     blocks::auth_ui::redirect::is_safe_local_redirect,
@@ -88,7 +88,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         div .auth-divider { "or" }
                     }
 
-                    form #form .login-form onsubmit="return handleLogin(event)" {
+                    form #form .login-form {
                         input type="hidden" #redirect value=(redirect);
 
                         div .form-group {
@@ -102,7 +102,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         }
 
                         div .auth-actions {
-                            button type="button" class="btn btn--ghost btn--sm" onclick="handleForgot()" {
+                            button type="button" class="btn btn--ghost btn--sm" data-action="auth-forgot" {
                                 "Forgot password?"
                             }
                         }
@@ -118,7 +118,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     }
                 }
 
-                script { (PreEscaped(pw_toggle_js())) }
                 script { (PreEscaped(login_script())) }
                 @if !oauth_providers.is_empty() {
                     script { (PreEscaped(oauth_button_script())) }

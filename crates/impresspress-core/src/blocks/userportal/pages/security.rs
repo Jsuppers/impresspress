@@ -10,6 +10,40 @@ use crate::{
     ui::SiteConfig,
 };
 
+/// The resend-verification button's behaviour, delegated.
+///
+/// It was a single `onclick` attribute built with `format!` — an IIFE with the
+/// signed-in address `serde_json`-encoded into a JavaScript string literal.
+/// Nothing could break out of it, but it is the shape the rule at
+/// `blocks/admin/pages/network.rs` warns about, and it was the only place in
+/// the tree that put a user's email into executable source.
+const RESEND_VERIFICATION_JS: &str = r#"
+(function () {
+  if (window.__resendVerificationInit) return;
+  window.__resendVerificationInit = true;
+  document.addEventListener('click', function (e) {
+    if (!(e.target instanceof Element)) return;
+    var btn = e.target.closest('[data-action="resend-verification"]');
+    if (!btn) return;
+    var result = document.getElementById('resend-verification-result');
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+    fetch('/b/auth/api/resend-verification', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: btn.getAttribute('data-verify-email') || '' })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { if (result) result.textContent = d.message || 'Sent'; })
+      .catch(function (err) { if (result) result.textContent = 'Error: ' + err.message; })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = 'Resend verification email';
+      });
+  });
+})();
+"#;
+
 pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
@@ -67,21 +101,17 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     @if !user_email.is_empty() { " — " (user_email) }
                 }
                 div #resend-verification-result {}
+                // The address travels as an attribute the script reads back
+                // with `getAttribute`, not as a `serde_json`-escaped literal
+                // spliced into JavaScript source. See the delegated-action
+                // rule in `ui/assets/chrome.js`.
                 button .btn .btn--secondary
                     type="button"
                     .w-full
-                    onclick=(format!(
-                        "(function(b){{b.disabled=true;b.textContent='Sending…';\
-                         fetch('/b/auth/api/resend-verification',{{method:'POST',\
-                         headers:{{'Content-Type':'application/json'}},\
-                         body:JSON.stringify({{email:{email_json}}})}})\
-                         .then(function(r){{return r.json();}})\
-                         .then(function(d){{document.getElementById('resend-verification-result').textContent=d.message||'Sent';}})\
-                         .catch(function(e){{document.getElementById('resend-verification-result').textContent='Error: '+e.message;}})\
-                         .finally(function(){{b.disabled=false;b.textContent='Resend verification email';}});}})(this)",
-                        email_json = serde_json::Value::String(user_email.clone())
-                    ))
+                    data-action="resend-verification"
+                    data-verify-email=(user_email)
                 { "Resend verification email" }
+                script { (maud::PreEscaped(RESEND_VERIFICATION_JS)) }
             }
         }
         section .account-section {

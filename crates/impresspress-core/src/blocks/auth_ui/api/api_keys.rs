@@ -111,20 +111,6 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
             if !msg.get_meta("http.header.hx-request").is_empty() {
                 let key_for_display = key_string.clone();
                 let name = record.name;
-                // Inline JS handler for the copy button. The key text lives
-                // in #new-api-key — read `innerText` (not the JS string) so
-                // we never have to escape the key into a JS literal, and so
-                // the button works even if the swap re-renders without the
-                // original closure scope.
-                let copy_js = "\
-                    var el=document.getElementById('new-api-key');\
-                    var t=el?el.innerText:'';\
-                    if(t&&navigator.clipboard){\
-                        navigator.clipboard.writeText(t).then(function(){\
-                            var b=event.currentTarget;b.textContent='Copied';\
-                            setTimeout(function(){b.textContent='Copy'},1500);\
-                        });\
-                    }";
                 let markup = maud::html! {
                     div .card .api-key-card {
                         div .card__head { h2 .card__title { "Key created — save it now" } }
@@ -136,8 +122,13 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
                                 code #new-api-key .api-key-value .text-13 {
                                     (key_for_display)
                                 }
+                                // Chrome's `copy-text` verb reads the key
+                                // out of `#new-api-key`, so the key itself is
+                                // never written into an attribute — which is
+                                // also what the inline handler this replaced
+                                // was careful to avoid.
                                 button type="button" .btn .btn--secondary .btn--sm .flex-none
-                                    onclick=(copy_js)
+                                    data-action="copy-text" data-copy-source="new-api-key"
                                 { "Copy" }
                             }
                             p .api-key-name-hint {

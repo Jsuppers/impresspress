@@ -1436,7 +1436,8 @@ mod tests {
         assert!(!s.contains("contenteditable"), "no contenteditable allowed");
         assert!(s.contains(r#"data-tab="edit""#));
         assert!(s.contains(r#"data-tab="preview""#));
-        // Vanilla JS fetch path — URL lives in EDITOR_JS / onclick handler
+        // Vanilla JS fetch path — the URL lives in EDITOR_JS, reached
+        // through the delegated `legalpages-editor-tab` action
         assert!(s.contains("/b/legalpages/admin/render-preview"));
     }
 }

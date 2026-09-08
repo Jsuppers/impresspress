@@ -12,11 +12,12 @@
 //   3. toasts           (was emitted by `ui::layout::page`)
 //   4. modals           (was emitted by `ui::layout::page`)
 //
-// Sections 1 and 2 are IIFEs with their own idempotence guards. Sections 3
-// and 4 are deliberately NOT wrapped: `openModal`/`closeModal` are called
-// from `onclick` attributes and from `components::modal`, so they must stay
-// top-level function declarations to remain globals, and the toast listener
-// binds `document.body` directly.
+// Sections 1, 2 and 4 are IIFEs with their own idempotence guards. Section 3
+// is deliberately NOT wrapped: the toast listener binds `document.body`
+// directly and declares nothing. Section 4 was unwrapped too until the pages
+// stopped calling `openModal`/`closeModal` from `onclick` attributes; it now
+// owns the shared delegated-action listener and exposes no globals. The rule
+// and the vocabulary are documented at the head of that section.
 //
 // The page loads this with `defer` from `<head>`, so the whole file runs
 // after parsing and every element these sections look for already exists --
@@ -227,22 +228,181 @@ document.body.addEventListener("showToast", function(e) {
     setTimeout(function() { t.remove(); }, 4000);
 });
 
-// --- 4. modal open/close ---
-document.addEventListener("keydown", function(e) {
-    if (e.key === "Escape") {
-        var m = document.querySelector('.modal-overlay:not([hidden])');
+// --- 4. modals, and the shared delegated-action listener ---
+//
+// Everything a modal does lives in this one IIFE, so `openModal`/`closeModal`
+// are no longer globals. They had to be, because pages spelled their controls
+// as `onclick="openModal('create-role')"` attributes. Those are gone; the only
+// other caller was the htmx `HX-Trigger` response-header channel, handled here.
+//
+// ## The delegated-action rule
+//
+// Page markup carries no `on*=` attribute. A control declares WHAT it does with
+// `data-action="<verb>"` plus whatever `data-*` operands the verb needs, and a
+// delegated listener on `document` reads them back. The reason is written out at
+// `blocks/admin/pages/network.rs`: maud escapes an attribute VALUE as HTML, but
+// an `onclick` value is not HTML, it is JavaScript source, so a page that ever
+// interpolates request-shaped text into one has a script-execution site with no
+// escaping in the way. A `data-*` operand read with `getAttribute` is inert text
+// whatever it holds. It also collapses the same few behaviours — open a modal,
+// close a modal, reveal a password field — from a hundred hand-written copies
+// down to one.
+//
+// `data-action` is one namespace shared by every script in the tree, so a verb
+// is prefixed by whoever owns it. The verbs below are chrome's; a block's own
+// script owns verbs named for that block's page and ignores the rest. A listener
+// that does not recognise a verb MUST fall through silently — more than one
+// delegated listener sees every click.
+//
+// Chrome's verbs:
+//   modal-open    + data-modal-target="<id>"   reveal that modal overlay
+//   modal-close   + data-modal-target="<id>"   hide it (omit the operand to
+//                                              close the enclosing overlay)
+//   reveal-toggle + data-reveal-target="<id>"  swap a password field between
+//                                              masked and plain, and swap the
+//                                              button's label when it carries
+//                                              data-reveal-show/-hide
+//   mirror-value  + data-mirror-target="<id>"  on change, copy this control's
+//                                              value into that field (the
+//                                              colour swatch beside its hex box)
+//   copy-text     + data-copy-source="<id>"    put that element's text on the
+//                                              clipboard and flash "Copied" on
+//                                              the button for 1.5s
+//   drawer-open / drawer-close                 section 2 above
+//
+// Plus two attributes with no verb, because they describe the element rather
+// than a control acting on it:
+//   .modal-overlay[data-modal-dismiss]   a click on the backdrop closes it
+//   [data-stop-propagation]              a click inside it reaches no ancestor
+//                                        listener — the escape hatch for a link
+//                                        nested in a clickable card
+//   [data-submit-on-enter]               a textarea where Enter submits the
+//                                        enclosing form and Shift+Enter keeps
+//                                        inserting a newline (chat composers)
+(function () {
+    if (window.__modalInit) return;
+    window.__modalInit = true;
+
+    // `data-stop-propagation` has to run in the CAPTURE phase: the listener it
+    // exists to silence (htmx's, bound on the enclosing card) sits between
+    // `document` and the link, so a bubbling listener would fire too late.
+    // Stopping propagation does not cancel the default action, so the link
+    // still navigates — which is exactly what the inline
+    // `event.stopPropagation()` it replaced did.
+    document.addEventListener("click", function (e) {
+        var t = e.target;
+        if (t instanceof Element && t.closest("[data-stop-propagation]")) {
+            e.stopPropagation();
+        }
+    }, true);
+
+    function openModal(id) {
+        var m = document.getElementById(id);
+        if (m) m.removeAttribute("hidden");
+    }
+    function closeModal(id) {
+        var m = document.getElementById(id);
         if (m) m.setAttribute("hidden", "");
     }
-});
-function openModal(id) {
-    var m = document.getElementById(id);
-    if (m) m.removeAttribute("hidden");
-}
-function closeModal(id) {
-    var m = document.getElementById(id);
-    if (m) m.setAttribute("hidden", "");
-}
-document.body.addEventListener("closeModal", function(e) {
-    var d = e.detail || {};
-    if (d.id) closeModal(d.id);
-});
+
+    function revealToggle(btn) {
+        var input = document.getElementById(btn.getAttribute("data-reveal-target") || "");
+        if (!input) return;
+        var masked = input.type === "password";
+        input.type = masked ? "text" : "password";
+        // A button with no label operands keeps the label it was rendered with
+        // — the auth pages use one static "Toggle password visibility" for both
+        // states, and did before this was delegated.
+        var label = btn.getAttribute(masked ? "data-reveal-hide" : "data-reveal-show");
+        if (label === null) return;
+        btn.title = label;
+        btn.setAttribute("aria-label", label + " value");
+    }
+
+    // The text is read out of the DOM rather than carried in the operand: a
+    // secret that is only shown once should not also be written into an
+    // attribute, and reading `innerText` needs no escaping at all.
+    function copyText(btn) {
+        var src = document.getElementById(btn.getAttribute("data-copy-source") || "");
+        var text = src ? src.innerText : "";
+        if (!text || !navigator.clipboard) return;
+        navigator.clipboard.writeText(text).then(function () {
+            var was = btn.textContent;
+            btn.textContent = "Copied";
+            setTimeout(function () { btn.textContent = was; }, 1500);
+        });
+    }
+
+    document.addEventListener("click", function (e) {
+        var t = e.target;
+        if (!(t instanceof Element)) return;
+
+        // Backdrop dismissal: only a click that landed on the overlay itself,
+        // never one that bubbled out of the dialog inside it.
+        if (t.matches(".modal-overlay[data-modal-dismiss]")) {
+            closeModal(t.id);
+            return;
+        }
+
+        var el = t.closest("[data-action]");
+        if (!el) return;
+        var action = el.getAttribute("data-action");
+        if (action === "modal-open") {
+            openModal(el.getAttribute("data-modal-target") || "");
+            e.preventDefault();
+        } else if (action === "modal-close") {
+            var target = el.getAttribute("data-modal-target");
+            if (target === null) {
+                var overlay = el.closest(".modal-overlay");
+                if (overlay) closeModal(overlay.id);
+            } else {
+                closeModal(target);
+            }
+            e.preventDefault();
+        } else if (action === "reveal-toggle") {
+            revealToggle(el);
+            e.preventDefault();
+        } else if (action === "copy-text") {
+            copyText(el);
+            e.preventDefault();
+        }
+    });
+
+    document.addEventListener("change", function (e) {
+        var el = e.target;
+        if (!(el instanceof Element)) return;
+        if (el.getAttribute("data-action") !== "mirror-value") return;
+        var target = document.getElementById(el.getAttribute("data-mirror-target") || "");
+        if (target) target.value = el.value;
+    });
+
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+            var m = document.querySelector(".modal-overlay:not([hidden])");
+            if (m) m.setAttribute("hidden", "");
+            return;
+        }
+        // Two chat composers had the same nine-word `onkeydown` attribute.
+        if (e.key !== "Enter" || e.shiftKey) return;
+        var box = e.target;
+        if (!(box instanceof Element) || !box.hasAttribute("data-submit-on-enter")) return;
+        var form = box.closest("form");
+        if (!form) return;
+        e.preventDefault();
+        form.requestSubmit();
+    });
+
+    // The htmx response-header channel, both directions. A handler that
+    // answers with a modal's contents says so in `HX-Trigger-After-Swap`
+    // rather than appending a script that reveals the overlay itself — four
+    // copies of that script existed, one of them built by `format!` with a
+    // record id interpolated into JavaScript source.
+    document.body.addEventListener("closeModal", function (e) {
+        var d = e.detail || {};
+        if (d.id) closeModal(d.id);
+    });
+    document.body.addEventListener("openModal", function (e) {
+        var d = e.detail || {};
+        if (d.id) openModal(d.id);
+    });
+})();

@@ -120,14 +120,14 @@ pub fn sidebar_grouped(
                         }
                     }
                 }
-                button .sidebar__collapse-toggle id="sidebar-collapse-btn" type="button" onclick="toggleSidebar()" aria-label="Toggle sidebar" {
+                button .sidebar__collapse-toggle id="sidebar-collapse-btn" type="button" data-action="sidebar-collapse" aria-label="Toggle sidebar" {
                     span .sidebar__collapse-icon-expanded { (icons::chevron_left()) }
                     span .sidebar__collapse-icon-collapsed { (icons::chevron_right()) }
                 }
             }
             @if let Some(u) = user {
                 div .sidebar__user-container {
-                    button .sidebar__user id="user-menu-btn" type="button" onclick="toggleProfileMenu()" {
+                    button .sidebar__user id="user-menu-btn" type="button" data-action="profile-menu-toggle" {
                         (crate::ui::components::avatar(&u.email, crate::ui::components::CtrlSize::Sm))
                         div .sidebar__user-text {
                             div .sidebar__user-email { (u.email) }
@@ -164,32 +164,45 @@ pub fn sidebar_grouped(
                 }
             }
         }
+        // The two controls above declare `data-action` and this one delegated
+        // listener reads it — the rule is written out in `ui/assets/chrome.js`,
+        // and the verbs `sidebar-collapse` and `profile-menu-toggle` belong to
+        // this file. The outside-click branch that closes the profile menu was
+        // already delegated; it now shares the listener rather than adding a
+        // second one.
         script { (maud::PreEscaped(r#"
-function toggleProfileMenu() {
-    var m = document.getElementById('profile-menu');
-    if (!m) return;
-    m.hidden = !m.hidden;
-}
-document.addEventListener('click', function(e) {
-    var m = document.getElementById('profile-menu');
-    var b = document.getElementById('user-menu-btn');
-    if (m && b && !b.contains(e.target) && !m.contains(e.target)) {
-        m.hidden = true;
-    }
-});
-function toggleSidebar() {
-    var s = document.querySelector('.sidebar');
-    if (!s) return;
-    s.classList.toggle('collapsed');
-    try { localStorage.setItem('sidebar.collapsed', s.classList.contains('collapsed') ? '1' : '0'); } catch (e) {}
-}
 (function() {
+    if (window.__sidebarInit) return;
+    window.__sidebarInit = true;
+    document.addEventListener('click', function(e) {
+        var t = e.target;
+        if (!(t instanceof Element)) return;
+        var el = t.closest('[data-action]');
+        var action = el ? el.getAttribute('data-action') : null;
+        if (action === 'profile-menu-toggle') {
+            var menu = document.getElementById('profile-menu');
+            if (menu) menu.hidden = !menu.hidden;
+            return;
+        }
+        if (action === 'sidebar-collapse') {
+            var s = document.querySelector('.sidebar');
+            if (!s) return;
+            s.classList.toggle('collapsed');
+            try { localStorage.setItem('sidebar.collapsed', s.classList.contains('collapsed') ? '1' : '0'); } catch (err) {}
+            return;
+        }
+        var m = document.getElementById('profile-menu');
+        var b = document.getElementById('user-menu-btn');
+        if (m && b && !b.contains(t) && !m.contains(t)) {
+            m.hidden = true;
+        }
+    });
     try {
         if (localStorage.getItem('sidebar.collapsed') === '1') {
             var s = document.querySelector('.sidebar');
             if (s) s.classList.add('collapsed');
         }
-    } catch (e) {}
+    } catch (err) {}
 })();
 "#)) }
     }

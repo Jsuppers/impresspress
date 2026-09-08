@@ -837,10 +837,10 @@ pub async fn admin_seller_detail(
     } else {
         "btn--secondary"
     };
-    let config = serde_json::json!({
+    let config = ui::script_json(&serde_json::json!({
         "action_url": format!("/b/products/api/admin/sellers/{seller_id}/{action}"),
         "action": action,
-    });
+    }));
     let content = html! {
         (admin_tabs("sellers"))
         (components::page_header(
@@ -857,7 +857,7 @@ pub async fn admin_seller_detail(
                 }
                 div .flex .gap-2 .items-center .flex-wrap {
                     (components::status_badge(&commerce_wire(&seller.status)))
-                    button .btn .(action_class) .btn--sm type="button" data-seller-action=(action) onclick="adminSellerSetState(this)" { (action_label) }
+                    button .btn .(action_class) .btn--sm type="button" data-seller-action=(action) data-action="psa-set-state" { (action_label) }
                 }
             }
             div .card__body {
@@ -917,6 +917,11 @@ pub async fn admin_seller_detail(
 }
 
 const SELLER_ADMIN_JS: &str = r#"
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action="psa-set-state"]');
+  if(el)adminSellerSetState(el);
+});
 async function adminSellerSetState(button){if(window.__sellerAdminConfig.action==='suspend'&&!window.confirm('Suspend this seller? Active offers and Payment Links will be archived in Stripe before local access is revoked.'))return;button.disabled=true;var original=button.textContent;button.textContent='Working…';var target=document.getElementById('seller-admin-error');target.hidden=true;try{var response=await fetch(window.__sellerAdminConfig.action_url,{method:'POST',credentials:'same-origin',headers:{Accept:'application/json','Content-Type':'application/json'},body:'{}'}),text=await response.text(),payload={};if(text){try{payload=JSON.parse(text)}catch(_error){payload={message:text}}}if(!response.ok)throw new Error(payload.message||payload.error||('Request failed ('+response.status+')'));window.location.reload()}catch(error){target.textContent=error.message;target.hidden=false;button.disabled=false;button.textContent=original}}
 "#;
 
@@ -1014,7 +1019,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                 }
             }
         }
-        form #product-wizard-form novalidate onsubmit="return false" {
+        form #product-wizard-form novalidate {
             p #product-wizard-error .text-sm role="alert" aria-live="assertive" hidden .text-danger .mt-0 {}
 
             section .card data-wizard-step="1" {
@@ -1030,7 +1035,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                         div .product-template-grid {
                             @for (value, title, description) in &template_definitions {
                                 label .product-template-card {
-                                    input type="radio" name="product_template" value=(value) checked[*value == initial_template] onchange="productWizardTemplateChanged()";
+                                    input type="radio" name="product_template" value=(value) checked[*value == initial_template] data-action="pw-template-changed";
                                     strong { (title) }
                                     span .text-muted .text-sm { (description) }
                                 }
@@ -1153,7 +1158,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                                     h4 .m-0 { "Customer fields" }
                                     p .text-muted .text-sm { "Collect dates, quantities, choices, toggles, and notes from the customer." }
                                 }
-                                button .btn .btn--secondary .btn--sm type="button" onclick="addWizardVariable()" { "+ Add input" }
+                                button .btn .btn--secondary .btn--sm type="button" data-action="pw-add-variable" { "+ Add input" }
                             }
                             div #wizard-variables {}
                         }
@@ -1163,7 +1168,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                                     h4 .m-0 { "Itemized price rows" }
                                     p .text-muted .text-sm { "Build the total from clear rows such as base booking, nights, guests, and add-ons." }
                                 }
-                                button .btn .btn--secondary .btn--sm type="button" onclick="addWizardComponent()" { "+ Add row" }
+                                button .btn .btn--secondary .btn--sm type="button" data-action="pw-add-component" { "+ Add row" }
                             }
                             div #wizard-components {}
                         }
@@ -1187,7 +1192,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                             ("wizard-terms", "Terms consent", "Require customers to accept your terms before paying.", false),
                         ] {
                             label .products-choice {
-                                input id=(id) type="checkbox" checked[checked] onchange="productWizardShippingChanged()";
+                                input id=(id) type="checkbox" checked[checked] data-action="pw-shipping-changed";
                                 span { strong { (label) } small .text-muted { (help) } }
                             }
                         }
@@ -1235,11 +1240,11 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             }
 
             div .product-wizard-actions {
-                button #wizard-previous .btn .btn--secondary .btn--md type="button" onclick="productWizardPrevious()" hidden { "Back" }
+                button #wizard-previous .btn .btn--secondary .btn--md type="button" data-action="pw-previous" hidden { "Back" }
                 div .product-wizard-actions__buttons {
-                    button #wizard-next .btn .btn--primary .btn--md type="button" onclick="productWizardNext()" disabled[template_definitions.is_empty()] { "Continue" }
-                    button #wizard-save-draft .btn .btn--secondary .btn--md type="button" onclick="submitProductWizard('draft')" hidden { "Save draft" }
-                    button #wizard-publish .btn .btn--primary .btn--md type="button" onclick="submitProductWizard('publish')" hidden {
+                    button #wizard-next .btn .btn--primary .btn--md type="button" data-action="pw-next" disabled[template_definitions.is_empty()] { "Continue" }
+                    button #wizard-save-draft .btn .btn--secondary .btn--md type="button" data-action="pw-submit" data-wizard-intent="draft" hidden { "Save draft" }
+                    button #wizard-publish .btn .btn--primary .btn--md type="button" data-action="pw-submit" data-wizard-intent="publish" hidden {
                         @if admin { "Create and publish" } @else { "Submit for publication" }
                     }
                 }
@@ -1265,11 +1270,11 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
 }
 
 fn product_wizard_bootstrap(admin: bool) -> String {
-    let config = serde_json::json!({
+    let config = ui::script_json(&serde_json::json!({
         "admin": admin,
         "product_collection": if admin { "/b/products/api/admin/products" } else { "/b/products/api/products" },
         "return_url": if admin { "/b/products/admin/manage" } else { "/b/products/my-products" },
-    });
+    }));
     format!("window.__productWizardConfig={config};\n{PRODUCT_WIZARD_JS}\ninitProductWizard();")
 }
 
@@ -1675,6 +1680,33 @@ async function submitProductWizard(intent){
   }
 }
 function initProductWizard(){productWizardTemplateChanged();productWizardShippingChanged();productWizardShowStep(1,false)}
+// The wizard's controls, delegated. They used to be `onclick`/`onchange`
+// attributes; see the rule in ui/assets/chrome.js. The verbs are `pw-`
+// prefixed because `data-action` is one namespace shared by every script on
+// the page -- the product manager loads this file too, for the visual editor's
+// "+ Add input"/"+ Add row" buttons, which is why those two verbs work on both
+// pages from this one listener.
+document.addEventListener('submit',function(e){
+  if(e.target&&e.target.id==='product-wizard-form')e.preventDefault();
+});
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action]');
+  if(!el)return;
+  var action=el.getAttribute('data-action');
+  if(action==='pw-add-variable')addWizardVariable();
+  else if(action==='pw-add-component')addWizardComponent();
+  else if(action==='pw-previous')productWizardPrevious();
+  else if(action==='pw-next')productWizardNext();
+  else if(action==='pw-submit')submitProductWizard(el.getAttribute('data-wizard-intent'));
+});
+document.addEventListener('change',function(e){
+  var el=e.target;
+  if(!(el instanceof Element))return;
+  var action=el.getAttribute('data-action');
+  if(action==='pw-template-changed')productWizardTemplateChanged();
+  else if(action==='pw-shipping-changed')productWizardShippingChanged();
+});
 "#;
 
 // ---------------------------------------------------------------------------
@@ -1898,11 +1930,11 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                 }
                 div .products-actions {
                     @if managed.status == OfferStatus::Draft {
-                        button .btn .btn--primary .btn--sm type="button" onclick="productManagerOpenVisualEditor(this)" { "Edit visually" }
-                        button .btn .btn--primary .btn--sm type="button" onclick="productManagerOfferAction(this,'publish')" { "Publish" }
+                        button .btn .btn--primary .btn--sm type="button" data-action="pm-open-visual-editor" { "Edit visually" }
+                        button .btn .btn--primary .btn--sm type="button" data-action="pm-offer-action" data-offer-op="publish" { "Publish" }
                     }
                     @if managed.status == OfferStatus::Active {
-                        button .btn .btn--secondary .btn--sm type="button" onclick="productManagerOfferAction(this,'sync')" {
+                        button .btn .btn--secondary .btn--sm type="button" data-action="pm-offer-action" data-offer-op="sync" {
                             @if managed.sync_status == OfferSyncStatus::Failed {
                                 "Retry Stripe sync"
                             } @else if managed.sync_status == OfferSyncStatus::Synced {
@@ -1912,9 +1944,9 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                             }
                         }
                     }
-                    button .btn .btn--secondary .btn--sm type="button" onclick="productManagerOfferAction(this,'duplicate')" { "Duplicate to draft" }
+                    button .btn .btn--secondary .btn--sm type="button" data-action="pm-offer-action" data-offer-op="duplicate" { "Duplicate to draft" }
                     @if managed.status != OfferStatus::Archived {
-                        button .btn .btn--secondary .btn--sm type="button" onclick="productManagerOfferAction(this,'archive')" { "Archive" }
+                        button .btn .btn--secondary .btn--sm type="button" data-action="pm-offer-action" data-offer-op="archive" { "Archive" }
                     }
                 }
             }
@@ -1932,7 +1964,7 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                                     h4 { "Test checkout price" }
                                     p .text-muted .text-sm { "Enter a typical order to confirm the amount customers will see." }
                                 }
-                                button .btn .btn--secondary .btn--sm type="button" onclick="productManagerPreview(this)" { "Calculate preview" }
+                                button .btn .btn--secondary .btn--sm type="button" data-action="pm-preview" { "Calculate preview" }
                             }
                             div data-preview-inputs .products-form-grid .products-form-grid--compact {
                                 div .form-group {
@@ -1983,7 +2015,7 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                         summary .summary-strong { "Advanced draft definition" }
                         p .text-muted .text-sm { "Edit the complete typed offer JSON. Published offers are immutable; duplicate one to create an editable draft." }
                         textarea .form-textarea data-offer-definition rows="18" spellcheck="false" { (definition) }
-                        button .btn .btn--primary .btn--sm type="button" .mt-3 onclick="productManagerSaveOffer(this)" { "Save draft definition" }
+                        button .btn .btn--primary .btn--sm type="button" .mt-3 data-action="pm-save-offer" { "Save draft definition" }
                     }
                 }
                 @if managed.status == OfferStatus::Active {
@@ -2012,9 +2044,9 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                             input .form-input data-link-completion-url type="url" placeholder="https://example.com/thank-you";
                         }
                         div .flex .gap-2 .flex-wrap {
-                            button .btn .btn--primary .btn--sm type="button" data-create-link onclick="productManagerCreateLink(this)" { "+ Create or reuse Payment Link" }
+                            button .btn .btn--primary .btn--sm type="button" data-create-link data-action="pm-create-link" { "+ Create or reuse Payment Link" }
                             @if !offer.variables.is_empty() {
-                                button .btn .btn--secondary .btn--sm type="button" onclick="productManagerNewPreset(this)" { "New preset" }
+                                button .btn .btn--secondary .btn--sm type="button" data-action="pm-new-preset" { "New preset" }
                             }
                         }
                         @if !offer.variables.is_empty() {
@@ -2029,12 +2061,12 @@ fn render_managed_offer(managed: &ManagedOffer, product_api_url: &str) -> Markup
                         div .form-group {
                             label .form-label { "Hosted Checkout widget" }
                             textarea .form-textarea data-integration-snippet readonly rows="4" spellcheck="false" { (hosted_snippet) }
-                            button .btn .btn--secondary .btn--sm type="button" .mt-2 onclick="productManagerCopyField(this)" { "Copy hosted snippet" }
+                            button .btn .btn--secondary .btn--sm type="button" .mt-2 data-action="pm-copy-field" { "Copy hosted snippet" }
                         }
                         div .form-group {
                             label .form-label { "Embedded Checkout widget" }
                             textarea .form-textarea data-integration-snippet readonly rows="4" spellcheck="false" { (embedded_snippet) }
-                            button .btn .btn--secondary .btn--sm type="button" .mt-2 onclick="productManagerCopyField(this)" { "Copy embedded snippet" }
+                            button .btn .btn--secondary .btn--sm type="button" .mt-2 data-action="pm-copy-field" { "Copy embedded snippet" }
                         }
                     }
                 }
@@ -2086,10 +2118,10 @@ pub async fn product_manager(
     } else {
         "/b/products/my-products/"
     };
-    let page_config = serde_json::json!({
+    let page_config = ui::script_json(&serde_json::json!({
         "product_url": product_api_url,
         "detail_base_url": detail_base_url,
-    });
+    }));
     let status = product.str_field("status");
     let approval = product.str_field("approval_status");
     // As above: the stored spelling compared against the variant's own. The
@@ -2123,15 +2155,15 @@ pub async fn product_manager(
                 }
                 div .products-actions {
                     @if admin && product.str_field("owner_kind") == "user" && awaiting_moderation {
-                        button .btn .btn--primary .btn--sm type="button" data-moderation-action="approve" onclick="productManagerModerate(this,'approve')" { "Approve listing" }
-                        button .btn .btn--secondary .btn--sm type="button" data-moderation-action="reject" onclick="productManagerModerate(this,'reject')" { "Return to seller" }
+                        button .btn .btn--primary .btn--sm type="button" data-moderation-action="approve" data-action="pm-moderate" { "Approve listing" }
+                        button .btn .btn--secondary .btn--sm type="button" data-moderation-action="reject" data-action="pm-moderate" { "Return to seller" }
                     }
-                    button .btn .btn--secondary .btn--sm type="button" onclick="productManagerDuplicate(this)" { "Duplicate product" }
+                    button .btn .btn--secondary .btn--sm type="button" data-action="pm-duplicate" { "Duplicate product" }
                     @if publishable {
-                        button .btn .btn--primary .btn--sm type="button" onclick="productManagerSetStatus('active',this)" { @if admin { "Publish product" } @else { "Submit for publication" } }
+                        button .btn .btn--primary .btn--sm type="button" data-action="pm-set-status" data-product-status="active" { @if admin { "Publish product" } @else { "Submit for publication" } }
                     }
                     @if !archived {
-                        button .btn .btn--secondary .btn--sm type="button" onclick="productManagerSetStatus('archived',this)" { "Archive product" }
+                        button .btn .btn--secondary .btn--sm type="button" data-action="pm-set-status" data-product-status="archived" { "Archive product" }
                     }
                     @if live {
                         a .btn .btn--secondary .btn--sm href=(format!("/b/products/catalog/{product_id}")) target="_blank" rel="noopener" { "View storefront" }
@@ -2139,7 +2171,7 @@ pub async fn product_manager(
                 }
             }
             div .card__body {
-                form #product-manager-form onsubmit="productManagerSaveProduct(event)" {
+                form #product-manager-form {
                     div .form-group { label .form-label .required for="manager-product-name" { "Product name" } input #manager-product-name .form-input type="text" maxlength="160" required value=(product.str_field("name")); }
                     div .form-group { label .form-label for="manager-product-description" { "Customer-facing description" } textarea #manager-product-description .form-textarea maxlength="4000" { (product.str_field("description")) } }
                     details .products-advanced {
@@ -2169,7 +2201,7 @@ pub async fn product_manager(
                     h3 #manager-visual-title .card__title { "Edit pricing draft" }
                     p .text-muted .text-sm .text-subtitle { "Manage customer inputs, itemized price rows, conditions, and recurring terms without editing JSON." }
                 }
-                button .btn .btn--secondary .btn--sm type="button" onclick="productManagerCloseVisualEditor()" { "Close editor" }
+                button .btn .btn--secondary .btn--sm type="button" data-action="pm-close-visual-editor" { "Close editor" }
             }
             div .card__body {
                 div .grid .grid-auto-180 .gap-4 {
@@ -2179,7 +2211,7 @@ pub async fn product_manager(
                     }
                     div .form-group {
                         label .form-label for="manager-visual-mode" { "Charge type" }
-                        select #manager-visual-mode .form-select onchange="productManagerVisualModeChanged()" { option value="payment" { "One-time payment" } option value="subscription" { "Subscription" } }
+                        select #manager-visual-mode .form-select data-action="pm-visual-mode-changed" { option value="payment" { "One-time payment" } option value="subscription" { "Subscription" } }
                     }
                     div .form-group {
                         label .form-label .required for="manager-visual-currency" { "Currency" }
@@ -2197,21 +2229,21 @@ pub async fn product_manager(
                 section .mt-4 {
                     div .flex .items-center .justify-between .gap-4 .flex-wrap {
                         div { h4 .m-0 { "Customer fields" } p .text-muted .text-sm { "Typed quantities, choices, flags, and text used by price rows." } }
-                        button .btn .btn--secondary .btn--sm type="button" onclick="addWizardVariable()" { "+ Add input" }
+                        button .btn .btn--secondary .btn--sm type="button" data-action="pw-add-variable" { "+ Add input" }
                     }
                     div #wizard-variables {}
                 }
                 section .products-section {
                     div .flex .items-center .justify-between .gap-4 .flex-wrap {
                         div { h4 .m-0 { "Itemized price rows" } p .text-muted .text-sm { "Fixed, per-unit, lookup, tiered, package, and conditional rows are supported." } }
-                        button .btn .btn--secondary .btn--sm type="button" onclick="addWizardComponent()" { "+ Add row" }
+                        button .btn .btn--secondary .btn--sm type="button" data-action="pw-add-component" { "+ Add row" }
                     }
                     div #wizard-components {}
                 }
                 p .text-muted .text-sm { "Checkout collection, shipping, tax, and fulfillment settings remain unchanged. Advanced nested conditions and quantity rules are preserved when saved." }
                 div .flex .gap-2 .mt-4 .flex-wrap {
-                    button .btn .btn--primary .btn--sm type="button" onclick="productManagerSaveVisualOffer(this)" { "Save visual changes" }
-                    button .btn .btn--secondary .btn--sm type="button" onclick="productManagerCloseVisualEditor()" { "Cancel" }
+                    button .btn .btn--primary .btn--sm type="button" data-action="pm-save-visual-offer" { "Save visual changes" }
+                    button .btn .btn--secondary .btn--sm type="button" data-action="pm-close-visual-editor" { "Cancel" }
                 }
             }
         }
@@ -2258,7 +2290,7 @@ function productManagerComponentSeed(component,currency){var amount=component.am
 function productManagerOpenVisualEditor(button){var card=productManagerCard(button),source=card.querySelector('[data-offer-definition]'),definition;productManagerClearError();try{definition=JSON.parse(source.value)}catch(error){productManagerError('Draft definition is not valid JSON: '+error.message);return}productManagerVisualCard=card;productManagerVisualDefinition=definition;var currency=String(definition.currency||'USD').toUpperCase();document.getElementById('manager-visual-title').textContent='Edit '+(definition.name||'pricing draft');document.getElementById('manager-visual-offer-name').value=definition.name||'';document.getElementById('manager-visual-mode').value=definition.mode||'payment';document.getElementById('manager-visual-currency').value=currency;document.getElementById('manager-visual-interval').value=definition.recurring_interval||'month';document.getElementById('manager-visual-interval-count').value=definition.interval_count||1;document.getElementById('wizard-variables').replaceChildren();document.getElementById('wizard-components').replaceChildren();(definition.variables||[]).forEach(addWizardVariable);(definition.components||[]).forEach(function(component){addWizardComponent(productManagerComponentSeed(component,currency))});productManagerVisualModeChanged();var editor=document.getElementById('product-manager-visual-editor');editor.hidden=false;editor.scrollIntoView({block:'start'});document.getElementById('manager-visual-offer-name').focus()}
 function productManagerCloseVisualEditor(){var editor=document.getElementById('product-manager-visual-editor');if(editor)editor.hidden=true;productManagerVisualCard=null;productManagerVisualDefinition=null;productManagerClearError()}
 async function productManagerSaveVisualOffer(button){if(!productManagerVisualCard||!productManagerVisualDefinition){productManagerError('Choose a draft offer to edit first.');return}productManagerClearError();var nameField=document.getElementById('manager-visual-offer-name'),currencyField=document.getElementById('manager-visual-currency'),mode=document.getElementById('manager-visual-mode').value,currency=currencyField.value.trim().toUpperCase(),interval=document.getElementById('manager-visual-interval').value,intervalCount=Number(document.getElementById('manager-visual-interval-count').value||1),definition=JSON.parse(JSON.stringify(productManagerVisualDefinition));try{if(!nameField.value.trim())throw Object.assign(new Error('Offer name is required.'),{focus:nameField});if(!/^[A-Z]{3}$/.test(currency))throw Object.assign(new Error('Currency must be a three-letter ISO code.'),{focus:currencyField});if(mode==='subscription'&&(!Number.isSafeInteger(intervalCount)||intervalCount<1||intervalCount>36))throw Object.assign(new Error('Billing interval count must be between 1 and 36.'),{focus:document.getElementById('manager-visual-interval-count')});var variables=collectWizardVariables(),components=collectWizardComponents(variables,currency,mode==='subscription',interval,intervalCount);definition.name=nameField.value.trim();definition.mode=mode;definition.currency=currency;definition.recurring_interval=mode==='subscription'?interval:null;definition.interval_count=mode==='subscription'?intervalCount:1;definition.variables=variables;definition.components=components;definition.pricing_model=variables.length||components.length!==1||components[0].amount.type!=='fixed'?'components':'fixed';definition.billing_scheme=components.some(function(component){return component.amount.type==='graduated'||component.amount.type==='volume'})?'tiered':'per_unit'}catch(error){productManagerError(error.message);if(error.focus)error.focus.focus();return}productManagerButton(button,true);try{await productManagerRequest(productManagerVisualCard.dataset.offerUrl,'PATCH',definition);var source=productManagerVisualCard.querySelector('[data-offer-definition]');if(source)source.value=JSON.stringify(definition,null,2);window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-async function productManagerSaveProduct(event){event.preventDefault();productManagerClearError();var button=event.currentTarget.querySelector('button[type="submit"]');productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url,'PATCH',{name:document.getElementById('manager-product-name').value.trim(),slug:document.getElementById('manager-product-slug').value.trim(),description:document.getElementById('manager-product-description').value.trim(),image_url:document.getElementById('manager-product-image').value.trim(),fulfillment_kind:document.getElementById('manager-product-fulfillment').value});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
+async function productManagerSaveProduct(event){event.preventDefault();productManagerClearError();var button=event.target.querySelector('button[type="submit"]');productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url,'PATCH',{name:document.getElementById('manager-product-name').value.trim(),slug:document.getElementById('manager-product-slug').value.trim(),description:document.getElementById('manager-product-description').value.trim(),image_url:document.getElementById('manager-product-image').value.trim(),fulfillment_kind:document.getElementById('manager-product-fulfillment').value});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
 async function productManagerSetStatus(status,button){if(status==='archived'&&!window.confirm('Archive this product? Public checkout will no longer be available.'))return;productManagerClearError();productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url,'PATCH',{status:status});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
 async function productManagerDuplicate(button){productManagerClearError();productManagerButton(button,true);try{var result=await productManagerRequest(window.__productManagerConfig.product_url+'/duplicate','POST',{}),id=result.product&&result.product.id;if(!id)throw new Error('Product duplication returned no product ID');window.location.assign(window.__productManagerConfig.detail_base_url+encodeURIComponent(id))}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
 async function productManagerModerate(button,decision){if(decision==='reject'&&!window.confirm('Return this listing to the seller as a draft?'))return;productManagerClearError();productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url+'/'+decision,'POST',{});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
@@ -2284,6 +2316,34 @@ async function productManagerCopyField(button){var field=button.closest('.form-g
 async function productManagerRetryLink(card,link,button){productManagerClearCardError(card);productManagerButton(button,true);try{await productManagerRequest(card.dataset.linksUrl,'POST',link.preset_id?{preset_id:link.preset_id}:{});await productManagerLoadLinks(card)}catch(error){productManagerCardError(card,error.message)}finally{productManagerButton(button,false)}}
 async function productManagerLoadLinks(card){var target=card.querySelector('[data-payment-links]');if(!target)return;target.textContent='Loading Payment Links…';try{var payload=await productManagerRequest(card.dataset.linksUrl,'GET'),links=payload.payment_links||[];target.replaceChildren();if(!links.length){target.textContent='No Payment Links yet.';return}links.forEach(function(link){var row=document.createElement('div');row.className='product-payment-link-row';var failed=link.sync_status==='failed',status=document.createElement('span');status.className='badge '+(failed?'badge-danger':link.active?'badge-success':'badge-secondary');status.textContent=failed?'Sync failed':link.active?'Active':'Inactive';row.appendChild(status);if(link.url){var anchor=document.createElement('a');anchor.href=link.url;anchor.target='_blank';anchor.rel='noopener';anchor.textContent='Open hosted payment page';row.appendChild(anchor)}else{var pending=document.createElement('span');pending.className='text-muted text-sm';pending.textContent='Stripe link pending';row.appendChild(pending)}if(failed){var retry=document.createElement('button');retry.type='button';retry.className='btn btn--secondary btn--sm';retry.textContent='Retry link sync';retry.onclick=function(){productManagerRetryLink(card,link,retry)};row.appendChild(retry);if(link.sync_error){var error=document.createElement('span');error.className='text-muted text-sm';error.textContent=link.sync_error;row.appendChild(error)}}if(link.active&&link.url){var copy=document.createElement('button');copy.type='button';copy.className='btn btn--secondary btn--sm';copy.textContent='Copy';copy.onclick=function(){productManagerCopy(link.url,copy)};row.appendChild(copy);var deactivate=document.createElement('button');deactivate.type='button';deactivate.className='btn btn--secondary btn--sm';deactivate.textContent='Deactivate';deactivate.onclick=function(){productManagerDeactivateLink(card,link.id)};row.appendChild(deactivate)}target.appendChild(row)})}catch(error){target.textContent='Could not load Payment Links: '+error.message}}
 function initProductManager(){document.querySelectorAll('[data-offer-card]').forEach(function(card){productManagerLoadLinks(card);productManagerLoadPresets(card)})}
+// The manager page's 17 controls, delegated. `pm-moderate` reads the decision
+// from the `data-moderation-action` attribute the two buttons already carried.
+document.addEventListener('submit',function(e){
+  if(e.target&&e.target.id==='product-manager-form')productManagerSaveProduct(e);
+});
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action]');
+  if(!el)return;
+  switch(el.getAttribute('data-action')){
+    case 'pm-open-visual-editor':productManagerOpenVisualEditor(el);break;
+    case 'pm-offer-action':productManagerOfferAction(el,el.getAttribute('data-offer-op'));break;
+    case 'pm-preview':productManagerPreview(el);break;
+    case 'pm-save-offer':productManagerSaveOffer(el);break;
+    case 'pm-create-link':productManagerCreateLink(el);break;
+    case 'pm-new-preset':productManagerNewPreset(el);break;
+    case 'pm-copy-field':productManagerCopyField(el);break;
+    case 'pm-moderate':productManagerModerate(el,el.getAttribute('data-moderation-action'));break;
+    case 'pm-duplicate':productManagerDuplicate(el);break;
+    case 'pm-set-status':productManagerSetStatus(el.getAttribute('data-product-status'),el);break;
+    case 'pm-close-visual-editor':productManagerCloseVisualEditor();break;
+    case 'pm-save-visual-offer':productManagerSaveVisualOffer(el);break;
+  }
+});
+document.addEventListener('change',function(e){
+  var el=e.target;
+  if(el instanceof Element&&el.getAttribute('data-action')==='pm-visual-mode-changed')productManagerVisualModeChanged();
+});
 "#;
 
 const PRODUCT_CATALOG_ADMIN_JS: &str = r#"
@@ -2295,8 +2355,21 @@ async function productCatalogRequest(url,method,body){var response=await fetch(u
 function productCatalogClose(){var editor=productCatalogById('group-editor');if(editor)editor.hidden=true;productCatalogClearError()}
 function productCatalogNew(){productCatalogClearError();var editor=productCatalogById('group-editor');editor.hidden=false;productCatalogById('group-editor-id').value='';productCatalogById('group-editor-name').value='';productCatalogById('group-editor-description').value='';productCatalogById('group-editor-status').value='active';productCatalogById('group-editor-title').textContent='New group';editor.scrollIntoView({block:'start'});productCatalogById('group-editor-name').focus()}
 function productCatalogEditGroup(button){productCatalogNew();productCatalogById('group-editor-title').textContent='Edit group';productCatalogById('group-editor-id').value=button.dataset.recordId;productCatalogById('group-editor-name').value=button.dataset.recordName||'';productCatalogById('group-editor-description').value=button.dataset.recordDescription||'';productCatalogById('group-editor-status').value=button.dataset.recordStatus||'active'}
-async function productCatalogSaveGroup(event){event.preventDefault();productCatalogClearError();var form=event.currentTarget,name=productCatalogById('group-editor-name'),button=form.querySelector('button[type="submit"]');if(!form.checkValidity()){productCatalogError('Enter a group name before saving.',name);return}productCatalogBusy(button,true);try{var id=productCatalogById('group-editor-id').value,url='/b/products/api/admin/groups'+(id?'/'+encodeURIComponent(id):'');await productCatalogRequest(url,id?'PATCH':'POST',{name:name.value.trim(),description:productCatalogById('group-editor-description').value.trim(),status:productCatalogById('group-editor-status').value});window.location.reload()}catch(error){productCatalogError(error.message);productCatalogBusy(button,false)}}
+async function productCatalogSaveGroup(event){event.preventDefault();productCatalogClearError();var form=event.target,name=productCatalogById('group-editor-name'),button=form.querySelector('button[type="submit"]');if(!form.checkValidity()){productCatalogError('Enter a group name before saving.',name);return}productCatalogBusy(button,true);try{var id=productCatalogById('group-editor-id').value,url='/b/products/api/admin/groups'+(id?'/'+encodeURIComponent(id):'');await productCatalogRequest(url,id?'PATCH':'POST',{name:name.value.trim(),description:productCatalogById('group-editor-description').value.trim(),status:productCatalogById('group-editor-status').value});window.location.reload()}catch(error){productCatalogError(error.message);productCatalogBusy(button,false)}}
 async function productCatalogDelete(button){if(!window.confirm('Delete group '+(button.dataset.recordName||'')+'? Products already using it may prevent deletion.'))return;productCatalogClearError();button.disabled=true;try{await productCatalogRequest('/b/products/api/admin/groups/'+encodeURIComponent(button.dataset.recordId),'DELETE');window.location.reload()}catch(error){productCatalogError(error.message);button.disabled=false}}
+document.addEventListener('submit',function(e){
+  if(e.target instanceof Element&&e.target.getAttribute('data-action')==='pc-save-group')productCatalogSaveGroup(e);
+});
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action]');
+  if(!el)return;
+  var action=el.getAttribute('data-action');
+  if(action==='pc-new')productCatalogNew();
+  else if(action==='pc-close')productCatalogClose();
+  else if(action==='pc-edit-group')productCatalogEditGroup(el);
+  else if(action==='pc-delete')productCatalogDelete(el);
+});
 "#;
 
 // ---------------------------------------------------------------------------
@@ -2309,7 +2382,7 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let content = html! {
         (admin_tabs("groups"))
         (components::page_header("Groups", Some("Keep related products together so your catalog is easier to browse"), Some(html! {
-            button .btn .btn--primary .btn--sm type="button" onclick="productCatalogNew('group')" { "+ New group" }
+            button .btn .btn--primary .btn--sm type="button" data-action="pc-new" { "+ New group" }
         })))
 
         p #catalog-admin-error .login-error role="alert" aria-live="assertive" hidden {}
@@ -2318,7 +2391,7 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 div { h3 #group-editor-title .card__title { "New group" } p .text-muted .text-sm .text-subtitle { "Give the group a clear name customers will recognize." } }
             }
             div .card__body {
-                form onsubmit="productCatalogSaveGroup(event)" {
+                form data-action="pc-save-group" {
                     input #group-editor-id type="hidden";
                     div .products-form-grid {
                         div .form-group {
@@ -2336,7 +2409,7 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     }
                     div .products-actions {
                         button .btn .btn--primary .btn--sm type="submit" { "Save group" }
-                        button .btn .btn--secondary .btn--sm type="button" onclick="productCatalogClose('group')" { "Cancel" }
+                        button .btn .btn--secondary .btn--sm type="button" data-action="pc-close" { "Cancel" }
                     }
                 }
             }
@@ -2358,12 +2431,12 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         components::status_badge(r.str_field("status")),
                         html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
                         html! { div .flex .gap-2 .flex-wrap {
-                            button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-record-description=(r.str_field("description")) data-record-status=(r.str_field("status")) onclick="productCatalogEditGroup(this)" { "Edit" }
-                            button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) onclick="productCatalogDelete(this,'group')" { "Delete" }
+                            button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-record-description=(r.str_field("description")) data-record-status=(r.str_field("status")) data-action="pc-edit-group" { "Edit" }
+                            button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-action="pc-delete" { "Delete" }
                         } },
                     ]).collect();
                     (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
-                        (components::empty_state(icons::folder(), "No groups yet", "Groups are optional. Add one when you want to organize related products.", Some(html! { button .btn .btn--primary .btn--sm type="button" onclick="productCatalogNew('group')" { "+ Create group" } })))
+                        (components::empty_state(icons::folder(), "No groups yet", "Groups are optional. Add one when you want to organize related products.", Some(html! { button .btn .btn--primary .btn--sm type="button" data-action="pc-new" { "+ Create group" } })))
                     }))
                 }
                 Err(e) => { div .login-error { "Error: " (e.message) } }
@@ -2529,7 +2602,7 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
                     }
                 }
                 div .flex .gap-3 .flex-wrap .mt-5 {
-                    button #stripe-test-button .btn .btn--secondary .btn--md type="button" onclick="testStripeConnection()" {
+                    button #stripe-test-button .btn .btn--secondary .btn--md type="button" data-action="ps-test-connection" {
                         "Test connection"
                     }
                     a .btn .btn--primary .btn--md href="/b/products/admin/settings" { "Configure Stripe" }
@@ -2694,6 +2767,24 @@ async function reconcileStripeProviderOperations(button){
   }catch(err){error.textContent=err.message||'Could not reconcile provider operations.';error.hidden=false}
   finally{button.disabled=false;button.textContent='Reconcile due operations'}
 }
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action]');
+  if(!el)return;
+  var action=el.getAttribute('data-action');
+  if(action==='ps-test-connection')testStripeConnection();
+  else if(action==='ps-load-webhooks')loadStripeWebhookEvents();
+  else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
+  else if(action==='ps-reconcile')reconcileStripeProviderOperations(el);
+});
+// The two filter <select>s raise the same verbs as their Refresh buttons.
+document.addEventListener('change',function(e){
+  var el=e.target;
+  if(!(el instanceof Element))return;
+  var action=el.getAttribute('data-action');
+  if(action==='ps-load-webhooks')loadStripeWebhookEvents();
+  else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
+});
 loadStripeWebhookEvents();
 loadStripeProviderOperations();
 "#
@@ -2773,7 +2864,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 div .flex .gap-2 .items-end .flex-wrap {
                     label .text-sm for="stripe-webhook-filter" {
                         "Status"
-                        select #stripe-webhook-filter onchange="loadStripeWebhookEvents()" .d-block .mt-1 {
+                        select #stripe-webhook-filter data-action="ps-load-webhooks" .d-block .mt-1 {
                             option value="dead_letter" selected { "Needs manual review" }
                             option value="failed" { "Waiting to retry" }
                             option value="processing" { "Processing" }
@@ -2781,7 +2872,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             option value="" { "All events" }
                         }
                     }
-                    button .btn .btn--secondary .btn--sm type="button" onclick="loadStripeWebhookEvents()" { "Refresh" }
+                    button .btn .btn--secondary .btn--sm type="button" data-action="ps-load-webhooks" { "Refresh" }
                 }
             }
             div .card__body {
@@ -2805,7 +2896,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 div .flex .gap-2 .items-end .flex-wrap {
                     label .text-sm for="stripe-provider-filter" {
                         "Status"
-                        select #stripe-provider-filter onchange="loadStripeProviderOperations()" .d-block .mt-1 {
+                        select #stripe-provider-filter data-action="ps-load-provider-ops" .d-block .mt-1 {
                             option value="dead_letter" selected { "Needs manual review" }
                             option value="failed" { "Waiting to retry" }
                             option value="pending" { "Pending" }
@@ -2814,8 +2905,8 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             option value="" { "All operations" }
                         }
                     }
-                    button #stripe-provider-reconcile .btn .btn--primary .btn--sm type="button" onclick="reconcileStripeProviderOperations(this)" { "Reconcile due operations" }
-                    button .btn .btn--secondary .btn--sm type="button" onclick="loadStripeProviderOperations()" { "Refresh" }
+                    button #stripe-provider-reconcile .btn .btn--primary .btn--sm type="button" data-action="ps-reconcile" { "Reconcile due operations" }
+                    button .btn .btn--secondary .btn--sm type="button" data-action="ps-load-provider-ops" { "Refresh" }
                 }
             }
             div .card__body {
@@ -2916,12 +3007,12 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
                 }
                 div .flex .gap-3 .flex-wrap .mt-5 {
                     @if !suspended && !ready {
-                        button .btn .btn--primary .btn--md type="button" onclick="startSellerOnboarding()" {
+                        button .btn .btn--primary .btn--md type="button" data-action="pp-seller-onboarding" {
                             @if has_account { "Continue Stripe setup" } @else { "Connect Stripe to sell" }
                         }
                     }
                     @if !suspended && has_account {
-                        button .btn .btn--secondary .btn--md type="button" onclick="openSellerDashboard()" {
+                        button .btn .btn--secondary .btn--md type="button" data-action="pp-seller-dashboard" {
                             "Open Stripe dashboard"
                         }
                     }
@@ -2959,6 +3050,17 @@ async function manageBuyerBilling(){
   try{await commercePortalRedirect('/b/products/billing-portal',{return_url:window.location.origin+'/b/products/'})}
   catch(error){commercePortalError(error.message)}
 }
+// `pp-order-billing` is handled by ORDER_DETAIL_JS, which is emitted after
+// this file on the one page that needs it.
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action]');
+  if(!el)return;
+  var action=el.getAttribute('data-action');
+  if(action==='pp-seller-onboarding')startSellerOnboarding();
+  else if(action==='pp-seller-dashboard')openSellerDashboard();
+  else if(action==='pp-buyer-billing')manageBuyerBilling();
+});
 "#
 }
 
@@ -3043,7 +3145,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
             }
             div .card__body .flex .gap-3 .flex-wrap {
                 a .btn .btn--primary .btn--md href="/b/products/my-purchases" { "View purchases" }
-                button .btn .btn--secondary .btn--md type="button" onclick="manageBuyerBilling()" { "Manage billing" }
+                button .btn .btn--secondary .btn--md type="button" data-action="pp-buyer-billing" { "Manage billing" }
             }
         }
         @if seller_enabled {
@@ -3242,6 +3344,14 @@ function orderDetailError(message){var target=document.getElementById('order-det
 function parseOrderRefundMinor(value,exponent){value=value.trim();if(!value)return null;if(!/^[+]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))throw new Error('Enter a plain positive amount.');value=value.replace(/^\+/,'');var parts=value.split('.'),whole=parts[0]||'0',fraction=parts[1]||'';if(fraction.length>exponent&&/[1-9]/.test(fraction.slice(exponent)))throw new Error('The amount has too many decimal places for this currency.');fraction=fraction.slice(0,exponent).padEnd(exponent,'0');var minor=BigInt(whole)*(10n**BigInt(exponent))+BigInt(fraction||'0');if(minor<=0n)throw new Error('Refund amount must be positive.');if(minor>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('This amount is too large for the browser refund form.');return Number(minor)}
 async function submitOrderRefund(button){var config=window.__orderDetailConfig,target=document.getElementById('order-detail-error');if(target)target.hidden=true;button.disabled=true;button.textContent='Refunding…';try{var amount=parseOrderRefundMinor(document.getElementById('order-refund-amount').value,config.currency_exponent),note=document.getElementById('order-refund-note').value.trim(),body={note:note,idempotency_key:'ui_'+config.refunded_total+'_'+(amount===null?'full':amount)};if(amount!==null)body.amount_minor=amount;var response=await fetch(config.refund_url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)}),payload={};try{payload=await response.json()}catch(_error){}if(!response.ok)throw new Error(payload.message||payload.error||'Refund failed.');window.location.reload()}catch(error){orderDetailError(error.message);button.disabled=false;button.textContent='Create refund'}}
 async function manageOrderBilling(){var config=window.__orderDetailConfig;try{await commercePortalRedirect('/b/products/billing-portal',{return_url:window.location.href,order_id:config.order_id})}catch(error){orderDetailError(error.message)}}
+document.addEventListener('click',function(e){
+  if(!(e.target instanceof Element))return;
+  var el=e.target.closest('[data-action]');
+  if(!el)return;
+  var action=el.getAttribute('data-action');
+  if(action==='po-submit-refund')submitOrderRefund(el);
+  else if(action==='pp-order-billing')manageOrderBilling();
+});
 "#;
 
 async fn order_detail(
@@ -3307,12 +3417,12 @@ async fn order_detail(
         OrderPageAccess::Buyer => None,
     };
     let currency_exponent = money::currency_exponent(currency).unwrap_or(2);
-    let page_config = serde_json::json!({
+    let page_config = ui::script_json(&serde_json::json!({
         "order_id": purchase_id,
         "refund_url": refund_url.clone(),
         "refunded_total": refunded_total,
         "currency_exponent": currency_exponent,
-    });
+    }));
     let (back_url, back_label, tabs) = match access {
         OrderPageAccess::Admin => (
             "/b/products/admin/purchases",
@@ -3476,7 +3586,7 @@ async fn order_detail(
                     p .text-sm { strong { "Cancels at period end: " } (if purchase.bool_field("subscription_cancel_at_period_end") { "Yes" } else { "No" }) }
                     @if !purchase.str_field("subscription_canceled_at").is_empty() { p .text-sm { strong { "Canceled: " } (purchase.str_field("subscription_canceled_at")) } }
                     @if matches!(access, OrderPageAccess::Buyer) && !purchase.str_field("stripe_customer_id").is_empty() {
-                        button .btn .btn--primary .btn--md type="button" onclick="manageOrderBilling()" { "Manage subscription and billing" }
+                        button .btn .btn--primary .btn--md type="button" data-action="pp-order-billing" { "Manage subscription and billing" }
                     }
                 }
             }
@@ -3541,7 +3651,7 @@ async fn order_detail(
                         div .form-group { label .form-label for="order-refund-amount" { "Amount (" (currency) ")" } input #order-refund-amount .form-input type="text" inputmode="decimal" placeholder="Full remaining amount" {} }
                         div .form-group { label .form-label for="order-refund-note" { "Private note" } textarea #order-refund-note .form-textarea maxlength="500" {} }
                     }
-                    button .btn .btn--danger .btn--md type="button" onclick="submitOrderRefund(this)" { "Create refund" }
+                    button .btn .btn--danger .btn--md type="button" data-action="po-submit-refund" { "Create refund" }
                 }
             }
         }

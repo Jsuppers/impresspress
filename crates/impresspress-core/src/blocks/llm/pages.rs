@@ -56,9 +56,8 @@ fn render_page_body(
     // Escape `<` so no `</script>` can terminate the application/json carrier
     // element. serde_json does not escape `<`; the browser terminates a
     // <script> element on literal `</script>` regardless of the type attribute.
-    let messages_json_str = serde_json::to_string(&messages_json)
-        .unwrap_or_else(|_| "[]".into())
-        .replace('<', "\\u003c");
+    let messages_json_str = serde_json::to_string(&messages_json).unwrap_or_else(|_| "[]".into());
+    let messages_json_str = crate::ui::script_json_escape(&messages_json_str);
 
     let thread_list = render_thread_list_pane(threads, thread_id);
     let messages_pane = render_messages_pane(entries, thread_id);
@@ -221,7 +220,7 @@ fn render_thread_list_pane(threads: &[ContextView], active_id: Option<&str>) -> 
                 h2 .thread-pane__title {
                     "Threads"
                 }
-                button .btn.btn--sm.btn--primary onclick="createNewThread()" {
+                button .btn.btn--sm.btn--primary type="button" data-action="llm-new-thread" {
                     (icons::plus())
                 }
             }
@@ -307,7 +306,6 @@ fn render_composer(thread_id: Option<&str>) -> Markup {
         form
             id="chat-form"
             class={ "chat-form" @if !enabled { " chat-form--disabled" } }
-            onsubmit="return handleChatSubmit(event)"
             data-thread=(thread_value)
         {
             input type="hidden" name="thread_id" id="active-thread-id" value=(thread_value);
@@ -321,7 +319,7 @@ fn render_composer(thread_id: Option<&str>) -> Markup {
                         rows="3"
                         required
                         disabled[!enabled]
-                        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.closest('form').requestSubmit();}"
+                        data-submit-on-enter
                     {}
                 }
                 div .flex .flex-col .items-center .gap-1 {
@@ -352,7 +350,7 @@ fn render_right_rail(
                     #model-picker
                     .form-input .w-full
                     name="model"
-                    onchange="onModelChange(this.value)"
+                    data-action="llm-model-change"
                 {
                     optgroup label="Remote" {
                         option value="" selected[default_model.is_empty()] { "Default (remote)" }
@@ -373,7 +371,7 @@ fn render_right_rail(
                 div .card .p-3 {
                     div .flex .items-center .gap-2 .mb-2 {
                         span .text-sm .font-medium { "Loading model..." }
-                        button #model-unload-btn .btn.btn--sm.btn--ghost onclick="unloadLocalModel()" .ml-auto {
+                        button #model-unload-btn .btn.btn--sm.btn--ghost type="button" data-action="llm-unload-model" .ml-auto {
                             "Cancel"
                         }
                     }
@@ -744,7 +742,7 @@ mod tests {
             "empty hint missing: {html}"
         );
         assert!(
-            html.contains("createNewThread()"),
+            html.contains(r#"data-action="llm-new-thread""#),
             "new-thread button missing"
         );
         assert!(html.contains("Threads"));

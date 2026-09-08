@@ -344,7 +344,7 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
     html! {
         div .flex .items-center .justify-between .mb-4 {
             h3 .font-semibold { "Roles" }
-            button .btn .btn--primary .btn--sm onclick="openModal('create-role')" {
+            button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-role" {
                 (icons::plus()) " Create Role"
             }
         }
@@ -408,7 +408,7 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
                     input .form-input type="text" #role-desc name="description" placeholder="Optional description";
                 }
                 div .form-actions {
-                    button .btn .btn--secondary type="button" onclick="closeModal('create-role')" { "Cancel" }
+                    button .btn .btn--secondary type="button" data-action="modal-close" data-modal-target="create-role" { "Cancel" }
                     button .btn .btn--primary type="submit" { "Create" }
                 }
             }
@@ -425,7 +425,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
     html! {
         div .flex .items-center .justify-between .mb-4 {
             h3 .font-semibold { "API Keys" }
-            button .btn .btn--primary .btn--sm onclick="openModal('create-api-key')" {
+            button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-api-key" {
                 (icons::plus()) " Create API Key"
             }
         }
@@ -500,7 +500,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                     input .form-input type="text" #key-name name="name" placeholder="e.g. CI/CD key" required;
                 }
                 div .form-actions {
-                    button .btn .btn--secondary type="button" onclick="closeModal('create-api-key')" { "Cancel" }
+                    button .btn .btn--secondary type="button" data-action="modal-close" data-modal-target="create-api-key" { "Cancel" }
                     button .btn .btn--primary type="submit" { "Create" }
                 }
             }

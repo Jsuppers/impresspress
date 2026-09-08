@@ -508,6 +508,63 @@ pub fn html_response_with_toast(
         )
 }
 
+/// Serialize a value for a `<script>` body that maud will not escape.
+///
+/// Inside a `<script>` element the HTML parser is looking for exactly one
+/// thing: the byte sequence `</script`. It does not care that the `<` is
+/// inside a JSON string, and `type="application/json"` does not change that.
+/// So a payload that ever carries operator- or user-supplied text — a product
+/// name, a seller's display name, a chat message — can close the element early
+/// and have everything after it parsed as markup.
+///
+/// Escaping every `<` as its JSON escape sequence (backslash, u, 0, 0, 3, c)
+/// closes that off completely: `<` can only appear inside a JSON *string*
+/// (the structural characters are `{}[]:,` and the literals are alphanumeric),
+/// the escape denotes the same character to any JSON or JavaScript parser, and
+/// the text `</script` can no longer be spelled in the output at all.
+///
+/// Every site that interpolates a serialized value into a script goes through
+/// this. None of the current payloads can carry `<` — they are ids, URLs and
+/// enum wire strings — so this is closing a hazard, not a live hole; the
+/// `blocks/llm/pages.rs` bootstrap carrier had already done it by hand
+/// (its payload IS user text) and now shares the helper.
+pub fn script_json(value: &serde_json::Value) -> String {
+    script_json_escape(&value.to_string())
+}
+
+/// [`script_json`] for a payload that is already serialized.
+pub fn script_json_escape(json: &str) -> String {
+    json.replace('<', "\\u003c")
+}
+
+/// An htmx fragment that is (or fills) a modal, plus the instruction to
+/// reveal that modal once it has been swapped in.
+///
+/// The four handlers that answer with modal contents used to append a
+/// `<script>` to the fragment that reached back out and cleared the overlay's
+/// `hidden` attribute — three byte-identical copies plus one built with
+/// `format!`, interpolating a record id into JavaScript source. The
+/// `HX-Trigger-After-Swap` channel says the same thing without a script: the
+/// modal section of `ui/assets/chrome.js` listens for `openModal`, the mirror
+/// of the `closeModal` event handlers already emit through `HX-Trigger`.
+///
+/// *After-swap* rather than plain `HX-Trigger` because the overlay is already
+/// in the page and opening it before its contents arrive shows an empty box.
+/// As in [`html_response_with_toast`], the payload goes through `serde_json`
+/// so an id can neither malform the JSON nor inject a header.
+pub fn html_response_opening_modal(
+    markup: maud::Markup,
+    modal_id: &str,
+) -> wafer_run::OutputStream {
+    let trigger = serde_json::json!({ "openModal": { "id": modal_id } }).to_string();
+    crate::http::ResponseBuilder::new()
+        .set_header("HX-Trigger-After-Swap", &trigger)
+        .body(
+            markup.into_string().into_bytes(),
+            "text/html; charset=utf-8",
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use maud::{html, Markup};
@@ -979,6 +1036,91 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "static inline styles remain:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// No page emits an event-handler attribute. Behaviour is declared with
+    /// `data-action` and read by a delegated listener — the rule and the shared
+    /// vocabulary are written out in `ui/assets/chrome.js`, and the reason it
+    /// exists is at `blocks/admin/pages/network.rs`: maud escapes an attribute
+    /// value as HTML, but an `onclick` value is not HTML, it is JavaScript
+    /// source, so nothing stands between interpolated text and script
+    /// execution. None of the 114 handlers this replaced was a live sink —
+    /// every interpolating one was traced to a closed set — but there was no
+    /// door keeping the next one safe, and this is that door.
+    ///
+    /// **What it does not cover.** htmx's own `hx-on--*` attributes carry
+    /// JavaScript in the same way and are deliberately out of scope here: they
+    /// are htmx's channel, not the browser's event-handler IDL attributes, and
+    /// the nine that exist (in `blocks/{products,messages,llm}`) all hold
+    /// literal text. Converting them is its own change. `hx-on` is spelled so
+    /// that the word-boundary rule below cannot see it, which is why this note
+    /// exists rather than a silent gap.
+    #[test]
+    fn pages_carry_no_event_handler_attributes() {
+        /// The maud (`on…="…"`, `on…=(expr)`, `on…={…}`) and raw-HTML shapes.
+        /// The leading character must not be a letter, so `textContent = "…"`
+        /// and `hx-on--after-request` are not mistaken for handlers, and
+        /// `el.onclick = function () {…}` — a property assignment on an element
+        /// the script itself created, which is not an attribute at all — is not
+        /// either, because a function expression follows the `=`.
+        fn handler_attribute(line: &str) -> Option<String> {
+            let bytes = line.as_bytes();
+            for (i, _) in line.match_indices("on") {
+                if i > 0 && (bytes[i - 1] as char).is_ascii_alphanumeric() {
+                    continue;
+                }
+                let rest = &line[i + 2..];
+                let name_len = rest.chars().take_while(|c| c.is_ascii_lowercase()).count();
+                if name_len == 0 {
+                    continue;
+                }
+                let after = rest[name_len..].trim_start();
+                if after.starts_with("=\"") || after.starts_with("=(") || after.starts_with("={") {
+                    return Some(line[i..].chars().take(48).collect());
+                }
+            }
+            None
+        }
+
+        let roots = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
+        ];
+        let mut offenders = Vec::new();
+        for root in roots {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                // The `.js` assets are scanned too — a handler written into an
+                // HTML string by a script is the same defect, and the llm
+                // chat's thread list used to build one. Vendored minified
+                // libraries are not ours to fix.
+                .filter(|e| {
+                    let p = e.path();
+                    let ext = p.extension().and_then(|x| x.to_str());
+                    (ext == Some("rs") || ext == Some("js"))
+                        && !p.to_string_lossy().ends_with(".min.js")
+                })
+            {
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                for (n, line) in src.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    // Prose about the rule is not a violation of it.
+                    if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                        continue;
+                    }
+                    if let Some(found) = handler_attribute(line) {
+                        offenders.push(format!("{}:{} ({found})", entry.path().display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "event-handler attributes remain — declare a `data-action` verb and \
+             read it from a delegated listener instead:\n{}",
             offenders.join("\n")
         );
     }

@@ -26,8 +26,8 @@ function moderationHtml(pending: boolean) {
   <main>
     <h1>Seller print</h1>
     ${pending ? `
-      <button data-moderation-action="approve" onclick="productManagerModerate(this,'approve')">Approve listing</button>
-      <button data-moderation-action="reject" onclick="productManagerModerate(this,'reject')">Return to seller</button>
+      <button data-moderation-action="approve" data-action="pm-moderate">Approve listing</button>
+      <button data-moderation-action="reject" data-action="pm-moderate">Return to seller</button>
     ` : '<p>Approval: approved</p>'}
   </main>
   <script>window.__productManagerConfig={product_url:'/b/products/api/admin/products/product_1',detail_base_url:'/b/products/admin/products/'};</script>
@@ -43,7 +43,7 @@ function sellerHtml(status: "active" | "suspended") {
   <p id="seller-admin-error" role="alert" aria-live="assertive" hidden></p>
   <main>
     <h1>maker_1</h1><p>Seller status: ${status}</p>
-    <button data-seller-action="${action}" onclick="adminSellerSetState(this)">${label}</button>
+    <button data-seller-action="${action}" data-action="psa-set-state">${label}</button>
   </main>
   <script>window.__sellerAdminConfig={action_url:'/b/products/api/admin/sellers/seller_1/${action}',action:'${action}'};</script>
   <script>${rustScript("SELLER_ADMIN_JS")}</script>

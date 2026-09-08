@@ -75,6 +75,11 @@ mod tests {
         assert!(js.contains("(function ()") || js.contains("(function()"));
         assert!(js.contains("__impresspressLlmChatLoaded"));
         assert!(js.contains("window.impresspressLlmChat = { init: init }"));
+        // `init` is the ONLY global. The five handlers used to be re-exported
+        // on `window` so the page's `onclick=""`/`onsubmit=""` attributes
+        // could reach them; those attributes are `data-action` verbs now and
+        // the file binds them itself, so a re-export would be a needless
+        // global.
         for sym in [
             "handleChatSubmit",
             "createNewThread",
@@ -83,8 +88,14 @@ mod tests {
             "unloadLocalModel",
         ] {
             assert!(
-                js.contains(&format!("window.{sym} = {sym}")),
-                "missing global re-export for {sym}"
+                !js.contains(&format!("window.{sym} = {sym}")),
+                "{sym} must not be re-exported as a global"
+            );
+        }
+        for verb in ["llm-new-thread", "llm-unload-model", "llm-model-change"] {
+            assert!(
+                js.contains(&format!("'{verb}'")),
+                "the delegated listener must handle {verb}"
             );
         }
     }

@@ -1201,11 +1201,18 @@ jobs:
       # webmcp.spec.ts runs AFTER the visual baselines: it seeds a product into
       # the same database, and a product that exists before the admin pages are
       # screenshotted would show up in them.
+      #
+      # delegated-actions.spec.ts is last and writes nothing — it filters a
+      # list, opens and closes a modal and toggles a password field, all of
+      # which are the browser-side half of the `data-action` rule that
+      # `ui::tests::pages_carry_no_event_handler_attributes` enforces on the
+      # markup. Neither that test nor a screenshot can see a listener that
+      # stopped firing.
       - name: Run visual-baseline and WebMCP end-to-end tests (native server, port 8093)
         working-directory: crates/impresspress-web
         env:
           TEST_PORT: 8093
-        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts tests/e2e/webmcp.spec.ts
+        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts tests/e2e/webmcp.spec.ts tests/e2e/delegated-actions.spec.ts
 
       - name: Stop server
         if: always()

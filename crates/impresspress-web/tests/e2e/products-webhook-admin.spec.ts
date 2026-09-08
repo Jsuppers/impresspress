@@ -75,26 +75,26 @@ async function openWebhookOperations(page: Page) {
 const operationsHtml = `<!doctype html>
 <html>
   <body>
-    <button id="stripe-test-button" type="button" onclick="testStripeConnection()">Test connection</button>
+    <button id="stripe-test-button" type="button" data-action="ps-test-connection">Test connection</button>
     <span id="stripe-state"></span>
     <p id="stripe-error"></p>
     <section aria-label="Webhook delivery health">
       <label for="stripe-webhook-filter">Status</label>
-      <select id="stripe-webhook-filter" onchange="loadStripeWebhookEvents()">
+      <select id="stripe-webhook-filter" data-action="ps-load-webhooks">
         <option value="dead_letter" selected>Needs manual review</option>
         <option value="failed">Waiting to retry</option>
         <option value="processing">Processing</option>
         <option value="processed">Processed</option>
         <option value="">All events</option>
       </select>
-      <button type="button" onclick="loadStripeWebhookEvents()">Refresh</button>
+      <button type="button" data-action="ps-load-webhooks">Refresh</button>
       <p id="stripe-webhook-summary" aria-live="polite"></p>
       <p id="stripe-webhook-error" role="alert" aria-live="assertive" hidden></p>
       <div id="stripe-webhook-events" aria-live="polite">Loading webhook events…</div>
     </section>
     <section aria-label="Provider reconciliation">
       <label for="stripe-provider-filter">Status</label>
-      <select id="stripe-provider-filter" onchange="loadStripeProviderOperations()">
+      <select id="stripe-provider-filter" data-action="ps-load-provider-ops">
         <option value="dead_letter" selected>Needs manual review</option>
         <option value="failed">Waiting to retry</option>
         <option value="pending">Pending</option>
@@ -102,8 +102,8 @@ const operationsHtml = `<!doctype html>
         <option value="succeeded">Succeeded</option>
         <option value="">All operations</option>
       </select>
-      <button id="stripe-provider-reconcile" type="button" onclick="reconcileStripeProviderOperations(this)">Reconcile due operations</button>
-      <button type="button" onclick="loadStripeProviderOperations()">Refresh</button>
+      <button id="stripe-provider-reconcile" type="button" data-action="ps-reconcile">Reconcile due operations</button>
+      <button type="button" data-action="ps-load-provider-ops">Refresh</button>
       <p id="stripe-provider-summary" aria-live="polite"></p>
       <p id="stripe-provider-reconcile-result" role="status" aria-live="polite"></p>
       <p id="stripe-provider-error" role="alert" aria-live="assertive" hidden></p>
