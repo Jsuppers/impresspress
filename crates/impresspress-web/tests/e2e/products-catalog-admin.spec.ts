@@ -2,28 +2,29 @@ import { expect, test, type Route } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const pagesPath = fileURLToPath(
-  new URL(
-    "../../../impresspress-core/src/blocks/products/pages.rs",
-    import.meta.url,
-  ),
+const bundlesUrl = new URL(
+  "../../../impresspress-core/src/blocks/products/assets/",
+  import.meta.url,
 );
-const adminOrigin = "https://admin.example";
 
-function catalogScript() {
-  const source = readFileSync(pagesPath, "utf8");
-  const match = source.match(
-    /const PRODUCT_CATALOG_ADMIN_JS: &str = r#"\n([\s\S]*?)\n"#;/,
-  );
-  if (!match) throw new Error("Could not extract PRODUCT_CATALOG_ADMIN_JS");
-  return match[1];
+/**
+ * A products browser bundle, read from the very file the server serves at
+ * `/b/static/products-*.js`. These used to be Rust string constants dug out
+ * of `pages.rs` with a regular expression; they are real files now, so the
+ * spec reads the file — the same way `products-storefront.spec.ts` has always
+ * read `storefront.js`.
+ */
+function bundle(name: string) {
+  return readFileSync(fileURLToPath(new URL(name, bundlesUrl)), "utf8");
 }
+
+const adminOrigin = "https://admin.example";
 
 function shell(body: string) {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>
     <p id="catalog-admin-error" role="alert" aria-live="assertive" hidden></p>
     ${body}
-    <script>${catalogScript()}</script>
+    <script>${bundle("products-catalog-admin.js")}</script>
   </body></html>`;
 }
 

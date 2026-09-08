@@ -78,6 +78,41 @@ const FILE_ASSETS: &[(&str, &str, &str)] = &[
         "application/javascript; charset=utf-8",
     ),
     (
+        "blocks/products/assets/products-wizard.js",
+        "products-wizard.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "blocks/products/assets/products-manager.js",
+        "products-manager.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "blocks/products/assets/products-catalog-admin.js",
+        "products-catalog-admin.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "blocks/products/assets/products-seller-admin.js",
+        "products-seller-admin.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "blocks/products/assets/products-stripe-setup.js",
+        "products-stripe-setup.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "blocks/products/assets/products-commerce-portal.js",
+        "products-commerce-portal.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
+        "blocks/products/assets/products-order-detail.js",
+        "products-order-detail.js",
+        "application/javascript; charset=utf-8",
+    ),
+    (
         "ui/assets/fonts/itim-latin.woff2",
         "itim-latin.woff2",
         "font/woff2",

@@ -7,6 +7,14 @@
 //! method its carrier implies, and resolves it: under `/b/products/` through
 //! `endpoint_match::dispatch` against `ROUTES`, under another block's prefix
 //! through `endpoint_auth` against that block's declared endpoints.
+//!
+//! **The scan follows the page into its scripts.** Most of these `fetch(`
+//! targets are written in JavaScript, and that JavaScript is no longer inside
+//! the HTML: it is served from `/b/static/products-*.js`. So each page's
+//! `<script src>` elements are resolved back through the asset manifest and
+//! their source is scanned alongside the markup — otherwise this guard would
+//! have gone quietly vacuous the day the scripts moved to files, which is the
+//! failure mode the whole module exists to prevent.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -162,6 +170,49 @@ fn fetch_targets(html: &str) -> Vec<(&'static str, String)> {
 
 const PRODUCTS_PREFIX: &str = "/b/products/";
 const BLOCK_PREFIX: &str = "/b/";
+
+/// The source of every products bundle the page loaded, in the order the page
+/// loaded it.
+///
+/// The `src` carries a content hash (`products-wizard-a1b2c3d4.js`), so the
+/// manifest is what maps it back to a logical key. A `/b/static/` `src` that
+/// resolves to no manifest entry is an assertion failure, not a skip, because
+/// that is what a renamed or unregistered asset looks like.
+///
+/// Scoped to this block's own bundles. The shared chrome (`htmx.min.js`,
+/// `chrome.js`, `webmcp.js`) is on every shelled page in the tree and emits
+/// URLs of its own; auditing those is the shared module's business, not this
+/// guard's, and folding them in here would make every block's copy of this
+/// test responsible for the chrome.
+#[cfg(feature = "embed-assets")]
+fn script_sources(html: &str) -> Vec<(&'static str, &'static str)> {
+    let owned = crate::blocks::products::assets::LOGICAL_KEYS;
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find("<script src=\"") {
+        rest = &rest[pos + "<script src=\"".len()..];
+        let end = rest.find('"').expect("script src is terminated");
+        let src = &rest[..end];
+        rest = &rest[end..];
+        let Some(filename) = src.strip_prefix(crate::routing::STATIC_PREFIX) else {
+            continue;
+        };
+        let entry = crate::ui::assets::ASSETS
+            .iter()
+            .find(|e| e.filename == filename)
+            .unwrap_or_else(|| panic!("page loads {src}, which is in no asset manifest entry"));
+        if !owned.contains(&entry.logical) {
+            continue;
+        }
+        let bytes = crate::ui::assets::bytes(entry.logical)
+            .unwrap_or_else(|| panic!("no bytes embedded for {}", entry.logical));
+        out.push((
+            entry.logical,
+            std::str::from_utf8(bytes).expect("asset source is UTF-8"),
+        ));
+    }
+    out
+}
 
 /// The SSR rows of `ROUTES` (section E of the plan's inventory): every one
 /// must be rendered by this guard.
@@ -450,6 +501,7 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
     }
 
     let mut collected: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut scanned_scripts: BTreeSet<&'static str> = BTreeSet::new();
     for (viewer, path, query) in PAGES {
         let mut msg = match viewer {
             As::Admin => admin_msg("retrieve", path),
@@ -462,6 +514,12 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
         let html = output_html(block.handle(&ctx, msg, InputStream::empty()).await).await;
         let mut targets = attribute_targets(&html);
         targets.extend(fetch_targets(&html));
+        #[cfg(feature = "embed-assets")]
+        for (logical, source) in script_sources(&html) {
+            scanned_scripts.insert(logical);
+            targets.extend(attribute_targets(source));
+            targets.extend(fetch_targets(source));
+        }
         for (link_action, link_path) in targets {
             if link_path.starts_with(PRODUCTS_PREFIX) {
                 assert!(
@@ -495,6 +553,24 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
             collected.insert((link_action.to_string(), link_path));
         }
     }
+
+    // The scripts carry most of the `fetch(` targets, so a scan that reached
+    // none of them would leave this guard passing on markup alone — the exact
+    // way it would have rotted when the bundles moved out of the page. Every
+    // bundle the block declares must be loaded by at least one page here; a
+    // bundle no page loads is either dead or a page that forgot its script.
+    #[cfg(feature = "embed-assets")]
+    assert_eq!(
+        scanned_scripts.iter().copied().collect::<Vec<_>>(),
+        {
+            let mut expected = crate::blocks::products::assets::LOGICAL_KEYS.to_vec();
+            expected.sort_unstable();
+            expected
+        },
+        "every products bundle must be loaded by a page this guard renders"
+    );
+    #[cfg(not(feature = "embed-assets"))]
+    let _ = scanned_scripts;
 
     // The guard is only as good as what the pages rendered: each
     // per-record control must actually have been emitted for its seed.

@@ -230,7 +230,8 @@ body:has(.products-tabs) .filter-bar { margin: var(--space-4) 0; padding: var(--
 .wizard-step-check svg { width: .75rem; height: .75rem; }
 .product-wizard-actions { position: sticky; bottom: 0; z-index: 2; display: flex; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; margin-top: var(--space-4); padding: var(--space-3) 0; border-top: 1px solid var(--border-color); background: var(--surface-1); }
 .product-wizard-actions__buttons { display: flex; gap: var(--space-3); margin-left: auto; }
-/* Rows built client-side by `PRODUCT_MANAGER_JS` (pricing preview, saved
+/* Rows built client-side by `blocks/products/assets/products-manager.js`
+ * (pricing preview, saved
  * checkout presets, Stripe Payment Links) — previously `row.style.cssText=
  * '…'` (task 12e). */
 .product-preview-row { display: flex; justify-content: space-between; gap: var(--space-4); padding: var(--space-1) 0; border-bottom: 1px solid var(--border-color); }

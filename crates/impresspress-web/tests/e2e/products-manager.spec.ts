@@ -2,31 +2,23 @@ import { expect, test, type Route } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const pagesPath = fileURLToPath(
-  new URL(
-    "../../../impresspress-core/src/blocks/products/pages.rs",
-    import.meta.url,
-  ),
+const bundlesUrl = new URL(
+  "../../../impresspress-core/src/blocks/products/assets/",
+  import.meta.url,
 );
+
+/**
+ * A products browser bundle, read from the very file the server serves at
+ * `/b/static/products-*.js`. These used to be Rust string constants dug out
+ * of `pages.rs` with a regular expression; they are real files now, so the
+ * spec reads the file — the same way `products-storefront.spec.ts` has always
+ * read `storefront.js`.
+ */
+function bundle(name: string) {
+  return readFileSync(fileURLToPath(new URL(name, bundlesUrl)), "utf8");
+}
+
 const adminOrigin = "https://admin.example";
-
-function productManagerScript() {
-  const source = readFileSync(pagesPath, "utf8");
-  const match = source.match(
-    /const PRODUCT_MANAGER_JS: &str = r#"\n([\s\S]*?)\n"#;/,
-  );
-  if (!match) throw new Error("Could not extract PRODUCT_MANAGER_JS from pages.rs");
-  return match[1];
-}
-
-function productWizardScript() {
-  const source = readFileSync(pagesPath, "utf8");
-  const match = source.match(
-    /const PRODUCT_WIZARD_JS: &str = r#"\n([\s\S]*?)\n"#;/,
-  );
-  if (!match) throw new Error("Could not extract PRODUCT_WIZARD_JS from pages.rs");
-  return match[1];
-}
 
 function managerHtml(syncStatus: "failed" | "synced") {
   const label =
@@ -47,8 +39,7 @@ function managerHtml(syncStatus: "failed" | "synced") {
         </button>
       </section>
     </main>
-    <script>${productManagerScript()}</script>
-    <script>initProductManager();</script>
+    <script>${bundle("products-manager.js")}</script>
   </body>
 </html>`;
 }
@@ -96,8 +87,7 @@ function configurableManagerHtml() {
         </div>
       </section>
     </main>
-    <script>${productManagerScript()}</script>
-    <script>initProductManager();</script>
+    <script>${bundle("products-manager.js")}</script>
   </body>
 </html>`;
 }
@@ -203,9 +193,8 @@ function visualDraftManagerHtml() {
       <div id="wizard-components"></div>
       <button type="button" data-action="pm-save-visual-offer">Save visual changes</button>
     </section>
-    <script>${productWizardScript()}</script>
-    <script>${productManagerScript()}</script>
-    <script>initProductManager();</script>
+    <script>${bundle("products-wizard.js")}</script>
+    <script>${bundle("products-manager.js")}</script>
   </body></html>`;
 }
 

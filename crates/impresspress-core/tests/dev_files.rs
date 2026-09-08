@@ -961,14 +961,31 @@ async fn unknown_types_that_are_not_utf8_still_come_back_as_base64() {
 /// Bounded, and the bound panics rather than returning: a mutation that
 /// silently gave up waiting would run unraced and the test would report on
 /// nothing.
+///
+/// The bound is sized against `HeldGet::POLL_BUDGET`, for the same reason that
+/// constant is sized the way it is. This is the FIRST assertion starvation
+/// trips: the read half reaches its `get` only after some database reads, and
+/// every yield here is a yield the executor may spend elsewhere, so a bound
+/// two orders of magnitude under the park's own budget turns a slow machine
+/// into a failure that says "never parked" about a read that parks fine. The
+/// yields are self-waking and do no work, so a budget of this size costs
+/// milliseconds in the failing case and nothing at all in the passing one —
+/// the helper returns on the first poll after the park.
+///
+/// The panic reports the count it actually burned, so the next failure says
+/// whether the bound was reached or something else went wrong.
 async fn once_parked(hold: &HeldGet) {
-    for _ in 0..1_024 {
-        if hold.was_reached() {
-            return;
-        }
+    const YIELD_BUDGET: u32 = 100_000;
+    let mut yields = 0u32;
+    while !hold.was_reached() {
+        assert!(
+            yields < YIELD_BUDGET,
+            "the read half never parked its `get` after {yields} yields, so nothing could be \
+             interleaved with it"
+        );
+        yields += 1;
         tokio::task::yield_now().await;
     }
-    panic!("the read half never parked its `get`, so nothing could be interleaved with it");
 }
 
 /// A read holds the manifest it loaded until it has the blob that manifest

@@ -2,22 +2,23 @@ import { expect, test, type Route } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const pagesPath = fileURLToPath(
-  new URL(
-    "../../../impresspress-core/src/blocks/products/pages.rs",
-    import.meta.url,
-  ),
+const bundlesUrl = new URL(
+  "../../../impresspress-core/src/blocks/products/assets/",
+  import.meta.url,
 );
-const adminOrigin = "https://admin.example";
 
-function rustScript(name: string) {
-  const source = readFileSync(pagesPath, "utf8");
-  const match = source.match(
-    new RegExp(`const ${name}: &str = r#"\\n([\\s\\S]*?)\\n"#;`),
-  );
-  if (!match) throw new Error(`Could not extract ${name} from pages.rs`);
-  return match[1];
+/**
+ * A products browser bundle, read from the very file the server serves at
+ * `/b/static/products-*.js`. These used to be Rust string constants dug out
+ * of `pages.rs` with a regular expression; they are real files now, so the
+ * spec reads the file — the same way `products-storefront.spec.ts` has always
+ * read `storefront.js`.
+ */
+function bundle(name: string) {
+  return readFileSync(fileURLToPath(new URL(name, bundlesUrl)), "utf8");
 }
+
+const adminOrigin = "https://admin.example";
 
 function moderationHtml(pending: boolean) {
   return `<!doctype html>
@@ -31,7 +32,7 @@ function moderationHtml(pending: boolean) {
     ` : '<p>Approval: approved</p>'}
   </main>
   <script>window.__productManagerConfig={product_url:'/b/products/api/admin/products/product_1',detail_base_url:'/b/products/admin/products/'};</script>
-  <script>${rustScript("PRODUCT_MANAGER_JS")}</script>
+  <script>${bundle("products-manager.js")}</script>
 </body></html>`;
 }
 
@@ -46,7 +47,7 @@ function sellerHtml(status: "active" | "suspended") {
     <button data-seller-action="${action}" data-action="psa-set-state">${label}</button>
   </main>
   <script>window.__sellerAdminConfig={action_url:'/b/products/api/admin/sellers/seller_1/${action}',action:'${action}'};</script>
-  <script>${rustScript("SELLER_ADMIN_JS")}</script>
+  <script>${bundle("products-seller-admin.js")}</script>
 </body></html>`;
 }
 

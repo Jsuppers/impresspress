@@ -7,6 +7,7 @@ use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
+    assets,
     contracts::{
         AmountRule, ApprovalStatus, CommerceAnalytics, ManagedOffer, OfferStatus, OfferSyncStatus,
         ProductStatus, SellerAccount, SellerFailureSummary, SellerStatus, StripeConnectionState,
@@ -905,7 +906,8 @@ pub async fn admin_seller_detail(
                 (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {}))
             }
         }
-        script { (maud::PreEscaped(format!("window.__sellerAdminConfig={config};\n{SELLER_ADMIN_JS}"))) }
+        script { (maud::PreEscaped(format!("window.__sellerAdminConfig={config};"))) }
+        script src=(assets::seller_admin_js_url()) {}
     };
     ui::shell_page(
         ctx,
@@ -915,26 +917,6 @@ pub async fn admin_seller_detail(
     )
     .await
 }
-
-const SELLER_ADMIN_JS: &str = r#"
-// Guarded, because this whole script re-runs on every htmx partial swap: a tab
-// navigation asks for the page with `HX-Request`, `ui::shell_page` answers with
-// the body verbatim (`ui/mod.rs:226`), htmx executes the scripts in what it
-// swapped in, and `document` outlives the swap. Without the flag a user who
-// visits a second tab and comes back has this listener bound twice and every
-// mutating action fires twice. The declarations below are safe to re-run --
-// re-declaring a function replaces it -- so only the registration is guarded.
-(function(){
-  if(window.__sellerAdminDelegated)return;
-  window.__sellerAdminDelegated=true;
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action="psa-set-state"]');
-    if(el)adminSellerSetState(el);
-  });
-})();
-async function adminSellerSetState(button){if(window.__sellerAdminConfig.action==='suspend'&&!window.confirm('Suspend this seller? Active offers and Payment Links will be archived in Stripe before local access is revoked.'))return;button.disabled=true;var original=button.textContent;button.textContent='Working…';var target=document.getElementById('seller-admin-error');target.hidden=true;try{var response=await fetch(window.__sellerAdminConfig.action_url,{method:'POST',credentials:'same-origin',headers:{Accept:'application/json','Content-Type':'application/json'},body:'{}'}),text=await response.text(),payload={};if(text){try{payload=JSON.parse(text)}catch(_error){payload={message:text}}}if(!response.ok)throw new Error(payload.message||payload.error||('Request failed ('+response.status+')'));window.location.reload()}catch(error){target.textContent=error.message;target.hidden=false;button.disabled=false;button.textContent=original}}
-"#;
 
 // ---------------------------------------------------------------------------
 // Shared admin/seller product wizard
@@ -1262,6 +1244,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
             }
         }
         script { (maud::PreEscaped(product_wizard_bootstrap(admin))) }
+        script src=(assets::wizard_js_url()) {}
     };
     ui::shell_page(
         ctx,
@@ -1286,447 +1269,8 @@ fn product_wizard_bootstrap(admin: bool) -> String {
         "product_collection": if admin { "/b/products/api/admin/products" } else { "/b/products/api/products" },
         "return_url": if admin { "/b/products/admin/manage" } else { "/b/products/my-products" },
     }));
-    format!("window.__productWizardConfig={config};\n{PRODUCT_WIZARD_JS}\ninitProductWizard();")
+    format!("window.__productWizardConfig={config};")
 }
-
-const PRODUCT_WIZARD_JS: &str = r#"
-var productWizardStep=1;
-var productWizardVariableIndex=0;
-var productWizardComponentIndex=0;
-
-function wizardById(id){return document.getElementById(id)}
-function productWizardTemplate(){
-  var selected=document.querySelector('input[name="product_template"]:checked');
-  return selected?selected.value:'simple_product';
-}
-function productWizardIsSubscription(){return productWizardTemplate().indexOf('subscription')!==-1}
-function productWizardIsConfigurable(){return productWizardTemplate().indexOf('configurable')===0}
-function productWizardShowError(message,focus){
-  var error=wizardById('product-wizard-error');
-  error.textContent=message;error.hidden=false;
-  if(focus&&typeof focus.focus==='function')focus.focus();
-  error.scrollIntoView({block:'center'});
-}
-function productWizardClearError(){var error=wizardById('product-wizard-error');error.textContent='';error.hidden=true}
-function productWizardSlug(value){
-  return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,160);
-}
-function productWizardTemplateChanged(){
-  var subscription=productWizardIsSubscription();
-  var configurable=productWizardIsConfigurable();
-  document.querySelectorAll('[data-subscription-field]').forEach(function(el){el.hidden=!subscription});
-  document.querySelectorAll('[data-simple-pricing]').forEach(function(el){el.hidden=configurable});
-  wizardById('wizard-advanced-pricing').hidden=!configurable;
-  if(configurable&&wizardById('wizard-variables').children.length===0){
-    addWizardVariable({key:'quantity',label:'Quantity',kind:'integer',required:true,minimum:'1',maximum:'100',step:'1'});
-    addWizardComponent({key:'base',label:'Base price',amount_type:'fixed',amount:'0.00',required:true});
-    addWizardComponent({key:'quantity',label:'Quantity',amount_type:'per_unit',amount:'0.00',input:'quantity',required:true});
-  }
-}
-function productWizardShowStep(step,scrollToStep){
-  productWizardStep=Math.max(1,Math.min(5,step));
-  document.querySelectorAll('[data-wizard-step]').forEach(function(el){el.hidden=Number(el.dataset.wizardStep)!==productWizardStep});
-  document.querySelectorAll('[data-wizard-indicator]').forEach(function(el){
-    var current=Number(el.dataset.wizardIndicator);
-    el.className='badge '+(current===productWizardStep?'badge-primary':current<productWizardStep?'badge-success':'badge-secondary');
-    var check=el.querySelector('.wizard-step-check');
-    if(check)check.hidden=current>=productWizardStep;
-  });
-  wizardById('wizard-previous').hidden=productWizardStep===1;
-  wizardById('wizard-next').hidden=productWizardStep===5;
-  wizardById('wizard-save-draft').hidden=productWizardStep!==5;
-  wizardById('wizard-publish').hidden=productWizardStep!==5;
-  if(productWizardStep===5)renderProductWizardReview();
-  productWizardClearError();
-  var current=document.querySelector('[data-wizard-step="'+productWizardStep+'"]');
-  if(current&&scrollToStep!==false)current.scrollIntoView({block:'start'});
-}
-function productWizardValidateStep(step){
-  if(step===2){
-    var name=wizardById('wizard-name');
-    if(!name.value.trim()){productWizardShowError('Product name is required.',name);return false}
-    var slug=wizardById('wizard-slug');
-    if(slug.value.trim()&&!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug.value.trim())){
-      productWizardShowError('URL slug may contain lowercase letters, numbers, and single hyphens.',slug);return false
-    }
-    var image=wizardById('wizard-image');
-    if(image.value&&!image.checkValidity()){productWizardShowError('Image URL must be a valid absolute URL.',image);return false}
-  }
-  if(step===3){
-    try{buildProductWizardOffer()}catch(error){productWizardShowError(error.message);return false}
-  }
-  return true;
-}
-function productWizardNext(){if(productWizardValidateStep(productWizardStep))productWizardShowStep(productWizardStep+1)}
-function productWizardPrevious(){productWizardShowStep(productWizardStep-1)}
-
-function addWizardVariable(seed){
-  seed=seed||{};var index=productWizardVariableIndex++;
-  var row=document.createElement('section');row.className='card mt-3';row.dataset.variableRow='';
-  row.innerHTML=`<div class="card__body">
-    <div class="flex justify-between gap-3 items-center"><strong>Customer input</strong><button class="btn btn--secondary btn--sm" type="button" data-remove-row>Remove</button></div>
-    <div class="grid grid-auto-150 gap-3 mt-3">
-      <div class="form-group"><label class="form-label required" for="wizard-variable-key-${index}">Key</label><input class="form-input" id="wizard-variable-key-${index}" data-variable-key required placeholder="quantity"></div>
-      <div class="form-group"><label class="form-label required" for="wizard-variable-label-${index}">Label</label><input class="form-input" id="wizard-variable-label-${index}" data-variable-label required placeholder="Quantity"></div>
-      <div class="form-group"><label class="form-label" for="wizard-variable-kind-${index}">Type</label><select class="form-select" id="wizard-variable-kind-${index}" data-variable-kind><option value="integer">Whole number</option><option value="number">Decimal number</option><option value="date">Date</option><option value="date_time">Date and time</option><option value="boolean">Yes / no</option><option value="select">Choice</option><option value="multi_select">Multiple choices</option><option value="text">Text</option></select></div>
-      <div class="form-group" data-variable-min-wrap><label class="form-label" for="wizard-variable-min-${index}">Minimum</label><input class="form-input" id="wizard-variable-min-${index}" data-variable-min inputmode="decimal"></div>
-      <div class="form-group" data-variable-max-wrap><label class="form-label" for="wizard-variable-max-${index}">Maximum</label><input class="form-input" id="wizard-variable-max-${index}" data-variable-max inputmode="decimal"></div>
-      <div class="form-group" data-variable-step-wrap><label class="form-label" for="wizard-variable-step-${index}">Step</label><input class="form-input" id="wizard-variable-step-${index}" data-variable-step inputmode="decimal"></div>
-      <div class="form-group" data-variable-options-wrap><label class="form-label" for="wizard-variable-options-${index}">Choices</label><input class="form-input" id="wizard-variable-options-${index}" data-variable-options placeholder="small, medium, large"></div>
-      <div class="form-group"><label class="form-label" for="wizard-variable-visibility-${index}">Visibility</label><select class="form-select" id="wizard-variable-visibility-${index}" data-variable-visibility><option value="public">Customer</option><option value="hidden">Hidden</option><option value="admin_only">Admin only</option></select></div>
-      <div class="form-group"><label class="form-label" for="wizard-variable-default-${index}">Default value</label><input class="form-input" id="wizard-variable-default-${index}" data-variable-default placeholder="Optional"></div>
-      <div class="form-group" data-variable-length-wrap><label class="form-label" for="wizard-variable-length-${index}">Maximum text length</label><input class="form-input" id="wizard-variable-length-${index}" data-variable-length type="number" min="1" max="10000"></div>
-    </div><label class="flex gap-2"><input type="checkbox" data-variable-required> Required</label>
-    <div class="form-group"><label class="form-label" for="wizard-variable-help-${index}">Help text</label><input class="form-input" id="wizard-variable-help-${index}" data-variable-help maxlength="500" placeholder="Shown beside this input"></div>
-  </div>`;
-  row.querySelector('[data-remove-row]').onclick=function(){row.remove()};
-  row.querySelector('[data-variable-key]').value=seed.key||'';
-  row.querySelector('[data-variable-label]').value=seed.label||'';
-  row.querySelector('[data-variable-kind]').value=seed.kind||'integer';
-  row.querySelector('[data-variable-min]').value=seed.minimum||'';
-  row.querySelector('[data-variable-max]').value=seed.maximum||'';
-  row.querySelector('[data-variable-step]').value=seed.step||'';
-  row.querySelector('[data-variable-options]').value=(seed.allowed_values||[]).join(', ');
-  row.querySelector('[data-variable-visibility]').value=seed.visibility||'public';
-  row.querySelector('[data-variable-default]').value=seed.default_value===undefined||seed.default_value===null?'':Array.isArray(seed.default_value)?seed.default_value.join(', '):String(seed.default_value);
-  row.querySelector('[data-variable-length]').value=seed.maximum_length||'';
-  row.querySelector('[data-variable-help]').value=seed.help_text||'';
-  row.querySelector('[data-variable-required]').checked=seed.required!==false;
-  row.querySelector('[data-variable-kind]').onchange=function(){wizardVariableKindChanged(row)};
-  wizardVariableKindChanged(row);
-  wizardById('wizard-variables').appendChild(row);
-}
-
-function wizardVariableKindChanged(row){
-  var kind=row.querySelector('[data-variable-kind]').value,numeric=kind==='integer'||kind==='number',dated=kind==='date'||kind==='date_time',choices=kind==='select'||kind==='multi_select';
-  var minimum=row.querySelector('[data-variable-min]'),maximum=row.querySelector('[data-variable-max]'),defaultInput=row.querySelector('[data-variable-default]');
-  row.querySelector('[data-variable-min-wrap]').hidden=!(numeric||dated);row.querySelector('[data-variable-max-wrap]').hidden=!(numeric||dated);row.querySelector('[data-variable-step-wrap]').hidden=!numeric;row.querySelector('[data-variable-options-wrap]').hidden=!choices;row.querySelector('[data-variable-length-wrap]').hidden=kind!=='text';
-  minimum.type=kind==='date'?'date':kind==='date_time'?'datetime-local':'text';maximum.type=minimum.type;defaultInput.type=minimum.type;
-  minimum.inputMode=numeric?'decimal':'';maximum.inputMode=numeric?'decimal':'';
-}
-
-function addWizardComponent(seed){
-  seed=seed||{};var index=productWizardComponentIndex++;
-  var row=document.createElement('section');row.className='card mt-3';row.dataset.componentRow='';
-  row.innerHTML=`<div class="card__body">
-    <div class="flex justify-between gap-3 items-center"><strong>Price row</strong><button class="btn btn--secondary btn--sm" type="button" data-remove-row>Remove</button></div>
-    <div class="grid grid-auto-150 gap-3 mt-3">
-      <div class="form-group"><label class="form-label required" for="wizard-component-key-${index}">Key</label><input class="form-input" id="wizard-component-key-${index}" data-component-key required placeholder="base"></div>
-      <div class="form-group"><label class="form-label required" for="wizard-component-label-${index}">Label</label><input class="form-input" id="wizard-component-label-${index}" data-component-label required placeholder="Base price"></div>
-      <div class="form-group"><label class="form-label" for="wizard-component-description-${index}">Description</label><input class="form-input" id="wizard-component-description-${index}" data-component-description maxlength="500"></div>
-      <div class="form-group"><label class="form-label" for="wizard-component-type-${index}">Calculation</label><select class="form-select" id="wizard-component-type-${index}" data-component-type><option value="fixed">Fixed amount</option><option value="per_unit">Amount × input</option><option value="flat_plus_per_unit">Base + amount × input</option><option value="lookup">Price selected by input</option><option value="graduated">Graduated tiers</option><option value="volume">Volume tiers</option><option value="package">Packages / blocks</option></select></div>
-      <div class="form-group"><label class="form-label required" for="wizard-component-amount-${index}">Amount / unit rate</label><input class="form-input" id="wizard-component-amount-${index}" data-component-amount inputmode="decimal" value="0.00" required></div>
-      <div class="form-group"><label class="form-label" for="wizard-component-input-${index}">Pricing input key</label><input class="form-input" id="wizard-component-input-${index}" data-component-input placeholder="quantity"></div>
-      <div class="form-group"><label class="form-label" for="wizard-condition-${index}">Condition</label><select class="form-select" id="wizard-condition-${index}" data-component-condition><option value="always">Always include</option><option value="equals">Input equals value</option><option value="not_equals">Input does not equal value</option><option value="greater_than">Input is greater than value</option><option value="greater_than_or_equal">Input is at least value</option><option value="less_than">Input is less than value</option><option value="less_than_or_equal">Input is at most value</option><option value="contains">Input contains value</option><option value="in">Input is one of these values</option><option value="present">Input is present</option><option value="advanced_preserved" hidden>Advanced condition (preserved)</option></select></div>
-      <div class="form-group"><label class="form-label" for="wizard-condition-input-${index}">Condition input</label><input class="form-input" id="wizard-condition-input-${index}" data-condition-input></div>
-      <div class="form-group"><label class="form-label" for="wizard-condition-value-${index}">Condition value</label><input class="form-input" id="wizard-condition-value-${index}" data-condition-value></div>
-    </div>
-    <details class="my-3"><summary>Advanced calculation details</summary>
-      <div class="grid grid-auto-180 gap-3 mt-3">
-        <div class="form-group"><label class="form-label" for="wizard-component-base-${index}">Base amount</label><input class="form-input" id="wizard-component-base-${index}" data-component-base inputmode="decimal" value="0.00"><p class="text-muted text-sm">Used by base + per-unit pricing.</p></div>
-        <div class="form-group"><label class="form-label" for="wizard-component-package-size-${index}">Units per package</label><input class="form-input" id="wizard-component-package-size-${index}" data-component-package-size type="number" min="1" value="1"><p class="text-muted text-sm">Used by package pricing.</p></div>
-        <div class="form-group"><label class="form-label" for="wizard-component-rounding-${index}">Partial packages</label><select class="form-select" id="wizard-component-rounding-${index}" data-component-rounding><option value="up">Round up and charge a package</option><option value="exact">Require an exact multiple</option></select></div>
-      </div>
-      <div class="form-group"><label class="form-label" for="wizard-component-details-${index}">Lookup prices or tiers</label><textarea class="form-textarea" id="wizard-component-details-${index}" data-component-details rows="4" placeholder="Lookup: small = 10.00&#10;Tier: 10 | 1.00 | 0.00&#10;Final tier: * | 0.80 | 0.00"></textarea><p class="text-muted text-sm">Lookup rows use <code>choice = amount</code>. Tier rows use <code>upper bound | unit amount | flat amount</code>; use <code>*</code> for the final open tier.</p></div>
-    </details>
-    <label class="flex gap-2"><input type="checkbox" data-component-required> Required row</label>
-  </div>`;
-  row.querySelector('[data-remove-row]').onclick=function(){row.remove()};
-  row.querySelector('[data-component-key]').value=seed.key||'';
-  row.querySelector('[data-component-label]').value=seed.label||'';
-  row.querySelector('[data-component-description]').value=seed.description||'';
-  row.querySelector('[data-component-type]').value=seed.amount_type||'fixed';
-  row.querySelector('[data-component-amount]').value=seed.amount||'0.00';
-  row.querySelector('[data-component-input]').value=seed.input||'';
-  row.querySelector('[data-component-base]').value=seed.base_amount||'0.00';
-  row.querySelector('[data-component-package-size]').value=seed.units_per_package||'1';
-  row.querySelector('[data-component-rounding]').value=seed.rounding||'up';
-  row.querySelector('[data-component-details]').value=seed.details||'';
-  row.querySelector('[data-component-condition]').value=seed.condition||'always';
-  if(seed.preserved_condition){row.dataset.preservedCondition=JSON.stringify(seed.preserved_condition);row.querySelector('[data-component-condition]').querySelector('[value="advanced_preserved"]').hidden=false;row.querySelector('[data-component-condition]').value='advanced_preserved'}
-  if(seed.preserved_quantity)row.dataset.preservedQuantity=JSON.stringify(seed.preserved_quantity);
-  if(seed.preserved_metadata)row.dataset.preservedMetadata=JSON.stringify(seed.preserved_metadata);
-  row.querySelector('[data-condition-input]').value=seed.condition_input||'';
-  row.querySelector('[data-condition-value]').value=seed.condition_value||'';
-  row.querySelector('[data-component-required]').checked=seed.required!==false;
-  wizardById('wizard-components').appendChild(row);
-}
-
-function wizardCurrencyExponent(currency){
-  var zero=['BIF','CLP','DJF','GNF','JPY','KMF','KRW','MGA','PYG','RWF','UGX','VND','VUV','XAF','XOF','XPF'];
-  var three=['BHD','JOD','KWD','OMR','TND'];
-  return zero.indexOf(currency)!==-1?0:three.indexOf(currency)!==-1?3:2;
-}
-function wizardMoneyToMinor(raw,currency){
-  raw=String(raw).trim();currency=String(currency).trim().toUpperCase();
-  if(!/^[A-Z]{3}$/.test(currency))throw new Error('Currency must be a three-letter ISO code.');
-  if(!/^\+?(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw))throw new Error('Amounts must be non-negative plain decimal numbers.');
-  raw=raw.replace(/^\+/,'');var parts=raw.split('.');var whole=parts[0]||'0';var fraction=parts[1]||'';var exponent=wizardCurrencyExponent(currency);
-  if(fraction.length>exponent&&/[^0]/.test(fraction.slice(exponent)))throw new Error('Amount has more than '+exponent+' decimal places for '+currency+'.');
-  fraction=fraction.slice(0,exponent).padEnd(exponent,'0');
-  var multiplier=BigInt(10)**BigInt(exponent);var minor=BigInt(whole)*multiplier+BigInt(fraction||'0');
-  if(minor>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('Amount is too large.');
-  return Number(minor);
-}
-function wizardMinorToDisplay(minor,currency){
-  var exponent=wizardCurrencyExponent(currency),raw=String(minor).padStart(exponent+1,'0');
-  return exponent===0?raw:raw.slice(0,-exponent)+'.'+raw.slice(-exponent);
-}
-function collectWizardVariables(){
-  var variables=[],keys=new Set();
-  document.querySelectorAll('[data-variable-row]').forEach(function(row,index){
-    var key=row.querySelector('[data-variable-key]').value.trim();var label=row.querySelector('[data-variable-label]').value.trim();var kind=row.querySelector('[data-variable-kind]').value;
-    if(!/^[A-Za-z][A-Za-z0-9_]*$/.test(key))throw new Error('Each customer input needs a unique key using letters, numbers, and underscores.');
-    if(keys.has(key))throw new Error('Customer input keys must be unique: '+key);keys.add(key);
-    if(!label)throw new Error('Each customer input needs a label.');
-    var variable={key:key,kind:kind,label:label,required:row.querySelector('[data-variable-required]').checked,visibility:row.querySelector('[data-variable-visibility]').value,sort_order:index};
-    var minimum=row.querySelector('[data-variable-min]').value.trim(),maximum=row.querySelector('[data-variable-max]').value.trim(),step=row.querySelector('[data-variable-step]').value.trim();
-    if((kind==='integer'||kind==='number'||kind==='date'||kind==='date_time')&&minimum)variable.minimum=minimum;
-    if((kind==='integer'||kind==='number'||kind==='date'||kind==='date_time')&&maximum)variable.maximum=maximum;
-    if((kind==='integer'||kind==='number')&&step)variable.step=step;
-    if(kind==='select'||kind==='multi_select'){
-      variable.allowed_values=row.querySelector('[data-variable-options]').value.split(',').map(function(v){return v.trim()}).filter(Boolean);
-      if(variable.allowed_values.length===0)throw new Error('Choice input '+key+' needs at least one allowed value.');
-    }
-    var help=row.querySelector('[data-variable-help]').value.trim(),defaultRaw=row.querySelector('[data-variable-default]').value.trim(),maximumLength=Number(row.querySelector('[data-variable-length]').value||0);
-    if(help)variable.help_text=help;
-    if(maximumLength){if(!Number.isSafeInteger(maximumLength)||maximumLength<1||maximumLength>10000)throw new Error('Maximum text length on '+key+' must be between 1 and 10000.');variable.maximum_length=maximumLength}
-    if(defaultRaw!==''){
-      if(kind==='multi_select')variable.default_value=defaultRaw.split(',').map(function(value){return value.trim()}).filter(Boolean);
-      else variable.default_value=wizardConditionValue(defaultRaw,variable);
-    }
-    variables.push(variable);
-  });
-  return variables;
-}
-function wizardConditionValue(raw,variable){
-  if(!variable)return raw;
-  if(variable.kind==='boolean'){
-    if(raw!=='true'&&raw!=='false')throw new Error('Boolean conditions must use true or false.');return raw==='true';
-  }
-  if(variable.kind==='integer'){
-    if(!/^-?\d+$/.test(raw))throw new Error('Integer condition values must be whole numbers.');return Number(raw);
-  }
-  if(variable.kind==='number'){
-    if(!/^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw))throw new Error('Number condition values must be decimal numbers.');return raw;
-  }
-  if(variable.kind==='date'&&!/^\d{4}-\d{2}-\d{2}$/.test(raw))throw new Error('Date values must use YYYY-MM-DD.');
-  if(variable.kind==='date_time'&&!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(raw))throw new Error('Date and time values must use YYYY-MM-DDTHH:MM.');
-  return raw;
-}
-function wizardPricingLines(raw){return String(raw).split(/\r?\n/).map(function(line){return line.trim()}).filter(Boolean)}
-function wizardParseLookup(raw,currency,key){
-  var prices={};wizardPricingLines(raw).forEach(function(line){
-    var split=line.indexOf('=');if(split<1)throw new Error('Lookup row '+key+' must use choice = amount.');
-    var choice=line.slice(0,split).trim(),value=line.slice(split+1).trim();
-    if(!choice||Object.prototype.hasOwnProperty.call(prices,choice))throw new Error('Lookup choices on '+key+' must be non-empty and unique.');
-    prices[choice]=wizardMoneyToMinor(value,currency);
-  });
-  if(Object.keys(prices).length===0)throw new Error('Lookup row '+key+' needs at least one choice and amount.');return prices;
-}
-function wizardParseTiers(raw,currency,key){
-  var tiers=wizardPricingLines(raw).map(function(line,index,lines){
-    var parts=line.split('|').map(function(part){return part.trim()});
-    if(parts.length<2||parts.length>3)throw new Error('Tier row '+key+' must use upper bound | unit amount | optional flat amount.');
-    var open=parts[0]==='*',upTo=open?undefined:Number(parts[0]);
-    if(!open&&(!Number.isSafeInteger(upTo)||upTo<1))throw new Error('Tier bounds on '+key+' must be positive whole numbers.');
-    if(open&&index!==lines.length-1)throw new Error('Only the final tier on '+key+' may use *.');
-    if(!open&&index===lines.length-1)throw new Error('The final tier on '+key+' must use *.');
-    var tier={unit_amount_minor:wizardMoneyToMinor(parts[1],currency),flat_amount_minor:wizardMoneyToMinor(parts[2]||'0',currency)};
-    if(!open)tier.up_to=upTo;return tier;
-  });
-  if(tiers.length===0)throw new Error('Tiered row '+key+' needs at least one tier.');
-  for(var i=1;i<tiers.length;i++){if(tiers[i-1].up_to!==undefined&&tiers[i].up_to!==undefined&&tiers[i].up_to<=tiers[i-1].up_to)throw new Error('Tier bounds on '+key+' must increase.')}
-  return tiers;
-}
-function productWizardShippingChanged(){
-  var settings=wizardById('wizard-shipping-settings'),shipping=wizardById('wizard-shipping-address');
-  if(settings&&shipping)settings.hidden=!shipping.checked;
-}
-function wizardParseShippingCountries(raw){
-  var seen=new Set(),countries=String(raw).split(',').map(function(value){return value.trim().toUpperCase()}).filter(Boolean);
-  if(countries.length===0)throw new Error('Add at least one allowed shipping country.');
-  if(countries.length>50)throw new Error('At most 50 shipping countries may be configured.');
-  countries.forEach(function(country){if(!/^[A-Z]{2}$/.test(country))throw new Error('Shipping countries must use two-letter codes.');if(seen.has(country))throw new Error('Shipping countries must be unique.');seen.add(country)});
-  return countries;
-}
-function wizardParseShippingOptions(raw,currency,taxBehavior){
-  var units=new Set(['hour','day','business_day','week','month']);
-  var options=wizardPricingLines(raw).map(function(line){
-    var parts=line.split('|').map(function(part){return part.trim()});
-    if(parts.length<2||parts.length>6)throw new Error('Shipping options must use name | amount | minimum | maximum | unit | optional Stripe rate ID.');
-    while(parts.length<6)parts.push('');
-    var name=parts[0],minimum=parts[2]===''?undefined:Number(parts[2]),maximum=parts[3]===''?undefined:Number(parts[3]),unit=parts[4],stripeId=parts[5];
-    if(!name||name.length>100)throw new Error('Shipping option names must contain between 1 and 100 characters.');
-    if(minimum!==undefined&&(!Number.isSafeInteger(minimum)||minimum<1))throw new Error('Shipping estimate minimums must be positive whole numbers.');
-    if(maximum!==undefined&&(!Number.isSafeInteger(maximum)||maximum<1))throw new Error('Shipping estimate maximums must be positive whole numbers.');
-    if(minimum!==undefined&&maximum!==undefined&&minimum>maximum)throw new Error('Shipping estimate minimums must not exceed maximums.');
-    if((minimum!==undefined||maximum!==undefined)&&!units.has(unit))throw new Error('Shipping estimates need a valid time unit.');
-    if(minimum===undefined&&maximum===undefined&&unit!=='')throw new Error('A shipping time unit needs a minimum or maximum estimate.');
-    if(stripeId&&!/^shr_[A-Za-z0-9_]+$/.test(stripeId))throw new Error('Stripe shipping rate IDs must start with shr_.');
-    var option={display_name:name,amount_minor:wizardMoneyToMinor(parts[1],currency),tax_behavior:taxBehavior,stripe_shipping_rate_id:stripeId};
-    if(minimum!==undefined||maximum!==undefined){option.delivery_estimate={minimum:minimum,maximum:maximum,unit:unit}}
-    return option;
-  });
-  if(options.length>5)throw new Error('Stripe Checkout supports at most five shipping options.');
-  return options;
-}
-function collectWizardComponents(variables,currency,subscription,interval,intervalCount){
-  var components=[],keys=new Set(),byKey={};variables.forEach(function(v){byKey[v.key]=v});
-  document.querySelectorAll('[data-component-row]').forEach(function(row,index){
-    var key=row.querySelector('[data-component-key]').value.trim(),label=row.querySelector('[data-component-label]').value.trim();
-    if(!/^[A-Za-z][A-Za-z0-9_]*$/.test(key)||keys.has(key))throw new Error('Each price row needs a unique key using letters, numbers, and underscores.');keys.add(key);
-    if(!label)throw new Error('Each price row needs a label.');
-    var type=row.querySelector('[data-component-type]').value,input=row.querySelector('[data-component-input]').value.trim(),amount;
-    var numeric=type==='per_unit'||type==='flat_plus_per_unit'||type==='graduated'||type==='volume'||type==='package';
-    if(type!=='fixed'&&!byKey[input])throw new Error('Price row '+key+' must reference an existing input.');
-    if(numeric&&byKey[input].kind!=='integer'&&byKey[input].kind!=='number')throw new Error('Price row '+key+' must reference a number input.');
-    if(type==='fixed')amount={type:'fixed',unit_amount_minor:wizardMoneyToMinor(row.querySelector('[data-component-amount]').value,currency)};
-    else if(type==='per_unit')amount={type:'per_unit',input:input,unit_amount_minor:wizardMoneyToMinor(row.querySelector('[data-component-amount]').value,currency)};
-    else if(type==='flat_plus_per_unit')amount={type:'flat_plus_per_unit',base_amount_minor:wizardMoneyToMinor(row.querySelector('[data-component-base]').value,currency),input:input,unit_amount_minor:wizardMoneyToMinor(row.querySelector('[data-component-amount]').value,currency)};
-    else if(type==='lookup'){
-      if(byKey[input].kind!=='select'&&byKey[input].kind!=='text')throw new Error('Lookup row '+key+' must reference a choice or text input.');
-      amount={type:'lookup',input:input,prices:wizardParseLookup(row.querySelector('[data-component-details]').value,currency,key)};
-    }else if(type==='graduated'||type==='volume')amount={type:type,input:input,tiers:wizardParseTiers(row.querySelector('[data-component-details]').value,currency,key)};
-    else if(type==='package'){
-      var packageSize=Number(row.querySelector('[data-component-package-size]').value);
-      if(!Number.isSafeInteger(packageSize)||packageSize<1)throw new Error('Package size on '+key+' must be a positive whole number.');
-      amount={type:'package',input:input,units_per_package:packageSize,package_amount_minor:wizardMoneyToMinor(row.querySelector('[data-component-amount]').value,currency),rounding:row.querySelector('[data-component-rounding]').value};
-    }else throw new Error('Price row '+key+' uses an unknown calculation.');
-    var conditionType=row.querySelector('[data-component-condition]').value,conditionInput=row.querySelector('[data-condition-input]').value.trim(),rawCondition=row.querySelector('[data-condition-value]').value.trim();var condition={op:'always'};
-    if(conditionType==='advanced_preserved'){
-      try{condition=JSON.parse(row.dataset.preservedCondition)}catch(_error){throw new Error('Advanced condition on '+key+' could not be preserved.')}
-    }else if(conditionType!=='always'){
-      if(!byKey[conditionInput])throw new Error('Condition on '+key+' must reference an existing input.');
-      if(conditionType==='present')condition={op:'present',input:conditionInput};
-      else if(conditionType==='in'){
-        var conditionValues=rawCondition.split(',').map(function(value){return value.trim()}).filter(Boolean);
-        if(conditionValues.length===0)throw new Error('Condition on '+key+' needs at least one comparison value.');
-        condition={op:'in',input:conditionInput,values:conditionValues.map(function(value){return wizardConditionValue(value,byKey[conditionInput])})};
-      }else{
-        if(rawCondition==='')throw new Error('Condition on '+key+' needs a comparison value.');
-        condition={op:conditionType,input:conditionInput,value:wizardConditionValue(rawCondition,byKey[conditionInput])};
-      }
-    }
-    var quantity={type:'fixed',value:1},metadata={};
-    if(row.dataset.preservedQuantity){try{quantity=JSON.parse(row.dataset.preservedQuantity)}catch(_error){throw new Error('Advanced quantity rule on '+key+' could not be preserved.')}}
-    if(row.dataset.preservedMetadata){try{metadata=JSON.parse(row.dataset.preservedMetadata)}catch(_error){throw new Error('Metadata on '+key+' could not be preserved.')}}
-    var component={key:key,label:label,description:row.querySelector('[data-component-description]').value.trim(),sort_order:index,required:row.querySelector('[data-component-required]').checked,amount:amount,quantity:quantity,condition:condition,metadata:metadata};
-    if(subscription)component.recurrence={interval:interval,interval_count:intervalCount};
-    components.push(component);
-  });
-  if(components.length===0)throw new Error('Add at least one itemized price row.');return components;
-}
-function buildProductWizardOffer(){
-  var template=productWizardTemplate(),subscription=productWizardIsSubscription(),configurable=productWizardIsConfigurable();
-  var currency=wizardById('wizard-currency').value.trim().toUpperCase();
-  if(!/^[A-Z]{3}$/.test(currency))throw new Error('Currency must be a three-letter ISO code.');
-  var interval=wizardById('wizard-interval').value,intervalCount=Number(wizardById('wizard-interval-count').value||1);
-  if(subscription&&(!Number.isInteger(intervalCount)||intervalCount<1||intervalCount>36))throw new Error('Billing interval count must be between 1 and 36.');
-  var variables=[],components=[];
-  if(configurable){variables=collectWizardVariables();components=collectWizardComponents(variables,currency,subscription,interval,intervalCount)}
-  else{
-    var amount=wizardMoneyToMinor(wizardById('wizard-price').value,currency);
-    var component={key:'price',label:wizardById('wizard-name').value.trim()||'Price',sort_order:0,required:true,amount:{type:'fixed',unit_amount_minor:amount},quantity:{type:'fixed',value:1},condition:{op:'always'}};
-    if(subscription)component.recurrence={interval:interval,interval_count:intervalCount};components=[component];
-  }
-  var tiered=components.some(function(component){return component.amount.type==='graduated'||component.amount.type==='volume'});
-  var taxBehavior=wizardById('wizard-tax-behavior').value,collectShipping=wizardById('wizard-shipping-address').checked;
-  var shippingCountries=collectShipping?wizardParseShippingCountries(wizardById('wizard-shipping-countries').value):[];
-  var shippingOptions=collectShipping?wizardParseShippingOptions(wizardById('wizard-shipping-options').value,currency,taxBehavior):[];
-  var minimumRaw=wizardById('wizard-minimum-total').value.trim(),maximumRaw=wizardById('wizard-maximum-total').value.trim();
-  var minimumTotal=minimumRaw?wizardMoneyToMinor(minimumRaw,currency):null,maximumTotal=maximumRaw?wizardMoneyToMinor(maximumRaw,currency):null;
-  if(maximumTotal!==null&&maximumTotal<=0)throw new Error('Maximum item total must be greater than zero.');
-  if(minimumTotal!==null&&maximumTotal!==null&&minimumTotal>maximumTotal)throw new Error('Minimum item total must not exceed maximum item total.');
-  var checkout={allow_promotion_codes:wizardById('wizard-promotions').checked,automatic_tax:wizardById('wizard-automatic-tax').checked,collect_billing_address:wizardById('wizard-billing-address').checked,collect_shipping_address:collectShipping,allowed_shipping_countries:shippingCountries,shipping_options:shippingOptions,create_customer:wizardById('wizard-create-customer').checked,require_terms_consent:wizardById('wizard-terms').checked,trial_days:subscription?Number(wizardById('wizard-trial-days').value||0):0};
-  if(minimumTotal!==null)checkout.minimum_total_minor=minimumTotal;if(maximumTotal!==null)checkout.maximum_total_minor=maximumTotal;
-  return {name:wizardById('wizard-name').value.trim()||'New offer',mode:subscription?'subscription':'payment',currency:currency,pricing_model:configurable?'components':'fixed',recurring_interval:subscription?interval:null,interval_count:subscription?intervalCount:1,usage_type:'licensed',billing_scheme:tiered?'tiered':'per_unit',tax_behavior:taxBehavior,variables:variables,components:components,checkout:checkout};
-}
-function buildProductWizardPayload(){
-  var name=wizardById('wizard-name').value.trim();if(!name)throw new Error('Product name is required.');
-  var slug=wizardById('wizard-slug').value.trim()||productWizardSlug(name);if(!slug)throw new Error('Product name must contain at least one letter or number.');
-  var offer=buildProductWizardOffer();var tags=wizardById('wizard-tags').value.split(',').map(function(v){return v.trim()}).filter(Boolean);
-  var product={name:name,slug:slug,description:wizardById('wizard-description').value.trim(),image_url:wizardById('wizard-image').value.trim(),tags:tags,currency:offer.currency,fulfillment_kind:wizardById('wizard-fulfillment').value,product_template_id:productWizardTemplate(),metadata:{impresspress_template:productWizardTemplate()}};
-  return {product:product,offer:offer};
-}
-function renderProductWizardReview(){
-  var target=wizardById('wizard-review');target.replaceChildren();
-  try{
-    var built=buildProductWizardPayload(),offer=built.offer;
-    var title=document.createElement('h4');title.textContent=built.product.name;target.appendChild(title);
-    var summary=document.createElement('p');summary.className='text-muted text-sm';summary.textContent=(offer.mode==='subscription'?'Subscription':'One-time payment')+' · '+offer.currency+' · '+(offer.pricing_model==='fixed'?'Fixed price':'Configurable rows');target.appendChild(summary);
-    var list=document.createElement('ul');
-    offer.components.forEach(function(component){var item=document.createElement('li'),rule=component.amount,description='';
-      if(rule.type==='fixed')description=wizardMinorToDisplay(rule.unit_amount_minor,offer.currency)+' '+offer.currency;
-      else if(rule.type==='per_unit')description=wizardMinorToDisplay(rule.unit_amount_minor,offer.currency)+' '+offer.currency+' per '+rule.input;
-      else if(rule.type==='flat_plus_per_unit')description=wizardMinorToDisplay(rule.base_amount_minor,offer.currency)+' + '+wizardMinorToDisplay(rule.unit_amount_minor,offer.currency)+' '+offer.currency+' per '+rule.input;
-      else if(rule.type==='lookup')description=Object.keys(rule.prices).length+' lookup price(s) selected by '+rule.input;
-      else if(rule.type==='graduated'||rule.type==='volume')description=rule.tiers.length+' '+rule.type+' tier(s) based on '+rule.input;
-      else if(rule.type==='package')description=wizardMinorToDisplay(rule.package_amount_minor,offer.currency)+' '+offer.currency+' per '+rule.units_per_package+' '+rule.input;
-      item.textContent=component.label+': '+description+(component.condition.op!=='always'?' when '+component.condition.input+' '+component.condition.op.replace(/_/g,' ')+' '+String(component.condition.value||component.condition.values||''):'');list.appendChild(item)});
-    target.appendChild(list);
-    var options=document.createElement('p');options.className='text-muted text-sm';options.textContent=offer.variables.length+' customer input(s), '+offer.components.length+' price row(s)'+(offer.checkout.minimum_total_minor!==undefined?', minimum '+wizardMinorToDisplay(offer.checkout.minimum_total_minor,offer.currency)+' '+offer.currency:'')+(offer.checkout.maximum_total_minor!==undefined?', maximum '+wizardMinorToDisplay(offer.checkout.maximum_total_minor,offer.currency)+' '+offer.currency:'')+(offer.checkout.automatic_tax?', automatic tax':'')+(offer.checkout.allow_promotion_codes?', promotion codes':'');target.appendChild(options);
-  }catch(error){productWizardShowError(error.message)}
-}
-async function productWizardRequest(path,method,body){
-  var response=await fetch(path,{method:method,credentials:'same-origin',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});var data={};try{data=await response.json()}catch(_){}
-  if(!response.ok)throw new Error(data.message||data.error||'The server rejected the product configuration.');return data;
-}
-async function submitProductWizard(intent){
-  productWizardClearError();var buttons=[wizardById('wizard-save-draft'),wizardById('wizard-publish')];var productId='';
-  try{
-    var built=buildProductWizardPayload();buttons.forEach(function(button){button.disabled=true});
-    var config=window.__productWizardConfig;var created=await productWizardRequest(config.product_collection,'POST',built.product);productId=created.id;
-    if(!productId)throw new Error('Product creation returned no product ID.');
-    var offerCollection=config.product_collection+'/'+encodeURIComponent(productId)+'/offers';var managed=await productWizardRequest(offerCollection,'POST',built.offer);var offerId=managed.offer&&managed.offer.id;
-    if(!offerId)throw new Error('Pricing creation returned no offer ID.');
-    if(intent==='publish'){
-      await productWizardRequest(offerCollection+'/'+encodeURIComponent(offerId)+'/publish','POST',{});
-      await productWizardRequest(config.product_collection+'/'+encodeURIComponent(productId),'PATCH',{status:'active'});
-    }
-    window.location.assign(config.return_url+'?created='+encodeURIComponent(productId)+(intent==='publish'?'&published=1':''));
-  }catch(error){
-    productWizardShowError((productId?'Product draft '+productId+' was created, but setup did not finish. ':'')+(error.message||'Product setup failed.'));
-    buttons.forEach(function(button){button.disabled=false});
-  }
-}
-function initProductWizard(){productWizardTemplateChanged();productWizardShippingChanged();productWizardShowStep(1,false)}
-// The wizard's controls, delegated. They used to be `onclick`/`onchange`
-// attributes; see the rule in ui/assets/chrome.js. The verbs are `pw-`
-// prefixed because `data-action` is one namespace shared by every script on
-// the page -- the product manager loads this file too, for the visual editor's
-// "+ Add input"/"+ Add row" buttons, which is why those two verbs work on both
-// pages from this one listener.
-//
-// Guarded for the reason spelled out at SELLER_ADMIN_JS: an htmx tab swap
-// re-executes this script against the same `document`, so an unguarded
-// registration accumulates one listener per visit.
-(function(){
-  if(window.__productWizardDelegated)return;
-  window.__productWizardDelegated=true;
-  document.addEventListener('submit',function(e){
-    if(e.target&&e.target.id==='product-wizard-form')e.preventDefault();
-  });
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action]');
-    if(!el)return;
-    var action=el.getAttribute('data-action');
-    if(action==='pw-add-variable')addWizardVariable();
-    else if(action==='pw-add-component')addWizardComponent();
-    else if(action==='pw-previous')productWizardPrevious();
-    else if(action==='pw-next')productWizardNext();
-    else if(action==='pw-submit')submitProductWizard(el.getAttribute('data-wizard-intent'));
-  });
-  document.addEventListener('change',function(e){
-    var el=e.target;
-    if(!(el instanceof Element))return;
-    var action=el.getAttribute('data-action');
-    if(action==='pw-template-changed')productWizardTemplateChanged();
-    else if(action==='pw-shipping-changed')productWizardShippingChanged();
-  });
-})();
-"#;
 
 // ---------------------------------------------------------------------------
 // Shared admin/seller product lifecycle manager
@@ -2278,7 +1822,9 @@ pub async fn product_manager(
                 @for offer in &offers { (render_managed_offer(offer, &product_api_url)) }
             }
         }
-        script { (maud::PreEscaped(format!("window.__productManagerConfig={page_config};\n{PRODUCT_WIZARD_JS}\n{PRODUCT_MANAGER_JS}\ninitProductManager();"))) }
+        script { (maud::PreEscaped(format!("window.__productManagerConfig={page_config};"))) }
+        script src=(assets::wizard_js_url()) {}
+        script src=(assets::manager_js_url()) {}
     };
     ui::shell_page(
         ctx,
@@ -2296,113 +1842,6 @@ pub async fn product_manager(
     )
     .await
 }
-
-const PRODUCT_MANAGER_JS: &str = r#"
-function productManagerError(message){var target=document.getElementById('product-manager-error');target.textContent=message||'Something went wrong.';target.hidden=false;target.scrollIntoView({block:'nearest'});}
-function productManagerClearError(){var target=document.getElementById('product-manager-error');target.hidden=true;target.textContent='';}
-async function productManagerRequest(url,method,body){var options={method:method,credentials:'same-origin',headers:{Accept:'application/json'}};if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body)}var response=await fetch(url,options),text=await response.text(),payload={};if(text){try{payload=JSON.parse(text)}catch(_error){payload={message:text}}}if(!response.ok)throw new Error(payload.message||payload.error||('Request failed ('+response.status+')'));return payload;}
-function productManagerButton(button,busy){if(!button)return;button.disabled=busy;if(busy){button.dataset.originalText=button.textContent;button.textContent='Working…'}else if(button.dataset.originalText){button.textContent=button.dataset.originalText;delete button.dataset.originalText}}
-var productManagerVisualCard=null;
-var productManagerVisualDefinition=null;
-function productManagerVisualModeChanged(){var recurring=document.getElementById('manager-visual-mode').value==='subscription';document.querySelectorAll('[data-manager-recurring]').forEach(function(field){field.hidden=!recurring})}
-function productManagerComponentSeed(component,currency){var amount=component.amount||{},seed={key:component.key,label:component.label,description:component.description||'',amount_type:amount.type||'fixed',required:component.required!==false,amount:'0.00',input:amount.input||'',base_amount:'0.00',units_per_package:amount.units_per_package||1,rounding:amount.rounding||'up',details:'',preserved_quantity:component.quantity||{type:'fixed',value:1},preserved_metadata:component.metadata||{}};if(amount.type==='fixed')seed.amount=wizardMinorToDisplay(amount.unit_amount_minor||0,currency);else if(amount.type==='per_unit'||amount.type==='flat_plus_per_unit')seed.amount=wizardMinorToDisplay(amount.unit_amount_minor||0,currency);else if(amount.type==='package')seed.amount=wizardMinorToDisplay(amount.package_amount_minor||0,currency);if(amount.type==='flat_plus_per_unit')seed.base_amount=wizardMinorToDisplay(amount.base_amount_minor||0,currency);if(amount.type==='lookup')seed.details=Object.keys(amount.prices||{}).map(function(key){return key+' = '+wizardMinorToDisplay(amount.prices[key],currency)}).join('\n');if(amount.type==='graduated'||amount.type==='volume')seed.details=(amount.tiers||[]).map(function(tier){return (tier.up_to===undefined||tier.up_to===null?'*':tier.up_to)+' | '+wizardMinorToDisplay(tier.unit_amount_minor||0,currency)+' | '+wizardMinorToDisplay(tier.flat_amount_minor||0,currency)}).join('\n');var condition=component.condition||{op:'always'},simple=['always','present','equals','not_equals','greater_than','greater_than_or_equal','less_than','less_than_or_equal','contains','in'];if(simple.indexOf(condition.op)!==-1){seed.condition=condition.op;seed.condition_input=condition.input||'';seed.condition_value=condition.op==='in'?(condition.values||[]).join(', '):condition.value===undefined?'':String(condition.value)}else seed.preserved_condition=condition;return seed}
-function productManagerOpenVisualEditor(button){var card=productManagerCard(button),source=card.querySelector('[data-offer-definition]'),definition;productManagerClearError();try{definition=JSON.parse(source.value)}catch(error){productManagerError('Draft definition is not valid JSON: '+error.message);return}productManagerVisualCard=card;productManagerVisualDefinition=definition;var currency=String(definition.currency||'USD').toUpperCase();document.getElementById('manager-visual-title').textContent='Edit '+(definition.name||'pricing draft');document.getElementById('manager-visual-offer-name').value=definition.name||'';document.getElementById('manager-visual-mode').value=definition.mode||'payment';document.getElementById('manager-visual-currency').value=currency;document.getElementById('manager-visual-interval').value=definition.recurring_interval||'month';document.getElementById('manager-visual-interval-count').value=definition.interval_count||1;document.getElementById('wizard-variables').replaceChildren();document.getElementById('wizard-components').replaceChildren();(definition.variables||[]).forEach(addWizardVariable);(definition.components||[]).forEach(function(component){addWizardComponent(productManagerComponentSeed(component,currency))});productManagerVisualModeChanged();var editor=document.getElementById('product-manager-visual-editor');editor.hidden=false;editor.scrollIntoView({block:'start'});document.getElementById('manager-visual-offer-name').focus()}
-function productManagerCloseVisualEditor(){var editor=document.getElementById('product-manager-visual-editor');if(editor)editor.hidden=true;productManagerVisualCard=null;productManagerVisualDefinition=null;productManagerClearError()}
-async function productManagerSaveVisualOffer(button){if(!productManagerVisualCard||!productManagerVisualDefinition){productManagerError('Choose a draft offer to edit first.');return}productManagerClearError();var nameField=document.getElementById('manager-visual-offer-name'),currencyField=document.getElementById('manager-visual-currency'),mode=document.getElementById('manager-visual-mode').value,currency=currencyField.value.trim().toUpperCase(),interval=document.getElementById('manager-visual-interval').value,intervalCount=Number(document.getElementById('manager-visual-interval-count').value||1),definition=JSON.parse(JSON.stringify(productManagerVisualDefinition));try{if(!nameField.value.trim())throw Object.assign(new Error('Offer name is required.'),{focus:nameField});if(!/^[A-Z]{3}$/.test(currency))throw Object.assign(new Error('Currency must be a three-letter ISO code.'),{focus:currencyField});if(mode==='subscription'&&(!Number.isSafeInteger(intervalCount)||intervalCount<1||intervalCount>36))throw Object.assign(new Error('Billing interval count must be between 1 and 36.'),{focus:document.getElementById('manager-visual-interval-count')});var variables=collectWizardVariables(),components=collectWizardComponents(variables,currency,mode==='subscription',interval,intervalCount);definition.name=nameField.value.trim();definition.mode=mode;definition.currency=currency;definition.recurring_interval=mode==='subscription'?interval:null;definition.interval_count=mode==='subscription'?intervalCount:1;definition.variables=variables;definition.components=components;definition.pricing_model=variables.length||components.length!==1||components[0].amount.type!=='fixed'?'components':'fixed';definition.billing_scheme=components.some(function(component){return component.amount.type==='graduated'||component.amount.type==='volume'})?'tiered':'per_unit'}catch(error){productManagerError(error.message);if(error.focus)error.focus.focus();return}productManagerButton(button,true);try{await productManagerRequest(productManagerVisualCard.dataset.offerUrl,'PATCH',definition);var source=productManagerVisualCard.querySelector('[data-offer-definition]');if(source)source.value=JSON.stringify(definition,null,2);window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-async function productManagerSaveProduct(event){event.preventDefault();productManagerClearError();var button=event.target.querySelector('button[type="submit"]');productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url,'PATCH',{name:document.getElementById('manager-product-name').value.trim(),slug:document.getElementById('manager-product-slug').value.trim(),description:document.getElementById('manager-product-description').value.trim(),image_url:document.getElementById('manager-product-image').value.trim(),fulfillment_kind:document.getElementById('manager-product-fulfillment').value});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-async function productManagerSetStatus(status,button){if(status==='archived'&&!window.confirm('Archive this product? Public checkout will no longer be available.'))return;productManagerClearError();productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url,'PATCH',{status:status});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-async function productManagerDuplicate(button){productManagerClearError();productManagerButton(button,true);try{var result=await productManagerRequest(window.__productManagerConfig.product_url+'/duplicate','POST',{}),id=result.product&&result.product.id;if(!id)throw new Error('Product duplication returned no product ID');window.location.assign(window.__productManagerConfig.detail_base_url+encodeURIComponent(id))}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-async function productManagerModerate(button,decision){if(decision==='reject'&&!window.confirm('Return this listing to the seller as a draft?'))return;productManagerClearError();productManagerButton(button,true);try{await productManagerRequest(window.__productManagerConfig.product_url+'/'+decision,'POST',{});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-function productManagerCard(button){return button.closest('[data-offer-card]')}
-function productManagerCardError(card,message,focus){var target=card&&card.querySelector('[data-offer-error]');if(!target){productManagerError(message);return}target.textContent=message||'Something went wrong.';target.hidden=false;if(focus&&typeof focus.focus==='function')focus.focus();target.scrollIntoView({block:'nearest'});}
-function productManagerClearCardError(card){var target=card&&card.querySelector('[data-offer-error]');if(target){target.textContent='';target.hidden=true}card&&card.querySelectorAll('[aria-invalid="true"]').forEach(function(input){input.removeAttribute('aria-invalid')})}
-function productManagerInputs(card,purpose){var inputs={};card.querySelectorAll('[data-offer-variable="'+purpose+'"]').forEach(function(input){var key=input.dataset.variableKey,kind=input.dataset.variableKind,value;if(!key)return;if(!input.checkValidity()){input.setAttribute('aria-invalid','true');throw Object.assign(new Error((input.labels&&input.labels[0]?input.labels[0].textContent:key)+' is invalid.'),{focus:input})}if(kind==='boolean')value=input.checked;else if(kind==='multi_select')value=Array.from(input.selectedOptions,function(option){return option.value});else if(kind==='integer'){if(input.value==='')return;value=Number(input.value);if(!Number.isSafeInteger(value))throw Object.assign(new Error(key+' must be a whole number.'),{focus:input})}else if(kind==='number'){if(input.value==='')return;value=Number(input.value);if(!Number.isFinite(value))throw Object.assign(new Error(key+' must be a number.'),{focus:input})}else{if(input.value==='')return;value=input.value}inputs[key]=value});return inputs}
-function productManagerCurrencyExponent(currency){return ['BIF','CLP','DJF','GNF','JPY','KMF','KRW','MGA','PYG','RWF','UGX','VND','VUV','XAF','XOF','XPF'].indexOf(currency)!==-1?0:['BHD','JOD','KWD','OMR','TND'].indexOf(currency)!==-1?3:2}
-function productManagerMoney(minor,currency){currency=String(currency||'USD').toUpperCase();var places=productManagerCurrencyExponent(currency),value;try{value=BigInt(String(minor))}catch(_error){return currency+' —'}var negative=value<0n;if(negative)value=-value;var divisor=10n**BigInt(places),whole=value/divisor,fraction=value%divisor;return (negative?'-':'')+(places?whole+'.'+fraction.toString().padStart(places,'0'):whole.toString())+' '+currency}
-function productManagerRenderPreview(card,preview){var target=card.querySelector('[data-pricing-preview]');target.replaceChildren();var list=document.createElement('div');(preview.components||[]).forEach(function(component){var row=document.createElement('div');row.className='product-preview-row';var label=document.createElement('span');label.textContent=component.label+(component.included?'':' — not included');var amount=document.createElement('strong');amount.textContent=component.included?productManagerMoney(component.total_amount_minor,preview.amounts.currency):component.reason;row.append(label,amount);list.appendChild(row)});target.appendChild(list);var total=document.createElement('div');total.className='product-preview-total';var totalLabel=document.createElement('strong');totalLabel.textContent='Item total';var totalValue=document.createElement('strong');totalValue.textContent=productManagerMoney(preview.amounts.total_minor,preview.amounts.currency);total.append(totalLabel,totalValue);target.appendChild(total)}
-async function productManagerPreview(button){var card=productManagerCard(button),quantityInput=card.querySelector('[data-preview-quantity]');productManagerClearCardError(card);productManagerButton(button,true);try{if(!quantityInput.checkValidity())throw Object.assign(new Error('Checkout quantity must be a positive whole number.'),{focus:quantityInput});var quantity=Number(quantityInput.value);if(!Number.isSafeInteger(quantity)||quantity<1)throw Object.assign(new Error('Checkout quantity must be a positive whole number.'),{focus:quantityInput});var preview=await productManagerRequest(card.dataset.previewUrl,'POST',{offer_id:card.dataset.offerId,quantity:quantity,inputs:productManagerInputs(card,'preview')});productManagerRenderPreview(card,preview)}catch(error){productManagerCardError(card,error.message,error.focus)}finally{productManagerButton(button,false)}}
-async function productManagerOfferAction(button,action){var card=productManagerCard(button);if(action==='archive'&&!window.confirm('Archive this immutable offer? Existing order snapshots remain unchanged.'))return;productManagerClearError();productManagerButton(button,true);try{var method=action==='archive'?'DELETE':'POST',url=card.dataset.offerUrl+(action==='archive'?'':'/'+action);await productManagerRequest(url,method,action==='archive'?undefined:{});window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-async function productManagerSaveOffer(button){var card=productManagerCard(button),definition;productManagerClearError();try{definition=JSON.parse(card.querySelector('[data-offer-definition]').value)}catch(error){productManagerError('Offer definition is not valid JSON: '+error.message);return}productManagerButton(button,true);try{await productManagerRequest(card.dataset.offerUrl,'PATCH',definition);window.location.reload()}catch(error){productManagerError(error.message);productManagerButton(button,false)}}
-function productManagerSetPresetInputs(card,inputs){inputs=inputs||{};card.querySelectorAll('[data-offer-variable="preset"]').forEach(function(input){var value=inputs[input.dataset.variableKey],kind=input.dataset.variableKind;if(kind==='boolean')input.checked=value===true;else if(kind==='multi_select')Array.from(input.options).forEach(function(option){option.selected=Array.isArray(value)&&value.indexOf(option.value)!==-1});else input.value=value===undefined||value===null?'':String(value)})}
-function productManagerNewPreset(button){var card=productManagerCard(button);delete card.dataset.editPresetId;var name=card.querySelector('[data-preset-name]'),slug=card.querySelector('[data-preset-slug]'),action=card.querySelector('[data-create-link]');if(name)name.value=name.defaultValue;if(slug)slug.value='';card.querySelectorAll('[data-offer-variable="preset"]').forEach(function(input){if(input.type==='checkbox')input.checked=input.defaultChecked;else if(input.tagName==='SELECT')Array.from(input.options).forEach(function(option){option.selected=option.defaultSelected});else input.value=input.defaultValue});if(action)action.textContent='+ Create or reuse Payment Link';productManagerClearCardError(card)}
-function productManagerEditPreset(card,preset){card.dataset.editPresetId=preset.id;var name=card.querySelector('[data-preset-name]'),slug=card.querySelector('[data-preset-slug]'),action=card.querySelector('[data-create-link]');if(name)name.value=preset.name||'';if(slug)slug.value=preset.slug||'';productManagerSetPresetInputs(card,preset.inputs);if(action)action.textContent='Update preset and create/reuse link';var first=name||card.querySelector('[data-offer-variable="preset"]');if(first)first.focus()}
-async function productManagerArchivePreset(card,preset){if(!window.confirm('Archive preset '+preset.name+'? Existing Payment Links keep their immutable configuration.'))return;try{await productManagerRequest(card.dataset.presetsUrl+'/'+encodeURIComponent(preset.id),'DELETE');if(card.dataset.editPresetId===preset.id)productManagerNewPreset(card.querySelector('[data-create-link]'));await productManagerLoadPresets(card)}catch(error){productManagerCardError(card,error.message)}}
-async function productManagerLoadPresets(card){var target=card.querySelector('[data-checkout-presets]');if(!target)return;target.textContent='Loading presets…';try{var payload=await productManagerRequest(card.dataset.presetsUrl,'GET'),presets=payload.presets||[];target.replaceChildren();if(!presets.length){target.textContent='No saved presets yet.';return}presets.forEach(function(preset){var row=document.createElement('div');row.className='product-preset-row';var status=document.createElement('span');status.className='badge '+(preset.active?'badge-success':'badge-secondary');status.textContent=preset.active?'Active':'Archived';var name=document.createElement('strong');name.textContent=preset.name;var values=document.createElement('span');values.className='text-muted text-sm';values.textContent=JSON.stringify(preset.inputs||{});row.append(status,name,values);if(preset.active){var edit=document.createElement('button');edit.type='button';edit.className='btn btn--secondary btn--sm';edit.textContent='Edit preset';edit.onclick=function(){productManagerEditPreset(card,preset)};var archive=document.createElement('button');archive.type='button';archive.className='btn btn--secondary btn--sm';archive.textContent='Archive preset';archive.onclick=function(){productManagerArchivePreset(card,preset)};row.append(edit,archive)}target.appendChild(row)})}catch(error){target.textContent='Could not load presets: '+error.message}}
-async function productManagerCreateLink(button){var card=productManagerCard(button),payload={};productManagerClearCardError(card);productManagerButton(button,true);try{var nameField=card.querySelector('[data-preset-name]');if(nameField){var name=nameField.value.trim();if(!name)throw Object.assign(new Error('Preset name is required.'),{focus:nameField});var slugField=card.querySelector('[data-preset-slug]'),slug=slugField?slugField.value.trim():'';if(slugField&&!slugField.checkValidity())throw Object.assign(new Error('Preset slug may contain lowercase letters, numbers, and single hyphens.'),{focus:slugField});var visual=card.querySelector('[data-offer-variable="preset"]'),inputs;if(visual)inputs=productManagerInputs(card,'preset');else{var values=card.querySelector('[data-preset-values]');try{inputs=JSON.parse(values.value)}catch(error){throw Object.assign(new Error('Preset values are not valid JSON: '+error.message),{focus:values})}}var editing=card.dataset.editPresetId,preset=await productManagerRequest(card.dataset.presetsUrl+(editing?'/'+encodeURIComponent(editing):''),editing?'PATCH':'POST',{name:name,slug:slug,inputs:inputs});if(!preset.id)throw new Error('Preset operation returned no ID');payload.preset_id=preset.id}var completion=card.querySelector('[data-link-completion-url]');if(completion&&completion.value.trim()){if(!completion.checkValidity())throw Object.assign(new Error('After-completion URL must be a valid absolute URL.'),{focus:completion});payload.after_completion_url=completion.value.trim()}await productManagerRequest(card.dataset.linksUrl,'POST',payload);await Promise.all([productManagerLoadPresets(card),productManagerLoadLinks(card)])}catch(error){productManagerCardError(card,error.message,error.focus)}finally{productManagerButton(button,false)}}
-async function productManagerDeactivateLink(card,id){if(!window.confirm('Deactivate this Stripe Payment Link?'))return;try{await productManagerRequest(card.dataset.linksUrl+'/'+encodeURIComponent(id),'DELETE');await productManagerLoadLinks(card)}catch(error){productManagerError(error.message)}}
-async function productManagerCopy(url,button){try{await navigator.clipboard.writeText(url);button.textContent='Copied';window.setTimeout(function(){button.textContent='Copy'},1200)}catch(_error){productManagerError('Copy failed. Open the link and copy it from the address bar.')}}
-async function productManagerCopyField(button){var field=button.closest('.form-group').querySelector('[data-integration-snippet]');if(field)await productManagerCopy(field.value,button)}
-async function productManagerRetryLink(card,link,button){productManagerClearCardError(card);productManagerButton(button,true);try{await productManagerRequest(card.dataset.linksUrl,'POST',link.preset_id?{preset_id:link.preset_id}:{});await productManagerLoadLinks(card)}catch(error){productManagerCardError(card,error.message)}finally{productManagerButton(button,false)}}
-async function productManagerLoadLinks(card){var target=card.querySelector('[data-payment-links]');if(!target)return;target.textContent='Loading Payment Links…';try{var payload=await productManagerRequest(card.dataset.linksUrl,'GET'),links=payload.payment_links||[];target.replaceChildren();if(!links.length){target.textContent='No Payment Links yet.';return}links.forEach(function(link){var row=document.createElement('div');row.className='product-payment-link-row';var failed=link.sync_status==='failed',status=document.createElement('span');status.className='badge '+(failed?'badge-danger':link.active?'badge-success':'badge-secondary');status.textContent=failed?'Sync failed':link.active?'Active':'Inactive';row.appendChild(status);if(link.url){var anchor=document.createElement('a');anchor.href=link.url;anchor.target='_blank';anchor.rel='noopener';anchor.textContent='Open hosted payment page';row.appendChild(anchor)}else{var pending=document.createElement('span');pending.className='text-muted text-sm';pending.textContent='Stripe link pending';row.appendChild(pending)}if(failed){var retry=document.createElement('button');retry.type='button';retry.className='btn btn--secondary btn--sm';retry.textContent='Retry link sync';retry.onclick=function(){productManagerRetryLink(card,link,retry)};row.appendChild(retry);if(link.sync_error){var error=document.createElement('span');error.className='text-muted text-sm';error.textContent=link.sync_error;row.appendChild(error)}}if(link.active&&link.url){var copy=document.createElement('button');copy.type='button';copy.className='btn btn--secondary btn--sm';copy.textContent='Copy';copy.onclick=function(){productManagerCopy(link.url,copy)};row.appendChild(copy);var deactivate=document.createElement('button');deactivate.type='button';deactivate.className='btn btn--secondary btn--sm';deactivate.textContent='Deactivate';deactivate.onclick=function(){productManagerDeactivateLink(card,link.id)};row.appendChild(deactivate)}target.appendChild(row)})}catch(error){target.textContent='Could not load Payment Links: '+error.message}}
-function initProductManager(){document.querySelectorAll('[data-offer-card]').forEach(function(card){productManagerLoadLinks(card);productManagerLoadPresets(card)})}
-// The manager page's 17 controls, delegated. `pm-moderate` reads the decision
-// from the `data-moderation-action` attribute the two buttons already carried.
-// Guarded against htmx re-execution; see SELLER_ADMIN_JS.
-(function(){
-  if(window.__productManagerDelegated)return;
-  window.__productManagerDelegated=true;
-  document.addEventListener('submit',function(e){
-    if(e.target&&e.target.id==='product-manager-form')productManagerSaveProduct(e);
-  });
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action]');
-    if(!el)return;
-    switch(el.getAttribute('data-action')){
-      case 'pm-open-visual-editor':productManagerOpenVisualEditor(el);break;
-      case 'pm-offer-action':productManagerOfferAction(el,el.getAttribute('data-offer-op'));break;
-      case 'pm-preview':productManagerPreview(el);break;
-      case 'pm-save-offer':productManagerSaveOffer(el);break;
-      case 'pm-create-link':productManagerCreateLink(el);break;
-      case 'pm-new-preset':productManagerNewPreset(el);break;
-      case 'pm-copy-field':productManagerCopyField(el);break;
-      case 'pm-moderate':productManagerModerate(el,el.getAttribute('data-moderation-action'));break;
-      case 'pm-duplicate':productManagerDuplicate(el);break;
-      case 'pm-set-status':productManagerSetStatus(el.getAttribute('data-product-status'),el);break;
-      case 'pm-close-visual-editor':productManagerCloseVisualEditor();break;
-      case 'pm-save-visual-offer':productManagerSaveVisualOffer(el);break;
-    }
-  });
-  document.addEventListener('change',function(e){
-    var el=e.target;
-    if(el instanceof Element&&el.getAttribute('data-action')==='pm-visual-mode-changed')productManagerVisualModeChanged();
-  });
-})();
-"#;
-
-const PRODUCT_CATALOG_ADMIN_JS: &str = r#"
-function productCatalogById(id){return document.getElementById(id)}
-function productCatalogError(message,focus){var target=productCatalogById('catalog-admin-error');target.textContent=message||'Something went wrong.';target.hidden=false;if(focus&&typeof focus.focus==='function')focus.focus();target.scrollIntoView({block:'nearest'})}
-function productCatalogClearError(){var target=productCatalogById('catalog-admin-error');if(target){target.textContent='';target.hidden=true}}
-function productCatalogBusy(button,busy){if(!button)return;button.disabled=busy;if(busy){button.dataset.originalText=button.textContent;button.textContent='Saving…'}else if(button.dataset.originalText){button.textContent=button.dataset.originalText;delete button.dataset.originalText}}
-async function productCatalogRequest(url,method,body){var response=await fetch(url,{method:method,credentials:'same-origin',headers:{Accept:'application/json','Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)}),text=await response.text(),payload={};if(text){try{payload=JSON.parse(text)}catch(_error){payload={message:text}}}if(!response.ok)throw new Error(payload.message||payload.error||('Request failed ('+response.status+')'));return payload}
-function productCatalogClose(){var editor=productCatalogById('group-editor');if(editor)editor.hidden=true;productCatalogClearError()}
-function productCatalogNew(){productCatalogClearError();var editor=productCatalogById('group-editor');editor.hidden=false;productCatalogById('group-editor-id').value='';productCatalogById('group-editor-name').value='';productCatalogById('group-editor-description').value='';productCatalogById('group-editor-status').value='active';productCatalogById('group-editor-title').textContent='New group';editor.scrollIntoView({block:'start'});productCatalogById('group-editor-name').focus()}
-function productCatalogEditGroup(button){productCatalogNew();productCatalogById('group-editor-title').textContent='Edit group';productCatalogById('group-editor-id').value=button.dataset.recordId;productCatalogById('group-editor-name').value=button.dataset.recordName||'';productCatalogById('group-editor-description').value=button.dataset.recordDescription||'';productCatalogById('group-editor-status').value=button.dataset.recordStatus||'active'}
-async function productCatalogSaveGroup(event){event.preventDefault();productCatalogClearError();var form=event.target,name=productCatalogById('group-editor-name'),button=form.querySelector('button[type="submit"]');if(!form.checkValidity()){productCatalogError('Enter a group name before saving.',name);return}productCatalogBusy(button,true);try{var id=productCatalogById('group-editor-id').value,url='/b/products/api/admin/groups'+(id?'/'+encodeURIComponent(id):'');await productCatalogRequest(url,id?'PATCH':'POST',{name:name.value.trim(),description:productCatalogById('group-editor-description').value.trim(),status:productCatalogById('group-editor-status').value});window.location.reload()}catch(error){productCatalogError(error.message);productCatalogBusy(button,false)}}
-async function productCatalogDelete(button){if(!window.confirm('Delete group '+(button.dataset.recordName||'')+'? Products already using it may prevent deletion.'))return;productCatalogClearError();button.disabled=true;try{await productCatalogRequest('/b/products/api/admin/groups/'+encodeURIComponent(button.dataset.recordId),'DELETE');window.location.reload()}catch(error){productCatalogError(error.message);button.disabled=false}}
-// Guarded against htmx re-execution; see SELLER_ADMIN_JS. This is the page the
-// duplicate-listener defect was concrete on: Groups, Orders, Groups again used
-// to leave `pc-delete` bound twice, so one click raised two confirmations and
-// issued two DELETEs, the second answering not found.
-(function(){
-  if(window.__productCatalogDelegated)return;
-  window.__productCatalogDelegated=true;
-  document.addEventListener('submit',function(e){
-    if(e.target instanceof Element&&e.target.getAttribute('data-action')==='pc-save-group')productCatalogSaveGroup(e);
-  });
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action]');
-    if(!el)return;
-    var action=el.getAttribute('data-action');
-    if(action==='pc-new')productCatalogNew();
-    else if(action==='pc-close')productCatalogClose();
-    else if(action==='pc-edit-group')productCatalogEditGroup(el);
-    else if(action==='pc-delete')productCatalogDelete(el);
-  });
-})();
-"#;
 
 // ---------------------------------------------------------------------------
 // Admin: Groups
@@ -2474,7 +1913,7 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 Err(e) => { div .login-error { "Error: " (e.message) } }
             }
         }
-        script { (maud::PreEscaped(PRODUCT_CATALOG_ADMIN_JS)) }
+        script src=(assets::catalog_admin_js_url()) {}
     };
 
     ui::shell_page(
@@ -2644,215 +2083,6 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
     }
 }
 
-fn stripe_setup_js() -> &'static str {
-    r#"
-async function testStripeConnection(){
-  var button=document.getElementById('stripe-test-button');
-  var state=document.getElementById('stripe-state');
-  var error=document.getElementById('stripe-error');
-  button.disabled=true;button.textContent='Testing…';error.textContent='';
-  try{
-    var response=await fetch('/b/products/api/admin/stripe/status',{credentials:'same-origin'});
-    var data=await response.json();
-    if(!response.ok)throw new Error(data.message||'Stripe connection test failed.');
-    var labels={not_configured:'Not configured',connected_test:'Connected — test mode',connected_live:'Connected — live mode',misconfigured:'Connection problem'};
-    state.textContent=labels[data.state]||data.state||'Unknown';
-    state.className='badge '+(data.state==='connected_live'?'badge-success':data.state==='connected_test'?'badge-info':data.state==='misconfigured'?'badge-danger':'badge-warning');
-    error.textContent=data.error||'Connection test completed.';
-  }catch(err){error.textContent=err.message||'Stripe connection test failed.'}
-  finally{button.disabled=false;button.textContent='Test connection'}
-}
-function stripeWebhookElement(tag,text,className){
-  var element=document.createElement(tag);
-  if(text!==undefined)element.textContent=text;
-  if(className)element.className=className;
-  return element;
-}
-function stripeWebhookDate(value){
-  if(!value)return '—';
-  var date=new Date(value);
-  return Number.isNaN(date.getTime())?value:date.toLocaleString();
-}
-function stripeWebhookStatus(status){
-  return (status||'unknown').replace(/_/g,' ');
-}
-function renderStripeWebhookEvents(data){
-  var target=document.getElementById('stripe-webhook-events');
-  var summary=document.getElementById('stripe-webhook-summary');
-  var records=Array.isArray(data.records)?data.records:[];
-  target.replaceChildren();
-  summary.textContent=(data.total_count||0)+' event'+(data.total_count===1?'':'s')+' match this filter.';
-  if(!records.length){
-    target.appendChild(stripeWebhookElement('p','No matching webhook events.','text-muted text-sm'));
-    return;
-  }
-  var table=stripeWebhookElement('table',undefined,'data-table');
-  var head=document.createElement('thead'),headRow=document.createElement('tr');
-  ['Event','Status','Mode / attempts','Last result','Action'].forEach(function(label){headRow.appendChild(stripeWebhookElement('th',label))});
-  head.appendChild(headRow);table.appendChild(head);
-  var body=document.createElement('tbody');
-  records.forEach(function(event){
-    var row=document.createElement('tr');
-    var eventCell=document.createElement('td');
-    eventCell.dataset.label='Event';
-    eventCell.appendChild(stripeWebhookElement('strong',event.event_type||'Unknown event'));
-    eventCell.appendChild(document.createElement('br'));
-    eventCell.appendChild(stripeWebhookElement('code',event.id));
-    if(event.stripe_account_id){eventCell.appendChild(document.createElement('br'));eventCell.appendChild(stripeWebhookElement('span',event.stripe_account_id,'text-muted text-sm'))}
-    row.appendChild(eventCell);
-    var statusCell=document.createElement('td');statusCell.dataset.label='Status';
-    var badgeClass=event.status==='processed'?'badge-success':event.status==='dead_letter'?'badge-danger':event.status==='failed'?'badge-warning':'badge-info';
-    statusCell.appendChild(stripeWebhookElement('span',stripeWebhookStatus(event.status),'badge '+badgeClass));row.appendChild(statusCell);
-    var attempts=document.createElement('td');attempts.dataset.label='Mode / attempts';attempts.textContent=(event.livemode?'Live':'Test')+' · '+event.attempts;row.appendChild(attempts);
-    var result=document.createElement('td');result.dataset.label='Last result';
-    result.appendChild(stripeWebhookElement('span',event.last_error||'No processing error recorded.',event.last_error?'':'text-muted'));
-    result.appendChild(document.createElement('br'));
-    result.appendChild(stripeWebhookElement('span',event.next_retry_at?'Retry '+stripeWebhookDate(event.next_retry_at):stripeWebhookDate(event.updated_at),'text-muted text-sm'));
-    row.appendChild(result);
-    var action=document.createElement('td');action.dataset.label='Action';
-    if(event.status==='failed'||event.status==='dead_letter'){
-      var replay=stripeWebhookElement('button','Replay','btn btn--secondary btn--sm');replay.type='button';
-      replay.setAttribute('aria-label','Replay webhook '+event.id);
-      replay.onclick=function(){replayStripeWebhookEvent(event.id,replay)};action.appendChild(replay);
-    }else{action.appendChild(stripeWebhookElement('span','—','text-muted'))}
-    row.appendChild(action);body.appendChild(row);
-  });
-  table.appendChild(body);target.appendChild(table);
-}
-// Both lists are replaced wholesale, so two loads in flight at once can land
-// out of order and leave the list disagreeing with the filter that produced
-// it. Each load takes a ticket and only paints if it is still the newest --
-// last request wins, and a superseded response is dropped rather than blocked,
-// which a plain busy flag could not do without losing the newer filter value.
-var stripeWebhookLoadTicket=0;
-async function loadStripeWebhookEvents(){
-  var ticket=++stripeWebhookLoadTicket;
-  var target=document.getElementById('stripe-webhook-events');
-  var error=document.getElementById('stripe-webhook-error');
-  var status=document.getElementById('stripe-webhook-filter').value;
-  error.hidden=true;error.textContent='';target.textContent='Loading webhook events…';
-  try{
-    var query='?page=1&page_size=50'+(status?'&status='+encodeURIComponent(status):'');
-    var response=await fetch('/b/products/api/admin/webhook-events'+query,{credentials:'same-origin'});
-    var data={};try{data=await response.json()}catch(_){}
-    if(ticket!==stripeWebhookLoadTicket)return;
-    if(!response.ok)throw new Error(data.message||'Could not load webhook events.');
-    renderStripeWebhookEvents(data);
-  }catch(err){
-    if(ticket!==stripeWebhookLoadTicket)return;
-    target.replaceChildren();error.textContent=err.message||'Could not load webhook events.';error.hidden=false
-  }
-}
-async function replayStripeWebhookEvent(id,button){
-  if(!window.confirm('Replay this Stripe webhook through the normal validation pipeline?'))return;
-  var error=document.getElementById('stripe-webhook-error');
-  button.disabled=true;button.textContent='Replaying…';error.hidden=true;
-  try{
-    var response=await fetch('/b/products/api/admin/webhook-events/'+encodeURIComponent(id)+'/replay',{method:'POST',credentials:'same-origin'});
-    var data={};try{data=await response.json()}catch(_){}
-    if(!response.ok)throw new Error(data.message||'Could not replay the webhook event.');
-    await loadStripeWebhookEvents();
-  }catch(err){error.textContent=err.message||'Could not replay the webhook event.';error.hidden=false;button.disabled=false;button.textContent='Replay'}
-}
-function renderStripeProviderOperations(data){
-  var target=document.getElementById('stripe-provider-operations-list');
-  var summary=document.getElementById('stripe-provider-summary');
-  var records=Array.isArray(data.records)?data.records:[];
-  target.replaceChildren();
-  summary.textContent=(data.total_count||0)+' operation'+(data.total_count===1?'':'s')+' match this filter.';
-  if(!records.length){target.appendChild(stripeWebhookElement('p','No matching provider operations.','text-muted text-sm'));return}
-  var table=stripeWebhookElement('table',undefined,'data-table');
-  var head=document.createElement('thead'),headRow=document.createElement('tr');
-  ['Operation','Status','Attempts','Last result'].forEach(function(label){headRow.appendChild(stripeWebhookElement('th',label))});
-  head.appendChild(headRow);table.appendChild(head);var body=document.createElement('tbody');
-  records.forEach(function(operation){
-    var row=document.createElement('tr');
-    var identity=document.createElement('td');identity.dataset.label='Operation';
-    identity.appendChild(stripeWebhookElement('strong',operation.operation_type||'Provider operation'));
-    identity.appendChild(document.createElement('br'));identity.appendChild(stripeWebhookElement('code',operation.aggregate_id||operation.id));
-    if(operation.stripe_account_id){identity.appendChild(document.createElement('br'));identity.appendChild(stripeWebhookElement('span',operation.stripe_account_id,'text-muted text-sm'))}
-    row.appendChild(identity);
-    var state=document.createElement('td');state.dataset.label='Status';
-    var badgeClass=operation.status==='succeeded'?'badge-success':operation.status==='dead_letter'?'badge-danger':operation.status==='failed'?'badge-warning':'badge-info';
-    state.appendChild(stripeWebhookElement('span',stripeWebhookStatus(operation.status),'badge '+badgeClass));row.appendChild(state);
-    var attempts=document.createElement('td');attempts.dataset.label='Attempts';attempts.textContent=String(operation.attempts||0);row.appendChild(attempts);
-    var result=document.createElement('td');result.dataset.label='Last result';
-    result.appendChild(stripeWebhookElement('span',operation.last_error||'No reconciliation error recorded.',operation.last_error?'':'text-muted'));
-    result.appendChild(document.createElement('br'));
-    result.appendChild(stripeWebhookElement('span',operation.next_attempt_at?'Retry '+stripeWebhookDate(operation.next_attempt_at):stripeWebhookDate(operation.updated_at),'text-muted text-sm'));
-    row.appendChild(result);body.appendChild(row);
-  });
-  table.appendChild(body);target.appendChild(table);
-}
-// Ticketed for the same reason as loadStripeWebhookEvents above.
-var stripeProviderLoadTicket=0;
-async function loadStripeProviderOperations(){
-  var ticket=++stripeProviderLoadTicket;
-  var target=document.getElementById('stripe-provider-operations-list');
-  var error=document.getElementById('stripe-provider-error');
-  var status=document.getElementById('stripe-provider-filter').value;
-  error.hidden=true;error.textContent='';target.textContent='Loading provider operations…';
-  try{
-    var query='?page=1&page_size=50'+(status?'&status='+encodeURIComponent(status):'');
-    var response=await fetch('/b/products/api/admin/provider-operations'+query,{credentials:'same-origin'});
-    var data={};try{data=await response.json()}catch(_){}
-    if(ticket!==stripeProviderLoadTicket)return;
-    if(!response.ok)throw new Error(data.message||'Could not load provider operations.');
-    renderStripeProviderOperations(data);
-  }catch(err){
-    if(ticket!==stripeProviderLoadTicket)return;
-    target.replaceChildren();error.textContent=err.message||'Could not load provider operations.';error.hidden=false
-  }
-}
-async function reconcileStripeProviderOperations(button){
-  var error=document.getElementById('stripe-provider-error');
-  var result=document.getElementById('stripe-provider-reconcile-result');
-  button.disabled=true;button.textContent='Reconciling…';error.hidden=true;result.textContent='';
-  try{
-    var response=await fetch('/b/products/api/admin/provider-operations/reconcile?limit=50',{method:'POST',credentials:'same-origin'});
-    var data={};try{data=await response.json()}catch(_){}
-    if(!response.ok)throw new Error(data.message||'Could not reconcile provider operations.');
-    result.textContent='Claimed '+data.claimed+'; completed '+data.succeeded+'; retry scheduled '+data.retry_scheduled+'; manual review '+data.dead_letter+'.';
-    await loadStripeProviderOperations();
-  }catch(err){error.textContent=err.message||'Could not reconcile provider operations.';error.hidden=false}
-  finally{button.disabled=false;button.textContent='Reconcile due operations'}
-}
-// Guarded against htmx re-execution; see SELLER_ADMIN_JS. The two initial
-// loads below stay outside the guard: the swap brought in empty containers, so
-// they have to be filled again even though the listeners are already bound.
-(function(){
-  if(window.__stripeSetupDelegated)return;
-  window.__stripeSetupDelegated=true;
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action]');
-    if(!el)return;
-    var action=el.getAttribute('data-action');
-    if(action==='ps-test-connection')testStripeConnection();
-    else if(action==='ps-reconcile')reconcileStripeProviderOperations(el);
-    // The two filter <select>s carry the same verbs as their Refresh buttons,
-    // and `closest('[data-action]')` matches the <select> itself -- so without
-    // this the mousedown that OPENS the dropdown would fire a load with the
-    // value the user is on their way to changing, and the change event would
-    // fire a second one. Only the buttons act on click.
-    else if(el.tagName!=='SELECT'){
-      if(action==='ps-load-webhooks')loadStripeWebhookEvents();
-      else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
-    }
-  });
-  document.addEventListener('change',function(e){
-    var el=e.target;
-    if(!(el instanceof Element))return;
-    var action=el.getAttribute('data-action');
-    if(action==='ps-load-webhooks')loadStripeWebhookEvents();
-    else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
-  });
-})();
-loadStripeWebhookEvents();
-loadStripeProviderOperations();
-"#
-}
-
 pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let status = stripe_provider::connection_status(ctx).await;
     let connected = matches!(
@@ -2981,7 +2211,7 @@ pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
             }
         }
         }
-        script { (maud::PreEscaped(stripe_setup_js())) }
+        script src=(assets::stripe_setup_js_url()) {}
     };
     ui::shell_page(
         ctx,
@@ -3086,52 +2316,6 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
     }
 }
 
-fn commerce_portal_js() -> &'static str {
-    r#"
-function commercePortalError(message){
-  var el=document.getElementById('commerce-portal-error');
-  if(el){el.textContent=message||'Something went wrong. Please try again.';el.hidden=false}
-}
-async function commercePortalRedirect(path,body){
-  var response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  var data={};try{data=await response.json()}catch(_){}
-  if(!response.ok)throw new Error(data.message||'The request could not be completed.');
-  if(!data.url||!/^https:\/\//.test(data.url))throw new Error('The payment provider returned an invalid redirect.');
-  window.location.assign(data.url);
-}
-async function startSellerOnboarding(){
-  try{
-    var target=window.location.origin+'/b/products/';
-    await commercePortalRedirect('/b/products/api/seller/onboarding',{return_url:target+'?stripe=returned',refresh_url:target+'?stripe=refresh'});
-  }catch(error){commercePortalError(error.message)}
-}
-async function openSellerDashboard(){
-  try{await commercePortalRedirect('/b/products/api/seller/dashboard',{})}
-  catch(error){commercePortalError(error.message)}
-}
-async function manageBuyerBilling(){
-  try{await commercePortalRedirect('/b/products/billing-portal',{return_url:window.location.origin+'/b/products/'})}
-  catch(error){commercePortalError(error.message)}
-}
-// `pp-order-billing` is handled by ORDER_DETAIL_JS, which is emitted after
-// this file on the one page that needs it.
-// Guarded against htmx re-execution; see SELLER_ADMIN_JS.
-(function(){
-  if(window.__commercePortalDelegated)return;
-  window.__commercePortalDelegated=true;
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action]');
-    if(!el)return;
-    var action=el.getAttribute('data-action');
-    if(action==='pp-seller-onboarding')startSellerOnboarding();
-    else if(action==='pp-seller-dashboard')openSellerDashboard();
-    else if(action==='pp-buyer-billing')manageBuyerBilling();
-  });
-})();
-"#
-}
-
 pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
@@ -3221,7 +2405,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 (seller_status_card(seller_account.as_ref(), fee_basis_points))
             }
         }
-        script { (maud::PreEscaped(commerce_portal_js())) }
+        script src=(assets::commerce_portal_js_url()) {}
     };
     ui::shell_page(
         ctx,
@@ -3287,7 +2471,7 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
         (seller_status_card(account.as_ref(), fee_basis_points))
         (analytics_section(&analytics, "Your sales by currency", true))
         (seller_failures_section(&failures))
-        script { (maud::PreEscaped(commerce_portal_js())) }
+        script src=(assets::commerce_portal_js_url()) {}
     };
     ui::shell_page(
         ctx,
@@ -3406,29 +2590,6 @@ pub async fn seller_order_detail(
 ) -> OutputStream {
     order_detail(ctx, msg, purchase_id, OrderPageAccess::Seller).await
 }
-
-const ORDER_DETAIL_JS: &str = r#"
-function orderDetailError(message){var target=document.getElementById('order-detail-error');if(target){target.textContent=message||'Something went wrong.';target.hidden=false;target.scrollIntoView({block:'nearest'})}}
-function parseOrderRefundMinor(value,exponent){value=value.trim();if(!value)return null;if(!/^[+]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))throw new Error('Enter a plain positive amount.');value=value.replace(/^\+/,'');var parts=value.split('.'),whole=parts[0]||'0',fraction=parts[1]||'';if(fraction.length>exponent&&/[1-9]/.test(fraction.slice(exponent)))throw new Error('The amount has too many decimal places for this currency.');fraction=fraction.slice(0,exponent).padEnd(exponent,'0');var minor=BigInt(whole)*(10n**BigInt(exponent))+BigInt(fraction||'0');if(minor<=0n)throw new Error('Refund amount must be positive.');if(minor>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('This amount is too large for the browser refund form.');return Number(minor)}
-async function submitOrderRefund(button){var config=window.__orderDetailConfig,target=document.getElementById('order-detail-error');if(target)target.hidden=true;button.disabled=true;button.textContent='Refunding…';try{var amount=parseOrderRefundMinor(document.getElementById('order-refund-amount').value,config.currency_exponent),note=document.getElementById('order-refund-note').value.trim(),body={note:note,idempotency_key:'ui_'+config.refunded_total+'_'+(amount===null?'full':amount)};if(amount!==null)body.amount_minor=amount;var response=await fetch(config.refund_url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)}),payload={};try{payload=await response.json()}catch(_error){}if(!response.ok)throw new Error(payload.message||payload.error||'Refund failed.');window.location.reload()}catch(error){orderDetailError(error.message);button.disabled=false;button.textContent='Create refund'}}
-async function manageOrderBilling(){var config=window.__orderDetailConfig;try{await commercePortalRedirect('/b/products/billing-portal',{return_url:window.location.href,order_id:config.order_id})}catch(error){orderDetailError(error.message)}}
-// Guarded against htmx re-execution; see SELLER_ADMIN_JS. The refund is the
-// one mutating action on these pages that carries an idempotency key, so a
-// double dispatch would not have double-charged -- but it would still have
-// raised two requests and two error paints.
-(function(){
-  if(window.__orderDetailDelegated)return;
-  window.__orderDetailDelegated=true;
-  document.addEventListener('click',function(e){
-    if(!(e.target instanceof Element))return;
-    var el=e.target.closest('[data-action]');
-    if(!el)return;
-    var action=el.getAttribute('data-action');
-    if(action==='po-submit-refund')submitOrderRefund(el);
-    else if(action==='pp-order-billing')manageOrderBilling();
-  });
-})();
-"#;
 
 async fn order_detail(
     ctx: &dyn Context,
@@ -3731,7 +2892,9 @@ async fn order_detail(
                 }
             }
         }
-        script { (maud::PreEscaped(format!("window.__orderDetailConfig={};\n{}\n{}", page_config, commerce_portal_js(), ORDER_DETAIL_JS))) }
+        script { (maud::PreEscaped(format!("window.__orderDetailConfig={page_config};"))) }
+        script src=(assets::commerce_portal_js_url()) {}
+        script src=(assets::order_detail_js_url()) {}
     };
     ui::shell_page(
         ctx,

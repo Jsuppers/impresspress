@@ -2379,27 +2379,34 @@ async fn admin_product_wizard_exposes_simple_and_advanced_templates() {
     }
     assert!(html.contains("Customer fields"));
     assert!(html.contains("Itemized price rows"));
-    assert!(html.contains("Condition"));
     assert!(html.contains("Checkout options"));
     assert!(html.contains("Create and publish"));
     assert!(html.contains(r#"value="NZD""#));
     assert!(html.contains(r#"id="wizard-automatic-tax" type="checkbox" checked"#));
     assert!(html.contains("/b/products/api/admin/products"));
-    assert!(html.contains("BigInt"), "money conversion must be exact");
-    assert!(html.contains("wizardCurrencyExponent"));
-    assert!(html.contains("unit_amount_minor"));
-    assert!(html.contains(r#"value="graduated""#));
-    assert!(html.contains(r#"value="volume""#));
-    assert!(html.contains(r#"value="package""#));
-    assert!(html.contains("wizardParseTiers"));
-    assert!(html.contains("wizardParseLookup"));
-    assert!(html.contains("wizardParseShippingCountries"));
-    assert!(html.contains("wizardParseShippingOptions"));
     assert!(html.contains(r#"id="wizard-shipping-countries""#));
     assert!(html.contains(r#"value="NZ""#));
     assert!(html.contains("Inline rates work in hosted and embedded Checkout"));
     assert!(html.contains("Create a Stripe Customer for one-time payments"));
-    assert!(html.contains("upper bound | unit amount | flat amount"));
+
+    // The advanced rows, the price-model options and the money maths are the
+    // bundle's, not the page's. `loaded_bundle` asserts the page loads it.
+    #[cfg(feature = "embed-assets")]
+    {
+        let js = loaded_bundle(&html, "products-wizard.js");
+        assert!(js.contains("Condition"));
+        assert!(js.contains("BigInt"), "money conversion must be exact");
+        assert!(js.contains("wizardCurrencyExponent"));
+        assert!(js.contains("unit_amount_minor"));
+        assert!(js.contains(r#"value="graduated""#));
+        assert!(js.contains(r#"value="volume""#));
+        assert!(js.contains(r#"value="package""#));
+        assert!(js.contains("wizardParseTiers"));
+        assert!(js.contains("wizardParseLookup"));
+        assert!(js.contains("wizardParseShippingCountries"));
+        assert!(js.contains("wizardParseShippingOptions"));
+        assert!(js.contains("upper bound | unit amount | flat amount"));
+    }
 }
 
 #[tokio::test]
@@ -2494,7 +2501,9 @@ async fn admin_product_manager_renders_product_offer_lifecycle_and_payment_link_
     assert!(html.contains(&format!(
         "/b/products/api/admin/products/{product_id}/offers/{active_id}/payment-links"
     )));
-    assert!(html.contains("navigator.clipboard"));
+    // Copy-to-clipboard is the bundle's; the page's half is loading it.
+    #[cfg(feature = "embed-assets")]
+    assert!(loaded_bundle(&html, "products-manager.js").contains("navigator.clipboard"));
 
     wafer_core::clients::database::update(
         &test_ctx,
@@ -3277,12 +3286,20 @@ async fn the_close_manager_offers_nothing_that_keeps_selling() {
         "the page must render the product and its closing actions: {html}"
     );
 
+    // Each name is markup the FULL manager renders. They used to be the
+    // JavaScript handler names, which were only ever in this page's HTML
+    // because the manager bundle was inlined into it — two of the five had
+    // already ceased to exist anywhere in the tree, and the bundle is an
+    // external file now, so the whole list asserted nothing. `data-action`
+    // verbs and the bundle's own URL stem are what actually distinguish the
+    // two pages.
     for forbidden in [
-        "productManagerPublishOffer",
-        "productManagerSyncOffer",
-        "productManagerDuplicate",
-        "productManagerCreateLink",
-        "productManagerSetStatus",
+        "data-offer-op=\"publish\"",
+        "data-offer-op=\"sync\"",
+        "data-action=\"pm-duplicate\"",
+        "data-action=\"pm-create-link\"",
+        "data-action=\"pm-set-status\"",
+        "products-manager",
         "product-manager-form",
         "/b/products/catalog/gone",
     ] {
@@ -3402,12 +3419,19 @@ async fn stripe_setup_guides_configuration_without_rendering_credentials() {
     assert!(html.contains("Test connection"));
     assert!(html.contains("Webhook delivery health"));
     assert!(html.contains("Needs manual review"));
-    assert!(html.contains("/b/products/api/admin/webhook-events"));
-    assert!(html.contains("replayStripeWebhookEvent"));
     assert!(html.contains("Provider reconciliation"));
     assert!(html.contains("Reconcile due operations"));
-    assert!(html.contains("/b/products/api/admin/provider-operations"));
-    assert!(html.contains("reconcileStripeProviderOperations"));
+    // The page renders empty containers and a Reconcile button; the two
+    // administration endpoints they are filled from, and the replay and
+    // reconcile calls, are the bundle's.
+    #[cfg(feature = "embed-assets")]
+    {
+        let js = loaded_bundle(&html, "products-stripe-setup.js");
+        assert!(js.contains("/b/products/api/admin/webhook-events"));
+        assert!(js.contains("replayStripeWebhookEvent"));
+        assert!(js.contains("/b/products/api/admin/provider-operations"));
+        assert!(js.contains("reconcileStripeProviderOperations"));
+    }
     assert!(!html.contains("pk_test_must_never_render"));
     assert!(!html.contains("whsec_must_never_render"));
     assert!(html.contains(r#"href="/b/products/admin/stripe""#));
