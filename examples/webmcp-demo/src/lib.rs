@@ -2,7 +2,7 @@
 //! to Cloudflare so a WebMCP-capable browser can register the storefront
 //! tools from a public URL.
 //!
-//! There is deliberately nothing here but the two Worker entry points.
+//! There is deliberately nothing here but the three Worker entry points.
 //! Every page of this site carries `ui/assets/webmcp.js`, which fetches
 //! `/b/webmcp/manifest.json` (filtered to the visitor's auth level) and
 //! registers each tool with `document.modelContext`. The tools themselves
@@ -21,6 +21,25 @@ async fn fetch_main(
     ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
     impresspress_cloudflare::run(req, env, ctx, Ok, |_wafer, _storage| Ok(())).await
+}
+
+/// Cloudflare Worker `scheduled` entrypoint, for the `[triggers] crons`
+/// schedule `impresspress deploy` writes into `wrangler.toml`. Defers to
+/// [`impresspress_cloudflare::run_scheduled`], which runs the auth retention
+/// sweep and nothing else.
+///
+/// The two registration hooks are the same ones `fetch_main` passes — both
+/// entry points share one per-isolate runtime cache, so a `scheduled` handler
+/// that registered a different block set would leave the wrong runtime cached
+/// for the next request.
+#[cfg(feature = "target-cloudflare")]
+#[worker::event(scheduled)]
+async fn scheduled_main(
+    event: worker::ScheduledEvent,
+    env: worker::Env,
+    ctx: worker::ScheduleContext,
+) {
+    impresspress_cloudflare::run_scheduled(event, env, ctx, Ok, |_wafer, _storage| Ok(())).await
 }
 
 /// Cloudflare Worker `start` entrypoint: one-time isolate initialization

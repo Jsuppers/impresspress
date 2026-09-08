@@ -7,9 +7,9 @@ use impresspress::cli::helpers::cloudflare::{
     wrangler::{
         generate, generate_candidate_upload, generate_final_upload, generate_upload,
         generate_upload_with_release, CloudflareConfig, D1Config, R2Config, ASSET_BASE_URL_VAR,
-        PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR,
-        PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_WAFER_LOCK_IDENTITY_VAR, RELEASE_ASSET_ID_VAR,
-        RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
+        DEFAULT_CRONS, PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR,
+        PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_WAFER_LOCK_IDENTITY_VAR,
+        RELEASE_ASSET_ID_VAR, RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
         RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR,
     },
 };
@@ -35,6 +35,7 @@ fn sample_cfg() -> CloudflareConfig {
         },
         wrangler_overrides_path: None,
         head_sampling_rate: 1.0,
+        crons: DEFAULT_CRONS.iter().map(|s| s.to_string()).collect(),
         deploy_smoke_paths: vec!["/health".into()],
     }
 }
@@ -132,6 +133,64 @@ fn generate_writes_configured_head_sampling_rate() {
         body.contains("head_sampling_rate = 0.1"),
         "generated toml should reflect the configured sampling rate, not a \
          hardcoded 1.0:\n{body}"
+    );
+}
+
+/// Golden for the generated `[triggers]` section. It is what makes the
+/// Worker's `scheduled` handler run at all, and it is written into every
+/// deployment, so the exact rendered text is the reviewed artifact — not
+/// "somewhere in the file there is a cron".
+#[test]
+fn generate_writes_the_default_daily_cron_trigger_section() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    let path = generate(&sample_cfg(), repo_root, &out).unwrap();
+    let body = fs::read_to_string(&path).unwrap();
+
+    assert!(
+        body.contains("[triggers]\ncrons = [\"17 3 * * *\"]\n"),
+        "expected the default daily cron trigger section verbatim:\n{body}"
+    );
+    assert_eq!(
+        DEFAULT_CRONS,
+        ["17 3 * * *"],
+        "the golden above spells the default out; keep them in step"
+    );
+}
+
+/// The schedule is a deployment's own operational choice — a fleet that wants
+/// the retention sweep at a different hour, more often, or not at all must not
+/// have to reach for a `wrangler_overrides_path` file.
+#[test]
+fn generate_writes_a_configured_cron_schedule_and_omits_the_section_when_disabled() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    let mut cfg = sample_cfg();
+    cfg.crons = vec!["0 * * * *".into(), "30 4 * * 1".into()];
+    let path = generate(&cfg, repo_root, &out).unwrap();
+    let body = fs::read_to_string(&path).unwrap();
+    // `toml::to_string_pretty` breaks a multi-element array across lines; a
+    // single-element one stays inline. Both forms are in the golden so a
+    // change to either rendering is a reviewed diff.
+    assert!(
+        body.contains("[triggers]\ncrons = [\n    \"0 * * * *\",\n    \"30 4 * * 1\",\n]\n"),
+        "expected the configured schedules verbatim:\n{body}"
+    );
+
+    let mut cfg = sample_cfg();
+    cfg.crons = Vec::new();
+    let path = generate(&cfg, repo_root, &out).unwrap();
+    let body = fs::read_to_string(&path).unwrap();
+    assert!(
+        !body.contains("[triggers]"),
+        "an empty schedule list means no scheduled invocation at all, not an \
+         empty trigger section:\n{body}"
     );
 }
 

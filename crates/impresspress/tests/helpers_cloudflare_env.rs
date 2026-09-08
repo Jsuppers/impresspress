@@ -132,6 +132,48 @@ fn resolve_preserves_configured_deploy_smoke_paths_and_trailing_slashes() {
 }
 
 #[test]
+fn resolve_defaults_crons_to_the_daily_sweep_and_takes_an_explicit_list() {
+    let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
+    assert_eq!(cfg.crons, vec!["17 3 * * *"]);
+
+    let configured = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"",
+        "compatibility_date = \"2026-05-01\"\ncrons = [\"0 */6 * * *\"]",
+    );
+    let cfg = parse_str(&configured).resolve(fake_env(&[])).unwrap();
+    assert_eq!(cfg.crons, vec!["0 */6 * * *"]);
+
+    // Empty is a real answer, not a mistake: this deployment runs no cron.
+    let disabled = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"",
+        "compatibility_date = \"2026-05-01\"\ncrons = []",
+    );
+    let cfg = parse_str(&disabled).resolve(fake_env(&[])).unwrap();
+    assert!(cfg.crons.is_empty());
+}
+
+/// `wrangler deploy` rejects a malformed cron at the very end of a two-stage
+/// deployment, after the candidate has been uploaded. Reject it before
+/// anything is built.
+#[test]
+fn resolve_rejects_a_cron_expression_that_is_not_five_fields() {
+    for invalid in ["17 3 * *", "17 3 * * * *", "@daily", ""] {
+        let configured = FULL_TOML.replace(
+            "compatibility_date = \"2026-05-01\"",
+            &format!(
+                "compatibility_date = \"2026-05-01\"\ncrons = [{}]",
+                serde_json::to_string(invalid).unwrap()
+            ),
+        );
+        let err = parse_str(&configured).resolve(fake_env(&[])).unwrap_err();
+        assert!(
+            err.to_string().contains("five-field cron expression"),
+            "{invalid:?} should be refused: {err}"
+        );
+    }
+}
+
+#[test]
 fn resolve_rejects_empty_deploy_smoke_path_list() {
     let configured = FULL_TOML.replace(
         "compatibility_date = \"2026-05-01\"",

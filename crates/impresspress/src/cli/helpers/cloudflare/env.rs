@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-use super::wrangler::{CloudflareConfig, D1Config, R2Config};
+use super::wrangler::{self, CloudflareConfig, D1Config, R2Config};
 
 /// Default Workers Observability head sampling rate when neither
 /// `IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE` nor `impresspress.toml`'s
@@ -39,6 +39,10 @@ pub struct RawCloudflareConfig {
     /// defaults to [`DEFAULT_HEAD_SAMPLING_RATE`] when unset by both toml
     /// and env.
     pub head_sampling_rate: Option<f64>,
+    /// Cloudflare cron expressions for the Worker's `scheduled` handler.
+    /// TOML-only; defaults to [`wrangler::DEFAULT_CRONS`]. An explicit empty
+    /// list disables the schedule.
+    pub crons: Option<Vec<String>>,
     /// Ordinary application paths exercised before promotion. TOML-only;
     /// defaults to `/health` for existing consumers.
     pub deploy_smoke_paths: Option<Vec<String>>,
@@ -158,6 +162,7 @@ impl RawCloudflareConfig {
             env("IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE"),
             self.head_sampling_rate,
         )?;
+        let crons = resolve_crons(self.crons)?;
         let deploy_smoke_paths = resolve_deploy_smoke_paths(self.deploy_smoke_paths)?;
         Ok(CloudflareConfig {
             account_id,
@@ -177,6 +182,7 @@ impl RawCloudflareConfig {
             },
             wrangler_overrides_path: self.wrangler_overrides_path,
             head_sampling_rate,
+            crons,
             deploy_smoke_paths,
         })
     }
@@ -219,6 +225,34 @@ fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) ->
         );
     }
     Ok(rate)
+}
+
+/// Resolve `[cloudflare].crons`: an explicit list (empty included, which
+/// disables the schedule) or [`wrangler::DEFAULT_CRONS`].
+///
+/// Each entry is checked for the five whitespace-separated fields Cloudflare's
+/// cron parser requires. A malformed expression is rejected by `wrangler
+/// deploy` at the very end of a two-stage deployment, long after the candidate
+/// has been uploaded, so failing here — before anything is built — is worth
+/// the eleven lines.
+fn resolve_crons(crons: Option<Vec<String>>) -> Result<Vec<String>> {
+    let crons = crons.unwrap_or_else(|| {
+        wrangler::DEFAULT_CRONS
+            .iter()
+            .map(|cron| (*cron).to_string())
+            .collect()
+    });
+    for (index, cron) in crons.iter().enumerate() {
+        let fields = cron.split_whitespace().count();
+        if fields != 5 {
+            bail!(
+                "cloudflare.crons[{index}] must be a five-field cron expression \
+                 (minute hour day-of-month month day-of-week), found {fields} \
+                 field(s): {cron:?}"
+            );
+        }
+    }
+    Ok(crons)
 }
 
 fn resolve_deploy_smoke_paths(paths: Option<Vec<String>>) -> Result<Vec<String>> {

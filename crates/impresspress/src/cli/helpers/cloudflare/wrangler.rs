@@ -32,6 +32,20 @@ pub const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFES
 pub const PREPARED_WAFER_LOCK_IDENTITY_VAR: &str =
     impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR;
 
+/// Default `[triggers] crons` for a generated Worker config.
+///
+/// One invocation a day, at an off-peak minute that is not `:00` — Cloudflare
+/// schedules every account's `0 * * * *` at the same instant, and this work is
+/// not urgent enough to join that queue. What runs on it is the auth retention
+/// sweep (`auth.maintenance`), which is throttled to at most one pass an hour
+/// anyway and which every deployment already performs opportunistically on
+/// login; the schedule exists so a deployment with no logins still prunes.
+///
+/// Overridable per deployment through `[cloudflare].crons` in
+/// `impresspress.toml`, including to the empty list, which emits no
+/// `[triggers]` section and so schedules nothing.
+pub const DEFAULT_CRONS: &[&str] = &["17 3 * * *"];
+
 #[derive(Debug, Clone)]
 pub struct CloudflareConfig {
     pub account_id: String,
@@ -50,6 +64,11 @@ pub struct CloudflareConfig {
     /// deployment that outgrows 100%-capture traffic doesn't have to reach
     /// for a `wrangler_overrides_path` file to dial it down.
     pub head_sampling_rate: f64,
+    /// Cloudflare cron expressions the Worker's `scheduled` handler runs on,
+    /// resolved by [`super::env::RawCloudflareConfig::resolve`] from
+    /// `impresspress.toml`'s `[cloudflare].crons`, defaulting to
+    /// [`DEFAULT_CRONS`]. Empty means no `[triggers]` section at all.
+    pub crons: Vec<String>,
     /// Ordinary routes exercised by the bounded mixed-concurrency gate after
     /// final-version verification and before promotion. Resolution guarantees
     /// a non-empty collection of path-only values.
@@ -477,6 +496,26 @@ fn base_toml(cfg: &CloudflareConfig) -> toml::Value {
         Value::Float(cfg.head_sampling_rate),
     );
     root.insert("observability".into(), Value::Table(obs));
+
+    // Cron triggers. Cloudflare invokes the Worker's `scheduled` handler on
+    // each of these; the adapter dispatches the auth retention sweep there and
+    // nothing else (`impresspress_cloudflare::run_scheduled`). Emitted only
+    // when there is at least one schedule: `crons = []` and an absent
+    // `[triggers]` mean the same thing to wrangler, and the absent form says
+    // "this deployment schedules nothing" without looking like a bug.
+    if !cfg.crons.is_empty() {
+        let mut triggers = toml::map::Map::new();
+        triggers.insert(
+            "crons".into(),
+            Value::Array(
+                cfg.crons
+                    .iter()
+                    .map(|cron| Value::String(cron.clone()))
+                    .collect(),
+            ),
+        );
+        root.insert("triggers".into(), Value::Table(triggers));
+    }
 
     Value::Table(root)
 }
