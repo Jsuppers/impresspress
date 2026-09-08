@@ -445,4 +445,9 @@ function initProductWizard(){productWizardTemplateChanged();productWizardShippin
 // executes in order against other external scripts) while a following INLINE
 // script executes immediately on insertion -- a trailing inline
 // `initProductWizard()` would therefore run before this file had loaded.
+// Latent, and not reachable today: nothing ever clears
+// `window.__productWizardConfig`, so if the products links ever became
+// htmx-boosted, loading the wizard and then swapping to the manager would
+// leave a stale truthy global and init the wizard against the manager's DOM.
+// Today both pages are reached by plain links, so each gets a fresh document.
 if(window.__productWizardConfig)initProductWizard();
