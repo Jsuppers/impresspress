@@ -148,10 +148,11 @@ struct VarRow<'a> {
     show_default: bool,
 }
 
-/// Render one variable table row: key (+ optional name), value cell (masked
-/// per SEC-060), optional default column, description (+ optional warning),
-/// and the edit button. Shared by all four variable tables so the masking
-/// policy and edit affordance can't drift between them.
+/// Build one variable table row's cells, in column order: key (+ optional
+/// name), value cell (masked per SEC-060), optional default column,
+/// description (+ optional warning), and the edit button. Shared by all four
+/// variable tables so the masking policy and edit affordance can't drift
+/// between them. The `<td>`s around these belong to `components::data_table`.
 fn var_row(row: &VarRow) -> Vec<Markup> {
     let mut cells = vec![
         html! {

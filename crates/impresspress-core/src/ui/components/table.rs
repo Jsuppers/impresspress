@@ -109,12 +109,6 @@ impl TableRow {
     }
 }
 
-impl From<Vec<Markup>> for TableRow {
-    fn from(cells: Vec<Markup>) -> Self {
-        TableRow::new(cells)
-    }
-}
-
 /// The shared data table.
 ///
 /// Sticky header, mobile card-collapse, optional row link. Each `<td>`
