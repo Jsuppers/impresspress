@@ -547,50 +547,6 @@ fn custom_tab_content() -> maud::Markup {
 /// confirmed successful write — a failed persist must not report success or
 /// log "block.enable"/"block.disable" as if it happened.
 #[cfg(test)]
-mod badge_tone_tests {
-    use maud::html;
-
-    use super::*;
-
-    /// The block-detail modal is the only place these two colour sets render,
-    /// and the seeded block in `page_link_tests` declares no endpoints, so no
-    /// page render exercises them. Pinned here against the exact class each
-    /// arm emitted before the tones became `BadgeVariant` values.
-    #[test]
-    fn method_and_auth_tones_render_the_classes_they_always_did() {
-        let rendered = |variant| {
-            Badge::new(variant)
-                .classes("text-11")
-                .render(html! { "x" })
-                .into_string()
-        };
-        for (method, class) in [
-            (wafer_run::HttpMethod::Get, "badge--tone-brand"),
-            (wafer_run::HttpMethod::Post, "badge--tone-green"),
-            (wafer_run::HttpMethod::Patch, "badge--tone-amber"),
-            (wafer_run::HttpMethod::Delete, "badge--tone-red"),
-        ] {
-            assert_eq!(
-                rendered(method_badge_tone(method)),
-                format!(r#"<span class="badge {class} text-11">x</span>"#),
-                "{method:?}"
-            );
-        }
-        for (auth, class) in [
-            (wafer_run::AuthLevel::Public, "badge--tone-green"),
-            (wafer_run::AuthLevel::Admin, "badge--tone-red"),
-            (wafer_run::AuthLevel::Authenticated, "badge--tone-amber"),
-        ] {
-            assert_eq!(
-                rendered(auth_badge_tone(auth)),
-                format!(r#"<span class="badge {class} text-11">x</span>"#),
-                "{auth:?}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod toggle_feature_tests {
     use wafer_core::clients::database as db;
 
@@ -700,6 +656,50 @@ mod toggle_feature_tests {
             0,
             "a failed persist must not write a success audit row"
         );
+    }
+}
+
+#[cfg(test)]
+mod badge_tone_tests {
+    use maud::html;
+
+    use super::*;
+
+    /// The block-detail modal is the only place these two colour sets render,
+    /// and the seeded block in `page_link_tests` declares no endpoints, so no
+    /// page render exercises them. Pinned here against the exact class each
+    /// arm emitted before the tones became `BadgeVariant` values.
+    #[test]
+    fn method_and_auth_tones_render_the_classes_they_always_did() {
+        let rendered = |variant| {
+            Badge::new(variant)
+                .classes("text-11")
+                .render(html! { "x" })
+                .into_string()
+        };
+        for (method, class) in [
+            (wafer_run::HttpMethod::Get, "badge--tone-brand"),
+            (wafer_run::HttpMethod::Post, "badge--tone-green"),
+            (wafer_run::HttpMethod::Patch, "badge--tone-amber"),
+            (wafer_run::HttpMethod::Delete, "badge--tone-red"),
+        ] {
+            assert_eq!(
+                rendered(method_badge_tone(method)),
+                format!(r#"<span class="badge {class} text-11">x</span>"#),
+                "{method:?}"
+            );
+        }
+        for (auth, class) in [
+            (wafer_run::AuthLevel::Public, "badge--tone-green"),
+            (wafer_run::AuthLevel::Admin, "badge--tone-red"),
+            (wafer_run::AuthLevel::Authenticated, "badge--tone-amber"),
+        ] {
+            assert_eq!(
+                rendered(auth_badge_tone(auth)),
+                format!(r#"<span class="badge {class} text-11">x</span>"#),
+                "{auth:?}"
+            );
+        }
     }
 }
 
