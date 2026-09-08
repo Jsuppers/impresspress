@@ -106,8 +106,8 @@ fn ui_asset_entries_carry_hashed_keys_and_content_types() {
 #[test]
 fn ui_asset_entries_skips_block_gated_assets_instead_of_panicking() {
     let entries = ui_asset_entries();
-    // The base set (app.css, htmx, webmcp, fonts, logos, favicon) still
-    // publishes; exactly the 4 block-llm/block-files-gated logical assets
+    // The base set (app.css, htmx, chrome.js, webmcp, fonts, logos, favicon)
+    // still publishes; exactly the 4 block-llm/block-files-gated logical assets
     // (marked.min.js, purify.min.js, llm-chat.js, files-browser.js) are
     // absent from the manifest's bytes on this feature set and must be
     // skipped, not panic the whole publish.

@@ -41,11 +41,18 @@ pub fn page(title: &str, config: &SiteConfig, body: Markup) -> Markup {
                 // The chrome's own behaviour — palette, drawer, toasts,
                 // modals — as one hashed asset instead of four raw strings
                 // inlined at the bottom of every page. `defer` is what keeps
-                // that a pure move: a deferred script runs after parsing and
-                // in document order, so every element these sections bind to
-                // exists by the time they run (their end-of-body placement
-                // gave them the same guarantee) and htmx is still installed
-                // first.
+                // the bindings sound: a deferred script runs after parsing
+                // and in document order, so every element these sections bind
+                // to exists by the time they run — their end-of-body
+                // placement gave them the same guarantee.
+                //
+                // What did change is the order relative to htmx. The four
+                // inline tags were synchronous, so they ran during parse,
+                // ahead of every deferred script including htmx; the file
+                // below runs after it. That is inert: htmx defers its own
+                // document processing to the ready event, which fires after
+                // all deferred scripts, so the body listeners here are still
+                // installed before anything can dispatch to them.
                 script src=(assets::chrome_js_url()) defer {}
             }
             body {

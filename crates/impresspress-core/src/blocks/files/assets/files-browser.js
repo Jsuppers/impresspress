@@ -5,7 +5,7 @@
 //
 // All POST URLs match the existing /b/storage/api/* and /b/cloudstorage/* endpoints.
 // `showToast` dispatches a `showToast` CustomEvent that the page-level toast handler
-// (in ui/assets.rs::toast_js) listens for.
+// (the "toast notifications" section of ui/assets/chrome.js) listens for.
 (function () {
   if (window.__impresspressFilesBrowserInit) return;
   window.__impresspressFilesBrowserInit = true;

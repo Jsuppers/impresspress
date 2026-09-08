@@ -2,7 +2,7 @@
 //
 // One file, one `<script src>`, one manifest hash. These four sections used
 // to be four Rust raw strings inlined into the bottom of every rendered page
-// (`ui::assets::{palette_js, drawer_js, toast_js, modal_js}`) -- 202 lines
+// (`ui::assets::{palette_js, drawer_js, toast_js, modal_js}`) -- 196 lines
 // re-sent uncached on every request, and unreachable to a linter, a
 // formatter or a source map. They are concatenated here in exactly the order
 // the page used to emit them, so behaviour is unchanged:
@@ -21,6 +21,16 @@
 // The page loads this with `defer` from `<head>`, so the whole file runs
 // after parsing and every element these sections look for already exists --
 // the same guarantee their old end-of-body placement gave them.
+//
+// What `defer` does NOT preserve is *when* that happens. The four inline
+// scripts ran during parse, in the same document, with no network. This one
+// waits on a fetch, and on a cold cache -- or on an `embed-assets`-off build
+// streaming it from object storage -- that fetch is a real round trip.
+// Nothing in here paints, so the delay is mostly invisible -- the palette
+// trigger, the drawer control and the modal handlers are simply inert until
+// it lands, where before they worked as soon as the parser passed them --
+// with one visible exception: the palette's platform swap in section 1
+// rewrites a server-rendered glyph. See the note there.
 
 // --- 1. command palette ---
 (function () {
@@ -101,6 +111,17 @@
 
   // The shortcut hint defaults to the Mac glyph; swap to Ctrl elsewhere so
   // the advertised key matches what the keydown handler above accepts.
+  //
+  // This is the one thing in this file a visitor can see happen. It used to
+  // run during parse; it now waits on this file's fetch, so a non-Mac visitor
+  // on a cold cache sees the server-rendered `⌘` painted and then replaced.
+  // The string grows from one glyph to four characters, so on a narrow
+  // viewport the topbar re-lays out rather than merely re-texting. Rendering
+  // the label server-side would trade that for either a wrong glyph on Mac or
+  // a changed rendered output on every shelled page; the flash is on a
+  // once-per-deploy cold cache only, and the button works throughout, so it
+  // is documented rather than designed away. If it ever needs to go, the fix
+  // is a platform-neutral server-rendered label, not an inline script.
   if (!/Mac|iPhone|iPad|iPod/.test(navigator.platform || '')) {
     document.querySelectorAll('.topbar__palette-cmd').forEach((n) => { n.textContent = 'Ctrl'; });
     document.querySelectorAll('.shell__palette-icon').forEach((n) => { n.textContent = 'Ctrl K'; });

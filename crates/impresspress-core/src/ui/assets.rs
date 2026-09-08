@@ -355,7 +355,7 @@ pub(crate) fn short_hash(content: &[u8]) -> String {
 /// toasts and modals, as one hashed `/b/static/chrome-{hash}.js`.
 ///
 /// Was four Rust raw strings — `palette_js`, `drawer_js`, `toast_js`,
-/// `modal_js` — inlined into the bottom of every rendered page, 202 lines
+/// `modal_js` — inlined into the bottom of every rendered page, 196 lines
 /// re-sent uncached on every request. They are now one file, concatenated in
 /// exactly the order the page emitted them, loaded once and cached forever
 /// (the filename carries a content hash, so a changed script is a changed
