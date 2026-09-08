@@ -116,6 +116,14 @@ async fn network_inbound_tab(
 /// `data-detail-target`/`data-detail-url` that the delegated click handler
 /// reads — never an `onclick` JS-string literal (maud doesn't escape JS-string
 /// context, which was a stored-XSS sink).
+///
+/// `avg_ms` and `last_seen` are per-run values — a latency measured by the
+/// running deployment and the wall-clock time of a request it served — so
+/// each is wrapped in the element the visual-baseline suite masks
+/// (`crates/impresspress-web/tests/e2e/visual-baseline.spec.ts`). The
+/// wrappers are inside the cell, not attributes on the `<td>`, because
+/// `components::data_table` emits the `<td>` itself and takes only the
+/// cell's inner markup, which it carries through verbatim.
 fn inbound_row(
     method: &str,
     path: &str,
@@ -134,7 +142,7 @@ fn inbound_row(
             td .text-sm {
                 span .badge .badge-info { (cnt) }
             }
-            td .text-muted .text-sm { (avg_ms) "ms" }
+            td .text-muted .text-sm { span data-volatile-metric { (avg_ms) "ms" } }
             td .text-sm {
                 @if errors > 0 {
                     span .badge .badge-danger { (errors) }
@@ -142,11 +150,49 @@ fn inbound_row(
                     span .text-muted { "0" }
                 }
             }
-            td .text-muted .text-sm { (last_seen.get(..19).unwrap_or(last_seen)) }
+            td .text-muted .text-sm {
+                time datetime=(last_seen) { (last_seen.get(..19).unwrap_or(last_seen)) }
+            }
         }
         tr .detail-rows hidden {
             td colspan="7" .p-0 {
                 div id=(row_id) {}
+            }
+        }
+    }
+}
+
+/// Render one row of the per-request detail table: status, duration, client
+/// IP, user and timestamp for a single logged request.
+///
+/// `duration` and `created` are produced by whichever run is looking at the
+/// page — during a visual-baseline capture that is the capture run itself —
+/// so each is wrapped in the element the baseline suite masks. The wrapper
+/// sits inside the cell rather than on the `<td>` for the same reason as in
+/// [`inbound_row`]: `components::data_table` owns the `<td>`.
+fn detail_row(
+    status_code: i64,
+    duration: i64,
+    client_ip: &str,
+    user_id: &str,
+    created: &str,
+) -> Markup {
+    html! {
+        tr {
+            td {
+                span .badge .(if status_code >= 500 { "badge-danger" } else if status_code >= 400 { "badge-warning" } else { "badge-success" }) {
+                    (status_code)
+                }
+            }
+            td .text-muted { span data-volatile-metric { (duration) "ms" } }
+            td .text-muted { (client_ip) }
+            td .text-muted {
+                @if !user_id.is_empty() {
+                    (user_id.get(..8).unwrap_or(user_id))
+                }
+            }
+            td .text-muted {
+                time datetime=(created) { (created.get(..19).unwrap_or(created)) }
             }
         }
     }
@@ -190,26 +236,13 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
             }
             tbody {
                 @for row in display_rows {
-                    @let status_code = row.status_code;
-                    @let duration = row.duration_ms;
-                    @let client_ip = row.client_ip.as_str();
-                    @let user_id = row.user_id.as_str();
-                    @let created = row.created_at.as_str();
-                    tr {
-                        td {
-                            span .badge .(if status_code >= 500 { "badge-danger" } else if status_code >= 400 { "badge-warning" } else { "badge-success" }) {
-                                (status_code)
-                            }
-                        }
-                        td .text-muted { (duration) "ms" }
-                        td .text-muted { (client_ip) }
-                        td .text-muted {
-                            @if !user_id.is_empty() {
-                                (user_id.get(..8).unwrap_or(user_id))
-                            }
-                        }
-                        td .text-muted { (created.get(..19).unwrap_or(created)) }
-                    }
+                    (detail_row(
+                        row.status_code,
+                        row.duration_ms,
+                        row.client_ip.as_str(),
+                        row.user_id.as_str(),
+                        row.created_at.as_str(),
+                    ))
                 }
             }
         }
@@ -268,6 +301,54 @@ mod tests {
         assert!(
             !html.contains("method=GET&path="),
             "a raw unescaped query would mean an injection sink survived: {html}"
+        );
+    }
+
+    /// The visual-baseline suite screenshots this page, and the values in
+    /// these two tables are produced by the run that takes the screenshot:
+    /// `avg_ms` and `duration_ms` are latencies measured during it, and
+    /// `last_seen` / `created_at` are wall-clock stamps of requests the
+    /// baseline run itself made. Nothing pinned them, so they drift on every
+    /// capture; the suite's 1% pixel tolerance absorbed the drift, which made
+    /// this latent fragility rather than a live flake.
+    ///
+    /// The mask hooks go INSIDE the cell, never on the `<td>`.
+    /// `components::data_table` renders the `<td>` itself and accepts only
+    /// each cell's inner markup (`ui/components/table.rs:53`), so an
+    /// attribute on the `<td>` would be dropped the moment this table
+    /// migrates onto the shared component. Inner markup is carried through
+    /// verbatim and survives that migration.
+    #[test]
+    fn inbound_row_marks_the_values_the_baseline_run_itself_produces() {
+        let html = inbound_row("GET", "/b/admin/", 4, 37, 0, "2026-01-01T00:00:00Z").into_string();
+
+        assert!(
+            html.contains("<span data-volatile-metric>37ms</span>"),
+            "the per-route average must carry the mask hook inside the cell: {html}"
+        );
+        assert!(
+            html.contains("<time datetime=\"2026-01-01T00:00:00Z\">2026-01-01T00:00:00</time>"),
+            "the last-seen stamp must be a <time>, which the suite's existing \
+             `[data-relative-time], .relative-time, time` mask already matches: {html}"
+        );
+    }
+
+    /// Same contract for the lazily-loaded per-request detail table. It is
+    /// collapsed until an operator clicks a row, so it is not inside the
+    /// captured region today — but it is the same page module rendering the
+    /// same two kinds of per-run value, and the table migration may change
+    /// what fits in frame.
+    #[test]
+    fn detail_row_marks_the_values_the_baseline_run_itself_produces() {
+        let html = detail_row(200, 12, "127.0.0.1", "", "2026-01-01T00:00:00Z").into_string();
+
+        assert!(
+            html.contains("<span data-volatile-metric>12ms</span>"),
+            "the per-request duration must carry the mask hook inside the cell: {html}"
+        );
+        assert!(
+            html.contains("<time datetime=\"2026-01-01T00:00:00Z\">2026-01-01T00:00:00</time>"),
+            "the per-request stamp must be a <time>: {html}"
         );
     }
 }

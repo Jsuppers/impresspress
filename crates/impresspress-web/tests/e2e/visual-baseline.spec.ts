@@ -103,6 +103,18 @@ test.describe('visual baseline — admin', () => {
         mask: [
           page.locator('[data-relative-time], .relative-time, time'),
           page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
+          // Values the baseline run itself produces: latencies it measured, and
+          // wall-clock stamps of requests it made. Until now nothing pinned them
+          // and the 1% tolerance absorbed the drift, which made them latent
+          // fragility rather than a live flake. `data-volatile-metric` wraps the
+          // duration figures on the admin network page (see
+          // `blocks/admin/pages/network.rs`); the timestamps beside them are
+          // `<time>` elements and are already covered by the mask above. The
+          // admin dashboard's "Avg Response" tile is reached by its label
+          // instead, because `StatTile::value` is a plain `&str` with nowhere to
+          // hang an attribute — a Rust test pins that label so a rename cannot
+          // silently unmask the tile.
+          page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
         ],
       });
     });
@@ -178,6 +190,8 @@ test.describe('visual baseline — admin vector', () => {
       mask: [
         page.locator('[data-relative-time], .relative-time, time'),
         page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
+        // Per-run measured values; see the admin describe block above.
+        page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
       ],
     });
   });
@@ -208,6 +222,8 @@ test.describe('visual baseline mobile — admin (375px)', () => {
         mask: [
           page.locator('[data-relative-time], .relative-time, time'),
           page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
+          // Per-run measured values; see the admin describe block above.
+          page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
         ],
       });
     });
