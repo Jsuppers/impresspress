@@ -4,6 +4,7 @@
 //! dispatches on it and `info().endpoints` is generated from it. Handlers
 //! read path variables only as the matcher bound them (`msg.var(..)`).
 
+pub mod assets;
 mod cloud;
 mod contracts;
 pub(crate) mod migrations;

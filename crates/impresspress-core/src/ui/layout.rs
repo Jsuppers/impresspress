@@ -38,12 +38,26 @@ pub fn page(title: &str, config: &SiteConfig, body: Markup) -> Markup {
                     link rel="icon" href=(config.favicon_url);
                 }
                 script src=(assets::htmx_js_url()) defer {}
+                // The chrome's own behaviour — palette, drawer, toasts,
+                // modals — as one hashed asset instead of four raw strings
+                // inlined at the bottom of every page. `defer` is what keeps
+                // the bindings sound: a deferred script runs after parsing
+                // and in document order, so every element these sections bind
+                // to exists by the time they run — their end-of-body
+                // placement gave them the same guarantee.
+                //
+                // What did change is the order relative to htmx. The four
+                // inline tags were synchronous, so they ran during parse,
+                // ahead of every deferred script including htmx; the file
+                // below runs after it. That is inert: htmx defers its own
+                // document processing to the ready event, which fires after
+                // all deferred scripts, so the body listeners here are still
+                // installed before anything can dispatch to them.
+                script src=(assets::chrome_js_url()) defer {}
             }
             body {
                 (body)
                 div #toast-container .toast-container {}
-                script { (PreEscaped(assets::toast_js())) }
-                script { (PreEscaped(assets::modal_js())) }
                 script src=(assets::webmcp_js_url()) defer {}
                 @for src in &config.embedded_scripts {
                     script type="module" src=(src) {}
@@ -74,5 +88,41 @@ mod tests {
             rendered.contains(&assets::webmcp_js_url()),
             "the WebMCP script must be on every page: {rendered}"
         );
+    }
+
+    /// The chrome's behaviour ships as one hashed `<script src>`, not as
+    /// inlined raw strings. Markers from all four former inline scripts must
+    /// be absent from the document, and the asset URL present.
+    #[test]
+    fn chrome_behaviour_is_one_hashed_script_not_inline_source() {
+        let config = SiteConfig {
+            app_name: "Test".into(),
+            logo_url: String::new(),
+            logo_icon_url: String::new(),
+            favicon_url: String::new(),
+            primary_color: String::new(),
+            embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
+        };
+        let rendered = page("Title", &config, maud::html! { p { "body" } }).into_string();
+        assert!(
+            rendered.contains(&format!(
+                r#"<script src="{}" defer></script>"#,
+                assets::chrome_js_url()
+            )),
+            "the chrome script must be linked, hashed and deferred: {rendered}"
+        );
+        for marker in [
+            "__cmdkInit",
+            "__drawerInit",
+            "showToast",
+            "function openModal",
+        ] {
+            assert!(
+                !rendered.contains(marker),
+                "{marker} is still inlined into the page: {rendered}"
+            );
+        }
     }
 }

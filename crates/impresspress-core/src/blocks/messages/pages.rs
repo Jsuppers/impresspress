@@ -39,7 +39,7 @@ pub fn entry_card(record: &db::Record) -> Result<Markup, WaferError> {
     // and only genuinely semantic kinds keep a semantic hue (notification/
     // system = warning yellow). The old palette hardcoded sky/indigo blues
     // that clashed with the orange brand. Keep in sync with
-    // `messageCardHtml` in ui/assets/llm-chat.js — same cards, JS-rendered.
+    // `messageCardHtml` in blocks/llm/assets/llm-chat.js — same cards, JS-rendered.
     let (card_variant, badge_class) = match kind {
         EntryKind::Artifact | EntryKind::Status => ("message-card--neutral", "badge"),
         EntryKind::Notification => ("message-card--warning", "badge-warning"),

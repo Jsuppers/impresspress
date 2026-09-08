@@ -38,9 +38,12 @@ pub fn resolve_asset_base_url(has_r2: bool) -> String {
 ///
 /// `ASSETS` is unconditional (`build.rs` lists every asset file on disk
 /// regardless of Cargo features), but `ui_assets::bytes()` returns `None`
-/// for an entry gated behind a block feature the CLI wasn't built with
-/// (`marked.min.js`/`purify.min.js`/`llm-chat.js` need `block-llm`,
-/// `files-browser.js` needs `block-files`) — a supported combination, e.g.
+/// for a block-owned entry whose block the CLI wasn't built with — the block
+/// declares those bytes itself (`blocks::llm::assets` owns
+/// `marked.min.js`/`purify.min.js`/`llm-chat.js` and needs `block-llm`;
+/// `blocks::files::assets` owns `files-browser.js` and needs `block-files`),
+/// so a build without the block carries no bytes for them. A supported
+/// combination, e.g.
 /// `--no-default-features --features sqlite,embed-assets`. Such entries are
 /// skipped rather than treated as an error, with a warning naming exactly
 /// what was skipped so the omission is visible in the deploy log instead of

@@ -291,7 +291,7 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // native <dialog> modal + JS from `pages_user`. The bootstrap
     // script with empty bucket/prefix is needed for the JS to wire
     // the "+ New bucket" trigger; without it the JS bails on init.
-    let js_url = crate::ui::assets::files_browser_js_url();
+    let js_url = crate::blocks::files::assets::files_browser_js_url();
     let body = list_page(
         PageHeader {
             title: "",

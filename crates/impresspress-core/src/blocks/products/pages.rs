@@ -512,7 +512,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 /// The `hx-on--after-request` body shared by every one-shot action button on
 /// these pages: reload on success, and on failure raise the message the API
-/// sent on the shared `showToast` channel `ui::assets::toast_js` listens on.
+/// sent on the shared `showToast` channel `ui/assets/chrome.js`'s toast section listens on.
 ///
 /// Without the failure half a refused action renders as nothing happening at
 /// all — no reload, no message — which is the worst outcome on a page whose

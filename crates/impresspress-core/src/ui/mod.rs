@@ -189,7 +189,7 @@ impl<'a> Page<'a> {
     /// Render the full page: `page()` wrapping `shell()` + the ⌘K palette
     /// modal (mounted only when `topbar.show_palette` is true).
     pub fn render(self) -> maud::Markup {
-        use maud::{html, PreEscaped};
+        use maud::html;
         let palette_markup = if self.topbar.show_palette {
             palette::palette(nav_groups::palette_entries_from_groups(self.nav))
         } else {
@@ -210,8 +210,6 @@ impl<'a> Page<'a> {
                     self.body,
                 ))
                 (palette_markup)
-                script { (PreEscaped(assets::palette_js())) }
-                script { (PreEscaped(assets::drawer_js())) }
             },
         )
     }
