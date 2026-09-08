@@ -122,6 +122,17 @@ jobs:
           cargo check --locked -p impresspress --no-default-features --features sqlite
           cargo check --locked -p impresspress-core --no-default-features --features sqlite
 
+      # The vector block WITHOUT the `llm` cargo feature — the configuration
+      # `blocks::vector::ingestion::add_context` exists to serve, and the one
+      # every other lane hides. `llm` is in `impresspress-core`'s `default`, so
+      # the ordinary test job only ever runs that code with the native provider
+      # backend compiled in; `add_context` was `cfg(feature = "llm")`-gated
+      # with a silent no-op twin for exactly this build, which is every wasm32
+      # build. Nothing in the body needs the feature — it reaches the llm block
+      # through `ctx.call_block` — so this must keep passing.
+      - name: Test the vector block without the llm backend (no default features)
+        run: cargo test --locked -p impresspress-core --no-default-features --features block-vector,test-support --lib blocks::vector
+
       # `block-dev` is deliberately absent from `default` (the dev sandbox's
       # control plane must not exist in a normal bundle), so the workspace
       # clippy above compiles none of it — not the block, and not the ~4 200
@@ -318,10 +329,17 @@ jobs:
       # after the LlmService refactor made them clean. `block-vector` implies
       # `block-llm`, so the second command covers the first; both are listed
       # because either can break on its own if that implication ever changes.
+      #
+      # `--tests` for the same reason as the step above: a bare check compiles
+      # no `#[cfg(test)]` code at all, so without it this step would build the
+      # library under these two features and leave every wasm test in the crate
+      # untouched under them. The `cloudflare-wasm-test` job is path-filtered
+      # and enables neither feature, so this is the only place they meet test
+      # code.
       - name: Check impresspress-cloudflare optional blocks (wasm32)
         run: |
-          cargo check --locked -p impresspress-cloudflare --features block-llm --target wasm32-unknown-unknown
-          cargo check --locked -p impresspress-cloudflare --features block-vector --target wasm32-unknown-unknown
+          cargo check --locked --tests -p impresspress-cloudflare --features block-llm --target wasm32-unknown-unknown
+          cargo check --locked --tests -p impresspress-cloudflare --features block-vector --target wasm32-unknown-unknown
 
       # Browser-target crates are also wasm-only consumers of wafer-run, and
       # nothing else in CI builds them for wasm32 — a set_asset_loader

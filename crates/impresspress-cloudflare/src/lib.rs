@@ -525,3 +525,52 @@ mod static_asset_target_tests {
         }
     }
 }
+
+/// The wasm32 half of the middleware-block invariant.
+///
+/// `impresspress-core`'s `use_static_blocks!` anchor list is the ONE place
+/// the six `wafer-run/*` middleware blocks are named. Off wasm32 linkme
+/// collects them and `WAFER_STATIC_BLOCKS` is empty; on wasm32 linkme writes
+/// into a link section that does not exist, so the by-value list is the only
+/// thing that registers them — and it is the half a hand-written second list
+/// used to cover, with nothing keeping the two in step.
+///
+/// That is asserted here rather than beside the list because
+/// `impresspress-core` cannot compile test code for wasm32 at all
+/// (`--all-targets` pulls its tokio/mio dev-dependencies, which do not build
+/// for that target), so a `cfg(target_arch = "wasm32")` assertion written
+/// there is compiled by nothing. This crate has an executable wasm lane and a
+/// CI job whose path filter covers the manifests that turn these blocks on.
+#[cfg(test)]
+mod middleware_blocks_tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn a_runtime_built_on_wasm32_carries_every_middleware_block() {
+        let mut wafer =
+            wafer_run::Wafer::new(std::sync::Arc::new(wafer_run::StaticConfigSource::default()))
+                .expect("Wafer::new with no lockfile");
+
+        // Self-guard: on wasm32 linkme collects nothing, so a bare `Wafer` has
+        // none of the six. If that ever stopped being true the assertions
+        // below would pass without `register_middleware_blocks` doing anything.
+        for name in impresspress_core::builder::MIDDLEWARE_BLOCKS {
+            assert!(
+                !wafer.has_block(name),
+                "{name} was already registered before                  `register_middleware_blocks` ran — this test would be vacuous"
+            );
+        }
+
+        impresspress_core::builder::register_middleware_blocks(&mut wafer)
+            .expect("register the middleware blocks");
+
+        for name in impresspress_core::builder::MIDDLEWARE_BLOCKS {
+            assert!(
+                wafer.has_block(name),
+                "{name} is not registered on wasm32 — is its crate still in \
+                 `impresspress-core`'s `use_static_blocks!` anchor list, and \
+                 does it still invoke `register_static_block!` under that name?"
+            );
+        }
+    }
+}

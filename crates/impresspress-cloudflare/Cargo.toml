@@ -59,27 +59,57 @@ block-userportal = ["impresspress-core/block-userportal"]
 # neither `default` nor `full`: on the measurement below a Worker that asks
 # for both pays for them, and one that does not pays nothing at all.
 #
-# Measured on this tree against a real Worker — `examples/webmcp-demo`, which
-# is a cdylib whose `#[event(fetch)]` calls `impresspress_cloudflare::run`.
-# (Building THIS crate alone is not a measurement: it exports no Worker entry
-# point, so the linker discards every block and the .wasm is the same size
-# whatever features are on.)
+# ## What each one actually turns on
+#
+# Neither is one block. In `impresspress-core`, `block-llm` implies
+# `block-messages` and `block-vector` implies `block-llm`, so:
+#
+#   block-llm     ->  impresspress/llm + impresspress/messages
+#   block-vector  ->  impresspress/vector + both of the above
+#
+# Those implications are declarations, not conveniences: `llm.requires` names
+# `impresspress/messages` and every thread, entry and turn the chat UI touches
+# goes through `ctx.call_block("impresspress/messages", ..)`. But they are a
+# SURFACE change, not only byte accounting — a Worker that opts into the chat
+# interface also registers the `/b/messages` routes, which it never named.
+# Both rows below therefore include the implied blocks.
+#
+# `block-vector` additionally buys a 503 surface unless the consumer does more.
+# This adapter injects neither a vector service nor an embedding service, so a
+# Worker that only flips the feature registers `impresspress/vector` with no
+# backend and every route answers `503 Unavailable`. It is not inert by
+# construction — `run_with_config`'s registration hook takes
+# `ImpresspressBuilder::vector_service` and `::embedding_service` — but wiring
+# those is the consumer's job, and without it the feature buys routes that
+# cannot serve.
+#
+# ## Cost
+#
+# Measured against a real Worker — `examples/webmcp-demo`, which is a cdylib
+# whose `#[event(fetch)]` calls `impresspress_cloudflare::run`. (Building THIS
+# crate alone is not a measurement: it exports no Worker entry point, so the
+# linker discards every block and the .wasm is the same size whatever features
+# are on.) The demo declares no passthrough of its own, so the extra feature is
+# named through the dependency:
 #
 #   cargo build --release -p impresspress-webmcp-demo \
-#       --target wasm32-unknown-unknown \
-#       --no-default-features --features target-cloudflare[,<extra>]
+#       --target wasm32-unknown-unknown --no-default-features \
+#       --features target-cloudflare[,impresspress-cloudflare/block-<name>]
 #
-#   as shipped (block-products only)   7,790,612 bytes
-#   + block-llm                        8,236,268 bytes   (+445,656, +5.7%)
-#   + block-vector                     8,526,732 bytes   (+736,120, +9.4%)
+#   as shipped (block-products only)   ~7.79 MB
+#   + block-llm (+ messages)           ~8.24 MB   (about +0.45 MB)
+#   + block-vector (+ both)            ~8.53 MB   (about +0.74 MB)
 #
-# `block-vector` implies `block-llm` in impresspress-core, so the third row
-# includes the second. These are cargo's own wasm, before `worker-build`'s
-# wasm-opt pass, so they overstate the shipped bytes; the ratio is the point.
+# Rounded on purpose: the exact byte counts move with every commit, and these
+# are cargo's own wasm, BEFORE `worker-build`'s wasm-opt and before the gzip
+# the platform's size limit is actually applied to. Neither step preserves
+# pre-optimisation ratios, so these are the relative cost of adding the blocks
+# to this build, not what a consumer pays against the limit. Re-measure rather
+# than scale them.
 #
 # Declaring a feature nobody enables costs nothing, and that was measured too,
-# not assumed: the demo Worker is byte-identical at 7,790,612 built against
-# the manifest with and without this stanza.
+# not assumed: the demo Worker is byte-identical built against the manifest
+# with and without this stanza.
 block-llm = ["impresspress-core/block-llm"]
 block-vector = ["impresspress-core/block-vector"]
 

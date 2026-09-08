@@ -40,6 +40,39 @@ use crate::{
     features::FeatureConfig,
 };
 
+/// The six `wafer-run/*` middleware blocks, by the name each crate's
+/// `register_static_block!` gives it.
+///
+/// Written once here and read by `MIDDLEWARE_BLOCKS`'s two tests, so a block
+/// added to the anchor list above and not to this one — or renamed — is a
+/// failure rather than a silently missing middleware.
+pub const MIDDLEWARE_BLOCKS: &[&str] = &[
+    "wafer-run/cors",
+    "wafer-run/inspector",
+    "wafer-run/readonly-guard",
+    "wafer-run/router",
+    "wafer-run/security-headers",
+    "wafer-run/web",
+];
+
+/// Step 5 of [`ImpresspressBuilder::build`], as a free function.
+///
+/// Off wasm32 `WAFER_STATIC_BLOCKS` is empty and `Wafer::new` has already
+/// installed the six through linkme, so this is a no-op. On wasm32 linkme
+/// writes into a link section that does not exist, so this call is the ONLY
+/// thing that registers them.
+///
+/// It is a free function rather than an inline statement so a **wasm32 test**
+/// can run it: `impresspress-core` cannot compile its own test code for that
+/// target (`--all-targets` pulls tokio/mio, which do not build there), so an
+/// assertion about the wasm32 arm written here would document rather than
+/// gate. `impresspress-cloudflare` has an executable wasm lane and calls this
+/// from `middleware_blocks_tests`. Same shape as `blocks::rate_limit`'s
+/// ungated helper, and for the same reason.
+pub fn register_middleware_blocks(wafer: &mut Wafer) -> Result<(), RuntimeError> {
+    wafer.register_static_blocks(WAFER_STATIC_BLOCKS)
+}
+
 impl ImpresspressBuilder {
     pub fn build(self) -> Result<(Wafer, Arc<ImpresspressStorageBlock>), RuntimeError> {
         // 1. Validate required services
@@ -238,7 +271,7 @@ impl ImpresspressBuilder {
         // list, with nothing keeping the two in step — a block added to one
         // and not the other was a middleware silently missing from every
         // browser and Worker build.
-        wafer.register_static_blocks(WAFER_STATIC_BLOCKS)?;
+        register_middleware_blocks(&mut wafer)?;
 
         // 5a. Register every zero-arg impresspress feature block (`impresspress/*`)
         // from the single manifest in `crate::blocks`. The same call runs on
@@ -274,11 +307,23 @@ impl ImpresspressBuilder {
         // 6b. Register LlmBlock — not in the feature-block manifest because its
         //     constructor takes `Arc<dyn ProviderAdmin>`.
         //
-        //     Native (`not(wasm32)`): with `feature = "llm"` the concrete
-        //     `ProviderLlmService` (already on the router under `"provider"`)
-        //     doubles as the provider-admin handle; a native
-        //     `block-llm`-without-`llm` build falls back to the no-op.
-        #[cfg(all(feature = "block-llm", not(target_arch = "wasm32")))]
+        //     The `llm` feature alone decides the handle. With it, the
+        //     concrete `ProviderLlmService` — already on the router under
+        //     `"provider"` — doubles as the provider-admin handle; without it
+        //     the runtime cannot manage providers and says so through
+        //     `NoopProviderAdmin`, whose `manages_providers()` is `false`.
+        //
+        //     This used to be two registration sites split on
+        //     `target_arch`, which was the same decision written twice: the
+        //     wasm32 arm passed the no-op, and `llm` (tokio + reqwest, not
+        //     `Send` on wasm32) can never be on there anyway, so it took the
+        //     `not(feature = "llm")` branch of the arm it was distinguished
+        //     from. A `block-llm`-without-`llm` build — every wasm32 one, and
+        //     a native one that asked for it — reaches the same handle by the
+        //     same line now, and the browser's `LlmService` still arrives
+        //     through `ImpresspressBuilder::llm_service` on the router either
+        //     way.
+        #[cfg(feature = "block-llm")]
         {
             use crate::blocks::llm::provider_admin::ProviderAdmin;
             // `provider_llm_svc` is already registered on the router under
@@ -291,17 +336,6 @@ impl ImpresspressBuilder {
                 Arc::new(crate::blocks::llm::provider_admin::NoopProviderAdmin);
             crate::blocks::register_llm(&mut wafer, provider_admin)?;
         }
-
-        // 6c. Register LlmBlock on wasm32 against a browser-supplied
-        //     `LlmService` (installed on the router via
-        //     `ImpresspressBuilder::llm_service`). Provider CRUD / discovery have no
-        //     browser surface, so a `NoopProviderAdmin` stands in for the native
-        //     HTTP `ProviderLlmService`.
-        #[cfg(all(feature = "block-llm", target_arch = "wasm32"))]
-        crate::blocks::register_llm(
-            &mut wafer,
-            Arc::new(crate::blocks::llm::provider_admin::NoopProviderAdmin),
-        )?;
 
         // 7. Extra platform-specific blocks
         for (name, block) in self.extra_blocks {
@@ -537,45 +571,29 @@ impl ImpresspressBuilder {
 mod static_block_list_tests {
     use super::*;
 
-    /// The middleware blocks the anchor list at the top of this file is
-    /// expected to yield, by the name each crate's `register_static_block!`
-    /// gives it. This is the list that used to be written out a second time,
-    /// by hand, as `register_block` calls under `cfg(target_arch = "wasm32")`.
-    const MIDDLEWARE: &[&str] = &[
-        "wafer-run/cors",
-        "wafer-run/inspector",
-        "wafer-run/readonly-guard",
-        "wafer-run/router",
-        "wafer-run/security-headers",
-        "wafer-run/web",
-    ];
-
     /// `WAFER_STATIC_BLOCKS` carries exactly what link-time collection cannot
     /// reach on this target: nothing off wasm32, every anchored crate's block
     /// on it.
     ///
-    /// The wasm32 arm is the assertion the deletion rests on — the same six
-    /// names, in the same spelling, that the hand-written wasm32 list
-    /// registered. Only the native arm ever executes: this crate has no wasm
-    /// test runner, and its wasm32 lane cannot even *compile* test code
-    /// (`--all-targets` pulls the tokio/mio dev-dependencies, which do not
-    /// build for that target). The wasm32 arm is here so the invariant is
-    /// written next to the list it constrains; the executable proof on that
-    /// target is `impresspress-cloudflare`'s wasm lane building a runtime.
+    /// Only the native half is asserted here, and it is the half this crate
+    /// can execute: `impresspress-core` cannot compile test code for wasm32
+    /// at all (`--all-targets` pulls the tokio/mio dev-dependencies, which do
+    /// not build there), so a `cfg(target_arch = "wasm32")` arm in this file
+    /// would document rather than gate — see `carry-forward` and F7. The
+    /// wasm32 half — that a runtime built on that target really does carry all
+    /// six — is asserted where it can run, in
+    /// `impresspress-cloudflare::middleware_blocks_tests`, through the same
+    /// [`register_middleware_blocks`] this crate's `build()` calls.
     #[test]
     fn wafer_static_blocks_holds_what_the_linker_could_not_collect() {
         let names: Vec<&str> = WAFER_STATIC_BLOCKS.iter().map(|r| r.name).collect();
 
-        #[cfg(not(target_arch = "wasm32"))]
         assert!(
             names.is_empty(),
             "off wasm32 linkme has already collected these, so the by-value \
              list must be empty or every middleware block would register \
              twice: {names:?}"
         );
-
-        #[cfg(target_arch = "wasm32")]
-        assert_eq!(names, MIDDLEWARE);
     }
 
     /// And on native, where the linker does the collecting, the anchor list
@@ -585,15 +603,14 @@ mod static_block_list_tests {
     /// Together with the test above this is the whole invariant: one list,
     /// the same six blocks on both paths. A crate dropped from the anchor
     /// list fails here, and so does one whose block is named something other
-    /// than `MIDDLEWARE` says.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// than `MIDDLEWARE_BLOCKS` says.
     #[test]
     fn the_anchor_list_yields_the_middleware_blocks_on_native() {
         let wafer =
             wafer_run::Wafer::new(std::sync::Arc::new(wafer_run::StaticConfigSource::default()))
                 .expect("Wafer::new with no lockfile");
 
-        for name in MIDDLEWARE {
+        for name in MIDDLEWARE_BLOCKS {
             assert!(
                 wafer.has_block(name),
                 "{name} is not registered — is its crate still in the \
