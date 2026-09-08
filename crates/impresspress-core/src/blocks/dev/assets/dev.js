@@ -223,6 +223,19 @@ var lastRuntimeGeneration = null;
 // reading a workspace that is about to change again.
 var outstanding = 0;
 
+// Whether a status request is already outstanding.
+//
+// The interval fires on a timer and the request is not instant, so without
+// this a slow answer is met by another tick, and another. That matters
+// because `/b/dev/api/status` reads the workspace manifest under
+// `DevShared::workspace` (`blocks/dev/gc.rs::storage_usage`): during a
+// collector pass, which holds that mutex across a loop of sequential deletes,
+// every tick issued would take a place in a first-in-first-out queue and the
+// user's next save would land behind all of them. With the guard the pass
+// costs one waiter, whatever it takes — and a poll that is skipped loses
+// nothing, since each response is a complete picture rather than a delta.
+var statusInFlight = false;
+
 // ~300 ms while a mutating call is outstanding (design §7.5). There is no
 // push channel: the block answers `no-store` precisely so this poll always
 // sees the journal as it stands.
@@ -231,7 +244,21 @@ function startPolling() {
     return;
   }
   polling = setInterval(function () {
-    api.get('/b/dev/api/status').then(json).then(observe).catch(logError);
+    if (statusInFlight) {
+      return;
+    }
+    statusInFlight = true;
+    api
+      .get('/b/dev/api/status')
+      .then(json)
+      .then(observe)
+      .catch(logError)
+      .then(function () {
+        // A `then` after the `catch`, so the flag is cleared on a refusal as
+        // well as on an answer: a guard that leaked on failure would stop the
+        // panel updating for the rest of the session.
+        statusInFlight = false;
+      });
   }, 300);
 }
 

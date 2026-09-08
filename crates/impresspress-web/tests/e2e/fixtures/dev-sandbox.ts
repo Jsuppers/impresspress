@@ -43,10 +43,25 @@ export const ADMIN_EMAIL = 'admin@example.com';
 export const ADMIN_PASSWORD = 'admin123';
 
 /**
- * Contexts already carrying a forwarder, so a spec that boots twice does not
- * print every line twice.
+ * Contexts already carrying a console forwarder, so a spec that boots twice in
+ * one context does not print every line twice.
  */
-const FORWARDING = new WeakSet<BrowserContext>();
+const FORWARDING_CONSOLE = new WeakSet<BrowserContext>();
+
+/**
+ * Pages already carrying an uncaught-exception forwarder.
+ *
+ * A SEPARATE set from `FORWARDING_CONSOLE`, and the separation is the point:
+ * `console` is a context-scoped event and `pageerror` is a page-scoped one, so
+ * a single guard keyed on the context would arm the console listener on the
+ * first page of a context and then silently attach NOTHING to the second —
+ * and a second page is what several specs actually put under test (the
+ * anonymous visitor in `dev-compile.spec.ts`, the storefront in
+ * `dev-scenario.spec.ts` and `dev-workspace.spec.ts`). A listener that
+ * silently captures nothing is the exact failure this forwarder exists to
+ * prevent.
+ */
+const FORWARDING_PAGE_ERRORS = new WeakSet<Page>();
 
 /**
  * Print the sandbox's own error and warning logs to the test runner's stdout.
@@ -55,17 +70,27 @@ const FORWARDING = new WeakSet<BrowserContext>();
  * sanitizes it to `Internal server error (ref: <id>)` and logs the real cause
  * behind that ref. On the native server that log is the process's stderr. In
  * the browser it is `console.error` **inside the service worker**
- * (`impresspress-browser`'s `tracing` bridge), and a service worker's console
- * goes nowhere a test run can read. So four intermittent sanitized 500s across
- * four unrelated pull requests were each diagnosed with the one piece of
- * evidence that would have named the cause already destroyed.
+ * (`impresspress-browser`'s `tracing` bridge), and by default nothing in a
+ * test run records it. So four intermittent sanitized 500s across four
+ * unrelated pull requests were each diagnosed with the one piece of evidence
+ * that would have named the cause already destroyed.
  *
- * Chromium routes a service worker's console messages to the BROWSER CONTEXT,
- * not to the worker handle and not to the page — `msg.page()` is null for them
- * — which is why this listens on the context rather than on `page`. Both
- * sources go to stdout rather than to a Playwright attachment, because CI tees
- * the runner's output into the job log and that survives a run in which the
- * report artifact is not what anyone opens first.
+ * Chromium routes a service worker's console message to the browser context,
+ * to the worker handle, and to every page inside the worker's scope — all
+ * three, in the Playwright this repo pins (see `playwright-core`'s
+ * `browserContext` console dispatch). `dev-scenario.spec.ts` takes the
+ * worker-handle route successfully, and that is the better one for a spec that
+ * wants the worker ALONE. This forwarder wants both halves, so it takes the
+ * context route for two reasons the worker route cannot give it: one listener
+ * carries page messages as well as worker ones, and it can be armed before the
+ * first navigation without first awaiting a `serviceworker` event — the worker
+ * does not exist yet at that point, and its boot-time logs are the ones worth
+ * having. `msg.page()` is null for a worker message, which is what labels the
+ * origin below.
+ *
+ * Both halves go to stdout rather than to a Playwright attachment, because CI
+ * tees the runner's output into the job log and that survives a run in which
+ * the report artifact is not what anyone opens first.
  *
  * Errors and warnings only: the sandbox logs steadily at info while it boots,
  * migrates and seeds, and a forwarder that reprinted all of it would bury the
@@ -73,20 +98,25 @@ const FORWARDING = new WeakSet<BrowserContext>();
  */
 export function forwardSandboxDiagnostics(page: Page) {
   const context = page.context();
-  if (FORWARDING.has(context)) return;
-  FORWARDING.add(context);
-
-  context.on('console', (msg) => {
-    const level = msg.type();
-    if (level !== 'error' && level !== 'warning') return;
-    // A message with no page came from the service worker; the runtime's own
-    // logs are all of that kind, and they are the ones that carry the ref.
-    const origin = msg.page() === null ? 'worker' : 'page';
-    console.log(`[sandbox ${origin} ${level}] ${msg.text()}`);
-  });
-  page.on('pageerror', (error) => {
-    console.log(`[sandbox page uncaught] ${error.message}`);
-  });
+  if (!FORWARDING_CONSOLE.has(context)) {
+    FORWARDING_CONSOLE.add(context);
+    context.on('console', (msg) => {
+      const level = msg.type();
+      if (level !== 'error' && level !== 'warning') return;
+      // A message with no page came from the service worker; the runtime's own
+      // logs are all of that kind, and they are the ones that carry the ref.
+      const origin = msg.page() === null ? 'worker' : 'page';
+      console.log(`[sandbox ${origin} ${level}] ${msg.text()}`);
+    });
+  }
+  // Page-scoped, so EVERY page a spec boots gets one — including the second
+  // page of a context whose console listener is already armed.
+  if (!FORWARDING_PAGE_ERRORS.has(page)) {
+    FORWARDING_PAGE_ERRORS.add(page);
+    page.on('pageerror', (error) => {
+      console.log(`[sandbox page uncaught] ${error.message}`);
+    });
+  }
 }
 
 /**

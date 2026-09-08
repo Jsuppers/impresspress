@@ -227,6 +227,7 @@ impl ActivationIntent {
 /// current now.
 async fn compose(
     ctx: &dyn Context,
+    shared: &super::DevShared,
     intent: ActivationIntent,
     previous: Option<&(GenerationRow, GenerationManifest)>,
 ) -> Result<GenerationManifest, ActivationError> {
@@ -234,12 +235,12 @@ async fn compose(
         || previous.map_or_else(Vec::new, |(_row, manifest)| manifest.blocks.clone());
     Ok(match intent {
         ActivationIntent::SiteOnly => {
-            GenerationManifest::staged(workspace_site(ctx).await?, active_blocks())
+            GenerationManifest::staged(workspace_site(ctx, shared).await?, active_blocks())
         }
         ActivationIntent::BlockSet { site, blocks } => {
             let site = match site {
                 Some(site) => site,
-                None => workspace_site(ctx).await?,
+                None => workspace_site(ctx, shared).await?,
             };
             GenerationManifest::staged(site, blocks)
         }
@@ -251,8 +252,56 @@ async fn compose(
 }
 
 /// The workspace's `site/` half as a site manifest, read from storage.
-async fn workspace_site(ctx: &dyn Context) -> Result<SiteManifest, ActivationError> {
-    let ws = workspace::load(ctx).await.map_err(storage_error)?;
+///
+/// # Why this read is locked
+///
+/// This is the manifest read that backs **every ordinary edit**, not a rare
+/// one: `files::handle_write` and `files::handle_delete` release
+/// `DevShared::workspace` before they publish — deliberately, so editing never
+/// waits behind a runtime rebuild — and this function then reads the manifest
+/// back inside the activation that publish asked for. That released gap is
+/// exactly where a second concurrent write takes the lock and saves the
+/// manifest, and an unlocked read straddling a save is `super::files`' first
+/// failure mode: `workspace::load` snapshots `workspace.json` and then reads
+/// its bytes, a save between the two steps replaces the file, and the browser
+/// storage layer reports the invalidated snapshot as an internal error rather
+/// than a miss. The write whose content was already saved then answers a
+/// sanitized `500`.
+///
+/// So it takes the same mutex as the mutators. The section is one small JSON
+/// read; nothing else is inside it.
+///
+/// # Deadlock
+///
+/// Stated here rather than by analogy to the other holders, because this is
+/// the only acquisition that happens *inside* the activation queue.
+///
+/// 1. **Nothing enters the queue holding this lock.** Every caller of
+///    [`request`] — `files::publish_if_site`, `blocks_api`'s stage and remove,
+///    `generations_api`'s rollback, and the browser host's seed import — holds
+///    no `DevShared::workspace` guard when it calls. `files.rs` closes its
+///    guard's scope before it publishes; the three block-set callers hold
+///    `DevShared::compile` instead; the seed importer holds neither. So no
+///    task can be waiting on this queue while holding the mutex this takes.
+/// 2. **It does not nest with [`adopt_site`].** Both acquisitions live in
+///    [`activate`], but they are sequential, not nested: this guard's scope
+///    ends when this function returns, which is inside `compose`, and
+///    `adopt_site` runs only after `activate_staged` has finished.
+/// 3. **The one lock ordering in the block still has no reverse edge.**
+///    `compile` is taken above this (`blocks_api`, `generations_api`) and this
+///    lock is taken below it; nothing anywhere takes `compile` while holding
+///    `workspace`, so `compile → workspace` is the only order that exists.
+/// 4. **The guard is never held across an `await` on anything but storage.**
+///    `workspace::load` is one object read; there is no activation request, no
+///    runtime rebuild and no ledger write inside the section.
+async fn workspace_site(
+    ctx: &dyn Context,
+    shared: &super::DevShared,
+) -> Result<SiteManifest, ActivationError> {
+    let ws = {
+        let _serialized = shared.workspace.lock().await;
+        workspace::load(ctx).await.map_err(storage_error)?
+    };
     Ok(SiteManifest {
         files: workspace::site_manifest(&ws),
     })
@@ -484,7 +533,7 @@ async fn activate(
         .await
         .map_err(storage_error)?;
     let previous = load_previous(ctx, &state).await?;
-    let mut manifest = compose(ctx, intent, previous.as_ref()).await?;
+    let mut manifest = compose(ctx, shared, intent, previous.as_ref()).await?;
 
     // The id is minted here, not by the repo, because the manifest has to
     // carry it before it is hashed (design §11.3) — and the parent is
@@ -542,7 +591,10 @@ async fn adopt_site(
     // Deadlock-free because the lock is *only* ever held around a
     // read-modify-write of `workspace.json`: `files.rs` drops it before it
     // asks for an activation, so nothing holding it is ever waiting on this
-    // queue.
+    // queue. The other acquisition inside the queue — `workspace_site`, in
+    // `compose` — is sequential with this one rather than nested: its guard's
+    // scope ends before `compose` returns, and this runs after
+    // `activate_staged`. `workspace_site` carries the full argument.
     let _serialized = shared.workspace.lock().await;
     let mut ws = workspace::load(ctx).await?;
     let stale: Vec<String> = ws

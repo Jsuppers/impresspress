@@ -593,7 +593,7 @@ impl TestContext {
         use wafer_core::interfaces::storage::service::StorageService as _;
         let (bytes, _info) = self
             .storage()
-            .get(&format!("{block}/{folder}"), key)
+            .get(&store_folder(block, folder), key)
             .await?;
         Ok(bytes)
     }
@@ -604,8 +604,13 @@ impl TestContext {
     /// `block`, `folder` and `key` are the same three parts
     /// [`Self::storage_get`] takes — the namespace owner, its folder and the
     /// object — because the hold is installed *underneath* the per-block
-    /// namespacing wrapper, where the key really is `{block}/{folder}` +
-    /// `{key}`.
+    /// namespacing wrapper. `store_folder` composes the first two the way the
+    /// real path does, which matters for a block's namespace root: the dev
+    /// block's `workspace.json` lives in folder `""`, and that resolves to
+    /// `impresspress/dev` with no trailing separator.
+    ///
+    /// A hold whose key does not match parks nothing and fails silently, so
+    /// assert [`HeldGet::was_reached`] in any test that installs one.
     ///
     /// This is the only way a fixture can put a suspension inside a handler:
     /// the store resolves everything on the first poll, so joined futures
@@ -613,7 +618,7 @@ impl TestContext {
     /// observable at all.
     pub fn hold_next_storage_get(&self, block: &str, folder: &str, key: &str) -> Arc<HeldGet> {
         self.storage()
-            .hold_next_get(&format!("{block}/{folder}"), key)
+            .hold_next_get(&store_folder(block, folder), key)
     }
 
     /// Make the fixture's object store refuse the next `put`.
@@ -1930,6 +1935,24 @@ pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
 // In-memory storage backend
 // ---------------------------------------------------------------------------
 
+/// The folder name the object store actually sees, for a block's own folder.
+///
+/// The same rule `blocks::storage::resolve_folder` applies on the real path:
+/// a block's namespace root (`folder == ""`) is the caller id ALONE, with no
+/// trailing separator — `impresspress/dev`, not `impresspress/dev/`. Written
+/// once here because both [`TestContext::storage_get`] and
+/// [`TestContext::hold_next_storage_get`] address the store underneath the
+/// namespacing wrapper, and a key that is off by a separator addresses
+/// nothing: the read answers `NotFound` and the hold parks a `get` that never
+/// comes.
+fn store_folder(block: &str, folder: &str) -> String {
+    if folder.is_empty() {
+        block.to_string()
+    } else {
+        format!("{block}/{folder}")
+    }
+}
+
 /// A `get` [`InMemoryStorageService::hold_next_get`] has parked, and the
 /// handle that lets it through.
 ///
@@ -1941,18 +1964,61 @@ pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
 /// the read is holding and the release can never arrive at all. Only the bound
 /// distinguishes the second case from a hang, so the correct behaviour is the
 /// one that exhausts the budget.
+///
+/// Which makes both accessors obligatory in a serialization test:
+/// [`Self::was_reached`], because a seam that never fired proves nothing, and
+/// [`Self::budget_expired`], because "the release never arrived" and "the
+/// release arrived late" resume identically and every other assertion in such
+/// a test passes either way.
+///
+/// # Why this exists alongside `gc::GcInterleave`
+///
+/// They answer the same question — "nothing in the fixture yields, so no
+/// ordering is observable" — at two different levels, and the project's
+/// preference for one canonical seam is why the difference is written down
+/// rather than left to be rediscovered:
+///
+/// * [`crate::blocks::dev::gc::GcInterleave`] is a **production** seam: a
+///   trait on the collector, passed `Uninterrupted` in the shipped build. It
+///   exists because the collector's soundness argument is about one specific
+///   gap (between its listings and its roots) that no caller can reach from
+///   outside. It is the right shape when the interleaving point is internal to
+///   one function and has to be named as part of that function's contract.
+/// * `HeldGet` is a **fixture** seam, underneath the object store. It reaches
+///   any handler that reads any object, with no production code changed at
+///   all. It is the right shape when the property under test is "this handler
+///   is serialized against that one", where adding a seam to every handler
+///   involved would be adding production surface to observe something that is
+///   not the handler's own contract.
+///
+/// A new test should prefer `HeldGet` unless the gap it needs is genuinely
+/// invisible from the store — and a second production seam of `GcInterleave`'s
+/// kind should be argued for rather than assumed.
 #[derive(Default)]
 pub struct HeldGet {
     released: std::sync::atomic::AtomicBool,
     reached: std::sync::atomic::AtomicBool,
+    expired: std::sync::atomic::AtomicBool,
 }
 
 impl HeldGet {
     /// How many polls a parked `get` waits before giving up.
     ///
-    /// Only ever reached when the release is unreachable, so its size costs
-    /// nothing; large enough that a released hold is never cut short by it.
-    const POLL_BUDGET: u32 = 256;
+    /// The bound exists only to turn a hang into a reported failure, so it is
+    /// deliberately far larger than any mutation a test drives against it.
+    /// That sizing is not cosmetic: the other half of the join is re-polled on
+    /// every one of these polls, so a budget in the hundreds RACES the
+    /// mutation, and a mutation whose storage or database calls happen to
+    /// suspend more times than the budget allows would expire the park for a
+    /// reason that has nothing to do with the lock under test — the park would
+    /// end early, the mutation would not have landed, and the test would pass
+    /// against unfixed code. That is a flake, and it is the shape `cc67a3d8`
+    /// already recorded once in this repository.
+    ///
+    /// A hundred thousand self-waking polls is tens of milliseconds, which is
+    /// what a genuine deadlock costs before it is reported, and no mutation in
+    /// these fixtures comes within three orders of magnitude of it.
+    const POLL_BUDGET: u32 = 100_000;
 
     /// Let the parked `get` through.
     pub fn release(&self) {
@@ -1967,14 +2033,36 @@ impl HeldGet {
         self.reached.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether the park ended on its poll budget rather than on a release.
+    ///
+    /// The two outcomes are what a serialization test is choosing between, and
+    /// nothing else distinguishes them: a park that was released and a park
+    /// that timed out both resume and both let the rest of the test pass. Only
+    /// this says which happened.
+    ///
+    /// Assert it wherever the argument is "the other half of the join could
+    /// not reach the release, because it is blocked on the lock this read is
+    /// holding". Without it, a future change that merely made the other half
+    /// SLOW — one more `await` on its way to the release — would exhaust the
+    /// budget for an entirely different reason and the test would keep
+    /// passing, against unfixed code. `cc67a3d8` records a concurrency test in
+    /// this repository that flaked for exactly that shape.
+    pub fn budget_expired(&self) -> bool {
+        self.expired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Suspend until [`Self::release`] or the poll budget, whichever is first.
     async fn park(&self) {
         self.reached
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut polls = 0u32;
         std::future::poll_fn(|cx| {
-            if self.released.load(std::sync::atomic::Ordering::SeqCst) || polls >= Self::POLL_BUDGET
-            {
+            if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Ready(());
+            }
+            if polls >= Self::POLL_BUDGET {
+                self.expired
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return std::task::Poll::Ready(());
             }
             polls += 1;

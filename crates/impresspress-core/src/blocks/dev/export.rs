@@ -213,7 +213,18 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     let Some((row, manifest)) = generation::active(ctx).await.map_err(Refusal::Internal)? else {
         return Err(Refusal::NothingPublished);
     };
-    let ws = workspace::load(ctx).await.map_err(Refusal::Internal)?;
+    // The MANIFEST read is locked; the content reads below are not, and the
+    // split is the whole of this module's concurrency position (see
+    // [`content_gone`]). `workspace::load` snapshots `workspace.json` and then
+    // reads its bytes, so a save landing between those two steps invalidates
+    // the snapshot and the browser storage layer reports that as an internal
+    // error — `super::files`' failure mode 1, and a `500` on an export that
+    // asked for nothing unusual. The section is one small JSON read, which is
+    // not what the "do not hold this across an export" argument is about.
+    let ws = {
+        let _serialized = shared.workspace.lock().await;
+        workspace::load(ctx).await.map_err(Refusal::Internal)?
+    };
 
     // --- the shell -------------------------------------------------------
     let listed = shared.shell.list().await.map_err(Refusal::Shell)?;
@@ -661,12 +672,22 @@ enum Refusal {
 /// A content read that came back [`ErrorCode::NotFound`] is the export losing
 /// a race, not an internal fault.
 ///
-/// [`assemble`] reads the manifest first and then each blob, holding no lock
-/// across the two — deliberately, because a 10 MB read under the workspace
-/// mutex would block editing for the length of an export. What that admits is
-/// a `blocks/`-source delete landing between them: `files::handle_delete`
-/// collects after a `blocks/` delete (nothing was published, so no activation
-/// will), and the blob this loop is about to read can be freed underneath it.
+/// [`assemble`] reads the manifest under `DevShared::workspace` and then reads
+/// each blob **outside** it — deliberately, because a 10 MB read under that
+/// mutex would block editing for the length of an export. This is the one
+/// place in the block where a read of stored content is not covered by the
+/// lock: `files::handle_read` holds it across its blob fetch precisely so an
+/// entry and its content are one view, and it can afford to because one file
+/// is capped at `paths::MAX_FILE_BYTES`. An export is not capped at anything.
+///
+/// What the split admits is a `blocks/`-source delete landing between the
+/// manifest and the blob: `files::handle_delete` collects after a `blocks/`
+/// delete (nothing was published, so no activation will), and the blob this
+/// loop is about to read can be freed underneath it. That is the *same* race
+/// `files::handle_read` closes with the lock, answered the other way — as a
+/// retry-able `409` rather than as a sanitized `500` — because the cost of
+/// closing it here is unbounded. `super::files`' header names both decisions
+/// so a maintainer finds them together.
 ///
 /// The site half cannot lose this race — the active generation is always
 /// retained and a compile finishing mid-export leaves the old generation

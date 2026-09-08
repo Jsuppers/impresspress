@@ -42,15 +42,55 @@
 //!   `NotFound` the handler can only report as corruption — the manifest it is
 //!   holding names content that no longer exists.
 //!
-//! So every reader of the manifest takes the same lock, and
-//! [`handle_read`] holds it across the blob fetch as well as the load, which
-//! is what makes the two steps one consistent view. The cost is that a read
-//! paces behind a mutation instead of failing.
+//! ## Every read of `workspace.json` is under the lock
+//!
+//! Without exception, and the list is short enough to state:
+//! [`handle_read`], [`handle_list`], `gc::storage_usage` (the `/b/dev` page's
+//! ~3 Hz status poll), `activation::workspace_site` and `export::assemble`,
+//! alongside the five mutators. `workspace_site` is the one that matters most
+//! and was the last to get it: [`handle_write`] and [`handle_delete`] release
+//! the guard before they publish, and `workspace_site` is what reads the
+//! manifest back inside the activation that publish asked for — so it backs
+//! **every ordinary site write and delete**, not a rare path, and an unlocked
+//! read there answers a `500` on a write whose content is already saved.
+//!
+//! ## Reading a file's CONTENT is a different question, answered twice
+//!
+//! There are two deliberate and opposite strategies in this block, and they
+//! are opposite because the two reads are not the same size:
+//!
+//! * [`handle_read`] holds the lock across the blob fetch as well as the load,
+//!   which is what makes an entry and the content it names one view. It can
+//!   afford to: one file is capped at [`paths::MAX_FILE_BYTES`].
+//! * `export::assemble` deliberately does **not**. An export is the whole
+//!   site, every block artifact and every block source — megabytes, uncapped —
+//!   and holding the mutex across it would block editing for the export's
+//!   duration. It admits the second failure mode above and maps it to a
+//!   retry-able `409` (`export::content_gone`) rather than to an internal
+//!   error, which is the honest answer for a read that can be repeated.
+//!
+//! So the rule is not "readers take the lock" but: *the manifest read is
+//! always locked; a content read is locked when it is bounded and mapped to a
+//! conflict when it is not.* `export`'s `content_gone` states the same pair
+//! from its side.
+//!
+//! ## What it costs
+//!
+//! A read paces behind a mutation instead of failing. The status poll pays the
+//! most for that: it runs on a fixed interval, so during a collector pass —
+//! which holds the lock across a loop of sequential deletes — a waiter accrues
+//! per interval and `futures::lock::Mutex` is first-in-first-out, which would
+//! queue the user's next save behind all of them. That is why the page's poll
+//! now carries an in-flight guard (`assets/dev.js`): at most one status
+//! request is outstanding, so the pass costs one waiter rather than one per
+//! tick.
 //!
 //! The deadlock rule is unchanged and the readers keep it: the lock is only
 //! ever held around `workspace.json` access, never across an
 //! `activation::request`, so nothing holding it waits on the queue that takes
-//! it in `activation::adopt_site`.
+//! it in `activation::adopt_site` and in `activation::workspace_site` — the
+//! latter carries the full argument, being the only acquisition that happens
+//! inside the queue.
 //!
 //! # Refusal shapes
 //!
